@@ -124,6 +124,9 @@ pub(crate) async fn navigate_ui_impl(
     let mut payload = args.clone();
     crate::api::resolve_thread_id_in_nav_payload(&mut payload, Some(thread_id))
         .map_err(|e| format!("Error: {e}"))?;
+    crate::api::resolve_repo_in_nav_payload(pool, &mut payload)
+        .await
+        .map_err(|e| format!("Error: {e}"))?;
 
     let (who, actor) = recipient(pool, args, last_used).await?;
     let device_id = match &actor {

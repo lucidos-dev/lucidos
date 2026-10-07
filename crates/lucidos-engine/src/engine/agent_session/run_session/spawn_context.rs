@@ -756,6 +756,9 @@ impl LucidosEngine {
             "{system_prompt}{}",
             crate::core::technical_literacy::coding_agent_section(literacy)
         );
+        // ADR 0362: on the Tree memory module the session starts from the
+        // workspace memory view. Only this appended prompt changes (I15).
+        let system_prompt = format!("{system_prompt}{}", self.coding_agent_memory().await);
         Ok(SpawnWorktreeContext {
             cwd,
             system_prompt,
@@ -767,5 +770,36 @@ impl LucidosEngine {
             worktree_created,
             branch_created,
         })
+    }
+}
+
+impl LucidosEngine {
+    /// The workspace memory view section for a coding agent's appended
+    /// prompt, or empty on Classic, or empty while
+    /// `workspace_view_bytes_coding_agent` stays at its default of 0 (ADR
+    /// 0362's amendment).
+    async fn coding_agent_memory(&self) -> String {
+        use crate::engine::summary_tree::module::{tree_ready, Surface, ViewBudgets};
+        if !tree_ready(&self.pool).await {
+            return String::new();
+        }
+        let budgets = ViewBudgets::resolve(&self.pool, Surface::CodingAgent, None).await;
+        if budgets.workspace == 0 {
+            return String::new();
+        }
+        match self
+            .view_snapshots
+            .workspace_view(&self.pool, budgets.workspace)
+            .await
+        {
+            Ok(view) => crate::engine::summary_tree::view::coding_agent_section(&view),
+            Err(e) => {
+                log!(
+                    "[AgentSession] The workspace memory view could not be read: {}",
+                    e
+                );
+                String::new()
+            }
+        }
     }
 }

@@ -18,12 +18,12 @@ vi.mock('../../../store/actions/credentials', async (importOriginal) => ({
 
 vi.mock('../../../store/actions/preferences', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../store/actions/preferences')>()),
-  setTypeSafeEnabled: vi.fn(async () => {}),
+  setSystemOneEnabled: vi.fn(async () => {}),
 }));
 
 import { TypeSafeJudgmentSettings } from '../TypeSafeJudgmentSettings';
 import { deleteCredential } from '../../../store/actions/credentials';
-import { setTypeSafeEnabled } from '../../../store/actions/preferences';
+import { setSystemOneEnabled } from '../../../store/actions/preferences';
 import { credentials, preferences } from '../../../store/store';
 import type { CredentialInfo } from '../../../store/types';
 
@@ -69,7 +69,7 @@ describe('TypeSafeJudgmentSettings', () => {
     document.body.appendChild(host);
     preferences.value = { status: 'loaded', data: {} };
     credentials.value = { status: 'loaded', data: [] };
-    vi.mocked(setTypeSafeEnabled).mockClear();
+    vi.mocked(setSystemOneEnabled).mockClear();
     vi.mocked(deleteCredential).mockClear();
   });
 
@@ -105,7 +105,7 @@ describe('TypeSafeJudgmentSettings', () => {
     render(<TypeSafeJudgmentSettings />, host);
     await press(true);
     expect(secretInput()).not.toBeNull();
-    expect(setTypeSafeEnabled).not.toHaveBeenCalled();
+    expect(setSystemOneEnabled).not.toHaveBeenCalled();
   });
 
   it('keeps the secret write-only, never rendering a stored value', () => {
@@ -142,11 +142,13 @@ describe('TypeSafeJudgmentSettings', () => {
     withKey();
     render(<TypeSafeJudgmentSettings />, host);
     await press(false);
-    expect(setTypeSafeEnabled).toHaveBeenCalledWith(false);
+    expect(setSystemOneEnabled).toHaveBeenCalledWith('provider_enabled_typesafe', false);
     expect(deleteCredential).not.toHaveBeenCalled();
 
     switchedOff();
     render(<TypeSafeJudgmentSettings />, host);
+    // The frame owns the preferences read, so its rerender lands on the flush.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(header()?.textContent).toContain('switched off, key kept');
     expect(header()?.textContent).toContain('configured');
     expect(secretInput()).toBeNull();
@@ -158,7 +160,7 @@ describe('TypeSafeJudgmentSettings', () => {
     render(<TypeSafeJudgmentSettings />, host);
     expect(toggle()?.checked).toBe(false);
     await press(true);
-    expect(setTypeSafeEnabled).toHaveBeenCalledWith(true);
+    expect(setSystemOneEnabled).toHaveBeenCalledWith('provider_enabled_typesafe', true);
   });
 
   /** Remove sits on the header row beside the switch, like every other

@@ -1,15 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { disclosureDurationMs, rollCap } from './disclosureMotion';
+import {
+    disclosureDurationMs, rollCap, DISCLOSURE_MIN_MS, DISCLOSURE_MAX_MS,
+} from './disclosureMotion';
 
 describe('disclosureDurationMs', () => {
     it('grows with the block and stays within its bounds', () => {
-        expect(disclosureDurationMs(10)).toBe(260);
-        expect(disclosureDurationMs(5000)).toBe(420);
+        expect(disclosureDurationMs(10)).toBe(DISCLOSURE_MIN_MS);
+        expect(disclosureDurationMs(5000)).toBe(DISCLOSURE_MAX_MS);
         expect(disclosureDurationMs(400)).toBeGreaterThan(disclosureDurationMs(350));
     });
 
     it('rolls a phone screen of rows well inside half a second', () => {
-        expect(disclosureDurationMs(700)).toBeLessThanOrEqual(420);
+        expect(disclosureDurationMs(700)).toBeLessThan(500);
     });
 });
 

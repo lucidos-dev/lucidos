@@ -257,7 +257,7 @@ describe('waitingPanelBody', () => {
   });
 
   it('renders the list inside the padded body, not directly on the shell', () => {
-    expect(body()).toContain('<div class="anchored-popover-body">');
+    expect(body()).toContain('<div data-surface-step="list" class="anchored-popover-body">');
     expect(body()).toContain('<ul class="event-wait-list">');
   });
 

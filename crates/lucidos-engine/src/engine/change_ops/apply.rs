@@ -225,6 +225,7 @@ impl LucidosEngine {
             Some(&pre_sha),
             Some(&post_sha),
             actor,
+            change.thread_id,
         )
         .await;
         self.broadcast_changes_updated().await;

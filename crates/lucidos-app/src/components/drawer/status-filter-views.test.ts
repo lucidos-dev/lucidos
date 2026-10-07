@@ -1,6 +1,6 @@
 /**
  * Every status-filter view in the thread drawer (Drafts / Needs attention /
- * Review / Running) offers the same way out: a "See all statuses" shortcut back
+ * Review / In flight) offers the same way out: a "See all statuses" shortcut back
  * to the unfiltered view. It has to be there in BOTH states, because the user is
  * equally stuck either way. An empty filter says "nothing here", and a filter
  * with two rows says "these two, and nothing else". In both cases whatever else
@@ -88,5 +88,14 @@ describe('status-filter view header count', () => {
         // lifecycle headers cannot drift apart.
         expect(SOURCE).not.toContain('section-count');
         expect(fns.get('DrawerSectionTitle')).toMatch(/<SectionHeaderContent\b[^>]*\bcount=\{count\}/);
+    });
+});
+
+describe('In flight header shimmer', () => {
+    it('shimmers only while a row is running, never unconditionally', () => {
+        // A list of parked threads is in flight but idle, so a bare `running`
+        // prop would claim work that is not happening.
+        const body = topLevelFunctions(SOURCE).get('InFlightList')!;
+        expect(body).toMatch(/<SectionHeaderContent\b[^>]*\brunning=\{inFlightHasRunning\(rows\)\}/);
     });
 });

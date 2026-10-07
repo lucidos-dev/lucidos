@@ -1,21 +1,24 @@
 //! How long the proxy waits on one upstream request.
 //!
 //! Two layers decide it, in this order: an `apis.json` entry's own
-//! `timeout_secs`, then the workspace preference `proxy_timeout_secs`, then
-//! [`DEFAULT_SECS`]. The builtin model providers have no entry, so the
-//! preference is their only knob. See ADR 0277.
+//! `timeout_secs`, then the workspace preference [`prefs::PROXY_TIMEOUT_SECS`],
+//! then that preference's catalog default. The builtin model providers have no
+//! entry, so the preference is their only knob. See ADR 0277.
 //!
 //! The wait applies per upstream request, so a redirect hop and the one 401
 //! retry each start their own. [`CallBudget`] caps the whole proxied call at
 //! [`MAX_SECS`], which is what lets a client wait a fixed time and never cut
-//! first. At the default the cap never binds: ten requests at 30 s is 300 s.
+//! first. At the catalog default the cap never binds for ten requests.
 
+use crate::core::prefs;
 use axum::http::StatusCode;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// The wait when nothing is configured.
-pub(crate) const DEFAULT_SECS: u64 = 30;
+/// The wait when nothing is configured: the catalog default.
+pub(crate) fn default_wait() -> Duration {
+    Duration::from_secs_f64(prefs::PROXY_TIMEOUT_SECS.default_number())
+}
 
 /// The largest wait either layer accepts. The Anthropic and OpenAI SDKs both
 /// default to ten minutes.
@@ -23,6 +26,16 @@ pub(crate) const MAX_SECS: u64 = 600;
 
 /// The smallest wait either layer accepts.
 pub(crate) const MIN_SECS: u64 = 1;
+
+/// How long a client waits on one proxied call: [`MAX_SECS`] plus a margin.
+/// Every pipeline step and request is bounded by the cap, so the margin covers
+/// only the work before the budget starts. A client deadline below the cap
+/// would cut a call the engine still means to finish.
+///
+/// The SDK reads it from the generated `engine-constants.ts`. `lucidos proxy`
+/// cannot import this crate, so a test pins its copy.
+#[cfg(test)]
+pub(crate) const CLIENT_WAIT_SECS: u64 = MAX_SECS + 60;
 
 /// Why `secs` is not a usable wait for `field`, if it is not.
 pub(crate) fn range_rejection(field: &str, secs: f64) -> Option<String> {
@@ -51,9 +64,9 @@ pub(crate) fn effective(
         };
     }
     let Some(raw) = workspace else {
-        return Ok(Duration::from_secs(DEFAULT_SECS));
+        return Ok(default_wait());
     };
-    let key = crate::core::PREF_PROXY_TIMEOUT_SECS;
+    let key = prefs::PROXY_TIMEOUT_SECS.key();
     let secs: f64 = raw
         .trim()
         .parse()
@@ -98,7 +111,9 @@ impl CallBudget {
     }
 }
 
-/// [`effective`], with the preference read from the database.
+/// [`effective`], with the preference read from the database. The raw row,
+/// because [`effective`] refuses an out-of-range value where a handle read
+/// would clamp it.
 pub(crate) async fn resolve(
     pool: &sqlx::PgPool,
     entry_secs: Option<f64>,
@@ -107,7 +122,8 @@ pub(crate) async fn resolve(
     if entry_secs.is_some() {
         return effective(entry_secs, None).map_err(internal);
     }
-    let stored = crate::core::PreferenceStore::get(pool, crate::core::PREF_PROXY_TIMEOUT_SECS)
+    let stored = prefs::PROXY_TIMEOUT_SECS
+        .try_stored(pool)
         .await
         .map_err(|e| internal(format!("could not read the proxy timeout: {e}")))?;
     effective(None, stored.as_deref()).map_err(internal)
@@ -118,8 +134,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nothing_configured_waits_thirty_seconds() {
-        assert_eq!(effective(None, None).unwrap(), Duration::from_secs(30));
+    fn nothing_configured_waits_the_catalog_default() {
+        assert_eq!(effective(None, None).unwrap(), default_wait());
     }
 
     #[test]
@@ -146,7 +162,7 @@ mod tests {
     fn an_entry_value_out_of_range_is_an_error_not_a_panic() {
         assert!(effective(Some(-1.0), None).is_err());
         assert!(effective(Some(f64::NAN), None).is_err());
-        assert!(effective(Some(601.0), Some("30")).is_err());
+        assert!(effective(Some(MAX_SECS as f64 + 1.0), Some("300")).is_err());
     }
 
     #[test]
@@ -159,62 +175,51 @@ mod tests {
 
     #[test]
     fn a_stored_value_out_of_range_fails_loudly() {
-        let err = effective(None, Some("601")).unwrap_err();
-        assert!(err.contains("proxy_timeout_secs"), "{err}");
-        assert!(err.contains("600"), "{err}");
+        let err = effective(None, Some(&(MAX_SECS + 1).to_string())).unwrap_err();
+        assert!(err.contains(prefs::PROXY_TIMEOUT_SECS.key()), "{err}");
+        assert!(err.contains(&MAX_SECS.to_string()), "{err}");
         assert!(effective(None, Some("0")).is_err());
         assert!(effective(None, Some("soon")).is_err());
     }
 
     #[test]
     fn the_range_is_inclusive_at_both_ends() {
-        assert!(range_rejection("timeout_secs", 1.0).is_none());
-        assert!(range_rejection("timeout_secs", 600.0).is_none());
-        assert!(range_rejection("timeout_secs", 0.5).is_some());
-        assert!(range_rejection("timeout_secs", 600.5).is_some());
+        let (min, max) = (MIN_SECS as f64, MAX_SECS as f64);
+        assert!(range_rejection("timeout_secs", min).is_none());
+        assert!(range_rejection("timeout_secs", max).is_none());
+        assert!(range_rejection("timeout_secs", min - 0.5).is_some());
+        assert!(range_rejection("timeout_secs", max + 0.5).is_some());
         assert!(range_rejection("timeout_secs", -5.0).is_some());
-        let reason = range_rejection("timeout_secs", 601.0).unwrap();
+        let reason = range_rejection("timeout_secs", max + 1.0).unwrap();
         assert!(reason.contains("'timeout_secs'"), "{reason}");
-        assert!(reason.contains("between 1 and 600"), "{reason}");
+        let range = format!("between {MIN_SECS} and {MAX_SECS}");
+        assert!(reason.contains(&range), "{reason}");
     }
 
     #[test]
     fn a_request_waits_the_setting_while_the_call_has_time() {
-        let budget = CallBudget::start(Duration::from_secs(30));
+        let budget = CallBudget::start(default_wait());
         let wait = budget.next_request().expect("a fresh call has time");
-        assert_eq!(wait, Duration::from_secs(30));
+        assert_eq!(wait, default_wait());
     }
 
     #[tokio::test]
     async fn the_last_request_gets_only_what_is_left_of_the_call() {
-        let budget = CallBudget::with_cap(Duration::from_secs(30), Duration::from_millis(200));
+        let budget = CallBudget::with_cap(default_wait(), Duration::from_millis(200));
         let wait = budget.next_request().expect("a fresh call has time");
         assert!(wait <= Duration::from_millis(200), "{wait:?}");
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(budget.next_request(), None, "the call is out of time");
     }
 
-    /// How much longer than [`MAX_SECS`] a client waits on the engine. Every
-    /// pipeline step and request is bounded by the cap, so this covers only
-    /// the work before the budget starts: reading the preference, binding the
-    /// pipeline, and building its layers.
-    const CLIENT_MARGIN_SECS: u64 = 60;
-
-    /// A client deadline below the engine's maximum would cut a call the
-    /// engine still means to finish, which is the bug a raised setting fixes.
-    /// `lucidos proxy` and the SDK's `lucidos.proxy` each carry the sum as a
-    /// literal, since neither can import this crate.
+    /// `lucidos proxy` cannot import this crate, so it carries
+    /// [`CLIENT_WAIT_SECS`] as a literal and this test pins it.
     #[test]
-    fn the_clients_wait_longer_than_the_engine_maximum() {
-        let wait = MAX_SECS + CLIENT_MARGIN_SECS;
+    fn the_cli_waits_the_client_wait() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let cli = std::fs::read_to_string(root.join("crates/lucidos-cli/src/proxy.rs"))
             .expect("read the CLI proxy source");
-        let needle = format!("const CLIENT_WAIT_SECS: u64 = {wait};");
+        let needle = format!("const CLIENT_WAIT_SECS: u64 = {CLIENT_WAIT_SECS};");
         assert!(cli.contains(&needle), "lucidos proxy must carry `{needle}`");
-        let sdk = std::fs::read_to_string(root.join("packages/lucidos-sdk/src/proxy.ts"))
-            .expect("read the SDK proxy source");
-        let needle = format!("const PROXY_TIMEOUT_MS = {};", wait * 1000);
-        assert!(sdk.contains(&needle), "lucidos.proxy must carry `{needle}`");
     }
 }

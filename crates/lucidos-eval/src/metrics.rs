@@ -28,7 +28,7 @@ type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 /// there is not the agent going back for a dropped fact. Every other LLM domain
 /// is named in `NOT_RECOVERY_DOMAINS`, in this file's test module. A new one
 /// belongs to neither list, so it fails the drift test until somebody places it.
-pub const RECOVERY_DOMAINS: [&str; 4] = ["events", "memory", "threads", "triggers"];
+pub const RECOVERY_DOMAINS: [&str; 5] = ["events", "memory", "recall", "threads", "triggers"];
 
 /// Recovery tools that belong to no domain, so no `action` dispatches them.
 ///
@@ -126,11 +126,27 @@ impl ModelTokens {
 pub struct ThreadTokens {
     /// Every model that captured on this thread, main agent and auxiliary.
     pub by_model: Vec<ModelTokens>,
+    /// The agent's first and last round. Auxiliary work is left out: a title
+    /// or a compactor line lands after the turn, and nobody waits on it.
     pub started: Option<DateTime<Utc>>,
     pub ended: Option<DateTime<Utc>>,
 }
 
 impl ThreadTokens {
+    /// Take one group in. Only the agent's own rounds widen the span.
+    fn add(
+        &mut self,
+        group: ModelTokens,
+        started: Option<DateTime<Utc>>,
+        ended: Option<DateTime<Utc>>,
+    ) {
+        if group.is_main_agent() {
+            self.started = earliest(self.started, started);
+            self.ended = latest(self.ended, ended);
+        }
+        self.by_model.push(group);
+    }
+
     /// Rounds the agent took. An auxiliary call is spend, not a round.
     ///
     /// Counting the classifier, the title and the summariser as rounds would
@@ -339,11 +355,7 @@ pub async fn thread_tokens(pool: &PgPool, thread_id: Uuid) -> Fallible<ThreadTok
     .await?;
     let mut tokens = ThreadTokens::default();
     for row in rows {
-        let started: Option<DateTime<Utc>> = row.try_get("started")?;
-        let ended: Option<DateTime<Utc>> = row.try_get("ended")?;
-        tokens.started = earliest(tokens.started, started);
-        tokens.ended = latest(tokens.ended, ended);
-        tokens.by_model.push(ModelTokens {
+        let group = ModelTokens {
             model: row.try_get("model")?,
             producer: row.try_get("producer")?,
             captures: row.try_get("captures")?,
@@ -355,7 +367,8 @@ pub async fn thread_tokens(pool: &PgPool, thread_id: Uuid) -> Fallible<ThreadTok
                 input_total: row.try_get::<Option<i64>, _>("input_total")?.unwrap_or(0),
                 output_tokens: row.try_get::<Option<i64>, _>("output_tokens")?.unwrap_or(0),
             },
-        });
+        };
+        tokens.add(group, row.try_get("started")?, row.try_get("ended")?);
     }
     Ok(tokens)
 }
@@ -586,25 +599,35 @@ pub async fn workspace_events(pool: &PgPool) -> Fallible<Vec<EventRow>> {
 pub fn usd(tokens: &ThreadTokens, prices: &[ModelPrice]) -> Fallible<Spend> {
     let mut spend = Spend::default();
     for group in &tokens.by_model {
-        if group.counts.is_zero() {
-            continue;
-        }
-        let price = prices
-            .iter()
-            .find(|price| price.id == group.model)
-            .ok_or_else(|| {
-                format!(
-                    "prices.toml has no row for model {:?}, seen on a {:?} capture",
-                    group.model, group.producer
-                )
-            })?;
-        let dollars = price_counts(&group.counts, price);
+        let dollars = priced(&group.model, &group.producer, &group.counts, prices)?;
         spend.total += dollars;
         if !group.is_main_agent() {
             spend.auxiliary += dollars;
         }
     }
     Ok(spend)
+}
+
+/// One group's dollars at its own model's pinned rate.
+///
+/// `seen_on` names the capture in the refusal, so an operator can tell which
+/// call brought the unpriced model in.
+pub fn priced(
+    model: &str,
+    seen_on: &str,
+    counts: &TokenCounts,
+    prices: &[ModelPrice],
+) -> Fallible<f64> {
+    if counts.is_zero() {
+        return Ok(0.0);
+    }
+    let price = prices
+        .iter()
+        .find(|price| price.id == model)
+        .ok_or_else(|| {
+            format!("prices.toml has no row for model {model:?}, seen on a {seen_on:?} capture")
+        })?;
+    Ok(price_counts(counts, price))
 }
 
 /// One group's dollars at one model's rates.
@@ -1089,6 +1112,33 @@ mod tests {
         assert_eq!(earliest(None, Some(start)), Some(start));
         assert_eq!(latest(Some(start), None), Some(start));
         assert_eq!(earliest(None, None), None);
+    }
+
+    /// A Tree arm's compactor writes onto the thread after the turn ends, and
+    /// the harness waits for it. Counted in, it would bill that wait to the
+    /// agent's wall time.
+    #[test]
+    fn auxiliary_work_after_the_turn_does_not_stretch_the_wall_clock() {
+        let start = DateTime::parse_from_rfc3339("2026-01-05T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut tokens = ThreadTokens::default();
+        tokens.add(
+            group("test-model", MAIN_LLM_PRODUCER, TokenCounts::default()),
+            Some(start),
+            Some(start + chrono::Duration::seconds(60)),
+        );
+        tokens.add(
+            group("test-aux", "auxiliary", TokenCounts::default()),
+            Some(start + chrono::Duration::seconds(30)),
+            Some(start + chrono::Duration::seconds(400)),
+        );
+        assert_eq!(tokens.wall_secs(), 60);
+        assert_eq!(
+            tokens.by_model.len(),
+            2,
+            "the auxiliary group is still priced"
+        );
     }
 
     #[test]

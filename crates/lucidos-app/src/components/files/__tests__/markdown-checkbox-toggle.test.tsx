@@ -9,12 +9,14 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render } from 'preact';
 import { MarkdownDocument } from '../MarkdownDocument';
 
+const NOTES = { kind: 'workspace', path: 'artifacts/notes.md' } as const;
+
 let host: HTMLElement;
 
 function mount(content: string, props?: { editable?: boolean; onToggleCheckbox?: (i: number) => Promise<boolean> }): HTMLElement {
   host = document.createElement('div');
   document.body.append(host);
-  render(<MarkdownDocument content={content} {...props} />, host);
+  render(<MarkdownDocument content={content} location={NOTES} {...props} />, host);
   return host;
 }
 
@@ -121,7 +123,7 @@ describe('MarkdownDocument task-list checkboxes', () => {
     // Same content, same host: a parent re-render that hands MarkdownDocument
     // a brand-new (unmemoized) onToggleCheckbox function identity. Only the
     // callback identity differs; `html` is unchanged.
-    render(<MarkdownDocument content={content} editable onToggleCheckbox={() => Promise.resolve(true)} />, host);
+    render(<MarkdownDocument content={content} location={NOTES} editable onToggleCheckbox={() => Promise.resolve(true)} />, host);
 
     expect(boxes[0].disabled).toBe(true); // still mid-flight, not re-enabled
   });
@@ -226,7 +228,7 @@ describe('MarkdownDocument task-list checkboxes', () => {
     const boxes = checkboxes(mount('- [ ] One\n', { editable: true, onToggleCheckbox }));
     await flushEffects(() => !boxes[0].disabled);
 
-    render(<MarkdownDocument content="- [x] One\n" editable onToggleCheckbox={onToggleCheckbox} />, host);
+    render(<MarkdownDocument content="- [x] One\n" location={NOTES} editable onToggleCheckbox={onToggleCheckbox} />, host);
     const freshBoxes = checkboxes(host);
 
     expect(freshBoxes[0]).not.toBe(boxes[0]); // the subtree really was replaced

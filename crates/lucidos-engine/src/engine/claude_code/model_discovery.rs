@@ -3,7 +3,7 @@
 //! a request path, so a slow or absent Claude Code only leaves the last list.
 
 use super::LucidosEngine;
-use crate::core::PreferenceStore;
+use crate::core::prefs;
 use crate::runtime::cc_model_discovery as discovery;
 
 impl LucidosEngine {
@@ -27,18 +27,10 @@ impl LucidosEngine {
         let workspace = self.workspace_path().to_path_buf();
         tokio::spawn(async move {
             let _slot = slot;
-            let binary_override = PreferenceStore::get_nonblank(
-                &pool,
-                crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
-                "CcModels",
-            )
-            .await;
-            let permission_mode = PreferenceStore::get_nonblank(
-                &pool,
-                crate::core::PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
-                "CcModels",
-            )
-            .await;
+            let binary_override = prefs::CODING_AGENT_CLAUDE_PATH.read(&pool).await;
+            let permission_mode = prefs::CODING_AGENT_CLAUDE_PERMISSION_MODE
+                .stored(&pool)
+                .await;
             let user_env =
                 crate::core::EnvironmentVariableStore::spawn_pairs(&pool, "CcModels").await;
             // A session in the workspace, minus everything a turn needs: no

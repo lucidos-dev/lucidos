@@ -133,6 +133,18 @@ pub(in crate::api) async fn save_thread(
         Some(true) => return Ok(StatusCode::OK),
         Some(false) => {}
     }
+    // The home thread sits in no drawer section, so a pin would move it
+    // nowhere (ADR 0362).
+    let is_home = crate::engine::home_thread::is_home_thread(&state.pool, thread_uuid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if is_home {
+        return Err((
+            StatusCode::CONFLICT,
+            "The home thread opens from Home rather than the thread list, so it is never pinned."
+                .to_string(),
+        ));
+    }
     let actor = crate::api::actor::user_actor(&headers, None);
 
     state
@@ -253,6 +265,23 @@ pub(in crate::api) async fn suggest_title(
         .get("thread_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing thread_id".to_string()))?;
+    let thread_uuid = uuid::Uuid::parse_str(thread_id).ok();
+
+    // Refused before the model call, so a stale menu spends nothing.
+    if let Some(id) = thread_uuid {
+        let home = crate::engine::home_thread::is_marked_home_thread(&state.pool, id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if home {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "Thread {id} is the home thread. Only you name it, so Lucidos suggests \
+                     no name for it. Rename it by hand instead."
+                ),
+            ));
+        }
+    }
 
     // Get recent messages for context (last few messages give better titles than just the first)
     let messages = state
@@ -291,30 +320,16 @@ pub(in crate::api) async fn suggest_title(
         .collect::<Vec<_>>()
         .join("\n---\n");
 
-    let extractor = state.engine.extractor().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No extraction provider available".to_string(),
-        )
-    })?;
-
-    let call = crate::engine::title_call(&state.pool, extractor)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to build title provider: {}", e),
-            )
-        })?;
+    let call = crate::engine::title_call(&state.engine).await;
     // A suggestion costs the same tokens an automatic title does, so it is
-    // captured the same way. An unparseable id anchors nothing, and the call
-    // goes ahead uncaptured rather than being refused over bookkeeping.
-    let capture = crate::engine::AuxCapture::for_thread(
+    // captured the same way. An unparseable id records on the home thread,
+    // rather than refusing the call over bookkeeping.
+    let capture = crate::engine::AuxCapture::for_thread_or_home(
         &state.engine.event_bus,
-        uuid::Uuid::parse_str(thread_id).ok(),
+        thread_uuid,
         crate::engine::ContextPurpose::Title,
     );
-    let title = crate::engine::generate_thread_title(&call, &summary, None, capture.as_ref())
+    let title = crate::engine::generate_thread_title(&call, &summary, None, &capture)
         .await
         .map_err(|e| {
             log!("[API] Failed to generate title suggestion: {}", e);
@@ -457,6 +472,16 @@ pub(in crate::api) async fn cancel_thread_event_wait(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
     let wait_uuid = Uuid::parse_str(&wait_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid wait_id: {e}")))?;
+    // The path names the thread, and the caller picks the path. So an agent
+    // presenting its token is held to its own reach, as on every cancel route.
+    refuse_without_authority(
+        &state.pool,
+        &headers,
+        Some(thread_uuid),
+        ThreadReachVerb::Cancel,
+    )
+    .await
+    .map_err(|e| (e.status_code(), e.to_string()))?;
     let actor = crate::api::actor::user_actor(&headers, None);
 
     use crate::engine::event_wait::CancelWaitOutcome;
@@ -506,9 +531,9 @@ pub(in crate::api) async fn cancel_thread_event_wait(
 /// it has nothing to be scoped to and is refused rather than granted the run of
 /// every thread.
 ///
-/// Deliberately NOT applied to `.../event-waits/:wait_id/cancel`: that is the
-/// **Stop waiting** button, a person acting through the UI, which carries no
-/// token by construction.
+/// Not applied to `.../event-waits/:wait_id/cancel`, the **Stop waiting**
+/// button. That route takes the clause-4 Cancel gate instead, so an agent may
+/// stop a wait anywhere in its own subtree, as `POST /api/v1/chat/cancel` lets it.
 pub(super) fn refuse_event_waits_for_another_thread(
     headers: &HeaderMap,
     thread_id: Uuid,

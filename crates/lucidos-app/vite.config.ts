@@ -336,6 +336,9 @@ export default defineConfig({
       'src/**/*.test.ts',
       'src/**/*.test.tsx',
       '../../packages/lucidos-sdk/src/**/*.test.ts',
+      // Unit tests for the Playwright harness. Specs are `*.spec.ts`, and
+      // playwright.config.ts matches only those, so neither runner takes the other's.
+      'e2e/**/*.test.ts',
     ],
     setupFiles: ['src/test-setup.ts'],
   },
@@ -363,6 +366,10 @@ export default defineConfig({
       // barrel, for the same reason as the three above.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/event-stream': resolve(__dirname, '../../packages/lucidos-sdk/src/eventStream.ts'),
+      // The find bar's matcher, shared so an app frame and the host's own
+      // previews and transcript match text the same way. Reached WITHOUT the
+      // barrel, for the same reason. Mirrored in tsconfig.json `paths`.
+      '@lucidos/find': resolve(__dirname, '../../packages/lucidos-sdk/src/find.ts'),
       // The text-entry contract, shared so the host's field stamp and an app
       // frame's resolve the Autocorrect switch by one rule. Reached WITHOUT the
       // barrel, for the same reason as the four above.
@@ -378,6 +385,15 @@ export default defineConfig({
       // barrel, for the same reason as the six above.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/pane-swipe': resolve(__dirname, '../../packages/lucidos-sdk/src/paneSwipe.ts'),
+      // The preference catalog, generated from the engine's. Every default and
+      // value list the host reads comes from here, never from a copy. Reached
+      // WITHOUT the barrel, for the same reason as the seven above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/preference-catalog': resolve(__dirname, '../../packages/lucidos-sdk/src/generated/preference-catalog.ts'),
+      // The engine constants a client must agree with, generated from the
+      // engine's. Reached WITHOUT the barrel, for the same reason as above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/engine-constants': resolve(__dirname, '../../packages/lucidos-sdk/src/generated/engine-constants.ts'),
     },
   },
   server: {

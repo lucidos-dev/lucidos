@@ -123,7 +123,7 @@ describe('restorePendingUploads', () => {
     expect(chip.mime).toBe('image/png');
     expect(chip.file.name).toBe('photo.png');
     expect(new Uint8Array(await chip.file.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
-    expect(uploadThreadBlob).toHaveBeenCalledWith(LIVE, chip.file, expect.anything());
+    await vi.waitFor(() => expect(uploadThreadBlob).toHaveBeenCalledWith(LIVE, chip.file, expect.anything()));
     // Now this page's record.
     expect((await readPendingUploadStore()).uploads[0].ownerId).not.toBe(EARLIER_PAGE);
     expect(warnings()).toEqual([]);

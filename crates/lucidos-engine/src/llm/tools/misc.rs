@@ -105,7 +105,7 @@ pub(super) fn get_navigate_ui_tool() -> ToolDefinition {
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "Required for 'file'. Path with its directory prefix (e.g. 'artifacts/notes.md'). In a registered repository clone: 'repo:<repoId>:file:<path>' at HEAD, or 'repo:<repoId>:file#<ref>:<path>' for a branch, tag or sha."
+                    "description": "Required for 'file'. Path with its directory prefix (e.g. 'artifacts/notes.md'). In a registered repository clone: 'repo:<name or id>:file:<path>' at HEAD; 'file#<ref>' in place of 'file' for a branch, tag or sha."
                 },
                 "line": {
                     "type": "integer",
@@ -358,6 +358,10 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
             parameters: json!({
                 "type": "object",
                 "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Markdown shown in full as your reply, above the first card: the answer, steps, links, pictures or draft it follows."
+                    },
                     "questions": {
                         "type": "array",
                         "minItems": 1,
@@ -368,11 +372,7 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
                             "properties": {
                                 "question": {
                                     "type": "string",
-                                    "description": "REQUIRED, in the user's language. Never empty and never only in `header`: the engine rejects that and makes you re-ask. Markdown: short paragraphs or a list, the question last."
-                                },
-                                "header": {
-                                    "type": "string",
-                                    "description": "Optional chip-label, 12 characters or fewer. Never a replacement for `question`."
+                                    "description": "REQUIRED, in the user's language: the full text shown on the card. Never empty: the engine rejects that and makes you re-ask. Markdown: short paragraphs or a list, the question last."
                                 },
                                 "options": {
                                     "type": "array",

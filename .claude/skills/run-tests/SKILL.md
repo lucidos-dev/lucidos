@@ -87,14 +87,17 @@ report that distinctly.
 
 ## Documented #[ignore] exceptions
 
-Expect **`16 ignored` in the lib run and `0 ignored` in the doctest run**,
+Expect **`18 ignored` in the lib run and `0 ignored` in the doctest run**,
 and nothing else. Any other ignored test is a real skip and must be
 fixed. (`crates/lucidos-engine/tests/`, the integration binaries, has
-no `#[ignore]` at all.) The sixteen are three different things: **eleven
-codegen writers**, **three diagnostic printers**, and **two
+no `#[ignore]` at all.) The eighteen are three different things:
+**thirteen codegen writers**, **three diagnostic printers**, and **two
 live-provider checks**.
 
-### The eleven codegen writers
+### The thirteen codegen writers
+
+The table lists fourteen. The last row is in `lucidos-gateway`, so the
+engine's lib run counts thirteen.
 
 Every one of them is paired with a *non-ignored* staleness guard that
 fails `cargo test` when the generated file on disk no longer matches
@@ -121,6 +124,9 @@ and "regenerate" (run on demand). Don't re-litigate it, and don't
 | `core::fonts::tests::generate_font_catalog_files` | `generated_font_catalog_is_up_to_date` and `generated_font_faces_are_up_to_date` |
 | `core::themes::parts::tests::generate_theme_parts_files` | `generated_theme_parts_ts_is_up_to_date` and `generated_theme_parts_css_is_up_to_date` |
 | `api::app_reach::tests::generate_app_reach_file` | `generated_app_reach_is_up_to_date` |
+| `core::preference_catalog::codegen_tests::generate_preference_catalog_file` | `generated_preference_catalog_is_up_to_date` |
+| `engine_constants_codegen_tests::generate_engine_constants_file` | `generated_engine_constants_are_up_to_date` |
+| `lucidos-gateway`: `generate_gateway_constants_file` (`cargo test -p lucidos-gateway generate_gateway_constants_file -- --ignored`) | `generated_gateway_constants_are_up_to_date` |
 
 When a guard fails it prints the exact regeneration command; run that,
 then re-run the suite. `cargo test -p lucidos-engine --lib -- --ignored --list`
@@ -179,10 +185,11 @@ cargo test -p lucidos-engine --lib voice::live -- --ignored --nocapture
 | `voice::realtime::…::a_real_session_accepts_the_opening_payload` | `the_instructions_reach_the_opening_payload`, `the_talker_is_opened_with_one_tool_and_it_delegates`, `end_of_turn_is_decided_semantically`, and the rest of `voice/realtime_tests.rs` |
 | `voice::live::…::a_real_session_accepts_the_opening_payload` | `the_opening_frame_names_the_model_and_starts_a_session`, `the_session_delegates_to_us_and_never_to_a_rented_backend`, `the_opening_frame_declares_no_tools`, and the rest of `voice/live_tests.rs` |
 
-**No doctests.** The crate has none, so the doc run reports `0 passed; 0
-failed; 0 ignored`. It once carried a single ```` ```ignore ```` fenced
-example in `crates/lucidos-engine/src/engine/event_bus/mod.rs`, since
-removed. If a doctest returns, update this line and the count above.
+**One doctest.** The doc run reports `1 passed; 0 failed; 0 ignored`.
+It is a ```` ```compile_fail ```` example on `Pref` in
+`crates/lucidos-engine/src/core/preference_catalog.rs`. It proves that a
+flag handle on a text spec does not compile, so it is a real type-level
+guard, not a skip. If the doctest count changes, update this line.
 
 If a future change introduces a *new* `#[ignore]`, it must come with
 either (a) a sibling non-ignored verification test, or (b) a script

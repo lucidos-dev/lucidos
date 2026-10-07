@@ -470,7 +470,8 @@ service_desktop_agent_labels() {
 # service_desktop_default_port: the port the .app takes when nothing has
 # overridden it. The *stable gateway port*: paired devices and the Tauri
 # capability URL pattern key on it, so the app cannot step off it the way a
-# brand-new instance here can. Mirrors DEFAULT_GATEWAY_PORT in the Rust crate.
+# brand-new instance here can. crates/lucidos-gateway/src/value_pins_tests.rs
+# pins it to DEFAULT_GATEWAY_PORT.
 service_desktop_default_port() { printf '5252'; }
 
 # service_desktop_app_paths <home> [system-applications-dir]: every path the

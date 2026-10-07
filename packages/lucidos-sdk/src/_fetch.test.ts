@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { request, restampDeadline, SdkError } from './_fetch';
+import { HEADER_DEVICE_ID } from './generated/engine-constants';
 
 /** WebKit (iOS Safari, the packaged WKWebView) rejects an aborted fetch with its
  *  own `AbortError: Fetch is aborted` instead of the signal's `reason`, so a
@@ -158,8 +159,6 @@ describe('rawFetch deadline + caller signal', () => {
  *  device-stamped client, so stamping here covers every SDK caller at once.
  *  See ADR 0169. */
 describe('device attribution', () => {
-  const DEVICE_ID_HEADER = 'x-lucidos-device-id';
-
   /** The header the facade sent, or undefined. */
   async function headerOn(deviceId: string | null): Promise<string | undefined> {
     if (deviceId === null) localStorage.removeItem('lucidos-device-id');
@@ -168,7 +167,7 @@ describe('device attribution', () => {
     globalThis.fetch = spy;
     await request('/triggers');
     const init = spy.mock.calls[0][1] as RequestInit;
-    return (init.headers as Record<string, string>)[DEVICE_ID_HEADER];
+    return (init.headers as Record<string, string>)[HEADER_DEVICE_ID];
   }
 
   afterEach(() => localStorage.removeItem('lucidos-device-id'));
@@ -185,8 +184,8 @@ describe('device attribution', () => {
     localStorage.setItem('lucidos-device-id', 'stored');
     const spy = vi.fn<typeof fetch>(async () => new Response('{}', { status: 200 }));
     globalThis.fetch = spy;
-    await request('/triggers', { headers: { [DEVICE_ID_HEADER]: 'explicit' } });
+    await request('/triggers', { headers: { [HEADER_DEVICE_ID]: 'explicit' } });
     const init = spy.mock.calls[0][1] as RequestInit;
-    expect((init.headers as Record<string, string>)[DEVICE_ID_HEADER]).toBe('explicit');
+    expect((init.headers as Record<string, string>)[HEADER_DEVICE_ID]).toBe('explicit');
   });
 });

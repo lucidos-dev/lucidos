@@ -42,23 +42,23 @@ pub fn dispatch_notifications(ws: &Workspace, cmd: NotificationsCmd) -> Result<(
     match cmd {
         NotificationsCmd::List { filter, limit } => {
             let url = format!("{}/api/v1/notifications", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
+            let mut params: Vec<(&str, String)> = Vec::new();
             if let Some(v) = filter {
-                query.push(("filter", v.to_string()));
+                params.push(("filter", v.to_string()));
             }
             if let Some(v) = limit {
-                query.push(("limit", v.to_string()));
+                params.push(("limit", v.to_string()));
             }
-            let req = client()?.get(&url).query(&query);
+            let req = client()?.get(&url).query(&params);
             send_and_print("GET", &url, req)
         }
         NotificationsCmd::Read { id } => {
             let url = format!("{}/api/v1/notification/read", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("id", id.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
             let req = client()?
                 .post(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::json!({}));
             send_and_print("POST", &url, req)
         }
@@ -98,11 +98,11 @@ pub fn dispatch_preferences(ws: &Workspace, cmd: PreferencesCmd) -> Result<(), B
     match cmd {
         PreferencesCmd::Get { device_id } => {
             let url = format!("{}/api/v1/preferences", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
+            let mut params: Vec<(&str, String)> = Vec::new();
             if let Some(v) = device_id {
-                query.push(("device_id", v.to_string()));
+                params.push(("device_id", v.to_string()));
             }
-            let req = client()?.get(&url).query(&query);
+            let req = client()?.get(&url).query(&params);
             send_and_print("GET", &url, req)
         }
         PreferencesCmd::Set {
@@ -111,8 +111,8 @@ pub fn dispatch_preferences(ws: &Workspace, cmd: PreferencesCmd) -> Result<(), B
             device_id,
         } => {
             let url = format!("{}/api/v1/preferences", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("key", key.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("key", key.to_string()));
             let mut body = serde_json::Map::new();
             body.insert("value".into(), serde_json::json!(value));
             if let Some(v) = device_id {
@@ -120,7 +120,7 @@ pub fn dispatch_preferences(ws: &Workspace, cmd: PreferencesCmd) -> Result<(), B
             }
             let req = client()?
                 .put(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::Value::Object(body));
             send_and_print("PUT", &url, req)
         }
@@ -322,8 +322,8 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
             provider,
         } => {
             let url = format!("{}/api/v1/triggers", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("id", id.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
             let mut body = serde_json::Map::new();
             if let Some(v) = name {
                 body.insert("name".into(), serde_json::json!(v));
@@ -382,27 +382,27 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
             }
             let req = client()?
                 .put(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::Value::Object(body));
             send_and_print("PUT", &url, req)
         }
         TriggersCmd::Delete { id } => {
             let url = format!("{}/api/v1/triggers", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("id", id.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
             let req = client()?
                 .delete(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }
         TriggersCmd::Run { id } => {
             let url = format!("{}/api/v1/triggers/run", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("id", id.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
             let req = client()?
                 .post(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::json!({}));
             send_and_print("POST", &url, req)
         }
@@ -466,13 +466,13 @@ pub fn dispatch_trigger_groups(ws: &Workspace, cmd: TriggerGroupsCmd) -> Result<
         }
         TriggerGroupsCmd::Rename { id, name } => {
             let url = format!("{}/api/v1/trigger-groups", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("id", id.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
             let mut body = serde_json::Map::new();
             body.insert("name".into(), serde_json::json!(name));
             let req = client()?
                 .put(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::Value::Object(body));
             send_and_print("PUT", &url, req)
         }
@@ -489,11 +489,11 @@ pub fn dispatch_trigger_groups(ws: &Workspace, cmd: TriggerGroupsCmd) -> Result<
         }
         TriggerGroupsCmd::Delete { id } => {
             let url = format!("{}/api/v1/trigger-groups", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("id", id.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
             let req = client()?
                 .delete(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }
@@ -541,9 +541,9 @@ pub fn dispatch_apps(ws: &Workspace, cmd: AppsCmd) -> Result<(), BoxError> {
         }
         AppsCmd::Get { id } => {
             let url = format!("{}/api/v1/app", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("id", id.to_string()));
-            let req = client()?.get(&url).query(&query);
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
+            let req = client()?.get(&url).query(&params);
             send_and_print("GET", &url, req)
         }
         AppsCmd::Update {
@@ -552,8 +552,8 @@ pub fn dispatch_apps(ws: &Workspace, cmd: AppsCmd) -> Result<(), BoxError> {
             description,
         } => {
             let url = format!("{}/api/v1/app", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("id", id.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
             let mut body = serde_json::Map::new();
             body.insert("name".into(), serde_json::json!(name));
             if let Some(v) = description {
@@ -561,17 +561,17 @@ pub fn dispatch_apps(ws: &Workspace, cmd: AppsCmd) -> Result<(), BoxError> {
             }
             let req = client()?
                 .put(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::Value::Object(body));
             send_and_print("PUT", &url, req)
         }
         AppsCmd::Delete { id } => {
             let url = format!("{}/api/v1/app", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("id", id.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
             let req = client()?
                 .delete(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }
@@ -643,23 +643,23 @@ pub fn dispatch_memory(ws: &Workspace, cmd: MemoryCmd) -> Result<(), BoxError> {
             importance,
         } => {
             let url = format!("{}/api/v1/memory/entries", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
+            let mut params: Vec<(&str, String)> = Vec::new();
             if let Some(v) = limit {
-                query.push(("limit", v.to_string()));
+                params.push(("limit", v.to_string()));
             }
             if let Some(v) = offset {
-                query.push(("offset", v.to_string()));
+                params.push(("offset", v.to_string()));
             }
             if let Some(v) = source_type {
-                query.push(("source_type", v.to_string()));
+                params.push(("source_type", v.to_string()));
             }
             if let Some(v) = sort {
-                query.push(("sort", v.to_string()));
+                params.push(("sort", v.to_string()));
             }
             if let Some(v) = importance {
-                query.push(("importance", v.to_string()));
+                params.push(("importance", v.to_string()));
             }
-            let req = client()?.get(&url).query(&query);
+            let req = client()?.get(&url).query(&params);
             send_and_print("GET", &url, req)
         }
         MemoryCmd::Source {
@@ -669,30 +669,133 @@ pub fn dispatch_memory(ws: &Workspace, cmd: MemoryCmd) -> Result<(), BoxError> {
             commit,
         } => {
             let url = format!("{}/api/v1/memory/source", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
+            let mut params: Vec<(&str, String)> = Vec::new();
             if let Some(v) = source_id {
-                query.push(("source_id", v.to_string()));
+                params.push(("source_id", v.to_string()));
             }
             if let Some(v) = source_type {
-                query.push(("source_type", v.to_string()));
+                params.push(("source_type", v.to_string()));
             }
             if let Some(v) = path {
-                query.push(("path", v.to_string()));
+                params.push(("path", v.to_string()));
             }
             if let Some(v) = commit {
-                query.push(("commit", v.to_string()));
+                params.push(("commit", v.to_string()));
             }
-            let req = client()?.get(&url).query(&query);
+            let req = client()?.get(&url).query(&params);
             send_and_print("GET", &url, req)
         }
         MemoryCmd::Search { q, limit } => {
             let url = format!("{}/api/v1/memory/search", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("q", q.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("q", q.to_string()));
             if let Some(v) = limit {
-                query.push(("limit", v.to_string()));
+                params.push(("limit", v.to_string()));
             }
-            let req = client()?.get(&url).query(&query);
+            let req = client()?.get(&url).query(&params);
+            send_and_print("GET", &url, req)
+        }
+    }
+}
+
+/// Open and search the summary trees behind this turn's memory views. Each view line starts with its id.
+#[derive(clap::Subcommand)]
+pub enum RecallCmd {
+    /// Open a memory view line into the lines it summarises, down to the exact message.
+    Zoom {
+        /// A node id from a memory view or a recall result: w/<start>+<span> for the workspace tree, <thread id>/<start>+<span> for a thread's.
+        #[arg(long)]
+        id: String,
+        /// Levels to open, 1-6 (default 1). Each level halves the span of the lines.
+        #[arg(long)]
+        n: Option<i64>,
+        /// The thread a bare <start>+<span> id names.
+        #[arg(long)]
+        thread: Option<String>,
+    },
+    /// Walk the workspace tree for lines about something, judging each line on the way down.
+    Find {
+        /// What to find, in plain words.
+        #[arg(long)]
+        query: String,
+        /// Max results (1-20, default 10).
+        #[arg(long)]
+        limit: Option<i64>,
+        /// The thread the judgment calls' cost is filed under.
+        #[arg(long)]
+        thread: Option<String>,
+    },
+    /// Find messages holding exact words. Returns each one's id.
+    Search {
+        /// Words the messages hold. Every word must appear.
+        #[arg(long)]
+        text: String,
+        /// Max results (1-20, default 10).
+        #[arg(long)]
+        limit: Option<i64>,
+    },
+    /// When the entries under a line happened, first to last.
+    Date {
+        /// A node id from a memory view or a recall result: w/<start>+<span> for the workspace tree, <thread id>/<start>+<span> for a thread's.
+        #[arg(long)]
+        id: String,
+        /// The thread a bare <start>+<span> id names.
+        #[arg(long)]
+        thread: Option<String>,
+    },
+}
+
+/// Execute a `lucidos recall <op>` command against the parent workspace.
+pub fn dispatch_recall(ws: &Workspace, cmd: RecallCmd) -> Result<(), BoxError> {
+    match cmd {
+        RecallCmd::Zoom { id, n, thread } => {
+            let url = format!("{}/api/v1/recall/zoom", ws.base_url());
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
+            if let Some(v) = n {
+                params.push(("n", v.to_string()));
+            }
+            if let Some(v) = thread {
+                params.push(("thread", v.to_string()));
+            }
+            let req = client()?.get(&url).query(&params);
+            send_and_print("GET", &url, req)
+        }
+        RecallCmd::Find {
+            query,
+            limit,
+            thread,
+        } => {
+            let url = format!("{}/api/v1/recall/find", ws.base_url());
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("query", query.to_string()));
+            if let Some(v) = limit {
+                params.push(("limit", v.to_string()));
+            }
+            if let Some(v) = thread {
+                params.push(("thread", v.to_string()));
+            }
+            let req = client()?.get(&url).query(&params);
+            send_and_print("GET", &url, req)
+        }
+        RecallCmd::Search { text, limit } => {
+            let url = format!("{}/api/v1/recall/search", ws.base_url());
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("text", text.to_string()));
+            if let Some(v) = limit {
+                params.push(("limit", v.to_string()));
+            }
+            let req = client()?.get(&url).query(&params);
+            send_and_print("GET", &url, req)
+        }
+        RecallCmd::Date { id, thread } => {
+            let url = format!("{}/api/v1/recall/date", ws.base_url());
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
+            if let Some(v) = thread {
+                params.push(("thread", v.to_string()));
+            }
+            let req = client()?.get(&url).query(&params);
             send_and_print("GET", &url, req)
         }
     }
@@ -782,11 +885,11 @@ pub fn dispatch_env_vars(ws: &Workspace, cmd: EnvVarsCmd) -> Result<(), BoxError
         }
         EnvVarsCmd::Delete { name } => {
             let url = format!("{}/api/v1/env-vars", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("name", name.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("name", name.to_string()));
             let req = client()?
                 .delete(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }
@@ -796,7 +899,7 @@ pub fn dispatch_env_vars(ws: &Workspace, cmd: EnvVarsCmd) -> Result<(), BoxError
 /// The chat-model registry behind the Lucidos Agent's model picker. A builtin can be disabled but not removed. Switch the ACTIVE model with set_preference(key='chat_model').
 #[derive(clap::Subcommand)]
 pub enum ModelsCmd {
-    /// Every model, enabled and disabled, builtin and user.
+    /// Every model, enabled or not, builtin or user.
     List,
     /// Register a new model; needs provider or routes.
     Add {
@@ -818,8 +921,11 @@ pub enum ModelsCmd {
         /// Every backend that serves the model, in priority order, e.g. [{"provider":"vertex"},{"provider":"openrouter","id":"anthropic/claude-opus-5-5","context_window":200000}]. `id` defaults to the model id. Replaces provider and context_window when given.
         #[arg(long)]
         routes: Option<String>,
+        /// Whether the model reads images. Image description offers and calls only such models. Omitted on add means false; on update, keeps the stored value.
+        #[arg(long)]
+        vision: Option<bool>,
     },
-    /// Edit routes or preferred_provider; label and sort_order on user models only.
+    /// Edit any field; label and sort_order on user models only.
     Update {
         /// Model id (the request string, e.g. 'z-ai/glm-5.2').
         #[arg(long)]
@@ -845,6 +951,9 @@ pub enum ModelsCmd {
         /// The backend to use for this model when more than one route is configured. Must be one of its routes.
         #[arg(long)]
         preferred_provider: Option<String>,
+        /// Whether the model reads images. Image description offers and calls only such models. Omitted on add means false; on update, keeps the stored value.
+        #[arg(long)]
+        vision: Option<bool>,
     },
     /// Delete a user-added model.
     Delete {
@@ -869,6 +978,7 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
             sort_order,
             context_window,
             routes,
+            vision,
         } => {
             let url = format!("{}/api/v1/models", ws.base_url());
             let mut body = serde_json::Map::new();
@@ -892,6 +1002,9 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
                         .map_err(|e| format!("--routes must be valid JSON: {}", e))?,
                 );
             }
+            if let Some(v) = vision {
+                body.insert("vision".into(), serde_json::json!(v));
+            }
             let req = client()?.post(&url).json(&serde_json::Value::Object(body));
             send_and_print("POST", &url, req)
         }
@@ -904,10 +1017,11 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
             context_window,
             routes,
             preferred_provider,
+            vision,
         } => {
             let url = format!("{}/api/v1/models", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("id", id.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
             let mut body = serde_json::Map::new();
             if let Some(v) = label {
                 body.insert("label".into(), serde_json::json!(v));
@@ -934,19 +1048,22 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
             if let Some(v) = preferred_provider {
                 body.insert("preferred_provider".into(), serde_json::json!(v));
             }
+            if let Some(v) = vision {
+                body.insert("vision".into(), serde_json::json!(v));
+            }
             let req = client()?
                 .put(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::Value::Object(body));
             send_and_print("PUT", &url, req)
         }
         ModelsCmd::Delete { id } => {
             let url = format!("{}/api/v1/models", ws.base_url());
-            let mut query: Vec<(&str, String)> = Vec::new();
-            query.push(("id", id.to_string()));
+            let mut params: Vec<(&str, String)> = Vec::new();
+            params.push(("id", id.to_string()));
             let req = client()?
                 .delete(&url)
-                .query(&query)
+                .query(&params)
                 .json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }

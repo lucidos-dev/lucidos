@@ -247,6 +247,47 @@ async fn revert_multiple_fast_forward_commits() {
     );
 }
 
+/// A `/harden` merge of main sits INSIDE the applied range when main did not
+/// move again before Apply, so the tip is an ordinary commit. A plain
+/// `git revert pre..post` refuses that range ("is a merge but no -m option").
+#[tokio::test]
+async fn revert_fast_forward_range_containing_a_merge_of_main() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
+    tokio::fs::write(repo.join("feature.txt"), "feature")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add feature"], &repo).await;
+
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    tokio::fs::write(repo.join("main-work.txt"), "main")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "main work"], &repo).await;
+    let pre_sha = rev_parse(&repo, "main").await;
+
+    // The harden merge, then a fix on top of it.
+    let _ = git_cmd(&["checkout", "feature"], &repo).await;
+    let _ = git_cmd(&["merge", "main", "--no-edit"], &repo).await;
+    tokio::fs::write(repo.join("fix.txt"), "fix").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "harden fix"], &repo).await;
+    let post_sha = rev_parse(&repo, "feature").await;
+
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    let _ = git_cmd(&["merge", "--ff-only", "feature"], &repo).await;
+
+    let result = revert_with_shas(&repo, &pre_sha, &post_sha, "feature").await;
+    assert!(result.is_ok(), "revert should succeed: {:?}", result.err());
+
+    assert!(!repo.join("feature.txt").exists(), "branch work reverted");
+    assert!(!repo.join("fix.txt").exists(), "harden fix reverted");
+    assert!(repo.join("main-work.txt").exists(), "main's work kept");
+}
+
 // ── Merge ownership during a conflict resolution ──
 
 /// The incident this guard exists for (2026-08-11): a conflict-resolution

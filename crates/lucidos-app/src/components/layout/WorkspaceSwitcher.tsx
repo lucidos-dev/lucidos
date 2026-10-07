@@ -70,6 +70,7 @@ import {
   recallWorkspaceSwitcherExpanded,
 } from '../../utils/lastWorkspace';
 import { workspaceState, workspaceStateLabel } from '../../utils/workspaceState';
+import { GlyphBadge } from '../shared/GlyphBadge';
 
 /** Skeleton rows when this device has never recorded a workspace count. Two,
  *  not the picker's three: an unfolded list pushes the rows below it down, so
@@ -289,9 +290,9 @@ function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
   const name = <span class="brand-menu-ws-name">{w.name}</span>;
   const unread = w.unread_count ?? 0;
   const badge = unread > 0 && (
-    <span class="brand-menu-ws-badge" aria-label={`${unread} unread notifications`}>
+    <GlyphBadge class="brand-menu-ws-badge" aria-label={`${unread} unread notifications`}>
       {unread > 99 ? '99+' : unread}
-    </span>
+    </GlyphBadge>
   );
 
   // Claim the right-click for the action row below. Without `preventDefault`

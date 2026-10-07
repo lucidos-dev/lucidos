@@ -529,10 +529,10 @@ fn every_disk_body() -> Vec<String> {
 /// Usage" names a page with no Disk Usage on it. Someone who met the
 /// notification away from the tap has only this route.
 #[test]
-fn every_disk_body_names_the_page_the_tap_opens() {
-    const PATH: &str = "Settings → System → Disk Usage";
+fn every_disk_body_links_the_page_the_tap_opens() {
+    const LINK: &str = "[Settings → System → Disk Usage](settings:disk-usage)";
     for body in every_disk_body() {
-        assert!(body.contains(PATH), "{body}");
+        assert!(body.contains(LINK), "{body}");
     }
 }
 
@@ -553,18 +553,6 @@ fn the_two_low_disk_branches_keep_their_own_remedy() {
     assert!(
         !small.contains("clean idle ones"),
         "cleaning 1 GB does not answer a 3 GB shortfall: {small}"
-    );
-}
-
-/// The destination has to be one the frontend router renders. An id outside
-/// `NAVIGABLE_SETTINGS_VIEWS` toasts "Unknown settings section" instead of
-/// navigating, which is the dead end the tap replaced.
-#[test]
-fn the_tap_destination_is_a_renderable_settings_view() {
-    let view = super::DISK_USAGE_SETTINGS_VIEW;
-    assert!(
-        crate::llm::tools::NAVIGABLE_SETTINGS_VIEWS.contains(&view),
-        "{view} is not a settings view the router renders"
     );
 }
 

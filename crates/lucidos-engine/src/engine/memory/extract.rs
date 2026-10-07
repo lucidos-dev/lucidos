@@ -6,7 +6,7 @@
 
 use crate::core::EventRow;
 use crate::engine::LucidosEngine;
-use crate::memory::{EmbeddingProvider, ExtractedFact, MemoryExtractor, MemorySource};
+use crate::memory::{EmbeddingProvider, ExtractedFact, MemorySource};
 use chrono::{DateTime, Utc};
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
@@ -107,14 +107,11 @@ impl LucidosEngine {
         if event.payload.get("channel").and_then(|v| v.as_str()) == Some("trigger") {
             return None;
         }
-        // Reconstruct the ThreadEvent from stored payload + event_type
-        let mut payload = event.payload.clone();
-        payload.as_object_mut()?.insert(
-            "type".into(),
-            serde_json::Value::String(event.event_type.clone()),
-        );
-        let thread_event: crate::engine::thread_events::ThreadEvent =
-            serde_json::from_value(payload).ok()?;
+        let thread_event = crate::engine::thread_events::ThreadEvent::from_stored(
+            &event.event_type,
+            event.payload.clone(),
+        )
+        .ok()?;
         thread_event.indexable_text().map(ToString::to_string)
     }
 
@@ -291,19 +288,27 @@ impl LucidosEngine {
 
     /// The thread an indexing job's LLM cost belongs to.
     ///
-    /// `None` for an artifact, which no thread produced, and for an event row
-    /// with no `thread_id`. One primary-key lookup, next to an LLM round
-    /// trip, so the cost of asking does not register.
+    /// An event's own thread, or the thread that wrote an artifact at that
+    /// commit while it still exists. `None` for an event row with no
+    /// `thread_id`, and for an artifact no surviving thread wrote. Either
+    /// lookup sits next to an LLM round trip, so its cost does not register.
     async fn source_thread_id(&self, source: &MemorySource) -> Option<Uuid> {
-        let MemorySource::Event { id } = source else {
-            return None;
+        let found = match source {
+            MemorySource::Event { id } => {
+                sqlx::query_scalar::<_, Option<Uuid>>("SELECT thread_id FROM events WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+            }
+            MemorySource::Artifact { path, commit } => {
+                artifact_writer_thread(&self.pool, path, commit)
+                    .await
+                    .map(Some)
+            }
         };
-        sqlx::query_scalar::<_, Option<Uuid>>("SELECT thread_id FROM events WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
+        found
             .unwrap_or_else(|e| {
-                log!(@Memory, "Could not resolve the thread for event {}: {}", id, e);
+                log!(@Memory, "Could not resolve the thread for {:?}: {}", source, e);
                 None
             })
             .flatten()
@@ -342,15 +347,11 @@ impl LucidosEngine {
             return false;
         }
 
-        // For artifacts, skip fallback when extraction returns nothing — content
-        // probably has no facts (e.g., CSV exports, data files).
+        // An artifact never takes the raw-text fallback: a CSV export or a data
+        // file stored verbatim is noise, not a fact.
         let is_artifact = matches!(source, MemorySource::Artifact { .. });
         let mut used_fallback = false;
-        let memory_call = crate::engine::aux_purpose::AuxCall::resolve(
-            &self.pool,
-            crate::engine::ContextPurpose::Memory,
-        )
-        .await;
+        let memory_call = self.aux_call(crate::engine::ContextPurpose::Memory).await;
         // Cloned, and hoisted out of the retry loop, so no `RwLock` guard is held
         // across the `extract_facts` await below. `user_language` is a
         // write-preferring `tokio::sync::RwLock`, so a read guard parked on a
@@ -359,95 +360,49 @@ impl LucidosEngine {
         // every chat turn, `chat/process/run.rs`) then queues behind that pending
         // writer. Every other read site already clones.
         let language = self.user_language.read().await.clone();
-        let facts: Vec<ExtractedFact> = if let Some(ref extractor) = self.extractor {
-            // Extraction is billed to the thread the source event belongs to,
-            // so its cost lands where the conversation that caused it lives.
-            // An artifact has no thread and goes uncaptured, as does an event
-            // row predating the `thread_id` column. Resolved inside this
-            // branch: with no extractor there is no call to bill.
-            let capture = crate::engine::AuxCapture::for_thread(
-                &self.event_bus,
-                self.source_thread_id(&source).await,
-                crate::engine::ContextPurpose::Memory,
-            );
-            // The purpose's deadline bounds the WHOLE resample, not each call
-            // inside it. Three attempts, each carrying the provider's own
-            // retries, is exactly how a caller escapes a per-call bound.
-            let resample = async {
-                let mut facts = None;
-                for attempt in 1..=3u32 {
-                    let lang_ref = if language.is_empty() {
-                        None
-                    } else {
-                        Some(language.as_str())
-                    };
-                    match extractor
-                        .extract_facts(content, context, lang_ref, &memory_call, capture.as_ref())
-                        .await
-                    {
-                        Ok(f) if !f.is_empty() => {
-                            facts = Some(f);
-                            break;
-                        }
-                        Ok(_) => {
-                            if verbose {
-                                log!(@Memory, "Extraction returned no facts (attempt {}/3)", attempt);
-                            }
-                        }
-                        Err(e) => {
-                            if verbose {
-                                log!(@Memory, "Extraction failed (attempt {}/3): {}", attempt, e);
-                            }
-                            // Exponential backoff before the next attempt. The
-                            // provider already retried internally; this delay
-                            // lets the rate-limit window reset.
-                            if attempt < 3 {
-                                let delay = crate::llm::retry_delay(attempt, 2);
-                                tokio::time::sleep(delay).await;
-                            }
-                        }
-                    }
-                }
-                facts
-            };
-            let facts = match tokio::time::timeout(memory_call.deadline(), resample).await {
-                Ok(facts) => facts,
-                Err(_) => {
-                    log!(@Memory, "Extraction timed out ({:?}), falling back", memory_call.deadline());
-                    None
-                }
-            };
-            match facts {
-                Some(f) => f,
-                None if is_artifact => {
-                    if verbose {
-                        log!(@Memory, "No facts extracted from artifact, skipping fallback");
-                    }
-                    return false;
-                }
-                None => match MemoryExtractor::fallback_fact(content, "General") {
-                    Some(f) => {
-                        used_fallback = true;
-                        vec![f]
-                    }
-                    None => {
-                        if verbose {
-                            log!(@Memory, "Extraction failed; fallback content not storable, skipping");
-                        }
-                        return false;
-                    }
-                },
+        // Extraction is billed to the thread the source event belongs to, so
+        // its cost lands where the conversation that caused it lives. A
+        // source with no thread records on the home thread.
+        let capture = crate::engine::AuxCapture::for_thread_or_home(
+            &self.event_bus,
+            self.source_thread_id(&source).await,
+            crate::engine::ContextPurpose::Memory,
+        );
+        let lang_ref = (!language.is_empty()).then_some(language.as_str());
+        // The purpose's deadline bounds the WHOLE resample, not each call
+        // inside it. Three attempts, each carrying the provider's own
+        // retries, is exactly how a caller escapes a per-call bound.
+        let resample = resample_extraction(verbose, || {
+            crate::memory::extract_facts(content, context, lang_ref, &memory_call, &capture)
+        });
+        let outcome = match tokio::time::timeout(memory_call.deadline(), resample).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                log!(@Memory, "Extraction timed out ({:?}), falling back", memory_call.deadline());
+                Extraction::Failed
             }
-        } else if is_artifact {
-            return false;
-        } else {
-            match MemoryExtractor::fallback_fact(content, "General") {
+        };
+        let facts: Vec<ExtractedFact> = match outcome {
+            Extraction::Facts(f) => f,
+            Extraction::Nothing => return false,
+            Extraction::Failed if is_artifact => {
+                if verbose {
+                    log!(@Memory, "No facts extracted from artifact, skipping fallback");
+                }
+                return false;
+            }
+            Extraction::Failed => match crate::memory::fallback_fact(content, "General") {
                 Some(f) => {
                     used_fallback = true;
                     vec![f]
                 }
-                None => return false,
-            }
+                None => {
+                    if verbose {
+                        log!(@Memory, "Extraction failed; fallback content not storable, skipping");
+                    }
+                    return false;
+                }
+            },
         };
 
         // Batch-embed all fact summaries
@@ -607,6 +562,83 @@ impl LucidosEngine {
     }
 }
 
+/// What extracting one item yielded.
+#[derive(Debug)]
+enum Extraction {
+    Facts(Vec<ExtractedFact>),
+    /// The model read the content and found nothing worth remembering.
+    Nothing,
+    /// No attempt produced a readable answer.
+    Failed,
+}
+
+/// Up to three extraction attempts, retrying only a failed call or an
+/// unreadable reply. An empty list is an answer, so it ends the resample:
+/// asking again only shopped for a different one. Each attempt carries the
+/// purpose's attempt cap on its requests, so a stalled one cannot eat the rest.
+async fn resample_extraction<F, Fut>(verbose: bool, mut attempt_call: F) -> Extraction
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<Vec<ExtractedFact>, Box<dyn std::error::Error + Send + Sync>>,
+    >,
+{
+    for attempt in 1..=3u32 {
+        match attempt_call().await {
+            Ok(facts) if facts.is_empty() => return Extraction::Nothing,
+            Ok(facts) => return Extraction::Facts(facts),
+            Err(e) => {
+                if verbose {
+                    log!(@Memory, "Extraction failed (attempt {}/3): {}", attempt, e);
+                }
+                // Exponential backoff before the next attempt, for a transient
+                // error only. The provider already retried internally; this
+                // delay lets the rate-limit window reset. An unreadable reply
+                // resamples at once.
+                if attempt < 3 && crate::llm::is_transient_error(&e.to_string()) {
+                    tokio::time::sleep(crate::llm::retry_delay(attempt, 2)).await;
+                }
+            }
+        }
+    }
+    Extraction::Failed
+}
+
+/// The surviving thread that wrote `path` (relative to `data/artifacts/`)
+/// at `commit`, read from the artifact event that announced the write.
+pub(crate) async fn artifact_writer_thread(
+    pool: &sqlx::PgPool,
+    path: &str,
+    commit: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let artifact_writes = crate::engine::summary_tree::workspace_log::sql_list(
+        crate::engine::summary_tree::workspace_log::ARTIFACT_WRITE_EVENT_TYPES,
+    );
+    sqlx::query_scalar(&format!(
+        "SELECT w.thread_id FROM events e \
+         JOIN thread_summaries w ON w.thread_id = \
+           (COALESCE(e.payload->'data', e.payload)->>'writer_thread_id')::uuid \
+         WHERE e.event_type IN ({artifact_writes}) \
+           AND COALESCE(e.payload->'data', e.payload)->>'artifact_path' \
+               IN ($1, 'artifacts/' || $1) \
+           AND COALESCE(COALESCE(e.payload->'data', e.payload)->>'commit', \
+                        COALESCE(e.payload->'data', e.payload)->>'commit_hash') = $2 \
+         ORDER BY e.sequence DESC LIMIT 1"
+    ))
+    .bind(path)
+    .bind(commit)
+    .fetch_optional(pool)
+    .await
+}
+
 #[cfg(test)]
 #[path = "../memory_tests/source.rs"]
 mod memory_source_tests;
+
+#[cfg(test)]
+#[path = "../memory_tests/resample.rs"]
+mod resample_tests;
+
+#[cfg(test)]
+#[path = "../memory_tests/artifact_writer.rs"]
+mod artifact_writer_tests;

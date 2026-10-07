@@ -1,6 +1,8 @@
 import { API, ApiError, json, text } from './_core';
+import { repoFileUrl } from './fileUrls';
 import type { FormRequestEvent } from '../../store/thread-events/thread-event-types';
 import { lucidos } from '@lucidos/sdk';
+import { HEADER_DEVICE_ID } from '@lucidos/engine-constants';
 import type {
   AuthType,
   EmailAccountInfo,
@@ -8,7 +10,7 @@ import type {
   Notification,
   OAuthAccountInfo,
 } from '../../store/types';
-import type { AgentBinariesResponse, ApiResult, CredentialsListResponse, DeviceInfo, EmbeddingModelStatus, EnvVarsListResponse, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse, TailnetStatusResponse } from '../types';
+import type { AgentBinariesResponse, ApiResult, BackgroundModels, CredentialsListResponse, DeviceInfo, EmbeddingModelStatus, EnvVarsListResponse, RecallDateResponse, RecallZoomResponse, SummaryTreeThreadsResponse, SummaryTreeTop, TreeBackfill, TreeBackfillEstimate, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse, TailnetStatusResponse } from '../types';
 
 // --- Notifications (SDK delegation) ---
 export function getNotifications(params?: {
@@ -352,7 +354,7 @@ export function handOverDevice(
 ): Promise<ApiResult & { outcome?: HandOverOutcome }> {
   return json(`${API}/devices/hand-over`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-lucidos-device-id': deviceId },
+    headers: { 'Content-Type': 'application/json', [HEADER_DEVICE_ID]: deviceId },
     body: JSON.stringify({ old_device_id: oldDeviceId, device_id: deviceId }),
   });
 }
@@ -431,6 +433,51 @@ export async function cancelMemoryRebuild(): Promise<void> {
  *  mid-download catches up, and it returns the identical shape. */
 export function getEmbeddingModelStatus(): Promise<EmbeddingModelStatus> {
   return json(`${API}/memory/embedding-model-status`);
+}
+
+/** Where the Tree memory module's backfill has got. The `TreeBackfill*` SSE
+ *  frames move it after this. */
+export function getTreeBackfill(): Promise<TreeBackfill> {
+  return json(`${API}/memory/tree-backfill`);
+}
+
+/** The estimate scans a workspace's whole history. It answers in about a
+ *  second on millions of events. A cold database cache or a busy host can
+ *  stretch that past `json()`'s 10s default, and a deliberate one-off read
+ *  can afford to wait. */
+const TREE_BACKFILL_ESTIMATE_TIMEOUT_MS = 60_000;
+
+/** What a Tree backfill of this workspace would cost, read before the user
+ *  confirms Tree. */
+export function getTreeBackfillEstimate(): Promise<TreeBackfillEstimate> {
+  return json(`${API}/memory/tree-backfill/estimate`, undefined, TREE_BACKFILL_ESTIMATE_TIMEOUT_MS);
+}
+
+/** The top of a summary tree: the workspace's, or `threadId`'s. */
+export function getSummaryTree(threadId?: string): Promise<SummaryTreeTop> {
+  const q = threadId ? `?thread=${encodeURIComponent(threadId)}` : '';
+  return json(`${API}/memory/tree${q}`);
+}
+
+/** The threads with summary trees, the most recently active first. */
+export function getSummaryTreeThreads(params: { limit: number; offset: number }): Promise<SummaryTreeThreadsResponse> {
+  return json(`${API}/memory/tree/threads?limit=${params.limit}&offset=${params.offset}`);
+}
+
+/** A summary tree line opened one level: its halves, or for a leaf its source. */
+export function getRecallZoom(id: string): Promise<RecallZoomResponse> {
+  return json(`${API}/recall/zoom?id=${encodeURIComponent(id)}&n=1`);
+}
+
+/** When the entries under a summary tree line happened. */
+export function getRecallDate(id: string): Promise<RecallDateResponse> {
+  return json(`${API}/recall/date?id=${encodeURIComponent(id)}`);
+}
+
+/** The model each background task runs on, resolved against the configured
+ *  providers. Settings shows it while a row is unset. */
+export function getBackgroundModels(): Promise<BackgroundModels> {
+  return json(`${API}/models/background`);
 }
 
 // --- Email ---
@@ -641,16 +688,6 @@ export async function setBackupRetention(keep: number): Promise<void> {
 export async function listRepoFiles(repoId: string, gitRef?: string): Promise<string[]> {
   const params = gitRef ? `?ref=${encodeURIComponent(gitRef)}` : '';
   return json(`${API}/repositories/${encodeURIComponent(repoId)}/files${params}`);
-}
-
-/** URL of a repo file's raw bytes at `gitRef` (default HEAD). The engine serves
- *  it with a content-type inferred from the extension, so this is safe to point
- *  an <img>/<video>/<audio>/<iframe> `src` at for media previews. An HTML, SVG
- *  or XML body comes sandboxed with script off, so a frame never runs one. */
-export function repoFileUrl(repoId: string, path: string, gitRef?: string): string {
-  const params = new URLSearchParams({ path });
-  if (gitRef) params.set('ref', gitRef);
-  return `${API}/repositories/${encodeURIComponent(repoId)}/file?${params}`;
 }
 
 export async function getRepoFileContent(repoId: string, path: string, gitRef?: string): Promise<string> {

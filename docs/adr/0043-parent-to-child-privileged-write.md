@@ -127,6 +127,10 @@ second reclaimer.
 - A follow-up consumes no child slot, because the recursion guard counts rows
   rather than messages. That is intended: reviving a child is cheaper than
   spawning an eleventh, and the system prompt says so.
+  *Amended 2026-10-06 by
+  [ADR 0380](0380-the-child-cap-counts-live-children.md):* the cap now counts
+  live children, so a revived child holds a slot while it runs. The follow-up
+  itself is still never refused.
 - A redirect resolves the child's pending permission cards as superseded. That
   is a user-visible side effect of an agent action, so it is stated in the tool
   description and pinned by a test.

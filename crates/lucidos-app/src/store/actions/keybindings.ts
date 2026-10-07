@@ -73,11 +73,14 @@ function overrides(): Partial<Record<ShortcutId, Binding>> {
 }
 
 /** The current binding of every shortcut a frame may forward, in registry
- *  order: all but the `hostOnly` ones. Parses the override map once, where
- *  calling `bindingFor` per shortcut would parse it each time. */
-export function forwardableBindings(): Binding[] {
+ *  order: all but the `hostOnly` ones, and any the frame leaves to the
+ *  browser (`omit`). Parses the override map once, where calling `bindingFor`
+ *  per shortcut would parse it each time. */
+export function forwardableBindings(omit: readonly ShortcutId[] = []): Binding[] {
   const o = overrides();
-  return SHORTCUT_DEFS.filter((def) => !def.hostOnly).map((def) => o[def.id] ?? def.defaultBinding);
+  return SHORTCUT_DEFS
+    .filter((def) => !def.hostOnly && !omit.includes(def.id))
+    .map((def) => o[def.id] ?? def.defaultBinding);
 }
 
 /** The current (override-or-default) binding for a shortcut. */

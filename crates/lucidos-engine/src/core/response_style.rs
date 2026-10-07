@@ -27,8 +27,8 @@
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use crate::core::prefs;
 use crate::core::technical_literacy::{self, TechnicalLiteracy};
-use crate::core::{PreferenceStore, PREF_RESPONSE_STYLE, PREF_RESPONSE_STYLES};
 
 /// The off switch's id. Selected when `response_style` is unset.
 pub const STANDARD_ID: &str = "standard";
@@ -166,14 +166,15 @@ pub fn validate_document(raw: &str) -> Result<Vec<StyleEntry>, String> {
     let entries: Vec<StyleEntry> = serde_json::from_str(trimmed).map_err(|e| {
         format!(
             "'{}' must be a JSON array of {{id, label, instruction}} objects: {}",
-            PREF_RESPONSE_STYLES, e
+            prefs::RESPONSE_STYLES.key(),
+            e
         )
     })?;
 
     if entries.len() > MAX_STYLES {
         return Err(format!(
             "'{}' holds at most {} styles (got {})",
-            PREF_RESPONSE_STYLES,
+            prefs::RESPONSE_STYLES.key(),
             MAX_STYLES,
             entries.len()
         ));
@@ -229,7 +230,7 @@ fn read_document(raw: Option<&str>) -> Vec<StyleEntry> {
         Err(e) => {
             log!(
                 "[ResponseStyle] '{}' is unusable ({}). Falling back to the shipped styles",
-                PREF_RESPONSE_STYLES,
+                prefs::RESPONSE_STYLES.key(),
                 e
             );
             Vec::new()
@@ -349,28 +350,10 @@ pub fn section_for(
     render(instruction, literacy)
 }
 
-/// Read one preference, treating a DB error as unset.
-///
-/// A turn that refuses to run because a style row is unreadable is strictly
-/// worse than one that runs at the default. `build_chat_system_prompt` makes
-/// the same judgment for its own mandatory keys.
-async fn read_preference(pool: &PgPool, key: &str) -> Option<String> {
-    match PreferenceStore::get(pool, key).await {
-        Ok(value) => value,
-        Err(e) => {
-            log!(
-                "[ResponseStyle] failed to read '{}': {}. Using Standard",
-                key,
-                e
-            );
-            None
-        }
-    }
-}
-
-/// This workspace's merged style library.
+/// This workspace's merged style library. An unreadable row reads as no
+/// document, so the turn runs on the shipped styles rather than failing.
 pub async fn library(pool: &PgPool) -> Vec<Style> {
-    let document = read_preference(pool, PREF_RESPONSE_STYLES).await;
+    let document = prefs::RESPONSE_STYLES.stored(pool).await;
     merge(&read_document(document.as_deref()))
 }
 
@@ -379,14 +362,11 @@ pub async fn library(pool: &PgPool) -> Vec<Style> {
 ///
 /// Read once per turn, at prompt assembly. All three keys are workspace-global,
 /// so the result is the same for every thread and the cached system tier stays
-/// shared (ADR 0084).
+/// shared (ADR 0084). Every read is total: a turn that refuses to run because a
+/// style row is unreadable is strictly worse than one that runs at the default.
 pub async fn resolve(pool: &PgPool) -> String {
     let literacy = technical_literacy::read(pool).await;
-    let selected = read_preference(pool, PREF_RESPONSE_STYLE)
-        .await
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| STANDARD_ID.to_string());
+    let selected = prefs::RESPONSE_STYLE.read(pool).await;
     if selected == STANDARD_ID {
         return render("", literacy);
     }
@@ -417,7 +397,6 @@ pub fn widest_shipped_section() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::PREF_TECHNICAL_LITERACY;
 
     fn entry(id: &str, label: &str, instruction: &str) -> StyleEntry {
         StyleEntry {
@@ -726,7 +705,7 @@ mod tests {
         assert_eq!(resolve(&pool).await, "");
 
         // A shipped style, selected. The section is the shipped text.
-        seed(PREF_RESPONSE_STYLE, "minimal".to_string()).await;
+        seed(prefs::RESPONSE_STYLE.key(), "minimal".to_string()).await;
         let minimal = resolve(&pool).await;
         assert!(minimal.contains("Give the outcome, not the process"));
         assert!(minimal.ends_with(STYLE_FLOOR));
@@ -738,7 +717,7 @@ mod tests {
             "- One sentence, and only one.",
         )])
         .unwrap();
-        seed(PREF_RESPONSE_STYLES, document).await;
+        seed(prefs::RESPONSE_STYLES.key(), document).await;
         let overridden = resolve(&pool).await;
         assert!(overridden.contains("One sentence, and only one."));
         assert!(!overridden.contains("Give the outcome, not the process"));
@@ -751,45 +730,45 @@ mod tests {
             "- Three bullets, no more.",
         )])
         .unwrap();
-        seed(PREF_RESPONSE_STYLES, document).await;
-        seed(PREF_RESPONSE_STYLE, "board-report".to_string()).await;
+        seed(prefs::RESPONSE_STYLES.key(), document).await;
+        seed(prefs::RESPONSE_STYLE.key(), "board-report".to_string()).await;
         assert!(resolve(&pool).await.contains("Three bullets, no more."));
 
         // Deleting the style you had selected. The id survives, the row does
         // not, and the turn still runs.
-        seed(PREF_RESPONSE_STYLES, "[]".to_string()).await;
+        seed(prefs::RESPONSE_STYLES.key(), "[]".to_string()).await;
         assert_eq!(resolve(&pool).await, "");
 
         // A document written before the gate existed costs the styles, not the
         // turn: the shipped library answers and the selection still resolves.
-        seed(PREF_RESPONSE_STYLES, "{not json".to_string()).await;
-        seed(PREF_RESPONSE_STYLE, "concise".to_string()).await;
+        seed(prefs::RESPONSE_STYLES.key(), "{not json".to_string()).await;
+        seed(prefs::RESPONSE_STYLE.key(), "concise".to_string()).await;
         assert!(resolve(&pool).await.contains("Lead with the answer."));
 
         // Explicitly back to Standard, which is silent again.
-        seed(PREF_RESPONSE_STYLE, STANDARD_ID.to_string()).await;
+        seed(prefs::RESPONSE_STYLE.key(), STANDARD_ID.to_string()).await;
         assert_eq!(resolve(&pool).await, "");
 
         // A blank selection reads as unset rather than as a missing style.
-        seed(PREF_RESPONSE_STYLE, "   ".to_string()).await;
+        seed(prefs::RESPONSE_STYLE.key(), "   ".to_string()).await;
         assert_eq!(resolve(&pool).await, "");
 
         // Technical literacy speaks on Standard too: the two parts are
         // independent.
-        seed(PREF_TECHNICAL_LITERACY, "non-technical".to_string()).await;
+        seed(prefs::TECHNICAL_LITERACY.key(), "non-technical".to_string()).await;
         let literacy_only = resolve(&pool).await;
         assert!(literacy_only.contains(&TechnicalLiteracy::NonTechnical.chat_rules()));
         assert!(literacy_only.ends_with(STYLE_FLOOR));
 
         // And beside a style, under the one heading.
-        seed(PREF_RESPONSE_STYLE, "minimal".to_string()).await;
+        seed(prefs::RESPONSE_STYLE.key(), "minimal".to_string()).await;
         let both = resolve(&pool).await;
         assert!(both.contains("Give the outcome, not the process"));
         assert!(both.contains(&TechnicalLiteracy::NonTechnical.chat_rules()));
         assert_eq!(both.matches("RESPONSE STYLE:").count(), 1);
 
         // An unknown level costs the level, never the turn or the style.
-        seed(PREF_TECHNICAL_LITERACY, "wizard".to_string()).await;
+        seed(prefs::TECHNICAL_LITERACY.key(), "wizard".to_string()).await;
         let unknown = resolve(&pool).await;
         assert!(unknown.contains("Give the outcome, not the process"));
         assert!(!unknown.contains("The user is"));
@@ -813,7 +792,7 @@ mod tests {
             entry("board-report", "Board report", "- Three bullets."),
         ])
         .unwrap();
-        crate::test_support::seed_preference(&pool, PREF_RESPONSE_STYLES, &document)
+        crate::test_support::seed_preference(&pool, prefs::RESPONSE_STYLES.key(), &document)
             .await
             .unwrap();
 

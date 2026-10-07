@@ -8,6 +8,9 @@ const { port, proto } = readAddress();
 
 export default defineConfig({
   testDir: './e2e',
+  // Only specs. The default also takes `*.test.ts`, which here are Vitest unit
+  // tests for the harness itself.
+  testMatch: '**/*.spec.ts',
   timeout: 120_000,
   expect: { timeout: 30_000 },
   fullyParallel: false,
@@ -18,7 +21,7 @@ export default defineConfig({
   // a true flake passes on the retry. Reduces signal loss from infra noise.
   retries: 1,
   workers: 1,
-  reporter: 'list',
+  reporter: [['list'], ['./e2e/memSampleReporter.ts']],
   use: {
     baseURL: `${proto}://localhost:${port}`,
     ignoreHTTPSErrors: true,

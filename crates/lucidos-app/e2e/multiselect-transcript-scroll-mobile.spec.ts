@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, isMobileViewport } from './helpers';
+import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, waitForPaneAtRest, isMobileViewport } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
@@ -65,6 +65,8 @@ test.describe('Transcript scroll with a live multi-select card (mobile)', () => 
       await openThreadDrawer(page);
       await page.locator(`.thread-row:has-text("Multi-select scroll ${suffix}")`).first().click();
       await ensureOnThreadPane(page);
+      // The row click slides the pane in, and what follows reads geometry.
+      await waitForPaneAtRest(page);
       await expect(page.locator(`.question-body[data-tool-use-id="${toolUseId}"]`).first()).toBeVisible({ timeout: 15_000 });
 
       const transcript = page.locator('.thread-content.visible:visible').first();

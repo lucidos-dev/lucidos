@@ -1,19 +1,19 @@
 ---
 name: Lucidos JavaScript SDK
-description: API reference for the `lucidos` JS SDK that app UIs call: the data, events, proxy, apiUrl, oauth, triggers, apps, preferences, notifications, threads, ui and sse namespaces, plus the component classes and theme variables apps style with.
+description: API reference for the `lucidos` JS SDK. Namespaces: data, events, proxy, apiUrl, oauth, triggers, apps, preferences, storage, notifications, threads, ui, sse. Also the component classes and theme variables apps style with.
 ---
 
 # Lucidos JavaScript SDK
 
 The SDK is available as the `lucidos` global in app UIs (loaded via `<script src="/api/v1/sdk.js">`). The host frontend imports it from the `@lucidos/sdk` package directly.
 
-> From a coding-agent subprocess, prefer the `lucidos` CLI for `data.*` and `events.*` operations — see [`lucidos-cli.md`](./lucidos-cli.md).
+> From a coding-agent subprocess, prefer the `lucidos` CLI for `data.*` and `events.*` operations. See [`lucidos-cli.md`](./lucidos-cli.md).
 
 ## Setup
 
-App HTML is served as static content — the engine doesn't inject anything (except `?thread_id=` rewriting on WIP-preview requests). Apps opt into each piece they want.
+The engine serves app HTML as static content and injects nothing, except `?thread_id=` rewriting on WIP-preview requests. Apps opt into each piece they want.
 
-The standard Lucidos app boilerplate:
+The standard boilerplate:
 
 ```html
 <!DOCTYPE html>
@@ -36,113 +36,101 @@ The standard Lucidos app boilerplate:
 </html>
 ```
 
-What each piece does — include only what you need:
+What each piece does (include only what you need):
 
 | Tag | Provides | Skip if |
 |---|---|---|
-| `<title>` | Tab title | (always include — browsers require it) |
-| `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme-mode`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. The engine resolves this device's theme mode, theme, font and scale and serves them inside the script, so an app frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` to know whose to serve, and adds nothing to your document. The same script carries the device's Autocorrect switch, so `sdk.js` knows it before any field can take focus, and sets `data-motion` (§ Reduced motion), `data-theme-effects` (§ Theme parts) and `data-font-bold` (§ Theme variables). Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible: before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme-mode`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
-| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body is set to `--font-size-sm`, the step chat prose renders at, so text you do not size yourself reads at the size of the chat beside it. Inputs and buttons are set to `--font-ui` at `--font-size-md`, the host's step for labels and controls. Neither is the root font-size: the root is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Text that names no size at all would come out two steps larger than body, which is why the defaults exist. | App ships its own complete stylesheet and doesn't want Lucidos theming |
-| `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
-| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host; Apply and the voice call are the exceptions and never run from an app, since an app's own script could send their chords; a chord bound to a host shortcut has its browser default cancelled, so ⌘P opens file search rather than printing; your own handlers still receive that key, already marked `defaultPrevented`, so a handler that skips such events stands down for it); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); pull to refresh (a pull past the top reloads the app, see § Pull to refresh); the pane swipe (a sideways drag moves between Lucidos panes, see § Pane swipe); the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui); and the device's **Autocorrect switch** plus a key-code guard on your text fields (see § Text fields and autocorrect). Only modifier-bearing chords, Escape and the F-keys are forwarded; plain typing stays in the app, and so does Ctrl with a bare letter in a text field on a Mac, where it edits text. | App doesn't use `lucidos.*` |
-| `lucidos.ui.applyPreferences()` | Reads the user's theme mode/theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme-mode`, `data-font-bold` and CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`**: without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
-| `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), when the active theme's file or plugin changes, and, under a `system` preference, when the OS light/dark appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform, matching the host shell. Inside the host shell the app also repaints as the shell does, mid-drag included (§ lucidos.ui) | Static apps that have opted out of Lucidos theming |
+| `<title>` | Tab title | Never: browsers require it |
+| `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme-mode`, `--bg-primary` and `--font-ui` on `<html>` (plus `--user-ui-scale` when set) *before* any later stylesheet evaluates. The engine resolves this device's theme mode, theme, font and scale and serves them inside the script, so the frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` and adds nothing to your document. It also carries the device's Autocorrect switch, so `sdk.js` knows it before any field takes focus. It sets `data-motion` (§ Reduced motion), `data-theme-effects` (§ Theme parts) and `data-font-bold` (§ Theme variables). This removes the flash of default theme before `applyPreferences()`. **Place it as early in `<head>` as possible: before `sdk-iframe.css`, any other `<link rel="stylesheet">`, and any inline `<style>` that reads theme vars.** The inline `--bg-primary` makes `background: var(--bg-primary, …)` paint even when stylesheets load asynchronously (JS-injected, dynamic `import()`, Vite dev mode). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
+| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). With these classes your controls render like the host shell. The body is set to `--font-size-sm`, the chat prose step. Inputs and buttons get `--font-ui` at `--font-size-md`, the host's step for labels and controls. The root font-size is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Without these defaults, unsized text would read two steps larger than body. | App ships its own complete stylesheet and doesn't want Lucidos theming |
+| `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance that survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
+| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API, plus iframe-only side effects that need no call from you. **Link interceptor:** `target="_blank"` links resolve in-frame, and external `http(s)://` links go through `lucidos.ui.openExternal()`. **Shortcut forwarder:** host shortcuts (focus/hide a pane, narrow/widen, new thread, search, Escape) keep working while the app has focus. Apply and the voice call never run from an app, since an app's script could send their chords. A chord bound to a host shortcut has its browser default cancelled, so ⌘P opens file search, not print. Your handlers still get that key, marked `defaultPrevented`. Only modifier chords, Escape and the F-keys are forwarded. Plain typing stays in the app, and so does Ctrl plus a bare letter in a Mac text field. **Per-app scroll memory** across an app switch or reload. **Pull to refresh** (§ Pull to refresh). **Pane swipe** (§ Pane swipe). The Lucidos **tooltip** on any `data-tooltip` element (§ Tooltips, under lucidos.ui). The device's **Autocorrect switch** plus a key-code guard on text fields (§ Text fields and autocorrect). | App doesn't use `lucidos.*` |
+| `lucidos.ui.applyPreferences()` | Reads the user's theme mode/theme/font/scale (resolving `system` to the live OS light/dark) and sets `data-theme-mode`, `data-font-bold` and CSS vars on `<html>`. Pairs with `sdk-iframe.css`. | **Don't skip if you include `sdk-iframe.css`**: without it the app ignores a light or system setting and stays dark. Skip only when opting out of Lucidos theming entirely. |
+| `lucidos.ui.watchPreferences()` | Re-applies preferences live: on SSE `PreferencesChanged`, when the active theme's file or plugin changes, and under `system` when the OS appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform. Inside the host shell the app also repaints with the shell, mid-drag included (§ lucidos.ui) | Static apps that have opted out of Lucidos theming |
 
 **Hold the loading cover until your data is drawn.** An app that fetches
 its first data after page load declares `"reveal": "on-ready"` in its
 `manifest.json` and calls `lucidos.ui.ready()`. See § Showing the app once its
 content is ready, under lucidos.ui.
 
-**Inherit the theme by default.** A normal app includes the theme assets, calls `applyPreferences()` + `watchPreferences()`, and styles with the theme variables (below). It then follows the user's theme and light/dark appearance like the rest of Lucidos. Theme integration is *technically* opt-in, because the engine never auto-injects these tags. An app that omits both `<script src="/api/v1/sdk-prefs.js">` and `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` gets no `data-theme-mode` attribute, no CSS variables, and no Lucidos default styling.
+**Inherit the theme by default.** A normal app includes the theme assets, calls `applyPreferences()` + `watchPreferences()`, and styles with the theme variables (below). It then follows the user's theme and appearance like the rest of Lucidos. The engine never injects these tags. An app that omits both `sdk-prefs.js` and `sdk-iframe.css` gets no `data-theme-mode`, no CSS variables and no default styling.
 
-Opt out only for an app that ships its own complete visual identity (charts, games, embedded third-party UIs). Otherwise inheriting is the default, and **hardcoding colors is a bug** (a light-mode workspace gets a dark-only app, or vice versa).
+Opt out only for an app with its own complete visual identity (charts, games, embedded third-party UIs). Otherwise **hardcoding colors is a bug**: a light-mode workspace gets a dark-only app, or the reverse.
 
-**The tab icon is the one tag the engine does add.** An app opened in its own
-browser tab is a top-level document. Without a `<link rel="icon">` it shows the
-browser's blank page glyph. So the engine stamps the Lucidos mark into the
-served `<head>` when your HTML names no icon of its own. Ship a
-`<link rel="icon" href="…">` (or `rel="shortcut icon"`) and yours is kept
-untouched. Inside the host shell the app runs in an iframe, which has no tab, so
-this changes nothing there.
+**The tab icon is the one tag the engine does add.** An app in its own browser
+tab is a top-level document, and without a `<link rel="icon">` it shows a blank
+glyph. So the engine stamps the Lucidos mark into the served `<head>` when your
+HTML names no icon. Ship a `<link rel="icon" href="…">` (or
+`rel="shortcut icon"`) and the engine keeps yours. Inside the host shell the
+iframe has no tab, so nothing changes there.
 
 **Reach the engine through the SDK, never through a bare `fetch`.** Inside the
-host shell an app runs in its own renderer process, so an app that pegs its main
-thread slows itself and nothing else. That isolation gives the frame an opaque
-origin: a direct `fetch('/api/v1/…')` is refused by CORS, `new EventSource(…)`
-with it, and `localStorage` throws. `lucidos.*` carries the first two over a
-bridge to the host, so every call in this document works unchanged. An app that
-goes around the SDK loses its network instead.
+host shell an app runs in its own renderer process, so a busy main thread slows
+only that app. That isolation gives the frame an opaque origin. CORS refuses a
+direct `fetch('/api/v1/…')` and `new EventSource(…)`, and `localStorage` throws.
+`lucidos.*` carries the first two over a bridge to the host, so every call in
+this document works unchanged. An app that goes around the SDK loses its network.
 
-An endpoint with no namespace is reached through `lucidos.request`, over the
-same bridge. Not every endpoint: the engine says which ones an app may call,
-and refuses the rest. See § `lucidos.request`. Storage has no replacement yet,
-so keep per-device state out of an app or hold it in `lucidos.data`, which is
-workspace-wide.
+An endpoint with no namespace goes through `lucidos.request`, over the same
+bridge. The engine says which endpoints an app may call and refuses the rest
+(§ `lucidos.request`). Per-device state goes in `lucidos.storage.local` or
+`.session`, which stand in for `localStorage` and `sessionStorage`
+(§ `lucidos.storage`). State every device should see goes in `lucidos.data`.
 
 **Your own files load normally: a separate `app.js`, `style.css` or image is
 fine.** The opaque origin costs your frame the device credential on every
-subresource, and the gateway in front of the engine asks for it. So the engine
-gives your document a short-lived pass to its own files and stamps it into a
-`<base href>`. Every relative ref you write resolves through that, and
-`lucidos.data.url(path)` carries it too. You write nothing, and the host keeps
-the pass fresh while your app is open. See
+subresource, and the gateway asks for it. So the engine gives your document a
+short-lived pass to its own files and stamps it into a `<base href>`. Every
+relative ref resolves through that, and `lucidos.data.url(path)` carries it too.
+The host keeps the pass fresh while your app is open. See
 [ADR 0238](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0238-app-frame-carries-a-capability-to-its-own-files.md).
 
 **The user's workspace font loads by itself.** When the user picks a font they
 installed (`system-knowhow/workspace-fonts.md`), `sdk-prefs.js` and
-`applyPreferences()` register its faces from the workspace and set `--font-ui`.
-Your app needs no code for it.
+`applyPreferences()` register its faces and set `--font-ui`. You write no code.
 
 **A bundled font and an ES module load too.** Ship an `@font-face` pointing at
 your own `.woff2`, or a `<script type="module">` with relative `import`s. Both
-work in every browser on every install, except that a dev engine opened with no
-gateway refuses the module in Chromium. A `fetch()` of your own files never
-works: the engine grants a load, never a read, so use `lucidos.data.read`. See
+work everywhere, except that Chromium refuses the module on a dev engine opened
+with no gateway. A `fetch()` of your own files never works: the engine grants a
+load, never a read, so use `lucidos.data.read`. See
 [ADR 0289](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0289-app-frames-load-fonts-and-modules-across-origins.md).
 
-**Do not declare your own `<base href>`.** The first base in a document wins, so
-yours would replace the pass and your files would stop loading behind a gateway.
-Relative refs already resolve against your app's own directory, so there is
-nothing a base buys you here.
+**Do not declare your own `<base href>`.** The first base wins, so yours would
+replace the pass and your files would stop loading behind a gateway. Relative
+refs already resolve against your app's directory.
 
 The pass reaches your app's files and the workspace's `data/` tree, and nothing
-else. One `lucidos.data.url` call is outside it: a `system-knowhow/` path routes
-through `/api/v1/data/…`, an engine API route, so it still answers **401**
-behind a gateway. Read those with `lucidos.data.read` instead.
+else. A `system-knowhow/` path from `lucidos.data.url` routes through
+`/api/v1/data/…`, an engine API route, so it still answers **401** behind a
+gateway. Read those with `lucidos.data.read`.
 
-**The shell hands your frame a short list of browser features, and denies the
-rest.** A permissions-policy feature defaults to an allowlist of `self`, and an
-opaque origin is not `self`. So the frame gets a feature only where the shell
-delegates it. Today that is `autoplay`, `fullscreen`, `encrypted-media` and
-`clipboard-write`. Media plays, fullscreen works, and
-`navigator.clipboard.writeText()` puts text on the clipboard from a Copy button.
+**The shell delegates a short list of browser features, and denies the rest.**
+A permissions-policy feature defaults to an allowlist of `self`, and an opaque
+origin is not `self`. Today the shell delegates `autoplay`, `fullscreen`,
+`encrypted-media` and `clipboard-write`. Media plays, fullscreen works, and
+`navigator.clipboard.writeText()` works from a Copy button.
 
-What your frame does not get, and why each one. Some are a choice and some are
-a browser limit, so each bullet says which:
+What your frame does not get, and why:
 
-- **Reading the clipboard.** `navigator.clipboard.readText()` is refused. A read
-  would hand your app whatever the user last copied from anywhere, so it is
-  withheld on purpose.
-- **The camera and the microphone.** `getUserMedia` fails in a frame however the
-  shell is configured, because both browsers refuse media capture to an opaque
-  origin outright. An app that needs either has to run in its own tab.
-- **The OS share sheet.** `navigator.share` is refused, and is not delegated
-  because iOS refuses the delegation anyway. Call
-  `lucidos.ui.openExternal(url)`, which opens the link through the host.
+- **Reading the clipboard** (a choice). `navigator.clipboard.readText()` is
+  refused, because a read would hand your app whatever the user last copied.
+- **The camera and the microphone** (a browser limit). `getUserMedia` fails in
+  a frame, because both browsers refuse media capture to an opaque origin. An
+  app that needs either must run in its own tab.
+- **The OS share sheet** (a browser limit). `navigator.share` is refused, and
+  iOS refuses the delegation anyway. Call `lucidos.ui.openExternal(url)`, which
+  opens the link through the host.
 
-Popups and OAuth are untouched. Opened in its own browser tab an app is a
-top-level document, not a frame, so it keeps every direct path.
+Popups and OAuth are untouched. In its own browser tab an app is a top-level
+document, not a frame, so it keeps every direct path.
 
-**One link shape needs `sdk.js` specifically:** `<a href="report.pdf" download>`
-on one of your own bundled files. A browser ignores the `download` attribute on
-a cross-origin link, and your files are cross-origin to the frame. The click
-would navigate the frame to the file. `sdk.js` intercepts it and asks the engine
-for the file as an attachment. Without the SDK, use a `blob:` or `data:` URL,
-which download from any frame.
-
-That interception works behind a gateway too. It asks for
-`/<slug>/app/<id>/<file>?download=1`, which is one of your own files, so the
-pass above reaches it.
+**One link shape needs `sdk.js`:** `<a href="report.pdf" download>` on one of
+your bundled files. A browser ignores `download` on a cross-origin link, and
+your files are cross-origin to the frame, so the click would navigate the frame.
+`sdk.js` intercepts it and asks the engine for the file as an attachment, at
+`/<slug>/app/<id>/<file>?download=1`, which the pass reaches behind a gateway.
+Without the SDK, use a `blob:` or `data:` URL, which downloads from any frame.
 
 ### Text fields and autocorrect
 
@@ -152,9 +140,9 @@ Autocorrect switch is off.** Every text `<input>` and every `<textarea>` gets
 field mounts, before its first focus, which is when iOS reads it. You write
 nothing.
 
-The reason is an iOS bug. While autocorrect holds a correction, iOS can keep a
-tap on a button below the text for itself. A Save under a notes field then does
-nothing until the keyboard closes, and nothing tells the user why. See
+The reason is an iOS bug: while autocorrect holds a correction, iOS can swallow
+a tap on a button below the text. A Save under a notes field then does nothing
+until the keyboard closes. See
 [ADR 0262](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0262-ios-autocorrect-eats-the-send-tap.md).
 
 The switch is the `autocorrect` preference, per device (§ lucidos.preferences).
@@ -242,9 +230,8 @@ stylesheet drops every part shadow and filter:
 **A pull past the top of your app reloads it, with no code from you.** On a
 touch screen, `sdk.js` watches for a downward drag once the page is scrolled to
 the top. A scroll up that reaches the top and keeps going becomes a pull from
-that point. It posts the pull to Lucidos, which draws the arrow and
-runs the same reload as the header's Refresh button. So your app starts fresh,
-and a WIP preview stays on its WIP.
+that point. Lucidos draws the arrow and runs the header's Refresh reload, so
+your app starts fresh and a WIP preview stays on its WIP.
 
 It never blocks scrolling: every listener is passive. It stays out of the way
 of a gesture that is not a pull:
@@ -284,9 +271,32 @@ stays out of the way of a drag that is not a pane swipe:
 - give the element a `touch-action` that keeps the sideways pan, such as
   `touch-action: pan-y` on a carousel or `none` on a canvas.
 
+### Find in app
+
+**Your app's text is searchable with no code from you.** The header's *Find*
+button, or Mod+F while the app is open, rolls the find bar in above it.
+Lucidos sends each query to `sdk.js`, which matches the rendered text,
+highlights every match and scrolls the current one into view. Enter and
+Shift+Enter step through the matches and wrap at the ends.
+
+What it matches:
+
+- visible text only, case-insensitive, across inline elements but not from one
+  block into the next;
+- not text in `script`, `style`, `template`, or a form field's value;
+- not an element hidden with `display: none` or `visibility: hidden`.
+
+It never edits your DOM. The highlights are CSS Custom Highlights named
+`lucidos-find` and `lucidos-find-current`, styled by `sdk-iframe.css` from the
+theme tokens. Without that stylesheet the current match shows as the selection.
+An app that loads no `sdk.js` cannot be searched, and the bar says so.
+
+The count is taken when the reader types or steps. Content your app renders
+later is counted on the next keystroke.
+
 ### Theme variables
 
-`sdk-iframe.css` defines these CSS custom properties on `<html>` and flips their values between light and dark automatically. The `data-theme-mode` attribute drives them: `applyPreferences()` sets it (resolving `system` to the OS setting) and `watchPreferences()` keeps it in sync. Style your app with `var(--name)` and it tracks the user's appearance for free. The canonical values live in the engine's `sdk-iframe.css`; **the names are the contract**:
+`sdk-iframe.css` defines these CSS custom properties on `<html>` and flips them between light and dark. The `data-theme-mode` attribute drives them: `applyPreferences()` sets it (resolving `system` to the OS setting) and `watchPreferences()` keeps it in sync. Style with `var(--name)` and your app tracks the user's appearance. The canonical values live in the engine's `sdk-iframe.css`. **The names are the contract**:
 
 | Group | Variables |
 |---|---|
@@ -294,44 +304,40 @@ stays out of the way of a drag that is not a pane swipe:
 | Text | `--text-primary`, `--text-secondary`, `--text-muted`, `--text-on-accent`, `--text-strong` (bold text where the UI font has no bold face). `<html>` carries `data-font-bold="none"` for such a font and `"face"` otherwise, and `sdk-iframe.css` then paints `strong` and `b` inside `.markdown-content` with it. Key your own bold on the same attribute: `html[data-font-bold="none"] .my-label b { color: var(--text-strong); }` |
 | Border | `--border-color` |
 | Accents | `--accent`, `--accent-light`, `--accent-green`, `--accent-yellow`, `--accent-red` |
-| Focus | `--focus-ring` — a ready-made `box-shadow` value (a soft accent band) for focus indicators; the `.action-btn`/`.icon-btn` classes use it, and your own controls match the host with `:focus-visible { box-shadow: var(--focus-ring); }`. `--focus-ring-width` (`0.1875rem`) is that band's width. The band paints outside the control, so a box of yours that scrolls or clips (`overflow` other than `visible`) cuts it where a control touches its edge. Give such a box that much padding on the edge, and hand it back with a negative margin if nothing should move. |
+| Focus | `--focus-ring`: a ready-made `box-shadow` value (a soft accent band) for focus indicators. The `.action-btn`/`.icon-btn` classes use it, and your controls match the host with `:focus-visible { box-shadow: var(--focus-ring); }`. `--focus-ring-width` (`0.1875rem`) is the band's width. The band paints outside the control, so a box that scrolls or clips (`overflow` other than `visible`) cuts it at its edge. Give such a box that much edge padding, and hand it back with a negative margin if nothing should move. |
 | Shadows | `--shadow-sm`, `--shadow-md`, `--shadow-lg` |
 | Shape | `--radius-control` (`0.5rem`), `--radius-surface` (`0.75rem`), `--radius-round` (`999px`): the theme's corner steps. The shared component classes round with them, so a square theme squares them. Scale one with `calc()` to follow the theme in your own CSS. |
 | Layout (theme-independent) | `--font-ui`, `--font-mono`, `--font-features-text`, `--font-features-code`, `--transition`, `--user-ui-scale`, plus the spacing / radius / motion scales below |
 | Stacking | `--z-tooltip` (`10000`), the layer the built-in tooltip paints on. Keep your own overlays under it, so a tooltip is never covered. |
 
-The user's **theme** retunes these values too, on top of the light and dark defaults, so style with the variables rather than copying their values. An app that lists or builds themes uses the routes in `themes.md` § For apps.
+The user's **theme** retunes these values on top of the light and dark defaults, so style with the variables rather than copying their values. An app that lists or builds themes uses the routes in `themes.md` § For apps.
 
 The user's UI font is **`--font-ui`**, the canonical token. It is set live to the
-user's font pick, or to the font their theme suggests when they follow the theme
-(the default). You rarely need to apply it yourself: `sdk-iframe.css` already
-sets `body { font-family: var(--font-ui) }` — plus inputs and `.action-btn`, since
-form controls don't inherit the page font on their own — so any element that
-inherits gets the right font for free. (A *bare* unclassed `<button>` is the gap:
-it keeps the browser's own control font. One more reason to use `.action-btn`.)
-Only re-declare `font-family` when you deliberately override it, and then use
-`var(--font-ui)`. As a safety net,
-`--font-family` and `--font` are tolerated **aliases** of `--font-ui` (so the
-intuitive guess still resolves to the user's font instead of silently dropping to a
-hardcoded fallback) — but `--font-ui` is the name to write.
+user's font pick, or to the theme's font when they follow the theme (the
+default). `sdk-iframe.css` already sets `body { font-family: var(--font-ui) }`,
+plus inputs and `.action-btn`, since form controls don't inherit the page font.
+So any inheriting element gets the right font. A *bare* unclassed `<button>`
+keeps the browser's control font: one more reason to use `.action-btn`.
+
+Re-declare `font-family` only to override it deliberately, with `var(--font-ui)`.
+`--font-family` and `--font` are tolerated **aliases** of `--font-ui`, so a
+guess still resolves to the user's font. Write `--font-ui`.
 
 **`--font-features-text` and `--font-features-code` carry programming ligatures,
 and only code gets them.** Fira Code (the default), JetBrains Mono and Cascadia
 Code ship programming ligatures. With one of them as the UI font, the two
 resolve to `"liga" 0, "calt" 0` and `"liga" 1, "calt" 1`. For every other font
-both are `normal`. `sdk-iframe.css` applies them for you, the text one on `html, input,
-textarea, select, button` and the code one on `code, pre, kbd, samp`, so a code
-block in your app ligatures `=>` and `!=` while your prose and your form fields
-render literally.
+both are `normal`. `sdk-iframe.css` applies the text one on `html, input,
+textarea, select, button` and the code one on `code, pre, kbd, samp`. So a code
+block ligatures `=>` and `!=` while prose and form fields render literally.
 
 Apply one yourself only on an element that shows code but is none of those tags:
 `font-feature-settings: var(--font-features-code, normal)`. Never put the CODE
-one on `:root`, `html` or `body`: `font-feature-settings` is inherited, so that
-reaches every character in your app, and Fira Code's `calt` re-spaces dot runs
-tightly enough that a typed `...` reads as two dots.
+one on `:root`, `html` or `body`. `font-feature-settings` is inherited, and Fira
+Code's `calt` re-spaces dot runs so a typed `...` reads as two dots.
 
-Two things to know if you write your own rule, because both look fine in
-DevTools and neither shows up in the computed value:
+Two traps in your own rules. Both look fine in DevTools and neither shows in the
+computed value:
 
 - **`normal` does not mean "ligatures off".** `liga` and `calt` are default-ON
   features in CSS, so `normal` renders identically to `"liga" 1, "calt" 1`.
@@ -342,11 +348,11 @@ DevTools and neither shows up in the computed value:
   they are named explicitly above. A custom control of your own needs the same
   treatment.
 
-The spacing, radius, motion, icon, and type scales are theme-independent and have
-fixed values — **use the token, not a magic number, and never a `px` fallback
-that disagrees with the real value** (`var(--space-xl, 28px)` is a latent bug —
-`--space-xl` is `1.5rem` = 24px). When you include `sdk-iframe.css` these are
-always defined, so a fallback is dead noise at best:
+The spacing, radius, motion, icon and type scales are theme-independent, with
+fixed values. **Use the token, not a magic number, and never a `px` fallback
+that disagrees with the real value.** `var(--space-xl, 28px)` is a latent bug,
+since `--space-xl` is `1.5rem` = 24px. With `sdk-iframe.css` these are always
+defined, so a fallback is dead noise at best:
 
 | Token | Value | | Token | Value |
 |---|---|---|---|---|
@@ -360,16 +366,15 @@ always defined, so a fallback is dead noise at best:
 | `--duration-emphasis` | `0.5s` | | `--duration-scale` | `1`, or `0.001` under reduced motion |
 | `--spinner-weight` | `0.125rem` (2px), the `.mini-spinner` ring | | | |
 
-Each `--duration-*` above is its listed value times `--duration-scale`. Inside
-an app that is `1`, so your chrome animates at the listed durations. The host
-also has a debugging slider for its own copy. A custom property does not cross
-into an iframe, so that slider never reaches you. Under reduced motion the scale
-drops to `0.001`, and every transition on these tokens ends inside a frame. Set
-`--duration-scale` on your own `:root` if you want a knob of your own.
+Each `--duration-*` above is its listed value times `--duration-scale`, which is
+`1` inside an app. The host's debugging slider for its own copy never reaches
+you, since a custom property does not cross into an iframe. Under reduced motion
+the scale drops to `0.001`, and every transition on these tokens ends inside a
+frame. Set `--duration-scale` on your own `:root` for a knob of your own.
 
-**Type scale — `--font-size-*`.** The sanctioned font sizes; the host shell and
-this SDK stylesheet both size text from these, so use the token instead of a raw
-`rem`. All `rem`, so every step scales with the user's UI-scale preference.
+**Type scale: `--font-size-*`.** The host shell and this stylesheet both size
+text from these, so use the token instead of a raw `rem`. Every step is in
+`rem`, so it scales with the user's UI-scale preference.
 
 | Token | Value | Role | | Token | Value | Role |
 |---|---|---|---|---|---|---|
@@ -390,79 +395,75 @@ this SDK stylesheet both size text from these, so use the token instead of a raw
 .card a { color: var(--accent); }
 ```
 
-#### Respect the user's font size — size in `rem`, never `px`
+#### Respect the user's font size: size in `rem`, never `px`
 
-The user's UI-scale preference is applied as the **root font-size**
+The user's UI-scale preference is the **root font-size**
 (`html { font-size: var(--user-ui-scale, 100%) }`), so **only `rem`/`em` units
-scale with it.** An app that sizes text, padding, gaps, and radii in `px`
-renders at a fixed size and silently ignores the user's font-size setting — the
-single most common "the app doesn't respect my font size" bug. Size everything
-in `rem` (divide px by 16: 14px → `0.875rem`, 24px → `1.5rem`), and prefer the
-`--space-*` / `--radius-*` tokens above for spacing and corners. For text, prefer
-the `--font-size-*` type-scale tokens over a raw `rem`. Body text and
-paragraphs are `--font-size-sm` (12px), the size chat renders at. Labels,
-controls and row titles are `--font-size-md` (13px). Small/meta is
-`--font-size-xs` (11px), emphasis `--font-size-lg` (14px), and headings use the
-`h1`–`h6` defaults `sdk-iframe.css` already ships. (`1px` borders are the one
-acceptable `px` exception, same as the host shell.)
+scale with it.** An app sized in `px` ignores the user's font-size setting.
+That is the most common "the app doesn't respect my font size" bug. Size
+everything in `rem` (px / 16: 14px → `0.875rem`, 24px → `1.5rem`), and prefer
+the `--space-*` / `--radius-*` tokens for spacing and corners. `1px` borders are
+the one acceptable `px` exception, as in the host shell.
+
+For text, prefer the `--font-size-*` tokens over a raw `rem`. Body text is
+`--font-size-sm` (12px), the chat step. Labels, controls and row titles are
+`--font-size-md` (13px). Small/meta is `--font-size-xs` (11px), emphasis
+`--font-size-lg` (14px), and headings use the `h1`–`h6` defaults
+`sdk-iframe.css` ships.
 
 **The body step is already the default.** `sdk-iframe.css` sets
-`body { font-size: var(--font-size-sm) }`, so a paragraph you never size
-explicitly reads at the size of the chat beside it, not at the raw root
-(`1rem`). So you don't need to declare it. Don't raise it for a report either:
-an app sits next to the chat that made it, and a larger body reads as too big.
-Never reset it to `1rem` or a `px` value: that makes an app read two steps
-larger than the rest of Lucidos, with looser line spacing to match.
+`body { font-size: var(--font-size-sm) }`, so an unsized paragraph reads at the
+size of the chat beside it, not at the raw root (`1rem`). Don't raise it for a
+report: a larger body reads as too big beside the chat. Never reset it to `1rem`
+or a `px` value, which reads two steps larger than the rest of Lucidos.
 
 ### Component classes
 
-`sdk-iframe.css` also ships Lucidos's shared component layer — literally the
-**same CSS the host shell uses, from one source**: the engine appends
+`sdk-iframe.css` also ships Lucidos's shared component layer: the **same CSS the
+host shell uses, from one source**. The engine appends
 `crates/lucidos-app/src/styles/global/shared-components.css` (which the host
-itself imports via `global.css`) to the served stylesheet. There is no copy and
-nothing to keep in sync — apply these class names and your app's controls render
-exactly like the rest of Lucidos (and track the theme + UI scale for free). The
-class names are the contract:
+imports via `global.css`) to the served stylesheet. Apply these class names and
+your controls render like the rest of Lucidos and track the theme and UI scale.
+The class names are the contract:
 
 | Class | Use for |
 |---|---|
-| `.action-btn` (+ `.action-btn-confirm` green, `.action-btn-danger` red) | The filled primary CTA button — blue, with the confirm/danger variants additive (`class="action-btn action-btn-danger"`) |
-| `.action-btn-secondary` | A neutral, outlined secondary button for a lower-emphasis action beside a primary CTA — additive: `class="action-btn action-btn-secondary"`. **Use this instead of hand-rolling an off-palette outlined button.** |
-| `.button-group` | Wrap a **row of buttons** in this instead of a bare flex row. It keeps the row bound by its container: buttons that do not fit stack onto a second row rather than overflowing, and a single button whose label is wider than the row ellipsizes instead of being sliced by whatever ancestor hides its overflow. Set your own `justify-content` on the same element (the class deliberately sets none) and the buttons keep their natural widths. |
+| `.action-btn` (+ `.action-btn-confirm` green, `.action-btn-danger` red) | The filled primary CTA button: blue, with the confirm/danger variants additive (`class="action-btn action-btn-danger"`) |
+| `.action-btn-secondary` | A neutral, outlined button for a lower-emphasis action beside a primary CTA. Additive: `class="action-btn action-btn-secondary"`. **Use this instead of hand-rolling an off-palette outlined button.** |
+| `.button-group` | Wrap a **row of buttons** in this instead of a bare flex row. Buttons that do not fit stack onto a second row rather than overflowing. A single button wider than the row ellipsizes rather than being sliced by an ancestor's hidden overflow. Set your own `justify-content` on the same element (the class sets none), and the buttons keep their natural widths. |
 | `.icon-btn` | A small borderless icon button (wrap an SVG sized via `--icon-size-sm`). `disabled` fades it and drops its tooltip. `aria-disabled="true"` only drops the hover wash, so a busy button keeps its tooltip. |
 | `.accent-link` | An inline text link/button in the accent color |
-| `.label` (+ `.label-success`, `.label-warning`, `.label-error`, `.label-neutral`) | A small uppercase chip for a status or a category: the host's own. The bare class is the accent tone, and the tones are additive: `class="label label-success"`. They use the toast's words, so a status reads the same in a chip and in a toast. **Use this instead of drawing your own badge, chip or pill.** A pill the user taps is a button, not a label: see `.pill-bar`. |
+| `.label` (+ `.label-success`, `.label-warning`, `.label-error`, `.label-neutral`) | The host's small uppercase chip for a status or a category. The bare class is the accent tone, and the tones are additive: `class="label label-success"`. They use the toast's words, so a status reads the same in a chip and a toast. **Use this instead of drawing your own badge, chip or pill.** A pill the user taps is a button, not a label: see `.pill-bar`. |
 | `.title` | A list/panel/modal title |
-| `.segmented-control` + `.segmented-btn` (`.active`) | A toggle button group: a few mutually exclusive options with one picked. Two or three segments is what it is for. Not page navigation, and not a long strip: the control has no room to say where a link goes, and past a handful of segments it wraps onto a second row and reads as options to weigh rather than places to go. Use `.pill-bar` as tabs to switch between views, or a list of rows to go somewhere. It does wrap when the segments pass their container, so a squeezed strip keeps every label on one line. |
-| `.pill-bar` + `.pill-bar-btn` | A row of pills with one picked, the one Settings > Theme filters its families with. Two uses, told apart by the markup. **Tabs** that switch between views: `<div class="pill-bar" role="tablist">` holding `<button class="pill-bar-btn" role="tab" aria-selected="true">`. A **filter** that narrows one list: `role="group"` with `aria-pressed` on each button. Set the attribute to `true` on the picked pill, and the bar marks it. It stays on one line and scrolls sideways when the pills do not fit. On a touch screen each pill takes taps `--pill-bar-hit-slop` (0.5rem) above and below itself without growing. The bar pads out room for that reach and for the pills' focus rings (`--focus-ring-width`). A negative margin hands back the room above and below, so the pills sit `--focus-ring-width` in from the bar's sides. A bar you give your own padding keeps both, or a ring or the extra reach is cut off. **Use this instead of drawing your own tabs or filter pills.** |
+| `.segmented-control` + `.segmented-btn` (`.active`) | A toggle button group: two or three mutually exclusive options with one picked. Not page navigation, and not a long strip: past a handful of segments it wraps and reads as options to weigh, not places to go. Use `.pill-bar` as tabs to switch views, or a list of rows to go somewhere. It wraps when the segments pass their container, so each label stays on one line. |
+| `.pill-bar` + `.pill-bar-btn` | A row of pills with one picked, as in Settings > Theme. The markup tells two uses apart. **Tabs** that switch views: `<div class="pill-bar" role="tablist">` holding `<button class="pill-bar-btn" role="tab" aria-selected="true">`. A **filter** that narrows one list: `role="group"` with `aria-pressed` on each button. Set the attribute to `true` on the picked pill, and the bar marks it. It stays on one line and scrolls sideways when the pills do not fit. On a touch screen each pill takes taps `--pill-bar-hit-slop` (0.5rem) above and below itself without growing. The bar pads out room for that reach and for focus rings (`--focus-ring-width`). A negative margin hands back the room above and below, so the pills sit `--focus-ring-width` in from the bar's sides. If you pad the bar yourself, keep both allowances, or a ring or the reach is cut off. **Use this instead of drawing your own tabs or filter pills.** |
 | `.list-rows`, `.list-row`, `.list-row-info`, `.list-row-name`, `.list-row-actions`, `.list-section-title`, … | List/row layouts |
-| `.list-row-add-card` (+ `.list-row-add-icon`, `.list-row-add-label`) | The "+ Add <thing>" row that closes a list. **Put it on a `<button type="button">`**, not a clickable `<div>`: the class carries the UA button reset and a `:focus-visible` ring, so on a button the card is in the tab order and answers Enter and Space, and on a div it is reachable by pointer only. Markup is `<button class="list-row-add-card"><span class="list-row-add-icon">+</span><span class="list-row-add-label">Add Thing</span></button>`. |
-| `.list-row-details` (+ `.list-row-details-prose`) | The small muted line under a row title. The base class is a flex row of metadata fields whose 0.75rem gap IS the separator between them, so a **sentence** takes the additive prose variant (`class="list-row-details list-row-details-prose"`): under the bare flex class every inline `<strong>`/`<code>` becomes its own flex item, which opens gaps mid-sentence and strands the punctuation after the element at the start of the next line. |
+| `.list-row-add-card` (+ `.list-row-add-icon`, `.list-row-add-label`) | The "+ Add <thing>" row that closes a list. **Put it on a `<button type="button">`**, not a clickable `<div>`. The class carries the UA button reset and a `:focus-visible` ring. On a button the card is in the tab order and answers Enter and Space, and on a div only a pointer reaches it. Markup is `<button class="list-row-add-card"><span class="list-row-add-icon">+</span><span class="list-row-add-label">Add Thing</span></button>`. |
+| `.list-row-details` (+ `.list-row-details-prose`) | The small muted line under a row title. The base class is a flex row of metadata fields, and its 0.75rem gap IS the separator. So a **sentence** takes the additive prose variant (`class="list-row-details list-row-details-prose"`). Under the bare flex class every inline `<strong>`/`<code>` becomes a flex item, which opens gaps mid-sentence and strands the following punctuation on the next line. |
 | `.markdown-content` | A container for rendered markdown (headings, tables, code, blockquotes) |
-| `.table-scroll-wrapper` | Wrap a `<table>` inside `.markdown-content` in this. A table always fits its container and wraps its cells, at every viewport width, so this is a safety net rather than the normal path: it catches the one overflow that cannot be designed away, a single token wider than the container, and scrolls it inside the wrapper instead of widening your iframe body. Cells are also capped at a readable line length (`60ch`), so one prose column cannot swallow the table and starve the key column beside it. |
-| `.image-scroll-wrapper` | Wrap an `<img>` inside `.markdown-content` in this. Unlike a table an image cannot reflow, so this one is the normal path rather than a safety net: the wrapper stays within your container width and pans an oversized image sideways inside itself, at every viewport width, instead of widening the body. The image keeps its natural width (no `max-width` cap, which would shrink a wide screenshot to a thumbnail) and is capped at `24rem` tall with the aspect ratio preserved. An image smaller than the container renders unchanged, with no scrollbar. A bare `<img>` with no wrapper around it is untouched by these rules. |
-| `data-stack` + `data-label` (attributes, not classes) | Opt a wide table into the stacked mobile layout: put `data-stack` on the `<table>` and `data-label="<column header>"` on every `<td>`. At 768px and under each row becomes a card, the header row is hidden, and each cell shows its `data-label` above its value. Worth it from about 4 columns up; below that the scroll wrapper reads better. |
+| `.table-scroll-wrapper` | Wrap a `<table>` inside `.markdown-content` in this. A table always fits its container and wraps its cells, so this is a safety net. It catches a single token wider than the container and scrolls it inside the wrapper instead of widening your iframe body. Cells are capped at `60ch`, so one prose column cannot starve the key column beside it. |
+| `.image-scroll-wrapper` | Wrap an `<img>` inside `.markdown-content` in this. An image cannot reflow, so this is the normal path. The wrapper stays within your container width and pans an oversized image sideways inside itself, instead of widening the body. The image keeps its natural width (no `max-width` cap to shrink a screenshot to a thumbnail) and is capped at `24rem` tall, aspect ratio preserved. A smaller image renders unchanged, with no scrollbar. These rules leave a bare unwrapped `<img>` alone. |
+| `data-stack` + `data-label` (attributes, not classes) | Opt a wide table into the stacked mobile layout: `data-stack` on the `<table>` and `data-label="<column header>"` on every `<td>`. At 768px and under, each row becomes a card, the header row hides, and each cell shows its `data-label` above its value. Worth it from about 4 columns up. Below that the scroll wrapper reads better. |
 | `.progress-bar` + `.progress-bar-fill`, `.progress-label` | A progress indicator |
 | `<input type="checkbox">` (element, no class) | A plain checkbox already renders as the Lucidos checkbox: a soft accent-tinted box with a tick that draws on, sized in `em` to its row's text, identical in every browser. The `indeterminate` DOM property shows a dash. Put it in a `<label>` with its text and set no width or height on it. |
-| `.text-input` | A free-text field, the exact box every host text field uses: `<input class="text-input">` or `<textarea class="text-input">`. Gives you the themed background, border, radius, placeholder colour and focus ring, with nothing to hand-roll. |
+| `.text-input` | A free-text field, the box every host text field uses: `<input class="text-input">` or `<textarea class="text-input">`. Gives the themed background, border, radius, placeholder colour and focus ring. |
 | `.toggle-switch` + `.toggle-slider` | An on/off switch, the one Settings draws. Markup is `<label class="toggle-switch"><input type="checkbox" role="switch"><span class="toggle-slider"></span></label>`: the real checkbox stays in the markup and carries the state, so read and set `checked` as usual. `disabled` on the input dims it, and `toggle-switch-disabled` on the label adds the not-allowed cursor. Give it an accessible name with an `aria-label` on the input, or a visible `<label for>`. |
 | `.mini-spinner` | The spinning ring the host shows for a working state, such as a save in flight: `<span class="mini-spinner" aria-hidden="true"></span>` beside text that says what is happening. It stops under reduced motion and stays drawn. Recolour it with `--spinner-color`, for example `style="--spinner-color: currentColor"` inside a button. A busy button is a disabled `.action-btn` holding the ring and its label. Loading data draws a skeleton or nothing, never a spinner. |
 | `.empty-state`, `.error-text` | Empty/error placeholders |
-| `data-tooltip` (an attribute, plus the `#tooltip` rules that paint it) | A themed Lucidos tooltip on any element. You write the attribute and nothing else: `sdk.js` builds, positions and paints the box. Full contract in § Tooltips, under lucidos.ui. |
+| `data-tooltip` (an attribute, plus the `#tooltip` rules that paint it) | A themed Lucidos tooltip on any element. Write the attribute, and `sdk.js` builds, positions and paints the box (§ Tooltips, under lucidos.ui). |
 
-Prefer these over hand-rolling buttons and rows — a plain unclassed `<button>`
+Prefer these over hand-rolled buttons and rows. A plain unclassed `<button>`
 gets a neutral default that does **not** match Lucidos's primary blue button.
 
 **Four of those rows are the overflow half of a wider rule.** `.button-group`,
 `.table-scroll-wrapper`, `.image-scroll-wrapper` and `data-stack` each contain
-one thing that would otherwise widen the page, and that is all they do. They do
-not make an app responsive. `data-stack` is one of the stylesheet's two width
-breakpoints and the other only tightens markdown-table type, so every other
-width decision is yours to write. The rules, and the three regions the host
-paints over a fullscreen app, are in `system-knowhow/building-an-app.md`
-§ Responsive by default.
+one thing that would otherwise widen the page. They do not make an app
+responsive. `data-stack` is one of the stylesheet's two width breakpoints, and
+the other only tightens markdown-table type, so every other width decision is
+yours. The rules, and the three regions the host paints over a fullscreen app,
+are in `system-knowhow/building-an-app.md` § Responsive by default.
 
-Apps using `lucidos._capture()` don't need to include `html2canvas` — the SDK loads it on demand from `/api/v1/static/html2canvas.min.js`. `html2canvas` can't rasterize CSS Color 4 functions (`color()`, `oklab()`, `oklch()`, `color-mix()`); when the screenshot fails for any reason the capture degrades to **DOM-only** — it returns an empty `screenshot` plus a `dom` layout snapshot (element positions + classes) prefixed with the failure reason, rather than throwing. The agent still sees the rendered layout instead of going blind.
+Apps using `lucidos._capture()` don't need to include `html2canvas`: the SDK loads it on demand from `/api/v1/static/html2canvas.min.js`. `html2canvas` can't rasterize CSS Color 4 functions (`color()`, `oklab()`, `oklch()`, `color-mix()`). When the screenshot fails for any reason, the capture degrades to **DOM-only** rather than throwing. It returns an empty `screenshot` plus a `dom` layout snapshot (element positions + classes), prefixed with the failure reason. So the agent still sees the layout.
 
 External-host apps point `baseUrl` at the Lucidos instance with `lucidos.configure`:
 
@@ -474,11 +475,11 @@ lucidos.configure(opts: { baseUrl?: string; token?: string }): void
 lucidos.configure({ baseUrl: 'https://your-lucidos.example' });
 ```
 
-`baseUrl` overrides the auto-derived workspace base path (in-app iframes don't
-need it — the SDK reads the gateway prefix from `<base href>` / the `/app/` URL).
-`token`, when set, is sent as an `Authorization: Bearer <token>` header on every
-SDK request — for embedders calling a remote engine that requires auth. Both are
-optional and each call merges into the existing config.
+`baseUrl` overrides the auto-derived workspace base path. In-app iframes don't
+need it: the SDK reads the gateway prefix from `<base href>` / the `/app/` URL.
+`token`, when set, goes out as an `Authorization: Bearer <token>` header on every
+SDK request, for embedders calling a remote engine that requires auth. Both are
+optional, and each call merges into the existing config.
 
 ## Error Handling
 
@@ -501,23 +502,21 @@ A call that never gets an answer rejects with a `DOMException` instead, and the
 | `AbortError` | Something cancelled the request: an `AbortSignal` you passed in `init`, or the browser tearing down an in-flight fetch. | If you did not cancel it yourself, treat as retryable. |
 
 The `AbortError` case is routine on an installed iOS PWA: WebKit aborts every
-in-flight fetch when it suspends the page, which says nothing about your
-request. Retry an idempotent call rather than reporting it as a failure, and
-prefer retrying when the page comes back (`visibilitychange`, `pageshow`,
-`focus`) over retrying immediately, because a suspended page cannot reach the
-engine either.
+in-flight fetch when it suspends the page. Retry an idempotent call rather than
+reporting a failure. Retry when the page comes back (`visibilitychange`,
+`pageshow`, `focus`), not immediately, because a suspended page cannot reach
+the engine either.
 
-The two are deliberately distinguishable. WebKit rejects an aborted fetch with
-its own generic `AbortError` rather than the signal's reason, so the SDK
-re-stamps a fired deadline as `TimeoutError` to match what Chrome and Firefox
-deliver. A cancel you requested stays an `AbortError` even when the deadline
-fired in the same instant.
+WebKit rejects an aborted fetch with a generic `AbortError` rather than the
+signal's reason. So the SDK re-stamps a fired deadline as `TimeoutError`, as
+Chrome and Firefox deliver it. A cancel you requested stays an `AbortError`,
+even when the deadline fired in the same instant.
 
-## lucidos.data — File Operations
+## lucidos.data: File Operations
 
 Read, write, and manage files in the workspace `data/` directory.
 
-> **Paths are relative to `data/`, not `data/artifacts/`.** App code lives in `apps/{id}/`, but app *data* must be written under `artifacts/` explicitly — e.g. `artifacts/{app-id}/data.json`. Omitting the prefix gives a 404 `SdkError` from `read` and a silent failure from `write`.
+> **Paths are relative to `data/`, not `data/artifacts/`.** App code lives in `apps/{id}/`, but app *data* goes under `artifacts/` explicitly, e.g. `artifacts/{app-id}/data.json`. Omitting the prefix gives a 404 `SdkError` from `read` and a silent failure from `write`.
 
 ```ts
 lucidos.data.read(path: string): Promise<string>
@@ -555,7 +554,7 @@ Mix any of these forms in a single path:
 | Raw JSON Pointer (RFC 6901)       | `/sections/1/title`                | `/sections/1/title`          |
 | Mixed                             | `habits[0].dailyLog["2026-05-04"]` | `/habits/0/dailyLog/2026-05-04` |
 
-Use **quoted keys** whenever a key contains characters that aren't a bare identifier — dates (`"2026-05-04"`), slugs with dots (`"foo.bar"`), or anything with spaces. Inside a quoted key, `\` escapes the next character. RFC 6901 escaping (`~` → `~0`, `/` → `~1`) is applied automatically.
+Use **quoted keys** for any key that isn't a bare identifier: dates (`"2026-05-04"`), slugs with dots (`"foo.bar"`), or anything with spaces. Inside a quoted key, `\` escapes the next character. RFC 6901 escaping (`~` → `~0`, `/` → `~1`) is applied automatically.
 
 ### Examples
 
@@ -586,28 +585,27 @@ const src = lucidos.data.url('artifacts/screenshots/latest.png');
 
 ### `url` and app-bundled assets
 
-`lucidos.data.url(path)` normally returns a `/data/...` URL, which always serves from the live workspace. When the SDK is loaded inside an app iframe (`/app/<id>/...`) and `path` points at the app's own bundled folder (`apps/<id>/<rest>`), it instead returns a `/app/<id>/<rest>` URL and carries over `?thread_id=` from the iframe. This makes JS-set asset URLs (e.g. `img.src = lucidos.data.url('apps/my-app/icon.png')`) load correctly in WIP-preview — without it, the engine's HTML rewriter only covers markup `src` / `href` attributes and JS-set sources silently 404 against the live workspace. Cross-app references (`apps/<other>/...`) and non-app paths (`artifacts/...`, `knowhow/...`) keep the `/data/` route unchanged.
+`lucidos.data.url(path)` normally returns a `/data/...` URL, which serves from the live workspace. Inside an app iframe (`/app/<id>/...`), a `path` in the app's own folder (`apps/<id>/<rest>`) instead returns `/app/<id>/<rest>` and carries over the iframe's `?thread_id=`. So JS-set asset URLs (e.g. `img.src = lucidos.data.url('apps/my-app/icon.png')`) load in WIP-preview. The engine's HTML rewriter covers only markup `src` / `href` attributes, so a JS-set source would otherwise 404 against the live workspace. Cross-app references (`apps/<other>/...`) and non-app paths (`artifacts/...`, `knowhow/...`) keep the `/data/` route.
 
-One other special case: a `system-knowhow/...` path is routed through the engine's `/api/v1/data/...` endpoint (these files live in the engine repo, not the workspace, so the static `/data` mount can't serve them).
+A `system-knowhow/...` path routes through the engine's `/api/v1/data/...` endpoint, because those files live in the engine repo and the static `/data` mount can't serve them.
 
-Behind a gateway a URL this returns carries your frame's pass to its own files. So it loads from inside an app frame like any other subresource. The `system-knowhow/` case above is the one exception: it is an `/api/v1` route, which a pass deliberately never reaches, so it still answers **401** there. Read those with `lucidos.data.read` instead. See § Setup.
+Behind a gateway, a returned URL carries your frame's pass to its own files, so it loads like any other subresource. The `system-knowhow/` case is the exception: a pass never reaches an `/api/v1` route, so it answers **401** there. Read those with `lucidos.data.read`. See § Setup.
 
-A URL you keep around is not a URL you can keep forever. The pass behind it lasts an hour, and `url()` reads the current one on every call. So build the URL where you use it rather than caching the string. An `<iframe src>` you set once and leave open past the hour needs its `src` rebuilt before an in-page link inside it works again.
+The pass behind a URL lasts an hour, and `url()` reads the current one on every call. So build the URL where you use it rather than caching the string. An `<iframe src>` left open past the hour needs its `src` rebuilt before an in-page link inside it works again.
 
-The same applies to a url the browser captured when it loaded something. A dynamic `import()` inside an ES module resolves against that module's own url, and a stylesheet's `url()` against the stylesheet's. Both keep the pass they loaded with, so a chunk imported for the first time an hour into a session answers 401. Load what you need up front, or accept that the user reloads.
+The same applies to a URL the browser captured at load. A dynamic `import()` resolves against its module's URL, and a stylesheet's `url()` against the stylesheet's. Both keep the pass they loaded with, so a chunk first imported an hour in answers 401. Load what you need up front, or accept that the user reloads.
 
-## lucidos.events — Event Store
+## lucidos.events: Event Store
 
 Emit domain events, and query the workspace's event store.
 
 **`query` reads the whole store, not just what your app emitted.** Workspace
 domain events (`HabitCompleted`) and the engine's own thread / system events
 (`ChildThreadCompleted`, `ResponseGenerated`, `ChangeApplied`, `TriggerCompleted`)
-are rows in one `events` table and come back from one call, filtered by
-`event_type`, time, `thread_id`, or a paging cursor. There is no second stream
-to reach for. See
-`system-knowhow/thread-events.md` § "One table, two enums" for what the
-`ThreadEvent` / `SystemEvent` distinction actually is.
+are rows in one `events` table. One call returns them, filtered by `event_type`,
+time, `thread_id`, or a paging cursor. There is no second stream. See
+`system-knowhow/thread-events.md` § "One table, two enums" for the
+`ThreadEvent` / `SystemEvent` distinction.
 
 ```ts
 lucidos.events.emit(type: string, payload: Record<string, unknown>, options?: EmitOptions): Promise<void>
@@ -640,7 +638,7 @@ interface LucidosEvent {
 }
 
 interface EmitOptions {
-  /** Skip persistence — broadcast on SSE only. */
+  /** Skip persistence: broadcast on SSE only. */
   transient?: boolean;
 }
 ```
@@ -655,7 +653,7 @@ await lucidos.events.emit('HabitCompleted', {
   streak: 5
 });
 
-// Emit a transient coordination signal — reaches SSE consumers but
+// Emit a transient coordination signal: it reaches SSE consumers but
 // is not written to the event store. Use for heartbeats and ephemeral
 // state broadcasts (e.g. presenter↔remote view sync).
 await lucidos.events.emit('SlidePresenterState', {
@@ -690,9 +688,9 @@ for (const e of completions) {
 
 ### Paging with `before_event_id` / `after_event_id`
 
-Rows come back **newest first** (`created DESC, id DESC`) and `limit` is clamped to 1000, so anything longer than one page needs a cursor rather than a bigger `limit`. Pass the id of the oldest row you received as `before_event_id` to get the next page backwards; pass the newest id you already stored as `after_event_id` to tail-follow what has arrived since. Both cursors are exclusive, and both are ids from `LucidosEvent.id` (not `sequence`).
+Rows come back **newest first** (`created DESC, id DESC`) and `limit` is clamped to 1000, so a longer read needs a cursor. Pass the oldest id you received as `before_event_id` to page backwards. Pass the newest id you stored as `after_event_id` to tail-follow what arrived since. Both cursors are exclusive, and both take `LucidosEvent.id` (not `sequence`).
 
-The two are mutually exclusive: set both and the engine answers 400, since "strictly older than X AND strictly newer than Y" has no coherent paging meaning. A cursor id matching no event is a 404, never a silently unfiltered page. `after_event_id` still returns newest-first, so a tail longer than `limit` gives you the most recent slice, not the rows immediately after the cursor.
+The two are mutually exclusive: set both and the engine answers 400. A cursor id matching no event is a 404, never a silently unfiltered page. `after_event_id` still returns newest-first, so a tail longer than `limit` gives the most recent slice, not the rows right after the cursor.
 
 ```js
 // Walk backwards from newest until we reach an event we already have.
@@ -715,16 +713,16 @@ async function eventsNewerThan(knownId) {
 }
 ```
 
-## lucidos.proxy — Call External APIs
+## lucidos.proxy: Call External APIs
 
-Call backends configured in `data/config/apis.json` through the engine. The engine injects the configured auth header from the credential store. It strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request, and with them every `x-lucidos-*` header and the two `x-forwarded-*` ones the gateway owns. So **the credential never enters the iframe**, and no Lucidos credential reaches the upstream.
+Call backends configured in `data/config/apis.json` through the engine. The engine injects the configured auth header from the credential store. It strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request, plus every `x-lucidos-*` header and the two `x-forwarded-*` ones the gateway owns. So **the credential never enters the iframe**, and no Lucidos credential reaches the upstream.
 
-This is the preferred way for app UIs to talk to external HTTP APIs. Direct `fetch` from the iframe runs into two walls:
+This is the preferred way for app UIs to call external HTTP APIs. Direct `fetch` from the iframe hits two walls:
 
-- **Mixed content** — apps load over HTTPS, so `fetch('http://localhost:5005/...')` is blocked by the browser.
-- **CORS** — the upstream rarely whitelists the engine's origin, so cross-origin XHR fails.
+- **Mixed content:** apps load over HTTPS, so the browser blocks `fetch('http://localhost:5005/...')`.
+- **CORS:** the upstream rarely allows the engine's origin, so cross-origin XHR fails.
 
-`lucidos.proxy` sidesteps both: the request reaches the engine, which forwards it server-side. From an app frame it travels over the host bridge, and from a standalone app tab it goes direct. Either way the upstream call is made by the engine.
+`lucidos.proxy` sidesteps both: the engine makes the upstream call server-side. From an app frame the request travels over the host bridge, and from a standalone app tab it goes direct.
 
 ```ts
 lucidos.proxy(name: string): ProxyClient
@@ -734,7 +732,9 @@ interface ProxyClient {
 }
 ```
 
-`fetch` returns the raw `Response` so the caller picks how to read the body (`.json()`, `.text()`, `.blob()`, …). The auth header is added server-side; do not set `Authorization` from the iframe.
+`fetch` returns the raw `Response`, so you pick how to read the body (`.json()`, `.text()`, `.blob()`, …). The engine adds the auth header, so do not set `Authorization` from the iframe.
+
+**A model call through it records its own cost.** When the upstream is a model provider, the engine reads the usage block from the reply and writes a `ContextCaptured` with `purpose: "proxy"`. An app never reports its own model spend, and the Token Cost app counts it. To read that block, the engine asks a model provider for an uncompressed reply, so `Content-Encoding` is absent there.
 
 **The upstream cannot act on the Lucidos origin.** The engine serves the response from its own origin, so it passes only the headers a caller reads:
 
@@ -744,9 +744,9 @@ interface ProxyClient {
 
 The engine drops everything else. That covers `Set-Cookie`, `Clear-Site-Data`, `Strict-Transport-Security`, a CSP, CORS headers, `Alt-Svc` and `WWW-Authenticate`, and any other vendor header. Every response carries `X-Content-Type-Options: nosniff`. An HTML, XML or untyped one also carries `Content-Security-Policy: sandbox`, so a proxy URL opened in a tab never runs upstream script.
 
-**A response is buffered, so it does not stream.** The engine reads the whole upstream body before it answers, from a frame and from a standalone tab alike. A token stream therefore arrives complete rather than as it is generated. Render the finished answer.
+**A response is buffered, so it does not stream.** The engine reads the whole upstream body before it answers, from a frame or a standalone tab. A token stream arrives complete, so render the finished answer.
 
-**The engine waits 30 seconds on the upstream by default, then answers 504.** A streamed reply counts in full. Raise the wait for every route with the `proxy_timeout_secs` preference, or for one entry with `timeout_secs` in `apis.json`; both accept 1 to 600. See `system-knowhow/lucidos-cli.md` § Timeouts. One proxied call never runs past 600 seconds in total, and the bridge waits 660, so it never gives up before the engine does.
+**The engine waits 30 seconds on the upstream by default, then answers 504.** A streamed reply counts in full. Raise the wait for every route with the `proxy_timeout_secs` preference, or for one entry with `timeout_secs` in `apis.json`. Both accept 1 to 600 (`system-knowhow/lucidos-cli.md` § Timeouts). One proxied call never runs past 600 seconds in total, and the bridge waits a little longer, so it never gives up first.
 
 ### Configure the backend (one-time)
 
@@ -762,16 +762,16 @@ The engine drops everything else. That covers `Set-Cookie`, `Clear-Site-Data`, `
 }
 ```
 
-Authentication is configured per-API and applied server-side — the iframe never sees credentials, and the URL pattern (`/api/v1/proxy/<name>/<path>`) is identical regardless of auth mode. See `system-knowhow/lucidos-cli.md` § `lucidos proxy` for the full `apis.json` schema (bearer / api_key / basic / query_param / hmac_signed / script_handshake). Omit `auth` for unauthenticated backends (e.g. local services).
+Auth is configured per API and applied server-side. The URL pattern (`/api/v1/proxy/<name>/<path>`) is the same in every auth mode. See `system-knowhow/lucidos-cli.md` § `lucidos proxy` for the full `apis.json` schema (bearer / api_key / basic / query_param / hmac_signed / script_handshake). Omit `auth` for unauthenticated backends (e.g. local services).
 
 ### Examples
 
 ```js
-// GET — unauthenticated local backend
+// GET: unauthenticated local backend
 const res = await lucidos.proxy('sonos').fetch('/living-room/play');
 if (!res.ok) throw new Error(`Sonos: HTTP ${res.status}`);
 
-// POST JSON — auth header injected by engine
+// POST JSON: the engine injects the auth header
 const res = await lucidos.proxy('comfort').fetch('/api/v1/devices', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
@@ -782,35 +782,35 @@ const data = await res.json();
 
 ### Built-in model-provider proxies (no `apis.json` entry needed)
 
-The engine already holds working credentials + routing for every model provider in the model registry (Settings → Models), plus TypeSafe. Those are exposed as **built-in provider proxies** under the SAME route. An app can then call an LLM / image / judgment provider without the workspace re-entering the credential in `apis.json`. When `<name>` matches one of them and has no `apis.json` entry, the engine forwards to that provider's API root and injects its credential server-side:
+The engine already holds credentials and routing for every model provider in the model registry (Settings → Models), plus TypeSafe. It exposes them as **built-in provider proxies** under the SAME route. So an app can call an LLM / image / judgment provider with no `apis.json` entry. When `<name>` matches one and has no `apis.json` entry, the engine forwards to that provider's API root and injects its credential server-side:
 
 | `proxy(name)` | Base URL | Injected server-side | You send |
 |---|---|---|---|
 | `openai` | `https://api.openai.com/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/chat/completions`, `/images/generations` |
 | `openrouter` | `https://openrouter.ai/api/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/chat/completions` |
 | `xai` | `https://api.x.ai/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/chat/completions` |
-| `anthropic` | `https://api.anthropic.com/v1` | `x-api-key: <key>` (or `Authorization: Bearer` for an OAuth credential) | path as-is, e.g. `/messages` — set your own `anthropic-version` header |
+| `anthropic` | `https://api.anthropic.com/v1` | `x-api-key: <key>` (or `Authorization: Bearer` for an OAuth credential) | path as-is, e.g. `/messages`; set your own `anthropic-version` header |
 | `local` | your configured local base (Ollama default `http://localhost:11434/v1`) | `Authorization: Bearer <key>` (omitted if keyless) | path as-is, e.g. `/chat/completions` |
 | `vertex` | `https://<region>-aiplatform.googleapis.com/v1/projects/<project>/locations/<region>` (engine-owned prefix) | `Authorization: Bearer <access-token>` (minted + refreshed server-side) | ONLY the suffix, e.g. `/publishers/anthropic/models/claude-opus-4-8@default:rawPredict` |
 | `typesafe` | `https://api.typesafe.ai/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/systemone` |
 
-- **Only the credential is injected.** The layer adds just the auth header (the secret the iframe must never see). `Content-Type`, `anthropic-version`, and any attribution headers stay yours to set in `init`.
-- **`apis.json` overrides the builtin.** An entry with the same name in `data/config/apis.json` is used instead — so you can still point `openai` at a mock/gateway or add extra auth layers.
-- **Vertex is addressed by suffix.** The engine owns the `…/projects/<project>/locations/<region>` prefix (project + region from its own Vertex config, region default `europe-west1`) and mints the OAuth token — so the app never needs the project id or a token. Send only `/publishers/<publisher>/models/<model>:<method>`. The region is fixed to the engine's configured region; a model that must run in another location (e.g. a `global`-only Gemini variant) needs an `apis.json` override.
-- **Not configured → 404.** If the provider has no credential/config (and no `apis.json` entry), the call returns 404 naming what to set.
+- **Only the credential is injected.** The layer adds just the auth header. `Content-Type`, `anthropic-version` and any attribution headers stay yours to set in `init`.
+- **`apis.json` overrides the builtin.** A same-name entry in `data/config/apis.json` wins, so you can point `openai` at a mock/gateway or add auth layers.
+- **Vertex is addressed by suffix.** The engine owns the `…/projects/<project>/locations/<region>` prefix (from its own Vertex config, region default `europe-west1`) and mints the OAuth token. Send only `/publishers/<publisher>/models/<model>:<method>`. The region is the engine's configured one. A model that must run elsewhere (e.g. a `global`-only Gemini variant) needs an `apis.json` override.
+- **Not configured → 404.** With no credential/config and no `apis.json` entry, the call returns 404 naming what to set.
 - **Every default base already includes `/v1`.** Send `/models`, never `/v1/models`, which doubles the segment and answers 404. A `local` base you configure yourself may lack it.
 - **`opencode-free` has no proxy.** The keyless free tier serves chat only, and an app must not build on an anonymous endpoint that can vanish without notice (ADR 0104).
 - **The same proxies serve scripts and the agent.** `lucidos proxy <name>` and the `proxy_request` tool resolve names exactly as this route does.
 
 ```js
-// Chat via the built-in OpenAI proxy — no apis.json, no key in the app
+// Chat via the built-in OpenAI proxy: no apis.json, no key in the app
 const res = await lucidos.proxy('openai').fetch('/chat/completions', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hi' }] }),
 });
 
-// Claude on Vertex — the app sends only the publisher/model suffix
+// Claude on Vertex: the app sends only the publisher/model suffix
 const res = await lucidos.proxy('vertex').fetch(
   '/publishers/anthropic/models/claude-opus-4-8@default:rawPredict',
   { method: 'POST', headers: { 'Content-Type': 'application/json' }, body },
@@ -827,7 +827,7 @@ const res = await lucidos.proxy('vertex').fetch(
 | Call any other external HTTP API | `lucidos.proxy(name).fetch(path, init)` + an `apis.json` entry |
 | Hit an engine endpoint no SDK method covers | `lucidos.request('/<suffix>', init)`. It travels the same bridge, and the engine decides which routes an app may reach. See § `lucidos.request`. |
 
-If the iframe needs a model provider the engine already has, use its built-in proxy name above — no config. For any other external API the workspace doesn't have a proxy entry for, add one to `data/config/apis.json` rather than embedding the credential in the app.
+For any other external API, add an entry to `data/config/apis.json` rather than embedding the credential in the app.
 
 ## lucidos.apiUrl
 
@@ -845,66 +845,55 @@ img.src = lucidos.apiUrl('/static/some-asset.png');
 ```
 
 **A `fetch` of what this returns does NOT work inside the host shell.** The
-frame's origin is opaque, so the engine is cross-origin to it and CORS refuses
-the answer. WebKit reports that as `Load failed` and Chromium as a `TypeError`,
-neither of which names the cause. What still works is a URL the browser fetches
-for you: a `src`, an `href`, a stylesheet.
+frame's origin is opaque, so CORS refuses the engine's answer. WebKit reports
+`Load failed` and Chromium a `TypeError`, and neither names the cause. A URL
+the browser fetches for you still works: a `src`, an `href`, a stylesheet.
 
 **So this builds URLs, and never makes calls.** For an endpoint with no SDK
-method, use `lucidos.request` below: it travels the bridge and works in both
-realms.
-
-**For everything else, use the SDK method.** `lucidos.data.*`, `lucidos.events.*`
-and the rest resolve the prefix and travel over the bridge. They also carry the
-timeout, error shape and response parsing a raw `fetch` does not.
+method, use `lucidos.request` below, which travels the bridge. For everything
+else use the SDK method: it resolves the prefix, travels the bridge, and
+carries the timeout, error shape and response parsing a raw `fetch` lacks.
 
 ### Why a hand-written `/api/v1/…` does not work
 
 An app iframe is served at `/<workspace>/app/<app-id>/`, and the engine's HTTP
-surface lives at `/<workspace>/api/v1/…`. Both of the URLs an author reaches for
-first resolve somewhere else:
+surface lives at `/<workspace>/api/v1/…`. The two URLs an author reaches for
+first both resolve somewhere else:
 
 | Written in JS | Resolves to | Answer |
 |---|---|---|
 | `new URL('api/v1/events/query', document.baseURI)` | your app's own directory, plus `api/v1/events/query` | `404` |
 | `fetch('/api/v1/events/query')` | `/api/v1/events/query` | `404 unknown workspace 'api'` |
 
-**Inside the host shell the call fails before it gets that far.** An app frame
-has an opaque origin, so every request it makes to the engine is cross-origin,
-and the engine grants no CORS. The `fetch` rejects with a `TypeError` and your
-code never sees a status. The addresses above are what a standalone app tab, a
-top-level document on the engine's own origin, still resolves.
+**Inside the host shell the call fails before it gets that far.** Every request
+from the opaque-origin frame to the engine is cross-origin, and the engine
+grants no CORS. The `fetch` rejects with a `TypeError` and your code never sees
+a status. The table shows what a standalone app tab, on the engine's own origin,
+resolves.
 
 The relative form fails because **`document.baseURI` is your app's own
-directory**, so every relative path hangs off it. Behind a gateway that
-directory also carries your frame's pass to its own files. A pass reaches no
-engine route, so the URL is wrong twice over. The root-absolute form fails
-because the gateway reads the **first path segment as a workspace name**, and
-there is no workspace called `api`.
+directory**. Behind a gateway that directory also carries your frame's pass,
+which reaches no engine route, so the URL is wrong twice over. The root-absolute
+form fails because the gateway reads the **first path segment as a workspace
+name**, and there is no workspace called `api`.
 
-**Markup is rewritten on the way out, runtime JS is not.** This is the
-non-obvious part, and it is why the boilerplate in § Setup works at all: the
-engine rewrites root-absolute `src` / `href` **attributes** in the HTML it
-serves, so the `<script src="/api/v1/sdk.js">` sitting in the app's
-`index.html` reaches the browser as
-`<script src="/<workspace>/api/v1/sdk.js">`. Nothing does that for a string your
-JavaScript builds at runtime. **The same `/api/v1/…` string is correct in markup
-and broken in JS.**
+**Markup is rewritten on the way out, runtime JS is not.** The engine rewrites
+root-absolute `src` / `href` **attributes** in the HTML it serves. So the
+`<script src="/api/v1/sdk.js">` in `index.html` reaches the browser as
+`<script src="/<workspace>/api/v1/sdk.js">`, which is why the § Setup
+boilerplate works. Nothing rewrites a string your JavaScript builds at runtime.
+**The same `/api/v1/…` string is correct in markup and broken in JS.**
 
-`apiUrl` derives the prefix the way the SDK derives it internally: the
-`<base href>` when the document has one, minus your frame's pass, and otherwise
-everything before `/app/` in the path. Don't re-derive it in app code, and never
-hardcode a slug: the workspace name is not the app's to know.
-(`lucidos.configure({ baseUrl })` is the one override, for an app hosted outside
-the engine.)
+`apiUrl` derives the prefix as the SDK does internally: the `<base href>` when
+the document has one, minus your frame's pass, otherwise everything before
+`/app/` in the path. Don't re-derive it, and never hardcode a slug: the
+workspace name is not the app's to know. `lucidos.configure({ baseUrl })` is the
+one override, for an app hosted outside the engine.
 
-**The failure mode is silence.** Neither failure names itself: a wrong URL is a
-plain 404, and a refused one is `Load failed` on WebKit or a `TypeError` on
-Chromium. An app that catches it, warns to the console and falls back to a
-second data source goes on looking healthy. It renders plausible, stale numbers
-and nothing on screen changes. That is how this survived weeks in a real app.
-If a fetch of yours has a fallback path, surface the failure in the UI as well
-as the console.
+**The failure mode is silence.** A wrong URL is a plain 404, and a refused one is
+`Load failed` or a `TypeError`. An app that catches it, warns to the console and
+falls back to a second data source looks healthy while it renders stale numbers.
+If a fetch of yours has a fallback path, surface the failure in the UI too.
 
 ## lucidos.request: an endpoint no namespace covers
 
@@ -918,8 +907,8 @@ a non-2xx raises `SdkError`, and an empty body resolves to `null`. Same 10s
 deadline and `TimeoutError` as every other method.
 
 From an app frame it travels the host bridge, so it works where a raw
-`fetch(lucidos.apiUrl(...))` is refused. From an app opened in its own browser
-tab it goes direct. Same call, same contract, both realms.
+`fetch(lucidos.apiUrl(...))` is refused. From its own browser tab it goes
+direct, with the same contract.
 
 ```js
 // Read the workspace's environment variables. They are NOT secret: every app
@@ -972,10 +961,10 @@ app runs in. The whole reachable set, with the methods each opens:
 | `/themes/resolve` | POST |
 
 Most of those have a namespace of their own, which is the better way to call
-them. The generated `packages/lucidos-sdk/src/generated/app-reach.ts` is the
-exact list, and it cannot drift: the engine writes it.
+them. The engine writes the exact list to
+`packages/lucidos-sdk/src/generated/app-reach.ts`, so it cannot drift.
 
-Denied, and each for a reason worth knowing:
+Denied, and why:
 
 | Denied | Why |
 |---|---|
@@ -991,17 +980,17 @@ Denied, and each for a reason worth knowing:
 | repositories, `/browse-directories`, `/workspaces` | outside the workspace |
 
 If your app needs a denied route, say so rather than working around it. The
-answer lives in `crates/lucidos-engine/src/api/app_reach.rs`, and opening one is
-a deliberate decision recorded in ADR 0231.
+list lives in `crates/lucidos-engine/src/api/app_reach.rs`, and opening a route
+is a deliberate decision (ADR 0231).
 
 **Prefer a namespace where one exists.** `lucidos.data.read` gives you text
 rather than JSON, `lucidos.triggers.create` validates the cron before it sends,
 and `lucidos.proxy` handles a non-JSON body. This is the hatch, not the front
 door.
 
-## lucidos.oauth — OAuth Token Access
+## lucidos.oauth: OAuth Token Access
 
-Fetch a short-lived OAuth access token for a connected provider, for in-browser SDKs that need a bearer token in JavaScript (e.g. the Spotify Web Playback SDK). The engine looks up the connected account, refreshes the token if it's expired or expiring within 60s, and returns ONLY the access token — the refresh token never leaves the engine.
+Fetch a short-lived OAuth access token for a connected provider, for in-browser SDKs that need a bearer token in JavaScript (e.g. the Spotify Web Playback SDK). The engine looks up the connected account and refreshes the token if it is expired or expires within 60s. It returns ONLY the access token: the refresh token never leaves the engine.
 
 ```ts
 lucidos.oauth.getAccessToken(provider: string): Promise<AccessToken>
@@ -1014,10 +1003,10 @@ interface AccessToken {
 
 ### When to use
 
-- **You need a bearer token in the iframe**: a third-party SDK like `Spotify.Player` calls a `getOAuthToken` callback expecting a raw token string. There is no other way to hand it the credential — `lucidos.proxy(...)` can't help because the SDK initiates the request itself, not through your code.
-- **You are NOT making ordinary HTTP calls to the upstream API**: for those, use `lucidos.proxy(<provider>).fetch(...)` instead — the engine attaches the bearer header server-side and the iframe never sees the token. Only fall back to `getAccessToken` when something forces you to hand a raw token to in-browser code.
+- **You need a bearer token in the iframe**: a third-party SDK like `Spotify.Player` calls a `getOAuthToken` callback expecting a raw token string. `lucidos.proxy(...)` can't help, because the SDK makes the request itself.
+- **Not for ordinary HTTP calls to the upstream API**: use `lucidos.proxy(<provider>).fetch(...)`, so the engine attaches the bearer header and the iframe never sees the token.
 
-### Example — Spotify Web Playback SDK
+### Example: Spotify Web Playback SDK
 
 ```js
 const player = new Spotify.Player({
@@ -1031,18 +1020,18 @@ const player = new Spotify.Player({
 await player.connect();
 ```
 
-The SDK calls `getOAuthToken` on first init and again when it detects the token has expired — each call hits the engine, which refreshes from the stored refresh token if needed.
+The SDK calls `getOAuthToken` on first init and again when the token expires. Each call hits the engine, which refreshes from the stored refresh token if needed.
 
 ### Errors
 
-- `404` — the provider is not connected for this workspace. Ask the user to connect it via the OAuth account settings (or through the LLM `connect_oauth_account` tool).
-- `502` — the engine could not refresh the token (missing client credentials, upstream rejected the refresh, network failure).
+- `404`: the provider is not connected for this workspace. Ask the user to connect it in the OAuth account settings (or through the LLM `connect_oauth_account` tool).
+- `502`: the engine could not refresh the token (missing client credentials, upstream rejected the refresh, network failure).
 
 ### Security note
 
-The refresh token, client_id, client_secret, and PKCE state stay on the server. The iframe receives ONLY the short-lived access token, scoped to the connected account. Apps therefore must NOT cache the access token in `localStorage` / `sessionStorage` — re-call `getAccessToken` whenever you need a fresh one (the engine handles caching and refresh).
+The refresh token, client_id, client_secret and PKCE state stay on the server. The iframe receives ONLY the short-lived access token, scoped to the connected account. Do NOT cache it in `localStorage` / `sessionStorage`: re-call `getAccessToken` when you need one, and the engine handles caching and refresh.
 
-## lucidos.triggers — Scheduled Tasks
+## lucidos.triggers: Scheduled Tasks
 
 CRUD operations for cron-based and event-based triggers.
 
@@ -1057,12 +1046,11 @@ lucidos.triggers.run(id: string): Promise<TriggerRunResult>
 `run` fires an existing trigger **once, right now**, outside its schedule (an
 *off-schedule run*). It is a real fire: it records `TriggerExecuted` /
 `last_run` and runs under the trigger's own identity, side-effect grant and
-`go_to_review` routing, indistinguishable downstream from a scheduled fire. Use
-it for a "Sync now" button in an app rather than re-implementing the trigger's
-work in the app.
+`go_to_review` routing, indistinguishable downstream from a scheduled fire. Use it for a "Sync now" button
+rather than re-implementing the trigger's work in the app.
 
 It resolves when the run is **admitted**, not when it finishes, so a truthy
-`success` is not "the work is done". Branch on `status`:
+`success` does not mean the work is done. Branch on `status`:
 
 | `status` | Meaning |
 |---|---|
@@ -1082,11 +1070,11 @@ type TriggerRun =
   | { type: 'script'; path: string };
 
 // One event the trigger listens for, with an optional payload filter scoped
-// to that event. A trigger may carry several entries — it fires when an
+// to that event. A trigger may carry several entries. It fires when an
 // incoming event matches *any* entry's event_type AND that entry's
 // condition (if set) evaluates true against the payload. Conditions are
-// per-entry so different events with different payload shapes never
-// constrain each other.
+// per-entry, so events with different payload shapes never constrain
+// each other.
 interface EventSubscription {
   event_type: string;
   condition?: Record<string, unknown>;
@@ -1095,7 +1083,7 @@ interface EventSubscription {
 // Irreversible-side-effect category a trigger can be granted. Only enforced
 // when the workspace's command guard is on (Settings → Permissions → Command
 // Safety). A trigger that hits an irreversible command whose category isn't in
-// its grant is failed (it can't be asked to approve — it runs unattended).
+// its grant fails, since it runs unattended and cannot ask for approval.
 type SideEffectCategory =
   | 'email'
   | 'external_api'
@@ -1118,7 +1106,7 @@ interface Trigger {
   // Event subscriptions. Empty for schedule-only triggers; the engine omits
   // the field rather than emitting `[]`, so readers must tolerate absence.
   on?: EventSubscription[];
-  // Side-effect grant — irreversible categories this trigger may perform
+  // Side-effect grant: irreversible categories this trigger may perform
   // unattended. Omitted when empty (= no grant).
   side_effect_grant?: SideEffectCategory[];
   // Chat model this trigger's intent fires on, and its thinking budget. Both
@@ -1137,7 +1125,7 @@ interface CreateTrigger {
   on?: EventSubscription[];
   /** Optional *trigger group* id; omit for ungrouped. */
   group_id?: string;
-  /** Side-effect grant — irreversible categories this trigger may perform
+  /** Side-effect grant: irreversible categories this trigger may perform
    *  unattended. Omit / `[]` = none granted (the safe default). */
   side_effect_grant?: SideEffectCategory[];
   /** Pin the intent to a chat model and a thinking budget
@@ -1154,7 +1142,7 @@ interface UpdateTrigger {
   run?: TriggerRun;
   cron_expressions?: string[];
   paused?: boolean;
-  // Full replacement for the subscription list. Send the complete new set —
+  // Full replacement for the subscription list. Send the complete new set:
   // there is no partial edit. Pass `[]` to clear all subscriptions.
   on?: EventSubscription[];
   /** Move into a group (string id), clear membership (null), or leave it
@@ -1215,19 +1203,19 @@ await lucidos.triggers.create({
 });
 ```
 
-Each entry's `condition` only applies to its own `event_type` — the `from: 'partner'` filter on `MessageReceived` does NOT block `EmailReceived` from firing on its own filter.
+Each entry's `condition` applies only to its own `event_type`. The `from: 'partner'` filter on `MessageReceived` does NOT block `EmailReceived` from firing on its own filter.
 
 ### Cron validation on create and update
 
-Within one cron expression the fields are **ANDed**; across the array they are **ORed**. So `0 0 9 1 * Mon` fires only when the 1st IS a Monday (roughly 1.7 times a year), not on the 1st and every Monday, which is two expressions. See `system-knowhow/triggers.md` § "Writing cron expressions" for the nth-weekday and last-weekday recipes.
+Within one cron expression the fields are **ANDed**. Across the array they are **ORed**. So `0 0 9 1 * Mon` fires only when the 1st IS a Monday (roughly 1.7 times a year). The 1st plus every Monday takes two expressions. See `system-knowhow/triggers.md` § "Writing cron expressions" for the nth-weekday and last-weekday recipes.
 
-An expression that can **never** fire (`0 0 9 31 2 *`, Feb 31, and its relatives) is rejected: `success: false` with an `error` naming the offending fields. Do not retry it, and do not present it to the user as a transient failure; the expression itself is wrong.
+An expression that can **never** fire (`0 0 9 31 2 *`, Feb 31, and its relatives) is rejected: `success: false` with an `error` naming the offending fields. Do not retry it or present it as a transient failure: the expression itself is wrong.
 
-Every accepted create / update returns `cron_preview`. Show `next_runs` in your app's confirmation so the user sees what they actually scheduled, and surface each entry of `warnings` (currently the day-of-month/day-of-week AND footgun) rather than dropping it.
+Every accepted create / update returns `cron_preview`. Show `next_runs` in your confirmation so the user sees what they scheduled. Surface each entry of `warnings` (currently the day-of-month/day-of-week AND footgun) rather than dropping it.
 
-Trigger groups are user-visible folders shown in the triggers panel. Pure organizational labels — they have no schedule, run no code, and don't coordinate firing. Apps that organize the triggers they create can pass `group_id` to `create` / `update`; the engine validates the id against the workspace's group registry and rejects unknown values. The SDK does not expose group CRUD today — group management lives behind the engine's HTTP and LLM-tool surfaces.
+Trigger groups are user-visible folders in the triggers panel: pure labels that have no schedule, run no code and don't coordinate firing. An app can pass `group_id` to `create` / `update`. The engine checks the id against the workspace's group registry and rejects unknown values. The SDK has no group CRUD: group management lives behind the engine's HTTP and LLM-tool surfaces.
 
-## lucidos.apps — App Management
+## lucidos.apps: App Management
 
 ```ts
 lucidos.apps.list(): Promise<App[]>
@@ -1262,35 +1250,34 @@ const me = await lucidos.apps.get('habit-tracker');
 console.log(me.name, me.icon ?? '(no icon)');
 ```
 
-## lucidos.preferences — User Settings
+## lucidos.preferences: User Settings
 
 ```ts
 lucidos.preferences.get(deviceId?: string | null): Promise<Preferences>
 lucidos.preferences.set(key: string, value: string, deviceId?: string): Promise<void>
 ```
 
-`get()` defaults to the device the app is running on, so it sees the same merged
-view as the shell around it. That matters because theme, font and scale are
-device-scoped: a read naming no device gets only the global rows. The device id
-is per-workspace, and an app never handles it. An app frame names the device it
-is in, and the host substitutes the id. A standalone app tab reads the id
-itself. A popped-out tab follows the shell it left, named by the `?device=` in
-its URL, so it keeps that shell's theme. Otherwise the tab reads the
-workspace-scoped `ws:<slug>:lucidos-device-id`. Pass `null` to fetch only
-globally-scoped preferences.
+`get()` defaults to the device the app runs on, so it sees the same merged view
+as the shell. Theme, font and scale are device-scoped, and a read naming no
+device gets only the global rows. The device id is per-workspace, and an app
+never handles it. An app frame names its device, and the host substitutes the
+id. A standalone app tab reads the id itself.
 
-`set()` refuses a key the Lucidos Agent may not write either, such as
+A popped-out tab follows the shell it left, named by the `?device=` in its URL,
+so it keeps that shell's theme. Otherwise the tab reads the workspace-scoped
+`ws:<slug>:lucidos-device-id`. Pass `null` to fetch only global preferences.
+
+`set()` refuses any key the Lucidos Agent may not write, such as
 `command_guard`, `max_tool_calls`, `network_bind` or `local_base_url`. Those
-are security settings, and the user changes them in Settings. It also refuses
-the keys that choose what a coding-agent session spawns
-(`coding_agent_claude_path`, `coding_agent_codex_path`,
-`coding_agent_claude_permission_mode`).
+are security settings the user changes in Settings. It also refuses the keys
+that choose what a coding-agent session spawns (`coding_agent_claude_path`,
+`coding_agent_codex_path`, `coding_agent_claude_permission_mode`).
 
-The engine's own bookkeeping, such as the Web Push keypair in `vapid_keys`, is
-not a setting. `get()` leaves it out, and `set()` refuses it.
+Engine bookkeeping, such as the Web Push keypair in `vapid_keys`, is not a
+setting: `get()` leaves it out, and `set()` refuses it.
 
-Every refusal rejects the promise with the engine's reason. That includes a
-value the engine will not store, such as a malformed timezone.
+Every refusal rejects the promise with the engine's reason, including a value
+the engine will not store, such as a malformed timezone.
 
 ### Types
 
@@ -1309,7 +1296,75 @@ type Preferences = Record<string, string>;
 | `motion` | `system`, `reduce`, `full` | Whether this device reduces motion. `system` (the default) follows the OS. Read it as `data-motion` on `<html>` (§ Reduced motion, under Setup) |
 | `theme-effects` | `system`, `reduce`, `full` | Whether this device shows a theme's part shadows, filters and scanlines. `system` (the default) drops them when the OS asks for more contrast or less transparency. Read it as `data-theme-effects` on `<html>` (§ Theme parts, under Setup) |
 
-## lucidos.notifications — Notification Center
+## lucidos.storage: Per-Device App State
+
+```ts
+lucidos.storage.local: AppStore    // kept across reloads, on this device
+lucidos.storage.session: AppStore  // kept until the Lucidos tab closes
+lucidos.storage.ready: Promise<void>
+lucidos.storage.onError(handler: (failure: StorageFailure) => void): () => void
+lucidos.storage.quota: number      // per app, per area: characters of key plus value
+lucidos.storage.valueMax: number   // the largest single value, in characters
+
+interface AppStore {               // the `Storage` interface
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+  clear(): void;
+  key(index: number): string | null;
+  readonly length: number;
+}
+
+interface StorageFailure {
+  op: 'set' | 'remove' | 'clear';
+  area: 'local' | 'session';
+  key: string | null;              // null for clear()
+  message: string;
+}
+```
+
+An app frame has an opaque origin, so its own `localStorage`, `sessionStorage`,
+IndexedDB and cookies throw. These two stores take their place, with the same
+calls. The values live in the Lucidos shell's own browser storage, so they stay
+on this device, like `localStorage`. Each app sees only its own keys: the host
+decides which app a frame is, and nothing the app sends can name another.
+
+**Await `ready` before the first read.** The frame cannot read the shell's
+storage directly, so the SDK fetches this app's values once at load. Reads are
+synchronous after that. A read before `ready` resolves sees nothing stored, and
+the console says so once. `ready` resolves at once in a standalone app tab.
+
+```js
+await lucidos.storage.ready;
+const saved = JSON.parse(lucidos.storage.local.getItem('state') || '{}');
+
+function save(state) {
+  lucidos.storage.local.setItem('state', JSON.stringify(state));
+}
+```
+
+Moving off `localStorage` is a rename plus that one `await`. There is no
+`window.localStorage` shim: an unchanged app reads before `ready`, so a shim
+would still forget its state.
+
+**Limits.** Each app may keep `quota` characters per area, and one value may be
+`valueMax` characters long. A write past either throws a `QuotaExceededError`
+`DOMException` at once, as `localStorage` does, and stores nothing.
+
+**A write the host refuses later**, such as when the browser's storage is full,
+is rolled back and passed to every `onError` handler. The user also sees a toast
+naming the app. With no handler the console logs it.
+
+**What it is not:**
+
+- Not shared across devices or browsers. Use `lucidos.data` for that.
+- Not synced between two open frames of one app, and no `storage` event fires.
+- Not for secrets such as tokens. See § `lucidos.oauth`.
+- Cleared when the app is deleted, but only on a device with Lucidos open at
+  that moment. Another device keeps its copy, and an app later installed there
+  under the same id sees it.
+
+## lucidos.notifications: Notification Center
 
 ```ts
 lucidos.notifications.list(params?: {
@@ -1385,8 +1440,8 @@ interface Notification {
   /** Originating thread, when the notification has one. Drives the inbox
    *  modal's "Open thread" button. */
   thread_id?: string;
-  /** Specific event UUID inside `thread_id` that raised this notification —
-   *  the §4 in-app matrix uses it to silently mark-read when the user is
+  /** Specific event UUID inside `thread_id` that raised this notification.
+   *  The §4 in-app matrix uses it to silently mark-read when the user is
    *  looking at the source event. Distinct from `tap.to.event_id` (which
    *  is the scroll-and-pulse target when the tap navigates to a thread). */
   event_id?: string;
@@ -1405,16 +1460,14 @@ interface NotificationListResult {
 }
 ```
 
-### Tap shapes — examples
+### Tap shapes: examples
 
-The SDK exposes `list` / `markRead` / `markAllRead` for reading the inbox. Creating one goes through `lucidos.request('/notifications', …)`, the same wire shape the `lucidos notify` CLI and the `send_notification` LLM tool produce.
-
-The examples below run from an app frame and from a standalone app tab alike. Each `body` is the wire shape, so the CLI and the tool take the same fields.
+The SDK exposes `list` / `markRead` / `markAllRead` for reading the inbox. Create a notification with `lucidos.request('/notifications', …)`. Each `body` below is the wire shape the `lucidos notify` CLI and the `send_notification` LLM tool also take. The examples run from an app frame or a standalone app tab.
 
 ```js
 // Default: open the inbox detail showing the message body. Use this for any
-// info-only notification too ("OAuth completed", "Build succeeded") — every
-// notification is openable; there is no separate passive kind. For ephemeral
+// info-only notification too ("OAuth completed", "Build succeeded"): every
+// notification is openable, and there is no passive kind. For ephemeral
 // status that should NOT land in the inbox at all, use a plain `showToast`.
 await lucidos.request('/notifications', {
   method: 'POST',
@@ -1438,13 +1491,11 @@ await lucidos.request('/notifications', {
 });
 
 // Navigate to a thread, optionally scroll-and-pulse a specific event row.
-// Both ids are uuids, and the engine refuses anything else with a 400: a tap
-// the page cannot resolve is a dead deep link the reader meets as
-// `Thread "<id>" no longer exists`. The agent-only `current` alias means "the
-// thread I am working in", which an app does not have, so it is refused here
-// too. Take the ids from whatever you are notifying about. The event must live
-// in that thread: a domain event, or one from another thread, is refused with a
-// 400, because no transcript could show it.
+// Both ids must be uuids, or the engine answers 400. An unresolvable tap is a
+// dead deep link the reader meets as `Thread "<id>" no longer exists`. The
+// agent-only `current` alias is refused too, since an app has no current
+// thread. Take the ids from whatever you are notifying about. The event must
+// live in that thread: a domain event, or one from another thread, is a 400.
 const threadId = '4f1c2e8a-9d3b-4c17-8a55-0b6e2f7d1c93';
 const eventId = 'b7e04a12-5f6c-4d29-9e31-8c2a6d4b70f5';
 await lucidos.request('/notifications', {
@@ -1476,20 +1527,20 @@ await lucidos.request('/notifications', {
 });
 ```
 
-From scripts (Python/bash), use the `lucidos notify` CLI — it constructs the same body. From LLM threads, use the `send_notification` tool.
+From scripts (Python/bash), use the `lucidos notify` CLI, which builds the same body. From LLM threads, use the `send_notification` tool.
 
-## lucidos.threads — Thread Management
+## lucidos.threads: Thread Management
 
 ```ts
 lucidos.threads.list(opts?: ThreadsListOptions): Promise<ThreadSummary[]>
 lucidos.threads.count(opts?: Omit<ThreadsListOptions, 'limit'>): Promise<number>
 ```
 
-`list()` calls `GET /api/v1/threads/list` and returns a newest-first array of `ThreadSummary` rows from the projection. `count()` calls `GET /api/v1/threads/count` and resolves to the integer count under the same filter — cheaper on big workspaces than reading `(await list()).length`.
+`list()` calls `GET /api/v1/threads/list` and returns a newest-first array of `ThreadSummary` rows from the projection. `count()` calls `GET /api/v1/threads/count` and resolves to the count under the same filter, cheaper on big workspaces than `(await list()).length`.
 
-Same canonical surface as the `lucidos threads list` / `lucidos threads count` CLI and the `list_threads` / `count_threads` LLM tools. Use this when an app needs to render or react to thread state (counts, status indicators) without subscribing to the full SSE stream.
+Same surface as the `lucidos threads list` / `lucidos threads count` CLI and the `list_threads` / `count_threads` LLM tools. Use it to render thread state (counts, status indicators) without subscribing to the full SSE stream.
 
-**`active` is a union, `status` is precise.** `active: true` selects `running` OR `waiting_for_user_answer`, and those two are opposites: `running` is the workspace working, `waiting_for_user_answer` is the workspace stopped and waiting on a person. An app asking "is anything busy?" wants `status: 'running'`; an app rendering "N threads I have something invested in" wants `active: true`. Passing both is a 400.
+**`active` is a union, `status` is precise.** `active: true` selects `running` OR `waiting_for_user_answer`, which are opposites: the workspace working, or waiting on a person. "Is anything busy?" wants `status: 'running'`. "N threads I have something invested in" wants `active: true`. Passing both is a 400.
 
 ### Types
 
@@ -1497,11 +1548,10 @@ Same canonical surface as the `lucidos threads list` / `lucidos threads count` C
 interface ThreadsListOptions {
   /** The UNION of 'running' and 'waiting_for_user_answer'. true selects it,
    *  false inverts it, omitting it filters nothing. For "is the workspace
-   *  busy?" pass status: 'running' instead: a thread awaiting a user answer is
-   *  blocked on the human, not working. 'waiting' is in neither. Nothing
-   *  writes it now, so it only appears on older rows; a thread carrying
-   *  changes to review is 'idle', or the verdict its turn ended on.
-   *  Mutually exclusive with status. */
+   *  busy?" pass status: 'running': a thread awaiting an answer is blocked
+   *  on the human. 'waiting' is in neither, and appears only on older rows.
+   *  A thread carrying changes to review is 'idle', or the verdict its turn
+   *  ended on. Mutually exclusive with status. */
   active?: boolean;
   /** Comma-separated status filter naming exactly the statuses to keep, in the
    *  same spelling each row's `status` field carries: 'idle', 'running',
@@ -1514,11 +1564,10 @@ interface ThreadsListOptions {
   source?: string;
   /** Server clamps to 1..=1000 (default 100). */
   limit?: number;
-  /** Thread id. Restrict to that thread's DIRECT children only, never its
+  /** Thread id. Restrict to that thread's DIRECT children, never its
    *  grandchildren. Same filter as the `--parent` CLI flag and the
-   *  `list_threads` tool's `my_children` (which resolves it from the calling
-   *  thread; an app has no calling thread, so it names one). A malformed
-   *  uuid is a 400, never a silently unfiltered list. */
+   *  `list_threads` tool's `my_children`, except an app names the thread.
+   *  A malformed uuid is a 400, never a silently unfiltered list. */
   parent?: string;
 }
 
@@ -1535,14 +1584,14 @@ interface ThreadSummary {
    *  change apply-or-discard). The thread drawer sorts by this; agent churn does
    *  not bump it. */
   last_user_action: string;
-  /** When the agent (or trigger) last did something — streaming, a terminal
+  /** When the agent (or trigger) last did something: streaming, a terminal
    *  response, an idle, a trigger fire/complete, or asking the user. */
   last_agent_action: string;
   message_count: number;
   /** Whether the user parked this thread in the Saved section (stored in
    *  thread_summaries.is_saved). */
   saved: boolean;
-  /** 'inbox' | 'archived' — stored in thread_summaries.archive_state. */
+  /** 'inbox' | 'archived', stored in thread_summaries.archive_state. */
   section: string;
   active_children_count: number;
   total_children_count: number;
@@ -1550,7 +1599,7 @@ interface ThreadSummary {
    *  being archived (Running / WaitingForUserAnswer / pending in-workspace
    *  coding-agent changes). `> 0` ⇒ "N sub-threads still busy". */
   blocking_descendant_count: number;
-  /** Strict subset of `blocking_descendant_count` that drops the Running case —
+  /** Strict subset of `blocking_descendant_count` that drops the Running case:
    *  descendants needing *user attention* (WaitingForUserAnswer, or pending
    *  changes). Drives REVIEW bubbling up the ancestor chain. */
   attention_descendant_count: number;
@@ -1559,13 +1608,12 @@ interface ThreadSummary {
    *  every other read, so an absent field never means zero. */
   pending_sub_thread_change_count?: number;
   /** 'idle' | 'running' | 'waiting' | 'paused' | 'failed' | 'waiting_for_user_answer'.
-   *  The same values the `status` filter above accepts, so you can filter on
-   *  what you read. `running` is the workspace working; `waiting_for_user_answer`
-   *  is it stopped and waiting on a person (the `active` union covers both).
-   *  `paused` = the user's own version switch interrupted the turn and the engine
-   *  is resuming it, so nothing is being asked of anyone. Any OTHER interruption
-   *  (a crash, or a switch whose resume the boot could not deliver) is `failed`
-   *  and offers a Continue button. */
+   *  The same values the `status` filter accepts. `running` is the workspace
+   *  working; `waiting_for_user_answer` is it waiting on a person (the `active`
+   *  union covers both). `paused` = the user's own version switch interrupted
+   *  the turn and the engine is resuming it, so nothing is asked of anyone.
+   *  Any OTHER interruption (a crash, or a switch whose resume the boot could
+   *  not deliver) is `failed` and offers a Continue button. */
   status: string;
   coding_agent_has_diff: boolean;
   coding_agent_proposed: boolean;
@@ -1578,17 +1626,17 @@ interface ThreadSummary {
   trigger_name?: string | null;
   cc_repo_id?: string | null;
   cc_repo_name?: string | null;
-  /** Coding-agent thread flavor — `'lucidos' | 'app' | 'external'`. Omitted for
+  /** Coding-agent thread flavor: `'lucidos' | 'app' | 'external'`. Omitted for
    *  non-coding-agent threads (and legacy rows, which consumers default to
    *  `'lucidos'`). */
   coding_agent_kind?: string;
-  /** Canonical folder the coding agent operates on — `<ws>/data/apps/<id>/` for
+  /** Canonical folder the coding agent operates on: `<ws>/data/apps/<id>/` for
    *  an app thread, the repo root otherwise. Omitted for non-coding-agent threads. */
   coding_agent_folder?: string;
-  /** Which backend drives the thread — `'claude-code' | 'codex'`. Omitted for
+  /** Which backend drives the thread: `'claude-code' | 'codex'`. Omitted for
    *  non-coding-agent threads (legacy rows default to `'claude-code'`). */
   coding_agent?: string;
-  /** Compose state machine — `composing` | `active` | `discarded`. The
+  /** Compose state machine: `composing` | `active` | `discarded`. The
    *  archive flag is on the separate `section` field; an archived thread
    *  carries `state: 'active'` and `section: 'archived'`. */
   state: 'composing' | 'active' | 'discarded';
@@ -1620,7 +1668,7 @@ interface ThreadSummary {
 | Spawn a new thread from an app | `lucidos.ui.startThread({ prompt })` |
 | Open a link outside Lucidos from JS | `lucidos.ui.openExternal(url)` (never `window.open`) |
 
-## lucidos.ui — UI Control
+## lucidos.ui: UI Control
 
 ```ts
 lucidos.ui.applyPreferences(): Promise<void>
@@ -1639,41 +1687,47 @@ lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
 lucidos.ui.disableTooltips(): void
 ```
 
-`applyPreferences()` fetches user preferences and applies the theme mode, theme, font, and scale as CSS variables. It resolves a `system` theme mode to the live OS light or dark. Call once on app load, and style your app with the theme variables (§ Theme variables, under Setup) so it follows the user's appearance: don't hardcode colors. For each setting it prefers the server value, then whatever the synchronous `sdk-prefs.js` script already put on `<html>`, and only then a default. So a device with no server-scoped value (e.g. only `ui-scale` stored, no `theme-mode`) keeps the user's appearance instead of resetting to dark.
+`applyPreferences()` fetches user preferences and applies the theme mode, theme, font and scale as CSS variables. It resolves a `system` theme mode to the live OS light or dark. Call it once on load, and style with the theme variables (§ Theme variables, under Setup) rather than hardcoded colors. For each setting it prefers the server value, then what `sdk-prefs.js` already put on `<html>`, then a default. So a device with no server-scoped `theme-mode` keeps the user's appearance instead of resetting to dark.
 
-`applyPreferences()` also applies the user's **style overrides**: the
-`style_overrides` preference holds a map of CSS custom property to value, which
-it writes onto `<html>` after the theme mode, theme, font and scale (so an override of one
-of those wins). Clearing an override uncovers the theme's value for that token. That is what keeps an app's chrome matching a host the user has
-retuned. Only custom properties are honoured, and a value containing `;`, `{`,
-`}`, `<`, `>`, `@`, a backslash, `url(`, `image-set(`, `expression(` or a
-comment opener is dropped, because the map is writable by any app and must not
-be able to inject a declaration or fetch from another origin. For the same
-reason an override never sets five kinds of name: a `--protected-*` token,
-which protected surfaces read, a `--z-*` stacking token, the UI font tokens,
-`--user-ui-scale`, which the UI scale preference sets, and the screen's
-scanlines, `--part-screen-background-image`, which the engine clamps the
-protected palette against. A shadow token such as `--shadow-md` is dropped if
-it reaches more than 2rem past its box. Nothing is required of an app beyond
-calling `applyPreferences()`.
+`applyPreferences()` also applies the user's **style overrides**. The
+`style_overrides` preference maps CSS custom properties to values. It writes them
+onto `<html>` after the theme mode, theme, font and scale, so an override of one
+of those wins. Clearing an override uncovers the theme's value for that token.
+This keeps an app's chrome matching a host the user has retuned. You need
+nothing beyond calling `applyPreferences()`.
 
-`watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. It also re-fetches the active theme when its file is written or deleted (`DataFileWritten`, `DataFileEdited`, `DataFileDeleted`) and when a plugin is installed or uninstalled. Call it once alongside `applyPreferences()` so the app reacts without a reload. That covers a light/dark toggle, an OS appearance change under a `system` preference, and a value retuned from the Style Remote. It also covers a flip of the device's Autocorrect switch (§ Text fields and autocorrect, under Setup).
+Any app can write the map, so it must not inject a declaration or fetch from
+another origin. Only custom properties are honoured. A value containing `;`,
+`{`, `}`, `<`, `>`, `@`, a backslash, `url(`, `image-set(`, `expression(` or a
+comment opener is dropped. An override never sets five kinds of name:
 
-**Inside the host shell, the app repaints with it.** The shell pushes what it painted to every watching app frame, in the same task, with no request. So a scale drag, a zoom gesture or a theme switch moves the app with the shell rather than after the save. The push covers theme mode, theme, font, UI scale, style overrides, motion and theme effects. From the first push on, it owns the app's appearance, and `PreferencesChanged` then re-reads only the external-link target and Autocorrect. A popped-out app tab has no shell around it, so it follows changes through `PreferencesChanged` as above.
+- a `--protected-*` token, which protected surfaces read;
+- a `--z-*` stacking token;
+- the UI font tokens;
+- `--user-ui-scale`, which the UI scale preference sets;
+- `--part-screen-background-image` (the screen's scanlines), which the engine
+  clamps the protected palette against.
 
-Under a `system` preference the OS appearance is watched two ways, because neither alone is enough on every client. The `prefers-color-scheme` media query covers a flip while the app is on screen. The frame's resume (`visibilitychange`, `focus`, `pageshow`) covers one announced while it was not. That is the normal case in an installed iOS PWA, which is resumed rather than reloaded. Both are sampled a moment after the event and only re-apply when the resolved theme actually moved, so a wake that changed nothing costs nothing. Your app needs to do none of this: it is inside `watchPreferences()`.
+A shadow token such as `--shadow-md` is dropped if it reaches more than 2rem
+past its box.
+
+`watchPreferences()` subscribes to SSE `PreferencesChanged` and re-applies changes. It also re-fetches the active theme when its file is written or deleted (`DataFileWritten`, `DataFileEdited`, `DataFileDeleted`) and when a plugin is installed or uninstalled. Call it once beside `applyPreferences()`, and the app reacts with no reload. That covers a light/dark toggle, an OS appearance change under `system`, and a value retuned from the Style Remote. It also covers the Autocorrect switch (§ Text fields and autocorrect, under Setup).
+
+**Inside the host shell, the app repaints with it.** The shell pushes what it painted to every watching app frame, in the same task. So a scale drag, a zoom gesture or a theme switch moves the app with the shell rather than after the save. The push covers theme mode, theme, font, UI scale, style overrides, motion and theme effects. From the first push on it owns the app's appearance, and `PreferencesChanged` re-reads only the external-link target and Autocorrect. A popped-out app tab has no shell, so it follows `PreferencesChanged` as above.
+
+Under `system`, `watchPreferences()` watches the OS appearance two ways. The `prefers-color-scheme` media query covers a flip while the app is on screen. The frame's resume (`visibilitychange`, `focus`, `pageshow`) covers one announced while it was not, the normal case in an installed iOS PWA. Both sample a moment after the event and re-apply only when the resolved theme moved. Your app does none of this itself.
 
 `navigate()` sends a navigation request to the Lucidos frontend via SSE. `target`
-and `params` (`NavigateParams` = `NavigateUi` minus `target`) are typed against the
-generated navigation contract, so valid `target`s and `settings_view`s are
-discoverable and type-checked (§ Types, under lucidos.notifications).
+and `params` (`NavigateParams` = `NavigateUi` minus `target`) are typed against
+the generated navigation contract, so valid `target`s and `settings_view`s are
+type-checked (§ Types, under lucidos.notifications).
 
 ### Showing the app once its content is ready
 
 While your app opens, the host covers it with the theme background. After a
-short delay it also runs a thin progress bar along the top of the pane. By default
-the cover lifts on your page's `load` event. An app that fetches its data
-after `load` then shows an empty screen until that data arrives.
+short delay it also runs a thin progress bar along the top of the pane. By
+default the cover lifts on your page's `load` event. An app that fetches its
+data after `load` then shows an empty screen until the data arrives.
 
 To keep the cover up until your content is drawn, opt in from `manifest.json`
 and call `lucidos.ui.ready()` once the first data has rendered:
@@ -1717,18 +1771,18 @@ fuse lifts the cover before `load`, so a slow page still says it is loading.
 | `thread` | `id` | Focus a specific thread |
 | `app` | `id` (or `app_id`), `fragment` (optional) | Open an app UI, optionally at a place inside it. See the fragment param below. |
 | `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `permissions`, `mcp`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System page (`system` is the list of them; `system-overview`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging` are the pages themselves). Omit `settings_view` for the Settings home list. |
-| `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()` — it's the typed wrapper around this target. |
-| `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row — used by the plugin-update notification so a tap on a single update lands on its plugin. |
-| `app-store` | — | Open the Plugins panel's Store (marketplace) tab. |
+| `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()`, the typed wrapper around this target. |
+| `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row. The plugin-update notification uses this, so a tap on one update lands on its plugin. |
+| `app-store` | (none) | Open the Plugins panel's Store (marketplace) tab. |
 | `file` | `file_path`, `line` (optional), `line_end` (optional) | Open a file in the preview pane, optionally at a line. See the two accepted path forms and the line params below. |
-| _other panels_ | — | `files`, `apps`, `triggers`, `thread-queue`, `changes`, `notifications`; plus `trigger` (`id`), `url` (`url`), `new-app`, `new-trigger`. |
+| _other panels_ | (none) | `files`, `apps`, `triggers`, `thread-queue`, `changes`, `notifications`; plus `trigger` (`id`), `url` (`url`), `new-app`, `new-trigger`. |
 
 #### `fragment`: opening at a place inside the app
 
 **Whenever you name a specific item, pass it.** The app opens with that string as
 its `location.hash`, so an app that routes on the hash lands on the item. Without
-it the app opens on whatever the reader last looked at. On a sorted board that
-can be several cards away from the one you meant.
+it the app opens on whatever the reader last looked at, which on a sorted board
+can be several cards away.
 
 ```js
 // "the habit whose streak broke", not "the habit board".
@@ -1749,12 +1803,13 @@ await lucidos.ui.navigate('app', {
 An `app:<id>#<fragment>` link carries the same string. So a chat link, a
 file-preview link and a notification tap all name a place the same way.
 
-#### `file_path` — workspace data vs a registered repository
+#### `file_path`: workspace data vs a registered repository
 
 `file_path` takes one of two forms:
 
-- **A workspace data path** — `artifacts/…`, `knowhow/…`, `apps/…`, `triggers/…`, or `system-knowhow/…`. A path with none of those prefixes is treated as an artifact, so `notes.md` opens `artifacts/notes.md`.
-- **A repo-encoded path**: `repo:<repoId>:file:<repo-relative path>`, which opens a file from a **registered repository** (a local clone added under Settings → Coding Agents) instead of the workspace data tree. `<repoId>` is that Repository's id, as returned by `GET /api/v1/repositories`; the file is read at the clone's current `HEAD`.
+- **A workspace data path:** `artifacts/…`, `knowhow/…`, `apps/…`, `triggers/…`, or `system-knowhow/…`. A path with none of those prefixes is treated as an artifact, so `notes.md` opens `artifacts/notes.md`.
+- **A repo-encoded path**: `repo:<repoId>:file:<repo-relative path>` opens a file from a **registered repository** (a local clone added under Settings → Coding Agents). `<repoId>` is that Repository's id, as returned by `GET /api/v1/repositories`. The file is read at the clone's current `HEAD`.
+  - `lucidos.ui.navigate` also takes the repository's **name** there, and sends the id in its place. A name or id that no registered repository has rejects the call with an error naming it.
 
 ```js
 // Open src/main/resources/transforms/order.jslt from a registered repo clone.
@@ -1763,11 +1818,11 @@ await lucidos.ui.navigate('file', {
 });
 ```
 
-The preview pane binds itself to that repository, so the Files panel behind it and the preview's changed-files sidebar stay on the same repo. A malformed `repo:…` string is not a repo path — it falls back to the artifact rule above.
+The preview pane binds itself to that repository, so the Files panel behind it and the preview's changed-files sidebar stay on the same repo. A malformed `repo:…` string is not a repo path: it falls back to the artifact rule above.
 
 ##### Naming a revision: `repo:<repoId>:file#<ref>:<path>`
 
-The bare form reads the clone's `HEAD`, which is often not where the interesting content is: a file a coding agent has edited lives on that agent's worktree branch, and a citation into a released version means a tag or a sha. Add `#<ref>` to the `file` segment to say which revision you mean.
+The bare form reads the clone's `HEAD`. A file a coding agent edited lives on that agent's worktree branch, and a citation into a release means a tag or a sha. Add `#<ref>` to the `file` segment to name the revision.
 
 ```js
 // The file as it stands on a coding agent's branch, not as it stands on HEAD.
@@ -1778,8 +1833,8 @@ await lucidos.ui.previewFile({
 ```
 
 - `<ref>` is anything `git show` accepts as a revision: a branch, a tag, a full or short sha.
-- It works on both calls and in the href form below, since it is part of the path string rather than a separate parameter.
-- Omit it and you get `HEAD`, exactly as before.
+- It works on both calls and in the href form below, since it is part of the path string.
+- Omit it and you get `HEAD`.
 - A ref that does not exist (or a file that does not exist at it) shows the preview's normal "failed to load" state, not a thrown error.
 - **Every segment must be non-empty.** `repo:<repoId>:file#:<path>` names no revision and is not a repo path at all, so it falls back to the artifact rule like any other malformed `repo:…` string. Leave the `#` off instead.
 
@@ -1789,7 +1844,7 @@ A ref cannot contain `:` (git forbids it), which is what keeps the `:`-separated
 
 #### `line` / `line_end`: opening at a cited line
 
-**Whenever you cite a specific line, pass it.** The preview then scrolls that line into view and highlights it, exactly as if the reader had clicked its line number. Without it the file opens at the top and a `file.rs:510` citation leaves the reader to find line 510 by hand, which is the whole value of the citation lost at the last step.
+**Whenever you cite a specific line, pass it.** The preview then scrolls that line into view and highlights it, as if the reader had clicked its line number. Without it the file opens at the top, and the reader must find line 510 of a `file.rs:510` citation by hand.
 
 - `line` is **1-based**. `line_end` is the last line of the range and is **inclusive**; omit it to highlight a single line.
 - Both work for either `file_path` form, a workspace data path or a repo-encoded one.
@@ -1805,7 +1860,7 @@ await lucidos.ui.navigate('file', {
 });
 ```
 
-A line the file can't honour never costs the reader the file: `0`, a negative or fractional number, a line past the end of the file, and a format with no source view at all (PDF, an image) are all ignored, and the file opens at the top as it would with no `line` at all. A citation's line number is the part that goes stale, so this is deliberate rather than an error.
+A line the file can't honour never costs the reader the file. The preview ignores `0`, a negative or fractional number, a line past the end, and a format with no source view (PDF, an image). The file then opens at the top. A citation's line number is the part that goes stale, so this is deliberate.
 
 #### Linking to a repo file from an HTML artifact
 
@@ -1815,7 +1870,9 @@ An `<a href>` inside a **previewed HTML or markdown artifact** can use the repo-
 <a href="repo:REPO_ID:file:src/main.rs#L510-L520">src/main.rs:510-520</a>
 ```
 
-The host routes that click through the same navigation this section describes. So a report full of citations works as a plain artifact, and does not have to be published as an app to reach `lucidos.ui.navigate`. The artifact itself runs sandboxed and loads no SDK, so a link is its only way to reach the host. What else it can and cannot do: `system-knowhow/best-practices.md` § What a standalone HTML document can do. `#L510` is a single line; `#L510-L520` (or `#L510-520`) is a range. The suffix exists only for hrefs, since an anchor has no other way to carry a param: from JavaScript, use `line` / `line_end` above.
+The host routes that click through the same navigation, so a report full of citations works as a plain artifact, with no app needed. The artifact runs sandboxed and loads no SDK, so a link is its only way to reach the host. See `system-knowhow/best-practices.md` § What a standalone HTML document can do.
+
+`#L510` is a single line, and `#L510-L520` (or `#L510-520`) is a range. The suffix exists only for hrefs, since an anchor has no other way to carry a param. From JavaScript, use `line` / `line_end` above.
 
 The revision form composes with it. The two `#` never compete: the line suffix is the trailing one, and the ref is the one inside the `file` segment.
 
@@ -1825,7 +1882,7 @@ The revision form composes with it. The two `#` never compete: the line suffix i
 
 ### Showing a cited file without leaving your app
 
-`navigate('file', …)` takes the whole shell into the Files panel. For a report or a dashboard full of citations that is the wrong motion: the reader loses their place and has to navigate back. `lucidos.ui.previewFile(params)` shows the file in a **file preview modal** over your app instead, so they glance at the code and carry on.
+`navigate('file', …)` takes the whole shell into the Files panel, so a reader of a report loses their place. `lucidos.ui.previewFile(params)` shows the file in a **file preview modal** over your app instead, so they glance at the code and carry on.
 
 ```js
 // "src/main.rs:510-520" in a report, glanceable.
@@ -1858,9 +1915,9 @@ await lucidos.ui.previewFile(at);        // glance, your app stays put
 await lucidos.ui.navigate('file', at);   // leave for the Files panel
 ```
 
-Everything the two sections above specify applies unchanged: every `file_path` form (the named-revision one included), `line` / `line_end` 1-based and inclusive, and the same degradation for a line the file cannot honour. The modal shows the same rendering the Files panel shows, with the same highlight and line numbers, and it carries an **Open in Files** link that escalates the glance into exactly the `navigate('file', …)` you would otherwise have called, at the same lines.
+Everything the two sections above specify applies unchanged: every `file_path` form (named revision included), 1-based inclusive `line` / `line_end`, and the same degradation for a bad line. The modal renders as the Files panel does, with the same highlight and line numbers. Its **Open in Files** link escalates to the same `navigate('file', …)`, at the same lines.
 
-Naming the revision matters more here than anywhere else: the modal may be showing a repository the Files panel is not bound to, so it cannot fall back to whatever branch that panel happens to be on. Without a `#<ref>` it reads `HEAD`.
+Name the revision here above all. The modal may show a repository the Files panel is not bound to, so it cannot fall back to that panel's branch. Without a `#<ref>` it reads `HEAD`.
 
 | Want to … | Use |
 |---|---|
@@ -1869,29 +1926,28 @@ Naming the revision matters more here than anywhere else: the modal may be showi
 
 Three things to know:
 
-- **It resolves when the preview is on screen, not when the reader dismisses it.** A glance can stay open for minutes and your app is not blocked while it is. It rejects when the host cannot put it on screen, which makes the escalation a natural fallback:
+- **It resolves when the preview is on screen, not when the reader dismisses it.** Your app is not blocked while a glance stays open. It rejects when the host cannot put it on screen, so the escalation makes a natural fallback:
 
   ```js
   try { await lucidos.ui.previewFile(at); }
   catch { await lucidos.ui.navigate('file', at); }
   ```
 
-  Two things make it reject, and both mean "nothing would have appeared". Your app is running with **no host shell around it**: opened in its own tab, or the SDK loaded in a plain page. Or **something is fullscreen that the host cannot render over**, which in practice means your app called `requestFullscreen` on its own content. Fullscreen taken from the Lucidos content header is fine, and so is everything else: the preview appears over your app there like anywhere else. Write the `catch` and you are covered in all of them.
+  Two causes make it reject, and both mean nothing would have appeared. Your app runs with **no host shell around it** (its own tab, or the SDK in a plain page). Or **something is fullscreen that the host cannot render over**: in practice, your app called `requestFullscreen` on its own content. Fullscreen from the Lucidos content header is fine.
 
-- **Read-only.** There is no editing in the modal; `navigate('file', …)` is the way to the editable preview. A second `previewFile` replaces a showing one.
-- **A `repo:…:diff#…:…` locator previews the file, not the diff.** The diff view belongs to the Files panel; use `navigate` for it. The change is not thrown away though: the file is shown at that change's end state, so a citation into a coding agent's work shows the work. Because it is a file view, its lines ARE honoured, unlike the same locator through `navigate`.
+- **Read-only.** There is no editing in the modal: `navigate('file', …)` leads to the editable preview. A second `previewFile` replaces a showing one.
+- **A `repo:…:diff#…:…` locator previews the file, not the diff.** The diff view belongs to the Files panel, so use `navigate` for it. The modal shows the file at that change's end state, so a citation into a coding agent's work shows the work. As a file view it honours lines, unlike the same locator through `navigate`.
 
-Since one of those two reject causes is about fullscreen, the ordinary case is worth stating plainly: `previewFile`, `confirm`, `prompt` and `toast` are all rendered by the host, and all of them appear over your app when the reader has put it in fullscreen from the content header. Escape closes what is in front: with the app pseudo-fullscreen (iOS, and anywhere the Fullscreen API is unavailable) one Escape closes the modal and the app stays fullscreen; with real fullscreen the browser claims that first Escape to leave fullscreen, so the modal stays up in the normal layout and the next Escape closes it.
+`previewFile`, `confirm`, `prompt` and `toast` are all rendered by the host. All of them appear over your app when the reader put it in fullscreen from the content header. Escape closes what is in front. With the app pseudo-fullscreen (iOS, and anywhere the Fullscreen API is unavailable), one Escape closes the modal and the app stays fullscreen. With real fullscreen the browser takes the first Escape to leave fullscreen, so the modal stays up and the next Escape closes it.
 
 ### Opening a link outside Lucidos
 
 `lucidos.ui.openExternal(url)` sends a URL out of the app. **Use it instead of
 `window.open` for any link that leaves Lucidos.**
 
-Plain anchors are already handled for you: the SDK's link interceptor catches
-`<a href="https://…">` clicks and routes them here automatically. Reach for
-`openExternal` when you open a URL from JavaScript instead (a button handler, a
-row action, a redirect after a fetch).
+The SDK's link interceptor already routes plain `<a href="https://…">` clicks
+here. Call `openExternal` when you open a URL from JavaScript (a button handler,
+a row action, a redirect after a fetch).
 
 ```js
 document.querySelector('#docs-btn').addEventListener('click', () => {
@@ -1906,21 +1962,21 @@ Two rules:
   refuses without a live user gesture. An `await` before the call spends that
   gesture. Do async work first, then open from a later interaction.
 - **Don't fall back to `window.open`.** Inside an installed iOS PWA `window.open`
-  cannot leave the app: WebKit renders it in an in-app web view with no address
-  bar, no tabs and no shared Safari session. That overlay is exactly what the
-  user's `external_link_target` preference (`safari` / `ask` / `in-app`, default
-  `safari`) exists to control, so falling back to it overrides their choice.
+  cannot leave the app: WebKit renders an in-app web view with no address bar,
+  no tabs and no shared Safari session. The user's `external_link_target`
+  preference (`safari` / `ask` / `in-app`, default `safari`) controls that
+  overlay, so a fallback overrides their choice.
 
-Non-http(s) URLs (`mailto:`, `tel:`) are handed to the platform unchanged. The
-promise resolves once the open has been dispatched; a user dismissing the share
-sheet resolves normally rather than rejecting.
+Non-http(s) URLs (`mailto:`, `tel:`) go to the platform unchanged. The promise
+resolves once the open is dispatched. A user dismissing the share sheet resolves
+normally rather than rejecting.
 
 ### Starting a fresh chat with a prefilled prompt
 
-`lucidos.ui.startThread()` opens a new chat thread. If you pass a `prompt`, it lands in the compose textarea **prefilled** — the user reviews, edits, and clicks Send. It is never auto-submitted, so the user always stays in control of what gets sent on their behalf.
+`lucidos.ui.startThread()` opens a new chat thread. A `prompt` lands in the compose textarea **prefilled**: the user reviews, edits and clicks Send. It is never auto-submitted, so the user controls what is sent on their behalf.
 
 ```js
-// "Set this up for me" button — pops a fresh chat with a ready-to-send prompt.
+// "Set this up for me" button: pops a fresh chat with a ready-to-send prompt.
 document.querySelector('#setup-trigger').addEventListener('click', () => {
   lucidos.ui.startThread({
     prompt: 'Create a daily 9am trigger that summarizes my unread email.',
@@ -1928,11 +1984,11 @@ document.querySelector('#setup-trigger').addEventListener('click', () => {
 });
 ```
 
-Call with no arguments (`lucidos.ui.startThread()`) to just open a blank fresh chat — equivalent to the user pressing the "new thread" shortcut.
+Call it with no arguments to open a blank fresh chat, like the "new thread" shortcut.
 
 ### Confirmation dialogs
 
-`lucidos.ui.confirm` shows a modal rendered by the Lucidos shell (not inside your app iframe), so it inherits the user's theme and sits above all app content. Use it instead of `window.confirm()`.
+`lucidos.ui.confirm` shows a modal rendered by the Lucidos shell, outside your app iframe, so it inherits the user's theme and sits above all app content. Use it instead of `window.confirm()`.
 
 ```ts
 interface ConfirmOptions {
@@ -1950,9 +2006,7 @@ interface ConfirmOptions {
 }
 ```
 
-Resolves `true` on OK click or Enter; `false` on Cancel, Esc, or backdrop click.
-
-If a second `confirm` is called while one is visible, the previous one resolves `false` and the new one replaces it.
+Resolves `true` on OK click or Enter, and `false` on Cancel, Esc or backdrop click. A second `confirm` while one is visible resolves the first `false` and replaces it.
 
 **Example:**
 
@@ -1969,10 +2023,9 @@ if (!ok) return;
 
 ### Toasts
 
-`lucidos.ui.toast` shows a transient status banner rendered by the Lucidos shell
-(above all app content, themed by the user's preferences). It's **fire-and-forget**
-— no return value, no result to await. Use it for success/error feedback instead
-of hand-rolling your own banner.
+`lucidos.ui.toast` shows a transient status banner rendered by the Lucidos shell,
+above all app content and themed. It is **fire-and-forget**, with nothing to
+await. Use it for success/error feedback instead of hand-rolling a banner.
 
 ```ts
 type ToastType = 'success' | 'info' | 'warning' | 'error';
@@ -1990,7 +2043,7 @@ interface ToastOptions {
   dismissable?: boolean;
   /** Stable key for in-place replacement. A later toast with the same key
    *  updates the existing toast (message/type/etc.) instead of stacking a new
-   *  one — e.g. an 'Opening…' toast becoming 'Opened'. */
+   *  one, e.g. an 'Opening…' toast becoming 'Opened'. */
   key?: string;
   /** true = show an indeterminate "work in progress" spinner in place of the
    *  severity icon. Pair it with a `key`, so a later keyed toast can replace
@@ -1999,29 +2052,27 @@ interface ToastOptions {
 }
 ```
 
-`type` defaults to `'info'`; an unknown value degrades to `'info'`. Only this
-serializable subset is exposed — the host's toast action buttons take `onClick`
-callbacks, which can't cross the app-iframe boundary, so they aren't available
-from an app.
+`type` defaults to `'info'`, and an unknown value degrades to `'info'`. Only this
+serializable subset is exposed. The host's toast action buttons take `onClick`
+callbacks, which can't cross the app-iframe boundary.
 
-**A tap on an app's toast does nothing.** A reader may tap it looking for more,
-so it stays up until its X or its timer. A toast never takes keyboard focus when
-it appears; the user reaches it with the Focus newest toast shortcut.
+**A tap on an app's toast does nothing**, so it stays up until its X or its
+timer. A toast never takes keyboard focus. The user reaches it with the Focus
+newest toast shortcut.
 
 **A repeat counts instead of stacking.** Raise an unkeyed toast whose type,
 title and message match one still up, and that card shows `×2`, `×3` and so on.
 Its timer restarts. Use a `key` when a later toast should replace the words.
 
 **The title is explicit, and the message is plain text.** Pass `opts.title` for
-a bold line over the message. A newline in the message is a line break and
-nothing more: the host reads no heading and no list out of it. A `"• "` line is
-shown as written.
+a bold line over the message. A newline in the message is just a line break: the
+host reads no heading or list out of it, and shows a `"• "` line as written.
 
 **A toast is a summary, and the host bounds it.** A message longer than 2000
-characters is truncated with an ellipsis. An `'error'` toast is bounded harder:
-its title and message are each shown as ONE line, and truncated at 200
-characters. So a newline in an error is a space rather than a line break. Keep
-an error to a sentence, and put the detail somewhere the user can come back to.
+characters is truncated with an ellipsis. An `'error'` toast shows its title and
+message as ONE line each, truncated at 200 characters, so a newline becomes a
+space. Keep an error to a sentence, and put the detail somewhere the user can
+come back to.
 
 **Example:**
 
@@ -2041,15 +2092,13 @@ lucidos.ui.toast('Opened "Q3 deck"', 'success', { key: 'drive-open' });
 #### Long-running work: a spinner you can take back down
 
 `spinning: true` swaps the severity icon for a small indeterminate spinner, so a
-keyed toast can narrate work that has no honest percentage. Its counterpart is
-`lucidos.ui.dismissToast(key)`, which takes that toast back down. That covers the
-one case a keyed replacement can't express: work that finishes with nothing left
-to say.
+keyed toast can narrate work with no honest percentage. Its counterpart,
+`lucidos.ui.dismissToast(key)`, takes that toast back down, for work that
+finishes with nothing left to say.
 
 `dismissToast` is fire-and-forget like `toast`, and **a key matching nothing is a
-no-op**, never an error. Your app can't know whether the toast is still up (the
-user may have closed it, or its `durationMs` may have expired), so "already gone"
-is the normal case rather than a failure. It reaches toasts by key only, so a
+no-op**, never an error. The user may have closed the toast, or its `durationMs`
+expired, so "already gone" is normal. It reaches toasts by key only, so a
 `toast()` raised without one can't be dismissed this way.
 
 Start the spinner on the user's action, and let the event that reports the work
@@ -2077,16 +2126,15 @@ lucidos.sse.on('ReindexFailed', (data) => {
 });
 ```
 
-Reusing one `key` across every arm is what makes the spinner *become* the outcome
-in place instead of stacking a second toast under it. Give a `spinning` toast an
-end condition on every path (a keyed replacement or a `dismissToast`), or the
-spinner sits there forever.
+One `key` across every arm makes the spinner *become* the outcome in place,
+instead of stacking a second toast. Give a `spinning` toast an end on every path
+(a keyed replacement or a `dismissToast`), or the spinner stays forever.
 
 ### Prompts
 
 `lucidos.ui.prompt` shows a single-field text-input modal rendered by the Lucidos
-shell (themed, above all app content) — the text-input sibling of `confirm`. Use
-it instead of `window.prompt()`.
+shell, themed and above all app content: the text-input sibling of `confirm`.
+Use it instead of `window.prompt()`.
 
 ```ts
 interface PromptOptions {
@@ -2109,10 +2157,10 @@ interface PromptOptions {
 }
 ```
 
-Resolves the entered string on OK click or Enter; `null` on Cancel, Esc, or
-backdrop click. (A `multiline` prompt uses Enter for newlines — submit with the
-OK button.) If a second `prompt` is called while one is visible, the previous one
-resolves `null` and the new one replaces it.
+Resolves the entered string on OK click or Enter, and `null` on Cancel, Esc or
+backdrop click. A `multiline` prompt uses Enter for newlines, so submit with the
+OK button. A second `prompt` while one is visible resolves the first `null` and
+replaces it.
 
 **Example:**
 
@@ -2128,10 +2176,9 @@ if (name === null) return; // user cancelled
 
 ### Tooltips
 
-Any element with `data-tooltip` gets a themed Lucidos tooltip. There is nothing
-to call and nothing to build: `sdk.js` installs one delegated listener on the
-document, so an element you add later is covered too. Never hand-roll a tooltip
-in an app.
+Any element with `data-tooltip` gets a themed Lucidos tooltip, with nothing to
+call. `sdk.js` installs one delegated listener on the document, so an element
+you add later is covered too. Never hand-roll a tooltip in an app.
 
 ```html
 <button class="icon-btn" data-tooltip="Delete this row">🗑</button>
@@ -2165,9 +2212,8 @@ keeps its tooltip, which is what makes a clipped file name readable.
 
 #### Turning it off
 
-The layer stands down on its own whenever your page owns a `#tooltip` element.
-So an app that hand-rolled a tooltip before this existed never shows two, and
-neither opt-out below is needed for that case.
+The layer stands down on its own whenever your page owns a `#tooltip` element,
+so an app with a hand-rolled tooltip never shows two.
 
 To turn it off deliberately, set the attribute in markup:
 
@@ -2185,11 +2231,11 @@ The attribute is read on `<html>` or `<body>`, and it applies before any script
 runs. `disableTooltips()` sets the same attribute and drops the tooltip node.
 Both last for the life of the page.
 
-### lucidos.ui.Select — themed dropdown
+### lucidos.ui.Select: themed dropdown
 
-Replaces native `<select>` (whose popup the OS draws and CSS can't reach) with a fully themed dropdown that uses the same tokens as the rest of Lucidos. Supports keyboard nav, type-to-select, light + dark mode.
+Replaces a native `<select>` (whose popup the OS draws and CSS can't reach) with a themed dropdown. Supports keyboard nav, type-to-select, and light and dark mode.
 
-It renders the host's own `.dropdown-trigger` / `.dropdown-option` classes, plus `.surface-box` for the menu's box. So it always looks exactly like the dropdown in Settings, with no separate SDK copy to drift.
+It renders the host's own `.dropdown-trigger` / `.dropdown-option` classes, plus `.surface-box` for the menu's box, so it matches the dropdown in Settings.
 
 #### Types
 
@@ -2256,13 +2302,13 @@ sel.setDisabled(true);
 sel.destroy();
 ```
 
-#### Declarative usage — enhance existing `<select>` elements
+#### Declarative usage: enhance existing `<select>` elements
 
 `enhanceSelects()` walks `root` (default `document`) and replaces every
-`<select class="lucidos-select">` it finds. The native element stays in the DOM
-(hidden) — its `value` mirrors the user's selection and `change` events still
-fire on it, so existing form code keeps working unchanged. Already-enhanced
-selects are skipped, so it's safe to call again after adding new ones.
+`<select class="lucidos-select">` it finds. The native element stays in the DOM,
+hidden. Its `value` mirrors the user's selection and `change` events still fire
+on it, so existing form code keeps working. It skips already-enhanced selects,
+so call it again after adding new ones.
 
 ```html
 <select class="lucidos-select" data-placeholder="Choose…">
@@ -2275,7 +2321,7 @@ selects are skipped, so it's safe to call again after adding new ones.
 </script>
 ```
 
-## lucidos.sse — Real-time Events
+## lucidos.sse: Real-time Events
 
 Subscribe to server-sent events for live updates.
 
@@ -2285,20 +2331,20 @@ lucidos.sse.disconnect(): void
 lucidos.sse.on(eventType: string, callback: (data: unknown, raw: SseEvent) => void): () => void
 ```
 
-`on()` returns an unsubscribe function. Subscribe by inner event name — the SDK unwraps the wire format.
+`on()` returns an unsubscribe function. Subscribe by inner event name: the SDK unwraps the wire format.
 
 ### One stream per workspace
 
-`connect()` is idempotent, and every `on()` listener in your app is fanned out from one connection. Ten subscriptions cost one stream.
+`connect()` is idempotent, and one connection fans out to every `on()` listener in your app.
 
-The connection is also shared **across documents**, by one of two routes. An app frame has an opaque origin. It can open neither an `EventSource` nor a `SharedWorker` port, so the host relays every frame off the connection it already holds. A document that is not a frame attaches to the `SharedWorker` holder directly: the Lucidos shell, and each app opened in its own tab. Either way, opening more apps does not open more connections.
+The connection is also shared **across documents**. An app frame has an opaque origin and can open neither an `EventSource` nor a `SharedWorker` port. So the host relays every frame off the connection it already holds. A document that is not a frame (the Lucidos shell, or an app in its own tab) attaches to the `SharedWorker` holder directly. Opening more apps opens no more connections.
 
-You do not opt in, and there is nothing to configure. Two things follow for an app author:
+There is nothing to configure. For an app author:
 
-- **A frame is identical either way.** A relayed frame is the same payload a private connection would deliver, so nothing in your handler changes.
+- **A frame is identical either way.** A relayed frame carries the same payload a private connection would, so your handler does not change.
 - **`disconnect()` detaches this document only.** It never takes the stream from another app or from the shell.
 
-Where `SharedWorker` is missing (Chromium on Android, and Android WebView), a document that is not an app frame opens a private `EventSource` instead. Same events, same order, one connection per document. Nothing to handle.
+Where `SharedWorker` is missing (Chromium on Android, and Android WebView), a document that is not an app frame opens a private `EventSource`. Same events, same order, one connection per document.
 
 ### Types
 
@@ -2337,7 +2383,7 @@ lucidos.sse.on('NotificationCreated', (data) => {
   showToast(data.title);
 });
 
-// Wildcard — all events
+// Wildcard: all events
 lucidos.sse.on('*', (raw) => {
   console.log('Event:', raw);
 });
@@ -2347,7 +2393,7 @@ unsub();
 lucidos.sse.disconnect();
 ```
 
-## lucidos.utils — Utilities
+## lucidos.utils: Utilities
 
 ```ts
 lucidos.utils.timeAgo(iso: string): string      // "5m ago", "2d ago", "just now"
@@ -2366,7 +2412,7 @@ The two escapers are separate on purpose. Pick by where the value lands in the m
 | Inside a quoted attribute value | `escapeHtmlAttr` | `` `<a title="${lucidos.utils.escapeHtmlAttr(name)}">` `` |
 | In an unquoted attribute, a `<script>`, a `style`, or an `on*` handler | Neither | Set it from code instead |
 
-**Never use `escapeHtml` inside an attribute.** It escapes `&`, `<` and `>` but leaves `"` and `'` raw. A value carrying a quote closes the attribute and adds its own, such as `onmouseover`. That is script running with your app's full authority: data writes, proxy calls and OAuth tokens. An app rendering third-party content, such as a feed or a mailbox, is exposed.
+**Never use `escapeHtml` inside an attribute.** It escapes `&`, `<` and `>` but leaves `"` and `'` raw. A value carrying a quote closes the attribute and adds its own, such as `onmouseover`. That script runs with your app's full authority: data writes, proxy calls and OAuth tokens. An app rendering third-party content, such as a feed or a mailbox, is exposed.
 
 `escapeHtmlAttr` escapes all five characters, so it is also safe in text position. Quote the attribute either way: no escaper makes an unquoted value safe.
 

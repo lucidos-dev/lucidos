@@ -140,6 +140,8 @@
 
 .dir-picker-actions {
     display: flex;
+    /* The footer's space-between already places the row at its right end. */
+    justify-content: flex-end;
     gap: 0.5rem;
 }
 

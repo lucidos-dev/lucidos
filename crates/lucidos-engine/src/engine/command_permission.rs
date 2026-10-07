@@ -55,7 +55,9 @@ pub const CANCELED_REASON: &str = "Canceled by user";
 ///
 ///   * Bash `Broad`   → `Bash` (any bash command)
 ///   * Bash `Narrow`  → `Bash(<first-token>:*)`, e.g. `Bash(git:*)`
-///   * Bash `Session` → narrow if derivable, else `Bash`
+///   * Bash `Session` → the same narrow pattern, and nothing when no head
+///     derives. A bare `Bash` fallback would turn one click on an unreadable
+///     command into a grant for every command in the thread.
 ///   * Python (all scopes) → coarse `Python` (the python tool has no finer
 ///     sub-scope to key on)
 pub fn derive_command_allow_pattern(
@@ -66,10 +68,7 @@ pub fn derive_command_allow_pattern(
     match tool_name {
         tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => match scope {
             AllowScope::Broad => Some("Bash".to_string()),
-            AllowScope::Narrow => bash_narrow_pattern(command),
-            AllowScope::Session => {
-                bash_narrow_pattern(command).or_else(|| Some("Bash".to_string()))
-            }
+            AllowScope::Narrow | AllowScope::Session => bash_narrow_pattern(command),
         },
         tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => Some("Python".to_string()),
         _ => None,
@@ -490,8 +489,6 @@ pub(crate) struct CommandGuardCtx<'a> {
     /// `command_guard_judge` sub-toggle. `false` → the ambiguous middle uses the
     /// static fallback list instead of the LLM judge.
     pub judge_enabled: bool,
-    /// The model the judge runs on (`model_command_judge`).
-    pub judge_model: &'a str,
     /// Turn-scoped cache: `JudgeInput::cache_key()` → resolved classification.
     pub judge_cache: &'a mut HashMap<String, JudgedClassification>,
     /// The firing trigger's declared **side-effect grant** (ADR 0002, Phase 5).
@@ -964,7 +961,7 @@ impl LucidosEngine {
         }
         let site = CommandSite::Workspace(self.workspace_path());
         let resolved = if ctx.judge_enabled {
-            match self.judge_command(ctx.judge_model, &ji, thread_id).await {
+            match self.judge_command(&ji, thread_id).await {
                 Ok(verdict) => JudgedClassification {
                     lane: verdict.lane,
                     summary: Some(verdict.summary),
@@ -1208,6 +1205,18 @@ mod tests {
         assert_eq!(
             derive_command_allow_pattern(tn::RUN_BASH, cmd, AllowScope::Session),
             Some("Bash(git:*)".to_string())
+        );
+    }
+
+    /// A command with no derivable head gets no session pattern. The old bare
+    /// `Bash` fallback covered every later command in the thread.
+    #[test]
+    fn a_headless_command_derives_no_session_pattern() {
+        let cmd = "> /tmp/out";
+        assert_eq!(command_guard::first_command_token(cmd), None);
+        assert_eq!(
+            derive_command_allow_pattern(tn::RUN_BASH, cmd, AllowScope::Session),
+            None
         );
     }
 

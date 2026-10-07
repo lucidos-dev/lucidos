@@ -17,6 +17,7 @@
 //! its own duration and puts it back.
 
 use crate::support::{base_url, unique_marker, user_client};
+use lucidos_engine::core::prefs;
 use serde_json::json;
 
 /// Ensure a timezone preference exists so `create_trigger` doesn't have to fall
@@ -25,7 +26,11 @@ use serde_json::json;
 /// body — the body-only `{key, value}` form is silently a no-op.
 async fn set_timezone_utc(client: &reqwest::Client) {
     let _ = client
-        .put(format!("{}/api/v1/preferences?key=timezone", base_url()))
+        .put(format!(
+            "{}/api/v1/preferences?key={}",
+            base_url(),
+            prefs::TIMEZONE.key()
+        ))
         .json(&json!({ "value": "UTC" }))
         .send()
         .await;
@@ -397,12 +402,14 @@ async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
     // restores. A panic in the polling between here and there would leak them,
     // which is tolerable and not worth a Drop guard: no other test reads either
     // key, and the e2e database is recreated per run rather than per test.
-    let prior_guard = get_preference(&client, "command_guard").await;
-    let prior_judge = get_preference(&client, "command_guard_judge").await;
+    let guard = prefs::COMMAND_GUARD.key();
+    let judge = prefs::COMMAND_GUARD_JUDGE.key();
+    let prior_guard = get_preference(&client, guard).await;
+    let prior_judge = get_preference(&client, judge).await;
     // Judge off, so classification is the deterministic static fallback rather
     // than a mock LLM reply that would not parse as a verdict.
-    set_preference(&client, "command_guard", Some("true")).await;
-    set_preference(&client, "command_guard_judge", Some("false")).await;
+    set_preference(&client, guard, Some("true")).await;
+    set_preference(&client, judge, Some("false")).await;
 
     // Scratch under `.lucidos/`, which the e2e workspace gitignores. Destroying
     // it is exactly the shape of the reported step, and it leaves the working
@@ -475,8 +482,8 @@ async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
     .await
     .expect("DB query failed");
 
-    set_preference(&client, "command_guard", prior_guard.as_deref()).await;
-    set_preference(&client, "command_guard_judge", prior_judge.as_deref()).await;
+    set_preference(&client, guard, prior_guard.as_deref()).await;
+    set_preference(&client, judge, prior_judge.as_deref()).await;
 
     // The command really ran through the guard. Without this the "no card"
     // assertion below would also pass if the tool had never been called.

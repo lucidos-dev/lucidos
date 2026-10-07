@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, isMobileViewport } from './helpers';
+import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, waitForPaneAtRest, isMobileViewport, touchPress } from './helpers';
 import { psql, createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 import { randomUUID } from 'crypto';
 
@@ -66,6 +66,8 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       await openThreadDrawer(page);
       await page.locator(`.thread-row:has-text("${title}")`).first().click();
       await ensureOnThreadPane(page);
+      // The row click slides the pane in, and what follows reads geometry.
+      await waitForPaneAtRest(page);
 
       // The reported conditions: the user's ui scale, and the app shell shrunk
       // to what an open keyboard leaves of the visual viewport.
@@ -93,13 +95,14 @@ test.describe('Composer Send with the mobile keyboard up', () => {
           rect: { top: r.top, bottom: r.bottom, left: r.left, right: r.right },
           pointerEvents: getComputedStyle(btn).pointerEvents,
           centreIsSend: hit === btn || btn.contains(hit),
+          centreHit: hit ? `${hit.tagName.toLowerCase()}.${hit.getAttribute('class') ?? ''} ${hit.getAttribute('aria-label') ?? ''}` : 'nothing',
           shellBottom: shell.getBoundingClientRect().bottom,
         };
       });
 
       expect(probe, 'the Send button never rendered').not.toBeNull();
       expect(probe!.pointerEvents, 'Send is inert while the keyboard is up').not.toBe('none');
-      expect(probe!.centreIsSend, 'something else answers the pointer at the centre of Send').toBe(true);
+      expect(probe!.centreIsSend, `${probe!.centreHit} answers the pointer at the centre of Send`).toBe(true);
       expect(probe!.rect.bottom, 'Send sits below the app shell, behind the keyboard')
         .toBeLessThanOrEqual(probe!.shellBottom + 0.5);
 
@@ -108,12 +111,10 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       if (browserName !== 'chromium') return;
 
       const r = probe!.rect;
-      const cdp = await page.context().newCDPSession(page);
-      await cdp.send('Input.dispatchTouchEvent', {
-        type: 'touchStart',
-        touchPoints: [{ x: Math.round((r.left + r.right) / 2), y: Math.round((r.top + r.bottom) / 2) }],
-      });
-      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      await touchPress(page, [
+        { type: 'touchStart', x: Math.round((r.left + r.right) / 2), y: Math.round((r.top + r.bottom) / 2) },
+        { type: 'touchEnd' },
+      ]);
 
       // `psql` runs tuples-only and trims, so the count is the whole reply and
       // an exact match is honest. A loose one would read a 2 as a pass.
@@ -169,6 +170,8 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       await openThreadDrawer(page);
       await page.locator(`.thread-row:has-text("${title}")`).first().click();
       await ensureOnThreadPane(page);
+      // The row click slides the pane in, and what follows reads geometry.
+      await waitForPaneAtRest(page);
 
       await page.evaluate((h: number) => {
         document.documentElement.style.setProperty('--app-height', `${h}px`);
@@ -194,9 +197,7 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       expect(box, 'the Send button never rendered').not.toBeNull();
       const x = Math.round(box!.x + box!.width / 2);
       const y = Math.round(box!.y + box!.height / 2);
-      const cdp = await page.context().newCDPSession(page);
-      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
-      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      await touchPress(page, [{ type: 'touchStart', x, y }, { type: 'touchEnd' }]);
 
       await expect
         .poll(sentCount, { timeout: 15_000, message: 'the press died on a box the send never needed' })
@@ -252,6 +253,8 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       await openThreadDrawer(page);
       await page.locator(`.thread-row:has-text("${title}")`).first().click();
       await ensureOnThreadPane(page);
+      // The row click slides the pane in, and what follows reads geometry.
+      await waitForPaneAtRest(page);
 
       await page.evaluate((h: number) => {
         document.documentElement.style.setProperty('--app-height', `${h}px`);
@@ -268,12 +271,20 @@ test.describe('Composer Send with the mobile keyboard up', () => {
 
       const x = Math.round(box!.x + box!.width / 2);
       const y = Math.round(box!.y + box!.height / 2);
-      const cdp = await page.context().newCDPSession(page);
-      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+      // The press must start ON Send, or a dropped press reads as this bug.
+      const startHit = await page.evaluate(({ px, py }) => {
+        const hit = document.elementFromPoint(px, py);
+        if (hit?.closest('button[aria-label="Send message"]')) return 'send';
+        return hit ? `${hit.tagName.toLowerCase()}.${hit.getAttribute('class') ?? ''} ${hit.getAttribute('aria-label') ?? ''}` : 'nothing';
+      }, { px: x, py: y });
+      expect(startHit, `${startHit} answers the pointer where the press starts`).toBe('send');
       // Well past the 8 px both retired tests refused at, and past the tap
       // gate's own threshold, so this drives the composed decision.
-      await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y + 20 }] });
-      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      await touchPress(page, [
+        { type: 'touchStart', x, y },
+        { type: 'touchMove', x, y: y + 20 },
+        { type: 'touchEnd' },
+      ]);
 
       await expect
         .poll(sentCount, { timeout: 15_000, message: 'a press that moved 20px was thrown away' })
@@ -313,6 +324,8 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       await openThreadDrawer(page);
       await page.locator(`.thread-row:has-text("E2E Diff Tap ${suffix}")`).first().click();
       await ensureOnThreadPane(page);
+      // The row click slides the pane in, and what follows reads geometry.
+      await waitForPaneAtRest(page);
 
       await page.evaluate((h: number) => {
         document.documentElement.style.setProperty('--app-height', `${h}px`);
@@ -332,9 +345,7 @@ test.describe('Composer Send with the mobile keyboard up', () => {
 
       const x = Math.round(box!.x + box!.width / 2);
       const y = Math.round(box!.y + box!.height / 2);
-      const cdp = await page.context().newCDPSession(page);
-      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
-      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      await touchPress(page, [{ type: 'touchStart', x, y }, { type: 'touchEnd' }]);
 
       // What the tap must produce: the Files view, revealed in the content
       // pane. Both are unconditional in `viewThreadCcDiff`, ahead of the fetch.

@@ -108,6 +108,25 @@ describe('a menu row keeps its words in a clamped box', () => {
   });
 });
 
+/** On iOS a mousedown on a button blurs the focused field. A press on a
+ *  composer toggle then dropped the keyboard the reader was typing with. */
+describe('a press can leave focus where it is', () => {
+  const mouseDownOf = (node: ComponentChild) =>
+    propsOf(node).onMouseDown as ((e: Event) => void) | undefined;
+
+  it('cancels the mousedown default for a spec that keeps focus', () => {
+    let prevented = false;
+    mouseDownOf(renderHeaderAction(spec({ keepsFocus: true })))!(
+      { preventDefault: () => { prevented = true; } } as Event,
+    );
+    expect(prevented).toBe(true);
+  });
+
+  it('leaves a plain action to take focus as usual', () => {
+    expect(mouseDownOf(renderHeaderAction(spec()))).toBeUndefined();
+  });
+});
+
 describe('a menu row that OPENS something is handed the trigger', () => {
   /** The row it was clicked on unmounts as the menu closes, so a popover
    *  anchored to it would be positioned against nothing. The ⋯ is the only box

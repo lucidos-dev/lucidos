@@ -412,17 +412,21 @@ fn waiting_for_user_answer_events_match_the_status_table() {
     );
 }
 
-// 14g. only_a_thread_waiting_on_the_user_refuses_archive
+// 14g. only_a_waiting_thread_or_the_home_thread_refuses_archive
 #[test]
-fn only_a_thread_waiting_on_the_user_refuses_archive() {
+fn only_a_waiting_thread_or_the_home_thread_refuses_archive() {
     for status in ThreadStatus::ALL {
         for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
-            let refused = check_archive_allowed(thread_type, ArchiveState::Inbox, status).is_err();
-            assert_eq!(
-                refused,
-                status == ThreadStatus::WaitingForUserAnswer,
-                "archive of a {status:?} {thread_type:?} thread",
-            );
+            for is_home in [false, true] {
+                let refused =
+                    check_archive_allowed(thread_type, ArchiveState::Inbox, status, is_home)
+                        .is_err();
+                assert_eq!(
+                    refused,
+                    is_home || status == ThreadStatus::WaitingForUserAnswer,
+                    "archive of a {status:?} {thread_type:?} thread, home={is_home}",
+                );
+            }
         }
     }
 }

@@ -4,7 +4,7 @@ use super::secret_reveal::{
 };
 use super::*;
 use crate::core::backup::{self, crypto};
-use crate::core::PreferenceStore;
+use crate::core::{prefs, PreferenceStore};
 use crate::engine::thread_events::MessageOrigin;
 
 /// The route that mints a backup-key reveal token, named in its own refusal.
@@ -418,12 +418,21 @@ fn build_backup_status(
     running: bool,
     last_run: Option<backup::BackupLastRun>,
     list_result: Result<Vec<backup::BackupEntry>, String>,
+    workspace_name: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> BackupStatusResponse {
     let (latest_backup, list_error) = match list_result {
-        // The provider's order is not guaranteed (Drive returns by file id, not
+        // The folder is shared, so only this workspace's archives count: another
+        // workspace's fresh backup must not hide this one's failures. The
+        // provider's order is not guaranteed (Drive returns by file id, not
         // creation time), so pick the newest explicitly rather than trusting [0].
-        Ok(entries) => (entries.into_iter().max_by_key(|e| e.created_at), None),
+        Ok(entries) => (
+            entries
+                .into_iter()
+                .filter(|e| backup::is_own_backup_archive(&e.filename, workspace_name))
+                .max_by_key(|e| e.created_at),
+            None,
+        ),
         Err(e) => (None, Some(e)),
     };
 
@@ -463,6 +472,7 @@ pub async fn get_backup_status(
         running,
         last_run,
         list_result,
+        backup::workspace_archive_name(&state.workspace_path),
         chrono::Utc::now(),
     )))
 }
@@ -536,10 +546,12 @@ pub async fn get_schedule(
     State(state): State<AppState>,
 ) -> Result<Json<ScheduleResponse>, ApiError> {
     // Read directly from preferences — no scheduler lock needed
-    let cron = PreferenceStore::get(&state.pool, backup::PREF_BACKUP_SCHEDULE)
+    let cron = prefs::BACKUP_SCHEDULE
+        .try_stored(&state.pool)
         .await
         .map_err(|e| ApiError::internal(format!("Failed to get schedule: {e}")))?;
-    let provider = PreferenceStore::get(&state.pool, backup::PREF_BACKUP_PROVIDER)
+    let provider = prefs::BACKUP_PROVIDER
+        .try_stored(&state.pool)
         .await
         .map_err(|e| ApiError::internal(format!("Failed to get schedule: {e}")))?;
 
@@ -640,7 +652,7 @@ pub async fn get_retention(
     // deliberately does NOT take the default here.
     let keep = backup::get_retention_count(&state.pool)
         .await
-        .unwrap_or(backup::DEFAULT_BACKUP_RETENTION);
+        .unwrap_or_else(|_| prefs::BACKUP_RETENTION.default_number() as usize);
     Ok(Json(RetentionResponse { keep }))
 }
 
@@ -649,15 +661,16 @@ pub async fn set_retention(
     headers: HeaderMap,
     Json(req): Json<RetentionRequest>,
 ) -> Result<Json<RetentionResponse>, ApiError> {
-    if req.keep == 0 {
-        return Err(ApiError::bad_request("Must keep at least 1 backup"));
-    }
     let value = req.keep.to_string();
+    // The catalog's bounds, so a raw write cannot store a count the reader
+    // would then clamp (and prune to).
+    crate::core::preference_catalog::validate(&prefs::BACKUP_RETENTION.spec, &value)
+        .map_err(ApiError::bad_request)?;
     let actor = crate::api::actor::user_actor(&headers, None);
     PreferenceStore::set(
         &state.pool,
         &state.engine.event_bus,
-        backup::PREF_BACKUP_RETENTION,
+        prefs::BACKUP_RETENTION.key(),
         &value,
         actor,
     )
@@ -790,10 +803,17 @@ mod tests {
         }
     }
 
+    /// The workspace the status tests read as their own.
+    const WS: &str = "myws";
+
     fn entry(id: &str, age: Duration) -> backup::BackupEntry {
+        entry_of(WS, id, age)
+    }
+
+    fn entry_of(workspace: &str, id: &str, age: Duration) -> backup::BackupEntry {
         backup::BackupEntry {
             id: id.to_string(),
-            filename: format!("lucidos-backup-{id}.enc"),
+            filename: format!("lucidos-backup-{workspace}-20260601-040254.enc"),
             size_bytes: 1024,
             created_at: Utc::now() - age,
         }
@@ -1119,9 +1139,9 @@ mod tests {
     #[test]
     fn build_status_mirrors_running_flag() {
         let now = Utc::now();
-        let on = build_backup_status(true, None, Ok(vec![]), now);
+        let on = build_backup_status(true, None, Ok(vec![]), WS, now);
         assert!(on.running);
-        let off = build_backup_status(false, None, Ok(vec![]), now);
+        let off = build_backup_status(false, None, Ok(vec![]), WS, now);
         assert!(!off.running);
     }
 
@@ -1135,13 +1155,29 @@ mod tests {
             entry("newest", Duration::hours(1)),
             entry("mid", Duration::hours(10)),
         ];
-        let status = build_backup_status(false, None, Ok(entries), now);
+        let status = build_backup_status(false, None, Ok(entries), WS, now);
         let latest = status.latest_backup.expect("a latest backup");
         assert_eq!(latest.id, "newest");
         assert!(!status.stale, "a 1h-old backup is fresh");
         let age = status.age_seconds.expect("age");
         assert!((3000..4200).contains(&age), "≈1h in seconds, got {age}");
         assert!(status.list_error.is_none());
+    }
+
+    /// The backup folder is shared. Another workspace's fresh archive once
+    /// read as this one's latest, so a workspace whose backups failed looked
+    /// healthy.
+    #[test]
+    fn build_status_counts_only_this_workspaces_archives() {
+        let now = Utc::now();
+        let entries = vec![
+            entry("mine", Duration::hours(30)),
+            entry_of("myws-2", "sibling", Duration::hours(1)),
+            entry_of("other", "other", Duration::hours(2)),
+        ];
+        let status = build_backup_status(false, None, Ok(entries), WS, now);
+        assert_eq!(status.latest_backup.expect("own archive").id, "mine");
+        assert!(status.stale, "this workspace's newest backup is 30h old");
     }
 
     /// A backup older than 24h is stale.
@@ -1152,6 +1188,7 @@ mod tests {
             false,
             None,
             Ok(vec![entry("old", Duration::hours(30))]),
+            WS,
             now,
         );
         assert!(status.stale);
@@ -1163,7 +1200,7 @@ mod tests {
     #[test]
     fn build_status_stale_when_none() {
         let now = Utc::now();
-        let status = build_backup_status(false, None, Ok(vec![]), now);
+        let status = build_backup_status(false, None, Ok(vec![]), WS, now);
         assert!(status.stale);
         assert!(status.latest_backup.is_none());
         assert!(status.age_seconds.is_none());
@@ -1179,6 +1216,7 @@ mod tests {
             false,
             Some(backup::BackupLastRun::failure("disk full", now)),
             Err("Drive unreachable".to_string()),
+            WS,
             now,
         );
         assert!(status.latest_backup.is_none());
@@ -1210,7 +1248,7 @@ mod tests {
         PreferenceStore::set(
             &pool,
             &bus,
-            backup::PREF_BACKUP_SCHEDULE,
+            prefs::BACKUP_SCHEDULE.key(),
             "0 0 3 * * *",
             None,
         )
@@ -1219,7 +1257,7 @@ mod tests {
         PreferenceStore::set(
             &pool,
             &bus,
-            backup::PREF_BACKUP_PROVIDER,
+            prefs::BACKUP_PROVIDER.key(),
             "google_drive",
             None,
         )
@@ -1245,11 +1283,11 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            by_key.get(backup::PREF_BACKUP_SCHEDULE),
+            by_key.get(prefs::BACKUP_SCHEDULE.key()),
             Some(&"0 0 3 * * *")
         );
         assert_eq!(
-            by_key.get(backup::PREF_BACKUP_PROVIDER),
+            by_key.get(prefs::BACKUP_PROVIDER.key()),
             Some(&"google_drive")
         );
 
@@ -1278,10 +1316,10 @@ mod tests {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let (bus, _parent_rx) = EventBus::new(pool.clone());
 
-        PreferenceStore::set(&pool, &bus, backup::PREF_BACKUP_SCHEDULE, "off", None)
+        PreferenceStore::set(&pool, &bus, prefs::BACKUP_SCHEDULE.key(), "off", None)
             .await
             .unwrap();
-        PreferenceStore::set(&pool, &bus, backup::PREF_BACKUP_PROVIDER, "dropbox", None)
+        PreferenceStore::set(&pool, &bus, prefs::BACKUP_PROVIDER.key(), "dropbox", None)
             .await
             .unwrap();
 
@@ -1303,9 +1341,9 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(by_key.get(backup::PREF_BACKUP_SCHEDULE), Some(&"off"));
+        assert_eq!(by_key.get(prefs::BACKUP_SCHEDULE.key()), Some(&"off"));
         assert_eq!(
-            by_key.get(backup::PREF_BACKUP_PROVIDER),
+            by_key.get(prefs::BACKUP_PROVIDER.key()),
             Some(&"dropbox"),
             "the destination survives a disable"
         );

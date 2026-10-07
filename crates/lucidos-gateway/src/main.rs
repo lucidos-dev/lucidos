@@ -44,6 +44,8 @@ mod chain_tests;
 mod control;
 mod error;
 mod file_backup;
+#[cfg(test)]
+mod gateway_constants_codegen_tests;
 mod hook_socket;
 mod installs;
 mod net_config;
@@ -59,6 +61,8 @@ mod shell_env;
 mod slowness;
 mod stack;
 mod update_relay;
+#[cfg(test)]
+mod value_pins_tests;
 
 /// Lucidos umbrella release version (e.g. "0.7"), sourced from the repo-root
 /// `RELEASE` file at compile time. Mirrors `lucidos_engine::LUCIDOS_RELEASE`

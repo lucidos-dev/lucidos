@@ -1756,6 +1756,7 @@ async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
             result: "The user doesn't want to proceed with this tool use.".into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             tool_use_id: "toolu_1".into(),
+            parent_tool_use_id: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1767,6 +1768,7 @@ async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
         event: ThreadEvent::CodingAgentTextStreamed {
             text: "\n\n".into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            parent_tool_use_id: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1901,6 +1903,7 @@ async fn a_crash_still_offers_continue_on_an_app_coding_agent_thread() {
         event: ThreadEvent::CodingAgentTextStreamed {
             text: "mid-turn when the engine died".into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            parent_tool_use_id: None,
         },
         meta: cc_meta.clone(),
     })

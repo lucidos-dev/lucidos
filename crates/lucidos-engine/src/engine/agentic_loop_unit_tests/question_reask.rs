@@ -310,14 +310,15 @@ mod question_reask_tests {
     #[test]
     fn caps_are_bounded_and_below_the_default_tool_call_cap() {
         // Sanity: both caps are small positive bounds, far under the outer
-        // tool-call backstop. All operands are consts, so assert at compile time.
+        // tool-call backstop. The bounds are consts, so those assert at compile
+        // time; the cap's default lives in the catalog, so that one runs.
         //
         // This guards the DEFAULT cap, not the configured one: the tool-call cap
         // is a user setting with no ceiling and a floor of 1, so a user who sets
         // it to 1 has deliberately chosen for the backstop to fire before this
         // guard. What must not drift is the unconfigured relationship.
         const { assert!(MAX_QUESTION_REASK >= 1) };
-        const { assert!(MAX_QUESTION_REASK < crate::core::DEFAULT_MAX_TOOL_CALLS) };
+        assert!((MAX_QUESTION_REASK as f64) < crate::core::prefs::MAX_TOOL_CALLS.default_number());
         const { assert!(MAX_PROSE_QUESTION_NUDGE >= 1) };
         const { assert!(MAX_PROSE_QUESTION_NUDGE <= MAX_QUESTION_REASK) };
     }

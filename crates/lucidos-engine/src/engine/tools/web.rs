@@ -1,12 +1,13 @@
 use super::super::LucidosEngine;
-use crate::llm::WebSearchProvider;
 use std::time::Duration;
 
 impl LucidosEngine {
+    /// `thread_id` anchors the cost row a web search records.
     pub(crate) async fn execute_web_tool(
         &self,
         name: &str,
         args: &serde_json::Value,
+        thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             "fetch_news" => {
@@ -101,7 +102,13 @@ impl LucidosEngine {
                 // tool still searches via another configured one. The chain
                 // itself owns backend selection, fallthrough, and the
                 // nothing-configured message; see `llm::web_search`.
-                match self.current_web_search().search(query, max_results).await {
+                let capture = crate::engine::AuxCapture::new(
+                    &self.event_bus,
+                    thread_id,
+                    crate::engine::ContextPurpose::WebSearch,
+                );
+                let chain = self.current_web_search();
+                match capture.search(&chain, query, max_results).await {
                     Ok(result) => Ok(result),
                     Err(e) => Ok(format!("Error: Search failed: {}", e)),
                 }

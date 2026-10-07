@@ -14,6 +14,8 @@
  * `@lucidos/text-entry` alias without pulling the SDK barrel into its graph.
  */
 
+import { parseFlag, PREF_AUTOCORRECT } from './generated/preference-catalog';
+
 /** Input types that are not text entry, so no keyboard attribute applies.
  *  Allow-by-exclusion, so a new text-ish type (`date`, `month`, …) is covered
  *  without a list edit. */
@@ -36,19 +38,18 @@ export function isTextEntryField(el: Element): el is HTMLInputElement | HTMLText
  *  its preferences arrive. */
 export const AUTOCORRECT_STORAGE_KEY = 'lucidos-autocorrect';
 
-/** What an unset switch means: on, on every client. It is the one function
- *  that decides the default, so the host and every app frame agree. A device
- *  whose autocorrect keeps the tap on Send turns the switch off (ADR 0262). */
+/** What an unset switch means, on every client: the preference catalog's
+ *  default. A device whose autocorrect keeps the tap on Send turns the switch
+ *  off (ADR 0262). */
 export function defaultAutocorrect(): boolean {
-  return true;
+  return PREF_AUTOCORRECT.fallback === 'true';
 }
 
-/** Resolve the stored `autocorrect` preference. `'true'` and `'false'` win on
- *  any client; anything else is unset and falls to {@link defaultAutocorrect}. */
+/** Resolve the stored `autocorrect` preference. A spelling the engine reads as
+ *  on or off wins on any client; anything else is unset and falls to
+ *  {@link defaultAutocorrect}. */
 export function resolveAutocorrect(raw: string | null | undefined): boolean {
-  if (raw === 'true') return true;
-  if (raw === 'false') return false;
-  return defaultAutocorrect();
+  return parseFlag(raw ?? '') ?? defaultAutocorrect();
 }
 
 /** Whether a codepoint names a key rather than text.

@@ -34,6 +34,23 @@ pub(super) async fn submit_command_consent(
     headers: HeaderMap,
     Json(body): Json<CommandConsentRequest>,
 ) -> impl IntoResponse {
+    let card_thread = state
+        .engine
+        .pending_command_permission
+        .lock()
+        .unwrap()
+        .thread_of(&body.request_id);
+    if let Err(e) = super::thread_reach::refuse_permission_answer(
+        &state.pool,
+        &headers,
+        card_thread,
+        body.allowed,
+        body.persist_scope,
+    )
+    .await
+    {
+        return e.into_response();
+    }
     let actor = super::actor::user_actor(&headers, None);
     let answered = resolve_command_permission(
         &state.engine,

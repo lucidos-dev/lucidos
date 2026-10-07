@@ -124,6 +124,29 @@ async fn listing_servers_carries_totals_and_the_resolved_window() {
         "context_window: {body}"
     );
 
+    // The share is stated against the request's own char budget, and the MCP
+    // ceiling is a part of it.
+    let budget = &body["budget"];
+    let request_chars = budget["request_chars"].as_u64().unwrap_or(0);
+    let ceiling = budget["mcp_ceiling_chars"].as_u64().unwrap_or(0);
+    assert!(request_chars > 0, "budget.request_chars: {budget}");
+    assert!(
+        ceiling > 0 && ceiling < request_chars,
+        "budget.mcp_ceiling_chars: {budget}"
+    );
+    for key in ["sent_tools", "sent_chars", "sent_tokens"] {
+        assert!(budget[key].is_u64(), "budget.{key}: {budget}");
+    }
+    assert!(
+        budget["sent_chars"].as_u64().unwrap() <= ceiling,
+        "a request never carries more than the ceiling: {budget}"
+    );
+    assert!(budget["dropped"].is_array(), "budget.dropped: {budget}");
+    assert!(
+        budget["warning"].is_null() || budget["warning"].is_string(),
+        "budget.warning: {budget}"
+    );
+
     // The counts have to agree with the array, or the header contradicts the
     // rows it sits above.
     let servers = body["servers"].as_array().unwrap();

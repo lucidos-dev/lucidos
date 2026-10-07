@@ -1,8 +1,9 @@
 import { signal } from '@preact/signals';
-import { focusedThreadId, isMidTurn } from '../../store/store';
-import { computeExchanges, findQuestionAnswer } from '../../store/thread-events';
+import { effectiveThreadStatus, focusedThreadId, isMidTurn } from '../../store/store';
+import { awaitedQuestionCard, computeExchanges, findQuestionAnswer } from '../../store/thread-events';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
 import { uploadsGate, type PendingUpload } from '../../store/pendingUploads';
+import { pendingAnswers } from '../../store/pendingDecisions';
 
 // Pure prompt-input logic + the optimistic-send signal. Extracted from
 // PromptInput.tsx (re-exported there); imported directly by *.test.ts.
@@ -23,27 +24,16 @@ export const promptStopRequested = signal(false);
  *  Only the composer knows whether this draft can be asked aside. */
 export const promptSideQuestionRequested = signal(false);
 
-/** What the Side question half of the split pill does, or why it is not
- *  offered. The hold on the row's end button and the Side question shortcut
- *  share it.
- *  From Send it asks the draft. Stop, and the lone Cancel on a waiting card,
- *  show only over an empty box, so there it turns on side-question mode. */
-export type SideQuestionAction =
-  | { kind: 'ask-draft' }
-  | { kind: 'start-mode' }
-  | { kind: 'unavailable'; reason: string };
-
-export function sideQuestionAction(args: {
-  hasContent: boolean;
-  stopOrCancelShown: boolean;
+/** Why this thread cannot turn on side-question mode, or null when it can.
+ *  The hold on the row's end button and the Side question shortcut share it.
+ *  Both only ever turn the mode on, whatever the box holds. */
+export function sideQuestionBlocker(args: {
   threadStarted: boolean;
   isCodex: boolean;
-}): SideQuestionAction {
-  if (!args.threadStarted) return { kind: 'unavailable', reason: 'Side questions need a started thread.' };
-  if (args.isCodex) return { kind: 'unavailable', reason: "Codex threads don't take side questions." };
-  if (args.hasContent) return { kind: 'ask-draft' };
-  if (args.stopOrCancelShown) return { kind: 'start-mode' };
-  return { kind: 'unavailable', reason: 'Type the side question first.' };
+}): string | null {
+  if (!args.threadStarted) return 'Side questions need a started thread.';
+  if (args.isCodex) return "Codex threads don't take side questions.";
+  return null;
 }
 
 /** Whether side-question mode is in force. The stored flag counts only where a
@@ -521,6 +511,19 @@ export function findLatestPendingQuestion(
     return { toolUseId: ue.tool_use_id, multiSelect: !!ue.multi_select };
   }
   return null;
+}
+
+/** The question card a message sent now would answer, by tool-use id. The
+ *  engine routes typed text to an open question as its `FreeText` answer.
+ *
+ *  Only the NEWEST card that awaits an answer counts. A permission card waits
+ *  under the same status, and walking past it would reach a question an abort
+ *  stranded. A send behind an answer already in flight answers nothing either,
+ *  typed or tapped: the engine takes the later text as an ordinary message. */
+export function questionTheSendAnswers(thread: ThreadState): string | undefined {
+  if (effectiveThreadStatus(thread) !== 'waiting_for_user_answer') return undefined;
+  const card = awaitedQuestionCard(computeExchanges(thread));
+  return card && !pendingAnswers.map.peek().has(card) ? card : undefined;
 }
 
 /** Whether the optimistic `cancelingThreadIds` flag should be released.

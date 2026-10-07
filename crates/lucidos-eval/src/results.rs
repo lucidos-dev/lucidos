@@ -285,6 +285,13 @@ pub struct ThreadRow {
     /// Prompts the driver re-posted to recover one of those turns.
     #[serde(default)]
     pub empty_retries: i64,
+    /// Turns the provider refused with no output, every attempt counted.
+    /// Above zero with a finished status, a re-post recovered it.
+    #[serde(default)]
+    pub refusals: i64,
+    /// Prompts the driver re-posted to recover one of those turns.
+    #[serde(default)]
+    pub refusal_retries: i64,
     /// Sequence of the prompt that opened turn two, as the driver posted it.
     ///
     /// Recorded rather than counted, because a re-posted turn leaves more than
@@ -293,6 +300,14 @@ pub struct ThreadRow {
     /// which is what those runs meant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub followup_sequence: Option<i64>,
+    /// Whether a Tree arm's compactor had caught up when this row was written.
+    ///
+    /// A Tree arm waits for it once the thread settles. The next task then
+    /// reads the trees it was designed to read, and this row prices the
+    /// compactor's calls. `false` says the bound arrived first. `None` on a
+    /// Classic arm, which runs no compactor, so a Classic row keeps its bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_caught_up: Option<bool>,
 }
 
 impl ThreadRow {
@@ -474,15 +489,90 @@ fn schedule_change(recorded: &RunRow, wanted: &RunRow) -> Option<String> {
         })
 }
 
+/// How far one repeat got, read off the rows earlier invocations wrote.
+#[derive(Debug, Default, PartialEq)]
+pub struct RepeatProgress {
+    /// How many of the run's tasks, from the first, every arm has a verdict on.
+    pub reached: usize,
+    /// Per arm, the reached tasks that did not finish. They void the tasks
+    /// below them exactly as they did in the invocation that ran them.
+    pub failed: BTreeMap<Arm, BTreeSet<String>>,
+    /// Per arm, the last thread it drove. Its workspace must still hold it.
+    pub last_threads: BTreeMap<Arm, Uuid>,
+}
+
+/// Where a resume picks this repeat up, at a task boundary.
+///
+/// A task is reached once every arm has its completion row, which the pair
+/// verdict writes last. Rows for a task short of that mean an invocation died
+/// inside it. Its workspaces then hold half a task, so this refuses the resume.
+pub fn repeat_progress(rows: &[ResultRow], run: &RunRow, repeat: u32) -> Fallible<RepeatProgress> {
+    let mut verdicts: BTreeSet<(Arm, &str)> = BTreeSet::new();
+    let mut threads: BTreeMap<(Arm, &str), &ThreadRow> = BTreeMap::new();
+    let mut touched: BTreeSet<&str> = BTreeSet::new();
+    for row in rows {
+        match row {
+            ResultRow::Completion(done) if done.repeat == repeat => {
+                verdicts.insert((done.arm, &done.task));
+                touched.insert(&done.task);
+            }
+            ResultRow::Thread(thread) if thread.repeat == repeat => {
+                threads.insert((thread.arm, &thread.task), thread);
+                touched.insert(&thread.task);
+            }
+            ResultRow::Probe(probe) if probe.repeat == repeat => {
+                touched.insert(&probe.task);
+            }
+            _ => {}
+        }
+    }
+    let reached = run
+        .tasks
+        .iter()
+        .take_while(|task| {
+            run.arms
+                .iter()
+                .all(|arm| verdicts.contains(&(*arm, task.as_str())))
+        })
+        .count();
+    let done = &run.tasks[..reached];
+    if let Some(cut) = touched.iter().find(|task| !done.iter().any(|t| t == *task)) {
+        return Err(format!(
+            "cut_off: task {cut} of repeat {repeat} has rows but not a verdict from every arm, \
+             so an earlier invocation stopped inside it. Its workspaces hold half a task, and \
+             no later task can be dropped into them. Start a new run instead."
+        )
+        .into());
+    }
+    let mut progress = RepeatProgress {
+        reached,
+        ..RepeatProgress::default()
+    };
+    for arm in run.arms.iter().copied() {
+        let failed = progress.failed.entry(arm).or_default();
+        for task in done {
+            match threads.get(&(arm, task.as_str())) {
+                Some(thread) => {
+                    progress.last_threads.insert(arm, thread.thread_id);
+                    if !FINISHED_STATUSES.contains(&thread.status.as_str()) {
+                        failed.insert(task.clone());
+                    }
+                }
+                // No thread row is a task this arm was blocked from running.
+                None => {
+                    failed.insert(task.clone());
+                }
+            }
+        }
+    }
+    Ok(progress)
+}
+
 /// Repeats already finished in these rows, so a resume can skip them.
 ///
-/// A repeat counts as complete when every arm has reached a verdict on every
-/// task the run declared. A partly written repeat is re-run from the start,
-/// because its workspaces carry state no later task can be dropped into.
-///
-/// A **voided** task counts as reached. It writes probe rows and no thread row.
-/// Requiring a thread row read a finished repeat as unfinished and re-ran a
-/// whole sequence run, which is the most expensive thing this file prevents.
+/// Complete means [`repeat_progress`] reached every task the run declared, so
+/// one rule decides both a skip and a continuation. A **voided** task counts as
+/// reached: its pair verdict still writes a completion row per arm.
 pub fn completed_repeats(rows: &[ResultRow]) -> BTreeSet<u32> {
     let Some(run) = rows.iter().find_map(|row| match row {
         ResultRow::Run(run) => Some(run),
@@ -490,32 +580,19 @@ pub fn completed_repeats(rows: &[ResultRow]) -> BTreeSet<u32> {
     }) else {
         return BTreeSet::new();
     };
-    let mut seen: BTreeMap<u32, BTreeSet<(String, String)>> = BTreeMap::new();
-    for row in rows {
-        let reached = match row {
-            ResultRow::Thread(thread) => Some((thread.repeat, thread.arm, thread.task.clone())),
-            ResultRow::Probe(probe) => Some((probe.repeat, probe.arm, probe.task.clone())),
-            ResultRow::Completion(done) => Some((done.repeat, done.arm, done.task.clone())),
-            ResultRow::Run(_) => None,
-        };
-        if let Some((repeat, arm, task)) = reached {
-            seen.entry(repeat)
-                .or_default()
-                .insert((arm.as_str().to_string(), task));
-        }
-    }
-    let expected: BTreeSet<(String, String)> = run
-        .arms
+    let repeats: BTreeSet<u32> = rows
         .iter()
-        .flat_map(|arm| {
-            run.tasks
-                .iter()
-                .map(move |task| (arm.as_str().to_string(), task.clone()))
+        .filter_map(|row| match row {
+            ResultRow::Completion(done) => Some(done.repeat),
+            _ => None,
         })
         .collect();
-    seen.into_iter()
-        .filter(|(_, done)| expected.is_subset(done))
-        .map(|(repeat, _)| repeat)
+    repeats
+        .into_iter()
+        .filter(|repeat| {
+            repeat_progress(rows, run, *repeat)
+                .is_ok_and(|progress| progress.reached == run.tasks.len())
+        })
         .collect()
 }
 
@@ -536,7 +613,7 @@ mod tests {
             config: RunConfig::Smoke,
             repeats: 2,
             tasks: vec!["T01".into(), "T02".into()],
-            arms: Arm::BOTH.to_vec(),
+            arms: vec![Arm::CONTROL, Arm::LEAN],
             context_window: 200_000,
             run_label: "test-model".into(),
             expire_after_rounds: 5,
@@ -578,7 +655,10 @@ mod tests {
             memory_recalled: true,
             empty_completions: 0,
             empty_retries: 0,
+            refusals: 0,
+            refusal_retries: 0,
             followup_sequence: None,
+            compaction_caught_up: None,
         })
     }
 
@@ -586,7 +666,7 @@ mod tests {
         ResultRow::Probe(ProbeRow {
             run_id: "abc".into(),
             repeat: 1,
-            arm: Arm::Lean,
+            arm: Arm::LEAN,
             task: "T05".into(),
             probe: "P05.1".into(),
             fact: Some("F16".into()),
@@ -597,7 +677,7 @@ mod tests {
 
     #[test]
     fn every_row_kind_round_trips_through_json() {
-        for row in [run_row(), thread_row(1, Arm::Lean, "T01"), probe_row()] {
+        for row in [run_row(), thread_row(1, Arm::LEAN, "T01"), probe_row()] {
             let text = serde_json::to_string(&row).unwrap();
             assert_eq!(serde_json::from_str::<ResultRow>(&text).unwrap(), row);
         }
@@ -608,7 +688,7 @@ mod tests {
     #[test]
     fn a_thread_row_written_before_the_retrieval_field_still_parses() {
         let mut row: serde_json::Value =
-            serde_json::to_value(thread_row(1, Arm::Lean, "T01")).unwrap();
+            serde_json::to_value(thread_row(1, Arm::LEAN, "T01")).unwrap();
         row.as_object_mut()
             .expect("a thread row is an object")
             .remove("memory_recalled")
@@ -626,7 +706,7 @@ mod tests {
     #[test]
     fn a_thread_row_written_before_the_utilisation_fields_still_parses() {
         let mut row: serde_json::Value =
-            serde_json::to_value(thread_row(1, Arm::Lean, "T01")).unwrap();
+            serde_json::to_value(thread_row(1, Arm::LEAN, "T01")).unwrap();
         let object = row.as_object_mut().expect("a thread row is an object");
         for field in [
             "repeat_recoveries",
@@ -655,7 +735,7 @@ mod tests {
     #[test]
     fn a_thread_row_written_before_the_auxiliary_split_still_parses() {
         let mut row: serde_json::Value =
-            serde_json::to_value(thread_row(1, Arm::Lean, "T01")).unwrap();
+            serde_json::to_value(thread_row(1, Arm::LEAN, "T01")).unwrap();
         let object = row.as_object_mut().expect("a thread row is an object");
         for field in ["auxiliary_tokens", "usd_auxiliary"] {
             object.remove(field).expect("the field is written");
@@ -676,7 +756,7 @@ mod tests {
     #[test]
     fn the_old_input_field_name_still_reads() {
         let mut row: serde_json::Value =
-            serde_json::to_value(thread_row(1, Arm::Lean, "T01")).unwrap();
+            serde_json::to_value(thread_row(1, Arm::LEAN, "T01")).unwrap();
         let object = row.as_object_mut().expect("a thread row is an object");
         let total = object.remove("input_total").expect("the field is written");
         object.insert("input_tokens".to_string(), total);
@@ -694,7 +774,7 @@ mod tests {
     fn a_thread_that_woke_and_finished_counts_as_finished() {
         let row = |status: &str| ThreadRow {
             status: status.into(),
-            ..match thread_row(1, Arm::Lean, "T08") {
+            ..match thread_row(1, Arm::LEAN, "T08") {
                 ResultRow::Thread(thread) => thread,
                 _ => unreachable!("thread_row builds a thread row"),
             }
@@ -707,20 +787,20 @@ mod tests {
         assert!(!row("failed").finished());
     }
 
-    /// A run recorded before the retry existed reads as no empty completions and no
-    /// boundary. Both are what those runs measured: one prompt per turn, and no
-    /// re-post to move it.
+    /// A run recorded before the re-posts existed reads as no empty completions,
+    /// no refusals and no boundary. That is what those runs measured: one prompt
+    /// per turn, and no re-post to move it.
     #[test]
-    fn a_thread_row_written_before_the_empty_completion_fields_still_parses() {
+    fn a_thread_row_written_before_the_repost_fields_still_parses() {
         let mut row: serde_json::Value =
-            serde_json::to_value(thread_row(1, Arm::Lean, "T14")).unwrap();
+            serde_json::to_value(thread_row(1, Arm::LEAN, "T14")).unwrap();
         let object = row.as_object_mut().expect("a thread row is an object");
         object
             .remove("empty_completions")
             .expect("the field is written");
-        object
-            .remove("empty_retries")
-            .expect("the field is written");
+        for field in ["empty_retries", "refusals", "refusal_retries"] {
+            object.remove(field).expect("the field is written");
+        }
         // The boundary is skipped when absent, so an old row looks the same.
         assert!(!object.contains_key("followup_sequence"));
 
@@ -729,6 +809,7 @@ mod tests {
             ResultRow::Thread(thread) => {
                 assert_eq!(thread.empty_completions, 0);
                 assert_eq!(thread.empty_retries, 0);
+                assert_eq!((thread.refusals, thread.refusal_retries), (0, 0));
                 assert_eq!(thread.followup_sequence, None);
             }
             other => panic!("expected a thread row and got {other:?}"),
@@ -740,7 +821,7 @@ mod tests {
     #[test]
     fn a_thread_row_written_before_the_settle_wait_reads_as_unrecorded() {
         let mut row: serde_json::Value =
-            serde_json::to_value(thread_row(1, Arm::Lean, "T14")).unwrap();
+            serde_json::to_value(thread_row(1, Arm::LEAN, "T14")).unwrap();
         let object = row.as_object_mut().expect("a thread row is an object");
         object
             .remove("event_log_settled")
@@ -757,7 +838,7 @@ mod tests {
         ResultRow::Completion(CompletionRow {
             run_id: "abc".into(),
             repeat: 1,
-            arm: Arm::Lean,
+            arm: Arm::LEAN,
             task: "T06".into(),
             probe: "C06".into(),
             outcome: CompletionOutcome::Fail,
@@ -787,7 +868,7 @@ mod tests {
     /// existed still reads. It simply says nothing about delivery.
     #[test]
     fn a_results_file_written_before_completion_rows_still_parses() {
-        let rows = [run_row(), thread_row(1, Arm::Lean, "T01"), probe_row()];
+        let rows = [run_row(), thread_row(1, Arm::LEAN, "T01"), probe_row()];
         let text: Vec<String> = rows
             .iter()
             .map(|row| serde_json::to_string(row).unwrap())
@@ -809,7 +890,7 @@ mod tests {
     fn a_repeat_missing_one_arm_is_not_complete() {
         let mut rows = vec![run_row()];
         for task in ["T01", "T02"] {
-            rows.push(thread_row(1, Arm::Control, task));
+            rows.push(thread_row(1, Arm::CONTROL, task));
         }
         assert!(completed_repeats(&rows).is_empty());
     }
@@ -817,12 +898,9 @@ mod tests {
     #[test]
     fn a_repeat_with_every_arm_and_task_is_skipped_on_resume() {
         let mut rows = vec![run_row()];
-        for arm in Arm::BOTH {
-            for task in ["T01", "T02"] {
-                rows.push(thread_row(1, arm, task));
-            }
-        }
-        rows.push(thread_row(2, Arm::Lean, "T01"));
+        rows.extend(finished_task(1, "T01"));
+        rows.extend(finished_task(1, "T02"));
+        rows.extend(finished_task(2, "T01"));
         let complete = completed_repeats(&rows);
         assert!(complete.contains(&1));
         assert!(!complete.contains(&2));
@@ -944,13 +1022,15 @@ mod tests {
         }
     }
 
-    /// A voided task leaves probe rows and no thread row. The repeat is still
-    /// finished, and re-running it would pay for a whole sequence run twice.
+    /// A voided task leaves probe rows, a void verdict and no thread row. The
+    /// repeat is still finished, and re-running it would pay for a whole
+    /// sequence run twice.
     #[test]
     fn a_repeat_whose_last_task_was_voided_is_still_complete() {
         let mut rows = vec![run_row()];
-        for arm in Arm::BOTH {
-            rows.push(thread_row(1, arm, "T01"));
+        rows.extend(finished_task(1, "T01"));
+        for arm in [Arm::CONTROL, Arm::LEAN] {
+            rows.push(verdict_row(1, arm, "T02", CompletionOutcome::Void));
             rows.push(ResultRow::Probe(ProbeRow {
                 run_id: "abc".into(),
                 repeat: 1,
@@ -965,9 +1045,111 @@ mod tests {
         assert!(completed_repeats(&rows).contains(&1));
     }
 
+    /// The last task's thread rows landed and its verdict rows did not. That
+    /// repeat is cut off, not finished, so it is never skipped.
+    #[test]
+    fn a_repeat_missing_its_last_verdict_is_not_complete() {
+        let mut rows = vec![run_row()];
+        rows.extend(finished_task(1, "T01"));
+        for arm in [Arm::CONTROL, Arm::LEAN] {
+            rows.push(thread_row(1, arm, "T02"));
+        }
+        assert!(completed_repeats(&rows).is_empty());
+    }
+
+    fn verdict_row(repeat: u32, arm: Arm, task: &str, outcome: CompletionOutcome) -> ResultRow {
+        ResultRow::Completion(CompletionRow {
+            run_id: "abc".into(),
+            repeat,
+            arm,
+            task: task.into(),
+            probe: format!("C{}", &task[1..]),
+            outcome,
+        })
+    }
+
+    /// Both arms ran `task` to the end and got a verdict.
+    fn finished_task(repeat: u32, task: &str) -> Vec<ResultRow> {
+        let mut rows = Vec::new();
+        for arm in [Arm::CONTROL, Arm::LEAN] {
+            rows.push(thread_row(repeat, arm, task));
+        }
+        for arm in [Arm::CONTROL, Arm::LEAN] {
+            rows.push(verdict_row(repeat, arm, task, CompletionOutcome::Pass));
+        }
+        rows
+    }
+
+    #[test]
+    fn a_repeat_with_no_rows_starts_at_the_first_task() {
+        let progress = repeat_progress(&[run_row()], &bare_run_row(), 1).unwrap();
+        assert_eq!(progress.reached, 0);
+        assert!(progress.last_threads.is_empty());
+        assert!(progress.failed.values().all(BTreeSet::is_empty));
+    }
+
+    /// The chunked run: an invocation stopped after T01, so the next one
+    /// continues at T02 in the same workspaces.
+    #[test]
+    fn a_repeat_stopped_at_a_task_boundary_continues_after_it() {
+        let mut rows = vec![run_row()];
+        rows.extend(finished_task(1, "T01"));
+        let progress = repeat_progress(&rows, &bare_run_row(), 1).unwrap();
+        assert_eq!(progress.reached, 1);
+        assert_eq!(progress.last_threads.len(), 2);
+        assert!(progress.failed.values().all(BTreeSet::is_empty));
+    }
+
+    /// The failure set is what voids downstream tasks, so a resume must rebuild
+    /// it exactly: an arm that timed out failed, and so did one never let run.
+    #[test]
+    fn a_resume_rebuilds_which_tasks_failed_in_each_arm() {
+        let mut rows = vec![run_row()];
+        let ResultRow::Thread(timed_out) = thread_row(1, Arm::CONTROL, "T01") else {
+            unreachable!("thread_row builds a thread row")
+        };
+        rows.push(ResultRow::Thread(ThreadRow {
+            status: "timeout".into(),
+            ..timed_out
+        }));
+        rows.push(verdict_row(1, Arm::CONTROL, "T01", CompletionOutcome::Fail));
+        // Blocked: void probe rows and a void verdict, and no thread.
+        rows.push(verdict_row(1, Arm::LEAN, "T01", CompletionOutcome::Void));
+        let progress = repeat_progress(&rows, &bare_run_row(), 1).unwrap();
+        assert_eq!(progress.reached, 1);
+        for arm in [Arm::CONTROL, Arm::LEAN] {
+            assert!(progress.failed[&arm].contains("T01"), "{arm}");
+        }
+        assert!(!progress.last_threads.contains_key(&Arm::LEAN));
+    }
+
+    /// Rows for a task with no verdict from every arm mean an invocation died
+    /// inside it. The resume refuses to drive the next task onto half a task.
+    #[test]
+    fn a_repeat_cut_off_inside_a_task_is_refused() {
+        let mut rows = vec![run_row()];
+        rows.extend(finished_task(1, "T01"));
+        rows.push(thread_row(1, Arm::CONTROL, "T02"));
+        let err = repeat_progress(&rows, &bare_run_row(), 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cut_off: task T02 of repeat 1"), "{err}");
+    }
+
+    #[test]
+    fn another_repeats_rows_do_not_move_this_one() {
+        let mut rows = vec![run_row()];
+        rows.extend(finished_task(1, "T01"));
+        rows.push(thread_row(1, Arm::LEAN, "T02"));
+        assert_eq!(
+            repeat_progress(&rows, &bare_run_row(), 2).unwrap().reached,
+            0
+        );
+    }
+
     #[test]
     fn a_file_with_no_run_row_completes_nothing() {
-        let rows = vec![thread_row(1, Arm::Lean, "T01")];
+        let rows = vec![thread_row(1, Arm::LEAN, "T01")];
         assert!(completed_repeats(&rows).is_empty());
     }
 
@@ -975,7 +1157,7 @@ mod tests {
     fn a_written_file_reads_back_as_the_rows_that_went_in() {
         let dir = std::env::temp_dir().join(format!("lucidos-eval-{}", Uuid::new_v4().simple()));
         let file = ResultsFile::open(&dir, "abc").unwrap();
-        let written = vec![run_row(), thread_row(1, Arm::Lean, "T01"), probe_row()];
+        let written = vec![run_row(), thread_row(1, Arm::LEAN, "T01"), probe_row()];
         for row in &written {
             file.append(row).unwrap();
         }

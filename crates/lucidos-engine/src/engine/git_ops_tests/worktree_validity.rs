@@ -51,6 +51,60 @@ async fn is_live_worktree_at_true_for_real_worktree() {
     );
 }
 
+/// Commit a `.gitattributes` routing every file through a smudge filter that
+/// always fails, so any checkout in a new worktree of `repo` fails.
+async fn break_checkout(repo: &std::path::Path) {
+    tokio::fs::write(repo.join(".gitattributes"), "* filter=boom\n")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", ".gitattributes"], repo).await;
+    let _ = git_cmd(&["commit", "-m", "route files through boom"], repo).await;
+    let _ = git_cmd(&["config", "filter.boom.smudge", "false"], repo).await;
+    let _ = git_cmd(&["config", "filter.boom.required", "true"], repo).await;
+}
+
+#[tokio::test]
+async fn worktree_add_removes_the_tree_and_branch_it_added_when_checkout_fails() {
+    let (_tmp, repo) = make_test_repo().await;
+    break_checkout(&repo).await;
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt = wt_base.path().join("thread-unpopulated");
+
+    let out = worktree_add(&repo, &wt, &["-b", "claude-code/unpopulated"])
+        .await
+        .unwrap();
+
+    assert!(!out.status.success(), "the fixture must make checkout fail");
+    assert!(
+        !is_live_worktree_at(&wt).await,
+        "a tree whose checkout failed must not stay registered for reuse"
+    );
+    assert!(
+        !git_ref_exists(&repo, "refs/heads/claude-code/unpopulated").await,
+        "the -b branch this call created must be deleted with the tree"
+    );
+}
+
+#[tokio::test]
+async fn worktree_add_keeps_a_reused_branch_when_checkout_fails() {
+    let (_tmp, repo) = make_test_repo().await;
+    break_checkout(&repo).await;
+    let _ = git_cmd(&["branch", "claude-code/existing"], &repo).await;
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt = wt_base.path().join("thread-reuse");
+
+    let out = worktree_add(&repo, &wt, &["claude-code/existing"])
+        .await
+        .unwrap();
+
+    assert!(!out.status.success(), "the fixture must make checkout fail");
+    assert!(!is_live_worktree_at(&wt).await);
+    assert!(
+        git_ref_exists(&repo, "refs/heads/claude-code/existing").await,
+        "a branch the call only reused must survive the cleanup"
+    );
+}
+
 #[tokio::test]
 async fn is_live_worktree_at_false_when_absent() {
     let base = tempfile::tempdir().unwrap();

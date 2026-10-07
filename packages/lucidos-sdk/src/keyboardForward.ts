@@ -24,8 +24,8 @@ import { onHostPush } from './_bridge';
  *  side too (`useKeyboardShortcuts.ts`) — same convention as `lucidos:ui:confirm`. */
 export const FORWARD_KEYDOWN_TYPE = 'lucidos:keydown';
 
-/** Push channel carrying the host's shortcut bindings. Must match
- *  `APP_KEYBINDINGS_CHANNEL` in the host's `store/actions/app-keybindings.ts`. */
+/** Push channel carrying the host's shortcut bindings. The host imports this
+ *  constant (`store/actions/app-keybindings.ts`), so both ends speak one name. */
 export const KEYBINDINGS_CHANNEL = 'keybindings';
 
 /** One host binding, in the host registry's shape (`utils/shortcuts.ts`). */

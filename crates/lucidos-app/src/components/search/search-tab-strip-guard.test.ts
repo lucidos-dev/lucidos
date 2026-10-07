@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 // `rulesTargeting` rather than the first-match string helpers, so a copy of the
 // rule inside a media block cannot slip past.
-import { rulesTargeting, type CssRule } from '../../styles/__tests__/css-rule-helpers';
+import { cssRules, rulesTargeting, selectorList, type CssRule } from '../../styles/__tests__/css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const css = readFileSync(resolve(here, './SearchEverywhere.css'), 'utf-8');
@@ -61,5 +61,26 @@ describe('the Search Everywhere categories are all on screen', () => {
 
   it('keeps each label on one line', () => {
     expect(effective(TAB, 'white-space')).toBe('nowrap');
+  });
+});
+
+describe('the first chip holds its width as the query starts', () => {
+  const WIDEST = 'search-everywhere-widest';
+  // `rulesTargeting` skips pseudo-elements and children, and both are used here.
+  const prop = (selector: string, name: string): string | undefined =>
+    cssRules(css)
+      .filter(r => selectorList(r.selector).includes(selector))
+      .map(r => r.props.get(name))
+      .find(v => v !== undefined);
+
+  it('lays the widest content invisibly in the box', () => {
+    expect(prop(`.${WIDEST}::before`, 'content')).toBe('attr(data-widest)');
+    expect(prop(`.${WIDEST}::before`, 'visibility')).toBe('hidden');
+  });
+
+  it('stacks the real content on the widest one', () => {
+    expect(effective(WIDEST, 'display')).toBe('inline-grid');
+    expect(prop(`.${WIDEST}::before`, 'grid-area')).toBe('1 / 1');
+    expect(prop(`.${WIDEST} > *`, 'grid-area')).toBe('1 / 1');
   });
 });

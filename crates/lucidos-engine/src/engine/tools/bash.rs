@@ -762,20 +762,28 @@ impl LucidosEngine {
         }
     }
 
-    /// `bash_kill(task_id)` — cancel a running background task. No-op if
-    /// the task is unknown or already finished.
-    pub(crate) async fn execute_bash_kill_tool(&self, args: &serde_json::Value) -> ToolOutcome {
+    /// `bash_kill(task_id)`: stop a running background task as the calling
+    /// thread. Its completion does not re-open that thread (ADR 0369).
+    pub(crate) async fn execute_bash_kill_tool(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
         let task_id = match args.get("task_id").and_then(|v| v.as_str()) {
             Some(t) if !t.is_empty() => t,
             _ => return Err("Error: task_id is required".to_string()),
         };
-        if self.bash_background.kill(task_id).await {
-            Ok(format!("killed {}", task_id))
-        } else {
-            Err(format!(
-                "Error: unknown or already finished task_id '{}'",
-                task_id
-            ))
+        match self.stop_background_task_as(thread_id, task_id).await {
+            Some(stopped) => Ok(format!(
+                "killed {task_id}. Its completion will not re-open this thread.{}",
+                crate::engine::agent_session::background_task::ended_waits_note(
+                    &stopped.ended_with_others
+                )
+            )),
+            None => Err(format!(
+                "Error: unknown or already finished task_id '{task_id}', or a stop is \
+                 already on its way"
+            )),
         }
     }
 }

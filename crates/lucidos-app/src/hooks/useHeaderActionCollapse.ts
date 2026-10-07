@@ -31,12 +31,6 @@ export interface HeaderCollapseInput {
   moreWidth: number;
   /** Flex gap — between the three zones AND between adjacent action items. */
   gapPx: number;
-  /** Fold the WHOLE set into the ⋯ menu once it reaches this many actions, at
-   *  any width. A judgment about the row rather than about the room in it: past
-   *  a couple of context icons the cluster stops reading as "what I can do here"
-   *  and starts reading as a toolbar, and the ⋯ menu names each one in words
-   *  where the row only has glyphs. Absent, only room decides. */
-  alwaysCollapseFrom?: number;
 }
 
 export interface HeaderCollapseResult {
@@ -81,12 +75,8 @@ export function iconsRowWidth(
  *  place. */
 export function computeHeaderCollapse(input: HeaderCollapseInput): HeaderCollapseResult {
   const n = input.actionWidths.length;
-  // A set this large is folded whole, however much room there is: the only
-  // question left is whether the centre zone then fits.
-  const candidates: number[] = input.alwaysCollapseFrom !== undefined && n >= input.alwaysCollapseFrom
-    ? [n]
-    : [0];
-  if (candidates[0] === 0) for (let c = 2; c <= n; c++) candidates.push(c);
+  const candidates: number[] = [0];
+  for (let c = 2; c <= n; c++) candidates.push(c);
 
   const fits = (c: number): boolean => computeFitsInOneRow(
     [input.leadingWidth, input.centreWidth, iconsRowWidth(input, c)],
@@ -191,11 +181,9 @@ export function useHeaderActionCollapse(
   opts: {
     /** Flex gap between adjacent items, in rem. */
     gapRem?: number;
-    /** See `HeaderCollapseInput.alwaysCollapseFrom`. */
-    alwaysCollapseFrom?: number;
   } = {},
 ): number {
-  const { gapRem = 0.25, alwaysCollapseFrom } = opts;
+  const { gapRem = 0.25 } = opts;
   const [collapsed, setCollapsed] = useState(0);
   useLayoutEffect(() => {
     // Mobile has nothing to measure: the answer is "all of them", below.
@@ -241,7 +229,6 @@ export function useHeaderActionCollapse(
         anchorWidth: anchor ? anchor.getBoundingClientRect().width : 0,
         moreWidth: iconWidth,
         gapPx: gapRem * getRemPx(),
-        alwaysCollapseFrom,
       });
       setCollapsed(next);
     };
@@ -268,7 +255,7 @@ export function useHeaderActionCollapse(
       ro.disconnect();
       hostMo.disconnect();
     };
-  }, [hostRef, actionCount, gapRem, alwaysCollapseFrom, layout, targets.container,
+  }, [hostRef, actionCount, gapRem, layout, targets.container,
       targets.centre, targets.anchor]);
   // Mobile answers from the action count alone, without a measurement, so it is
   // also immune to the stale-count race the desktop clamp handles.

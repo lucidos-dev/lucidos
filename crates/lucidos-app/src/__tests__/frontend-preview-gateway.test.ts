@@ -37,7 +37,7 @@ describe('previewGatewayFromEnv', () => {
   });
 
   it('refuses a workspace id that is not slug-shaped, so it never becomes a path', () => {
-    for (const slug of ['../dev', 'dev/x', 'Dev', '-dev', '']) {
+    for (const slug of ['../dev', 'dev/x', 'Dev', '-dev', 'dev-', 'de--v', '']) {
       expect(previewGatewayFromEnv(env(GW.origin, slug))).toBeUndefined();
     }
   });

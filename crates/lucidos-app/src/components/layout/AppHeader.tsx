@@ -20,7 +20,7 @@ import { SwipeTouch } from '@lucidos/pane-swipe';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
 import { ContentRefreshButton } from './RefreshIndicator';
-import { ThreadHeaderActions } from './ThreadHeaderActions';
+import { ThreadHeaderActions, ThreadHeaderHomeButton } from './ThreadHeaderActions';
 import { BrandMenuButton } from './HeaderMark';
 import { WorkspaceNameLabel } from './WorkspaceNameLabel';
 import { getContentTitle, getContentTitleShort, getDiffDescription } from './headerHelpers';
@@ -288,6 +288,9 @@ export function AppHeader() {
             {/* Focus on click, not pointerdown, so a window drag never shifts
                 focus — see ThreadsHeader. */}
             <span class="pane-header-brand" onClick={onThreadHeaderClick}>
+              {/* Home leads the row, past the drawer toggle while the drawer
+                  is shut (shell.css). */}
+              <ThreadHeaderHomeButton />
               {/* The Lucidos mark, absolutely centred on the pane: brand,
                   connection light and menu in one control, the same one both
                   mobile headers carry. It replaced a `[Lucidos * workspace]`
@@ -310,10 +313,9 @@ export function AppHeader() {
                 </span>
                 <ThreadForwardButton showTooltip />
               </span>
-              {/* Right-side actions, and the region's ONLY in-flow child now
-                  that the drawer toggle has its own host: the brand pins them to
-                  its trailing edge with justify-content, while the label floats
-                  over the pane's true middle. They fold into a ⋯ menu as the
+              {/* Right-side actions: the brand pins them to its trailing edge
+                  with justify-content, while the label floats over the pane's
+                  true middle. They fold into a ⋯ menu as the
                   split narrows, see ThreadHeaderActions. */}
               <ThreadHeaderActions />
             </span>

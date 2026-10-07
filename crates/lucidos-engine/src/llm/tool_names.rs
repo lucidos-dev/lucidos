@@ -119,6 +119,14 @@ pub const CORRECT_MEMORY_BY_ID: &str = "correct_memory_by_id";
 pub const SEARCH_MEMORY: &str = "search_memory";
 pub const MEMORY_SOURCE: &str = "memory_source";
 
+// Recall: the grouped `recall` tool of the Tree memory module (ADR 0362). The
+// per-action names are the handler keys the manifest dispatches through.
+pub const RECALL: &str = "recall";
+pub const RECALL_ZOOM: &str = "recall_zoom";
+pub const RECALL_FIND: &str = "recall_find";
+pub const RECALL_SEARCH: &str = "recall_search";
+pub const RECALL_DATE: &str = "recall_date";
+
 // Events: the grouped `events` tool (emit/query/count/event_types) from the
 // capability parity manifest. The flat per-verb names below stay as back-compat
 // aliases.

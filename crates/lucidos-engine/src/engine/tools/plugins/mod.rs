@@ -17,11 +17,12 @@ use std::path::{Path, PathBuf};
 
 use crate::core::git_auth::GitCredentials;
 use crate::core::plugins::{
-    check_font_room, compare_versions, detect_conflicts, validate_tree, PlannedFile,
-    UpdateDecision, AUTH_MODULES_DIR,
+    check_engine_requirement, check_font_room, compare_versions, detect_conflicts,
+    engine_requirement_of, validate_tree, PlannedFile, UpdateDecision, AUTH_MODULES_DIR,
 };
 use crate::core::DATA_DIR;
 use crate::engine::event_bus::{BusEvent, EventBusEmitter, SystemEvent};
+use crate::engine::release_notices::running_release;
 use crate::engine::thread_events::{EngineReason, MessageOrigin, PluginSetupOccasion};
 use crate::engine::tools::agent_tool_actor;
 use crate::engine::trigger_writes::TriggerWrite;
@@ -262,8 +263,16 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
     });
     // The staging body is synchronous, so its credentials are resolved here.
     let credentials = credentials_for_source(&engine.pool, source_str).await;
+    let running = running_release();
     match tokio::task::spawn_blocking(move || {
-        prepare_install_request(&workspace, &pending, &source, &baselines, &credentials)
+        prepare_install_request(
+            &workspace,
+            &pending,
+            &source,
+            &baselines,
+            &credentials,
+            &running,
+        )
     })
     .await
     {
@@ -320,13 +329,15 @@ pub(crate) fn setup_is_new(new: Option<&str>, prior: Option<&str>) -> bool {
 /// the result in `pending_installs`, and return the
 /// `[PLUGIN_INSTALL_REQUEST]<json>` sentinel. On any failure returns
 /// `"Error: ..."` and no entry is registered. Free function so tests can
-/// drive it without standing up a `LucidosEngine`.
+/// drive it without standing up a `LucidosEngine`. `running` is
+/// [`running_release`], passed in so tests can stage against any release.
 pub(crate) fn prepare_install_request(
     workspace_path: &Path,
     pending_installs: &std::sync::Arc<PendingInstallsMap>,
     source_str: &str,
     baselines: &PluginBaselines,
     credentials: &GitCredentials,
+    running: &Result<semver::Version, String>,
 ) -> String {
     let source = match detect_source(source_str) {
         Ok(s) => s,
@@ -341,6 +352,14 @@ pub(crate) fn prepare_install_request(
         Ok(t) => t,
         Err(e) => return format!("Error: {}", e),
     };
+    // Before anything is registered, so a refusal opens no panel and leaves
+    // nothing behind but the staging dir, which drops on return.
+    if let Err(mismatch) = check_engine_requirement(&manifest.raw, running) {
+        return format!(
+            "Error: {}",
+            mismatch.refusal(&manifest.name, &manifest.version)
+        );
+    }
 
     let data_dir = workspace_path.join(DATA_DIR);
     if let Err(e) = check_font_room(&planned, &data_dir) {
@@ -390,6 +409,7 @@ pub(crate) fn prepare_install_request(
         "plugin_id": manifest.id,
         "plugin_version": manifest.version,
         "plugin_name": manifest.name,
+        "engine_requirement": engine_requirement_of(&manifest.raw),
     });
 
     let pending = PendingInstall {
@@ -1295,6 +1315,8 @@ async fn announce_local_changes(
                     artifact_path: artifact_path.to_string(),
                     commit: commit.clone(),
                     source: Some("plugin_update".to_string()),
+                    // A plugin update the user confirmed, not a thread's turn.
+                    writer_thread_id: None,
                 }),
                 "[Plugins] ArtifactCreated",
             )
@@ -1382,6 +1404,8 @@ pub async fn propose_local_patch_upstream(
                     artifact_path.to_string(),
                     commit_sha,
                     Some("plugin_upstream_patch".to_string()),
+                    // Written before the thread that proposes it exists.
+                    None,
                 )),
                 "[Plugins] ArtifactCreated",
             )

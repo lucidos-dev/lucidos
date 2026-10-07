@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 /**
- * One classification's model control, with TypeSafe (Jev) among the models.
+ * One judgment site's model control, with the System One rows among the models.
  *
  * Four things the pure decision functions cannot show. The row waits for BOTH
- * reads before offering Jev. The trigger reads the backend in force. A pick
+ * reads before offering a System One row. The trigger reads the backend in force. A pick
  * writes the judgment key AND the model pair, in that order. And a pick of Jev
  * leaves the stored model alone.
  */
@@ -18,15 +18,51 @@ vi.mock('../../../store/actions/preferences', async (importOriginal) => ({
 }));
 
 import { JudgmentModelRow } from '../JudgmentModelRow';
+import type { BackgroundRows } from '../useBackgroundModels';
 import { savePreference, saveModelSelection } from '../../../store/actions/preferences';
-import { credentials, preferences } from '../../../store/store';
-import type { ModelChoice } from '../../../store/modelSelection';
+import { chatModels, configuredProviders, credentials, preferences } from '../../../store/store';
+import type { BackgroundModel, ModelInfo } from '../../../api/types';
 import type { CredentialInfo } from '../../../store/types';
 
-const MODELS: ModelChoice[] = [
-  { value: 'claude-haiku-4-5', label: 'Haiku 4.5', reasoningEfforts: ['none', 'low'] },
-  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', reasoningEfforts: [] },
+function registryRow(id: string, label: string, efforts: string[]): ModelInfo {
+  return {
+    id,
+    label,
+    routes: [{ provider: 'vertex', id, reasoning_efforts: efforts }],
+    preferred_provider: null,
+    vision: false,
+    sort_order: 0,
+    source: 'builtin',
+    enabled: true,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+}
+
+/** The chat picker's list, which every background row offers. */
+const REGISTRY: ModelInfo[] = [
+  registryRow('claude-haiku-4-5-20251001', 'Haiku 4.5', ['none', 'low']),
+  registryRow('gemini-3.5-flash', 'Gemini 3.5 Flash', ['none', 'low']),
 ];
+
+/** The engine's answer, before it lands. */
+const UNRESOLVED: BackgroundRows = { row: () => null, error: null, refresh: async () => {} };
+
+function resolvedTo(row: Partial<BackgroundModel>): BackgroundRows {
+  return {
+    row: () => ({
+      model: 'gemini-3.5-flash',
+      effort: null,
+      source: 'default',
+      reachable: true,
+      needs_vision: false,
+      vision: true,
+      recommended: [],
+      ...row,
+    }),
+    error: null,
+    refresh: async () => {},
+  };
+}
 
 function typeSafeCred(): CredentialInfo {
   return {
@@ -64,14 +100,14 @@ describe('JudgmentModelRow', () => {
     act(() => { match.click(); });
   }
 
-  function mount(disabled = false) {
+  function mount(disabled = false, background: BackgroundRows = UNRESOLVED) {
     act(() => {
       render(
         <JudgmentModelRow
           site="command-guard"
           label="Judge model"
           anchor="command-safety:judge-model"
-          models={MODELS}
+          background={background}
           disabled={disabled}
         />,
         host,
@@ -86,6 +122,8 @@ describe('JudgmentModelRow', () => {
     vi.mocked(saveModelSelection).mockClear();
     preferences.value = { status: 'loaded', data: {} };
     credentials.value = { status: 'loaded', data: [] };
+    chatModels.value = { status: 'loaded', data: REGISTRY };
+    configuredProviders.value = null;
   });
 
   afterEach(() => {
@@ -93,13 +131,14 @@ describe('JudgmentModelRow', () => {
     host.remove();
     preferences.value = { status: 'not-loaded' };
     credentials.value = { status: 'not-loaded' };
+    chatModels.value = { status: 'not-loaded' };
   });
 
   /** ADR 0220's no-change promise, at the surface the user sees. */
   it('offers only the chat models with no TypeSafe key', () => {
     mount();
     open();
-    expect(optionValues()).toEqual(['claude-haiku-4-5', 'gemini-3.5-flash']);
+    expect(optionValues()).toEqual(['claude-haiku-4-5-20251001', 'gemini-3.5-flash']);
   });
 
   /** Unloaded credentials read as no key. An ungated rule would drop the row
@@ -115,7 +154,7 @@ describe('JudgmentModelRow', () => {
     credentials.value = { status: 'loaded', data: [typeSafeCred()] };
     mount();
     open();
-    expect(optionValues()).toEqual(['claude-haiku-4-5', 'gemini-3.5-flash', 'typesafe-jev']);
+    expect(optionValues()).toEqual(['claude-haiku-4-5-20251001', 'gemini-3.5-flash', 'typesafe-jev']);
   });
 
   it('reads the backend in force on the trigger', () => {
@@ -128,7 +167,7 @@ describe('JudgmentModelRow', () => {
   it('reads the stored chat pair otherwise', () => {
     preferences.value = {
       status: 'loaded',
-      data: { model_command_judge: 'claude-haiku-4-5', reasoning_command_judge: 'low' },
+      data: { model_command_judge: 'claude-haiku-4-5-20251001', reasoning_command_judge: 'low' },
     };
     mount();
     expect(triggerLabel()).toBe('Haiku 4.5 · Low');
@@ -152,34 +191,34 @@ describe('JudgmentModelRow', () => {
     preferences.value = { status: 'loaded', data: { judgment_command_guard: 'jev' } };
     mount();
     open();
-    pick('claude-haiku-4-5');
-    pick('claude-haiku-4-5|low');
+    pick('claude-haiku-4-5-20251001');
+    pick('claude-haiku-4-5-20251001|low');
     expect(savePreference).toHaveBeenCalledWith('judgment_command_guard', 'chat');
     await Promise.resolve();
     expect(saveModelSelection).toHaveBeenCalledWith(
       'model_command_judge',
       'reasoning_command_judge',
-      { model: 'claude-haiku-4-5', reasoningEffort: 'low', provider: null },
+      { model: 'claude-haiku-4-5-20251001', reasoningEffort: 'low', provider: null },
     );
   });
 
-  /** A tierless model commits on the model step, so there is no second click
-   *  and no effort to write. */
-  it('commits a tierless model in one step', async () => {
+  /** A registry model opens its tiers, and the tier pick writes both keys. */
+  it('commits a chat model with the tier picked for it', async () => {
     mount();
     open();
     pick('gemini-3.5-flash');
+    pick('gemini-3.5-flash|low');
     expect(savePreference).toHaveBeenCalledWith('judgment_command_guard', 'chat');
     await Promise.resolve();
     expect(saveModelSelection).toHaveBeenCalledWith(
       'model_command_judge',
       'reasoning_command_judge',
-      { model: 'gemini-3.5-flash', reasoningEffort: null, provider: null },
+      { model: 'gemini-3.5-flash', reasoningEffort: 'low', provider: null },
     );
   });
 
-  /** `jev_for` returns nothing while the master switch is off, so the row must
-   *  say the selection is not the one running. */
+  /** `system_one_for` returns nothing while the master switch is off, so the
+   *  row must say the selection is not the one running. */
   it('says so while TypeSafe itself is switched off', () => {
     credentials.value = { status: 'loaded', data: [typeSafeCred()] };
     preferences.value = {
@@ -204,8 +243,57 @@ describe('JudgmentModelRow', () => {
     expect(optionValues()).toContain('typesafe-jev');
   });
 
+  /** A Workers AI token offers both Clef rows, and a pick writes the row id
+   *  the engine reads. */
+  it('offers both Clef rows on a Cloudflare token, and writes the picked id', () => {
+    credentials.value = {
+      status: 'loaded',
+      data: [{
+        ...typeSafeCred(),
+        service_name: 'cloudflare-workers-ai',
+        base_urls: ['https://api.cloudflare.com/client/v4/accounts/abc123/ai'],
+      }],
+    };
+    mount();
+    open();
+    expect(optionValues()).toEqual([
+      'claude-haiku-4-5-20251001',
+      'gemini-3.5-flash',
+      'cloudflare-clef',
+      'cloudflare-clef-flash',
+    ]);
+    pick('cloudflare-clef-flash');
+    expect(savePreference).toHaveBeenCalledWith('judgment_command_guard', 'clef-flash');
+    expect(saveModelSelection).not.toHaveBeenCalled();
+  });
+
   it('honours a disabled prop from the surrounding feature', () => {
     mount(true);
     expect(trigger()?.disabled).toBe(true);
+  });
+
+  /** While unset, the trigger reads what the engine resolved, not a catalog
+   *  default no configured provider may serve. */
+  it('reads the resolved model while unset', () => {
+    mount(false, resolvedTo({ model: 'claude-haiku-4-5-20251001', effort: 'none' }));
+    expect(triggerLabel()).toBe('Haiku 4.5 · Off');
+  });
+
+  /** The recommended models head the list under their own heading, and the
+   *  System One rows get one too. */
+  it('lists the recommended models first, each section under a heading', () => {
+    credentials.value = { status: 'loaded', data: [typeSafeCred()] };
+    mount(false, resolvedTo({ recommended: ['gemini-3.5-flash'] }));
+    open();
+    expect(optionValues()).toEqual(['gemini-3.5-flash', 'claude-haiku-4-5-20251001', 'typesafe-jev']);
+    const headings = [...document.body.querySelectorAll('.control-section-label')].map((h) => h.textContent);
+    expect(headings).toEqual(['Recommended', 'Other models', 'System One']);
+  });
+
+  /** A stored pick nobody serves is refused, never moved, so the row says so. */
+  it('says when no configured provider serves the stored pick', () => {
+    preferences.value = { status: 'loaded', data: { model_command_judge: 'gemini-3.5-flash' } };
+    mount(false, resolvedTo({ source: 'preference', reachable: false }));
+    expect(detail()).toBe('No configured provider serves this model');
   });
 });

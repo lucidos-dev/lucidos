@@ -1169,3 +1169,129 @@ fn switch_meta() -> EventMeta {
         ..EventMeta::NONE
     }
 }
+
+/// A tester's coordinator thread sat in Current, stored archived, with all
+/// twelve sub-threads archived and idle. The menu offered no Archive and no
+/// reason. A switch abort keeps a child on its parent's count, expecting the
+/// resume. Archiving the family then set each child idle and recounted
+/// nothing, so the parent kept counting children that were no longer in
+/// flight. `display_section` keeps a parent with active children in Current.
+#[tokio::test]
+async fn archiving_a_paused_child_recounts_its_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::Chat).await;
+    assert_active_children(&pool, parent_id, 1, "the spawn counts the child").await;
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::ResponseAborted {
+            text: "".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+            cause: crate::engine::thread_events::AbortCause::EngineShutdown,
+        },
+        meta: switch_meta(),
+    })
+    .await
+    .unwrap();
+    assert_active_children(&pool, parent_id, 1, "a switch abort expects the resume").await;
+
+    for id in [parent_id, child_id] {
+        bus.emit(BusEvent::Thread {
+            thread_id: id,
+            event: ThreadEvent::ThreadArchived,
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+    }
+
+    assert_active_children(
+        &pool,
+        parent_id,
+        0,
+        "an archived child is idle, so its parent no longer counts it",
+    )
+    .await;
+    assert_eq!(read_blocking_descendant_count(&pool, parent_id).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A parent that drifted before the fix heals on the next boot: the rebuild
+/// recounts from the children's real status, archived ones included.
+#[tokio::test]
+async fn the_boot_rebuild_heals_a_parent_still_counting_archived_children() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::Chat).await;
+    for id in [parent_id, child_id] {
+        bus.emit(BusEvent::Thread {
+            thread_id: id,
+            event: ThreadEvent::ThreadArchived,
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE thread_summaries SET active_children_count = 12 WHERE thread_id = $1")
+        .bind(parent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    EventBus::rebuild_children_counts(&pool).await.unwrap();
+
+    assert_active_children(
+        &pool,
+        parent_id,
+        0,
+        "the rebuild counts no archived idle child",
+    )
+    .await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Archive on a thread already archived recounts its family, so a drifted
+/// parent goes to Archive on the press rather than at the next boot.
+#[tokio::test]
+async fn the_family_recount_heals_one_drifted_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::Chat).await;
+    for id in [parent_id, child_id] {
+        bus.emit(BusEvent::Thread {
+            thread_id: id,
+            event: ThreadEvent::ThreadArchived,
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE thread_summaries SET active_children_count = 3 WHERE thread_id = $1")
+        .bind(parent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    bus.recount_family_counts(parent_id).await.unwrap();
+
+    assert_active_children(
+        &pool,
+        parent_id,
+        0,
+        "the recount counts no archived idle child",
+    )
+    .await;
+    assert_eq!(read_blocking_descendant_count(&pool, parent_id).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

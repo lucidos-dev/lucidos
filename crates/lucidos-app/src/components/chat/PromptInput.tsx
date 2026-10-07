@@ -3,21 +3,19 @@ import { useRef, useEffect, useLayoutEffect, useState, useMemo } from 'preact/ho
 import { Overlay } from '../shared/Overlay';
 import { Disclosure } from '../shared/Disclosure';
 import { useLongPress } from '../../hooks/useLongPress';
-import { SendHoldMenu, sendHoldMenuOpener, SEND_HOLD_SLIDE_MS, SEND_HOLD_SLIDE_SLACK_MS } from './SendHoldMenu';
-import { useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { signal, untracked, useSignalEffect } from '@preact/signals';
 import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, currentApp, wipPreviewThreadId, promptSendCollapsing, composeViewActive, scaledDurationMs } from '../../store/store';
 import { resolveCodingAgent } from '../../store/composeSelections';
-import { sendMessage, handleCancelExchange } from '../../store/actions/chat';
+import { discardUnsentAnswers, sendMessage, handleCancelExchange } from '../../store/actions/chat';
 import { currentChatContext, type ChatContext } from '../../store/actions/chatContext';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
 import { type AnswerKind, type ThreadState } from '../../store/thread-events';
 import {
   multiSelectedByToolUse,
-  pendingAnswers,
   getMultiSelectedIds,
   setMultiSelectedIds,
 } from './QuestionCard';
+import { pendingAnswers } from '../../store/pendingDecisions';
 import { updateCompose, updateComposeSelection, sendCompose, sendFollowup, ensureFocusedComposeThread } from '../../store/actions/compose';
 import { focusPane } from '../../store/actions/pane';
 import { openAppById } from '../../store/actions/apps';
@@ -37,7 +35,7 @@ import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup } from '../../ho
 import { TodoPanelSlot, closeTodoPanel, todoIndicatorAction } from './todoIndicator';
 import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
 import { composerBannerState, getBannerActions, getWaitingState, getStandaloneActions } from './WaitingBanner';
-import { composeHasContent, sideQuestionModeActive, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, queuedUploadSends, queueUploadSend, clearQueuedUploadSend, uploadBlockedSends, markUploadBlockedSend, settleQueuedUploadSends, uploadSendNotice, uploadSendNoticeText, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionAction, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, sideQuestionModeActive, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, queuedUploadSends, queueUploadSend, clearQueuedUploadSend, uploadBlockedSends, markUploadBlockedSend, settleQueuedUploadSends, uploadSendNotice, uploadSendNoticeText, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionBlocker, type UploadSendIntent } from './prompt-input-helpers';
 import { canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting } from '../../store/canceledQuestions';
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
@@ -310,8 +308,8 @@ export function PromptInput() {
   //
   // The morph and the answer control are mutually exclusive, so they share one
   // gate instance. The multi-select split-button Submit needs no gate: its
-  // caret menu makes the action deliberate. Each gated button takes the down,
-  // move and cancel handlers through `holdHandlers`, which feeds this gate.
+  // caret menu makes the action deliberate. So it takes `ungatedHoldHandlers`,
+  // and each gated button takes `holdHandlers`, which feeds this gate.
   const morphGate = useMemo(() => createTapGate(), []);
   /** A discarded tap is the user's press thrown away, so it must never be
    *  silent: the button reads as dead and nothing says why.
@@ -512,16 +510,12 @@ export function PromptInput() {
       }
       return;
     }
-    // A modified Enter a shortcut claims (⌥↵ asks a side question) is the
-    // shortcut's, so it must not also send. With the split pill open, Enter
-    // presses its Side question half, as it does when the shortcut opened it.
+    // A modified Enter a shortcut claims (⌥↵ toggles side-question mode) is
+    // the shortcut's, so it must not also send.
     if (e.key === 'Enter' && !e.shiftKey && !isMobile() && matchShortcut(e) === null) {
       e.preventDefault();
       if (hasPendingMultiQ) void submitMultiAnswer();
-      else if (sendHoldMenuOpener.value !== null) {
-        sendHoldMenuOpener.value = null;
-        askFromSideQuestionPill();
-      } else void submit();
+      else void submit();
     }
   }
 
@@ -606,9 +600,8 @@ export function PromptInput() {
   }
 
   /** Send the composer's contents, or ask them as a side question in
-   *  side-question mode or when `asSideQuestion` says so (the split pill's
-   *  half). */
-  async function submit(asSideQuestion = false) {
+   *  side-question mode. */
+  async function submit() {
     const el = inputRef.current;
     const threadId = focusedThreadId.value;
     // ONE source for "is there anything to send": the draft the Send face was
@@ -650,7 +643,7 @@ export function PromptInput() {
     const sideQuestion = routeSideQuestion(msg, {
       started: threadId !== null && thread !== undefined && thread.meta.state !== 'composing',
       codex: effectiveCodingAgentBackend(thread, resolveCodingAgent(threadId)) === 'codex',
-    }, asSideQuestion || sideQuestionMode);
+    }, sideQuestionMode);
     if (sideQuestion.kind === 'refuse') {
       showToast(sideQuestion.toast, 'info');
       return;
@@ -994,7 +987,10 @@ export function PromptInput() {
   // always present, so Cancel lives behind the caret. Every other state is a
   // lone Submit, while a custom answer is typed, or a lone red Cancel. In the
   // second the forward action lives in the card above.
-  const answerMode = isAnsweringQuestion
+  // In side-question mode a typed box asks rather than answers. So the round
+  // morph button takes over from Submit, as during a running turn.
+  const answersCard = isAnsweringQuestion && !(sideQuestionMode && morphHasContent);
+  const answerMode = answersCard
     ? computeAnswerActionMode({
         pendingMultiQ: hasPendingMultiQ,
         hasContent: morphHasContent,
@@ -1021,74 +1017,39 @@ export function PromptInput() {
   // The constructive actions blur on their own (`submit`, `submitMultiAnswer`):
   // the suppressed click never reaches `installActionBtnBlurListener`, which
   // listens on `click`.
-  // A hold on Send or Submit offers the draft as a side question instead, and
-  // a hold on Stop or on a waiting card's lone Cancel turns on side-question
-  // mode. The release that ends the hold must not also send or cancel, so the
-  // hold marks itself. That release, the next press or the menu closing spends
-  // the mark, so it never swallows a later tap. `sideQuestionAction` says who
-  // takes one.
+  // A hold on whichever button ends the row turns on side-question mode, and
+  // the draft stays in the box to be asked. The release that ends the hold
+  // must not also send, submit or cancel, so the hold marks itself. That
+  // release or the next press spends the mark, so it never swallows a later
+  // tap.
   const heldSendRef = useRef(false);
-  const startedSideQuestionModeRef = useRef(false);
-  // A mouse press moves focus off the composer. The pill keeps the draft
-  // editable, so a hold that began mid-typing hands the focus back. So does a
-  // hold that turned on side-question mode.
+  // A mouse press moves focus off the composer, so a mouse hold hands it back
+  // for the side question to be typed. A touch hold keeps the keyboard up on
+  // its own, and focusing outside a tap cannot raise it.
   const holdRefocusesComposerRef = useRef(false);
-  const pressPointerTypeRef = useRef('');
-  const [splitPillButtonEl, setSplitPillButtonEl] = useState<HTMLButtonElement | null>(null);
-  const holdSideQuestion = sideQuestionAction({
-    hasContent: morphMode === 'send',
-    stopOrCancelShown: (morphMode === 'cancel' && !isAnsweringQuestion) || answerMode === 'cancel',
+  const sideQuestionRefusal = sideQuestionBlocker({
     threadStarted: focusedThread !== undefined && focusedThread.meta.state !== 'composing',
     isCodex: promptCodingAgent === 'codex',
   });
-  const sideQuestionBlocker = holdSideQuestion.kind === 'unavailable' ? holdSideQuestion.reason : null;
-  const canAskFromHold = sideQuestionBlocker === null;
-  // With the pill open, the side question is already on screen beside the
-  // button, so its tooltip stops advertising the hold.
-  const offersHoldHint = canAskFromHold && sendHoldMenuOpener.value === null;
+  const holdOffersSideQuestion = sideQuestionRefusal === null;
   const sendHold = useLongPress(() => {
-    if (!canAskFromHold) return;
+    if (sideQuestionRefusal !== null) return;
     heldSendRef.current = true;
     // The hold took the press, so the gate must not rule on its lift. Stop
-    // asks the gate before the mark, so drift under the new pill would toast.
+    // asks the gate before the mark, so drift during the hold would toast.
     morphGate.spend();
-    // Over an empty box the half could only turn on the mode, and while it is
-    // open the box takes no typing. A touch hold still opens it: only a tap
-    // can raise the iOS keyboard.
-    if (holdSideQuestion.kind === 'start-mode' && pressPointerTypeRef.current === 'mouse') {
-      setSideQuestionMode(true);
-      holdRefocusesComposerRef.current = true;
-      return;
-    }
-    sendHoldMenuOpener.value = 'hold';
-    if (holdRefocusesComposerRef.current) focusIfNeeded(inputRef.current);
+    setSideQuestionMode(true);
   }, () => {});
-  /** The Side question half's action, whether tapped or pressed with Enter. */
-  function askFromSideQuestionPill(): void {
-    if (holdSideQuestion.kind === 'start-mode') {
-      startedSideQuestionModeRef.current = true;
-      setSideQuestionMode(true);
-    } else void submit(true);
-  }
-  // The pill stays drawn while its half slides back behind its button, and
-  // the button keeps its squared seam until the half is gone.
-  const sendHoldMenuShown = useLingeringFlag(
-    sendHoldMenuOpener.value !== null,
-    scaledDurationMs(SEND_HOLD_SLIDE_MS) + SEND_HOLD_SLIDE_SLACK_MS,
-  );
-  // The pill shuts once the button under it offers no side question, such as
-  // a Stop whose turn just ended.
-  useEffect(() => {
-    if (sideQuestionBlocker !== null) sendHoldMenuOpener.value = null;
-  }, [sideQuestionBlocker]);
   useSignalEffect(() => {
     if (!promptSideQuestionRequested.value) return;
     promptSideQuestionRequested.value = false;
-    // A second press shuts the open pill, as Escape does.
-    if (sendHoldMenuOpener.peek() !== null) sendHoldMenuOpener.value = null;
-    else if (holdSideQuestion.kind === 'start-mode') setSideQuestionMode(true);
-    else if (sideQuestionBlocker === null) sendHoldMenuOpener.value = 'shortcut';
-    else showToast(sideQuestionBlocker, 'info');
+    if (sideQuestionRefusal !== null) {
+      showToast(sideQuestionRefusal, 'info');
+      return;
+    }
+    // The shortcut toggles, as the pill's × and Escape turn the mode off.
+    setSideQuestionMode(!sideQuestionMode);
+    if (!sideQuestionMode) requestAnimationFrame(() => focusIfNeeded(inputRef.current));
   });
   /** Whether this release ends a hold, spending the hold's mark if so. */
   function releaseEndsHold(): boolean {
@@ -1099,46 +1060,47 @@ export function PromptInput() {
     if (holdRefocusesComposerRef.current) requestAnimationFrame(() => focusIfNeeded(inputRef.current));
     return true;
   }
-  /** The hold gesture, on whichever button ends the row: Send, Stop, Submit,
-   *  or a waiting card's lone Cancel. */
-  const holdHandlers = {
+  /** The hold gesture alone. A multi-select card's Submit takes it as is,
+   *  since that button sits outside the tap gate. */
+  const ungatedHoldHandlers = {
     onPointerDown: (e: PointerEvent) => {
       heldSendRef.current = false;
-      // Read before the press's own mousedown moves focus. Never on touch,
-      // where the keyboard stays up through a hold on its own.
-      pressPointerTypeRef.current = e.pointerType;
-      holdRefocusesComposerRef.current = e.pointerType === 'mouse' && document.activeElement === inputRef.current;
+      holdRefocusesComposerRef.current = e.pointerType === 'mouse';
       sendHold.onPointerDown(e);
+    },
+    onPointerMove: sendHold.onPointerMove,
+    onPointerUp: sendHold.onPointerUp,
+    onPointerLeave: sendHold.onPointerLeave,
+    onPointerCancel: sendHold.onPointerCancel,
+    onContextMenu: holdOffersSideQuestion ? sendHold.onContextMenu : undefined,
+    // A key press is never a hold's release. A right-click leaves the mark
+    // with no click to spend it.
+    onKeyDown: (e: KeyboardEvent) => {
+      if (e.key === 'Enter' || e.key === ' ') heldSendRef.current = false;
+    },
+  };
+  /** The hold gesture, feeding the tap gate, on the gated buttons that end
+   *  the row: Send, Stop, Submit, or a waiting card's lone Cancel. */
+  const holdHandlers = {
+    ...ungatedHoldHandlers,
+    onPointerDown: (e: PointerEvent) => {
+      ungatedHoldHandlers.onPointerDown(e);
       morphGate.down(e);
     },
     onPointerMove: (e: PointerEvent) => {
       sendHold.onPointerMove(e);
       morphGate.move(e);
     },
-    onPointerUp: sendHold.onPointerUp,
-    onPointerLeave: sendHold.onPointerLeave,
     onPointerCancel: (e: PointerEvent) => {
       sendHold.onPointerCancel(e);
       morphGate.cancel();
-    },
-    onContextMenu: canAskFromHold ? sendHold.onContextMenu : undefined,
-    // A key press is never a hold's release. A right-click leaves the mark
-    // with no click to spend it, and the button takes its own clicks while
-    // the pill is open.
-    onKeyDown: (e: KeyboardEvent) => {
-      if (e.key === 'Enter' || e.key === ' ') heldSendRef.current = false;
     },
   };
   const morphActivate = useTouchActivated(
     () => {
       if (releaseEndsHold()) return;
-      if (morphMode === 'send') {
-        sendHoldMenuOpener.value = null;
-        void submit();
-      } else if (morphMode === 'cancel') {
-        sendHoldMenuOpener.value = null;
-        cancelExchangeForTarget();
-      }
+      if (morphMode === 'send') void submit();
+      else if (morphMode === 'cancel') cancelExchangeForTarget();
     },
     morphMode === 'send' || (morphMode === 'cancel' && !cancelSettling),
     morphActivationGate,
@@ -1146,7 +1108,6 @@ export function PromptInput() {
   );
   const answerSubmitActivate = useTouchActivated(() => {
     if (releaseEndsHold()) return;
-    sendHoldMenuOpener.value = null;
     void submit();
   }, true, morphActivationGate);
   // The lone answer Cancel is its own node, so it needs its own activation.
@@ -1154,7 +1115,6 @@ export function PromptInput() {
   const answerCancelActivate = useTouchActivated(
     () => {
       if (releaseEndsHold()) return;
-      sendHoldMenuOpener.value = null;
       cancelExchangeForTarget();
     },
     !cancelSettling,
@@ -1269,11 +1229,9 @@ export function PromptInput() {
       ...(imageHashes.length > 0 ? { image_hashes: imageHashes } : {}),
     };
     pendingAnswers.set(pendingMultiQ.toolUseId, answer);
-    // Same ask as the composer's Send: hold the reader at the live edge while
-    // the agent resumes, landing on what they just answered when they were not
-    // already riding it. Before the awaited answer below, because this is the
-    // button's own tap. A reader already at the live edge is not scrolled at
-    // all, only armed.
+    // Same ask as a picked option: the reader lands on the live edge once the
+    // engine confirms the answer. Called before the awaited answer below, so
+    // the reader's scroll during the round trip can still cancel it.
     followAnsweredQuestion(pendingMultiQ.toolUseId);
     if (el) {
       writeComposerValue(el, '');
@@ -1284,12 +1242,15 @@ export function PromptInput() {
     updateCompose(focused, { text: '', image_hashes: [] });
     setMultiSelectedIds(pendingMultiQ.toolUseId, []);
     if (isMobile()) el?.blur();
-    const ok = await answerThreadQuestion(focused, pendingMultiQ.toolUseId, answer);
-    if (!ok) {
-      // Drop optimistic so the question card un-resolves and the row re-shows
-      // Submit. The action owns the message, naming the cause once; a second
-      // toast here is what made one failed tap say two things.
-      pendingAnswers.clear(pendingMultiQ.toolUseId);
+    const outcome = await answerThreadQuestion(focused, pendingMultiQ.toolUseId, answer);
+    // The answer replaces a typed answer to this card that was not sent.
+    if (outcome === 'sent') discardUnsentAnswers(focused, pendingMultiQ.toolUseId);
+    // Drop optimistic so the question card un-resolves and the row re-shows
+    // Submit. The action owns the only failure message.
+    else pendingAnswers.clear(pendingMultiQ.toolUseId);
+    // An unsent answer stays whole on its card, ticks and text, behind its own
+    // Retry. Handing any of it back would let Submit send part of it.
+    if (outcome === 'refused') {
       // Hand the answer back so a retry is one tap. See
       // `recoverableAnswerDraft` for what a fresh pick or keystroke protects.
       const box = inputRef.current;
@@ -1375,7 +1336,11 @@ export function PromptInput() {
       primaryAriaLabel="Submit answer"
       primaryDisabled={submitMultiDisabled}
       primaryTouchActivate
-      onPrimary={() => void submitMultiAnswer()}
+      primaryPressHandlers={ungatedHoldHandlers}
+      onPrimary={() => {
+        if (releaseEndsHold()) return;
+        void submitMultiAnswer();
+      }}
       caretClassName="action-btn action-btn-confirm"
       caretAriaLabel="Cancel this question"
       menuItems={[{
@@ -1389,31 +1354,29 @@ export function PromptInput() {
       }]}
     />
   ) : answerMode === 'canceling' ? (
-    <button key="answer-lone" type="button" class="action-btn action-btn-danger" ref={setSplitPillButtonEl} disabled aria-label="Canceling" data-row-item>
+    <button key="answer-lone" type="button" class="action-btn action-btn-danger" disabled aria-label="Canceling" data-row-item>
       Canceling…
     </button>
   ) : answerMode === 'submit' ? (
     <button
       key="answer-lone"
       type="button"
-      class={'action-btn action-btn-confirm' + (sendHoldMenuShown ? ' split-open' : '')}
-      ref={setSplitPillButtonEl}
+      class="action-btn action-btn-confirm"
       {...holdHandlers}
       onTouchStart={answerSubmitActivate.onTouchStart}
       onTouchMove={answerSubmitActivate.onTouchMove}
       onTouchCancel={answerSubmitActivate.onTouchCancel}
       onTouchEnd={answerSubmitActivate.onTouchEnd}
       onClick={answerSubmitActivate.onClick}
-      aria-label={sideQuestionMode ? 'Ask side question' : 'Submit answer'}
+      aria-label="Submit answer"
       data-tooltip={
         uploadsBlocking ? 'Send after image upload'
-        : sideQuestionMode ? 'Ask side question'
-        : offersHoldHint ? tooltipWithShortcut('Send answer. Hold to ask a side question', 'askSideQuestion')
+        : holdOffersSideQuestion ? tooltipWithShortcut('Send answer. Hold for a side question', 'askSideQuestion')
         : 'Send answer'
       }
       data-row-item
     >
-      {sideQuestionMode ? 'Ask' : 'Submit'}
+      Submit
     </button>
   ) : answerMode === 'cancel' ? (
     // Lone destructive Cancel — keep the scroll-vs-tap gate so an iOS PWA scroll
@@ -1421,8 +1384,7 @@ export function PromptInput() {
     <button
       key="answer-lone"
       type="button"
-      class={'action-btn action-btn-danger' + (sendHoldMenuShown ? ' split-open' : '')}
-      ref={setSplitPillButtonEl}
+      class="action-btn action-btn-danger"
       // Held disabled for the post-submit settle window. The Submit the user
       // just pressed morphed into this Cancel, so a laggy repeat tap must not
       // abort the resuming turn. `cancelExchangeForTarget` belts the same check.
@@ -1458,9 +1420,7 @@ export function PromptInput() {
         'action-btn send-cancel-morph send-cancel-round'
         + (morphMode === 'placeholder' ? ' morph-placeholder' : '')
         + (morphMode === 'cancel' && cancelSettling ? ' morph-settling' : '')
-        + (sendHoldMenuShown ? ' split-open' : '')
       }
-      ref={setSplitPillButtonEl}
       {...holdHandlers}
       onTouchStart={morphActivate.onTouchStart}
       onTouchMove={morphActivate.onTouchMove}
@@ -1479,12 +1439,12 @@ export function PromptInput() {
         : true
       }
       data-tooltip={
-        morphMode === 'cancel' && offersHoldHint ? tooltipWithShortcut('Stop. Hold to ask a side question', 'stopThread')
+        morphMode === 'cancel' && holdOffersSideQuestion ? tooltipWithShortcut('Stop. Hold for a side question', 'stopThread')
         : morphMode === 'cancel' ? tooltipWithShortcut('Stop', 'stopThread')
         : morphMode === 'canceling' ? 'Stopping…'
         : morphMode === 'send' && uploadsBlocking ? 'Send after image upload'
         : morphMode === 'send' && sideQuestionMode ? 'Ask side question'
-        : morphMode === 'send' && offersHoldHint ? tooltipWithShortcut('Send. Hold to ask a side question', 'askSideQuestion')
+        : morphMode === 'send' && holdOffersSideQuestion ? tooltipWithShortcut('Send. Hold for a side question', 'askSideQuestion')
         : morphMode === 'send' ? 'Send'
         : undefined
       }
@@ -1610,7 +1570,7 @@ export function PromptInput() {
   // The right-hand members, then the two fixed toggles. Those fold LAST, which
   // is what keeps their slots stable at every width that can hold them.
   foldActions.push(...bannerActions);
-  const toggles = promptRowToggles(promptCodingAgent, inComposeContext);
+  const toggles = promptRowToggles(promptCodingAgent, inComposeContext, focusedThread);
   foldActions.push(...toggles.fold);
 
   // Where each member renders. The cluster declares a gap and the rest of the
@@ -1763,23 +1723,7 @@ export function PromptInput() {
             {bannerActions.filter(standing).map((a) => (
               <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment>
             ))}
-            <span class="split-pill">
-              <SendHoldMenu
-                anchor={splitPillButtonEl}
-                leaving={sendHoldMenuShown && sendHoldMenuOpener.value === null}
-                onAskSideQuestion={askFromSideQuestionPill}
-                onClosed={(opener) => {
-                  heldSendRef.current = false;
-                  const startedMode = startedSideQuestionModeRef.current;
-                  startedSideQuestionModeRef.current = false;
-                  // The shortcut took focus from the draft, and a side question
-                  // just started needs it to be typed. A frame later, after the
-                  // closing click's `.action-btn` blur.
-                  if (opener === 'shortcut' || startedMode) requestAnimationFrame(() => inputRef.current?.focus());
-                }}
-              />
-              {isAnsweringQuestion ? answerControl : sendButton}
-            </span>
+            {answersCard ? answerControl : sendButton}
           </div>
         </div>
       </div>

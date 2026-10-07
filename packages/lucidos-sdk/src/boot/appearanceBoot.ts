@@ -28,6 +28,9 @@
  * are the shell's, not the contract's.
  */
 import {
+  PREF_FONT_FAMILY, PREF_MOTION, PREF_THEME_EFFECTS, PREF_UI_SCALE,
+} from '../generated/preference-catalog';
+import {
   ANIMATION_SPEED_STORAGE_KEY,
   THEME_EFFECTS_STORAGE_KEY,
   THEME_SEED_KEY,
@@ -176,7 +179,7 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
     seeded(served, WORKSPACE_FONT_SEED_KEY, WORKSPACE_FONT_STORAGE_KEY),
   );
   const known = picked ? [picked, ...theme.workspace_fonts] : theme.workspace_fonts;
-  const font = resolveFont(seeded(served, 'font-family', 'lucidos-font-family'), theme.fonts, known);
+  const font = resolveFont(seeded(served, PREF_FONT_FAMILY.key, 'lucidos-font-family'), theme.fonts, known);
   d.style.setProperty('--font-ui', font.stack);
   d.style.setProperty('--font-features-text', font.features.text);
   d.style.setProperty('--font-features-code', font.features.code);
@@ -191,7 +194,7 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
   // `text-size` and `font-size` are the pre-grid aliases, read in the order
   // `ui.applyPreferences` reads them so the two cannot resolve differently.
   const scale = parseUiScale(
-    served?.['ui-scale'] || served?.['text-size'] || served?.['font-size']
+    served?.[PREF_UI_SCALE.key] || served?.['text-size'] || served?.['font-size']
     || wsLocalGet('lucidos-ui-scale'),
   );
   if (scale !== null) d.style.setProperty('--user-ui-scale', `${scale}%`);
@@ -199,7 +202,7 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
   // Motion. Resolved here, before the boot splash markup parses, so a device
   // that asked for calm never sees the splash move for a frame.
   const reducedMotion = resolveReducedMotion(
-    parseMotion(seeded(served, 'motion', MOTION_STORAGE_KEY)),
+    parseMotion(seeded(served, PREF_MOTION.key, MOTION_STORAGE_KEY)),
     matchMedia(REDUCED_MOTION_QUERY).matches,
   );
   d.setAttribute('data-motion', motionAttribute(reducedMotion));
@@ -211,7 +214,7 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
   // Theme effects, before first paint, so a device on `reduce` never shows a
   // theme's glow for a frame. CSS drops the part shadows and filters.
   const reducedThemeEffects = resolveReducedThemeEffects(
-    parseThemeEffects(seeded(served, 'theme-effects', THEME_EFFECTS_STORAGE_KEY)),
+    parseThemeEffects(seeded(served, PREF_THEME_EFFECTS.key, THEME_EFFECTS_STORAGE_KEY)),
     matchMedia(REDUCED_TRANSPARENCY_QUERY).matches,
     matchMedia(MORE_CONTRAST_QUERY).matches,
   );

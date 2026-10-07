@@ -88,6 +88,8 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'whats-new', label: "What's New", subview: 'whats-new', path: 'Settings → System', keywords: 'changelog release notes version history whats new updates changes released' },
   { id: 'backup', label: 'Backup', subview: 'backup', path: 'Settings → System' },
   { id: 'memory', label: 'Memory', subview: 'memory', path: 'Settings → System' },
+  { id: 'memory:module', label: 'Memory module', subview: 'memory', path: 'Settings → System → Memory', anchor: 'memory:module', keywords: 'memory module classic tree summary trees compactor compaction backfill recall zoom' },
+  { id: 'memory:summary-trees', label: 'Summary trees', subview: 'memory', path: 'Settings → System → Memory', anchor: 'memory:summary-trees', keywords: 'summary trees tree memory browser browse workspace threads zoom lines' },
   { id: 'disk-usage', label: 'Disk Usage', subview: 'disk-usage', path: 'Settings → System', keywords: 'storage space disk usage data' },
   { id: 'environment-variables', label: 'Environment Variables', subview: 'environment-variables', path: 'Settings → System', keywords: 'env var environment variable config' },
   { id: 'debugging', label: 'Debugging', subview: 'debugging', path: 'Settings → System', keywords: 'debug developer diagnostics perf performance instrumentation telemetry lag latency profiling capture context' },
@@ -139,7 +141,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:title-generation', label: 'Title generation', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:title-generation' },
   { id: 'models:image-description', label: 'Image description', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:image-description' },
   { id: 'models:memory-extraction', label: 'Memory extraction', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:memory-extraction' },
-  { id: 'models:query-classification', label: 'Query classification', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:query-classification', keywords: 'query classification retrieval memory typesafe jev judgment' },
+  { id: 'models:query-classification', label: 'Query classification', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:query-classification', keywords: 'query classification retrieval memory typesafe jev clef system one judgment' },
   { id: 'models:conversation-summary', label: 'Conversation summary', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:conversation-summary' },
   // Lands on the Vertex header, not on the Region row itself. That row sits
   // inside the provider's block, which renders only while Vertex is switched
@@ -173,6 +175,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // a search for it still lands somewhere true.
   { id: 'appearance:external-link-target', label: 'Open links in', subview: 'appearance', path: 'Settings → Appearance & Behavior → Links', anchor: 'appearance:external-link-target', keywords: 'external links safari ask share sheet in-app browser open link default browser', iosPwaOnly: true },
   { id: 'appearance:in-app-browser', label: 'Open links in the in-app browser', subview: 'appearance', path: 'Settings → Appearance & Behavior → Links', anchor: 'appearance:in-app-browser', keywords: 'in-app browser pane experimental drawer external link', tauriOnly: true },
+  { id: 'appearance:home-thread', label: 'Home thread', subview: 'appearance', path: 'Settings → Appearance & Behavior → Experimental', anchor: 'appearance:home-thread', keywords: 'experimental home thread main conversation boss voice' },
 
   // Backup subview (restore moved to the workspace picker — no in-app entry)
   { id: 'backup:provider', label: 'Provider', subview: 'backup', path: 'Settings → System → Backup', anchor: 'backup:provider' },
@@ -187,7 +190,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'command-safety', label: 'Command safety', subview: 'permissions', path: 'Settings → Permissions', anchor: 'command-safety', keywords: 'command guard safety bash python shell judge' },
   { id: 'command-safety:guard', label: 'Command guard', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:guard', keywords: 'command guard safety bash python shell' },
   { id: 'command-safety:judge', label: 'LLM judge', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge', keywords: 'command guard llm judge' },
-  { id: 'command-safety:judge-model', label: 'Judge model', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge-model', keywords: 'command guard judge model haiku typesafe jev judgment backend' },
+  { id: 'command-safety:judge-model', label: 'Judge model', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge-model', keywords: 'command guard judge model haiku typesafe jev clef system one judgment backend' },
   { id: 'permissions:lucidos', label: 'Lucidos Agent permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:lucidos', keywords: 'lucidos agent command allowlist bash python always allow auto allow' },
   { id: 'permissions:claude-code', label: 'Claude Code permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:claude-code', keywords: 'claude code coding agent tool permissions allowed tools allowlist' },
   { id: 'permissions:mcp', label: 'MCP tool permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:mcp', keywords: 'mcp model context protocol server tool permissions allowlist always allow' },

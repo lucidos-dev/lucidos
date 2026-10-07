@@ -13,6 +13,12 @@
 //! the events table every cycle. A restarted engine therefore cannot announce
 //! an outage the timeline already carries.
 //!
+//! A round the computer slept through is not evidence. It cannot declare or
+//! add a strike, and it breaks the chain, so the first round after a wake does
+//! not count either. It can still recover, because sleep cannot fake a 401. A
+//! long sleep is said once, as `WebhookDeliveriesSleptThrough`, and blames
+//! nothing (`docs/adr/0367-a-sleeping-host-is-not-a-dead-ingress.md`).
+//!
 //! The payloads are pinned by
 //! `docs/adr/0143-webhook-ingress-probed-per-address-family.md`, because a
 //! workspace trigger codes against them.
@@ -22,15 +28,17 @@ mod funnel;
 mod probe;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde::Deserialize;
 use sqlx::PgPool;
 
 use crate::api::SharedEngine;
+use crate::core::host_sleep::{self, ClockReading, RoundClocks};
 use crate::core::webhook_ingress::{
-    decide, degraded_families, judge, AddressProbe, Decision, Family, FamilyVerdict, Stage,
+    decide, degraded_families, judge, recovers, AddressProbe, Decision, Family, FamilyVerdict,
+    Stage, STRIKES_BEFORE_DEGRADED,
 };
 use crate::core::webhook_probe_token;
 use crate::core::WebhookStore;
@@ -40,22 +48,65 @@ use crate::engine::event_bus::{BusEvent, SystemEvent};
 /// case is half an hour of silence before the workspace is told.
 pub(crate) const WEBHOOK_INGRESS_CRON: &str = "0 */15 * * * *";
 
+/// The period [`WEBHOOK_INGRESS_CRON`] fires on, so a late tick can be told.
+const CHECK_PERIOD: Duration = Duration::from_secs(15 * 60);
+
+/// A sleep this long is reported once it ends. It is the time an awake host
+/// needs to declare an outage.
+const SLEEP_WORTH_REPORTING: Duration =
+    Duration::from_secs(CHECK_PERIOD.as_secs() * STRIKES_BEFORE_DEGRADED as u64);
+
 /// How long one DNS over HTTPS request gets.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 static CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// What the previous cycle saw, for the two-strike debounce.
+static WATCH: Mutex<Watch> = Mutex::new(Watch::new());
+
+/// What the check carries from one round to the next.
 ///
 /// Memory only, which the statelessness rule allows for a cache. Losing it on
-/// restart costs one extra cycle before a real outage is declared. What decides
-/// whether anything is emitted is read from the events table, not from here.
-static LAST_CYCLE: Mutex<Option<CycleMemory>> = Mutex::new(None);
+/// restart costs one extra round before a real outage is declared, and starts a
+/// new sleep spell. Whether an outage stands is read from the events table.
+#[derive(Debug)]
+struct Watch {
+    /// The two-strike debounce. `None` breaks the chain.
+    last_cycle: Option<CycleMemory>,
+    /// Where the previous round ended, whatever it did. The sleep sign between
+    /// rounds reads it, so breaking the debounce chain leaves it alone.
+    last_round_end: Option<ClockReading>,
+    /// Sleep summed since the last awake round that probed: the sleep spell.
+    spell: Duration,
+}
 
 #[derive(Debug, Default)]
 struct CycleMemory {
     degraded: Vec<Family>,
     strikes: u32,
+}
+
+/// One tick, as the two clocks see it.
+struct Round {
+    previous_end: Option<ClockReading>,
+    start: ClockReading,
+    /// Where [`Round::measure`] read the clocks. The next round measures from
+    /// here, so a sleep after it, during an emit, still shows there.
+    measured_end: Option<ClockReading>,
+}
+
+impl Round {
+    /// How long the computer slept during this round so far, or since the
+    /// round before it.
+    fn measure(&mut self) -> Option<Duration> {
+        let end = ClockReading::now();
+        self.measured_end = Some(end);
+        host_sleep::slept(&RoundClocks {
+            previous_end: self.previous_end,
+            start: self.start,
+            end,
+            period: CHECK_PERIOD,
+        })
+    }
 }
 
 struct CheckGuard;
@@ -84,13 +135,19 @@ pub(crate) async fn run_webhook_ingress_check(engine: SharedEngine, pool: PgPool
     if engine.is_shutting_down() {
         return;
     }
-    if let Some(reason) = run_cycle(&engine, &pool).await {
+    let mut round = watch().begin_round();
+    if let Some(reason) = run_cycle(&engine, &pool, &mut round).await {
         log!("[WebhookIngress] Not probing: {reason}");
     }
+    watch().last_round_end = Some(round.measured_end.unwrap_or_else(ClockReading::now));
 }
 
 /// The cycle proper. Returns the reason it stopped early, if it stopped early.
-async fn run_cycle(engine: &SharedEngine, pool: &PgPool) -> Option<&'static str> {
+async fn run_cycle(
+    engine: &SharedEngine,
+    pool: &PgPool,
+    round: &mut Round,
+) -> Option<&'static str> {
     let Some(hook_port) = configured_hook_port() else {
         return out_of_service(engine, pool, "this engine has no hook socket").await;
     };
@@ -102,7 +159,7 @@ async fn run_cycle(engine: &SharedEngine, pool: &PgPool) -> Option<&'static str>
         Ok(hooks) => hooks,
         Err(e) => {
             log!("[WebhookIngress] The webhook list could not be read: {e}");
-            return undetermined("the webhook list could not be read");
+            return undetermined(round, "the webhook list could not be read");
         }
     };
     // The list is ordered by creation, so every cycle picks the same hook.
@@ -115,7 +172,7 @@ async fn run_cycle(engine: &SharedEngine, pool: &PgPool) -> Option<&'static str>
             return out_of_service(engine, pool, "no funnel carries the hook port").await;
         }
         funnel::FunnelState::Unknown => {
-            return undetermined("the funnel could not be read");
+            return undetermined(round, "the funnel could not be read");
         }
     };
 
@@ -125,7 +182,7 @@ async fn run_cycle(engine: &SharedEngine, pool: &PgPool) -> Option<&'static str>
             // Unknown is neither healthy nor degraded. Emitting on a guess would
             // duplicate a live warning or retract one that still holds.
             log!("[WebhookIngress] The declared state could not be read: {e}");
-            return undetermined("the declared state could not be read");
+            return undetermined(round, "the declared state could not be read");
         }
     };
 
@@ -133,17 +190,17 @@ async fn run_cycle(engine: &SharedEngine, pool: &PgPool) -> Option<&'static str>
         Ok(resolver) => resolver,
         Err(e) => {
             log!("[WebhookIngress] No resolver client could be built: {e}");
-            return undetermined("no resolver client could be built");
+            return undetermined(round, "no resolver client could be built");
         }
     };
 
     let path = format!("/{slug}/{}", hook.id);
     let found = match addresses_to_probe(dns::public_addresses(&resolver, &ingress.host).await) {
         Ok(found) => found,
-        Err(reason) => return undetermined(reason),
+        Err(reason) => return undetermined(round, reason),
     };
     let Some(addresses) = probe_each(&ingress, &path, &found).await else {
-        return undetermined("no probe token could be minted");
+        return undetermined(round, "no probe token could be minted");
     };
     let families = judge(&addresses);
     let observed = degraded_families(&families);
@@ -158,7 +215,41 @@ async fn run_cycle(engine: &SharedEngine, pool: &PgPool) -> Option<&'static str>
         );
     }
 
-    match record_cycle(&families, declared.as_ref()) {
+    let slept = round.measure();
+    if let Some(slept) = slept {
+        log!(
+            "[WebhookIngress] This computer slept {} seconds around this round, so it judged nothing",
+            slept.as_secs()
+        );
+    }
+    let (decision, spell) = {
+        let mut watch = watch();
+        let decision = watch.record_cycle(&families, declared.as_ref(), slept);
+        (decision, watch.record_sleep(slept))
+    };
+
+    if let Some(spell) = spell {
+        log!(
+            "[WebhookIngress] This computer slept {} minutes while {} was on, so deliveries sent then never arrived",
+            spell.as_secs() / 60,
+            hook.name
+        );
+        engine
+            .event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::WebhookDeliveriesSleptThrough {
+                    webhook_id: hook.id.to_string(),
+                    webhook_name: hook.name.clone(),
+                    host: ingress.host.clone(),
+                    port: ingress.port,
+                    slept_secs: spell.as_secs(),
+                }),
+                "[WebhookIngress] WebhookDeliveriesSleptThrough",
+            )
+            .await;
+    }
+
+    match decision {
         Decision::Nothing => {}
         Decision::Declare => {
             log!(
@@ -264,9 +355,9 @@ async fn probe_each(
 /// The ingress therefore went untested, and a standing outage stays as it is.
 ///
 /// The debounce memory is cleared, because two failures separated by a cycle
-/// nobody could read are not consecutive.
-fn undetermined(reason: &'static str) -> Option<&'static str> {
-    forget_last_cycle();
+/// nobody could read are not consecutive. A sleep spell carries on through it.
+fn undetermined(round: &mut Round, reason: &'static str) -> Option<&'static str> {
+    watch().measured_nothing(round.measure());
     Some(reason)
 }
 
@@ -280,7 +371,7 @@ async fn out_of_service(
     pool: &PgPool,
     reason: &'static str,
 ) -> Option<&'static str> {
-    forget_last_cycle();
+    watch().stand_down();
     let declared = match declared_outage(pool).await {
         Ok(declared) => declared,
         Err(e) => {
@@ -318,29 +409,91 @@ async fn out_of_service(
     Some(reason)
 }
 
-/// Fold this cycle's reading into the debounce memory, and decide.
-///
-/// The lock is held for the update alone, never across an await.
-fn record_cycle(families: &[FamilyVerdict], declared: Option<&DeclaredOutage>) -> Decision {
-    let mut memory = LAST_CYCLE.lock().unwrap_or_else(|e| e.into_inner());
-    let previous = memory.take().unwrap_or_default();
-    let (decision, strikes) = decide(
-        families,
-        &previous.degraded,
-        previous.strikes,
-        declared.map(|declared| declared.families.as_slice()),
-    );
-    *memory = Some(CycleMemory {
-        degraded: degraded_families(families),
-        strikes,
-    });
-    decision
+/// The check's memory. Hold the guard for an update alone, never across an
+/// await.
+fn watch() -> MutexGuard<'static, Watch> {
+    WATCH.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Break the debounce chain, so "consecutive" keeps meaning consecutive.
-fn forget_last_cycle() {
-    let mut memory = LAST_CYCLE.lock().unwrap_or_else(|e| e.into_inner());
-    *memory = None;
+impl Watch {
+    const fn new() -> Self {
+        Self {
+            last_cycle: None,
+            last_round_end: None,
+            spell: Duration::ZERO,
+        }
+    }
+
+    /// Start a tick, measured from where the last one ended.
+    fn begin_round(&self) -> Round {
+        Round {
+            previous_end: self.last_round_end,
+            start: ClockReading::now(),
+            measured_end: None,
+        }
+    }
+
+    /// Fold a probed round's reading into the debounce, and decide.
+    ///
+    /// A round the computer slept through breaks the chain and can only
+    /// recover. Its failures are the sleep's, not the ingress's.
+    fn record_cycle(
+        &mut self,
+        families: &[FamilyVerdict],
+        declared: Option<&DeclaredOutage>,
+        slept: Option<Duration>,
+    ) -> Decision {
+        let declared = declared.map(|declared| declared.families.as_slice());
+        if slept.is_some() {
+            self.last_cycle = None;
+            return if recovers(families, declared) {
+                Decision::Recover
+            } else {
+                Decision::Nothing
+            };
+        }
+        let previous = self.last_cycle.take().unwrap_or_default();
+        let (decision, strikes) = decide(families, &previous.degraded, previous.strikes, declared);
+        self.last_cycle = Some(CycleMemory {
+            degraded: degraded_families(families),
+            strikes,
+        });
+        decision
+    }
+
+    /// Fold a probed round's sleep into the spell.
+    ///
+    /// An awake round closes the spell. It returns the spell when that was long
+    /// enough to report, so a night of dark wakes is said once, in the morning.
+    fn record_sleep(&mut self, slept: Option<Duration>) -> Option<Duration> {
+        match slept {
+            Some(slept) => {
+                self.carry_sleep(Some(slept));
+                None
+            }
+            None => Some(std::mem::take(&mut self.spell))
+                .filter(|spell| *spell >= SLEEP_WORTH_REPORTING),
+        }
+    }
+
+    /// A round that could not probe breaks the chain, and carries the spell
+    /// on without closing it.
+    fn measured_nothing(&mut self, slept: Option<Duration>) {
+        self.last_cycle = None;
+        self.carry_sleep(slept);
+    }
+
+    /// Add a round's sleep to the spell without closing it.
+    fn carry_sleep(&mut self, slept: Option<Duration>) {
+        self.spell = self.spell.saturating_add(slept.unwrap_or_default());
+    }
+
+    /// Nothing is being protected, so nothing is debounced and no delivery
+    /// was lost to a sleep.
+    fn stand_down(&mut self) {
+        self.last_cycle = None;
+        self.spell = Duration::ZERO;
+    }
 }
 
 /// The current outage, as the timeline records it.
@@ -509,6 +662,7 @@ fn family_list(families: &[Family]) -> String {
 mod tests {
     use super::*;
     use crate::core::webhook_ingress::Verdict;
+    use std::time::Instant;
 
     #[test]
     fn the_check_runs_every_fifteen_minutes() {
@@ -709,47 +863,234 @@ mod tests {
         }
     }
 
-    /// The debounce, driven through the memory the cycle actually uses.
-    ///
-    /// One test rather than several, because that memory is process-wide and
-    /// separate tests would race each other through it. What each reading means
-    /// is settled in `core::webhook_ingress`; this covers the threading.
+    const AWAKE: Option<Duration> = None;
+
+    /// A sleep, as `host_sleep::slept` reports one.
+    fn asleep(minutes: u64) -> Option<Duration> {
+        Some(Duration::from_secs(minutes * 60))
+    }
+
+    /// Both clocks at `wall` (UTC), with `awake_secs` of monotonic time since
+    /// `origin`.
+    fn clock(origin: Instant, wall: &str, awake_secs: u64) -> ClockReading {
+        let wall = chrono::DateTime::parse_from_rfc3339(wall).expect("test time parses");
+        ClockReading {
+            wall: wall.into(),
+            mono: origin + Duration::from_secs(awake_secs),
+        }
+    }
+
+    /// What a round between these readings slept, on this check's schedule.
+    fn slept_through(
+        previous_end: Option<ClockReading>,
+        start: ClockReading,
+        end: ClockReading,
+    ) -> Option<Duration> {
+        host_sleep::slept(&RoundClocks {
+            previous_end,
+            start,
+            end,
+            period: CHECK_PERIOD,
+        })
+    }
+
+    #[test]
+    fn a_late_tick_and_a_long_sleep_are_measured_against_this_schedule() {
+        assert_eq!(CHECK_PERIOD, Duration::from_secs(15 * 60));
+        assert!(WEBHOOK_INGRESS_CRON.contains("*/15"));
+        assert_eq!(SLEEP_WORTH_REPORTING, Duration::from_secs(30 * 60));
+    }
+
+    /// The debounce on an awake timeline. What each reading means is settled in
+    /// `core::webhook_ingress`; this covers the threading.
     #[test]
     fn two_failures_declare_an_outage_and_one_success_retracts_it() {
-        reset_memory();
         let down = reading(Verdict::Degraded, Verdict::Healthy);
         let up = reading(Verdict::Healthy, Verdict::Healthy);
 
-        assert_eq!(record_cycle(&down, None), Decision::Nothing);
-        assert_eq!(record_cycle(&down, None), Decision::Declare);
+        let mut watch = Watch::new();
+        assert_eq!(watch.record_cycle(&down, None, AWAKE), Decision::Nothing);
+        assert_eq!(watch.record_cycle(&down, None, AWAKE), Decision::Declare);
         let ipv4_down = standing(vec![Family::Ipv4]);
         // Still down, and already said so.
-        assert_eq!(record_cycle(&down, Some(&ipv4_down)), Decision::Nothing);
-        assert_eq!(record_cycle(&up, Some(&ipv4_down)), Decision::Recover);
+        assert_eq!(
+            watch.record_cycle(&down, Some(&ipv4_down), AWAKE),
+            Decision::Nothing
+        );
+        assert_eq!(
+            watch.record_cycle(&up, Some(&ipv4_down), AWAKE),
+            Decision::Recover
+        );
         // Nothing is retracted twice.
-        assert_eq!(record_cycle(&up, None), Decision::Nothing);
+        assert_eq!(watch.record_cycle(&up, None, AWAKE), Decision::Nothing);
 
         // A cycle nobody could read breaks the chain, so two failures either
         // side of it are not consecutive.
-        reset_memory();
-        assert_eq!(record_cycle(&down, None), Decision::Nothing);
-        forget_last_cycle();
-        assert_eq!(record_cycle(&down, None), Decision::Nothing);
+        let mut watch = Watch::new();
+        assert_eq!(watch.record_cycle(&down, None, AWAKE), Decision::Nothing);
+        watch.measured_nothing(AWAKE);
+        assert_eq!(watch.record_cycle(&down, None, AWAKE), Decision::Nothing);
 
         // The same cycle while an outage stands. `run_cycle` returns before
         // `record_cycle` is reached, so the declaration is neither repeated nor
         // retracted, and the cycle after it re-declares nothing.
-        reset_memory();
-        assert_eq!(record_cycle(&down, None), Decision::Nothing);
-        assert_eq!(record_cycle(&down, None), Decision::Declare);
-        forget_last_cycle();
-        assert_eq!(record_cycle(&down, Some(&ipv4_down)), Decision::Nothing);
-
-        reset_memory();
+        let mut watch = Watch::new();
+        assert_eq!(watch.record_cycle(&down, None, AWAKE), Decision::Nothing);
+        assert_eq!(watch.record_cycle(&down, None, AWAKE), Decision::Declare);
+        watch.measured_nothing(AWAKE);
+        assert_eq!(
+            watch.record_cycle(&down, Some(&ipv4_down), AWAKE),
+            Decision::Nothing
+        );
     }
 
-    fn reset_memory() {
-        let mut memory = LAST_CYCLE.lock().unwrap_or_else(|e| e.into_inner());
-        *memory = None;
+    #[test]
+    fn a_round_that_slept_mid_probe_declares_nothing() {
+        // The probe failed because the lid closed under it, not because the
+        // funnel died.
+        let down = reading(Verdict::Degraded, Verdict::Healthy);
+        let mut watch = Watch::new();
+        assert_eq!(watch.record_cycle(&down, None, AWAKE), Decision::Nothing);
+        assert_eq!(
+            watch.record_cycle(&down, None, asleep(14)),
+            Decision::Nothing
+        );
+        // Awake again, the count starts over, and two clean failures declare.
+        assert_eq!(watch.record_cycle(&down, None, AWAKE), Decision::Nothing);
+        assert_eq!(watch.record_cycle(&down, None, AWAKE), Decision::Declare);
+    }
+
+    #[test]
+    fn the_two_false_outages_of_that_night_are_not_declared() {
+        // A Mac with `pmset sleep 1`, waking for about 45 seconds every quarter
+        // hour. Times are UTC, two hours behind the Oslo times in the report.
+        let origin = Instant::now();
+        let down = reading(Verdict::Degraded, Verdict::Healthy);
+
+        // A dark-wake round fails as the network drops under it.
+        let mut watch = Watch::new();
+        let first_end = clock(origin, "2026-10-05T02:30:40Z", 35);
+        let first = slept_through(None, clock(origin, "2026-10-05T02:30:05Z", 0), first_end);
+        assert_eq!(first, AWAKE);
+        assert_eq!(watch.record_cycle(&down, None, first), Decision::Nothing);
+        // The next dark wake's round fails too. It declared at 04:49:26 Oslo,
+        // eight seconds after sleep entered.
+        let second = slept_through(
+            Some(first_end),
+            clock(origin, "2026-10-05T02:48:50Z", 75),
+            clock(origin, "2026-10-05T02:49:26Z", 111),
+        );
+        assert!(second.is_some(), "the two rounds sit in different wakes");
+        assert_eq!(watch.record_cycle(&down, None, second), Decision::Nothing);
+
+        // A failure in one wake, then the missed 07:15 tick fired by the
+        // 07:25:04 DarkWake. It declared at 07:25:51 Oslo.
+        let mut watch = Watch::new();
+        let first_end = clock(origin, "2026-10-05T05:00:40Z", 35);
+        let first = slept_through(None, clock(origin, "2026-10-05T05:00:05Z", 0), first_end);
+        assert_eq!(watch.record_cycle(&down, None, first), Decision::Nothing);
+        let late = slept_through(
+            Some(first_end),
+            clock(origin, "2026-10-05T05:25:04Z", 80),
+            clock(origin, "2026-10-05T05:25:49Z", 125),
+        );
+        assert!(late.is_some(), "a tick ten minutes late is a sleep sign");
+        assert_eq!(watch.record_cycle(&down, None, late), Decision::Nothing);
+    }
+
+    #[test]
+    fn a_sleep_between_round_one_and_round_two_resets_the_count() {
+        let origin = Instant::now();
+        let down = reading(Verdict::Degraded, Verdict::Healthy);
+        let mut watch = Watch::new();
+
+        let one_end = clock(origin, "2026-10-05T10:00:20Z", 20);
+        let one = slept_through(None, clock(origin, "2026-10-05T10:00:00Z", 0), one_end);
+        assert_eq!(watch.record_cycle(&down, None, one), Decision::Nothing);
+
+        // On time, but the machine slept for most of the quarter hour before.
+        let two_end = clock(origin, "2026-10-05T10:15:20Z", 80);
+        let two = slept_through(
+            Some(one_end),
+            clock(origin, "2026-10-05T10:15:00Z", 60),
+            two_end,
+        );
+        assert!(two.is_some());
+        assert_eq!(watch.record_cycle(&down, None, two), Decision::Nothing);
+
+        // Awake since: round three is strike one, round four declares.
+        let three_end = clock(origin, "2026-10-05T10:30:20Z", 980);
+        let three = slept_through(
+            Some(two_end),
+            clock(origin, "2026-10-05T10:30:00Z", 960),
+            three_end,
+        );
+        assert_eq!(three, AWAKE);
+        assert_eq!(watch.record_cycle(&down, None, three), Decision::Nothing);
+        let four = slept_through(
+            Some(three_end),
+            clock(origin, "2026-10-05T10:45:00Z", 1860),
+            clock(origin, "2026-10-05T10:45:20Z", 1880),
+        );
+        assert_eq!(four, AWAKE);
+        assert_eq!(watch.record_cycle(&down, None, four), Decision::Declare);
+    }
+
+    #[test]
+    fn a_round_that_slept_still_recovers_on_an_answer() {
+        // Sleep can only take answers away, so a 401 is proof whenever it came.
+        let ipv4_down = standing(vec![Family::Ipv4]);
+        let mut watch = Watch::new();
+        assert_eq!(
+            watch.record_cycle(
+                &reading(Verdict::Healthy, Verdict::Healthy),
+                Some(&ipv4_down),
+                asleep(14)
+            ),
+            Decision::Recover
+        );
+        // A failure in a round that slept neither repeats nor retracts.
+        assert_eq!(
+            watch.record_cycle(
+                &reading(Verdict::Degraded, Verdict::Healthy),
+                Some(&ipv4_down),
+                asleep(14)
+            ),
+            Decision::Nothing
+        );
+    }
+
+    #[test]
+    fn a_night_of_dark_wakes_is_reported_once_in_the_morning() {
+        let mut watch = Watch::new();
+        for _ in 0..30 {
+            assert_eq!(watch.record_sleep(asleep(14)), None);
+        }
+        // A wake where the funnel could not be read still adds to the spell.
+        watch.measured_nothing(asleep(14));
+
+        assert_eq!(
+            watch.record_sleep(AWAKE),
+            Some(Duration::from_secs(31 * 14 * 60))
+        );
+        assert_eq!(watch.record_sleep(AWAKE), None, "said once");
+    }
+
+    #[test]
+    fn a_short_sleep_is_not_reported_and_does_not_carry_over() {
+        let mut watch = Watch::new();
+        assert_eq!(watch.record_sleep(asleep(10)), None);
+        assert_eq!(watch.record_sleep(AWAKE), None);
+        assert_eq!(watch.record_sleep(asleep(25)), None);
+        assert_eq!(watch.record_sleep(AWAKE), None);
+    }
+
+    #[test]
+    fn nothing_to_protect_forgets_the_spell() {
+        // No hook or no funnel, so no delivery could have been lost.
+        let mut watch = Watch::new();
+        assert_eq!(watch.record_sleep(asleep(120)), None);
+        watch.stand_down();
+        assert_eq!(watch.record_sleep(AWAKE), None);
     }
 }

@@ -33,9 +33,6 @@ const TEXT_STRONG_TOKEN: &str = "--text-strong";
 /// The `data/` subdirectory, and plugin content folder, that holds themes.
 pub const THEMES_DIR: &str = "themes";
 
-/// The device-scoped preference naming the active theme.
-pub const THEME_KEY: &str = "theme";
-
 /// The theme mode values. No theme may take one as its id, so a write of
 /// `theme=dark` from code written before the rename is refused, never stored.
 pub const THEME_MODE_VALUES: [&str; 3] = ["light", "dark", "system"];
@@ -64,12 +61,10 @@ const BUILT_IN_THEMES: &[(&str, &str)] = &[
     ("real-computer", include_str!("builtin/real-computer.json")),
 ];
 
-/// Caps that mirror the style-override rules in
-/// `packages/lucidos-sdk/src/appearance.ts`, which re-checks every value at the
-/// apply site. `theme-validation-cases.json` pins the two sides together.
+/// Caps the apply sites in `packages/lucidos-sdk/src/appearance.ts` check
+/// again. They read these from the generated `theme-parts.ts`.
 const MAX_VALUE_LENGTH: usize = 120;
-/// The most tokens a resolved map may hold: `MAX_STYLE_OVERRIDES` in
-/// `packages/lucidos-sdk/src/appearance.ts`, where every apply site stops.
+/// The most tokens a resolved map may hold, and where every apply site stops.
 pub const MAX_RESOLVED_TOKENS: usize = 200;
 const MAX_ID_LENGTH: usize = 64;
 const MAX_NAME_LENGTH: usize = 80;
@@ -82,9 +77,9 @@ const MIN_PAGE_TEXT_CONTRAST: f64 = 3.0;
 
 /// How far a shadow may reach from its box, so no theme can paint over a
 /// neighbour such as an approval card.
-const MAX_SHADOW_PX: f64 = 32.0;
 const MAX_SHADOW_REM: f64 = 2.0;
 const PX_PER_REM: f64 = 16.0;
+const MAX_SHADOW_PX: f64 = MAX_SHADOW_REM * PX_PER_REM;
 /// The functions a shadow value may call. Each only names a colour.
 const SHADOW_COLOUR_FUNCTIONS: &[&str] = &[
     "rgb",
@@ -357,7 +352,8 @@ fn colour_tokens() -> impl Iterator<Item = (&'static str, bool)> {
 pub fn validate_id(id: &str) -> ThemeResult<()> {
     if THEME_MODE_VALUES.contains(&id) {
         return Err(format!(
-            "'{id}' is a theme mode, not a theme id. Set the 'theme-mode' preference for light or dark"
+            "'{id}' is a theme mode, not a theme id. Set the '{}' preference for light or dark",
+            crate::core::prefs::THEME_MODE.key()
         )
         .into());
     }
@@ -1223,7 +1219,7 @@ fn workspace_theme_path(data_dir: &Path, id: &str) -> std::path::PathBuf {
 }
 
 /// Where workspace themes lived when they were called looks. The plugin
-/// refusal hint and the plugin registry's path lookup still read it.
+/// refusal hint still reads it.
 pub const LEGACY_THEMES_DIR: &str = "looks";
 
 /// One theme by id, built-in first. `None` when no theme has that id.

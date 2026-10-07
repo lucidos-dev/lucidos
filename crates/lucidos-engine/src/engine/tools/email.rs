@@ -100,6 +100,7 @@ impl LucidosEngine {
         name: &str,
         args: &serde_json::Value,
         _request_id: Uuid,
+        thread_id: Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             tn::CONFIGURE_EMAIL => {
@@ -599,6 +600,7 @@ impl LucidosEngine {
                             source_detail: format!("UID {} attachment {}", uid, attachment_index),
                             commit_hash: commit_sha.clone(),
                             summary: Some(format!("{} ({})", safe_filename, size_display)),
+                            writer_thread_id: Some(thread_id),
                         },
                     ))
                     .await

@@ -11,6 +11,11 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const REPO_MARKER: &str = "scripts/web-dev.sh";
 
+/// Where a workspace keeps its coding-agent worktrees, relative to its root.
+/// The gateway's `stack::path_is_in_cc_worktree` and `scripts/lib/workspace.sh`
+/// spell the same two components and cannot import this.
+pub const WORKTREES_SUBPATH: &str = ".lucidos/worktrees";
+
 /// Does `path` lie inside a coding-agent worktree — one of the
 /// `<workspace>/.lucidos/worktrees/<thread>/` copies the engine creates per
 /// coding-agent thread?
@@ -29,13 +34,9 @@ const REPO_MARKER: &str = "scripts/web-dev.sh";
 /// `worktrees` component pair, so `~/worktrees/lucidos` and
 /// `.lucidos/served-frontend` are not caught.
 pub fn path_is_in_cc_worktree(path: &Path) -> bool {
-    let comps: Vec<_> = path
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    comps
-        .windows(2)
-        .any(|w| w[0] == ".lucidos" && w[1] == "worktrees")
+    let marker: Vec<_> = Path::new(WORKTREES_SUBPATH).components().collect();
+    let comps: Vec<_> = path.components().collect();
+    comps.windows(marker.len()).any(|w| w == marker.as_slice())
 }
 
 /// The per-user cache root every Lucidos engine on this machine shares:

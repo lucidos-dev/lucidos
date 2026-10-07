@@ -19,11 +19,11 @@
  * |-----------------|-------------------------------------|
  * | Settings        | the bell alone                      |
  * | Apps            | search + the bell                   |
- * | An app's UI     | open in tab + fullscreen + the bell |
+ * | An app's UI     | open in tab + find + fullscreen + the bell |
  *
- * The app's UI is the widest cluster the fold leaves standing: two context
- * actions and the bell. Its Refresh leads the row beside the hamburger, so the
- * back chevron must clear that too.
+ * The app's UI is the widest cluster: three context actions and the bell, all
+ * riding the row while it has room. Its Refresh leads the row beside the
+ * hamburger, so the back chevron must clear that too.
  *
  * The mirror case has its own test: two app views whose CLUSTERS are identical
  * and whose TITLES are not, one of them long enough to ellipsize. That is the
@@ -230,14 +230,14 @@ test.describe('the desktop content title holds its position across views', () =>
 
   test('the chevrons land on the same x whatever the trailing cluster holds', async ({ page }) => {
     // Restore-on-load opens the app in the content pane (the same hook
-    // sdk-iframe-mount uses): panelOverlay = {type:'app-ui'}, whose two
+    // sdk-iframe-mount uses): panelOverlay = {type:'app-ui'}, whose three
     // context actions ride the row beside the bell, the widest cluster.
     await page.addInitScript((id) => localStorage.setItem('app-window-open', id), APP_ID);
     await gotoWithRetry(page, '/');
     await expect(page.locator('iframe[data-role="app-ui-frame"]:visible')).toBeVisible({ timeout: 15_000 });
     const widest = await settled(page);
-    expect(widest.hasOverflow, 'two actions fit the reserve, so nothing folds').toBe(false);
-    expect(widest.trailingIcons, 'the app view: open in tab + fullscreen + the bell').toBe(3);
+    expect(widest.hasOverflow, 'the box is at its span cap, so three actions fit and nothing folds').toBe(false);
+    expect(widest.trailingIcons, 'the app view: open in tab + find + fullscreen + the bell').toBe(4);
     expect(widest.hasRefresh, 'the app view leads its row with Refresh').toBe(true);
     expectCentredAndClear(widest, 'app UI');
 
@@ -278,7 +278,7 @@ test.describe('the desktop content title holds its position across views', () =>
   test('the box still clears the cluster with the Canvas pane near its floor', async ({ page }) => {
     // The narrowest this pane legally gets, where the box has given up the most
     // width to the two side reserves. The reserve is sized for the widest
-    // cluster the fold leaves standing, so the clearance holds here too.
+    // cluster that can stand on the middle arm, so the clearance holds here too.
     //
     // The pane width is SEEDED, not dragged. `splitRatio` is read straight out
     // of localStorage with no load-time clamp (store/store.ts), so a ratio IS a
@@ -322,8 +322,8 @@ test.describe('the desktop content title holds its position across views', () =>
       narrow.boxWidth,
       `the box fell to its ${narrow.minSpan} min-span floor above the pane's own floor`,
     ).toBeGreaterThan(narrow.minSpan);
-    // The cluster is at most the two actions and the bell, folded or not: that
-    // is what the reserve is sized for.
+    // Near the floor the three actions no longer fit, so two fold into ⋯.
+    // The cluster is then three boxes, which is what the reserve is sized for.
     expect(narrow.trailingIcons, 'the narrow app view outgrew the reserve').toBeLessThanOrEqual(3);
     expect(narrow.hasRefresh, 'Refresh still leads the narrow row').toBe(true);
     expectCentredAndClear(narrow, 'canvas pane near its floor');

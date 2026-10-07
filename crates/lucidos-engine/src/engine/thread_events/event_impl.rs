@@ -191,6 +191,7 @@ impl ThreadEvent {
             Self::ThreadTriageProposed { .. } => "ThreadTriageProposed",
             Self::ThreadStarted { .. } => "ThreadStarted",
             Self::ThreadDiscarded { .. } => "ThreadDiscarded",
+            Self::HomeThreadCreated => "HomeThreadCreated",
             Self::ImageUploaded { .. } => "ImageUploaded",
             Self::TriggerStarted { .. } => "TriggerStarted",
             Self::TriggerCompleted { .. } => "TriggerCompleted",
@@ -316,6 +317,7 @@ impl ThreadEvent {
         "ThreadTriageProposed",
         "ThreadStarted",
         "ThreadDiscarded",
+        "HomeThreadCreated",
         "ImageUploaded",
         "TriggerStarted",
         "TriggerCompleted",
@@ -533,6 +535,19 @@ impl ThreadEvent {
             Self::ImageDescribed { description, .. } => Some(description),
             _ => None,
         }
+    }
+
+    /// A stored row back as its typed event: the inverse of [`Self::to_payload`].
+    /// The row keeps its type in the `event_type` column, not the payload.
+    pub fn from_stored(
+        event_type: &str,
+        mut payload: Value,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        payload
+            .as_object_mut()
+            .ok_or("the stored payload is not an object")?
+            .insert("type".into(), Value::String(event_type.into()));
+        Ok(serde_json::from_value(payload)?)
     }
 
     /// Serializes to JSON payload for DB storage, stripping the "type" tag.

@@ -6,7 +6,8 @@
 
 use super::context_mode::ContextMode;
 use super::history::{
-    render_older_region, speaker_label, CoveredSummary, SummaryInFlight, SummaryPlan,
+    locate_message_images, render_older_region, speaker_label, CoveredSummary, SummaryInFlight,
+    SummaryPlan,
 };
 use crate::core::store::{newest_conversation_summary, CachedSummary, SessionMessage};
 use crate::core::EventRow;
@@ -23,7 +24,7 @@ fn msg(role: &str, content: &str, event_id: Option<&str>) -> SessionMessage {
         created_at: Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap(),
         channel: None,
         steps: vec![],
-        images: vec![],
+        image_handles: vec![],
         user_image_hashes: vec![],
         image_description: None,
         completed: None,
@@ -41,13 +42,12 @@ fn msg(role: &str, content: &str, event_id: Option<&str>) -> SessionMessage {
 /// The renderer's formatter, reduced to what these tests need to read. The
 /// speaker name comes from the real `speaker_label`, so this double cannot
 /// drift from what a turn actually prints.
-fn format_msg(m: &SessionMessage, _verbatim: bool, _img: usize, _idx: usize) -> String {
+fn format_msg(m: &SessionMessage, _verbatim: bool, _idx: usize) -> String {
     format!("{}: {}", speaker_label(m), m.content)
 }
 
 fn render(older: &[SessionMessage], covered: Option<CoveredSummary<'_>>) -> String {
-    let starts = vec![0usize; older.len()];
-    render_older_region(older, &starts, covered, &format_msg)
+    render_older_region(older, covered, &format_msg)
 }
 
 /// A long alternating thread. Each marker is terminated with `|` so a
@@ -595,7 +595,7 @@ fn a_guest_turn_renders_under_its_own_speaker_name() {
     guest.agent = Some(AgentParticipant::Guest {
         label: "Voice".into(),
     });
-    let line = format_msg(&guest, false, 0, 0);
+    let line = format_msg(&guest, false, 0);
     assert_eq!(line, "Voice: I'll look that up.");
     assert!(!line.starts_with("Assistant:"), "{line}");
     assert!(!line.starts_with("User:"), "{line}");
@@ -609,8 +609,8 @@ fn our_own_agent_prints_assistant_named_or_not() {
     let unattributed = msg("assistant", "done", None);
     let mut ours = msg("assistant", "done", None);
     ours.agent = Some(AgentParticipant::LucidosAgent);
-    assert_eq!(format_msg(&unattributed, false, 0, 0), "Assistant: done");
-    assert_eq!(format_msg(&ours, false, 0, 0), "Assistant: done");
+    assert_eq!(format_msg(&unattributed, false, 0), "Assistant: done");
+    assert_eq!(format_msg(&ours, false, 0), "Assistant: done");
 }
 
 /// A user turn is a user turn whatever the actor says. Nothing an agent stamps
@@ -622,4 +622,106 @@ fn a_user_turn_is_never_relabelled_by_an_agent_actor() {
         label: "Voice".into(),
     });
     assert_eq!(speaker_label(&spoken), "User");
+}
+
+// ------------------------------------------------------------------
+// Image positions: the history's `thread:N` is the resolver's.
+// ------------------------------------------------------------------
+
+/// The reported drift. The history counted a turn's screenshot paths and
+/// skipped its generated images, while the resolver did the reverse. So after
+/// one generated image, every later `thread:N` in the history named the
+/// picture before it. Real events, through the real builder and the real walk.
+#[test]
+fn the_history_numbers_images_exactly_as_the_resolver_walks_them() {
+    use crate::core::events::{image_handle, walk_thread_image_handles, ImageRef};
+    let request = Uuid::new_v4().to_string();
+    let events = vec![
+        EventRow::new(
+            "MessageReceived",
+            json!({"text": "draw a cat", "user_image_hashes": ["aa11"]}),
+        ),
+        EventRow::new(
+            "ToolResult",
+            json!({"name": "generate_image", "images": ["R0lGODlh"], "result": "ok",
+                   "success": true, "request_event_id": request}),
+        ),
+        EventRow::new(
+            "ResponseGenerated",
+            json!({"text": "here it is", "images": ["screenshots/page_2026.png"],
+                   "request_event_id": request}),
+        ),
+        EventRow::new(
+            "MessageReceived",
+            json!({"text": "and this one", "user_image_hashes": ["bb22"]}),
+        ),
+    ];
+    let messages = crate::core::store::messages::build_session_messages(&events);
+    let walk = walk_thread_image_handles(&events);
+    let starts = locate_message_images(&messages, &walk);
+
+    let generated = image_handle(ImageRef::InlineBase64("R0lGODlh"));
+    let second_upload = image_handle(ImageRef::BlobHash("bb22"));
+    let at = |handle: &str| {
+        messages
+            .iter()
+            .position(|m| m.image_handles.iter().any(|h| h == handle))
+            .unwrap_or_else(|| panic!("no message carries {handle}"))
+    };
+    // 0-based starts: the cat prompt's upload is thread:1, the drawing
+    // thread:2, the second upload thread:3.
+    assert_eq!(starts[at(&generated)], Some(1));
+    assert_eq!(starts[at(&second_upload)], Some(2));
+    assert_eq!(walk[2], second_upload);
+}
+
+/// A message whose images the walk lacks gets no position, and does not drag
+/// the messages after it out of place.
+#[test]
+fn a_message_the_walk_lacks_does_not_shift_the_rest() {
+    let mut stray = msg("assistant", "ghost", None);
+    stray.image_handles = vec!["img-0000000000000000".into()];
+    let mut later = msg("user", "real", None);
+    later.image_handles = vec!["img-bbbbbbbbbbbbbbbb".into()];
+    let walk = vec![
+        "img-aaaaaaaaaaaaaaaa".to_string(),
+        "img-bbbbbbbbbbbbbbbb".to_string(),
+    ];
+    let starts = locate_message_images(&[stray, later], &walk);
+    assert_eq!(starts, vec![None, Some(1)]);
+}
+
+/// The same picture posted twice shares one handle. Each post still takes
+/// its own slot, in order, rather than both claiming the first.
+#[test]
+fn a_repeated_image_takes_each_of_its_own_slots_in_turn() {
+    let handle = "img-aaaaaaaaaaaaaaaa".to_string();
+    let mut first = msg("user", "one", None);
+    first.image_handles = vec![handle.clone()];
+    let mut again = msg("user", "two", None);
+    again.image_handles = vec![handle.clone()];
+    let starts = locate_message_images(&[first, again], &[handle.clone(), handle]);
+    assert_eq!(starts, vec![Some(0), Some(1)]);
+}
+
+/// A turn that generated an image and then failed keeps the image on its
+/// failed message, as it keeps its steps. So the history still lists it.
+#[test]
+fn a_failed_turn_keeps_the_image_it_generated() {
+    use crate::core::events::{image_handle, ImageRef};
+    let events = vec![
+        EventRow::new("MessageReceived", json!({"text": "draw a cat"})),
+        EventRow::new(
+            "ToolResult",
+            json!({"name": "generate_image", "images": ["R0lGODlh"], "result": "ok",
+                   "success": true}),
+        ),
+        EventRow::new("ResponseFailed", json!({"error": "provider timed out"})),
+    ];
+    let messages = crate::core::store::messages::build_session_messages(&events);
+    let failed = messages.last().expect("the failure is a message");
+    assert_eq!(
+        failed.image_handles,
+        vec![image_handle(ImageRef::InlineBase64("R0lGODlh"))]
+    );
 }

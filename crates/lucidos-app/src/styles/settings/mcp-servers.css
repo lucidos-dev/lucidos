@@ -22,6 +22,13 @@
     color: var(--text-secondary);
 }
 
+/* The engine's line once the tools are past or near their ceiling. Not forced
+   into the skeleton: it is rare, and a placeholder for it would read as one. */
+.mcp-cost-warning {
+    font-size: var(--font-size-md);
+    color: var(--accent-yellow);
+}
+
 /* The two conditional figures: what the stopped servers would add, and what the
    switched-off tools are keeping out. Quieter than the live total, because
    neither is what the workspace is paying. */

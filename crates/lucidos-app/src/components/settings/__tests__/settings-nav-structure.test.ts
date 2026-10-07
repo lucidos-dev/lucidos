@@ -32,7 +32,8 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve, join } from 'node:path';
-import { DEFAULT_FONT_PREFERENCE, FOLLOW_THEME, FONT_CATALOG } from '@lucidos/appearance';
+import { FOLLOW_THEME, FONT_CATALOG } from '@lucidos/appearance';
+import { PREF_FONT_FAMILY } from '@lucidos/preference-catalog';
 import { fontOptions } from '../fontOptions';
 import { SETTINGS_SUBVIEW_ITEMS } from '../../../store/store';
 import { findSettingsEntry, settingsSearchEntryIds } from '../../search/searchIndex';
@@ -224,7 +225,7 @@ describe('the Font dropdown', () => {
 
   it('lists the default first, as Mode and Motion list theirs', () => {
     expect(options[0]).toEqual({ value: FOLLOW_THEME, label: 'Follow the theme' });
-    expect(DEFAULT_FONT_PREFERENCE).toBe(FOLLOW_THEME);
+    expect(PREF_FONT_FAMILY.fallback).toBe(FOLLOW_THEME);
     expect(SETTINGS_VIEW).toContain('? fontOptions(workspaceFontList.value.data.fonts, font)');
   });
 

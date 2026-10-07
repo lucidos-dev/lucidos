@@ -75,12 +75,24 @@ pub fn vertex_host(location: &str) -> String {
     let lowered = location.to_ascii_lowercase();
     let location = well_formed_location(&lowered);
     if location == "global" {
-        "aiplatform.googleapis.com".to_string()
+        VERTEX_GLOBAL_HOST.to_string()
     } else if is_multi_region(location) {
-        format!("aiplatform.{}.rep.googleapis.com", location)
+        format!("aiplatform.{}{}", location, VERTEX_MULTI_REGION_SUFFIX)
     } else {
-        format!("{}-aiplatform.googleapis.com", location)
+        format!("{}-{}", location, VERTEX_GLOBAL_HOST)
     }
+}
+
+/// The global Vertex AI host, which a regional host carries as its suffix.
+const VERTEX_GLOBAL_HOST: &str = "aiplatform.googleapis.com";
+/// What a multi-region Vertex AI host ends with.
+const VERTEX_MULTI_REGION_SUFFIX: &str = ".rep.googleapis.com";
+
+/// Whether `host` is a Vertex AI host, in any shape [`vertex_host`] builds.
+pub fn is_vertex_host(host: &str) -> bool {
+    host == VERTEX_GLOBAL_HOST
+        || host.ends_with(&format!("-{VERTEX_GLOBAL_HOST}"))
+        || (host.starts_with("aiplatform.") && host.ends_with(VERTEX_MULTI_REGION_SUFFIX))
 }
 
 /// `location` if it can only ever be a label inside a Google host, else
@@ -210,8 +222,8 @@ pub(crate) fn explain_publisher_model_404(
 }
 
 /// Get a cached Vertex access token, refreshing only when expired (50 min TTL).
-/// Shared by VertexProvider, VertexImagenProvider, and the MemoryExtractor's
-/// Vertex provider, so every Vertex caller benefits from the same auth.
+/// Shared by VertexProvider and VertexImagenProvider, so every Vertex caller
+/// benefits from the same auth.
 ///
 /// On a cache miss the token is acquired **ADC-file-first, gcloud-fallback**:
 /// 1. If the user's Application Default Credentials are an `authorized_user`
@@ -346,32 +358,6 @@ impl VertexProvider {
         })
     }
 
-    /// Cap every HTTP attempt this provider makes at `timeout`, streaming
-    /// included. Builder-style, so the ordinary constructors keep their
-    /// unbounded-stream behaviour and only the caller that wants a bound pays
-    /// for it.
-    ///
-    /// The one caller is [`crate::memory::MemoryExtractor`], which serves
-    /// *auxiliary model calls*. Each of those runs under a deadline from
-    /// `engine::aux_purpose`, and that deadline can only contain the provider's
-    /// retries if one attempt is itself bounded. Without this, the 900s default
-    /// meant the first attempt outlived any deadline worth setting, so the
-    /// three retries behind it never happened.
-    pub fn with_request_timeout(
-        mut self,
-        timeout: std::time::Duration,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        self.client = reqwest::Client::builder()
-            .timeout(timeout)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .build()?;
-        self.streaming_client = reqwest::Client::builder()
-            .timeout(timeout)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .build()?;
-        Ok(self)
-    }
-
     /// Snapshot the current region. URL builders call this per-request.
     fn current_location(&self) -> String {
         read_location(&self.location)
@@ -468,6 +454,7 @@ impl VertexProvider {
         url: &str,
         access_token: &str,
         body: &impl Serialize,
+        attempt_timeout: Option<std::time::Duration>,
     ) -> Result<(reqwest::StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
         let mut attempt = 0u32;
         let mut token = access_token.to_string();
@@ -475,15 +462,13 @@ impl VertexProvider {
         loop {
             attempt += 1;
 
-            let response = match self
+            let request = self
                 .client
                 .post(url)
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Content-Type", "application/json")
-                .json(body)
-                .send()
-                .await
-            {
+                .json(body);
+            let response = match super::cap_attempt(request, attempt_timeout).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     if attempt <= super::MAX_RETRIES {
@@ -532,33 +517,15 @@ impl LlmProvider for VertexProvider {
         selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
+        _call: crate::llm::metered::CallToken,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let ModelSelection {
-            model: model_override,
-            reasoning_effort,
-            ..
-        } = selection;
-        let model = model_override.unwrap_or(&self.model);
+        let model = selection.model.unwrap_or(&self.model);
         if Self::is_claude_model(model) {
-            self.chat_claude(
-                messages,
-                tools,
-                model,
-                system_prompt,
-                on_token,
-                reasoning_effort,
-            )
-            .await
+            self.chat_claude(messages, tools, selection, system_prompt, on_token)
+                .await
         } else {
-            self.chat_gemini(
-                messages,
-                tools,
-                model,
-                system_prompt,
-                on_token,
-                reasoning_effort,
-            )
-            .await
+            self.chat_gemini(messages, tools, selection, system_prompt, on_token)
+                .await
         }
     }
 }
@@ -601,6 +568,8 @@ mod tests {
             VertexProvider::new("my-project".into(), "eu".into(), "claude-opus-5".into()).unwrap();
         for (model, expected) in [
             ("claude-opus-5@default", "eu"),
+            ("claude-sonnet-5", "eu"),
+            ("claude-sonnet-5-5", "eu"),
             ("gemini-2.5-flash", "eu"),
             ("gemini-3-flash-preview", "global"),
         ] {
@@ -710,6 +679,8 @@ mod tests {
             VertexProvider::new("my-project".into(), "eu".into(), "claude-opus-5".into()).unwrap();
         for model in [
             "claude-opus-5@default",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
             "gemini-2.5-flash",
             "gemini-3-flash-preview",
             "gemini-3.5-flash",
@@ -850,6 +821,16 @@ mod tests {
             explain_publisher_model_404(500, "Publisher model blew up", "x", url),
             None
         );
+    }
+
+    /// Every host `vertex_host` builds reads back as a Vertex host, which is
+    /// how the proxy knows a reply from one is a model call.
+    #[test]
+    fn every_built_vertex_host_is_recognised() {
+        for location in ["global", "eu", "us", "europe-west1"] {
+            assert!(is_vertex_host(&vertex_host(location)), "{location}");
+        }
+        assert!(!is_vertex_host("storage.googleapis.com"));
     }
 
     #[test]

@@ -7,6 +7,7 @@ import {
   confirmPluginInstallAction,
 } from '../../store/actions/plugin-install';
 import { renderMarkdown } from '../../utils/renderMarkdown';
+import { NO_ENGINE_REQUIREMENT_SENTENCE } from './engineRequirement';
 import { PluginFileList } from './PluginFileList';
 import { PluginSection, pluginPanelHeader } from './PluginSection';
 import { ProposeUpstreamButton } from './ProposeUpstreamButton';
@@ -142,6 +143,11 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
           <code class="plugin-install-source-value" data-tooltip={req.source}>
             {sourceField ?? req.source}
           </code>
+          {req.engine_requirement == null && (
+            <p class="plugin-install-note" data-role="engine-undeclared">
+              {NO_ENGINE_REQUIREMENT_SENTENCE}
+            </p>
+          )}
         </section>
 
         {localChanges.length > 0 && (

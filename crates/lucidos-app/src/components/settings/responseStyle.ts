@@ -1,9 +1,10 @@
 import type { ResponseStyle } from '../../api/types';
+import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 
-/** The off switch's id, mirroring `response_style::STANDARD_ID`. The one id
- *  worth spelling out here: the editor has to know which row draws no buttons,
- *  and the picker has to know which one costs nothing. */
-export const STANDARD_ID = 'standard';
+/** The off switch's id, which the engine makes the `response_style` default.
+ *  The editor has to know which row draws no buttons, and the picker has to
+ *  know which one costs nothing. */
+export const STANDARD_ID = PREFERENCE_CATALOG.response_style.fallback;
 
 /** Bounds, mirroring `core/response_style.rs`. The engine refuses a document
  *  that breaks one. These exist to say so BEFORE the user loses a paragraph to

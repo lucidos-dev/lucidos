@@ -37,14 +37,15 @@ pub(crate) fn lookup_repo_commands_in_cache(
 //     prompt regardless of `--allowedTools`, because the plan must be
 //     reviewed by the user before the assistant continues. A bare
 //     `ExitPlanMode` line never suppresses the card.
-// The "Always allow" broad button is hidden for these tools (see
-// `BROAD_ALLOW_INEFFECTIVE` in `PermissionCard.tsx`); users wanting in-thread
+// The "Always allow" broad button is hidden for these tools (`PermissionCard.tsx`
+// reads this list from the generated `engine-constants.ts`); users wanting in-thread
 // persistence should use the session-allow button instead, which the engine
 // intercepts before CC's gate. See `input_touches_protected_path` for the
 // related per-input filter (Bash commands targeting `.claude/` / `.git/`
 // paths, which empirically still surface a card even with bare `Bash` in
 // `--allowedTools`).
-const BROAD_ALLOW_INEFFECTIVE: &[&str] = &["Edit", "ExitPlanMode", "NotebookEdit", "Write"];
+pub(crate) const BROAD_ALLOW_INEFFECTIVE: &[&str] =
+    &["Edit", "ExitPlanMode", "NotebookEdit", "Write"];
 
 /// Substrings that mark a path CC treats specially for destructive Bash
 /// commands. Empirically (probed 2026-05-16): `Bash rm -rf .../.claude/...`
@@ -57,7 +58,7 @@ const BROAD_ALLOW_INEFFECTIVE: &[&str] = &["Edit", "ExitPlanMode", "NotebookEdit
 /// under bare allowlist entries — the trigger is the tool+path combination,
 /// not the path alone. Session scope is unaffected because the engine
 /// intercepts the MCP permission server call before CC's gate fires.
-const CC_PROTECTED_PATH_MARKERS: &[&str] = &[".claude/", ".git/"];
+pub(crate) const CC_PROTECTED_PATH_MARKERS: &[&str] = &[".claude/", ".git/"];
 
 // Tools whose `AllowScope::Session` pattern is per-file, derived from the
 // input's `file_path` / `notebook_path` field rather than the tool name.
@@ -66,9 +67,8 @@ const CC_PROTECTED_PATH_MARKERS: &[&str] = &[".claude/", ".git/"];
 // while `BROAD_ALLOW_INEFFECTIVE` is "tools whose bare allowlist entry is a
 // lie." Edit/Write/NotebookEdit are in both; ExitPlanMode is only in the
 // latter (no per-path identifier — its session pattern is the bare tool
-// name). Mirrors the TS-side `SESSION_PATH_TOOLS` constant in
-// `PermissionCard.tsx`.
-const SESSION_PATH_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
+// name). `PermissionCard.tsx` reads it from the generated `engine-constants.ts`.
+pub(crate) const SESSION_PATH_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
 // Codex backend tool names, raised by the app-server approval bridge (see
 // `runtime/codex_app_server_parse.rs::parse_approval_request`). The
@@ -79,9 +79,10 @@ const SESSION_PATH_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 // Session scope stays available where a meaningful sub-scope exists
 // (`command_execution(<first-token>:*)` — see `narrow_subscope`); `file_change`
 // gets NO session pattern at all (see the Session arm of
-// `derive_allow_pattern`). Mirrors the TS-side `CODEX_BACKEND_TOOLS` /
-// `SESSION_ALLOW_INEFFECTIVE` constants in `PermissionCard.tsx`.
-const CODEX_BACKEND_TOOLS: &[&str] = &["command_execution", "file_change"];
+// `derive_allow_pattern`). `PermissionCard.tsx` reads it from the generated
+// `engine-constants.ts`, and mirrors the `file_change` arm as
+// `SESSION_ALLOW_INEFFECTIVE`.
+pub(crate) const CODEX_BACKEND_TOOLS: &[&str] = &["command_execution", "file_change"];
 
 /// Where a granted "Always allow" click is remembered.
 ///
@@ -133,14 +134,15 @@ pub enum AllowScope {
 ///
 ///   * `Session` → stored on `PermissionState::session_allows` and matched
 ///     exact-string against patterns derived from future prompts in the same
-///     thread. Always returns `Some(_)` so any prompt can be remembered for
-///     the rest of the thread, including CC-protected paths the persisted
-///     scopes can't reach:
+///     thread, including CC-protected paths the persisted scopes can't reach:
 ///       * `Edit | Write` → `Tool(<file_path>)` (per-file)
 ///       * `NotebookEdit` → `NotebookEdit(<notebook_path>)`
-///       * `Bash` → `Bash(<first-token>:*)` (same as narrow)
+///       * `Bash | command_execution` → `Bash(<first-token>:*)` (same as narrow)
 ///       * `Skill` → `Skill(<plugin>:*)` (same as narrow)
 ///       * everything else → bare `tool_name`
+///
+///     `None` for `file_change`, and for a path tool or command with no path
+///     or head. The card's `sessionGrantable` hides the button in those cases.
 pub(crate) fn derive_allow_pattern(
     tool_name: &str,
     input: &serde_json::Value,

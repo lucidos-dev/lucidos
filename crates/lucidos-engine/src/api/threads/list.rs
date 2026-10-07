@@ -65,6 +65,32 @@ async fn load_family_threads<'a>(
         })
 }
 
+/// The home thread's summary, or `None` while its switch is off or before one
+/// exists.
+async fn home_thread_summary(
+    store: &EventStore,
+    pool: &sqlx::PgPool,
+) -> Result<Option<ThreadSummary>, (StatusCode, String)> {
+    let internal = |e: String| {
+        log!("[API] Failed to fetch the home thread: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to fetch the home thread: {e}"),
+        )
+    };
+    let Some(id) = crate::engine::home_thread::home_thread_id(pool)
+        .await
+        .map_err(|e| internal(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let mut threads = store
+        .get_threads_by_ids(&[id.to_string()])
+        .await
+        .map_err(|e| internal(e.to_string()))?;
+    Ok(threads.pop())
+}
+
 /// GET /api/v1/threads — returns saved threads, recent archive, and active thread IDs
 pub(in crate::api) async fn list_threads(
     State(state): State<AppState>,
@@ -82,7 +108,14 @@ pub(in crate::api) async fn list_threads(
 
     // Run all DB queries in parallel
     let store = state.engine.event_store();
-    let (saved_result, recent_result, active_result, composing_result, archive_count_result) = tokio::join!(
+    let (
+        saved_result,
+        recent_result,
+        active_result,
+        composing_result,
+        archive_count_result,
+        home_result,
+    ) = tokio::join!(
         store.get_saved_threads(),
         // Global newest-`created_at` archive slice (no longer per-source); 30 fills
         // the initial Archive view comfortably before scroll-pagination takes over.
@@ -93,6 +126,10 @@ pub(in crate::api) async fn list_threads(
         // filter-scoped count via GET /threads/archived-count when a drawer
         // filter is active (see `refreshArchivedCount`).
         store.count_archived_threads(None, None, None, None),
+        // The client's Home entries open the home thread whatever its age.
+        // The inbox lists only threads that have answered, so a new one needs
+        // its own read (ADR 0362).
+        home_thread_summary(store, &state.pool),
     );
 
     let saved = saved_result.map_err(|e| {
@@ -109,7 +146,7 @@ pub(in crate::api) async fn list_threads(
             format!("Failed to get recent threads: {}", e),
         )
     })?;
-    let active_threads = active_result.map_err(|e| {
+    let mut active_threads = active_result.map_err(|e| {
         log!("[API] Failed to get active thread info: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -130,6 +167,13 @@ pub(in crate::api) async fn list_threads(
             format!("Failed to count archived threads: {}", e),
         )
     })?;
+
+    let home_thread = home_result?;
+    // A summary still marked home while `home_thread` is None is the hidden
+    // home thread. Only a by-id read can carry it (active, focused, family),
+    // since every list query filters it, so those three drop it here.
+    let hidden_home = |t: &ThreadSummary| t.home && home_thread.is_none();
+    active_threads.retain(|t| !hidden_home(t));
 
     // If the frontend has a focused thread, ensure it's in the response.
     // The focused thread may fall outside the global newest-30 archive slice
@@ -158,6 +202,7 @@ pub(in crate::api) async fn list_threads(
     } else {
         None
     };
+    let focused_thread = focused_thread.filter(|t| !hidden_home(t));
 
     // Load any family members (ancestors + descendants) of the base set
     // that aren't already in it. The drawer's family-aware routing
@@ -172,7 +217,8 @@ pub(in crate::api) async fn list_threads(
         .chain(active_threads.iter())
         .chain(composing.iter())
         .chain(focused_thread.iter());
-    let family_threads = load_family_threads(store, family_base).await?;
+    let mut family_threads = load_family_threads(store, family_base).await?;
+    family_threads.retain(|t| !hidden_home(t));
 
     let mut response = serde_json::json!({
         "saved": saved,
@@ -185,6 +231,7 @@ pub(in crate::api) async fn list_threads(
         "active_threads": active_threads,
         "composing": composing,
         "family_threads": family_threads,
+        "home_thread": home_thread,
     });
     if let Some(ft) = focused_thread {
         response["focused_thread"] = match serde_json::to_value(&ft) {

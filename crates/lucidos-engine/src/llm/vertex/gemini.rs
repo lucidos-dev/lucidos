@@ -6,6 +6,7 @@ use super::VertexProvider;
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolCall, ToolDefinition,
 };
+use crate::llm::ModelSelection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -25,7 +26,10 @@ impl VertexProvider {
         &self,
         query: &str,
         max_results: usize,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        (String, Option<crate::llm::usage_wire::ProviderUsage>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let model = "gemini-2.5-flash-lite";
         let request = serde_json::json!({
             "system_instruction": {
@@ -44,7 +48,7 @@ impl VertexProvider {
         let url = self.global_gemini_endpoint(model);
 
         let (status, body) = self
-            .request_with_retry(model, &url, &access_token, &request)
+            .request_with_retry(model, &url, &access_token, &request, None)
             .await?;
 
         if !status.is_success() {
@@ -54,18 +58,20 @@ impl VertexProvider {
         let parsed: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("Failed to parse Gemini search response: {}", e))?;
 
-        grounded_search_result(&parsed, max_results)
+        let text = grounded_search_result(&parsed, max_results)?;
+        Ok((text, crate::llm::usage_wire::from_json(&parsed)))
     }
 
     pub(super) async fn chat_gemini(
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
-        model: &str,
+        selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
-        reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let model = selection.model.unwrap_or(&self.model);
+        let reasoning_effort = selection.reasoning_effort;
         let contents = messages_to_vertex_contents(messages)?;
 
         let vertex_tools = if tools.is_empty() {
@@ -106,7 +112,13 @@ impl VertexProvider {
         let url = self.endpoint_for_model(model);
 
         let (status, body) = self
-            .request_with_retry(model, &url, &access_token, &request)
+            .request_with_retry(
+                model,
+                &url,
+                &access_token,
+                &request,
+                selection.attempt_timeout,
+            )
             .await?;
 
         if !status.is_success() {
@@ -221,7 +233,8 @@ fn gemini_generation_config(
     if !model.starts_with("gemini-3") {
         return None;
     }
-    let effort = reasoning_effort.unwrap_or("high");
+    let effort =
+        reasoning_effort.unwrap_or(crate::core::prefs::CHAT_REASONING_EFFORT.default_text());
     Some(VertexGenerationConfig {
         thinking_config: VertexThinkingConfig {
             thinking_level: gemini_thinking_level(model, effort),
@@ -234,15 +247,16 @@ fn gemini_generation_config(
 /// the levels the specific model accepts: Gemini 3 Flash supports
 /// `minimal`/`low`/`medium`/`high`; Gemini 3 Pro supports only `low`/`high`
 /// (sending Pro `minimal` or `medium` 400s). Gemini 3 can't fully disable
-/// thinking, so `none` maps to the model's floor (`minimal` on Flash, `low` on
-/// Pro). Unknown/higher efforts default to `high` — the model's own default.
-/// Lowercase per Google's REST docs.
+/// thinking, so `none` maps to the model's floor: `minimal` on Flash, `low` on
+/// Pro and on a model that always reasons (Gemini 3.8 Flash answers `minimal`
+/// with a 400). Unknown/higher efforts default to `high`, the model's own
+/// default. Lowercase per Google's REST docs.
 fn gemini_thinking_level(model: &str, effort: &str) -> &'static str {
     let flash = model.contains("flash");
     match effort {
         // Gemini 3 can't be fully disabled; use the model's floor.
         "none" => {
-            if flash {
+            if flash && !crate::llm::reasoning::always_reasons(model) {
                 "minimal"
             } else {
                 "low"
@@ -491,7 +505,9 @@ fn message_content_to_parts(
             .map(|block| match block {
                 // A tail block is an ordinary text part here. Only the engine
                 // and Anthropic's cache anchor care who wrote it.
-                ContentBlock::Text { text } | ContentBlock::EngineTail { text } => Ok(VertexPart {
+                ContentBlock::Text { text }
+                            | ContentBlock::EngineTail { text }
+                            | ContentBlock::MemoryView { text } => Ok(VertexPart {
                     text: Some(text),
                     ..Default::default()
                 }),
@@ -1199,6 +1215,12 @@ mod tests {
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "high"), "high");
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "xhigh"), "high");
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "max"), "high");
+        // 3.8 Flash has no minimal: Vertex answers it with a 400.
+        assert_eq!(gemini_thinking_level("gemini-3.8-flash", "none"), "low");
+        assert_eq!(
+            gemini_thinking_level("gemini-3.8-flash", "medium"),
+            "medium"
+        );
         // Pro accepts only low/high: minimal floors to low, medium rounds to high.
         assert_eq!(gemini_thinking_level("gemini-3-pro-preview", "none"), "low");
         assert_eq!(

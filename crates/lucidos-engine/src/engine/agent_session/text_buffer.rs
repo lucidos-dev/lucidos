@@ -65,6 +65,7 @@ impl CodingAgentTextBuffer {
                     event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed {
                         text: tail.to_string(),
                         coding_agent,
+                        parent_tool_use_id: None,
                     },
                     meta: meta.clone(),
                 },

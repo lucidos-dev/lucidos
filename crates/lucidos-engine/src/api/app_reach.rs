@@ -190,8 +190,13 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/memory/search", Host, &[]),
     ("/memory/source", Host, &[]),
     ("/memory/stats", Host, &[]),
+    ("/memory/tree", Host, &[]),
+    ("/memory/tree-backfill", Host, &[]),
+    ("/memory/tree-backfill/estimate", Host, &[]),
+    ("/memory/tree/threads", Host, &[]),
     ("/messages", Host, &[]),
     ("/models", App, &["GET"]),
+    ("/models/background", Host, &[]),
     ("/network-config", Host, &[]),
     ("/notification", App, &["GET"]),
     ("/notification/read", App, &["POST"]),
@@ -238,6 +243,12 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/push/subscribe", Host, &[]),
     ("/push/unsubscribe", Host, &[]),
     ("/push/vapid-key", Host, &[]),
+    // The recall tools read every thread's words, so they stay with the user
+    // and their agent, like memory search.
+    ("/recall/date", Host, &[]),
+    ("/recall/find", Host, &[]),
+    ("/recall/search", Host, &[]),
+    ("/recall/zoom", Host, &[]),
     ("/release-notices", Host, &[]),
     ("/release-notices/resolve", Host, &[]),
     ("/repositories", Host, &[]),
@@ -252,6 +263,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/sdk-prefs.js", Asset, &[]),
     ("/sdk.js", Asset, &[]),
     ("/search", Host, &[]),
+    ("/search/text", Host, &[]),
     ("/session/messages", Host, &[]),
     ("/side-questions", Host, &[]),
     ("/side-questions/dismiss", Host, &[]),
@@ -427,14 +439,14 @@ pub(crate) async fn enforce_app_reach(request: Request, next: Next) -> Response 
 /// The human-only key a `PUT /preferences` names, if any.
 ///
 /// `/preferences` is an `App` route, so an app can keep its own settings. The
-/// keys the agent may not write (`preference_catalog::INTERNAL_KEYS`) include
-/// the security switches: the command guard, the tool-call cap, the network
-/// bind and the local model host. An app is no more trusted than the agent, so it may not write them
-/// either. Every `key` parameter counts, so a repeated one cannot hide a key.
+/// keys the agent may not write (`prefs::internal_specs`) include the security
+/// switches: the command guard, the tool-call cap, the network bind and the
+/// local model host. An app is no more trusted than the agent, so it may not
+/// write them either. Every `key` parameter counts, so a repeated one cannot
+/// hide a key. They also include the engine's own bookkeeping, which is no
+/// setting at all: an app overwriting `vapid_keys` stops every push.
 ///
 /// [`APP_REFUSED_PREFERENCES`] adds keys the agent may write but an app may not.
-/// The engine's own bookkeeping (`preference_catalog::SILENT_PREF_KEYS`) is no
-/// setting at all. An app overwriting `vapid_keys` stops every push.
 fn human_only_preference(
     mounted: &str,
     method: &axum::http::Method,
@@ -450,8 +462,7 @@ fn human_only_preference(
             (form_decode(name) == "key").then(|| form_decode(value))
         })
         .find(|key| {
-            crate::core::preference_catalog::internal_hint(key).is_some()
-                || crate::core::preference_catalog::is_silent_key(key)
+            crate::core::prefs::internal_hint(key).is_some()
                 || APP_REFUSED_PREFERENCES.contains(&key.as_str())
         })
 }
@@ -461,9 +472,9 @@ fn human_only_preference(
 /// thread's working directory. So a path pointed at `/bin/sh` runs the app's
 /// own script as the user when the next session starts.
 const APP_REFUSED_PREFERENCES: &[&str] = &[
-    crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
-    crate::core::PREF_CODING_AGENT_CODEX_PATH,
-    crate::core::PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
+    crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
+    crate::core::prefs::CODING_AGENT_CODEX_PATH.key(),
+    crate::core::prefs::CODING_AGENT_CLAUDE_PERMISSION_MODE.key(),
 ];
 
 /// Decode one `application/x-www-form-urlencoded` component, as axum's `Query`

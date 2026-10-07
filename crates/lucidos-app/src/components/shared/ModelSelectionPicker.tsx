@@ -12,6 +12,7 @@ import {
   ControlOptionList, selectedOptionIndex, wrapHighlight, type ControlOption,
 } from './ControlOptionList';
 import { isTypeaheadKey } from './typeahead';
+import { whenStepSettled } from '../../hooks/panelStepMorph';
 
 /** The MODEL step's rows.
  *
@@ -29,6 +30,7 @@ export function modelStepOptions(
     label: row.value === current.model ? current.label : row.label,
     description: describe ? describe(row) : row.description,
     drilldown: row.tiers.length > 0 || row.providers.length > 0,
+    section: row.section,
   }));
 }
 
@@ -212,7 +214,8 @@ export function ModelSelectionPicker({
 
   // The model step can overflow the panel, and it opens scrolled part-way down.
   useEffect(() => {
-    listRef.current?.querySelector('.control-item-active')?.scrollIntoView({ block: 'nearest' });
+    const row = listRef.current?.querySelector('.control-item-active');
+    whenStepSettled(row, () => row?.scrollIntoView({ block: 'nearest' }));
   }, [highlight.value, open.value]);
 
   /** Open a model's tiers, highlighting the one NEAREST the effort in force.

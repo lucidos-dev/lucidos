@@ -1,16 +1,21 @@
 import { OverflowMenu, type HostOpener, type TriggerFace } from './OverflowMenu';
 import type { ComponentChildren } from 'preact';
-import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, EditIcon, LocateIcon, MoveToTopIcon, PinIcon, SetAsideIcon, SparkleIcon, StandingApplyIcon, TrashIcon } from './icons';
-import { canRenameThread, promptRenameThread, suggestThreadName } from '../../store/actions/threadRename';
+import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, EditIcon, InboxIcon, LocateIcon, MoveToTopIcon, PinIcon, SearchIcon, SetAsideIcon, SparkleIcon, StandingApplyIcon, TrashIcon } from './icons';
+import { canRenameThread, canSuggestThreadName, promptRenameThread, suggestThreadName } from '../../store/actions/threadRename';
 import { copyThreadRef, copyThreadTitle } from '../../utils/threadRef';
 import { exportThread } from '../../utils/exportThread';
-import { resolveChangeMenuActions, resolveThreadActions } from '../../store/actions/threadActions';
+import { resolveChangeMenuActions, threadIsPinnable } from '../../store/actions/threadActions';
 import type { Action } from '../../generated/thread-lifecycle';
-import { handleSaveThread, handleUnsaveThread } from '../../store/actions/threads';
+import { focusThread, handleArchiveThread, handleSaveThread, handleUnarchiveThread, handleUnsaveThread } from '../../store/actions/threads';
 import { handleDeleteThread } from '../../store/actions/threads-delete';
 import { canMoveToTopLevel, handleDetachThread } from '../../store/actions/threads-detach';
-import { threadIsDeletable } from '../../generated/thread-lifecycle';
-import { threadMap, effectiveThreadStatus, standingApplyThreadIds } from '../../store/store';
+import { exitItems } from '../../store/actions/threadBlockers';
+import { SUB_THREAD_STATE, moreSubThreads } from '../../store/actions/blockerCopy';
+import { threadMap, standingApplyThreadIds } from '../../store/store';
+import { threadDisplayTitle } from '../../utils/threadTitle';
+
+/** Blocking sub-threads the menu lists by name before it counts the rest. */
+export const LISTED_SUB_THREADS = 3;
 
 const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentChildren>> = {
   apply: () => <CheckIcon />,
@@ -37,10 +42,17 @@ const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentCh
  *  learned from them, with no undo (ADR 0192). It confirms, and the
  *  confirmation names what this family holds.
  *
- *  **Delete is offered in the Archive section too.** `threadIsDeletable` asks
- *  `is_blocking` of the thread as if it were in the inbox, which is the one way
- *  it differs from Archive. Gating it on inbox would leave archived garbage
- *  undeletable, which is the case the feature exists for.
+ *  **A blocked exit shows dimmed, and is never hidden** (ADR 0378). A note
+ *  under the exits gives the reason, from `threadBlocker`, the same action
+ *  blocker the engine's refusal names. When sub-threads block, the note
+ *  introduces one row per blocking sub-thread, with its title and state. A tap
+ *  opens it, so the user can resolve it there.
+ *
+ *  **Delete is offered in the Archive section too.** The action blocker judges
+ *  the thread as if it were in the inbox. Gating Delete on inbox would leave
+ *  archived garbage undeletable, which is the case the feature exists for.
+ *  An archived thread offers Move to Current where Archive was, and brings its
+ *  sub-threads back with it.
  *
  *  **Move to top level shows only on a thread with a parent** (ADR 0278). It
  *  sits with the mutating actions. It confirms, because it cannot be undone,
@@ -48,19 +60,22 @@ const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentCh
  *
  *  **Show in thread list leads the menu, in the thread titles only**: they
  *  pass `onShowInThreadList`. On a drawer row it would point at the row
- *  just opened.
+ *  just opened. **Find in thread** joins it there, for the same reason
+ *  (`onFindInThread`): it searches the open transcript.
  *
  *  **Rename… and Suggest name follow, on a sent thread.** This menu is the only
  *  place to rename, because the title is display-only. A draft is titled by
- *  its compose text, so a rename there would change nothing on screen.
+ *  its compose text, so a rename there would change nothing on screen. The
+ *  home thread offers Rename… alone: only the user names it (ADR 0362).
  *
  *  **Pin/Unpin shows on every open.** The mobile title row draws no pin, and a
  *  drawer row's pin is mouse-only (`tabindex=-1`), so the menu must carry it.
  *  Beside an inline pin it repeats that button, which costs nothing. */
-export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, stopPropagation, extraClass, tabIndex, hostOpener, face }: {
+export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, onFindInThread, stopPropagation, extraClass, tabIndex, hostOpener, face }: {
   threadId: string;
   title: string;
   onShowInThreadList?: () => void;
+  onFindInThread?: () => void;
   stopPropagation?: boolean;
   extraClass?: string;
   tabIndex?: number;
@@ -83,32 +98,28 @@ export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, stopPr
         // `items` only while open, so a closed menu subscribes to neither.
         const liveThread = threadMap.value.get(threadId);
         const saved = liveThread?.meta.saved ?? false;
-        // A draft has nothing to pin until it is sent.
-        const pinnable = !!liveThread && liveThread.meta.state !== 'composing';
+        const pinnable = !!liveThread && threadIsPinnable(liveThread.meta);
         const renamable = canRenameThread(liveThread);
-        const archiveAction = resolveThreadActions(threadId).find((a) => a.kind === 'archive');
         const changeActions = resolveChangeMenuActions(threadId);
         const standingApplyArmed = standingApplyThreadIds.value.has(threadId);
         const movable = canMoveToTopLevel(threadId);
-        // Read from the same projection facts the server gate re-asks over the
-        // locked family, so the item is hidden rather than offered and refused.
-        const deletable = !!liveThread
-          && liveThread.meta.state !== 'composing'
-          && threadIsDeletable(
-            liveThread.meta.channel === 'claude_code' ? 'claude_code' : 'chat',
-            effectiveThreadStatus(liveThread),
-            liveThread.meta.codingAgentProposed ?? false,
-            liveThread.meta.codingAgentKind === 'external' || liveThread.meta.codingAgentIsExternalRepo,
-            liveThread.meta.blockingDescendantCount > 0,
-          );
+        const exits = exitItems(threadId);
         return (
           <>
-            {onShowInThreadList && (
+            {(onShowInThreadList || onFindInThread) && (
               <>
-                <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(onShowInThreadList)}>
-                  <LocateIcon />
-                  Show in thread list
-                </button>
+                {onShowInThreadList && (
+                  <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(onShowInThreadList)}>
+                    <LocateIcon />
+                    Show in thread list
+                  </button>
+                )}
+                {onFindInThread && (
+                  <button type="button" class="thread-overflow-item find-in-thread" role="menuitem" onClick={run(onFindInThread)}>
+                    <SearchIcon />
+                    Find in thread
+                  </button>
+                )}
                 <div class="thread-overflow-divider" role="separator" />
               </>
             )}
@@ -128,10 +139,12 @@ export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, stopPr
                   <EditIcon />
                   Rename…
                 </button>
-                <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void suggestThreadName(threadId); })}>
-                  <SparkleIcon />
-                  Suggest name
-                </button>
+                {canSuggestThreadName(liveThread) && (
+                  <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void suggestThreadName(threadId); })}>
+                    <SparkleIcon />
+                    Suggest name
+                  </button>
+                )}
                 <div class="thread-overflow-divider" role="separator" />
               </>
             )}
@@ -165,7 +178,7 @@ export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, stopPr
                 </button>
               );
             })}
-            {(movable || archiveAction || deletable) && <div class="thread-overflow-divider" role="separator" />}
+            {(movable || exits.archive || exits.unarchive || exits.delete) && <div class="thread-overflow-divider" role="separator" />}
             {movable && (
               <button type="button" class="thread-overflow-item" role="menuitem"
                 onClick={run(() => { void handleDetachThread(threadId); })}>
@@ -173,22 +186,64 @@ export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, stopPr
                 Move to top level
               </button>
             )}
-            {archiveAction && (
-              <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void archiveAction.invoke(); })}>
+            {exits.archive === 'enabled' && (
+              <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void handleArchiveThread(threadId); })}>
                 <ArchiveIcon />
                 Archive
               </button>
             )}
-            {deletable && (
+            {exits.archive === 'blocked' && <BlockedExit icon={<ArchiveIcon />} label="Archive" reason={exits.reason} />}
+            {exits.unarchive && (
+              <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void handleUnarchiveThread(threadId); })}>
+                <InboxIcon />
+                Move to Current
+              </button>
+            )}
+            {exits.delete === 'enabled' && (
               <button type="button" class="thread-overflow-item thread-overflow-item-danger" role="menuitem"
                 onClick={run(() => { void handleDeleteThread(threadId); })}>
                 <TrashIcon />
                 Delete thread
               </button>
             )}
+            {exits.delete === 'blocked' && <BlockedExit icon={<TrashIcon />} label="Delete thread" danger reason={exits.reason} />}
+            {exits.reason && <div class="thread-overflow-note" aria-hidden="true">{exits.reason}</div>}
+            {exits.subThreads.slice(0, LISTED_SUB_THREADS).map(({ thread: subThread, blocker }) => (
+              <button key={subThread.meta.id} type="button" class="thread-overflow-item" role="menuitem"
+                onClick={run(() => { focusThread(subThread.meta.id); })}>
+                <LocateIcon />
+                <span class="thread-overflow-sub-thread">
+                  <span class="thread-overflow-sub-thread-title">{threadDisplayTitle(subThread)}</span>
+                  <span class="thread-overflow-sub-thread-state">{SUB_THREAD_STATE[blocker]}</span>
+                </span>
+              </button>
+            ))}
+            {exits.subThreads.length > LISTED_SUB_THREADS && (
+              <div class="thread-overflow-note">{moreSubThreads(exits.subThreads.length - LISTED_SUB_THREADS)}</div>
+            )}
           </>
         );
       }}
     />
+  );
+}
+
+/** An exit the blocker holds back. `aria-disabled` rather than `disabled`, so it
+ *  stays in the roving focus order. The note under the exits draws the reason
+ *  once. Each exit also holds it as visually hidden text, so a screen reader
+ *  reads it with the item. */
+function BlockedExit({ icon, label, reason, danger }: {
+  icon: ComponentChildren;
+  label: string;
+  reason: string | null;
+  danger?: boolean;
+}) {
+  return (
+    <button type="button" role="menuitem" aria-disabled="true"
+      class={danger ? 'thread-overflow-item thread-overflow-item-blocked thread-overflow-item-danger' : 'thread-overflow-item thread-overflow-item-blocked'}>
+      {icon}
+      {label}
+      {reason && <span class="visually-hidden">{` ${reason}`}</span>}
+    </button>
   );
 }

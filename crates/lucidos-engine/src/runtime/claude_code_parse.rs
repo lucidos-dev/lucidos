@@ -26,6 +26,10 @@ pub struct CcStreamState {
     /// The parent's API call now streaming, opened by its `message_start` and
     /// reported at its `message_delta`. See [`CcStreamState::close_open_call`].
     open_call: Option<OpenCall>,
+    /// A sub-agent call's `Usage`, by message id, claimed on a frame that drew
+    /// nothing (a `thinking` block). It is released after the same message's
+    /// next frame, so the capture follows the step it belongs to.
+    held_sub_agent_usage: Vec<(String, AgentEvent)>,
 }
 
 /// One API call's token counts, as Anthropic's `usage` block spells them.
@@ -126,6 +130,7 @@ impl CcStreamState {
         message_id: Option<&str>,
         model: Option<String>,
         usage: CallUsage,
+        parent_tool_use_id: Option<String>,
     ) -> Option<AgentEvent> {
         // The `&&` order matters: an all-zero frame must not claim the id,
         // so a later real frame carrying the same id still reports.
@@ -136,6 +141,8 @@ impl CcStreamState {
                 output_tokens: usage.output,
                 cache_read_tokens: usage.cache_read,
                 cache_creation_tokens: usage.cache_creation,
+                parent_tool_use_id,
+                api_call_id: message_id.map(String::from),
             },
         )
     }
@@ -150,6 +157,30 @@ impl CcStreamState {
                 .is_some_and(|open| open.message_id.as_deref() == message_id)
     }
 
+    /// Hold a sub-agent call's `Usage` until its message draws something.
+    fn hold_usage(&mut self, message_id: &str, usage: AgentEvent) {
+        self.held_sub_agent_usage
+            .push((message_id.to_string(), usage));
+    }
+
+    /// The held `Usage` of one message, now that a frame of it drew something.
+    fn take_held_usage(&mut self, message_id: &str) -> Vec<AgentEvent> {
+        let (taken, kept) = std::mem::take(&mut self.held_sub_agent_usage)
+            .into_iter()
+            .partition(|(id, _)| id == message_id);
+        self.held_sub_agent_usage = kept;
+        taken.into_iter().map(|(_, usage)| usage).collect()
+    }
+
+    /// Every held `Usage`, for a turn or a stream that ended before the
+    /// messages drew anything. The provider billed them either way.
+    pub fn release_held_usage(&mut self) -> Vec<AgentEvent> {
+        std::mem::take(&mut self.held_sub_agent_usage)
+            .into_iter()
+            .map(|(_, usage)| usage)
+            .collect()
+    }
+
     /// Report the open call with the counts its `message_start` gave. This
     /// runs when no `message_delta` came: the next call started, the turn
     /// ended mid-stream, or the stream itself ended. The driver calls it once
@@ -157,7 +188,8 @@ impl CcStreamState {
     /// billed the prompt either way.
     pub fn close_open_call(&mut self) -> Option<AgentEvent> {
         let open = self.open_call.take()?;
-        self.report(open.message_id.as_deref(), open.model, open.usage)
+        // Only the parent's calls open (the `stream_event` arm).
+        self.report(open.message_id.as_deref(), open.model, open.usage, None)
     }
 }
 
@@ -284,6 +316,12 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
         Err(_) => return Vec::new(),
     };
     let event_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    // A sub-agent's lines ride the parent's stream, each naming the `Agent`
+    // call that spawned it.
+    let parent_tool_use_id = val
+        .get("parent_tool_use_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     match event_type {
         // Only parse subtype "init" — hook events (hook_started, hook_response,
@@ -347,16 +385,29 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             // response body, and again in the red card right beneath it.
             //
             // Only the text is skipped. A synthetic error line carries no tool_use
-            // and zeroed usage, so nothing else is lost, and a sub-agent's banner,
-            // which rides the parent's stream with the same flag, stops leaking into
-            // the parent's prose too.
+            // and zeroed usage, so nothing else is lost.
+            //
+            // A sub-agent's prose is the sub-agent's narration, so it arrives as
+            // `SubAgentMessage` and never joins the session's own reply.
             let is_api_error_banner = val
                 .get("is_api_error_message")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let prose = |text: String| match &parent_tool_use_id {
+                Some(parent) => AgentEvent::SubAgentMessage {
+                    text,
+                    parent_tool_use_id: parent.clone(),
+                },
+                None => AgentEvent::Message {
+                    role: "assistant".to_string(),
+                    text,
+                    opens_block: true,
+                },
+            };
             let model = message
                 .and_then(|m| m.get("model"))
                 .and_then(|v| v.as_str());
+            let message_id = message.and_then(|m| m.get("id")).and_then(|v| v.as_str());
             let notes_are_text = state.thinking_is_a_note(model);
             if let Some(content) = message
                 .and_then(|m| m.get("content"))
@@ -367,11 +418,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                     match block_type {
                         "text" if !is_api_error_banner => {
                             if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                events.push(AgentEvent::Message {
-                                    role: "assistant".to_string(),
-                                    text: text.to_string(),
-                                    opens_block: true,
-                                });
+                                events.push(prose(text.to_string()));
                             }
                         }
                         // The trailing break flushes the note at once, so it
@@ -382,11 +429,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                                 .and_then(|v| v.as_str())
                                 .and_then(crate::llm::anthropic_wire::progress_note)
                             {
-                                events.push(AgentEvent::Message {
-                                    role: "assistant".to_string(),
-                                    text: format!("{note}\n\n"),
-                                    opens_block: true,
-                                });
+                                events.push(prose(format!("{note}\n\n")));
                             }
                         }
                         "tool_use" => {
@@ -404,7 +447,13 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            events.push(AgentEvent::ToolUse { name, input, id });
+                            events.push(AgentEvent::ToolUse {
+                                name,
+                                input,
+                                id,
+                                parent_tool_use_id: parent_tool_use_id.clone(),
+                                api_call_id: message_id.map(String::from),
+                            });
                         }
                         _ => {}
                     }
@@ -421,14 +470,29 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             // sub-agent's calls arrive. The message id dedups those: an id is
             // unique per API response, so a second sighting is a re-report.
             // Only the `Usage` is suppressed; the frame's content emits above.
+            //
+            // A sub-agent message that opens with a `thinking` block claims on
+            // that frame, which draws nothing. Its `Usage` waits for the
+            // message's next frame, so it lands after the step it measured.
+            let frame_drew_nothing = events.is_empty();
+            let held_by = message_id.filter(|_| parent_tool_use_id.is_some());
+            if let (Some(id), false) = (held_by, frame_drew_nothing) {
+                events.extend(state.take_held_usage(id));
+            }
             if let Some(usage) = message.and_then(|m| m.get("usage")) {
-                let message_id = message.and_then(|m| m.get("id")).and_then(|v| v.as_str());
                 if !state.reports_at_message_delta(message_id) {
-                    events.extend(state.report(
+                    let report = state.report(
                         message_id,
                         model.map(String::from),
                         CallUsage::read(usage),
-                    ));
+                        parent_tool_use_id,
+                    );
+                    match (report, held_by) {
+                        (Some(report), Some(id)) if frame_drew_nothing => {
+                            state.hold_usage(id, report)
+                        }
+                        (report, _) => events.extend(report),
+                    }
                 }
             }
             events
@@ -449,6 +513,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                 output: content,
                 status: status.to_string(),
                 id,
+                parent_tool_use_id,
             }]
         }
         // CC 2.1.76+ sends tool results as "type": "user" with tool_result content
@@ -482,6 +547,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                             output,
                             status: status.to_string(),
                             id,
+                            parent_tool_use_id: parent_tool_use_id.clone(),
                         });
                     }
                 }
@@ -562,6 +628,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             // A call still open here was cut off before its `message_delta`.
             // Then the turn is over, so the ids it reported can go.
             let mut events: Vec<AgentEvent> = state.close_open_call().into_iter().collect();
+            events.extend(state.release_held_usage());
             state.end_turn();
             events.push(AgentEvent::Result {
                 text,
@@ -618,9 +685,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             // Only the parent's own calls open and close here. A sub-agent's
             // line names its spawning tool call, and its calls report from
             // their frames instead (the `"assistant"` arm).
-            let from_the_parent = val
-                .get("parent_tool_use_id")
-                .is_none_or(serde_json::Value::is_null);
+            let from_the_parent = parent_tool_use_id.is_none();
             match event_type {
                 Some("message_start") if from_the_parent => {
                     events.extend(state.close_open_call());
@@ -641,7 +706,12 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                         let usage = event
                             .and_then(|e| e.get("usage"))
                             .map_or(open.usage, |u| open.usage.updated_by(u));
-                        events.extend(state.report(open.message_id.as_deref(), open.model, usage));
+                        events.extend(state.report(
+                            open.message_id.as_deref(),
+                            open.model,
+                            usage,
+                            None,
+                        ));
                     }
                 }
                 _ => {}

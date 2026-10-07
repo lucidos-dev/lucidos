@@ -41,6 +41,7 @@ const {
   ARTIFACT_PREVIEW_SANDBOX,
   PREVIEW_BRIDGE_SOURCE,
   newBridgeNonce,
+  PREVIEW_FIND_LOCAL,
   previewBridgeScript,
   previewMayNavigate,
   readPreviewFrameMessage,
@@ -50,7 +51,7 @@ const {
 } = await import('./previewFrameBridge');
 const { repositories } = await import('../../store/store');
 const { PREVIEW_HOST_SCHEMES, classifyPreviewLink, withPreviewBase } = await import('./previewIframeLinks');
-const { PREVIEW_FRAME_MESSAGE, PREVIEW_HOST_MESSAGE } = await import('../../utils/previewFrameProtocol');
+const { PREVIEW_FRAME_MESSAGE, PREVIEW_HOST_MESSAGE, askPreviewFind } = await import('../../utils/previewFrameProtocol');
 
 const TID = '961b9b83-53b7-47cd-8982-3c959d7f1137';
 const NONCE = 'n0nce';
@@ -116,7 +117,10 @@ interface FakeFrame {
 
 /** Install the bridge in a fake frame. `ids` are the anchors the document holds,
  *  `baseHref` the `<base>` it carries (`null` for none). */
-function installBridge(opts: { ids?: string[]; baseHref?: string | null; topLevel?: boolean; mac?: boolean } = {}): FakeFrame {
+function installBridge(opts: {
+  ids?: string[]; baseHref?: string | null; topLevel?: boolean; mac?: boolean;
+  finder?: { serve(args: unknown): unknown };
+} = {}): FakeFrame {
   const posted: Record<string, unknown>[] = [];
   const scrolled: string[] = [];
   const listeners: Record<string, Record<string, Listener[]>> = { doc: {}, win: {} };
@@ -168,8 +172,8 @@ function installBridge(opts: { ids?: string[]; baseHref?: string | null; topLeve
     hostType: PREVIEW_HOST_MESSAGE,
   };
   const install = new Function(`return (${PREVIEW_BRIDGE_SOURCE});`)() as
-    (c: typeof cfg, w: unknown, d: unknown) => void;
-  install(cfg, win, doc);
+    (c: typeof cfg, w: unknown, d: unknown, f: unknown) => void;
+  install(cfg, win, doc, opts.finder);
   frame.scriptRemoved = removed.includes(script);
   return frame;
 }
@@ -365,6 +369,7 @@ describe('the claim rule and the host router agree', () => {
     trigger: 'trigger:t1',
     repo: 'repo:repo-1:file:src/main.rs',
     file: 'file:///Users/me/report.pdf',
+    settings: 'settings:backup',
   };
 
   it('routes every scheme the frame claims', () => {
@@ -385,6 +390,38 @@ describe('the claim rule and the host router agree', () => {
 // The host side
 // ---------------------------------------------------------------------------
 
+describe('the in-frame finder', () => {
+  const ask = (args: unknown, id = 'find-1') => ({ type: PREVIEW_HOST_MESSAGE, kind: 'find', id, args });
+
+  it('answers a find with its count, under the nonce', () => {
+    const served: unknown[] = [];
+    const finder = { serve: (args: unknown) => { served.push(args); return { total: 3, current: 1, capped: false }; } };
+    const frame = installBridge({ finder });
+    frame.fire('win', 'message', { source: frame.host, data: ask({ query: 'apple' }) });
+    expect(served).toEqual([{ query: 'apple' }]);
+    expect(frame.posted).toEqual([{
+      type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'find-result', id: 'find-1', total: 3, current: 1, capped: false,
+    }]);
+  });
+
+  it('reports a finder that threw as no count, never a stale one', () => {
+    const frame = installBridge({ finder: { serve: () => { throw new Error('boom'); } } });
+    frame.fire('win', 'message', { source: frame.host, data: ask({ query: 'apple' }) });
+    expect(frame.posted).toEqual([{
+      type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'find-result', id: 'find-1', total: null, current: null, capped: null,
+    }]);
+  });
+
+  it('runs a clear without answering, and takes a find from the host only', () => {
+    const served: unknown[] = [];
+    const frame = installBridge({ finder: { serve: (args: unknown) => { served.push(args); return null; } } });
+    frame.fire('win', 'message', { source: frame.host, data: ask({ clear: true }, '') });
+    frame.fire('win', 'message', { source: {}, data: ask({ query: 'apple' }) });
+    expect(served).toEqual([{ clear: true }]);
+    expect(frame.posted).toEqual([]);
+  });
+});
+
 describe('readPreviewFrameMessage', () => {
   const frameWindow = {} as Window;
   const link = { type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'link', href: 'notes.md', baseUri: 'https://x/' };
@@ -402,6 +439,18 @@ describe('readPreviewFrameMessage', () => {
     });
     expect(readPreviewFrameMessage(from({ type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'fragment-missing', id: 'x' }),
       frameWindow, NONCE)).toEqual({ kind: 'fragment-missing', id: 'x' });
+  });
+
+  it('takes a find result, leaving its count for the find bar to check', () => {
+    expect(readPreviewFrameMessage(from({
+      type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'find-result', id: 'find-1', total: 2, current: 1, capped: false,
+    }), frameWindow, NONCE)).toEqual({ kind: 'find-result', id: 'find-1', reply: { total: 2, current: 1, capped: false } });
+    expect(readPreviewFrameMessage(from({
+      type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'find-result', id: 'find-1', total: null, current: null, capped: null,
+    }), frameWindow, NONCE)).toEqual({ kind: 'find-result', id: 'find-1', reply: null });
+    expect(readPreviewFrameMessage(from({
+      type: PREVIEW_FRAME_MESSAGE, nonce: 'forged', kind: 'find-result', id: 'find-1', total: 9, current: 1, capped: false,
+    }), frameWindow, NONCE), 'a result without the render\'s nonce').toBeNull();
   });
 
   it('drops a message from any other window, an app frame included', () => {
@@ -647,9 +696,42 @@ describe('the stamped bridge script', () => {
     expect(out.endsWith('</script>')).toBe(true);
   });
 
+  it('carries the finder inside its own function, where the artifact cannot reach it', async () => {
+    const out = previewBridgeScript(cfg);
+    const bundle = (await import('../../../../../packages/lucidos-sdk/src/generated/preview-find.js?raw')).default;
+    // Pinned: the bundle's own name for its result is what the bridge reads.
+    expect(bundle).toContain(`var ${PREVIEW_FIND_LOCAL} =`);
+    expect(out.startsWith('<script>(function(){')).toBe(true);
+    expect(out).toContain(`, window, document, ${PREVIEW_FIND_LOCAL});})();</script>`);
+  });
+
   it('mints a fresh 128-bit nonce each render', () => {
     const a = newBridgeNonce();
     expect(a).toMatch(/^[0-9a-f]{32}$/);
     expect(newBridgeNonce()).not.toBe(a);
+  });
+});
+
+describe('askPreviewFind', () => {
+  it('resolves with the frame\'s answer once the router settles it', async () => {
+    const posted: Record<string, unknown>[] = [];
+    const frameWindow = { postMessage: (m: Record<string, unknown>) => { posted.push(m); } } as unknown as Window;
+    const answer = askPreviewFind(frameWindow, { query: 'apple' }, 1000);
+    const id = posted[0].id as string;
+    expect(posted[0]).toMatchObject({ type: PREVIEW_HOST_MESSAGE, kind: 'find', args: { query: 'apple' } });
+    routePreviewFrameMessage(
+      { kind: 'find-result', id, reply: { total: 1, current: 1, capped: false } },
+      { artifactPath: ARTIFACT, declaresOwnBase: false, frameWindow },
+    );
+    await expect(answer).resolves.toEqual({ total: 1, current: 1, capped: false });
+  });
+
+  it('gives up on a frame that never answers', async () => {
+    vi.useFakeTimers();
+    const frameWindow = { postMessage: () => {} } as unknown as Window;
+    const answer = askPreviewFind(frameWindow, { query: 'apple' }, 1000);
+    vi.advanceTimersByTime(1001);
+    await expect(answer).rejects.toThrow(/did not answer/);
+    vi.useRealTimers();
   });
 });

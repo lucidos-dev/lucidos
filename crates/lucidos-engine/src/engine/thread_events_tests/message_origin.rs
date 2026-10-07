@@ -362,3 +362,28 @@ fn an_old_message_received_with_a_stored_device_name_still_loads() {
         other => panic!("expected MessageReceived, got {other:?}"),
     }
 }
+
+/// Only the origin token names a local source thread. A cross-workspace
+/// caller's `thread_id` lives in another workspace, so it never answers.
+#[test]
+fn only_a_verified_subprocess_names_a_source_thread() {
+    let thread = uuid::Uuid::new_v4();
+    let subprocess = MessageOrigin::Api {
+        user_agent: None,
+        mode: ActorMode::Agent,
+        source_thread_id: Some(thread),
+    };
+    let elsewhere = MessageOrigin::Workspace {
+        workspace: "dev".to_string(),
+        thread_id: Some(thread),
+        event_id: None,
+        user_agent: None,
+        mode: ActorMode::Agent,
+    };
+    let device = MessageOrigin::Device {
+        device_id: "d1".to_string(),
+    };
+    assert_eq!(subprocess.source_thread_id(), Some(thread));
+    assert_eq!(elsewhere.source_thread_id(), None);
+    assert_eq!(device.source_thread_id(), None);
+}

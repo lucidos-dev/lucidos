@@ -15,6 +15,7 @@ import { hasCoarsePointer, viewportIsMobile } from '../../utils/viewport';
 import { errorDetail } from '../../utils/errorDetail';
 import { Overlay } from '../shared/Overlay';
 import { anchoredPanelStyle, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { whenStepSettled } from '../../hooks/panelStepMorph';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 import { useFocusWhenPlaced } from '../../hooks/useFocusWhenPlaced';
 import {
@@ -329,9 +330,8 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
 
   useEffect(() => {
     retryCountRef.current = 0;
-    // Compose view (no threadId) is loaded by the selectedScope signal effect
-    // below — fires on first render and on every repo switch. Loading here too
-    // would double-fetch on mount.
+    // The compose view (no threadId) is loaded by the `composeRepoId` effect
+    // below. Loading here too would double-fetch on mount.
     if (threadId) loadCommands();
     return clearRetryTimer;
   }, [threadId, resolvedCodingAgent]);
@@ -365,24 +365,24 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     }
   });
 
-  // Re-fetch when the compose-view scope dropdown changes — different repo,
-  // different skills. Clear the module-level cache first so the previous
-  // scope's skills don't flash before the new fetch resolves. Thread-bound
-  // menus are bound to the thread's repo and ignore this signal.
-  useSignalEffect(() => {
-    // Reading the resolved per-draft scope/agent here is what subscribes this
-    // effect — it re-fires when this draft's target/backend override changes (or
-    // the global default, when there is no draft).
-    resolveScope(composeThreadId);
-    resolveCodingAgent(composeThreadId);
-    if (threadId) return;
+  // Re-fetch whenever the compose view's commands could differ: entering
+  // compose, a repo pick, a backend pick, or focusing another draft. Clear the
+  // module-level cache first so the previous scope's skills don't flash before
+  // the new fetch resolves. Thread-bound menus take the thread's repo instead.
+  //
+  // Keyed on what the request sends, read in render, so a prop change counts
+  // too. Never a signal effect: it re-runs on signals only, and the menu stays
+  // mounted across a draft switch.
+  const composeRepoId = inCompose ? (scopeToRepoId(resolveScope(composeThreadId)) ?? '') : null;
+  useEffect(() => {
+    if (composeRepoId === null) return;
     commandCache.value = { status: 'not-loaded' };
     controlCommands.value = [];
     builtinCommands.value = [];
     skillCommands.value = [];
     retryCountRef.current = 0;
     loadCommands();
-  });
+  }, [composeRepoId, resolvedCodingAgent]);
 
   // Open from PromptInput when user types "/" prefix.
   // Must use useSignalEffect (not useEffect) — @preact/signals can optimize
@@ -435,7 +435,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   useEffect(() => {
     if (highlightIndex.value < 0) return;
     const el = panelRef.current?.querySelector('.control-item-active');
-    el?.scrollIntoView({ block: 'nearest' });
+    whenStepSettled(el, () => el?.scrollIntoView({ block: 'nearest' }));
   }, [highlightIndex.value]);
 
   // A phone gives the panel the header palette width (.control-dropdown), so
@@ -519,9 +519,11 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
    *  With no live session there is nothing to send, and this command has no
    *  pending slot to park the choice in, so it only reports. */
   async function selectOption(cmd: CodingAgentCommandDef, value: string, label: string) {
+    // Shut at the decision, never after the round trip. An open menu keeps
+    // the UI behind inert, so a Send tapped meanwhile only closed it.
+    close();
     if (!threadId || !hasActiveSession.value) {
       showToast(`${cmd.label}: ${label}`, 'success');
-      close();
       return;
     }
     sending.value = true;
@@ -531,7 +533,6 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     });
     sending.value = false;
     if (result !== 'error') showToast(`${cmd.label}: ${label}`, 'success');
-    close();
   }
 
   /** Apply a whole *model selection*, the picker's final answer.
@@ -546,10 +547,12 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     const pair = decodePair(encoded);
     const label = pairLabelOf(selection.rows, encoded);
     selection.pick(encoded);
+    // As in `selectOption`: the pick is recorded, so the menu shuts now and
+    // the reconcile below finishes behind it.
+    close();
 
     if (!threadId || !hasActiveSession.value) {
       showToast(`${cmd.label}: ${label}`, 'success');
-      close();
       return;
     }
     sending.value = true;
@@ -571,7 +574,6 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     if (result !== 'error' && tierResult !== 'error') {
       showToast(`${cmd.label}: ${label}`, 'success');
     }
-    close();
   }
 
   /** The MODEL currently in force, as a label. Backend-returned per-thread
@@ -696,7 +698,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
         panelProps={{ onKeyDown: handleKeyDown }}
       >
           {!cmd ? (
-            <div class="control-list">
+            <div class="control-list" data-surface-step="commands">
               <ControlFilter
                 placeholder="Filter commands…"
                 value={filter.value}

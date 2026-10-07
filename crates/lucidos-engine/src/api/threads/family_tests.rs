@@ -18,7 +18,7 @@
 
 use super::{
     classify_family, coding_agent_members, every_member, external_repo_pending, load_family,
-    not_yet_archived, FamilyDecision, FamilyRow, FamilyVerb,
+    not_yet_archived, FamilyDecision, FamilyRow, FamilyVerb, HOME_THREAD,
 };
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
@@ -45,6 +45,7 @@ fn row(
         coding_agent_proposed,
         coding_agent_is_external_repo,
         is_saved: false,
+        is_home: false,
     }
 }
 
@@ -1147,4 +1148,163 @@ fn delete_takes_every_member_including_the_already_archived() {
         "archive still skips it, which is why the two subsets are separate"
     );
     assert_eq!(coding_agent_members(&family), vec![cc_child]);
+}
+
+// ── The home thread ───────────────────────────────────────────────────
+//
+// It never ends, so neither verb may take it (ADR 0362, invariant I10).
+
+/// Both verbs refuse the home thread with one slug, before any other gate:
+/// an idle, childless home thread is still refused.
+#[test]
+fn both_verbs_refuse_the_home_thread() {
+    let home = Uuid::new_v4();
+    let family = vec![FamilyRow {
+        is_home: true,
+        ..idle_chat(home)
+    }];
+    for verb in [FamilyVerb::Archive, FamilyVerb::Delete] {
+        let (status, body) = expect_reject(&family, home, verb, "the home thread must be refused");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["reason"], HOME_THREAD);
+    }
+}
+
+/// A cascade refuses a family holding the home thread anywhere in it, so no
+/// path sweeps it up as a member. The database keeps it a root besides.
+#[test]
+fn a_cascade_refuses_a_family_holding_the_home_thread() {
+    let target = Uuid::new_v4();
+    let home = Uuid::new_v4();
+    let family = vec![
+        idle_chat(target),
+        FamilyRow {
+            is_home: true,
+            ..idle_chat(home)
+        },
+    ];
+    for verb in [FamilyVerb::Archive, FamilyVerb::Delete] {
+        let (_, body) = expect_reject(&family, target, verb, "a home member must refuse");
+        assert_eq!(body["reason"], HOME_THREAD);
+    }
+}
+
+/// The marker round-trips through the locked snapshot, so the gate sees it on
+/// a real row.
+#[tokio::test]
+async fn the_locked_snapshot_carries_the_home_marker() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .unwrap();
+    let other = spawn_idle_parent(&bus).await;
+
+    let family = locked_family(&pool, home).await;
+    assert!(family[0].is_home);
+    let (_, body) = expect_reject(&family, home, FamilyVerb::Delete, "home is refused");
+    assert_eq!(body["reason"], HOME_THREAD);
+    assert!(!locked_family(&pool, other).await[0].is_home);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+// ── The blocker slug ──────────────────────────────────────────────────
+// Every refusal names the one reason the thread menu shows, from the same
+// function, so the two cannot disagree.
+
+/// Each refusal carries the `blocker` slug `action_blocker` gives over the
+/// same facts, for both verbs, beside its existing `reason`.
+#[test]
+fn every_refusal_carries_the_blocker_the_menu_shows() {
+    use crate::engine::thread_lifecycle::Blocker;
+
+    let target = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let waiting = |id| row(id, false, "waiting_for_user_answer", "inbox", false, false);
+    let home = FamilyRow {
+        is_home: true,
+        ..idle_chat(target)
+    };
+    let cases: Vec<(&str, Vec<FamilyRow>, Blocker, &str)> = vec![
+        ("home", vec![home], Blocker::Home, HOME_THREAD),
+        (
+            "running parent",
+            vec![running_chat(target)],
+            Blocker::Running,
+            "parent_not_archivable",
+        ),
+        (
+            "waiting parent",
+            vec![waiting(target)],
+            Blocker::Question,
+            "parent_not_archivable",
+        ),
+        (
+            "pending parent",
+            vec![cc_with_pending(target)],
+            Blocker::PendingChange,
+            "parent_has_pending_changes",
+        ),
+        (
+            "archived parent still holding a change",
+            vec![row(target, true, "idle", "archived", true, false)],
+            Blocker::PendingChange,
+            "parent_has_pending_changes",
+        ),
+        (
+            "running child",
+            vec![idle_chat(target), running_chat(child)],
+            Blocker::DescendantRunning,
+            "descendants_blocking",
+        ),
+        (
+            "waiting child",
+            vec![idle_chat(target), waiting(child)],
+            Blocker::DescendantQuestion,
+            "descendants_blocking",
+        ),
+        (
+            "pending child",
+            vec![idle_chat(target), cc_with_pending(child)],
+            Blocker::DescendantPendingChange,
+            "descendants_blocking",
+        ),
+    ];
+    for (label, family, blocker, reason) in cases {
+        let (status, body) = expect_reject(&family, target, FamilyVerb::Archive, label);
+        assert_eq!(status, StatusCode::CONFLICT, "{label}");
+        assert_eq!(body["blocker"], blocker.as_str(), "{label}");
+        assert_eq!(body["reason"], reason, "{label}");
+        let (_, delete_body) = expect_reject(&family, target, FamilyVerb::Delete, label);
+        assert_eq!(delete_body["blocker"], blocker.as_str(), "{label} (delete)");
+    }
+}
+
+/// With several blocked sub-threads, the slug names the strongest reason, and
+/// `blocking` still lists every one of them.
+#[test]
+fn the_slug_names_the_strongest_sub_thread_reason() {
+    let (target, waiting, running) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let family = vec![
+        idle_chat(target),
+        row(
+            waiting,
+            false,
+            "waiting_for_user_answer",
+            "inbox",
+            false,
+            false,
+        ),
+        running_chat(running),
+    ];
+    let (_, body) = expect_reject(&family, target, FamilyVerb::Archive, "two blockers");
+    assert_eq!(body["blocker"], "descendant_running");
+    assert_eq!(body["blocking"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        body["blocking"][0]["thread_id"],
+        running.to_string(),
+        "the first listed member holds the named blocker, so Show sub-thread opens it"
+    );
 }

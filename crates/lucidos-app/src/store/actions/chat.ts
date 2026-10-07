@@ -18,13 +18,17 @@ import {
 } from '../store';
 import type { ChatContext } from './chatContext';
 import type { ChatRequestBody } from '../../api/types';
-import { submitChat, cancelChat, stopClaudeCode, isTransportError, removeQueuedMessage as removeQueuedMessageRequest, ApiError, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
+import { submitChat, cancelChat, stopClaudeCode, removeQueuedMessage as removeQueuedMessageRequest, ApiError, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
+import { sendFailureOf, withQuietRetries, type SendFailure } from './sendRetry';
+import { enterSendChain, type SendSlot } from './sendChain';
 import { getDeviceId } from './devices';
-import { endUnsentMessage, recordUnsentMessage, takeUnsentMessage, type SendSettlement } from '../unsentMessages';
+import { endUnsentMessage, recordUnsentMessage, takeUnsentMessage, unsentMessages, type SendSettlement } from '../unsentMessages';
 import { forgetUnsentMessageRecord, markUnsentMessageRecordUnsent, persistSendingMessage, type UnsentMessageRecord } from '../unsentMessageRecords';
 import { restoreRefusedSend, settleAcceptedSend } from './sendSettlement';
+import { unsentPicks } from '../pendingDecisions';
 import { generateUuid } from '../../utils/uuid';
-import { handleEvent, makeOptimisticThreadState, computeExchanges, queuedMessagesFromExchanges, retireUnsentExchange, type StoredEvent, type QueuedMessage } from '../thread-events';
+import { handleEvent, makeOptimisticThreadState, computeExchanges, queuedMessagesFromExchanges, retireUnsentExchange, type PendingUserMessage, type StoredEvent, type QueuedMessage } from '../thread-events';
+import { questionTheSendAnswers } from '../../components/chat/prompt-input-helpers';
 import { getDraft } from '../composeDrafts';
 import { reopenEmptyDraft, updateCompose } from './compose';
 import { requestPromptOverrideSync } from '../../components/chat/promptValueSync';
@@ -44,103 +48,15 @@ import { isTauri } from '../../utils/platform';
 import { getWebviewContent } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
 
-/** Safety timeout (ms) for pending messages. If SSE doesn't deliver the
- *  MessageReceived event within this window, we force-refresh thread events
- *  and clear the stale pending message. Prevents "Requesting..." getting
+/** Safety timeout (ms) for an accepted send's pending row. If SSE doesn't
+ *  deliver the MessageReceived event within this window, we force-refresh
+ *  thread events and clear that row. Prevents "Requesting..." getting
  *  stuck indefinitely when SSE drops after submitChat() succeeds. */
 export const PENDING_MESSAGE_SAFETY_MS = 30_000;
 
-/** How long a send waits for the thread's previous send to settle before going
- *  out anyway. `mutatingFetch` deliberately has no client-side timeout (a chat
- *  POST is re-sent only when the user presses Retry, never behind their back),
- *  which means a POST stalled on a half-open mobile connection can stay pending
- *  forever. Without a ceiling here, that one hung request would silently
- *  swallow every later message on the thread, which is far worse than the
- *  reordering the chain exists to prevent. Sized above a slow-but-alive
- *  cellular round trip and below `PENDING_MESSAGE_SAFETY_MS`, so a released
- *  send still gets its own safety sweep. */
-export const SEND_CHAIN_MAX_WAIT_MS = 15_000;
-
-/** Per-thread tail of the send chain: a promise that settles when the thread's
- *  most recently issued `submitChat` settles. It NEVER rejects, so one failed
- *  send cannot poison the chain for the rest of the thread.
- *
- *  This is what keeps a device's messages in the order the user pressed send.
- *  `MessageReceived.created` is stamped when the engine emits the event, and
- *  the request carries no client-side ordering data, so two POSTs in flight at
- *  once can be delivered out of order and the reversal is then unrecoverable:
- *  the later message wins the race, starts the turn, and the earlier one is
- *  queued and injected into it as a follow-up. See
- *  `docs/plans/2026-07-30-serialize-chat-sends-per-thread.md`.
- *
- *  Keyed per thread: two different threads are independent conversations and
- *  must not queue behind each other. */
-const sendChains = new Map<string, Promise<void>>();
-
-/** Resolve when `p` settles, or after `ms`, whichever comes first. `p` never
- *  rejects (see `sendChains`), so the success arm alone covers both outcomes. */
-function settledOrTimedOut(p: Promise<void>, ms: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    void p.then(() => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
-}
-
-/** This send's place in its thread's chain: what to await before POSTing, and
- *  the release that lets the next send go. */
-interface SendSlot {
-  /** `null` when nothing was ahead of this send. The caller must then skip the
-   *  await entirely rather than await an already-resolved promise: awaiting one
-   *  still defers a microtask, which would push the POST out of the caller's
-   *  synchronous turn. `sendMessage` dispatches `submitChat` synchronously on
-   *  the ordinary single-send path, and callers observe that (the compose
-   *  suite asserts on the fetch mock right after calling `sendFollowup`,
-   *  without awaiting). Serializing sends must not change when a lone send
-   *  goes out. */
-  waitForTurn: Promise<void> | null;
-  release: () => void;
-}
-
-/** Claim the thread's next chain slot. **Synchronous, and that is the point:**
- *  the slot must be taken in the order `sendMessage` is CALLED, not in the
- *  order each call happens to reach its POST.
- *
- *  `sendMessage` can await before it gets there (`getWebviewContent()` on the
- *  Tauri panel path), and two of those awaits resolve in whatever order the
- *  webview answers. Claiming the slot at POST time would let the second send
- *  overtake the first there and hand the chain its slots reversed, reproducing
- *  the exact bug the chain exists to prevent, just one layer up. Claiming it
- *  here makes the guarantee independent of whatever awaits get added above. */
-function enterSendChain(threadId: string): SendSlot {
-  const predecessor = sendChains.get(threadId);
-  let release!: () => void;
-  const link = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  sendChains.set(threadId, link);
-  // Drop the entry once the chain drains, so the map doesn't grow one
-  // permanent promise per thread the user has ever sent to. Guarded on
-  // identity: a send that chained behind this one owns the slot now.
-  void link.then(() => {
-    if (sendChains.get(threadId) === link) sendChains.delete(threadId);
-  });
-  return {
-    waitForTurn: predecessor ? settledOrTimedOut(predecessor, SEND_CHAIN_MAX_WAIT_MS) : null,
-    release,
-  };
-}
-
 type RemovedPendingMessage = {
   index: number;
-  message: {
-    text: string;
-    eventId: string;
-    created: string;
-    image_hashes?: string[];
-  };
+  message: PendingUserMessage;
 };
 
 /** Remove an optimistic pending message from a thread.
@@ -262,28 +178,6 @@ function markPendingUnconfirmed(threadId: string, eventId: string): void {
   bumpThreadEvents(threadId);
 }
 
-/** Remove pending messages older than PENDING_MESSAGE_SAFETY_MS.
- *  Called by the safety timer after submitChat() succeeds — if SSE dropped
- *  and refreshThreadEvents() didn't clear the pending message, this forcefully
- *  removes it so the thread stops showing "Requesting..." forever. */
-export function clearStalePendingMessages(threadId: string): void {
-  const thread = threadMap.value.get(threadId);
-  if (!thread || thread.pendingUserMessages.length === 0) return;
-
-  const now = Date.now();
-  const before = thread.pendingUserMessages.length;
-  thread.pendingUserMessages = thread.pendingUserMessages.filter(
-    p => now - new Date(p.created).getTime() < PENDING_MESSAGE_SAFETY_MS,
-  );
-  if (thread.pendingUserMessages.length < before) {
-    threadMap.value = new Map(threadMap.value);
-    // Same per-thread bump pairing as removePendingMessage — see comment
-    // there. Without this the stale 'Requesting...' row that this safety
-    // timer exists to clear keeps painting in the focused ThreadView.
-    bumpThreadEvents(threadId);
-  }
-}
-
 /** How long after PENDING_MESSAGE_SAFETY_MS to run a second refresh.
  *  If the CC process died and cleanup emitted ResponseAborted for lost
  *  follow-ups, this second refresh picks up those events so the exchange
@@ -300,7 +194,7 @@ const PENDING_CLEANUP_MAX_ATTEMPTS = 3;
 
 /** Schedule a safety check that fires after PENDING_MESSAGE_SAFETY_MS.
  *  If the pending message is still present (SSE missed the MessageReceived),
- *  force-refresh thread events and clear any stale pending messages.
+ *  force-refresh thread events and clear this send's pending row.
  *  A second refresh fires later to catch backend-emitted terminal events
  *  (e.g. ResponseAborted for lost follow-ups) that weren't ready at 30s.
  *
@@ -330,7 +224,9 @@ export function schedulePendingCleanup(threadId: string, eventId: string, attemp
     // LANDED instead, which is the only thing that can prove the event absent.
     const refetchOk = await refreshThreadEvents(threadId);
     if (refetchOk) {
-      clearStalePendingMessages(threadId);
+      // Only this send's row: another may still be sending or waiting its turn,
+      // and its age says nothing about whether it was accepted.
+      removePendingMessage(threadId, eventId);
     } else if (attempt < PENDING_CLEANUP_MAX_ATTEMPTS) {
       // No answer, so nothing is proven. Don't drop a persisted message.
       schedulePendingCleanup(threadId, eventId, attempt + 1);
@@ -346,7 +242,7 @@ export function schedulePendingCleanup(threadId: string, eventId: string, attemp
       // Marked rather than merely kept, because a bare pending row makes
       // `effectiveThreadStatus` report 'running'. Left counted, the thread would
       // sit mid-turn for the life of the page: out of Review even once it
-      // proposes a change, inside `runningThreadCount`, and showing a Stop with
+      // proposes a change, inside `inFlightThreadCount`, and showing a Stop with
       // nothing to stop.
       markPendingUnconfirmed(threadId, eventId);
       console.warn(`[Chat] pending message ${eventId} unconfirmed after ${attempt} refetches that never landed; keeping the row`);
@@ -365,13 +261,18 @@ export function schedulePendingCleanup(threadId: string, eventId: string, attemp
   }
 }
 
-/** Add an optimistic pending message to a thread so the user sees it immediately. */
+/** Add an optimistic pending message to a thread so the user sees it
+ *  immediately. Returns the question card the message answers, if any. */
 function addPendingMessage(
   threadId: string,
   message: string,
   eventId: string,
   imageHashes?: string[],
-): void {
+): string | undefined {
+  const target = threadMap.value.get(threadId);
+  // Read before the push: the new row flips the thread to running.
+  const answersQuestion = target ? questionTheSendAnswers(target) : undefined;
+  if (answersQuestion) discardUnsentAnswers(threadId, answersQuestion);
   const map = threadMap.value;
   const thread = map.get(threadId);
   if (thread) {
@@ -380,6 +281,7 @@ function addPendingMessage(
       eventId,
       created: new Date().toISOString(),
       image_hashes: imageHashes,
+      ...(answersQuestion ? { answersQuestion } : {}),
     });
     if (focusedThreadId.value === threadId) {
       // The reader just produced the content at the bottom, so rest them on the
@@ -407,6 +309,15 @@ function addPendingMessage(
     // synthetic exchange doesn't render until the next SSE event arrives.
     bumpThreadEvents(threadId);
   }
+  return answersQuestion;
+}
+
+/** A new answer to a question card replaces any typed answer to it that got
+ *  no answer. Called for every way this device answers a card. */
+export function discardUnsentAnswers(threadId: string, toolUseId: string): void {
+  for (const [eventId, unsent] of unsentMessages.value) {
+    if (unsent.threadId === threadId && unsent.answersQuestion === toolUseId) discardUnsentMessage(eventId);
+  }
 }
 
 // `loadRepositories` lives in `./repositoriesLoader` so SSE-handler modules
@@ -417,7 +328,7 @@ export { loadRepositories } from './repositoriesLoader';
 
 /** What became of a send's text.
  *   - 'sent': the engine accepted it.
- *   - 'shown-as-failed': the POST got no answer, so the text stays in the
+ *   - 'shown-as-failed': no attempt got an answer, so the text stays in the
  *     thread as an unsent message with a Retry (`showUnsentExchange`).
  *   - 'dropped': the engine refused it and the optimistic row is gone. A toast
  *     was shown, and the caller owns putting the text back. */
@@ -449,6 +360,9 @@ export async function sendMessage(
     /** Which kind of send this is, for a decision after the first attempt.
      *  Absent means a follow-up, or a raw new send when it creates its thread. */
     settlement?: SendSettlement;
+    /** Resolves once the engine holds the thread row. Awaited after the
+     *  optimistic row, so the thread reads as running while it is pending. */
+    threadStarted?: () => Promise<void>;
   },
 ): Promise<SendOutcome> {
   threadsLoaded.value = true;
@@ -458,10 +372,36 @@ export async function sendMessage(
   const isNewThread = explicitThreadId === undefined && focusedThreadId.value === null;
   const threadId = explicitThreadId || focusedThreadId.value || eventId;
   // Claim the chain slot before ANY await below, so this send's place in the
-  // thread's order is the order the user pressed send. Released in the
-  // `finally` around the POST.
+  // thread's order is the order the user pressed send. Released however the
+  // send ends, a throw before its POST included.
   const sendSlot = enterSendChain(threadId);
+  try {
+    return await buildAndPostSend({ message, imageHashes, options, eventId, threadId, isNewThread, shouldFocus, sendSlot });
+  } catch (error) {
+    // A throw before the POST: no sweep will come for this row, and a pending
+    // row counts as a turn in flight.
+    removePendingMessage(threadId, eventId);
+    forgetUnsentMessageRecord(eventId);
+    throw error;
+  } finally {
+    sendSlot.release();
+  }
+}
 
+type SendMessageOptions = NonNullable<Parameters<typeof sendMessage>[2]>;
+
+/** Everything `sendMessage` does once its chain slot is claimed: the
+ *  optimistic row, the request body, and the POST. */
+async function buildAndPostSend({ message, imageHashes, options, eventId, threadId, isNewThread, shouldFocus, sendSlot }: {
+  message: string;
+  imageHashes: string[] | undefined;
+  options: SendMessageOptions | undefined;
+  eventId: string;
+  threadId: string;
+  isNewThread: boolean;
+  shouldFocus: boolean;
+  sendSlot: SendSlot;
+}): Promise<SendOutcome> {
   if (shouldFocus) {
     setFocusedThread(threadId);
     if (isNewThread) {
@@ -490,7 +430,12 @@ export async function sendMessage(
       eventsLoaded: true,
     }));
   }
-  addPendingMessage(threadId, message, eventId, imageHashes);
+  const answersQuestion = addPendingMessage(threadId, message, eventId, imageHashes);
+  // A typed answer replaces a pick to the same card that was not sent.
+  if (answersQuestion) unsentPicks.clear(answersQuestion);
+  // After the row, never before: a send in flight must have one. The Stop
+  // bridge (`shouldClearSubmitting`) and the composer's action row read it.
+  if (options?.threadStarted) await options.threadStarted();
 
   const body: ChatRequestBody = {
     message,
@@ -520,8 +465,8 @@ export async function sendMessage(
   // typed. `threadBeforeSend` is the PRE-insert snapshot, so it is undefined
   // exactly on the raw-new path; compose first-sends and follow-ups both pass
   // an explicit `threadId` for a thread that is already in the map, and a
-  // compose thread's row exists server-side because `sendCompose` awaits
-  // `POST /threads` first.
+  // compose thread's row exists server-side because `threadStarted` was
+  // awaited above.
   if (!threadBeforeSend) body.new_thread = true;
 
   // `sendCompose` (compose.ts) flips composing→active before delegating here,
@@ -622,13 +567,14 @@ export async function sendMessage(
   const settlement: SendSettlement = options?.settlement ?? { kind: body.new_thread ? 'raw-new' : 'follow-up' };
   // Kept on the device before the POST goes out, so a reload while it is in
   // flight, or waiting its turn, still finds the message.
-  persistSendingMessage({ eventId, threadId, body, settlement, sentAt: new Date().toISOString() });
+  persistSendingMessage({ eventId, threadId, body, settlement, sentAt: new Date().toISOString(), answersQuestion });
   return postSend({ threadId, eventId, body, sendSlot, failedRetries: 0, settlement });
 }
 
-/** One POST of a send whose optimistic row is already on screen. Shared by the
- *  first attempt (`sendMessage`) and every Retry (`retryUnsentMessage`), so both
- *  settle the same three ways. */
+/** The POST of a send whose optimistic row is already on screen, with its quiet
+ *  retries. Shared by the first attempt (`sendMessage`) and every Retry
+ *  (`retryUnsentMessage`), so both settle the same three ways. The row stays
+ *  in its sending state until the last attempt. The caller owns the slot. */
 async function postSend(send: {
   threadId: string;
   eventId: string;
@@ -638,6 +584,9 @@ async function postSend(send: {
   settlement: SendSettlement;
 }): Promise<SendOutcome> {
   const { threadId, eventId, body, sendSlot } = send;
+  // Read before the POST: the engine's answer clears the pending row on arrival.
+  const answersQuestion = threadMap.value.get(threadId)?.pendingUserMessages
+    .find(p => p.eventId === eventId)?.answersQuestion;
   const accepted = (): SendOutcome => {
     forgetUnsentMessageRecord(eventId);
     schedulePendingCleanup(threadId, eventId);
@@ -648,43 +597,41 @@ async function postSend(send: {
     void retireWelcomeAfterUse(threadMap.value.values());
     return 'sent';
   };
-  try {
-    // Serialized per thread. The optimistic row is already on screen, so the
-    // wait costs the user nothing visible. It keeps the engine's record in the
-    // order they pressed send.
-    if (sendSlot.waitForTurn) await sendSlot.waitForTurn;
-    await submitChat(body);
-    return accepted();
-  } catch (error: unknown) {
-    if (isTransportError(error)) {
-      // The engine's own row can beat the lost answer over SSE. The send
-      // landed, so it is accepted, and an unsent card would be a duplicate.
-      if (engineRecordedMessage(threadId, eventId)) return accepted();
+  // Serialized per thread. The optimistic row is already on screen, so the
+  // wait costs the user nothing visible. It keeps the engine's record in the
+  // order they pressed send.
+  if (sendSlot.waitForTurn) await sendSlot.waitForTurn;
+  const result = await withQuietRetries(() => submitChat(body), {
+    path: 'message',
+    // The engine's own row can beat a lost answer over SSE. The send landed,
+    // so it is accepted, and a retry or an unsent card would be a duplicate.
+    landed: () => engineRecordedMessage(threadId, eventId, answersQuestion ? { toolUseId: answersQuestion, text: body.message } : false),
+  });
+  switch (result.kind) {
+    case 'done':
+    case 'landed':
+      return accepted();
+    case 'gave-up':
       // No answer, so the engine may never have seen it. Keep the text in the
       // thread as an unsent message with a Retry; a toast alone would hide it.
-      showUnsentExchange(send);
+      showUnsentExchange({ ...send, failure: sendFailureOf(result) });
       markUnsentMessageRecordUnsent(eventId, send.failedRetries);
       return 'shown-as-failed';
-    }
-    // HTTP error (4xx/5xx with body) or unknown bug. A raw new send created
-    // its thread optimistically (`new_thread`), and the engine has no record
-    // of it. A row left behind would be a phantom in the Active drawer that
-    // vanishes on refresh. So drop row + nav entries and unfocus. Established
-    // threads keep their row; their content predates this send and only the
-    // pending entry rolls back.
-    if (body.new_thread) {
-      dropNeverMadeThread(threadId);
-    } else {
-      removePendingMessage(threadId, eventId);
-    }
-    forgetUnsentMessageRecord(eventId);
-    showToast(`Failed to send message: ${errorDetail(error)}`, 'error');
-    return 'dropped';
-  } finally {
-    // Whatever happened to this POST, the next send on the thread may go. A
-    // throw between `enterSendChain` and here would skip this, which is why
-    // the wait is bounded rather than open-ended.
-    sendSlot.release();
+    case 'refused':
+      // HTTP error (4xx/5xx with body) or unknown bug. A raw new send created
+      // its thread optimistically (`new_thread`), and the engine has no record
+      // of it. A row left behind would be a phantom in the Active drawer that
+      // vanishes on refresh. So drop row + nav entries and unfocus. Established
+      // threads keep their row; their content predates this send and only the
+      // pending entry rolls back.
+      if (body.new_thread) {
+        dropNeverMadeThread(threadId);
+      } else {
+        removePendingMessage(threadId, eventId);
+      }
+      forgetUnsentMessageRecord(eventId);
+      showToast(`Failed to send message: ${errorDetail(result.error)}`, 'error');
+      return 'dropped';
   }
 }
 
@@ -701,12 +648,21 @@ function dropNeverMadeThread(threadId: string): void {
   if (focusedThreadId.value === threadId) setFocusedThread(null);
 }
 
-/** Does the thread already hold the engine's own row for this message? */
-export function engineRecordedMessage(threadId: string, eventId: string): boolean {
+/** Does the thread already hold the engine's own row for this message? A
+ *  typed answer to a question card leaves no row with its event id: the engine
+ *  records it as that card's `FreeText` answer, matched here by its text. */
+export function engineRecordedMessage(
+  threadId: string,
+  eventId: string,
+  answer?: { toolUseId: string; text: string } | false,
+): boolean {
   const thread = threadMap.value.get(threadId);
   if (!thread) return false;
   for (const [seq, stored] of thread.events) {
-    if (seq > 0 && stored._eventId === eventId) return true;
+    if (seq <= 0) continue;
+    if (stored._eventId === eventId) return true;
+    if (answer && stored.type === 'UserQuestionAnswered' && stored.tool_use_id === answer.toolUseId
+      && stored.answer.kind === 'FreeText' && stored.answer.text === answer.text) return true;
   }
   return false;
 }
@@ -738,22 +694,31 @@ function showUnsentExchange(send: {
   /** When it was sent, for one restored after a reload. Exchanges sort by it. */
   sentAt?: string;
   copy?: string;
+  /** The question card it answers, for one restored after a reload. A live
+   *  send carries it on its pending row instead. */
+  answersQuestion?: string;
+  failure?: SendFailure;
 }): void {
   const { threadId, eventId, body } = send;
   const failedSeq = nextUnsentSeq;
   const messageSeq = failedSeq - 1;
   nextUnsentSeq -= 2;
   const now = send.sentAt ?? new Date().toISOString();
+  const answersQuestion = threadMap.value.get(threadId)?.pendingUserMessages
+    .find(p => p.eventId === eventId)?.answersQuestion ?? send.answersQuestion;
   // Passing eventId piggybacks on handleEvent's pending-message cleanup, so the
   // optimistic row clears without a second write via removePendingMessage.
   handleEvent(threadMap.value, threadId, messageSeq, {
     type: 'MessageReceived',
     text: body.message,
     user_image_hashes: body.image_hashes,
+    _unsent: true,
+    ...(answersQuestion ? { _answersQuestion: answersQuestion } : {}),
   } as StoredEvent, now, eventId);
   handleEvent(threadMap.value, threadId, failedSeq, {
     type: 'ResponseFailed',
     error: send.copy ?? unsentMessageCopy(send.failedRetries),
+    _unsent: true,
   } as StoredEvent, now);
   const thread = threadMap.value.get(threadId);
   if (thread) (thread.unsentMessageSeqs ??= new Map()).set(eventId, messageSeq);
@@ -766,6 +731,8 @@ function showUnsentExchange(send: {
     body,
     failedRetries: send.failedRetries,
     settlement: send.settlement,
+    ...(answersQuestion ? { answersQuestion } : {}),
+    ...(send.failure ? { failure: send.failure } : {}),
   });
 }
 
@@ -780,7 +747,8 @@ export function showRestoredUnsentMessage(record: UnsentMessageRecord): void {
 
 /** Re-post an unsent message: the same request, event id included, so an
  *  engine that did get the first one acks without running it twice. The card
- *  turns back into a pending row while the POST runs. Resolves null when there
+ *  turns back into a pending row while the POST runs, and an answer typed to a
+ *  question card goes back to sending on that card. Resolves null when there
  *  is nothing to retry, e.g. a second press. */
 export async function retryUnsentMessage(eventId: string): Promise<SendOutcome | null> {
   const unsent = takeUnsentMessage(eventId);
@@ -789,16 +757,21 @@ export async function retryUnsentMessage(eventId: string): Promise<SendOutcome |
   const thread = threadMap.value.get(threadId);
   if (!thread) return null;
   const sendSlot = enterSendChain(threadId);
-  retireUnsentExchange(thread, eventId);
-  addPendingMessage(threadId, body.message, eventId, body.image_hashes);
-  const outcome = await postSend({
-    threadId,
-    eventId,
-    body,
-    sendSlot,
-    failedRetries: unsent.failedRetries + 1,
-    settlement: unsent.settlement,
-  });
+  let outcome: SendOutcome;
+  try {
+    retireUnsentExchange(thread, eventId);
+    addPendingMessage(threadId, body.message, eventId, body.image_hashes);
+    outcome = await postSend({
+      threadId,
+      eventId,
+      body,
+      sendSlot,
+      failedRetries: unsent.failedRetries + 1,
+      settlement: unsent.settlement,
+    });
+  } finally {
+    sendSlot.release();
+  }
   if (outcome === 'sent') settleAcceptedSend(threadId, unsent.settlement);
   if (outcome === 'dropped') restoreRefusedSend(threadId, body, unsent.settlement);
   return outcome;

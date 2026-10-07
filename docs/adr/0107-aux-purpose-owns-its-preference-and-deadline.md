@@ -125,3 +125,11 @@ output length does not track the setting. The failures were calls that never
 completed, and one thin roll that the cache then held for five turns. The floor
 in `summarize_or_none` addresses the second; the deadline addresses the first.
 Keeping `low` is what lets either be measured on its own.
+
+## Amendment, 2026-10-06: the attempt cap rides on each request
+
+Auxiliary calls now run through the router, whose backends turns share. So the
+attempt cap is `ModelSelection::attempt_timeout`, applied per request with
+`RequestBuilder::timeout`, and `with_request_timeout` is gone. The arithmetic
+above is unchanged, and it now holds on every backend. ADR 0375 records the
+decision.

@@ -2,6 +2,7 @@ import { threadMap, awaitedThreadId, focusedThreadId, setFocusedThread, showToas
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
 import { settleDeliveredUnsentMessage } from './sendSettlement';
+import { noteImageLanded } from '../landedImages';
 import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, applySummaryVersion, isSummaryCurrent, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
@@ -48,6 +49,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       channel: info.channel as ThreadMeta['channel'],
       initiator: info.initiator,
       saved,
+      ...(info.home ? { home: true as const } : {}),
       createdAt: info.created_at || new Date().toISOString(),
       updatedAt: info.last_activity || info.created_at || new Date().toISOString(),
       // Absent on a legacy row or test mock, so fall back to last_activity.
@@ -188,6 +190,7 @@ export function upsertThread(
     if (info.last_agent_action && (!existing.meta.lastAgentAction || info.last_agent_action > existing.meta.lastAgentAction)) existing.meta.lastAgentAction = info.last_agent_action;
     if (info.channel) existing.meta.channel = info.channel as ThreadMeta['channel'];
     if (info.initiator) existing.meta.initiator = info.initiator;
+    if (info.home) existing.meta.home = true;
     // The row's own fields apply only from a summary at least as new as the
     // one this meta holds (`ThreadMeta.summaryVersion`). A GET that fired
     // before a live event landed carries an older version and changes none of
@@ -368,6 +371,11 @@ async function loadAllThreadsInner(): Promise<void> {
   for (const info of [...response.active_threads, ...response.archive, ...response.composing]) {
     upsertThread(map, info, false, requestStartedAt, draftBatch);
     familyExtensionIds.delete(info.thread_id);
+  }
+  // The Home entries open the home thread, so it is loaded whatever its age.
+  if (response.home_thread) {
+    upsertThread(map, response.home_thread, false, requestStartedAt, draftBatch);
+    familyExtensionIds.delete(response.home_thread.thread_id);
   }
   // Focused thread may be too old for recent list, not saved, not active
   if (response.focused_thread) {
@@ -569,9 +577,9 @@ export function threadLoadInFlightMs(threadId: string): number | null {
  *
  *  And it lets a BACKGROUND caller decline a duplicate (`{ coalesce: true }`).
  *  Three can target one thread at once: a wake's `runResumeSync`, an SSE
- *  `Lagged` firing `resyncLoadedThreads`, and the user opening a thread those
- *  two just marked stale. ONLY those three decline, and the restriction is
- *  load-bearing. Several callers use a refresh as read-after-write PROOF, and
+ *  `Lagged` firing `resyncLoadedThreads`, and the catch-up of a thread those
+ *  two marked stale (`refreshStaleThreadEvents`, on opening it or on the
+ *  health poll). ONLY those decline, and the restriction is load-bearing. Several callers use a refresh as read-after-write PROOF, and
  *  a call that resolves without fetching breaks them.
  *
  *  Cleared with the other guards on resume (`clearThreadFetchGuards`), so a
@@ -632,8 +640,8 @@ export function threadEventsStillArriving(threadId: string): boolean {
  *  them there would disable the whole mechanism silently.
  *
  *  Mutated without a paired `threadMap` signal write, unlike its neighbours,
- *  because nothing RENDERS off a mark. It is read imperatively at focus time
- *  to decide whether to issue a fetch. */
+ *  because nothing RENDERS off a mark. It is read imperatively, at focus time
+ *  and on each health poll for the open thread, to decide whether to fetch. */
 let staleThreadEvents = new Set<string>();
 
 /** The value `fetchAttemptSeq` held when the marks were last raised, so that
@@ -667,8 +675,8 @@ let staleMarkedAtToken = 0;
  *
  *  The FOCUSED thread is marked with the rest, even though its caller
  *  refreshes it at once. A landed fetch then stays the only thing that clears
- *  a mark. If that refresh fails, the mark survives and re-opening the thread
- *  retries it, rather than the thread waiting for the next sync point. */
+ *  a mark. If that refresh fails, the mark survives, and the health poll
+ *  retries the open thread until one lands (`checkConnection`). */
 export function markLoadedThreadsStale(): void {
   const next = new Set<string>();
   for (const [id, thread] of threadMap.value) {
@@ -725,6 +733,19 @@ function mayCoalesceIntoLiveRefresh(threadId: string): boolean {
 export function refreshStaleThreadEvents(threadId: string): void {
   if (!staleThreadEvents.has(threadId)) return;
   void refreshThreadEvents(threadId, { coalesce: true });
+}
+
+/** The health poll's retry of the open thread's catch-up, after one died in
+ *  transport. A standing VERDICT is skipped: each failure re-raises its card,
+ *  so a poll retry would bring back a dismissed card every tick. Re-opening
+ *  the thread still retries it.
+ *
+ *  True when the thread is behind and its catch-up was handed on, so the
+ *  caller's own refresh this tick would only duplicate it. */
+export function retryStaleOpenThreadEvents(threadId: string): boolean {
+  if (!staleThreadEvents.has(threadId) || REFRESH_FAILURES.failing.has(threadId)) return false;
+  refreshStaleThreadEvents(threadId);
+  return true;
 }
 
 /** Test-only reset. Module state that outlives a vitest case; production never
@@ -1181,13 +1202,14 @@ export async function refreshThreadEvents(
     // sustained outage is the debounced connection dot's to report, once.
     //
     // Self-recovery: a refresh that did not land leaves the thread's stale
-    // mark set, so re-opening it retries. Failing that, the next SSE event
-    // re-syncs via handleThreadEvent, and the next sync point marks again.
+    // mark set. The health poll retries the open thread on every tick until
+    // one lands, and re-opening any thread retries it too. A live SSE event
+    // never fills the gap, since it carries only itself.
     //
     // A VERDICT means the engine answered and refused, so it reaches the user
     // through one keyed card, however many threads are failing.
     if (isTransientFetchError(err)) {
-      console.warn(`[ThreadLoading] refresh failed transiently for ${threadId} (iOS PWA wake / engine restart); SSE will recover`, err);
+      console.warn(`[ThreadLoading] refresh failed transiently for ${threadId} (iOS PWA wake / engine restart); the health poll retries`, err);
       return false;
     }
     console.warn(`[ThreadLoading] Failed to refresh events for ${threadId}:`, err);
@@ -1753,6 +1775,7 @@ function applyEventRows(
     const event = { type: row.event_type, ...row.payload } as ThreadEvent;
     const handled = handleEvent(map, threadId, row.sequence, event, row.created, row.event_id);
     if (handled.retiredUnsentEventId) settleDeliveredUnsentMessage(handled.retiredUnsentEventId);
+    if (event.type === 'ImageUploaded') noteImageLanded(threadId, event.hash);
     if (row.sequence > thread.lastDbSeq) thread.lastDbSeq = row.sequence;
 
     if ((row.event_type === 'ThreadTitleGenerated' || row.event_type === 'ThreadTitleRenamed') && row.payload.title) {

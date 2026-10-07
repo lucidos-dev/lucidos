@@ -86,7 +86,7 @@ fn notification_created_carries_thread_id_in_sse() {
 #[test]
 fn preferences_changed_is_persisted_with_key_value() {
     let set = SystemEvent::PreferencesChanged {
-        key: "language".into(),
+        key: crate::core::prefs::LANGUAGE.key().into(),
         value: Some("nb".into()),
         actor: None,
     };
@@ -96,7 +96,7 @@ fn preferences_changed_is_persisted_with_key_value() {
 
     // to_payload() wraps in serde's tag/content envelope: { "type": "...", "data": { ... } }
     let json = set.to_payload();
-    assert_eq!(json["data"]["key"], "language");
+    assert_eq!(json["data"]["key"], crate::core::prefs::LANGUAGE.key());
     assert_eq!(json["data"]["value"], "nb");
 }
 
@@ -140,6 +140,12 @@ fn other_system_events_not_persisted() {
         percent: 0
     }
     .is_persisted());
+    assert!(!SystemEvent::TreeBackfillProgressed {
+        progress: Default::default()
+    }
+    .is_persisted());
+    assert!(SystemEvent::TreeBackfillCompleted { total: 3 }.is_persisted());
+    assert!(SystemEvent::TreeBackfillReset {}.is_persisted());
     assert!(!SystemEvent::Toast {
         message: "hi".into(),
         level: "info".into()
@@ -190,12 +196,17 @@ fn artifact_created_serializes_and_persists() {
         artifact_path: "notes/todo.md".to_string(),
         commit: "abc1234".to_string(),
         source: Some("run_python".to_string()),
+        writer_thread_id: Some(uuid::Uuid::nil()),
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "ArtifactCreated");
     assert_eq!(json["data"]["artifact_path"], "notes/todo.md");
     assert_eq!(json["data"]["commit"], "abc1234");
     assert_eq!(json["data"]["source"], "run_python");
+    assert_eq!(
+        json["data"]["writer_thread_id"],
+        uuid::Uuid::nil().to_string()
+    );
     assert!(event.is_persisted());
     assert_eq!(event.aggregate(), "artifact");
     assert_eq!(event.aggregate_id(), "notes/todo.md");
@@ -207,12 +218,17 @@ fn artifact_updated_skips_none_source() {
         artifact_path: "report.md".to_string(),
         commit: "def5678".to_string(),
         source: None,
+        writer_thread_id: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "ArtifactUpdated");
     assert!(
         json["data"].get("source").is_none(),
         "None source should be skipped"
+    );
+    assert!(
+        json["data"].get("writer_thread_id").is_none(),
+        "no writer thread should be skipped"
     );
     assert!(event.is_persisted());
 }

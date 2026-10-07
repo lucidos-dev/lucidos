@@ -48,42 +48,43 @@ export function providerBlockLoaded(
   return installed !== null && preferencesLoaded;
 }
 
-/** The same three states for TypeSafe (Jev), which has no `/health` row.
+/** The same three states for a System One provider, which has no `/health`
+ *  row.
  *
- *  Jev holds no conversation, so it has no `ProviderKind` and never appears in
- *  `configured_providers` (ADR 0220). A stored `typesafe` credential stands in
- *  for that list: it is the one thing this page can see that says the provider
- *  is set up. So a workspace that stored no key reads `not-set-up` and draws
+ *  A System One model holds no conversation, so it has no `ProviderKind` and
+ *  never appears in `configured_providers` (ADR 0220). What this page can see
+ *  stands in for that list: a stored key for TypeSafe and Cloudflare, a URL for
+ *  the custom endpoint. So an unconfigured provider reads `not-set-up` and draws
  *  the switch off, exactly as xAI does with no key.
  *
  *  **The check order is the reverse of `providerState`'s, and has to be.**
  *  `/health` drops a provider the moment it is switched off, so `installed`
  *  already folds the preference in and can be asked first. A credential does
  *  not: it sits there while the provider is parked. So the preference is asked
- *  first here, and the credential decides only whether there is anything to
+ *  first here, and the configuration decides only whether there is anything to
  *  park.
  *
  *  **A launch-environment key is a blind spot.** The engine accepts
  *  `TYPESAFE_API_KEY`, which is not a credential row and so is not in the list
  *  this page reads. Such a workspace reads `not-set-up` while Jev really runs.
- *  The two per-site switches stay operable with no stored credential for
- *  exactly that reason, and remain the way to stop Jev there. */
-export function typeSafeProviderState(input: {
-  /** Whether a `typesafe` credential is stored. */
-  keyStored: boolean;
-  /** The `provider_enabled_typesafe` preference reads an explicit `false`. */
+ *  The per-site pickers stay operable with no stored credential for exactly
+ *  that reason, and remain the way to stop Jev there. */
+export function systemOneProviderState(input: {
+  /** Whether the provider is set up, per `systemOneConfigured`. */
+  configured: boolean;
+  /** Its `provider_enabled_*` preference reads an explicit off. */
   switchedOff: boolean;
 }): ProviderState {
-  if (!input.keyStored) return 'not-set-up';
+  if (!input.configured) return 'not-set-up';
   return input.switchedOff ? 'switched-off' : 'on';
 }
 
-/** Whether the TypeSafe block knows enough to draw a switch position.
+/** Whether a System One block knows enough to draw a switch position.
  *
  *  Both reads, for the reason `providerBlockLoaded` needs both: unloaded
  *  credentials read as no key, so a guess in that window draws a configured
  *  provider as never set up. */
-export function typeSafeBlockLoaded(
+export function systemOneBlockLoaded(
   credentialsLoaded: boolean,
   preferencesLoaded: boolean,
 ): boolean {

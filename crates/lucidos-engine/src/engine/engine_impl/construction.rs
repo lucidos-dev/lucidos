@@ -698,8 +698,7 @@ impl LucidosEngine {
         // docs/plans/2026-08-27-direct-engine-binds-loopback.md: dev's port IS
         // the vite port, so this skip may now be wrong for dev.
         let behind_gateway = std::env::var("LUCIDOS_BIND_LOOPBACK")
-            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
+            .is_ok_and(|v| crate::core::prefs::env_switch_is_on(&v));
         if workspace_was_uninitialized && !behind_gateway {
             match std::env::var("LUCIDOS_API_PORT")
                 .ok()
@@ -776,6 +775,9 @@ impl LucidosEngine {
             }
             return Err(e.into());
         }
+        // The boot load in main.rs ran before this migrator. On a fresh database
+        // it found no `models` table, and every model would read as unknown.
+        crate::llm::model_registry::reload(&model_registry, &pool).await;
 
         let event_store = EventStore::new(pool.clone());
 
@@ -875,8 +877,7 @@ impl LucidosEngine {
         // Resolve the OpenAI key once: a stored `openai` credential (Settings →
         // Providers) is preferred, then the OPENAI_API_KEY launch env var, then a
         // key auto-detected from the Codex CLI's auth file (apikey login) as the
-        // lowest-precedence fallback. Used for the image provider and for routing
-        // `gpt-*` background-task models through the MemoryExtractor.
+        // lowest-precedence fallback. Used for the image provider.
         let openai_credential = match CredentialStore::get(&pool, "openai").await {
             Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
             Ok(None) => None,
@@ -891,23 +892,6 @@ impl LucidosEngine {
             crate::llm::openai::codex_detect::load(),
         )
         .map(|(key, _source)| key);
-
-        let extractor = if vertex_project_id.is_empty() {
-            log!("[Memory] No Vertex project configured — memory extraction disabled");
-            None
-        } else {
-            let cache = vertex_token_cache
-                .clone()
-                .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None)));
-            Some(
-                MemoryExtractor::with_location_handle(
-                    vertex_project_id.clone(),
-                    vertex_location.clone(),
-                    cache,
-                )?
-                .with_openai_key(openai_api_key.clone()),
-            )
-        };
 
         // Memory index uses PostgreSQL + pgvector for vector search
         let memory_index = match PgVectorIndex::new(pool.clone()).await {
@@ -935,10 +919,10 @@ impl LucidosEngine {
             crate::engine::user_profile::UserProfileCache::load_from_workspace(&workspace_path);
 
         // Load user timezone from database, environment, or leave empty (LLM will ask)
-        let user_timezone = match PreferenceStore::get(&pool, "timezone").await {
-            Ok(Some(tz)) => tz,
-            _ => String::new(),
-        };
+        let user_timezone = crate::core::prefs::TIMEZONE
+            .stored(&pool)
+            .await
+            .unwrap_or_default();
 
         if user_timezone.is_empty() {
             log!("[Engine] User timezone: not set (LLM will ask)");
@@ -947,10 +931,10 @@ impl LucidosEngine {
         }
 
         // Load user language preference from database
-        let user_language = match PreferenceStore::get(&pool, "language").await {
-            Ok(Some(lang)) => lang,
-            _ => String::new(),
-        };
+        let user_language = crate::core::prefs::LANGUAGE
+            .stored(&pool)
+            .await
+            .unwrap_or_default();
 
         if user_language.is_empty() {
             log!("[Engine] User language: not set (will detect from conversation)");
@@ -1188,9 +1172,9 @@ impl LucidosEngine {
         // Vertex tokens. Clone everything here — the originals are moved into the
         // other subscribers / `Self` below.
         let default_model = std::env::var("LUCIDOS_MODEL")
-            .unwrap_or_else(|_| crate::core::DEFAULT_CHAT_MODEL.to_string());
+            .unwrap_or_else(|_| crate::core::prefs::CHAT_MODEL.default_text().to_string());
         let provider_build_ctx = crate::llm::ProviderBuildContext {
-            model_is_mock: default_model == "mock",
+            model_is_mock: default_model == crate::llm::MOCK_MODEL,
             default_model,
             vertex_project_id: vertex_project_id.clone(),
             vertex_location: vertex_location.clone(),
@@ -1275,7 +1259,6 @@ impl LucidosEngine {
             web_search: web_search_handle,
             embedder,
             memory_index,
-            extractor,
             vertex_project_id,
             vertex_location,
             vertex_token_cache,
@@ -1305,6 +1288,7 @@ impl LucidosEngine {
             frontend_refresh_task: std::sync::Mutex::new(None),
             frontend_refresh_started: std::sync::Mutex::new(None),
             frontend_worktree_pin_warned: std::sync::atomic::AtomicBool::new(false),
+            summary_tree: Default::default(),
             frontend_preview: tokio::sync::Mutex::new(None),
             frontend_preview_lifecycle: tokio::sync::Mutex::new(()),
             restart_actor: std::sync::Mutex::new(None),
@@ -1371,6 +1355,8 @@ impl LucidosEngine {
             frontend_origin: std::sync::Mutex::new(None),
             agent_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             loaded_knowhow: Arc::new(crate::engine::loaded_knowhow::LoadedKnowhowStore::new()),
+            view_snapshots: Default::default(),
+            find_cache: Default::default(),
             agent_runtimes: {
                 let mut m: HashMap<CodingAgent, Arc<dyn AgentRuntime>> = HashMap::new();
                 m.insert(CodingAgent::ClaudeCode, Arc::new(ClaudeCodeRuntime));

@@ -11,11 +11,23 @@ import { pushNavState } from './navigation';
 import { holdFocusedPaneWhileTyping, releaseTypingHold, revealContentPane } from './pane';
 import { ensureFocusedComposeThread, updateCompose } from './compose';
 import { openEncodedRepoFilePreview } from './repositories';
+import { openRepoFileLink } from './repoFileLink';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { isMobile } from '../../utils/viewport';
-import { showToast, dismissToast, focusedThreadId, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_SUBVIEW_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview } from '../store';
+import { showToast, dismissToast, repositories, focusedThreadId, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_SUBVIEW_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview } from '../store';
 import type { SettingsNavKey } from '../store';
 import type { MenuItem } from '../types';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Whether a locator's repository segment is not a known repository id. With
+ *  the list loaded, the list decides. Before it loads, as on a cold launch from
+ *  a notification tap, anything but a uuid is a name. */
+function isUnknownRepositoryId(repoId: string): boolean {
+  const list = repositories.value;
+  if (list.status === 'loaded') return !list.data.some((r) => r.id === repoId);
+  return !UUID_RE.test(repoId);
+}
 
 /** Is `view` a renderable Settings sub-section (`SettingsView.renderSubview` has
  *  a case for each)? The valid set is derived from the store's own nav lists —
@@ -230,6 +242,13 @@ export function handleNavigationRequest(nav: {
       // app-facing preview modal so the two surfaces address exactly the same
       // set of files (see `resolveFileTarget`).
       const { path: filePath, range } = resolveFileTarget(nav.file_path, nav.line, nav.line_end);
+      // The engine sends a repository's id, but a navigate stored before it
+      // resolved names (a notification tap) can still carry the NAME. The link
+      // resolver matches names and comes back here with the id.
+      const repoLocator = parseRepoPath(filePath);
+      if (repoLocator && isUnknownRepositoryId(repoLocator.repoId)) {
+        return openRepoFileLink({ locator: repoLocator, line: nav.line, lineEnd: nav.line_end }, opts?.source);
+      }
       // A repo-encoded path (`repo:<repoId>:file:<path>`) opens a file from a
       // registered repository clone rather than the workspace data tree, and
       // needs that repo bound before the panel mounts — see

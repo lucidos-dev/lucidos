@@ -821,6 +821,7 @@ impl LucidosEngine {
                                 Some(&pre_sha),
                                 Some(&post_sha),
                                 apply_actor,
+                                Some(change.thread_id.unwrap_or(thread_id)),
                             )
                             .await;
                             self.emit_merge_resolution_cleared(

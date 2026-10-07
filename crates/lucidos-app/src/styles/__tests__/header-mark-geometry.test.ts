@@ -520,8 +520,10 @@ describe('the nav chevrons are pinned to one shared span', () => {
     expect(decl(cluster, 'bottom')).toBe('0');
     expect(decl(cluster, 'height'), 'the inset pair is what spans it; a height re-opens the rounding')
       .toBeNull();
-    expect(decl(cluster, 'transform'), 'the horizontal centring only')
-      .toBe('translateX(-50%)');
+    expect(decl(cluster, 'transform'), 'no transform: a half-pixel one splits the badge in WebKit')
+      .toBeNull();
+    expect(decl(cluster, 'left'), 'centred by `left` alone, at the same spot')
+      .toBe('calc(50% - var(--header-nav-cluster-width) / 2)');
     expect(decl(cluster, 'align-items'), 'flexbox owns the vertical placement now').toBe('center');
   });
 

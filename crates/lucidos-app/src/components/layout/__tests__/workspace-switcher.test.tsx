@@ -28,6 +28,7 @@ import type { SwitcherListProps } from '../WorkspaceSwitcher';
 import { vnodeToText } from '../../chat/__tests__/vnodeToText';
 import type { WorkspaceStatus } from '../../../api/client/control';
 import type { Loadable } from '../../../store/types';
+vi.mock('../../shared/GlyphBadge', () => import('../../shared/__tests__/glyphBadgeStub'));
 
 const MANAGE = '/~/?pick';
 const NOOP = () => {};

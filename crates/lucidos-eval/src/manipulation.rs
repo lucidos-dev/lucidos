@@ -9,6 +9,10 @@
 //! The gate used to assert the two sections were ABSENT from round 2. They now
 //! leave at the round 1 boundary unless the model keeps them. So their absence
 //! is the default rather than evidence about the flag.
+//!
+//! The memory module has its own gate on the same terms. A Tree arm starts
+//! every task on the Tree path and never recalls memory. A Classic arm is
+//! never on the Tree path.
 
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -199,6 +203,38 @@ pub fn check(arm: Arm, placed: &[PlacedRound]) -> Fallible<()> {
     .into())
 }
 
+/// The memory-module gate, read before a task. `Err` aborts the repeat.
+///
+/// A Tree arm must be on the Tree path when the task starts, and a Classic arm
+/// must not be. The engine falls back to Classic until its ready flag sets,
+/// so a Tree arm that is not ready would run Classic under a Tree label.
+pub fn check_tree_path(arm: Arm, tree_ready: bool) -> Fallible<()> {
+    if tree_ready == arm.expects_tree_memory() {
+        return Ok(());
+    }
+    Err(format!(
+        "manipulation_check_failed: the {arm} arm {} the Tree memory path when its task \
+         started. This is a harness failure and never a result.",
+        if tree_ready { "was on" } else { "was not on" }
+    )
+    .into())
+}
+
+/// The memory-module gate, read after a task. `Err` aborts the repeat.
+///
+/// Only a Classic turn runs memory recall. A Tree thread that recalled was
+/// served at least one Classic turn, so it measured both modules at once.
+pub fn check_no_recall_on_tree(arm: Arm, memory_recalled: bool) -> Fallible<()> {
+    if !(arm.expects_tree_memory() && memory_recalled) {
+        return Ok(());
+    }
+    Err(format!(
+        "manipulation_check_failed: a thread of the {arm} arm recalled memory, which only a \
+         Classic turn does. This is a harness failure and never a result."
+    )
+    .into())
+}
+
 /// Refuse to run when the engine does not implement the flag (I2).
 ///
 /// The lean arm without ADR 0085 is the control arm wearing a label. Its
@@ -277,7 +313,7 @@ mod tests {
     #[test]
     fn the_control_arm_passes_when_no_round_carries_a_panel() {
         let placed = place_rounds(&rounds(&[(10, false), (20, false), (30, false)]), &[1]);
-        check(Arm::Control, &placed).unwrap();
+        check(Arm::CONTROL, &placed).unwrap();
     }
 
     /// A control arm carrying a panel means the flag leaked into it, so the
@@ -285,7 +321,7 @@ mod tests {
     #[test]
     fn the_control_arm_fails_when_a_panel_appears() {
         let placed = place_rounds(&rounds(&[(10, false), (20, true)]), &[1]);
-        let err = check(Arm::Control, &placed).unwrap_err().to_string();
+        let err = check(Arm::CONTROL, &placed).unwrap_err().to_string();
         assert!(err.contains("manipulation_check_failed"));
         assert!(err.contains("Context Panel"));
     }
@@ -293,7 +329,7 @@ mod tests {
     #[test]
     fn the_lean_arm_passes_when_every_round_carries_a_panel() {
         let placed = place_rounds(&rounds(&[(10, true), (20, true), (30, true)]), &[1]);
-        check(Arm::Lean, &placed).unwrap();
+        check(Arm::LEAN, &placed).unwrap();
     }
 
     /// The failure this whole check exists to catch: a flag that changes
@@ -302,7 +338,7 @@ mod tests {
     #[test]
     fn the_lean_arm_fails_when_the_flag_stops_working_mid_exchange() {
         let placed = place_rounds(&rounds(&[(10, true), (20, false)]), &[1]);
-        let err = check(Arm::Lean, &placed).unwrap_err().to_string();
+        let err = check(Arm::LEAN, &placed).unwrap_err().to_string();
         assert!(err.contains("manipulation_check_failed"));
         assert!(err.contains("was missing"));
     }
@@ -314,7 +350,7 @@ mod tests {
     fn a_lean_round_still_carrying_both_sections_is_not_a_violation() {
         let placed = place_rounds(&rounds(&[(10, true), (20, true)]), &[1]);
         assert!(placed.iter().all(|r| r.captured.has_memory));
-        check(Arm::Lean, &placed).unwrap();
+        check(Arm::LEAN, &placed).unwrap();
     }
 
     /// ADR 0085 decision 13: a re-entry is a fresh round 1, in both arms. The
@@ -329,13 +365,13 @@ mod tests {
             placed.iter().map(|r| r.round).collect::<Vec<_>>(),
             vec![1, 2, 1, 2]
         );
-        check(Arm::Lean, &placed).unwrap();
+        check(Arm::LEAN, &placed).unwrap();
     }
 
     #[test]
     fn a_single_round_thread_is_still_checked() {
-        check(Arm::Lean, &place_rounds(&rounds(&[(10, true)]), &[1])).unwrap();
-        check(Arm::Control, &place_rounds(&rounds(&[(10, false)]), &[1])).unwrap();
+        check(Arm::LEAN, &place_rounds(&rounds(&[(10, true)]), &[1])).unwrap();
+        check(Arm::CONTROL, &place_rounds(&rounds(&[(10, false)]), &[1])).unwrap();
     }
 
     /// Every round is assertable, in every exchange. The ledger had an escape
@@ -348,7 +384,7 @@ mod tests {
             &rounds(&[(10, false), (20, true), (30, true), (40, false)]),
             &[1, 25],
         );
-        let err = check(Arm::Lean, &placed).unwrap_err().to_string();
+        let err = check(Arm::LEAN, &placed).unwrap_err().to_string();
         assert!(err.contains("2 rounds disagree"), "{err}");
         assert!(err.contains("exchange 1"), "{err}");
         assert!(err.contains("exchange 2"), "{err}");
@@ -358,7 +394,7 @@ mod tests {
     /// was the unassertable case, and it is where a dead flag would hide.
     #[test]
     fn a_lean_round_one_with_nothing_addressable_still_needs_its_panel() {
-        let err = check(Arm::Lean, &place_rounds(&rounds(&[(10, false)]), &[1]))
+        let err = check(Arm::LEAN, &place_rounds(&rounds(&[(10, false)]), &[1]))
             .unwrap_err()
             .to_string();
         assert!(err.contains("was missing"), "{err}");
@@ -371,8 +407,33 @@ mod tests {
         let err = preflight(FlagAvailability::Missing)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("context_mode_flag_missing"));
+        assert!(err.contains("arm_flag_missing"));
         assert!(err.contains(crate::arm::CONTEXT_MODE_PREFERENCE_KEY));
+        assert!(err.contains(crate::arm::MEMORY_MODULE_PREFERENCE_KEY));
+    }
+
+    /// The failure the Tree gate exists for: a Tree arm whose backfill had not
+    /// completed runs Classic, and the run would report it as Tree.
+    #[test]
+    fn a_tree_arm_must_be_on_the_tree_path_and_a_classic_arm_must_not() {
+        check_tree_path(Arm::LEAN_TREE, true).unwrap();
+        check_tree_path(Arm::LEAN, false).unwrap();
+        let err = check_tree_path(Arm::LEAN_TREE, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("manipulation_check_failed"), "{err}");
+        assert!(err.contains("lean-tree"), "{err}");
+        assert!(check_tree_path(Arm::CONTROL, true).is_err());
+    }
+
+    #[test]
+    fn only_a_tree_thread_that_recalled_fails_the_recall_gate() {
+        check_no_recall_on_tree(Arm::LEAN, true).unwrap();
+        check_no_recall_on_tree(Arm::LEAN_TREE, false).unwrap();
+        let err = check_no_recall_on_tree(Arm::CONTROL_TREE, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("manipulation_check_failed"), "{err}");
     }
 
     #[test]

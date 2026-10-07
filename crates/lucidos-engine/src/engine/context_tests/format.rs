@@ -367,7 +367,7 @@ fn trim_history_from_oldest_preserves_newest() {
 /// existing thread and habit already uses.
 #[test]
 fn one_user_image_carries_its_handle_beside_its_position() {
-    let refs = format_image_refs(4, 1, &["img-0123456789abcdef".to_string()]);
+    let refs = format_image_refs(Some(4), &["img-0123456789abcdef".to_string()]);
     assert_eq!(refs, "thread:5, img-0123456789abcdef");
 }
 
@@ -380,19 +380,17 @@ fn every_image_in_a_message_states_its_own_handle() {
         "img-bbbbbbbbbbbbbbbb".to_string(),
         "img-cccccccccccccccc".to_string(),
     ];
-    let refs = format_image_refs(4, 3, &handles);
+    let refs = format_image_refs(Some(4), &handles);
     assert_eq!(
         refs,
         "thread:5-thread:7, img-aaaaaaaaaaaaaaaa img-bbbbbbbbbbbbbbbb img-cccccccccccccccc"
     );
 }
 
-/// With no handle to state, the annotation is byte-identical to what it was
-/// before handles existed. That is the generated-image case:
-/// `SessionMessage.images` can hold an artifact path the image walker never
-/// saw. A handle derived from one would name nothing.
+/// An image the walk could not place prints its handle alone. A guessed
+/// `thread:N` would name some other picture, which is the bug this replaced.
 #[test]
-fn an_image_with_no_stateable_handle_is_addressed_exactly_as_before() {
-    assert_eq!(format_image_refs(1, 1, &[]), "thread:2");
-    assert_eq!(format_image_refs(1, 2, &[]), "thread:2-thread:3");
+fn an_image_the_walk_cannot_place_prints_only_its_handle() {
+    let refs = format_image_refs(None, &["img-0123456789abcdef".to_string()]);
+    assert_eq!(refs, "img-0123456789abcdef");
 }

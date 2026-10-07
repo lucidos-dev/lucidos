@@ -42,6 +42,7 @@ function model(over: Partial<ModelInfo> & { id: string }): ModelInfo {
     label: over.id,
     routes: [{ provider: 'vertex', id: over.id, reasoning_efforts: [] }],
     preferred_provider: null,
+    vision: false,
     sort_order: 0,
     source: 'builtin',
     enabled: true,
@@ -50,7 +51,7 @@ function model(over: Partial<ModelInfo> & { id: string }): ModelInfo {
   };
 }
 
-const OPUS_5 = model({ id: 'claude-opus-5', label: 'Opus 5' });
+const OPUS_5 = model({ id: 'claude-opus-5[1m]', label: 'Opus 5 (1M)' });
 const OPUS_47 = model({ id: 'claude-opus-4-7', label: 'Opus 4.7', enabled: false });
 const OLD_USER = model({ id: 'my/old-model', label: 'My Old Model', source: 'user', enabled: false });
 
@@ -91,5 +92,17 @@ describe('the Off group', () => {
     // The off builtin beside it must NOT gain one: disable-only is the contract
     // that lets a saved `chat_model` naming a retired model still route.
     expect(text(true).match(/Delete/g)).toHaveLength(1);
+  });
+});
+
+describe('the vision toggle', () => {
+  /** Every row carries it, builtin and user alike, pressed only for a model
+   *  that reads images. A wrong or unverified seed is fixed here. */
+  it('shows on every row, pressed only when the model reads images', () => {
+    const looker = model({ id: 'claude-opus-5-5', label: 'Opus 5.5', vision: true });
+    const out = vnodeToText(modelManagerList([looker, OPUS_5], false, () => {}));
+    expect(out).toContain('aria-label="Opus 5.5 reads images" data-tooltip="Reads images"');
+    expect(out).toMatch(/aria-pressed="true"[^>]*aria-label="Opus 5.5 reads images"/);
+    expect(out).toMatch(/aria-pressed="false"[^>]*aria-label="Opus 5 \(1M\) reads images"/);
   });
 });

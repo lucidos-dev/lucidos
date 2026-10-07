@@ -84,7 +84,8 @@ shape of authority. It does not change that answer.
 - An agent can put away any inbox thread, but only through a proposal the user
   replied to.
 - `ThreadTriageProposed` and `ThreadUnarchived` are new persisted thread events.
-- Unarchive exists as a route, and Undo is its only caller for now.
+- Unarchive exists as a route. Undo was its only caller until ADR 0378 added
+  Move to Current, which takes the sub-threads too.
 - A thread waiting on the user is never bulk archived. A monitoring trigger
   that asks every run still leaves one open thread per unanswered run. Triage
   groups those runs per trigger and proposes dismissing older questions.

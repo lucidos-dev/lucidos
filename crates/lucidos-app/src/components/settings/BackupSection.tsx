@@ -20,6 +20,7 @@ import {
   oauthProviderFor,
 } from './backupProviderScopes';
 import { backupSeed, refreshMayApply } from './backupSeeding';
+import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 import { openConnectedAccountsSettings } from '../../store/actions/menu';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { formatTimeAgo } from '../../utils/formatTime';
@@ -372,10 +373,10 @@ export function BackupSection() {
   // (Show vs Generate) without revealing or minting the key.
   const [keyExists, setKeyExists] = useState<boolean | null>(null);
   const [statusLoadable, setStatusLoadable] = useState<Loadable<BackupStatus>>({ status: 'not-loaded' });
-  const [schedule, setSchedule] = useState<string>('off');
+  const [schedule, setSchedule] = useState<string>(PREFERENCE_CATALOG.backup_schedule.fallback);
   const [scheduleLoaded, setScheduleLoaded] = useState(false);
   const [scheduleSaving, setScheduleSaving] = useState(false);
-  const [retention, setRetention] = useState<string>('5');
+  const [retention, setRetention] = useState<string>(PREFERENCE_CATALOG.backup_retention.fallback);
   const [retentionSaving, setRetentionSaving] = useState(false);
   const [granting, setGranting] = useState(false);
   const [providerSaving, setProviderSaving] = useState(false);
@@ -431,7 +432,7 @@ export function BackupSection() {
       );
 
       // `scheduleLoaded` means the value is KNOWN, not that the request
-      // settled. A failed read leaves `schedule` at its 'off' default, and one
+      // settled. A failed read leaves `schedule` at its default, and one
       // endpoint writes the schedule and the provider together, so treating
       // that default as known would let a provider pick silently disable a real
       // nightly backup. Unknown therefore hides the schedule control and blocks
@@ -448,7 +449,7 @@ export function BackupSection() {
       // surfaced above.
       setSelectedProvider(seed.provider);
 
-      // A failed read leaves the dropdown on its '5' default, which is safe:
+      // A failed read leaves the dropdown on its default, which is safe:
       // only the user's own pick ever writes retention back.
       if (retention.status === 'fulfilled') {
         setRetention(String(retention.value.keep));

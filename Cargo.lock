@@ -4262,11 +4262,13 @@ name = "lucidos-cli"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "clap",
  "dirs",
  "imagesize",
  "libc",
  "lucidos-build-slot",
+ "lucidos-installs",
  "lucidos-local-token",
  "lucidos-tailscale",
  "qrcode",
@@ -4341,6 +4343,7 @@ dependencies = [
  "proc-macro2",
  "pulldown-cmark",
  "rand 0.8.7",
+ "rayon",
  "regex",
  "reqwest 0.12.28",
  "rustls",

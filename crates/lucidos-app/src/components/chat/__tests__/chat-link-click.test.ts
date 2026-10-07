@@ -30,7 +30,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, extractRepoFileTargetFromHref, hasUrlScheme, browserHandlesHref, type RepoFileHrefTarget } from '../../../utils/linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, extractSettingsViewFromHref, extractRepoFileTargetFromHref, hasUrlScheme, browserHandlesHref, type RepoFileHrefTarget } from '../../../utils/linkifyPaths';
 import { renderMarkdown } from '../../../utils/renderMarkdown';
 import type { App } from '../../../store/types';
 
@@ -100,7 +100,7 @@ type Callbacks = {
   openAppById: (id: string, fragment?: string) => void;
   openTrigger: (id: string) => void;
   openRepoFile: (target: RepoFileHrefTarget) => void;
-  navigate: (req: { target: string }) => void;
+  navigate: (req: { target: string; settings_view?: string }) => void;
   osOpen: (target: string) => void;
   toast: (message: string) => void;
 };
@@ -130,7 +130,7 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
   if (nav) {
     e.preventDefault();
     const target = (nav as any).dataset.navTarget;
-    if (target) cb.navigate({ target });
+    if (target) cb.navigate({ target, settings_view: (nav as any).dataset.settingsView });
     return;
   }
   // Defense-in-depth fallback
@@ -155,6 +155,12 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
     if (repoFile) {
       e.preventDefault();
       cb.openRepoFile(repoFile);
+      return;
+    }
+    const settingsView = extractSettingsViewFromHref(href);
+    if (settingsView) {
+      e.preventDefault();
+      cb.navigate({ target: 'settings', settings_view: settingsView });
       return;
     }
     const navName = extractNavTargetFromHref(href);
@@ -456,6 +462,44 @@ describe('chat link click — the bug-report scenario', () => {
     expect(html).toContain('class="trigger-link"');
     expect(html).toContain('data-trigger-id="3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63"');
     expect(html).toContain('>Nightly digest</a>');
+  });
+
+  // ---------------------------------------------------------------------------
+  // Settings page links. A backup notification names "Settings → System →
+  // Backup", and the name has to open that page, the same as the tap.
+  // ---------------------------------------------------------------------------
+
+  it('PRIMARY: a rewritten settings nav-link carries its view to the router', () => {
+    const a = mkAnchor('#', 'nav-link', { navTarget: 'settings', settingsView: 'backup' });
+    const e = mkEvent(a);
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.navigate).toHaveBeenCalledWith({ target: 'settings', settings_view: 'backup' });
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it('FALLBACK: plain <a href="settings:<view>"> click → that Settings page, never the guard', () => {
+    const e = mkEvent(mkAnchor('settings:backup'));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.navigate).toHaveBeenCalledWith({ target: 'settings', settings_view: 'backup' });
+    expect(cb.toast).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it('END-TO-END: render → linkify yields the settings nav-link the click expects', () => {
+    const md = 'Open [Settings → System → Backup](settings:backup) to see the details and retry.';
+    const html = linkifyPaths(renderMarkdown(md), [], APPS);
+    expect(html).toContain('class="nav-link"');
+    expect(html).toContain('data-nav-target="settings"');
+    expect(html).toContain('data-settings-view="backup"');
+    expect(html).toContain('>Settings → System → Backup</a>');
+  });
+
+  it('the real router claims settings: before the panel names', () => {
+    const settingsIdx = routerSource.indexOf('extractSettingsViewFromHref(rawHref)');
+    const navIdx = routerSource.indexOf('extractNavTargetFromHref(rawHref)');
+    expect(settingsIdx).toBeGreaterThan(0);
+    expect(navIdx).toBeGreaterThan(settingsIdx);
+    expect(routerSource).toMatch(/settings_view: navTarget\.dataset\.settingsView/);
   });
 
   it('PRIMARY: pre-rewritten <a class="nav-link"> click → handleNavigationRequest', () => {

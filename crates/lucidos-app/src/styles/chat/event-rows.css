@@ -118,6 +118,18 @@
     color: var(--text-muted);
 }
 
+/* A row waiting behind an open question dims until the agent reads it. Its
+   note says when. */
+.event-row[data-held] {
+    opacity: 0.55;
+}
+
+.event-row-held-note {
+    font-size: var(--font-size-xs);
+    font-style: italic;
+    color: var(--text-secondary);
+}
+
 /* A separator and the fact it introduces, kept on one line together. */
 .event-row-fact {
     display: inline-flex;

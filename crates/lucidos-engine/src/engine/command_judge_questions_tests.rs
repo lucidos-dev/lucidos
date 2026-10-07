@@ -156,11 +156,15 @@ fn a_confident_answer_takes_its_own_lane() {
 #[test]
 fn an_unsure_safe_answer_asks() {
     assert_eq!(
-        read_lane_of(lanes(0.6, 0.2, 0.2)),
+        read_lane_of(lanes(SAFE_MIN_PROBABILITY - 0.1, 0.2, 0.2)),
         RiskLane::IrreversibleDanger,
         "leading is not enough, the bar is the threshold"
     );
-    assert_eq!(read_lane_of(lanes(0.7, 0.2, 0.1)), RiskLane::Safe, "at it");
+    assert_eq!(
+        read_lane_of(lanes(SAFE_MIN_PROBABILITY, 0.2, 0.1)),
+        RiskLane::Safe,
+        "at it"
+    );
 }
 
 /// ADR 0002's second tie-break. Split between the two danger lanes means ask,
@@ -261,7 +265,7 @@ fn a_category_missing_from_its_own_distribution_falls_to_other() {
     assert_eq!(read(&answers).category, Some(SideEffectCategory::Other));
 }
 
-/// Jev writes no prose, so every lane and category pair has to produce a
+/// A judgment carries no prose, so every lane and category pair has to produce a
 /// sentence here. A blank card is worse than a general one.
 #[test]
 fn every_verdict_carries_a_card_sentence() {

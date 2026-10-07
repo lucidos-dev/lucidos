@@ -601,7 +601,8 @@ pub(crate) fn routes_for_create(
 /// Shared with the `manage_models` tool, so the two apply one rule set.
 ///
 /// Builtins keep their IDENTITY, so `label` and `sort_order` are engine-owned
-/// there. Routes, the preferred pick and `enabled` apply to every row.
+/// there. Routes, the preferred pick, the vision flag and `enabled` apply to
+/// every row.
 ///
 /// `provider` and `context_window` apply to the FIRST route, which is what the
 /// single-route shorthand means. Neither is identity: a vendor can raise a
@@ -649,6 +650,7 @@ pub(crate) fn apply_model_update(
         label,
         routes,
         preferred_provider,
+        vision: request.vision.unwrap_or(existing.vision),
         sort_order,
     };
     Ok((fields, request.enabled.unwrap_or(existing.enabled)))
@@ -698,6 +700,7 @@ fn model_info(model: crate::core::Model) -> ModelInfo {
         label: model.label,
         routes,
         preferred_provider: model.preferred_provider,
+        vision: model.vision,
         sort_order: model.sort_order,
         source: model.source,
         enabled: model.enabled,
@@ -750,6 +753,7 @@ pub(super) async fn create_model(
         label,
         routes,
         preferred_provider: None,
+        vision: request.vision,
         sort_order,
     };
     // The store emits `ModelCreated` from inside its write path (the in-memory
@@ -767,9 +771,10 @@ pub(super) async fn create_model(
 /// PUT /api/v1/models?id= to edit a model.
 ///
 /// Builtins keep their IDENTITY, so `label` and `sort_order` are engine-owned
-/// there. They still accept `enabled`, `routes` and `preferred_provider`.
+/// there. They still accept `enabled`, `routes`, `preferred_provider` and
+/// `vision`.
 ///
-/// None of those three is identity. Which backends serve a model is a fact that
+/// None of those is identity. Which backends serve a model is a fact that
 /// changes, and `preferred_provider` is the model picker's own write path.
 /// Refusing it on a builtin would pin every seeded model to whichever backend
 /// the migration listed first.
@@ -1025,7 +1030,7 @@ pub(super) async fn get_preferences(
 fn settings_only(
     mut preferences: std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
-    preferences.retain(|key, _| !crate::core::preference_catalog::is_silent_key(key));
+    preferences.retain(|key, _| !crate::core::prefs::is_silent_key(key));
     preferences
 }
 
@@ -1101,7 +1106,8 @@ pub(super) struct SetNetworkConfigRequest {
 pub(super) async fn get_network_config(
     State(state): State<AppState>,
 ) -> Result<Json<NetworkConfigResponse>, (StatusCode, String)> {
-    let engine_bind = PreferenceStore::get(&state.pool, crate::net_config::NETWORK_BIND_PREF_KEY)
+    let engine_bind = crate::core::prefs::NETWORK_BIND
+        .try_stored(&state.pool)
         .await
         .map_err(|e| {
             (
@@ -1142,12 +1148,7 @@ pub(super) async fn put_network_config(
     // PreferencesChanged like every other settings write.
     match state
         .engine
-        .apply_preference_write(
-            crate::net_config::NETWORK_BIND_PREF_KEY,
-            &value,
-            None,
-            actor,
-        )
+        .apply_preference_write(crate::core::prefs::NETWORK_BIND.key(), &value, None, actor)
         .await
     {
         Ok(_) => Ok(ApiResult::ok()),
@@ -2380,10 +2381,14 @@ mod preferences_read_tests {
     /// ride along. Every other row is a setting, and it still does.
     #[test]
     fn the_preference_read_leaves_out_engine_bookkeeping() {
+        use crate::core::prefs;
+        let theme_mode = prefs::THEME_MODE.key();
+        let vapid_keys = prefs::VAPID_KEYS.key();
+        let backfill = prefs::BACKFILL_REPO_NAMES_FROM_CHANGES_DONE.key();
         let stored: std::collections::HashMap<String, String> = [
-            ("theme-mode", "dark"),
-            ("vapid_keys", r#"{"private_key_pem":"secret"}"#),
-            ("backfill_repo_names_from_changes_done", "true"),
+            (theme_mode, "dark"),
+            (vapid_keys, r#"{"private_key_pem":"secret"}"#),
+            (backfill, "true"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -2391,8 +2396,60 @@ mod preferences_read_tests {
 
         let served = settings_only(stored);
 
-        assert_eq!(served.get("theme-mode").map(String::as_str), Some("dark"));
-        assert!(!served.contains_key("vapid_keys"));
-        assert!(!served.contains_key("backfill_repo_names_from_changes_done"));
+        assert_eq!(served.get(theme_mode).map(String::as_str), Some("dark"));
+        assert!(!served.contains_key(vapid_keys));
+        assert!(!served.contains_key(backfill));
+    }
+}
+
+#[cfg(test)]
+mod model_update_tests {
+    use super::*;
+
+    fn stored(source: &str, vision: bool) -> crate::core::Model {
+        crate::core::Model {
+            id: "some-model".to_string(),
+            label: "Some model".to_string(),
+            routes: vec![Route::bare("vertex")],
+            preferred_provider: None,
+            vision,
+            sort_order: 5,
+            source: source.to_string(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn edit(body: serde_json::Value) -> UpdateModelRequest {
+        serde_json::from_value(body).unwrap()
+    }
+
+    /// An edit that does not mention the flag keeps it, so renaming a model
+    /// never quietly takes image description away from it.
+    #[test]
+    fn an_edit_without_the_vision_flag_keeps_it() {
+        let (fields, _) = apply_model_update(
+            &stored("user", true),
+            edit(serde_json::json!({"label": "New"})),
+        )
+        .unwrap();
+        assert!(fields.vision);
+    }
+
+    /// A seed can be wrong, so a builtin takes the flag like it takes routes.
+    #[test]
+    fn a_builtin_accepts_the_vision_flag() {
+        let (fields, _) = apply_model_update(
+            &stored("builtin", false),
+            edit(serde_json::json!({"vision": true})),
+        )
+        .unwrap();
+        assert!(fields.vision);
+        let (fields, _) = apply_model_update(
+            &stored("builtin", true),
+            edit(serde_json::json!({"vision": false})),
+        )
+        .unwrap();
+        assert!(!fields.vision);
     }
 }

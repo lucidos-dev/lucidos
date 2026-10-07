@@ -29,7 +29,8 @@ import { SurfaceHead } from '../shared/Surface';
 import { useEscapeStep } from '../../hooks/useEscapeStep';
 import type { EventCondition } from '../../store/store';
 import { eventConditionBody, eventConditionTitle } from './eventConditionBody';
-import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
+import { ThreadStatusIcon } from '../shared/ThreadStatusIcon';
+import { threadVisualStatus } from '../shared/threadVisualStatus';
 import type { HeaderActionSpec } from '../layout/headerActions';
 
 /** What the panel is positioned against, or null while it is closed.
@@ -384,7 +385,11 @@ export function waitingPanelBody({
           onClose={onClose}
           closeLabel={closeLabel}
         />
-        <div class="anchored-popover-body" data-role="waiting-condition">
+        <div
+          class="anchored-popover-body"
+          data-role="waiting-condition"
+          data-surface-step={`condition:${condition.eventType}`}
+        >
           {eventConditionBody(condition)}
         </div>
       </>
@@ -394,7 +399,7 @@ export function waitingPanelBody({
   return (
     <>
       <SurfaceHead title="Waiting for" onClose={onClose} closeLabel={closeLabel} />
-      <div class="anchored-popover-body">
+      <div class="anchored-popover-body" data-surface-step="list">
         {waits.length > 0 ? (
           <section class="waiting-panel-section" data-role="waiting-subscriptions">
             {labelled ? <span class="waiting-panel-section-label">Events</span> : null}

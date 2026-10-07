@@ -5,35 +5,35 @@ description: Use when the user wants to author, package, publish, share, install
 
 # Plugins
 
-The working reference for *plugins*: packaging a coherent bundle of workspace content (apps + knowhow + triggers + scripts) so another workspace can install it as a unit, then distributing, updating, and uninstalling it. The full v1 design lives in `docs/plans/2026-04-29-plugins-v1-design.md`; this file is the operational reference. For setting up a plugin right after it is installed, see `plugin-setup.md`.
+How to package a coherent bundle of workspace content (apps, knowhow, triggers, scripts) so another workspace installs it as a unit. It also covers distribution, updates and uninstall. The v1 design is `docs/plans/2026-04-29-plugins-v1-design.md`. For setup right after install, see `plugin-setup.md`.
 
 ## When a plugin is the right artifact
 
-A plugin is one bundle other workspaces install as a single unit. Use it only when the answer to "is this a coherent thing someone else would benefit from installing whole?" is yes.
+Use a plugin only when the bundle is a coherent thing someone else would want to install whole.
 
 | You want to share... | Right answer |
 |---|---|
-| One app the user pinned and likes | App, copy/paste the `apps/<id>/` tree -- no plugin needed for a single file or two |
-| A standalone knowhow file | Knowhow file, paste it into `data/knowhow/` -- knowhow is already portable |
-| An app + the knowhow it relies on + the trigger that drives it | Plugin -- the pieces only make sense together |
-| A self-healing browser-skills loop (write-side knowhow + read-side reflection knowhow that a trigger calls) | Plugin -- canonical example, see `lucidos-dev/plugins/browser-learning` |
-| A WASM auth signer (`<name>.wasm` + `<name>.manifest.json`) and the apis.json snippet that calls it | Plugin -- ship the signer in `auth-modules/` and use the `setup` field to walk the user through wiring `apis.json` + credentials at install time. See `system-knowhow/building-an-auth-handshake.md` for the signer ABI. |
-| Engine defaults every workspace should always have | Not a plugin -- belongs in `system-knowhow/` |
+| One app the user pinned and likes | App: copy the `apps/<id>/` tree. No plugin needed for a file or two. |
+| A standalone knowhow file | Knowhow file: paste it into `data/knowhow/`. Knowhow is already portable. |
+| An app + the knowhow it relies on + the trigger that drives it | Plugin: the pieces only make sense together. |
+| A self-healing browser-skills loop (write-side knowhow + read-side reflection knowhow that a trigger calls) | Plugin. Canonical example: `lucidos-dev/plugins/browser-learning`. |
+| A WASM auth signer (`<name>.wasm` + `<name>.manifest.json`) and the apis.json snippet that calls it | Plugin. Ship the signer in `auth-modules/`. Use the `setup` field to walk the user through wiring `apis.json` and credentials at install. Signer ABI: `system-knowhow/building-an-auth-handshake.md`. |
+| Engine defaults every workspace should always have | Not a plugin: it belongs in `system-knowhow/`. |
 
-The distinguishing test: removing any one file from the bundle would leave the others non-functional or actively misleading. If the files don't cohere, ship them separately.
+The test: removing any one file leaves the others broken or misleading. If the files don't cohere, ship them separately.
 
 ## Questions to settle with the user before bundling
 
-A plugin is a published artifact other workspaces install -- get the shape right before scaffolding. Skip questions the user has already answered.
+Other workspaces install what you publish, so get the shape right before scaffolding. Skip questions the user has already answered.
 
 1. **What's the cohesive unit?** List the files you intend to bundle and confirm each one would be misleading or non-functional without the others. If the answer is "they're related but each works alone", ship them as separate apps / knowhow / triggers, not a plugin.
-2. **`id` and `name`?** `id` must match `[a-z0-9-]+`, max 64 chars -- confirm the slug. `name` is the human title.
+2. **`id` and `name`?** `id` must match `[a-z0-9-]+`, max 64 chars: confirm the slug. `name` is the human title.
 3. **Distribution shape?** Single-repo git URL, monorepo subpath, or local `.lucidos-plugin` archive. Drives whether `source` is set in the manifest and where the user will publish.
-4. **Cron triggers, OAuth, personal data?** None of those ship in plugins (see "What doesn't belong in a plugin" below). If the bundle would benefit from a cron trigger, surface that in the manifest `description` so the install-time LLM can offer to set one up -- confirm with the user that this is the intended UX.
+4. **Cron triggers, OAuth, personal data?** None of those ship in plugins (see "What doesn't belong in a plugin" below). If the bundle would benefit from a cron trigger, surface that in the manifest `description` so the install-time LLM can offer to set one up. Confirm with the user that this is the intended UX.
 
 ## Plugin layout
 
-A plugin is a directory containing `manifest.toml` at the root plus a subset of seven content directories. The directories mirror `data/` one-to-one -- whatever lives at `<plugin>/<dir>/...` lands at `<workspace>/data/<dir>/...` at install time.
+A plugin is a directory with `manifest.toml` at the root plus a subset of seven content directories. They mirror `data/` one-to-one: `<plugin>/<dir>/...` lands at `<workspace>/data/<dir>/...` at install.
 
 ```
 my-plugin/
@@ -51,43 +51,63 @@ my-plugin/
                          #   one `<slug>/` per font; see workspace-fonts.md
 ```
 
-The `manifest.json` sidecar carries only WASM-host metadata (`secret_handles`, `body_mode`, `capabilities`). The engine never auto-loads provider config from it — `data/config/apis.json` is the single source of truth for proxy entries. Plugins that ship a signer should include the matching `apis.json` snippet in the manifest's `setup` field so the install-time LLM walks the user through pasting it into `data/config/apis.json` and registering the credential.
+The `manifest.json` sidecar carries only WASM-host metadata (`secret_handles`, `body_mode`, `capabilities`). The engine never loads provider config from it: `data/config/apis.json` is the single source of truth for proxy entries. A plugin that ships a signer puts the matching `apis.json` snippet in its `setup` field. The install-time LLM then walks the user through pasting it into `data/config/apis.json` and registering the credential.
 
-Validation rules enforced at install (`core/plugins.rs::validate_tree` and `validate_archive_entry_path`). Any failure rejects the archive before any file is written:
+Install validates the tree (`core/plugins.rs::validate_tree` and `validate_archive_entry_path`). Any failure rejects the archive before any file is written:
 
 - `manifest.toml` exists at the plugin root and parses.
 - All required manifest fields are present (`id`, `version`, `name`, `description`).
 - `id` matches `[a-z0-9-]+`, non-empty, max 64 chars. Uppercase, underscore, dot all reject.
 - `version` parses as semver.
-- `source`, when present, looks like a git remote: starts with `https://`, `http://`, `git@`, or ends in `.git`. Bare strings, `file://` URLs, and `.lucidos-plugin` paths are not valid. `source` is optional -- omit it for archive-only plugins shared peer-to-peer (Slack drop, USB stick, attachment). `update_plugin` and `check_plugin_updates` will refuse a sourceless plugin with an explanatory error, but install and uninstall work fine.
-- Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, scripts, auth-modules, themes, fonts}`. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (auto-injected by macOS Finder when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed. A `looks/` folder, the name themes had before ADR 0316, is refused with a hint to rename it `themes/`. A plugin installed before the rename keeps owning its moved theme files, so uninstall still removes them.
+- `source`, when present, looks like a git remote: starts with `https://`, `http://`, `git@`, or ends in `.git`. Bare strings, `file://` URLs, and `.lucidos-plugin` paths are not valid. `source` is optional: omit it for archive-only plugins shared peer-to-peer (Slack drop, USB stick, attachment). `update_plugin` and `check_plugin_updates` refuse a sourceless plugin with an explanatory error. Install and uninstall work fine.
+- Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, scripts, auth-modules, themes, fonts}`. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (macOS Finder adds it when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed. A `looks/` folder, the name themes had before ADR 0316, is refused with a hint to rename it `themes/`.
 - At least one of `apps/`, `knowhow/`, `triggers/`, `scripts/`, `auth-modules/`, `themes/`, `fonts/` exists with at least one file. An empty `knowhow/` directory passes the top-level check but fails as `EmptyTree`.
-- Every file under `themes/` is `<id>.json` and a valid theme, with an id no built-in theme uses (`InvalidTheme` otherwise). The rules are in `themes.md`, theme parts included: a part value past a cap, or a part on a protected surface, fails staging with the field, the rule and the limit (`dark.parts.chat-text.text-shadow: blur 2em is over the 0.6em cap.`).
+- Every file under `themes/` is `<id>.json` and a valid theme, with an id no built-in theme uses (`InvalidTheme` otherwise). The rules are in `themes.md`, theme parts included. A part value past a cap, or a part on a protected surface, fails staging with the field, the rule and the limit (`dark.parts.chat-text.text-shadow: blur 2em is over the 0.6em cap.`).
 - Every file under `fonts/` belongs to a valid workspace font: `fonts/<slug>/font.json` plus the font files it names (`InvalidFont` otherwise). A theme in the plugin may name a workspace font only if the plugin ships it. Install is refused when the plugin's new fonts would take the workspace past 100. The rules are in `workspace-fonts.md`.
-- Hidden files (any path component starting with `.`) are silently skipped during the file walk -- `.DS_Store`, editor swap files, and friends do not get installed.
-- Build output is silently skipped during the file walk. The walk does not enter a directory named `node_modules`, `target`, `dist`, `build`, `out`, `__pycache__`, `venv`, `.venv`, `.next`, `.pytest_cache` or `.git`, at any depth. It also skips any `*.pyc` or `*.pyo` file. These files are machine-specific, so they never reach the install record or the uninstall list. A tree that holds only build output fails as `EmptyTree`.
+- The file walk silently skips hidden files (any path component starting with `.`), such as `.DS_Store` and editor swap files.
+- The file walk silently skips build output. It does not enter a directory named `node_modules`, `target`, `dist`, `build`, `out`, `__pycache__`, `venv`, `.venv`, `.next`, `.pytest_cache` or `.git`, at any depth. It also skips any `*.pyc` or `*.pyo` file. These files are machine-specific, so they never reach the install record or the uninstall list. A tree that holds only build output fails as `EmptyTree`.
 - An app, trigger or font folder with one of those names (`apps/dist/`, `triggers/build/`, `fonts/out/`) fails as `ItemNamedLikeBuildOutput`, so install never drops a whole item silently. Deeper down, install drops such a folder without a warning, so do not put real content in one.
 - Symbolic links are never followed. A file symlink is skipped and a dir symlink is not walked. A top-level symlink named as a content dir is rejected. This keeps a plugin from reaching a file outside its own tree.
-- No archive entry uses `..` or absolute paths (`/`, `\`) -- zip-slip protection.
+- No archive entry uses `..` or absolute paths (`/`, `\`): zip-slip protection.
 
-The flat one-to-one mapping means there is no separate "install destination" question. If your file lives at `apps/foo/index.html` in the plugin, it lands at `data/apps/foo/index.html` in the workspace. Sub-trees (`triggers/foo/foo.md`, `apps/foo/sdk-prefs.js`) are preserved verbatim.
+There is no separate install destination. `apps/foo/index.html` in the plugin lands at `data/apps/foo/index.html` in the workspace. Sub-trees (`triggers/foo/foo.md`, `apps/foo/sdk-prefs.js`) are preserved verbatim.
 
 ## `manifest.toml` schema
 
-Four required fields, four optional. Unknown extra fields are accepted and round-trip into the `PluginInstalled` event payload's `manifest` so future additive fields stay compatible with old install records.
+Four required fields, four optional. Unknown extra fields are accepted and round-trip into the `PluginInstalled` event payload's `manifest`, so future additive fields stay compatible with old install records.
 
 | Field | Required | Type | Notes |
 |---|---|---|---|
-| `id` | yes | string | `[a-z0-9-]+`, max 64 chars. Used as the install-record key, the event `aggregate_id`, and the canonical argument to `update_plugin` / `uninstall_plugin`. (`uninstall_plugin` also accepts the manifest `name` or any `apps/<dir>` folder name the plugin owns, case-insensitive — picks one if unambiguous, otherwise lists candidates.) |
+| `id` | yes | string | `[a-z0-9-]+`, max 64 chars. Used as the install-record key, the event `aggregate_id`, and the canonical argument to `update_plugin` / `uninstall_plugin`. (`uninstall_plugin` also accepts the manifest `name` or any `apps/<dir>` folder name the plugin owns, case-insensitive. It picks one if unambiguous, otherwise lists candidates.) |
 | `version` | yes | string | Semver (`MAJOR.MINOR.PATCH`). `0.1.0`, `1.4.2-beta.1` both parse. |
 | `name` | yes | string | Human-friendly title shown in install/uninstall messages. |
-| `description` | yes | string | One-line summary. Free text. If your plugin pairs well with a cron trigger, mention it here (e.g. "Ask Lucidos to set up a daily reflection trigger after install") so the install-time LLM offers to wire one up -- see "What doesn't belong in a plugin" below. |
-| `source` | no | string | Git remote URL where the plugin lives. Used by `check_plugin_updates` and `update_plugin` to re-fetch the manifest. Omit for archive-only sharing -- the plugin still installs and uninstalls correctly, but updates cannot be fetched (the update tools will return an explanatory error). When present, it must look like a git remote (`https://`, `http://`, `git@`, or ending in `.git`). |
-| `engine` | no | string | Semver constraint (e.g. `">=0.5.0"`). Parsed and stored but the v1 install path does not enforce it -- use it as documentation for now. |
+| `description` | yes | string | One-line summary. Free text. If your plugin pairs well with a cron trigger, mention it here (e.g. "Ask Lucidos to set up a daily reflection trigger after install"). The install-time LLM then offers to wire one up: see "What doesn't belong in a plugin" below. |
+| `source` | no | string | Git remote URL where the plugin lives. Used by `check_plugin_updates` and `update_plugin` to re-fetch the manifest. Omit for archive-only sharing: the plugin still installs and uninstalls, but the update tools return an explanatory error. When present, it must look like a git remote (`https://`, `http://`, `git@`, or ending in `.git`). |
+| `engine` | no | string | Semver requirement on the Lucidos release (e.g. `">=0.46.1"`). **Enforced at install and update**: see "The `engine` requirement" below. Omit it and any release installs the plugin, but Lucidos shows that it declares none. Declare it. |
 | `setup` | no | string | Markdown wiring instructions, written **to the agent about what to do with the user**. It renders in the install confirmation panel before the user confirms, and on confirm it drives a spawned Lucidos Agent setup thread. The engine never interprets it. This is the only way to ship workspace state rather than a file, a webhook above all. See "Install confirmation panel" below and `plugin-setup.md`. |
-| `categories` | no | array of string | Topical tags for browsing the **Store** (the Plugins panel's category filter). A **controlled vocabulary** (see below) — pick from the allowed set. Normalised to lowercase on parse; an unknown value is **dropped and flagged** at catalog-scan time (it appears in the catalog's `errors`), never blocking install. |
+| `categories` | no | array of string | Topical tags for browsing the **Store** (the Plugins panel's category filter). A **controlled vocabulary** (see below): pick from the allowed set. Normalised to lowercase on parse. An unknown value is **dropped and flagged** at catalog-scan time (it appears in the catalog's `errors`), never blocking install. |
 
-**Plugin categories — the controlled vocabulary.** The allowed values are: `productivity`, `finance`, `health`, `developer-tools`, `data`, `communication`, `automation`, `lifestyle`, `research`, `fun` (kebab-case). The catalog offers a filter pill per category that actually appears in the catalog, and each card shows its category chips. The set is intentionally small and curated so categories stay browsable — a free-form tag would fragment (`finance` vs `money` vs `budgeting`). Tag a plugin with the one or few that fit; omit `categories` entirely if none do. (Source of truth: `PLUGIN_CATEGORIES` in `crates/lucidos-engine/src/core/plugins.rs`.)
+**Plugin categories: the controlled vocabulary.** The allowed values are: `productivity`, `finance`, `health`, `developer-tools`, `data`, `communication`, `automation`, `lifestyle`, `research`, `fun` (kebab-case). The catalog offers a filter pill per category that appears in it, and each card shows its category chips. The set stays small so categories stay browsable: a free-form tag would fragment (`finance` vs `money` vs `budgeting`). Tag a plugin with the one or few that fit, or omit `categories` if none do. (Source of truth: `PLUGIN_CATEGORIES` in `crates/lucidos-engine/src/core/plugins.rs`.)
+
+**The `engine` requirement.** Set `engine` to the **first Lucidos release that has every platform feature your plugin uses**, as a floor: `engine = ">=0.46.1"`. For example, a plugin that styles a field with the shared `.text-input` class needs 0.46.1, the first release that ships it. The engine checks it every time a plugin is staged: the `install_plugin` and `update_plugin` tools, and the Plugins panel's Install and Update buttons.
+
+- **Met**: staging goes ahead as usual.
+- **Not met**: staging is refused before anything is written and before the confirmation panel opens. The refusal names the plugin, the requirement and the running release: `Theme Studio 0.1.0 needs Lucidos 0.46.1 or later. This is Lucidos 0.46.0. Update Lucidos first.`
+- **Not a valid requirement** (a typo such as `"latest"`, an empty string, or a number instead of a string): refused the same way, with the bad value quoted. A malformed requirement never installs.
+- **Release unreadable**: if Lucidos cannot read its own release, it refuses any plugin that declares `engine`, since nothing can vouch for it. A plugin without `engine` still installs.
+- **Not declared**: the plugin installs and updates on any release, exactly as before. Nothing is refused, disabled or asked. Lucidos only shows the gap:
+  - The confirmation panel carries a quiet note under the source: "This plugin doesn't say which Lucidos version it needs."
+  - The Plugins panel row carries a muted "No version requirement" chip, with the same sentence as its tooltip.
+
+**Always declare `engine`.** Without it, an older release installs the plugin, and it breaks at run time with no clear message. For example, an app that calls `lucidos.request` needs 0.39.0 or later, the first release that ships it. Declared, the same install is refused up front, with a sentence that tells the user to update Lucidos. Your floor is the release that first shipped the newest platform feature your plugin uses.
+
+**The workspace audit keeps asking until you declare one.** `system-knowhow/workspace-audit.md` checks every installed plugin and every plugin tree a workspace authors. It flags a plugin with no `engine` on every pass, with a fix the user can act on: update to a version that declares one, ask the author, or add the floor themselves.
+
+**Adding `engine` later still needs a version bump.** `check_plugin_updates` compares semver. Add `engine` without raising `version`, and every existing installer sees `Already at latest` and never receives the floor.
+
+**For a third-party plugin you cannot edit, propose the floor upstream.** Never try to add `engine` to the installed copy. `manifest.toml` never lands under `data/`, and the floor is read from the fetched source at install and update time. Use "Proposing your patch upstream" below, or a plain issue or pull request against the plugin's repository.
+
+The running release is the one Lucidos reports as `release` on `/api/v1/health`. A development build made after a release counts as the next patch, so a dev build of 0.46.2 meets `>=0.46.2`. Pre-release and build suffixes are ignored when comparing. The requirement is checked at install and update time only: an installed plugin is never removed or blocked because of it. A floor (`>=X.Y.Z`) reads as "X.Y.Z or later" in every message. Any other shape, such as `">=0.40, <0.46"`, is quoted as written.
 
 Worked example (`browser-learning/manifest.toml`):
 
@@ -97,55 +117,84 @@ version = "0.1.0"
 name = "Browser Learning"
 description = "Self-healing site knowhow for browser automation. Agents emit observations during tasks; a reflection recipe folds them into per-domain knowhow so the next agent visits with better priors."
 source = "https://github.com/lucidos-dev/plugins/tree/main/browser-learning"
+engine = ">=0.9.5"
 categories = ["automation", "developer-tools"]
 ```
 
-The `source` may be the GitHub tree URL the user copied from the address bar -- the install tool parses it back into a git remote + branch + subpath. For a single-repo plugin, use the bare git URL.
+It ships knowhow only, so its floor is the first release with a working plugin install/uninstall lifecycle, not a later UI feature.
+
+The `source` may be the GitHub tree URL the user copied from the address bar. The install tool parses it back into a git remote, branch and subpath. For a single-repo plugin, use the bare git URL.
 
 ## Install confirmation panel
 
-`install_plugin` (and `update_plugin`) never write directly to `data/`. The engine fetches + validates into a staged temp dir, then surfaces a confirmation panel in the Lucidos UI -- same content-pane surface as a credential request. The panel shows:
+`install_plugin` (and `update_plugin`) never write directly to `data/`. The engine fetches and validates into a staged temp dir, and checks the manifest's `engine` requirement. A plugin this release cannot take is refused there, and no panel opens. Otherwise the engine opens a confirmation panel in the same content pane as a credential request. The panel shows:
 
 - The plugin name + version + description from the manifest
 - The `source` (git URL or archive path) and `source_type` (git / archive)
+- When the manifest has no `engine`, the note "This plugin doesn't say which Lucidos version it needs." The staged payload carries `engine_requirement` (as authored, or `null` when undeclared)
 - Every `data/`-relative path the install will write (overwrites called out separately in yellow)
 - The `setup` field rendered as markdown, if present
 
-The user clicks **Confirm** (writes files, **commits them to the workspace git repo in one commit** — `"Install plugin: <id> v<version>"` — emits `PluginInstalled`, auto-reloads WASM signers if any `auth-modules/` files were touched) or **Cancel** (drops staging, emits `PluginInstallCanceled`). Until they click, no bytes hit `data/`. The install commit means a plugin's files are version-controlled exactly like `write_file`/`edit_file` writes — with history, recoverable on a hard reset, and visible to git-based backups. Uninstall is symmetric: confirming it deletes the recorded files and commits the deletion (`"Uninstall plugin: <id> v<version>"`) before emitting `PluginUninstalled`.
+The user clicks **Confirm** or **Cancel**. Until they click, no bytes hit `data/`.
 
-**Confirming does not close the panel: it becomes a receipt.** The same panel turns into a read-only record of what the engine actually wrote or deleted, with a timestamp and no buttons. The header's back arrow is how you leave it. It keeps the nav-history row the pending confirmation already held (relabelled "Installed <name>" / "Uninstalled <name>"). So the user can walk Back to it, or reload, and still see what happened. Cancel closes as before, since nothing happened.
+- **Confirm** writes the files and **commits them to the workspace git repo in one commit**, `"Install plugin: <id> v<version>"`. It emits `PluginInstalled`, and reloads WASM signers if any `auth-modules/` file changed. The plugin's files are then version-controlled like `write_file`/`edit_file` writes: with history, recoverable on a hard reset, and visible to git-based backups.
+- **Cancel** drops the staging and emits `PluginInstallCanceled`.
 
-**Setup runs on confirm — but only when there's *new* setup to run.** If the manifest carried a non-empty `setup` field, confirming the install spawns a **Lucidos Agent setup thread** and the user is navigated straight into it, so the author's "ask the user / wire this up" steps actually happen instead of sitting inert as panel text. The thread's first message is a short line — `Set up the newly installed <name> plugin.` — **not** a wall of agent instructions: the "how to run a plugin setup" guidance lives in `system-knowhow/plugin-setup` (the agent loads it — the chat system prompt nudges it to), and the agent reads your `setup` text by referencing the durable `PluginInstalled` event (that knowhow names the exact nested payload path). So the user sees a clean thread while the agent still gets everything it needs. This fires for **both** the Plugins panel's Install button and the agent's `install_plugin` tool (they share the confirm endpoint). The spawned thread's id is recorded in the `PluginInstalled` event (`manifest.setup_thread_id`) so the plugin's card can resolve it later. On an **update**, the setup thread spawns only when the new version's `setup` text actually **differs** (after trimming) from the currently-installed version's — a version bump that left `setup` unchanged re-runs nothing and navigates nowhere, since re-doing identical setup on every update is noise. A fresh install (or an update whose `setup` is new/changed) always spawns. The engine's background marketplace **update check** only notifies — it never installs — so it never spawns a setup thread.
+Uninstall is symmetric: confirming it deletes the recorded files and commits the deletion (`"Uninstall plugin: <id> v<version>"`) before emitting `PluginUninstalled`.
+
+**Confirming does not close the panel: it becomes a receipt.** It turns into a read-only record of what the engine wrote or deleted, with a timestamp and no buttons. The header's back arrow leaves it. It keeps its nav-history row, relabelled "Installed <name>" / "Uninstalled <name>", so Back or a reload still shows what happened. Cancel closes the panel, since nothing happened.
+
+**Setup runs on confirm, but only when there's *new* setup to run.** If the manifest carried a non-empty `setup` field, confirming spawns a **Lucidos Agent setup thread** and navigates the user into it.
+
+- The thread's first message is one short line, `Set up the newly installed <name> plugin.`, **not** a wall of agent instructions.
+- The agent loads `system-knowhow/plugin-setup` (the chat system prompt nudges it to). It reads your `setup` text from the durable `PluginInstalled` event, at the payload path that knowhow names.
+- It fires for **both** the Plugins panel's Install button and the agent's `install_plugin` tool, since they share the confirm endpoint.
+- The `PluginInstalled` event records the thread's id (`manifest.setup_thread_id`), so the plugin's card can resolve it later.
+- A fresh install spawns it. An **update** spawns it only when the new `setup` text **differs** (after trimming) from the installed version's. Otherwise it re-runs nothing and navigates nowhere.
+- The background marketplace **update check** never installs, so it never spawns a setup thread.
 
 **The setup thread's first message is the engine's, not yours.** It carries an engine origin with the reason `plugin_setup`: the plugin, the version installed, the occasion (fresh install or update, with the prior version when known) and the device that confirmed. The message route popover shows it as "Plugin install" or "Plugin update".
 
-**An update's setup thread starts from the last run, not from scratch.** Its seed says so (`Set up <name> again: its setup instructions changed since version <prior>.`, titled `Update <name> setup`), and `system-knowhow/plugin-setup` § 1 acts on it. That section diffs your two `setup` texts, reads the `PluginSetupCompleted` record the previous run wrote, and verifies what is already wired before asking anything. So a reworded `setup` costs the user a couple of questions rather than the whole interview.
+**An update's setup thread starts from the last run, not from scratch.** Its seed says so (`Set up <name> again: its setup instructions changed since version <prior>.`, titled `Update <name> setup`), and `system-knowhow/plugin-setup` § 1 acts on it. That section diffs your two `setup` texts, reads the `PluginSetupCompleted` record the previous run wrote, and verifies what is already wired before asking anything. So a reworded `setup` costs the user a couple of questions, not the whole interview.
 
 What this means for plugin authors:
 
-- **Lead with `name` and `description`.** They render at the top of the panel. A vague description ("Self-healing site knowhow for browser automation. Agents emit observations during tasks…") gives the user enough to decide; a single word ("browser-skills") doesn't.
-- **Use `setup` for wiring instructions the agent should run after install.** It renders as markdown in the panel so the user sees the steps before confirming, and on confirm a Lucidos Agent setup thread is spawned — the agent references this text (from the `PluginInstalled` event, guided by `system-knowhow/plugin-setup`), plans it as a todo list, and walks the user through the steps, asking for anything it needs (credentials, choices) and doing the wiring it can (e.g. pasting the `apis.json` snippet for a signer plugin). Write `setup` as instructions *to the agent about what to do with the user*, not as a static checklist.
+- **Lead with `name` and `description`.** They render at the top of the panel. A real description ("Self-healing site knowhow for browser automation. Agents emit observations during tasks…") gives the user enough to decide. A single word ("browser-skills") doesn't.
+- **Use `setup` for wiring instructions the agent should run after install.** The user sees it as markdown before confirming. On confirm, the setup thread's agent reads it, plans it as a todo list and walks the user through it. It asks for what it needs (credentials, choices) and does the wiring it can (e.g. pasting the `apis.json` snippet for a signer plugin). Write `setup` as instructions *to the agent about what to do with the user*, not as a static checklist.
   This is also the only way to ship anything that is workspace state rather than a file, a webhook above all.
-- **Updates inherit the same panel.** `update_plugin` re-fetches the source and routes through the same staging path -- the user reviews the new version's file list (added/changed/removed -- well, "would overwrite" for changed) before any bytes are written.
-- **Staged installs expire after 1 hour.** The user then has to re-call `install_plugin`. Engine restarts also drop in-flight stagings (the staged temp dir is gone). Don't author flows that expect the panel to sit open for a full day.
-- **The panel survives a reload, but not the expiry.** An install `install_plugin` staged from a chat is a *form request* (`PluginInstallRequested`, see `system-knowhow/thread-events.md` § Form requests). It stays reachable from its row in the thread until Confirm or Cancel, and the engine records the outcome in `FormRequestResolved`. When the staging expires, the request closes as `expired` and the row stops offering Confirm. Uninstall behaves the same.
+- **Updates inherit the same panel.** `update_plugin` re-fetches the source and routes through the same staging path. The user reviews the new version's file list (new files, and "would overwrite" for changed ones) before any bytes are written.
+- **Staged installs expire after 1 hour.** The user then has to re-call `install_plugin`. Engine restarts also drop in-flight stagings (the staged temp dir is gone).
+- **The panel survives a reload, but not the expiry.** An install staged from a chat is a *form request* (`PluginInstallRequested`, see `system-knowhow/thread-events.md` § Form requests). Its row in the thread stays live until Confirm or Cancel, and `FormRequestResolved` records the outcome. On expiry the request closes as `expired` and the row stops offering Confirm. Uninstall behaves the same.
 
 ## The Plugins panel and marketplaces
 
-Plugins — and the *apps* they ship — are discovered and installed in the **Plugins panel**, the browser UI for plugin discovery. The panel is one unified list with an **Installed only** filter (checked by default): checked, it lists every plugin on disk *regardless of what it ships* (read from the `PluginInstalled` projection via `GET /api/v1/plugins/installed`, so it works offline and still lists a plugin whose marketplace was later removed); unchecked, it widens to the full catalog (installed + available from registered marketplaces). The installed-plugins view is the home for plugins that ship **no app** — knowhow-, trigger-, script-, or auth-module-only bundles — showing each plugin's content kinds + shipped files (each file links to a preview) and an **Uninstall** button. When a registered marketplace offers a newer version, the row also shows an **Update available** chip and an **Update** button — resolved by cross-referencing the catalog by plugin *id* (not `app_id`), so it works for app-less plugins too; clicking stages the same confirmation panel as any install. (A plugin's *app*, if it ships one, still lives in the separate **Apps** panel — which has its own **Update** shortcut on the app row — but the plugin itself is managed here.) A **marketplace** is a git repository (or GitHub tree URL) registered in the workspace at `data/config/plugin-marketplaces.json`, added/removed under **Settings → Marketplaces**. The catalog clones each registered marketplace on refresh (it re-scans whenever it is shown — the panel opens or **Installed only** is unchecked), scans for valid `manifest.toml` plugin roots, compares each manifest version against currently installed `PluginInstalled` events, and shows each plugin as a card. Clicking `Install`/`Update` stages the exact same install confirmation panel described above; the catalog never writes plugin files directly.
+Users find and install plugins, and the *apps* they ship, in the **Plugins panel**. It is one list with an **Installed only** filter, checked by default:
+
+- **Checked**, it lists every plugin on disk, *whatever it ships*. It reads the `PluginInstalled` projection via `GET /api/v1/plugins/installed`, so it works offline and still lists a plugin whose marketplace was removed.
+- **Unchecked**, it widens to the full catalog: installed plus available from registered marketplaces.
+
+The installed view is the home for plugins that ship **no app** (knowhow-, trigger-, script- or auth-module-only bundles). Each row shows the plugin's content kinds, its shipped files (each links to a preview) and an **Uninstall** button. When a registered marketplace offers a newer version, the row also shows an **Update available** chip and an **Update** button. The match is by plugin *id* (not `app_id`), so it works for app-less plugins too. Clicking stages the same confirmation panel as any install. A plugin's *app* still lives in the separate **Apps** panel, with its own **Update** shortcut, but the plugin itself is managed here.
+
+A **marketplace** is a git repository (or GitHub tree URL) registered at `data/config/plugin-marketplaces.json`, added and removed under **Settings → Marketplaces**. A scan clones each one, finds valid `manifest.toml` plugin roots, and compares each version against installed `PluginInstalled` events. The catalog shows each plugin as a card, read from the last scan (see "A scan never runs on a page open" below). `Install`/`Update` stage the same confirmation panel described above. The catalog never writes plugin files directly.
 
 **Settings → Marketplaces** adds, renames and removes a marketplace. Only the name is editable there. The id hashes the URL, so a row's URL is read-only: pointing at another repository is a remove plus an add. The rename re-posts the stored URL, which is why the registry entry keeps its id.
 
 Each card has a primary button that progresses **Install → Setup → Open**, plus an **Uninstall** button once the plugin is on disk:
 
-- **Install** (or **Update** for an out-of-date install) — stages the confirmation panel.
-- **Setup** — shown after install while the plugin's setup thread is still running or waiting on the user; clicking opens that thread. Driven by `setup_thread_id` + `setup_complete` on the catalog row. `setup_complete` is resolved three ways from what the engine can observe about the setup thread: **present** (has a `thread_summaries` row) → done once its lifecycle status is neither `running` nor `waiting_for_user_answer`; **pending** (no row yet but a live `thread_queue` entry — the brief window after spawn before the agent's first event) → not done, so the card keeps showing Setup without flicker; **gone** (no row and no queue entry — a lost spawn, deleted thread, or a stale catalog id) → treated as done, so the card falls through to Open/Installed rather than offering a Setup button that would 404. Plugins with no `setup` field skip straight past this.
-- **Open** — shown once setup is finished (or the plugin had none); launches the plugin's primary app (`data/apps/<id>/`). Plugins that ship no app show a disabled **Installed** instead.
-- **Uninstall** — stages the uninstall confirmation panel (the same one the `uninstall_plugin` LLM tool produces). The card re-fetches the catalog on every mount, so the Setup→Open transition shows up when the user returns from finishing setup.
+- **Install** (or **Update** for an out-of-date install): stages the confirmation panel. A plugin whose `engine` requirement this release misses still lists. Its button is disabled, and a warning chip gives the reason ("Needs Lucidos 0.46.1 or later"). The catalog row carries `engine_requirement` (as authored), `engine_compatible` and `engine_incompatible_reason`. They are filled each time the catalog is served, so an engine upgrade counts at once.
+  - A plugin with no `engine` keeps a live button and shows a muted "No version requirement" chip instead. Its row has no `engine_requirement`.
+  - An installed plugin whose marketplace is gone reads the same field from `GET /api/v1/plugins/installed`, which reports the installed version's requirement.
+  - The two chips never show together, because an incompatible plugin always declares `engine`.
+- **Setup**: shown after install while the setup thread is still running or waiting on the user. Clicking opens that thread. Driven by `setup_thread_id` + `setup_complete` on the catalog row. Plugins with no `setup` field skip past this. The engine resolves `setup_complete` from what it can observe about the thread:
+  - **present** (has a `thread_summaries` row): done once its lifecycle status is neither `running` nor `waiting_for_user_answer`.
+  - **pending** (no row yet but a live `thread_queue` entry, the brief window before the agent's first event): not done, so the card keeps showing Setup without flicker.
+  - **gone** (no row and no queue entry: a lost spawn, deleted thread, or stale catalog id): treated as done. The card falls through to Open/Installed rather than offering a Setup button that would 404.
+- **Open**: shown once setup is finished (or the plugin had none). It launches the plugin's primary app (`data/apps/<id>/`). Plugins that ship no app show a disabled **Installed** instead.
+- **Uninstall**: stages the uninstall confirmation panel (the same one the `uninstall_plugin` LLM tool produces). The card re-fetches the catalog on every mount, so the Setup→Open transition shows when the user returns from setup.
 
-**Plugin uninstall is the single removal authority for a plugin's app.** A plugin-installed app cannot be removed by the **Delete** button on the Apps panel — that would `rm -rf` only the `apps/<id>/` dir and leave the plugin registered as installed with its sibling `triggers/`/`knowhow/`/`scripts/` orphaned. So `DELETE /api/v1/app?id=...` returns **409** with `{ error, plugin_id, plugin_name }` when the app belongs to an installed plugin (the app-level mirror of the `delete_file` guard, which already refuses raw deletes of plugin-owned files). The UI catches the 409 and routes the user to the plugin **Uninstall** panel instead — which removes the whole plugin tree and emits `PluginUninstalled`. Standalone apps (no `PluginInstalled` record) keep deleting directly.
+**Plugin uninstall is the single removal authority for a plugin's app.** The Apps panel's **Delete** button would `rm -rf` only `apps/<id>/`, leaving the plugin registered and its sibling `triggers/`/`knowhow/`/`scripts/` orphaned. So `DELETE /api/v1/app?id=...` returns **409** with `{ error, plugin_id, plugin_name }` when the app belongs to an installed plugin. That mirrors the `delete_file` guard, which refuses raw deletes of plugin-owned files. The UI catches the 409 and routes the user to the plugin **Uninstall** panel, which removes the whole plugin tree and emits `PluginUninstalled`. Standalone apps (no `PluginInstalled` record) keep deleting directly.
 
-Installed marketplace plugins are **not** auto-updated: the engine notifies, and the user decides. The engine scans registered marketplaces at startup, after a marketplace is registered or renamed, and every five minutes. A newer version of an installed plugin produces one deduplicated `NotificationCreated` ("Plugin update(s) available"). It does NOT install anything. Its tap opens the Plugins panel's installed list, with the **Installed only** filter on:
+Installed marketplace plugins are **not** auto-updated: the engine notifies, and the user decides. It scans registered marketplaces at startup, after a marketplace is registered or renamed, and every five minutes. A newer version of an installed plugin produces one deduplicated `NotificationCreated` ("Plugin update(s) available") and installs nothing. Its tap opens the Plugins panel's installed list, with the **Installed only** filter on:
 
 - **One update**: the list scrolls to and pulse-highlights that plugin, carried as the navigate `id`.
 - **Several updates**: no row is highlighted, since each pending row already shows its update chip.
@@ -156,13 +205,15 @@ The user applies an update from any of three places, and each stages the same co
 - the catalog card, with **Installed only** unchecked;
 - for a plugin that ships an app, the app row's **Update** button on the Apps panel.
 
-A `.lucidos/plugin-update-notice.json` marker tracks what the user was told. The five-minute re-scan re-notifies only for a *new* update (a fresh plugin or a bumped version), not every cycle.
+**No notification for an update this release cannot install.** When the running release misses a version's `engine` requirement, nothing is sent. The Plugins panel still shows it, with Update disabled and the reason beside it. On the Apps panel, the app row swaps its Update button and "Update available" chip for the reason. Once Lucidos meets the requirement, that version counts as new and the notification fires.
 
-**A scan never runs on a page open.** `GET /api/v1/plugins/catalog` reads the *plugin catalog cache* (`.lucidos/plugin-catalog.json`), which the five-minute scan writes, so the Plugins panel and Settings → Marketplaces paint at once. The response carries `scanned_at`, `scanning` and `scan_error` beside the rows. The panel shows no age, and names the reason above the list when the last scan failed. A cache older than five minutes, or none at all, starts a scan in the background and the request still answers immediately. `POST /api/v1/plugins/catalog/rescan` asks for a scan now, and returns as soon as it is queued.
+A `.lucidos/plugin-update-notice.json` marker tracks what the user was told. The re-scan re-notifies only for a *new* update (a fresh plugin or a bumped version), not every cycle.
 
-The marketplace list itself is read live from the registry on every request. So a rename shows up with no scan behind it, and a marketplace the user removed can never contribute cached plugins. A scan announces both ends, as **transient** events (SSE only, never stored): `PluginCatalogScanStarted` when it begins and `PluginCatalogScanned` when it lands, the latter carrying `failed`. They raise and lower the panel's scanning state on every connected client, including for the scheduler's own pass that nobody asked for.
+**A scan never runs on a page open.** `GET /api/v1/plugins/catalog` reads the *plugin catalog cache* (`.lucidos/plugin-catalog.json`), which the five-minute scan writes, so the Plugins panel and Settings → Marketplaces paint at once. The response carries `scanned_at`, `scanning` and `scan_error` beside the rows. The panel shows no age, but names the reason above the list when the last scan failed. A cache older than five minutes, or none, starts a background scan, and the request still answers at once. `POST /api/v1/plugins/catalog/rescan` queues a scan now and returns at once.
 
-Every marketplace mutation is **announced**, so an open Plugins panel and Settings → Marketplaces update in place with no reload: registering a marketplace (or re-registering one under a new name) emits `PluginMarketplaceRegistered`, unregistering emits `PluginMarketplaceRemoved`, and the frontend re-reads the catalog on either. `Registered` is an upsert event covering the rename as much as the create, because the marketplace id hashes the canonical source: re-registering a source already on the list rewrites its entry in place rather than adding a second one. The announcement lives inside the one shared registry write path. So it fires whichever surface asked: the HTTP endpoints below, or the `register_plugin_marketplace` tool in chat.
+The marketplace list itself is read live from the registry on every request. So a rename shows with no scan behind it, and a removed marketplace never contributes cached plugins. A scan announces both ends as **transient** events (SSE only, never stored): `PluginCatalogScanStarted` when it begins and `PluginCatalogScanned` when it lands, the latter carrying `failed`. They raise and lower the panel's scanning state on every connected client, the scheduler's own pass included.
+
+Every marketplace mutation is **announced**, so an open Plugins panel and Settings → Marketplaces update in place with no reload. Registering a marketplace (or re-registering one under a new name) emits `PluginMarketplaceRegistered`. Unregistering emits `PluginMarketplaceRemoved`. The frontend re-reads the catalog on either. `Registered` is an upsert covering rename as well as create: the id hashes the canonical source, so re-registering a listed source rewrites its entry in place. The announcement lives in the one shared registry write path, so it fires for the HTTP endpoints below and the `register_plugin_marketplace` tool alike.
 
 Marketplace HTTP surface:
 
@@ -179,16 +230,16 @@ Marketplace HTTP surface:
 
 Marketplace LLM surface:
 
-- `register_plugin_marketplace(source, name?)` registers or renames the same plugin marketplace registry the Plugins panel browses, commits `data/config/plugin-marketplaces.json`, announces the change (so any open panel refreshes without a reload), and kicks off the marketplace scan / update-check pass (which notifies the user of any available plugin updates rather than applying them). Use it when a user asks conversationally to add a plugin repo, marketplace, or plugin marketplace source. There is no unregister tool: removing a marketplace is done from Settings → Marketplaces.
+- `register_plugin_marketplace(source, name?)` registers or renames a marketplace in the registry the Plugins panel browses. It commits `data/config/plugin-marketplaces.json` and announces the change, so any open panel refreshes. It then starts the scan / update-check pass, which notifies about plugin updates rather than applying them. Use it when a user asks to add a plugin repo, marketplace, or plugin marketplace source. There is no unregister tool: remove a marketplace from Settings → Marketplaces.
 
-For GitHub monorepo marketplaces, register either the repo URL (`https://github.com/lucidos-dev/plugins`) or a tree URL (`https://github.com/lucidos-dev/plugins/tree/main/community`). The scanner turns discovered subdirectory plugins into installable GitHub tree URLs. For non-GitHub monorepos, use one repo per plugin or provide a GitHub tree URL equivalent; the install tool only knows how to install a subdirectory when it has a GitHub tree URL.
+For GitHub monorepo marketplaces, register either the repo URL (`https://github.com/lucidos-dev/plugins`) or a tree URL (`https://github.com/lucidos-dev/plugins/tree/main/community`). The scanner turns discovered subdirectory plugins into installable GitHub tree URLs. For non-GitHub monorepos, use one repo per plugin: the install tool installs a subdirectory only from a GitHub tree URL.
 
 ## Authoring a marketplace
 
-A marketplace is not its own artifact type -- there is no marketplace manifest,
+A marketplace is not its own artifact type: there is no marketplace manifest,
 no schema, no validation step. It is **a git repository whose subdirectories
-contain plugin roots**. Everything above about authoring a plugin still applies
-verbatim; this section only covers the repo that holds them.
+contain plugin roots**. Everything above about authoring a plugin still applies.
+This section covers only the repo that holds them.
 
 ### Repo layout and how the scanner finds plugins
 
@@ -209,17 +260,17 @@ looking for `manifest.toml`:
 - **At every depth, the walk skips hidden directories and build-output
   directories** (the same list as the install walk, see "Plugin layout"). So a
   `manifest.toml` inside `node_modules/` or `dist/` is never a plugin root.
-- **Duplicate plugin `id`s are de-duplicated** -- first root wins, later ones are
-  silently dropped. Keep directory name == manifest `id` to make collisions
+- **Duplicate plugin `id`s are de-duplicated**: the first root wins, later ones
+  are silently dropped. Keep directory name == manifest `id` to make collisions
   obvious.
 - A repo where the scan finds nothing fails with `no plugin manifest.toml files
   found`.
 
 **Root-level files that are not plugin directories are ignored.** A README,
 `CODEOWNERS`, `.github/`, `LICENSE`, `.gitignore` at the *marketplace* root are
-fine -- the strict "only `manifest.toml` + the seven content dirs" validation
+fine. The strict "only `manifest.toml` + the seven content dirs" validation
 applies **inside a plugin root**, not to the marketplace repo. Use the root
-README as the human discovery index (this is what `lucidos-dev/plugins` does).
+README as the human discovery index, as `lucidos-dev/plugins` does.
 
 ### Install URLs are generated, not authored
 
@@ -228,35 +279,37 @@ tree URL (`install_source`): `https://github.com/<owner>/<repo>/tree/<branch>/<p
 with the marketplace's own subpath prefixed when it was registered as a tree URL.
 The branch is the one registered, else the cloned repo's actual HEAD shorthand.
 
-Consequences worth designing around:
+Design around three consequences:
 
 - **Subdirectory install only works for GitHub.** For a non-GitHub host, the
-  fallback is the marketplace's own clone URL -- which is only correct if the
+  fallback is the marketplace's own clone URL, which is correct only if the
   repo *is* a single plugin. Multi-plugin marketplaces on GitLab / Bitbucket /
   an enterprise host do not produce installable per-plugin URLs in v1. Use one
   repo per plugin there.
 - **Renaming a plugin directory changes its install URL** and orphans the
   `source` recorded in existing installs. Treat the directory name as stable.
-- Each plugin's own `manifest.toml` `source` should still be set to its tree URL
-  -- that is what `check_plugin_updates` / `update_plugin` re-fetch after
-  install, independent of the marketplace.
+- Still set each plugin's own `manifest.toml` `source` to its tree URL. That is
+  what `check_plugin_updates` / `update_plugin` re-fetch after install,
+  independent of the marketplace.
 
 ### Registering and the scan cycle
 
 Register the repo URL (`https://github.com/owner/repo`) or a tree URL to scope
 the scan to a subdirectory (`.../tree/main/community`). `.lucidos-plugin`
-archive paths are rejected -- marketplaces must be git. The clone is shallow
+archive paths are rejected: marketplaces must be git. The clone is shallow
 (`depth 1`), lands in `.lucidos/tmp/plugin-marketplaces/`, and `.git` is removed
-before the scan, so nothing about the marketplace persists in the workspace
-except the registry entry in `data/config/plugin-marketplaces.json`.
+before the scan. Only the registry entry in `data/config/plugin-marketplaces.json`
+persists in the workspace.
 
 A `file://` URL is a valid marketplace source, and it clones deep rather than
 shallow: libgit2's local transport rejects a shallow fetch. A local bare clone
 of a repo, refreshed out of band, is a working offline marketplace.
 
-Scans run at startup, on registration/rename, whenever the Plugins panel is
-shown or "Installed only" is unchecked, and every five minutes. A scan **never
-installs** -- it notifies about newer versions and the user clicks Update.
+Scans run at startup, on registration or rename, every five minutes, and on a
+panel refresh (a pull, or the header's Refresh). Opening the Plugins panel only
+reads the cache, and starts a scan when the cache is over five minutes old. A
+scan **never installs**: it notifies about newer versions and the user clicks
+Update.
 
 ### Private and internal repos
 
@@ -310,9 +363,8 @@ Settings, Credentials, **Add**. Three fields decide the clone:
 hosts, and a credential scoped only to the API host never matches a clone.
 
 **One credential names them both.** Base URLs is a set, one row per hostname, so
-the same token serves the REST API and the clone from a single credential.
-Nothing is inferred from a hostname's spelling, so name each host in full. What
-you do not have to do is store the token twice. Press **Add another host** in the
+one credential serves the REST API and the clone. Nothing is inferred from a
+hostname's spelling, so name each host in full. Press **Add another host** in the
 credential form. Or ask Lucidos for the credential again, naming the second host,
 and it reopens the same row for you to save.
 
@@ -320,12 +372,11 @@ A Base URL may also carry a path, `https://github.com/example-org`, which scopes
 it to that owner. When several credentials match one URL the longest Base URL
 wins, so an org-scoped token overrides a host-wide one.
 
-A GitHub Enterprise install needs nothing extra beyond its own row. The clone
-never guesses which host is GitHub, so there is no host list to maintain.
+A GitHub Enterprise install needs only its own row. The clone never guesses
+which host is GitHub, so there is no host list to maintain.
 
 The row takes effect on the next scan, with no restart: every clone reads the
-store when it starts. Scans run every five minutes and whenever the Plugins
-panel opens.
+store when it starts.
 
 Two alternatives need no credential row at all:
 
@@ -352,18 +403,18 @@ What still does not work:
 
 ### Org permissions can block repo creation independently
 
-Creating the marketplace repo is a GitHub-side concern and fails separately from
-anything Lucidos does. An org with `members_can_create_repositories: false`
-rejects `gh repo create` for a plain member with
-`does not have the correct permissions to execute CreateRepository` -- for
-public, private, **and** internal alike. Check with
+Creating the marketplace repo is a GitHub-side step that can fail on its own.
+An org with `members_can_create_repositories: false` rejects `gh repo create`
+for a plain member with
+`does not have the correct permissions to execute CreateRepository`. That holds
+for public, private, **and** internal alike. Check with
 `gh api orgs/<org> --jq '{members_can_create_repositories, members_can_create_internal_repositories}'`
 before assuming the CLI or the token is at fault.
 
 ## Shipping triggers (auto-registration)
 
 A plugin ships a trigger by declaring it in a **`trigger.toml`** at
-`triggers/<slug>/trigger.toml` — mirroring how an app is its own folder
+`triggers/<slug>/trigger.toml`, just as an app is its own folder
 (`apps/<id>/manifest.json`). The file is a *trigger definition* (see
 `triggers.md` § "On-disk trigger definition"): `name`, `run`
 (`intent` or `script`), `on` (trigger subscriptions), and the usual optional
@@ -373,14 +424,13 @@ procedure the trigger needs in `triggers/<slug>/knowhow/`, beside it.
 
 What install does (ADR 0019):
 
-- **Auto-registers** each `trigger.toml` — emits `TriggerCreated` stamped with
+- **Auto-registers** each `trigger.toml`: emits `TriggerCreated` stamped with
   the plugin's id (provenance), so the trigger is **live immediately** (no agent
   step needed). The Triggers panel shows a "from \<plugin\>" chip on it.
 - **Event-driven only.** A `trigger.toml` that declares a cron `schedule` is
-  **rejected at install** (nothing is written) — cron is workspace state, not
-  plugin content. Ship `on:` subscriptions; if the plugin pairs well with a cron
-  cadence, say so in the manifest `description` so the install-time LLM offers to
-  set one up conversationally.
+  **rejected at install** (nothing is written): cron is workspace state, not
+  plugin content. Ship `on:` subscriptions. For a cron cadence, see "What
+  doesn't belong in a plugin".
 - **Uninstall** auto-deletes exactly the triggers carrying this plugin's id
   (user-created triggers are never touched).
 - **Update** re-syncs by `(plugin_id, slug)`: a still-declared slug is updated in
@@ -393,38 +443,40 @@ confirming, so activation is never silent.
 
 ## What doesn't belong in a plugin
 
-The seven content directories make almost anything technically packageable, but apply judgment to `triggers/`. Apps, knowhow, and **event-driven (`on_event`) triggers** belong in plugins -- they are reference material or part of the plugin's own mechanism. An `on_event` trigger that reacts to events the plugin's apps/knowhow emit ships as a `triggers/<slug>/trigger.toml` declaration: install **auto-registers** it (stamped with the plugin id) and uninstall removes it. See "Shipping triggers" above.
+Apps, knowhow, and **event-driven (`on_event`) triggers** belong in plugins: they are reference material or part of the plugin's own mechanism. An `on_event` trigger ships as a `triggers/<slug>/trigger.toml` declaration (see "Shipping triggers" above).
 
-**Nothing user- or machine-specific ships in a plugin.** A plugin is one artifact many workspaces install identically. Anything that differs per installer is workspace state, not plugin content: an account, a schedule, a client id, a path on someone's disk. Ship the generic code, and use the `setup` field to have the agent ask each installer for their own value at install time. The test for a file: would it still be correct on a machine that is not yours?
+**Nothing user- or machine-specific ships in a plugin.** Many workspaces install one plugin identically. Anything that differs per installer is workspace state, not plugin content: an account, a schedule, a client id, a path on someone's disk. Ship the generic code, and use the `setup` field to have the agent ask each installer for their own value. The test for a file: would it still be correct on a machine that is not yours?
 
-**Cron triggers, OAuth credentials, and personal data do not ship in plugins.** They are workspace state -- WHEN something runs on a clock, WHO owns the account, WHAT the user has accumulated. Cron triggers in particular get singled out -- four reasons:
+**Cron triggers, OAuth credentials, and personal data do not ship in plugins.** They are workspace state: WHEN something runs on a clock, WHO owns the account, WHAT the user has accumulated. Cron triggers stay out for four reasons:
 
 1. **Cadence is user-specific.** Heavy users want it every 6h, light users weekly. Hardcoding `0 0 4 * * *` in the bundle makes that decision for them.
-2. **The schedule is workspace state, not reference material.** A plugin shipping a cron entry is the equivalent of a library shipping a crontab line -- wrong layer. Knowhow is "how to do this well", cron triggers are "when I want it to happen".
-3. **Orphaned cron entries.** If the install instructions create a cron trigger as a side effect (asking an agent to call `create_trigger`), it carries no plugin provenance, so uninstall does not know to remove it — the workspace ends up with an orphaned cron entry pointing at deleted knowhow. (Event-driven triggers declared as `triggers/<slug>/trigger.toml` avoid this: install auto-registers them stamped with the plugin id, and uninstall auto-deletes exactly those — see "Shipping triggers".)
+2. **The schedule is workspace state, not reference material.** A plugin shipping a cron entry is like a library shipping a crontab line: wrong layer. Knowhow is "how to do this well", cron triggers are "when I want it to happen".
+3. **Orphaned cron entries.** A cron trigger the install instructions create as a side effect (an agent calling `create_trigger`) carries no plugin provenance. Uninstall does not remove it, so it is left pointing at deleted knowhow. A shipped `trigger.toml` avoids this, because uninstall deletes exactly the triggers stamped with the plugin id.
 4. **Install-time prompt is the right UX.** When `install_plugin` lands the knowhow, the LLM tells the user *"This plugin works best with a reflection trigger. Want me to set one up? Daily at 4am is a good default."* Conversational, opinionated default, but the user owns the schedule.
 
-**Webhooks do not ship either, and for the same reason.** A webhook is a row in the `webhooks` table, not a file, so there is no manifest field for one and no sixth content dir. Three things would have to travel with it and none can. The shared secret is a `credentials` row, and plugins never ship credentials. The delivery URL does not exist until create time, and the host is the installing machine's own funnel. The sender-side registration only the account owner can do.
+So if a plugin would benefit from a cron trigger, mention it in the manifest `description`. The install-time LLM then offers to set one up. The canonical example is `browser-learning` v0.2.0, which ships knowhow only and relies on that prompt for its reflection (cron) trigger.
 
-Everything downstream of the event still ships, and it is most of the value: the `triggers/<slug>/trigger.toml` subscribing to the pinned event, the script that reads the payload, and the knowhow describing the payload shape and its field paths. The `setup` field is the bridge for the hook itself. Write it as instructions to the agent. Request the shared secret as a credential. Run `lucidos webhooks create` with the same event type the trigger subscribes to. Read back the delivery path, and hand the user the URL plus the exact steps to register it with the sender.
+**Webhooks do not ship either, and for the same reason.** A webhook is a row in the `webhooks` table, not a file, so no manifest field or content dir holds one. Three things would have to travel with it and none can:
 
-**A plugin doing this should say so in its `description`.** The trigger goes live at install, subscribed to an event type nothing emits until setup finishes. If the user cancels the setup thread, or the create fails, the trigger sits there never firing and nothing warns anyone. The same failure mode as a half-done event rename. The `setup` text should verify the hook exists before it reports done.
+- The shared secret is a `credentials` row, and plugins never ship credentials.
+- The delivery URL does not exist until create time, and its host is the installing machine's own funnel.
+- Only the account owner can do the sender-side registration.
 
-Concretely:
+Everything downstream of the event still ships, and it is most of the value: the `triggers/<slug>/trigger.toml` subscribing to the pinned event, the script that reads the payload, and the knowhow describing the payload shape and its field paths. The `setup` field bridges the hook itself. Write it as instructions to the agent:
 
-- Apps, knowhow, and event-driven (`on_event`) triggers ship in plugins -- they're reference material or part of the plugin's mechanism (what it IS, how to do it, what it reacts to).
-- Cron triggers, OAuth credentials, and personal data DO NOT ship in plugins -- they're workspace state (WHEN-on-a-clock, WHO, WHAT-FOR).
-- If a plugin would benefit from a cron trigger, the manifest `description` should mention it so the install-time LLM can offer to set one up conversationally.
+1. Request the shared secret as a credential.
+2. Run `lucidos webhooks create` with the same event type the trigger subscribes to.
+3. Read back the delivery path, and hand the user the URL plus the exact steps to register it with the sender.
 
-The canonical example is `browser-learning` v0.2.0, which ships knowhow only and relies on the install-time prompt for the reflection (cron) trigger.
+**A plugin doing this should say so in its `description`.** The trigger goes live at install, subscribed to an event type nothing emits until setup finishes. If the user cancels the setup thread, or the create fails, the trigger never fires and nothing warns anyone. The `setup` text should verify the hook exists before it reports done.
 
 ## Where a plugin keeps its runtime state
 
 A plugin's scripts, triggers and apps often write state when they run: a cursor, a last-seen id, a cache, a log. Put that state under `data/artifacts/<plugin-id>/`. Never write it inside the plugin's own `triggers/`, `apps/`, `scripts/` or `knowhow/` folders.
 
-Those folders hold the shipped content, so two things go wrong with state there:
+Those folders hold shipped content, so state there goes wrong two ways:
 
-- **Updates and uninstalls manage them.** An update replaces or merges the files the plugin shipped. Uninstall tells the user to delete them. State kept among them is easy to lose.
+- **Updates and uninstalls manage them.** An update replaces or merges the files the plugin shipped. Uninstall deletes them. State kept among them is easy to lose.
 - **The engine reads state there as a local edit.** The Modified badge counts any file added to the plugin's app folder, and any change to a file the plugin shipped. An update's three-way merge then treats that change as the user's edit. A plugin nobody touched looks modified.
 
 Build the path from `LUCIDOS_WORKSPACE`, the workspace root the engine sets for every process it spawns:
@@ -444,7 +496,7 @@ This overrides the `__file__`-relative state path in `triggers.md` § "Scripts r
 
 `install_plugin(source)` detects the shape by string format (`engine/tools/plugins.rs::detect_source`).
 
-### 1. Single-repo plugin -- plain git URL
+### 1. Single-repo plugin: plain git URL
 
 The plugin tree sits at the repo root.
 
@@ -459,7 +511,7 @@ Install URL: `https://github.com/owner/my-plugin` or `https://github.com/owner/m
 
 Pick this when the plugin is a standalone project with its own README, issue tracker, and release cadence.
 
-### 2. Monorepo with subpath -- GitHub tree URL
+### 2. Monorepo with subpath: GitHub tree URL
 
 Many plugins live under one repo, each in its own subdirectory.
 
@@ -474,15 +526,15 @@ github.com/lucidos-dev/plugins
     apps/
 ```
 
-Install URL: `https://github.com/lucidos-dev/plugins/tree/main/browser-learning`. This is exactly what GitHub puts in the address bar when a user navigates to the plugin's directory in the web UI -- copy + paste install.
+Install URL: `https://github.com/lucidos-dev/plugins/tree/main/browser-learning`. GitHub shows exactly this in the address bar on the plugin's directory, so install is copy and paste.
 
 Parse rules (`parse_github_tree`): the URL must be `https://github.com/<owner>/<repo>/tree/<branch>[/<subpath>]`. The engine clones `https://github.com/<owner>/<repo>.git` at `<branch>`, then treats `<subpath>` as the plugin root. Subpath is optional (a tree URL pointing at the repo root works too).
 
-Pick this when shipping multiple plugins together makes sense -- shared review cadence, one CI, one README listing them all. The canonical example is `lucidos-dev/plugins`. The repo's top-level README acts as a human-browseable discovery index; the engine ignores it (subpath isolates the plugin tree).
+Pick this when shipping plugins together makes sense: shared review cadence, one CI, one README listing them all. The canonical example is `lucidos-dev/plugins`. Its top-level README is a human discovery index, which the engine ignores because the subpath isolates the plugin tree.
 
-For non-GitHub monorepos in v1, fall back to one repo per plugin -- only GitHub tree URLs are parsed.
+For non-GitHub monorepos in v1, fall back to one repo per plugin: only GitHub tree URLs are parsed.
 
-### 3. Local archive -- `.lucidos-plugin` file
+### 3. Local archive: `.lucidos-plugin` file
 
 A `.lucidos-plugin` is a **PKZip archive** of the plugin tree, renamed. Always build with `zip`:
 
@@ -491,41 +543,52 @@ cd my-plugin
 zip -r ../my-plugin.lucidos-plugin .
 ```
 
-**Do not use `tar`, `tar -czf`, `gzip`, or any non-zip format.** The custom `.lucidos-plugin` extension does not change the format -- the engine opens it with `zip::ZipArchive::new()` (`engine/tools/plugins.rs::extract_zip`), which only understands PKZip. A gzipped tarball or raw gzip stream fails with an opaque "read archive: ..." parse error and the user has to repackage. If `zip` is not installed, install it (`brew install zip`, `apt install zip`) rather than substituting another archiver.
+**Do not use `tar`, `tar -czf`, `gzip`, or any non-zip format.** The custom extension does not change the format. The engine opens it with `zip::ZipArchive::new()` (`engine/tools/plugins.rs::extract_zip`), which only understands PKZip. A gzipped tarball or raw gzip stream fails with an opaque "read archive: ..." parse error, and the user has to repackage. If `zip` is not installed, install it (`brew install zip`, `apt install zip`) rather than substituting another archiver.
 
-Install URL: an absolute filesystem path ending in `.lucidos-plugin` (`/Users/x/Downloads/my-plugin.lucidos-plugin`). The engine extracts the zip into a temp dir and validates as if it were a git checkout.
+Install URL: an absolute filesystem path ending in `.lucidos-plugin` (`/Users/me/Downloads/my-plugin.lucidos-plugin`). The engine extracts the zip into a temp dir and validates as if it were a git checkout.
 
-Pick this for: ad-hoc sharing (Slack, email), pre-publication testing, plugins that cannot or should not be published to a public git host. The custom extension makes the file self-announcing and gives a clean upgrade path to OS file association later. Archive plugins may omit the `source` field entirely -- they install and uninstall normally, but `check_plugin_updates` / `update_plugin` will report that there is nowhere to fetch from. If you do want updates while still distributing as an archive, set `source` to the git repo the archive is built from.
+Pick this for ad-hoc sharing (Slack, email), pre-publication testing, and plugins that should not go to a public git host. The custom extension makes the file self-announcing and leaves room for OS file association later. Archive plugins may omit `source`: they install and uninstall normally, but `check_plugin_updates` / `update_plugin` report nowhere to fetch from. For updates while distributing as an archive, set `source` to the git repo the archive is built from.
 
 ## Authoring loop
 
-1. **Lay out the tree.** Create `my-plugin/manifest.toml` and the content directories. Author content as if it were already installed -- knowhow files use the same frontmatter rules as any other knowhow (`system-knowhow/building-knowhow.md`), apps follow the app conventions (`system-knowhow/building-an-app.md`), triggers obey the intent-vs-procedure rule (`system-knowhow/triggers.md`).
-2. **Find every external reference, then ask the user how to handle each one.** Walk the apps' HTML/JS/CSS for `src=`, `href=`, `import`, and `fetch(...)` calls. For each path that does not resolve to a file you're already shipping under the plugin tree -- absolute paths, paths into `data/artifacts/`, paths into another app's tree, paths into the workspace's `data/scripts/` or `data/knowhow/` you don't intend to ship -- **list it back to the user and ask what to do** before bundling. Do not silently rewrite or drop references. Per reference, the user picks one of: (a) bundle the asset by copying it into `apps/<id>/` (or the appropriate plugin subtree) and rewriting the reference, (b) leave the reference as-is because the installer is expected to provide the file separately (rare -- document this in the plugin's README or `description`), (c) delete the reference and the dependent feature, or (d) abort packaging. The reason for asking: an image in `data/artifacts/foo.png` might be the user's source-of-truth they want to share, or it might be incidental scratch they want to drop -- the engine cannot guess.
-3. **Bump `version` in `manifest.toml` before publishing.** Without a version bump, `check_plugin_updates` will report `"Already at latest"` to existing installers and they will not pick up the new content.
-4. **For archive distribution, package as zip and verify.** From inside the plugin tree, run `zip -r ../my-plugin.lucidos-plugin .`. Then verify with `unzip -l ../my-plugin.lucidos-plugin` that every expected file is present and `file ../my-plugin.lucidos-plugin` reports `Zip archive data` (not `gzip compressed data`). Never substitute `tar`, `tar -czf`, or `gzip` -- the install path only understands PKZip.
-5. **Commit and push.** For monorepo plugins, the install URL changes only if the subpath changes -- bumping the plugin's content under the same path is what `update_plugin` re-fetches.
+1. **Lay out the tree.** Create `my-plugin/manifest.toml` and the content directories. Author content as if it were already installed:
+   - knowhow files use the same frontmatter rules as any other knowhow (`system-knowhow/building-knowhow.md`);
+   - apps follow the app conventions (`system-knowhow/building-an-app.md`);
+   - triggers obey the intent-vs-procedure rule (`system-knowhow/triggers.md`).
+2. **Find every external reference, then ask the user how to handle each one.** Walk the apps' HTML/JS/CSS for `src=`, `href=`, `import`, and `fetch(...)` calls. A path that does not resolve to a file you ship under the plugin tree needs a decision: absolute paths, and paths into `data/artifacts/`, another app's tree, or unshipped `data/scripts/` / `data/knowhow/`. **List each one back to the user and ask what to do** before bundling. Never silently rewrite or drop a reference. Per reference, the user picks one of:
+   - (a) bundle the asset by copying it into `apps/<id>/` (or the right plugin subtree) and rewriting the reference;
+   - (b) leave the reference as-is, because the installer provides the file separately (rare: document this in the plugin's README or `description`);
+   - (c) delete the reference and the dependent feature;
+   - (d) abort packaging.
 
-The engine's e2e tests cover install, update, and uninstall mechanics -- plugin authors don't need a manual smoke-test loop. Write a valid manifest and tree; the engine guarantees the rest.
+   Ask because the engine cannot guess. An image in `data/artifacts/foo.png` might be a source of truth the user wants to share, or scratch they want to drop. Auto-bundling risks shipping private workspace artifacts, and auto-dropping risks publishing a broken feature.
+3. **Bump `version` in `manifest.toml` before publishing.** Without a bump, `check_plugin_updates` reports `"Already at latest"` to existing installers, and they never get the new content. Adding `engine` for the first time needs its own bump too (see "The `engine` requirement" above).
+4. **For archive distribution, package as zip and verify.** From inside the plugin tree, run `zip -r ../my-plugin.lucidos-plugin .`. Then check that `unzip -l ../my-plugin.lucidos-plugin` lists every expected file. `file ../my-plugin.lucidos-plugin` must report `Zip archive data`, not `gzip compressed data`.
+5. **Commit and push.** For monorepo plugins, the install URL changes only if the subpath changes. `update_plugin` re-fetches new content under the same path.
 
-A second `install_plugin` over the same tree returns `Error: would overwrite N files: [list]. Re-run with overwrite=true to proceed.` That message is verbatim what the LLM relays to the user; running again with `overwrite=true` proceeds and atomically replaces each file (write to `<dest>.tmp`, rename) so a crash mid-extract does not leave half-written content. The conflict scan happens before any write to `data/`, so the "no conflicts -> no overwrite needed" path leaves the workspace untouched on validation failure.
+Authors need no manual smoke test: the engine's e2e tests cover install, update and uninstall.
 
-A disk failure during extract (out-of-space, permission denied) returns an error mid-write but does NOT roll back already-written files. This is rare in practice and the install record is not emitted -- but be aware that a failed install can leave a partial subset of files on disk.
+A second `install_plugin` over the same tree returns `Error: would overwrite N files: [list]. Re-run with overwrite=true to proceed.` The LLM relays that message verbatim. Running again with `overwrite=true` replaces each file atomically (write to `<dest>.tmp`, rename), so a crash mid-extract leaves no half-written file. The conflict scan runs before any write to `data/`, so a validation failure leaves the workspace untouched.
+
+A disk failure during extract (out-of-space, permission denied) returns an error mid-write but does NOT roll back files already written. No install record is emitted, so a failed install can leave a partial set of files on disk.
 
 ## Versioning and updates
 
-Semver is enforced at parse time -- `0.1.0`, `1.4.2-beta.1` parse, `latest` and `1.0` do not.
+Semver is enforced at parse time: `0.1.0`, `1.4.2-beta.1` parse, `latest` and `1.0` do not.
 
 `check_plugin_updates(id?)` (`engine/tools/plugins.rs::execute_check_plugin_updates`):
 
 - With `id` omitted, surveys every currently-installed plugin (newest `PluginInstalled` event for each `aggregate_id`, skipped if a later `PluginUninstalled` exists).
 - For each plugin, fetches the manifest from the recorded `manifest.source` (shallow clone to temp, read `manifest.toml`, discard).
 - Compares semver. `changed: true` only when the remote version is strictly greater.
-- Network failures per plugin become `error` entries in the JSON output -- they do not abort the whole check.
+- Checks the remote manifest's `engine` requirement. It reports `engine_requirement` (as authored, or `null` when undeclared), `engine_compatible`, and, when it is false, `engine_incompatible_reason` with the same sentence `update_plugin` would refuse with. `changed: true` with `engine_compatible: false` means a newer version exists that this release cannot install yet.
+- A network failure for one plugin becomes an `error` entry in the JSON output. It does not abort the whole check.
 
 ```json
 [
-  { "id": "browser-learning", "installed_version": "0.1.0", "latest_version": "0.2.0", "changed": true, "source": "...", "remote_manifest": { ... } },
-  { "id": "habit-tracker", "installed_version": "1.4.0", "latest_version": "1.4.0", "changed": false, "source": "..." },
+  { "id": "browser-learning", "installed_version": "0.1.0", "latest_version": "0.2.0", "changed": true, "engine_requirement": null, "engine_compatible": true, "engine_incompatible_reason": null, "source": "...", "remote_manifest": { ... } },
+  { "id": "theme-studio", "installed_version": "0.1.0", "latest_version": "0.2.0", "changed": true, "engine_requirement": ">=0.99.0", "engine_compatible": false, "engine_incompatible_reason": "Theme Studio 0.2.0 needs Lucidos 0.99.0 or later. This is Lucidos 0.46.2. Update Lucidos first.", "source": "...", "remote_manifest": { ... } },
+  { "id": "habit-tracker", "installed_version": "1.4.0", "latest_version": "1.4.0", "changed": false, "engine_requirement": null, "engine_compatible": true, "engine_incompatible_reason": null, "source": "..." },
   { "id": "weather-feed", "installed_version": "0.3.0", "source": "...", "error": "fetch failed: ..." }
 ]
 ```
@@ -534,54 +597,51 @@ Semver is enforced at parse time -- `0.1.0`, `1.4.2-beta.1` parse, `latest` and 
 
 - Looks up the newest `PluginInstalled` for `id` (must not be followed by `PluginUninstalled`).
 - Re-fetches the remote manifest from the recorded `source`.
-- If `remote_version <= installed_version` returns `Already at latest (v<x>)` -- a no-op that emits no event. (Note: the `compare_versions` helper treats remote-older-than-installed as `AlreadyLatest`, so a downgrade also no-ops; intentional version downgrades are not supported by `update_plugin`.)
-- Otherwise re-runs `install_plugin` with the recorded source and `overwrite=true`. Same conflict mechanics, same `PluginInstalled` event variant -- updates are just installs over existing files.
+- If `remote_version <= installed_version`, returns `Already at latest (v<x>)`: a no-op that emits no event. `compare_versions` treats remote-older-than-installed as `AlreadyLatest`, so `update_plugin` cannot downgrade.
+- Otherwise re-runs `install_plugin` with the recorded source and `overwrite=true`. It goes through the same staging, so an unmet `engine` requirement refuses the update just as it refuses an install. Same conflict mechanics, same `PluginInstalled` event variant: updates are installs over existing files.
 
-If the recorded manifest is missing `source` (which would only happen if a future plugin format changes the field), the update returns an error rather than guessing.
+If the recorded manifest has no `source`, the update returns an error rather than guessing.
 
-A version that fails to parse (`compare_versions` with garbage on either side) is treated as needing update -- the engine prefers attempting the install over silently no-oping on corrupted data.
+A version that fails to parse (`compare_versions` with garbage on either side) counts as needing an update. The engine prefers attempting the install over silently doing nothing on corrupted data.
 
-## Uninstall semantics (v1 is GUIDE-ONLY)
+## Uninstall semantics
 
-`uninstall_plugin(id)` (`execute_uninstall_plugin`):
+Uninstall stages a confirmation panel, just like install, and deletes nothing until the user confirms. The `uninstall_plugin(id)` tool (`prepare_uninstall_plugin`) and the Plugins panel's **Uninstall** button (`stage_uninstall_request`) open the same panel. Staging:
 
-- Looks up the newest `PluginInstalled` for `id`.
-- Emits a `PluginUninstalled` event with `{id, version, files}` (files copied from the install record).
-- Returns text the LLM relays to the user listing every path under `data/` to delete:
+- Resolves `id` (or the manifest `name`, or an owned `apps/<dir>` folder) and reads the newest `PluginInstalled` record.
+- Splits the recorded files into `files_present` and `files_missing`, and lists both in the panel. A recorded path outside the seven content dirs counts as missing, so the panel never offers it for deletion.
+- Expires after 1 hour, like an install.
 
-```
-Plugin "browser-learning" v0.1.0 marked uninstalled.
+**Confirm** (`confirm_pending_uninstall`, then `uninstall_with_bus`):
 
-To remove its files, delete these N paths under data/:
-  - knowhow/browser-skills.md
-  - knowhow/browser-knowhow-reflection.md
+1. Deletes each present file under `data/` and prunes empty parent folders. A content-dir root such as `data/apps/` always stays.
+2. Commits the deletion in one commit, `"Uninstall plugin: <id> v<version>"`.
+3. Emits `PluginUninstalled` with `files`, `files_deleted` and `files_missing`. A file that vanished between staging and confirm goes into `files_missing`.
+4. Deletes the triggers stamped with this plugin's id, and reloads WASM signers if an `auth-modules/` file went.
 
-Some files may have been edited since install, or shared with another plugin -- review before deletion.
-```
-
-The engine does NOT delete files. The LLM should offer "want me to delete them?" and chain to the existing file-delete tools once the user confirms.
+The confirm response carries `files_deleted`, `files_missing` and a `summary` such as `Uninstalled Browser Learning v0.1.0 (2 files removed).` **Cancel** drops the staging and emits `PluginUninstallCanceled`.
 
 What this means for plugin authors:
 
-- **Design files to be tolerant of being installed alongside user edits.** A user who customised your knowhow file in place loses those edits if the LLM blindly deletes during the uninstall guide flow -- your README should warn about this if your plugin invites edits.
-- **Sharing a path between plugins is allowed but messy.** If two plugins both ship `knowhow/sites/linkedin.com/selectors.md`, whichever installs second wins (overwrite). Uninstalling either one suggests deleting the file even though the other plugin still relies on it. Avoid path collisions across plugins where possible.
-- **Reinstall after uninstall is supported.** Calling `install_plugin` on the same source after `uninstall_plugin` works -- the engine treats the uninstall as a tombstone and the next install is fresh.
+- **Uninstall deletes edited files too.** Confirming removes every recorded file still on disk, local edits included. The panel lists them first, and the workspace git history keeps each committed version. If your plugin invites edits, say so in its `description`.
+- **Sharing a path between plugins is allowed but messy.** If two plugins both ship `knowhow/sites/linkedin.com/selectors.md`, whichever installs second wins (overwrite). Uninstalling either one deletes the file, even though the other plugin still relies on it. Namespace your files, e.g. `knowhow/<plugin-id>-<topic>.md` or a dedicated subdirectory.
+- **Reinstall after uninstall is supported.** `install_plugin` on the same source after `uninstall_plugin` works: the engine treats the uninstall as a tombstone, and the next install is fresh.
 
 ## Local modifications (the "Modified" badge)
 
-A plugin's shipped content lives under `data/` like any other artifact, so the user (or the Lucidos Agent, or a coding-agent thread) can edit it after install. When that happens the Plugins list shows a **Modified** badge on the plugin's row, and updating the plugin warns that the update will overwrite the local changes.
+A plugin's shipped content lives under `data/` like any other artifact. So the user, the Lucidos Agent or a coding-agent thread can edit it after install. When that happens the Plugins list shows a **Modified** badge on the plugin's row. An update merges those changes into the new version where it can (see "An update keeps your changes" below).
 
 This state is **derived on read, never stored**: there is no "PluginModified" event. The engine diffs the plugin's on-disk content against the install commit (`payload.data.manifest.commit`). It returns `modified` + `modified_paths` on the installed summary and catalog row (`registry::plugin_modification_status`). Being a pure function of git plus disk, it **self-heals**: revert an edit and the badge clears. An update re-stamps the baseline, so the badge clears there too, unless the update kept a patch. A kept patch is still a local change, so the badge correctly stays on.
 
 What counts as a modification, per content type:
 
 - **Apps** (`apps/<id>/`): any edit, delete, or **added** file inside the plugin's app directory (a directory diff against the install commit). Build output never counts: a file under one of the build-output directories listed in "Plugin layout", or a `*.pyc` / `*.pyo` file.
-- **Knowhow / scripts / auth-modules**: an edit or delete of a file the plugin *recorded*. A brand-new file you drop into `knowhow/` (etc.) is *not* attributed to a plugin — those roots are shared by the user and other content.
-- **Triggers** (`triggers/<slug>/trigger.toml`): a change to the trigger's *definition*. `trigger.toml` is a gitignored, re-serialized projection (ADR 0019), so it is compared semantically (ignoring `slug` / `plugin_id` / `group_id`), not byte-for-byte — re-serialization after install never counts as a modification.
+- **Knowhow / scripts / auth-modules**: an edit or delete of a file the plugin *recorded*. A brand-new file you drop into `knowhow/` (etc.) is *not* attributed to a plugin, since the user and other content share those roots.
+- **Triggers** (`triggers/<slug>/trigger.toml`): a change to the trigger's *definition*. `trigger.toml` is a gitignored, re-serialized projection (ADR 0019). It is compared semantically (ignoring `slug` / `plugin_id` / `group_id`), not byte-for-byte, so re-serialization after install never counts.
 
 ### An update keeps your changes
 
-An update used to overwrite every file the plugin ships, so a local edit was lost. It is three-way merged instead. The three inputs are all in hand at staging time. **Base** is the file at the install commit, **ours** is what is on disk, and **theirs** is the staged new version (`plugins::merge`).
+An update three-way merges each locally-edited file. The three inputs are all in hand at staging time. **Base** is the file at the install commit, **ours** is what is on disk, and **theirs** is the staged new version (`plugins::merge`).
 
 The staged install panel lists the outcome for each edited file **before** you confirm:
 
@@ -592,7 +652,7 @@ The staged install panel lists the outcome for each edited file **before** you c
 | `replaced` | Never mergeable: a trigger definition, a binary, or a file over 1 MB. Writes upstream's version, and saves yours aside. |
 | `restored` | You had deleted the file and the new version still ships it, so it comes back. Nothing is saved aside, because a deletion has no content to keep. |
 
-**A file already identical to the new version is not listed at all.** It is the common shape after you publish your own edit upstream: you update back onto your own work. Those paths are written as shipped, with no row, no count, and nothing saved aside. Only the files that still differ from the new version are a decision. The comparison is by content hash, so an oversized file is judged like any other.
+**A file already identical to the new version is not listed at all.** That is the common case after your own edit was accepted upstream. Those paths are written as shipped, with no row, no count, and nothing saved aside. The comparison is by content hash, so an oversized file is judged like any other.
 
 The panel also carries one **Keep my edits** control, on by default. Clearing it takes a clean update: every file becomes `replaced`, and every edit is saved aside. The choice reaches the engine as `?keep_local_changes=false` on the confirm. An absent flag means keep, so a caller that never showed the control cannot silently discard a patch.
 
@@ -602,11 +662,11 @@ The panel also carries one **Keep my edits** control, on by default. Clearing it
 
 Installing one version twice is allowed, so a second save of the same version lands in `v<version>-2` rather than replacing the first. The engine never writes over a folder it already saved edits into.
 
-**Why a conflict does not get conflict markers.** These files are LLM context: `knowhow/*.md` is loaded into the agent's prompt as instructions. A file containing `<<<<<<<` is not a broken file you notice, it is a corrupted instruction the engine acts on. So upstream's coherent version wins on disk, and yours is preserved beside it.
+**A conflict gets no conflict markers.** These files are LLM context: `knowhow/*.md` loads into the agent's prompt as instructions. A file containing `<<<<<<<` is a corrupted instruction the engine acts on. So upstream's coherent version wins on disk, and yours is preserved beside it.
 
-**`trigger.toml` is never text-merged.** It is a re-serialized projection the engine rewrites after every install, so its bytes never match what the plugin shipped. Merging it would report a conflict for every plugin trigger on every update. A changed trigger definition reports as `replaced`, and the shipped definition wins.
+**`trigger.toml` is never text-merged.** The engine rewrites it after every install, so its bytes never match what the plugin shipped, and every update would conflict. A changed trigger definition reports as `replaced`, and the shipped definition wins.
 
-**The install commit stays a pristine copy of what the plugin shipped.** A merged path is recorded from upstream's bytes, not from the working tree (`core::commit_data_paths_with_overrides`). A second commit then records the merged tree plus any saved-aside copies. That is what lets a patch carry forward indefinitely. Record the merge in the install commit instead, and the *next* update reads your patch as upstream's own content. It then finds no local modification, and drops it.
+**The install commit stays a pristine copy of what the plugin shipped.** A merged path is recorded from upstream's bytes, not from the working tree (`core::commit_data_paths_with_overrides`). A second commit then records the merged tree plus any saved-aside copies. That lets a patch carry forward across updates. Otherwise the *next* update would read your patch as upstream's content, find no local modification, and drop it.
 
 ### Proposing your patch upstream
 
@@ -636,7 +696,7 @@ Three `SystemEvent` variants for the install lifecycle, plus the two cancel-audi
 
 ### `PluginInstalled`
 
-Emitted on every successful install (including overwrites and updates -- the variant is reused, no separate "PluginUpdated"). Persisted (`payload` JSONB) shape:
+Emitted on every successful install, overwrites and updates included (there is no separate "PluginUpdated"). Persisted (`payload` JSONB) shape:
 
 ```json
 {
@@ -673,9 +733,13 @@ The two outer wrappers come from how Lucidos persists `SystemEvent`: serde's `ta
 
 Same rule for anything deeper: `payload.data.manifest.manifest.version` when reading, `manifest.manifest.version` in a condition. Getting this wrong is silent at match time. So the engine checks every condition path against recent stored payloads when you subscribe. It names the real path when yours is in none of them. See `system-knowhow/triggers.md` § "What a condition can say".
 
-`source_type` is `"git"` for both plain git URLs and GitHub tree URLs, `"archive"` for `.lucidos-plugin` installs. `files` is the same list at the top level (`payload.data.files`) and inside the nested `manifest` blob (`payload.data.manifest.files`) -- the nested copy is what `latest_install` reads when looking up "what files belong to this plugin?" for the uninstall guide. `commit` (at `payload.data.manifest.commit`) is the workspace-repo sha of the "Install plugin: ..." commit -- the baseline the Modified badge diffs against (see "Local modifications" below). Legacy rows installed before this field was recorded simply never show as modified.
+`source_type` is `"git"` for both plain git URLs and GitHub tree URLs, `"archive"` for `.lucidos-plugin` installs.
 
-> **Historical bug, fixed.** Earlier `InstalledRecord::source()` read `payload.manifest.source` -- two layers too shallow -- and silently returned `None`, surfacing as the misleading `"installed manifest is missing 'source' -- cannot fetch latest"` error from `check_plugin_updates` even when the source was recorded. The matching `aggregate_id()` derivation read `manifest.id` (also too shallow), which made every PluginInstalled row land with `aggregate_id = "unknown"` and broke `latest_install(pool, &id)` lookups. Both are fixed; the e2e tests in `engine/tools/plugins.rs` (the `e2e_*` cases) lock the round-trip in. Plugins installed before the fix may still have `aggregate_id = "unknown"` in the events table; reinstall to refresh.
+`files` is the same list at the top level (`payload.data.files`) and inside the nested `manifest` blob (`payload.data.manifest.files`). `latest_install` reads the nested copy to find which files uninstall deletes.
+
+`commit` (at `payload.data.manifest.commit`) is the workspace-repo sha of the "Install plugin: ..." commit. It is the baseline the Modified badge diffs against (see "Local modifications" above). Legacy rows installed before this field existed never show as modified.
+
+Some old rows carry `aggregate_id = "unknown"`, from a since-fixed bug, and `latest_install(pool, &id)` cannot find them. Reinstall the plugin to refresh.
 
 ### `PluginLocalChangesMerged`
 
@@ -700,30 +764,33 @@ This one IS stored, unlike the Modified badge beside it, and the difference is t
 
 ```json
 {
-  "summary": "Uninstalled browser-learning v0.1.0",
   "id": "browser-learning",
   "version": "0.1.0",
-  "files": ["knowhow/browser-skills.md", "..."],
+  "files": ["knowhow/browser-skills.md", "knowhow/browser-knowhow-reflection.md"],
+  "files_deleted": ["knowhow/browser-skills.md"],
+  "files_missing": ["knowhow/browser-knowhow-reflection.md"],
   "actor": { ... }
 }
 ```
 
+`files` is every recorded path, and `files_deleted` plus `files_missing` split it. Each list is omitted when empty. Rows from before uninstall deleted files carry neither.
+
 Both events are useful trigger sources. Examples worth considering:
 
 - A `PluginInstalled` trigger that runs the new plugin's smoke test or pins its app to the launcher.
-- A `PluginUninstalled` trigger that prompts the user "Want me to delete the listed files?" -- one workspace can wire this once instead of relying on the engine LLM to remember to offer it every time.
+- A `PluginUninstalled` trigger that offers to remove the plugin's runtime state under `data/artifacts/<plugin-id>/`, which uninstall leaves alone.
 
 ## Common mistakes to avoid
 
-- **Building the archive with `tar`, `tar -czf`, or `gzip`.** The `.lucidos-plugin` extension is a renamed PKZip file, not a tarball. The install path opens it with `zip::ZipArchive::new()` (`engine/tools/plugins.rs::extract_zip`), which fails on gzip/tar with an opaque parse error. Always run `zip -r ../foo.lucidos-plugin .` from inside the plugin tree -- if `zip` isn't installed, install it (`brew install zip`, `apt install zip`) instead of substituting another archiver. Verify before handing the file off: `unzip -l foo.lucidos-plugin` should list the entries; `file foo.lucidos-plugin` should say `Zip archive data`, not `gzip compressed data`.
-- **Calling the manifest `manifest.json`, `manifest.yaml`, or anything other than `manifest.toml`.** `validate_tree` looks for `manifest.toml` at the archive root and only parses TOML. Other names or formats reject the archive before any file is written. The required fields are `id`, `version`, `name`, `description` (optional: `source`, `engine`) -- see the schema table above.
-- **Silently dropping or rewriting external references.** When an app references a file outside the plugin tree (`<img src="../../artifacts/foo.png">`, `<script src="/data/scripts/bar.js">`, etc.), do not guess. List every external reference back to the user and ask whether to bundle the file into the plugin tree, leave the reference as-is (and document the external dependency), drop the reference + dependent feature, or abort packaging. Auto-bundling without asking risks shipping the user's private workspace artifacts; auto-dropping risks publishing a plugin with a broken feature the user did not realise was lost. See "Authoring loop" step 2 for the full handling rule.
-- **Putting a README at the plugin root.** Validation rejects any top-level entry that is not `manifest.toml` or one of the seven content directories (`apps`, `knowhow`, `triggers`, `scripts`, `auth-modules`, `themes`, `fonts`). Put your README inside `apps/<id>/` if it is app-specific, or only in the source repo (which is not part of what gets installed).
+- **Building the archive with `tar`, `tar -czf`, or `gzip`.** A `.lucidos-plugin` is a renamed PKZip file. See "3. Local archive" and "Authoring loop" step 4.
+- **Calling the manifest `manifest.json`, `manifest.yaml`, or anything other than `manifest.toml`.** `validate_tree` looks for `manifest.toml` at the archive root and only parses TOML. Other names or formats reject the archive before any file is written. See the schema table above for the fields.
+- **Silently dropping or rewriting external references** (`<img src="../../artifacts/foo.png">`, `<script src="/data/scripts/bar.js">`). Ask the user about each one: see "Authoring loop" step 2.
+- **Putting a README at the plugin root.** Validation rejects any top-level entry that is not `manifest.toml` or one of the seven content directories. Put your README inside `apps/<id>/` if it is app-specific, or only in the source repo, which install never reads.
 - **Committing `__pycache__/` or `*.pyc` files.** Install skips them (see "Plugin layout"), but they still bloat the repo and add noise to every PR. Give the plugin repo a `.gitignore` that lists `__pycache__/`, `*.pyc` and any other build output your scripts or apps create.
 - **Writing runtime state inside the plugin's own folders.** See "Where a plugin keeps its runtime state".
 - **Using underscores or capitals in `id`.** `browser_learning` and `Browser-Learning` both fail validation. Stick to `[a-z0-9-]+`.
-- **Setting `source` to a `.lucidos-plugin` path.** When `source` is present it must be a git URL -- a local archive path is not valid. If you're distributing as an archive only, just omit `source` entirely.
-- **Forgetting to bump `version` before publishing a fix.** Existing installers will see `"Already at latest"` and never pick up your change.
-- **Designing a plugin that overwrites user-editable files.** If the user is meant to edit `knowhow/sites/linkedin.com/selectors.md` after install, then your update flow either overwrites their edits or fails the conflict scan. Either ship the file as a starting template the user moves elsewhere, or document that updates require re-doing local edits.
-- **Cross-plugin path collisions.** Two plugins shipping the same `data/` path race -- the second install wins, and uninstalling either one suggests deleting the shared file. Namespace your files (e.g. `knowhow/<plugin-id>-<topic>.md` or under a dedicated subdirectory).
-- **Treating uninstall as destructive.** It is guide-only. Do not assume your files are gone after `PluginUninstalled` fires -- they may still be on disk, possibly edited.
+- **Setting `source` to a `.lucidos-plugin` path.** When present, `source` must be a git URL. For archive-only distribution, omit `source`.
+- **Forgetting to bump `version` before publishing a fix.** Existing installers see `"Already at latest"` and never get your change.
+- **Expecting an update to keep every user edit.** An update merges edits, but a conflict, a binary, a `trigger.toml` or a file over 1 MB takes the new shipped version. The user's copy is saved aside (see "An update keeps your changes"). If the user is meant to edit `knowhow/sites/linkedin.com/selectors.md`, ship it as a template they copy elsewhere.
+- **Cross-plugin path collisions.** See "Sharing a path between plugins" under "Uninstall semantics".
+- **Keeping user data in a shipped file.** Confirming an uninstall deletes every recorded file still on disk, edits included. Keep runtime state under `data/artifacts/<plugin-id>/`, which uninstall never touches.

@@ -5,7 +5,8 @@
 //! resumes the parent's turn. This module is the other direction, and it is
 //! deliberately not an any-to-any address space. A thread can address its own
 //! **direct** children and nothing else: no sibling edge, no grandchild edge,
-//! no cross-workspace edge.
+//! no cross-workspace edge. The one exception is the *home thread*, which may
+//! address any thread in its workspace (`api::thread_reach::follow_up_reach`).
 //!
 //! The caller never states the relationship. It is looked up from the child's
 //! `thread_summaries` row and the caller identity is ambient, so on the
@@ -33,6 +34,7 @@
 
 use uuid::Uuid;
 
+pub(crate) use crate::api::thread_reach::FollowUpReach;
 use crate::engine::thread_lifecycle::ThreadStatus;
 
 /// Why a child follow-up was refused. Every branch is a refusal: no branch
@@ -47,6 +49,9 @@ pub enum ChildFollowUpError {
     NotYourChild(Uuid),
     /// The target was thrown away by the user.
     ChildDiscarded(Uuid),
+    /// The target is an unsent draft. Only the home thread reaches one, since
+    /// a draft is nobody's child, and a message would overwrite the draft.
+    ChildIsDraft(Uuid),
     /// The caller addressed itself.
     SelfTarget(Uuid),
     /// No ambient caller identity, so there is no relationship to check.
@@ -68,7 +73,7 @@ impl ChildFollowUpError {
         match self {
             Self::UnknownChild(_) => 404,
             Self::NotYourChild(_) => 403,
-            Self::ChildDiscarded(_) => 409,
+            Self::ChildDiscarded(_) | Self::ChildIsDraft(_) => 409,
             Self::SelfTarget(_) => 400,
             Self::NoCaller => 403,
             Self::CrossWorkspaceUnsupported => 400,
@@ -89,6 +94,11 @@ impl std::fmt::Display for ChildFollowUpError {
             Self::ChildDiscarded(id) => {
                 write!(f, "Child thread {id} was discarded and cannot be reached.")
             }
+            Self::ChildIsDraft(id) => write!(
+                f,
+                "Thread {id} is an unsent draft the user is still writing, so it cannot \
+                 be followed up."
+            ),
             Self::SelfTarget(_) => write!(
                 f,
                 "A thread cannot follow up on itself. Address one of its child threads."
@@ -292,6 +302,9 @@ impl FollowUpDelivery {
 #[derive(Debug, Clone)]
 pub struct FollowUpAck {
     pub child_thread_id: Uuid,
+    /// How the caller reached it. Only [`FollowUpReach::OwnChild`] gets the
+    /// target's outcome back as a card.
+    pub reach: FollowUpReach,
     /// The child's human-meaningful handle. The tool's success text names the
     /// child by this and never by uuid, so the model's prose stays uuid-free.
     pub child_title: String,
@@ -423,14 +436,18 @@ impl crate::engine::LucidosEngine {
             first_message,
         };
 
-        if row.parent_thread_id != Some(caller_thread_id) {
+        let reach =
+            crate::api::thread_reach::follow_up_reach(pool, caller_thread_id, row.parent_thread_id)
+                .await
+                .map_err(|e| ChildFollowUpError::Internal(e.to_string()))?;
+        let Some(reach) = reach else {
             crate::log!(
                 "[ChildFollowUp] Refused: thread {} is not a child of caller {}",
                 child_thread_id,
                 caller_thread_id
             );
             return Err(ChildFollowUpError::NotYourChild(child_thread_id));
-        }
+        };
         if row.state.as_deref() == Some("discarded") {
             crate::log!(
                 "[ChildFollowUp] Refused: child {} of caller {} is discarded",
@@ -438,6 +455,13 @@ impl crate::engine::LucidosEngine {
                 caller_thread_id
             );
             return Err(ChildFollowUpError::ChildDiscarded(child_thread_id));
+        }
+        if row.state.as_deref() == Some("composing") {
+            crate::log!(
+                "[ChildFollowUp] Refused: thread {} is a draft",
+                child_thread_id
+            );
+            return Err(ChildFollowUpError::ChildIsDraft(child_thread_id));
         }
 
         // The router holds this message for a coding-agent child waiting on a
@@ -452,6 +476,7 @@ impl crate::engine::LucidosEngine {
             .await;
         let ack = FollowUpAck {
             child_thread_id,
+            reach,
             child_title: row.label(),
             delivered_to: if held {
                 FollowUpDelivery::Held
@@ -603,8 +628,7 @@ impl crate::engine::LucidosEngine {
                 urgency,
             )
             .await?;
-            // Authorized, so the caller is Some and is the child's parent.
-            let caller_thread_id = row.parent_thread_id.expect("ladder proved parenthood");
+            let caller_thread_id = caller_thread_id.expect("the ladder refuses a missing caller");
             let use_coding_agent = row.uses_coding_agent();
 
             // The child's timeline attributes this to the parent thread, by title,

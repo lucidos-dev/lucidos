@@ -1,378 +1,123 @@
-//! Command-guard LLM *judge* (ADR 0002, Phase 3) — the fallible half of the
-//! hybrid classifier.
+//! Command-guard *judge* (ADR 0002, Phase 3): the fallible half of the hybrid
+//! classifier.
 //!
 //! The static [`static_classify`](crate::engine::command_guard::static_classify)
-//! fast-path settles the catastrophic deny-list and an obviously-safe allowlist;
-//! everything else is the *ambiguous middle* and lands here. A cheap, fast model
-//! (Haiku by default, configurable via `model_command_judge`) reads the one
-//! command and returns a [`JudgeVerdict`] — a [`RiskLane`] plus a one-line
-//! summary for the permission card. It errs toward *ask*: anything it can't
-//! confidently call safe becomes `IrreversibleDanger`.
+//! fast-path settles the catastrophic deny-list and an obviously-safe allowlist.
+//! Everything else is the *ambiguous middle* and lands here. The judge asks two
+//! typed questions ([`command_judge_questions`]) of whichever judgment provider
+//! the user picked: the chat model `model_command_judge` names by default, or a
+//! System One row (ADR 0363).
 //!
-//! Infra failures (no provider, a failed/empty call) surface as `Err` so the
-//! caller can fall back to the static "dangerous" list
-//! ([`fallback_classify`](crate::engine::command_guard::fallback_classify))
-//! rather than punish the user for an LLM hiccup. A *parseable-but-unclear*
-//! response is NOT
-//! an error — it resolves to `IrreversibleDanger` (ask), per the design's
-//! tie-break.
+//! **The fail-safe is a Rust threshold** (I13 of
+//! `docs/plans/2026-10-04-tree-memory-module-and-the-home-thread.md`). A
+//! missing, malformed or unsure answer resolves to `IrreversibleDanger`, on
+//! every provider. Only a call that never answered is an `Err`, and the caller
+//! then falls back to the static list
+//! ([`fallback_classify`](crate::engine::command_guard::fallback_classify)).
 
 use std::time::Duration;
-
-use serde_json::Value;
 
 use crate::engine::command_guard::{JudgeInput, RiskLane, SideEffectCategory};
 use crate::engine::command_judge_questions;
 use crate::engine::{AuxCapture, ContextPurpose, LucidosEngine};
-use crate::llm::judgment::JudgmentProvider;
-use crate::llm::provider::{LlmProvider, Message, MessageContent};
-use crate::llm::tool_names as tn;
-
-/// The classifier rubric the judge runs under. Seeded with the safe/dangerous
-/// examples from the design doc so a small model stays calibrated.
-const JUDGE_SYSTEM_PROMPT: &str = r#"You are a security classifier for a personal AI assistant that runs shell and Python commands on the user's machine. The assistant works inside a single workspace directory (its current directory); reads anywhere on the machine and writes under the workspace are normal and expected.
-
-Classify exactly ONE command into one risk lane and return STRICT JSON.
-
-Lanes:
-- "safe": reads, data crunching, builds/tests, downloads (HTTP GET), in-workspace writes, reading or editing files ANYWHERE on the machine — anything with no irreversible real-world side-effect and no destruction outside the workspace.
-- "reversible": destruction confined to the workspace (e.g. rm or overwrite of files under the workspace) — recoverable from version control.
-- "irreversible": (1) an irreversible real-world side-effect, OR (2) destruction of content OUTSIDE the workspace.
-    Examples of (1): sending email or messages (mail, sendmail, osascript driving Mail/Messages), a mutating HTTP request (POST/PUT/DELETE/PATCH, a data upload), a cloud-service mutation (gh/aws/gcloud create/delete/push), Python requests.post / httpx / smtplib, publishing a package, anything that spends money or changes external state.
-    Examples of (2): deleting or overwriting files outside the workspace (rm/mv/dd on system paths, the home directory, another repo).
-
-IMPORTANT: reading or editing files OUTSIDE the workspace is a WANTED feature, not a threat — classify out-of-workspace READS and EDITS as "safe" (or "reversible" if it overwrites a file). Only out-of-workspace DESTRUCTION is "irreversible".
-
-Tie-breaks: when unsure between "safe" and a danger lane, pick the danger lane. When unsure between "reversible" and "irreversible", pick "irreversible".
-
-When (and only when) the lane is "irreversible", also classify the side-effect into one "category" — this gates whether an unattended scheduled trigger is allowed to run it:
-- "email": sending email or messages (mail, sendmail, osascript driving Mail/Messages, Python smtplib).
-- "external_api": a mutating outbound HTTP request (POST/PUT/DELETE/PATCH or data upload; Python requests/httpx writes).
-- "cloud_cli": a cloud-service mutation via gh, aws, or gcloud.
-- "out_of_workspace_destruction": deleting or overwriting files outside the workspace.
-- "other": any irreversible side-effect that fits none of the above.
-Pick the single best-fitting category; use "other" if unsure. For "safe" and "reversible" lanes, set "category" to null.
-
-Return ONLY this JSON object, no prose and no code fences:
-{"lane":"safe|reversible|irreversible","category":"email|external_api|cloud_cli|out_of_workspace_destruction|other|null","summary":"one short sentence the user sees on an approval card, e.g. 'Sends an email via the mail command.'","reason":"brief justification"}"#;
+use crate::llm::judgment::{
+    for_site, system_one_for, ChatJudgmentProvider, JudgmentProvider, JudgmentSite,
+};
 
 /// The judge's classification of one ambiguous command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JudgeVerdict {
     pub lane: RiskLane,
-    /// The side-effect category — `Some` only when `lane == IrreversibleDanger`
-    /// (gates the trigger side-effect grant); `None` for safe/reversible.
+    /// The side-effect category: `Some` only when `lane == IrreversibleDanger`
+    /// (gates the trigger side-effect grant), `None` for safe/reversible.
     pub category: Option<SideEffectCategory>,
     /// One-line card text shown to the user when the lane is `IrreversibleDanger`.
     pub summary: String,
-    /// The judge's brief justification — logged, not shown to the user.
+    /// The distribution behind the verdict, logged and not shown to the user.
     pub reason: String,
 }
 
 impl JudgeVerdict {
-    /// The verdict used when the model responded but produced nothing we can
-    /// read as a lane — err toward *ask* (the design's tie-break). An
-    /// unclassifiable irreversible command is [`SideEffectCategory::Other`], so
-    /// an unattended trigger blocks it unless it granted `other`.
+    /// The verdict for an answer the guard cannot read: err toward *ask*, the
+    /// design's tie-break. An unclassifiable irreversible command is
+    /// [`SideEffectCategory::Other`], so an unattended trigger blocks it
+    /// unless it granted `other`.
     pub(crate) fn uncertain() -> Self {
         Self {
             lane: RiskLane::IrreversibleDanger,
             category: Some(SideEffectCategory::Other),
             summary: "Could not classify this command; treating it as a possible irreversible side-effect.".to_string(),
-            reason: "judge response was not parseable".to_string(),
+            reason: "the judge gave no readable lane".to_string(),
         }
     }
 }
 
-/// Build the per-command user message: the tool kind, the out-of-workspace risk
-/// signal, and the command text itself.
+/// Run one judge classification as two typed Choice questions, on any
+/// judgment provider.
 ///
-/// The command is redacted first. This text leaves the machine for whatever
-/// `model_command_judge` resolves to, which is often not the chat provider,
-/// and a `run_bash` body routinely carries a `postgresql://user:pass@host/db`.
-/// Every sibling lane redacts before it PERSISTS that same text. The path
-/// shipping it to a third party cannot be the one that skips it. A password is
-/// not a risk signal, so the verdict is unchanged.
-fn build_judge_user_prompt(input: &JudgeInput) -> String {
-    let kind = match input.tool_name.as_str() {
-        tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => "Python code",
-        _ => "Shell command",
-    };
-    let escapes = if input.out_of_workspace {
-        "Static analysis flagged a filesystem target OUTSIDE the workspace.\n"
-    } else {
-        ""
-    };
-    format!(
-        "Tool: {kind}\n{escapes}Classify this {kind_lower}:\n```\n{cmd}\n```",
-        kind = kind,
-        escapes = escapes,
-        kind_lower = kind.to_ascii_lowercase(),
-        cmd = crate::core::redact_postgres_secrets(&input.command),
-    )
-}
-
-/// Parse the judge's raw response into a [`JudgeVerdict`]. Robust to code fences
-/// and surrounding prose; an unreadable response resolves to
-/// [`JudgeVerdict::uncertain`] (ask) rather than failing.
-pub fn parse_judge_response(raw: &str) -> JudgeVerdict {
-    let cleaned = strip_code_fences(raw);
-    let value = serde_json::from_str::<Value>(&cleaned).ok().or_else(|| {
-        extract_json_object(&cleaned).and_then(|s| serde_json::from_str::<Value>(&s).ok())
-    });
-    let Some(value) = value else {
-        return JudgeVerdict::uncertain();
-    };
-    let lane = value
-        .get("lane")
-        .and_then(Value::as_str)
-        .map(parse_lane)
-        .unwrap_or(RiskLane::IrreversibleDanger);
-    // The category only matters for the irreversible lane (it gates the trigger
-    // side-effect grant). An irreversible verdict with a missing/unrecognized
-    // category falls back to `Other` so a trigger must explicitly grant it.
-    let category = (lane == RiskLane::IrreversibleDanger).then(|| {
-        value
-            .get("category")
-            .and_then(Value::as_str)
-            .map(parse_category)
-            .unwrap_or(SideEffectCategory::Other)
-    });
-    let summary = value
-        .get("summary")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| default_summary(lane).to_string());
-    let reason = value
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    JudgeVerdict {
-        lane,
-        category,
-        summary,
-        reason,
-    }
-}
-
-/// Map the judge's `category` string to a [`SideEffectCategory`], erring toward
-/// [`SideEffectCategory::Other`] on any unrecognized value. Only consulted for
-/// the irreversible lane.
-pub(crate) fn parse_category(s: &str) -> SideEffectCategory {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "email" => SideEffectCategory::Email,
-        "external_api" | "externalapi" | "http" => SideEffectCategory::ExternalApi,
-        "cloud_cli" | "cloudcli" | "cloud" => SideEffectCategory::CloudCli,
-        "out_of_workspace_destruction" | "outofworkspacedestruction" | "destruction" => {
-            SideEffectCategory::OutOfWorkspaceDestruction
-        }
-        _ => SideEffectCategory::Other,
-    }
-}
-
-/// Map the judge's `lane` string to a [`RiskLane`], erring toward ask on any
-/// unrecognized value. Never returns `Catastrophic` — that lane is the static
-/// pass's exclusive, deterministic responsibility.
-fn parse_lane(s: &str) -> RiskLane {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "safe" => RiskLane::Safe,
-        "reversible" | "reversible_danger" | "reversibledanger" => RiskLane::ReversibleDanger,
-        _ => RiskLane::IrreversibleDanger,
-    }
-}
-
-/// Fallback card text when the judge gave a lane but no usable summary. Only the
-/// `IrreversibleDanger` text is ever shown (the other lanes don't prompt).
-fn default_summary(lane: RiskLane) -> &'static str {
-    match lane {
-        RiskLane::Safe => "Runs a command with no irreversible side-effect.",
-        RiskLane::ReversibleDanger => {
-            "Deletes or overwrites files inside the workspace (recoverable)."
-        }
-        RiskLane::Catastrophic | RiskLane::IrreversibleDanger => {
-            "May cause an irreversible real-world side-effect."
-        }
-    }
-}
-
-/// Strip a leading ```/```json fence and trailing ``` (Flash/Haiku sometimes
-/// wrap JSON in a code block despite the instruction not to).
-fn strip_code_fences(text: &str) -> String {
-    let trimmed = text.trim();
-    let without_opening = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    without_opening
-        .trim()
-        .strip_suffix("```")
-        .unwrap_or(without_opening.trim())
-        .trim()
-        .to_string()
-}
-
-/// Extract the first `{...}` object from a string that has prose around the
-/// JSON. Returns `None` if there's no balanced-looking object.
-fn extract_json_object(text: &str) -> Option<String> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    (end > start).then(|| text[start..=end].to_string())
-}
-
-/// Run one judge classification against an arbitrary [`LlmProvider`] — the
-/// provider-agnostic core of [`LucidosEngine::judge_command`], split out so it
-/// can be exercised with a stubbed provider offline.
+/// Split out of [`LucidosEngine::judge_command`] so a stubbed provider
+/// exercises it offline. [`command_judge_questions::read`] turns the answers
+/// into a verdict, resolving a weak or missing distribution to *ask*.
 ///
-/// Returns `Err` on infra failure (the call errors or the response is empty); a
-/// non-empty but unclear response is `Ok(JudgeVerdict::uncertain())` (ask).
-///
-/// The capture is recorded before the response is read, so an empty answer is
-/// accounted too. The call was paid for whatever came back.
-///
-/// **`deadline` covers the provider call alone.** Around the whole function it
-/// would cover the capture too. A call answering just inside the deadline could
-/// then have its row cancelled mid-write, losing the accounting for a call the
-/// user paid for.
-pub(crate) async fn judge_with_provider<P: LlmProvider + ?Sized>(
-    provider: &P,
-    input: &JudgeInput,
-    // The `reasoning_command_judge` preference, the other half of the judge's
-    // *model selection*.
-    reasoning_effort: &str,
-    deadline: Duration,
-    capture: Option<&AuxCapture>,
-) -> Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>> {
-    let prompt = build_judge_user_prompt(input);
-    let request_chars = JUDGE_SYSTEM_PROMPT.chars().count() + prompt.chars().count();
-    let messages = vec![Message {
-        role: "user".to_string(),
-        content: MessageContent::Text(prompt),
-    }];
-    let call = provider.chat(
-        messages,
-        vec![],
-        crate::llm::ModelSelection::default().with_effort(Some(reasoning_effort)),
-        Some(JUDGE_SYSTEM_PROMPT),
-        None,
-    );
-    let response = match tokio::time::timeout(deadline, call).await {
-        Ok(result) => result?,
-        Err(_) => return Err(format!("command judge timed out after {:?}", deadline).into()),
-    };
-    if let Some(capture) = capture {
-        capture
-            .record(provider.default_model(), request_chars, &response)
-            .await;
-    }
-    let raw = response.content.unwrap_or_default();
-    if raw.trim().is_empty() {
-        return Err("command judge returned an empty response".into());
-    }
-    Ok(parse_judge_response(&raw))
-}
-
-/// Run one judge classification as two typed Choice questions.
-///
-/// The counterpart of [`judge_with_provider`], and split out for the same
-/// reason: a stubbed provider exercises it offline. There is no unclear
-/// response to tolerate here, because the answers are typed. What replaces it
-/// is [`command_judge_questions::read`], which resolves a weak distribution to
-/// *ask*.
-///
-/// Both paths record under one purpose. The backend is the user's choice, and a
-/// switch of backend must not read as a switch of job in a cost rollup.
-///
-/// **`deadline` covers the ask alone**, for the reason [`judge_with_provider`]
-/// gives. A timeout surfaces as a boxed [`tokio::time::error::Elapsed`], which
-/// is how the caller tells it apart from a failure: one falls through to the
-/// chat path and the other does not.
-pub(crate) async fn judge_with_jev<J: JudgmentProvider + ?Sized>(
-    jev: &J,
+/// A timeout surfaces as a boxed [`tokio::time::error::Elapsed`]. `deadline`
+/// bounds the ask alone, so an answer that arrived in time is never lost to
+/// its record.
+pub(crate) async fn judge_with<J: JudgmentProvider + ?Sized>(
+    provider: &J,
     input: &JudgeInput,
     deadline: Duration,
-    capture: Option<&AuxCapture>,
+    capture: &AuxCapture,
 ) -> Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>> {
-    let ask = jev.ask(
-        command_judge_questions::state(input),
-        command_judge_questions::questions(),
-    );
-    let judgment = match tokio::time::timeout(deadline, ask).await {
-        Ok(result) => result?,
-        Err(elapsed) => return Err(Box::new(elapsed)),
-    };
-    if let Some(capture) = capture {
-        capture.record_judgment(&judgment).await;
-    }
+    let judgment = capture
+        .until(tokio::time::Instant::now() + deadline)
+        .judge(
+            provider,
+            command_judge_questions::state(input),
+            command_judge_questions::questions(),
+        )
+        .await?;
     Ok(command_judge_questions::read(&judgment.answers))
 }
 
 impl LucidosEngine {
-    /// Ask the configured judge model to classify one ambiguous command.
+    /// Ask the picked judgment provider to classify one ambiguous command.
     ///
-    /// Returns `Err` only on infra failure — no LLM provider is configured, the
-    /// provider can't be built for `model`, the call errors, or the response is
-    /// empty — so the caller falls back to the static "dangerous" list. A
-    /// non-empty but unclear response is `Ok(JudgeVerdict::uncertain())` (ask).
+    /// Returns `Err` only when nothing answered: the call failed, or it ran out
+    /// of time. The caller then falls back to
+    /// the static "dangerous" list. A reply it cannot read is `Ok` with
+    /// [`JudgeVerdict::uncertain`] (ask).
     ///
-    /// `judgment_command_guard` picks the path, and is `chat` unless the user
-    /// set it. A Jev call that fails falls through to the rubric prompt, which
-    /// is a better answer than the static list. Both paths end at the same
-    /// `Err`, so the caller's fallback is unchanged either way.
+    /// `judgment_command_guard` picks the backend and is `chat` unless the
+    /// user set it. A System One pick has the chat model behind it, inside the
+    /// same deadline, because a user waits on the permission card.
     ///
     /// `thread_id` anchors the capture. Every caller runs inside a turn and
     /// holds one, so the judge's spend is never filed against nothing.
     pub(crate) async fn judge_command(
         &self,
-        model: &str,
         input: &JudgeInput,
         thread_id: uuid::Uuid,
     ) -> Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>> {
-        let budget = crate::engine::aux_purpose::budget_for(ContextPurpose::CommandJudge);
+        let call = self.aux_call(ContextPurpose::CommandJudge).await;
+        let deadline = call.deadline();
         let capture = AuxCapture::new(&self.event_bus, thread_id, ContextPurpose::CommandJudge);
-        if let Some(jev) = crate::llm::judgment::jev_for(
+        let system_one = system_one_for(
             &self.pool,
-            crate::llm::judgment::JudgmentSite::CommandGuard,
-            budget.attempt_timeout,
+            JudgmentSite::CommandGuard,
+            call.attempt_timeout(),
         )
-        .await
-        {
-            // A failure falls through to the rubric prompt, because it costs
-            // little and answers better than the static list. A TIMEOUT does
-            // not: a user is waiting on the permission card, and a second
-            // full deadline behind the first is worse than the static answer.
-            match judge_with_jev(&jev, input, budget.deadline, Some(&capture)).await {
-                Ok(verdict) => return Ok(verdict),
-                Err(e) if e.is::<tokio::time::error::Elapsed>() => {
-                    return Err(
-                        format!("Jev command judge timed out after {:?}", budget.deadline).into(),
-                    )
-                }
-                Err(e) => log!(
-                    "[CommandGuard] Jev judge failed: {}. Using the chat path",
+        .await;
+        let chat = ChatJudgmentProvider::new(call.provider(), call.reasoning().map(str::to_string));
+        let provider = for_site(system_one, chat);
+        judge_with(provider.as_ref(), input, deadline, &capture)
+            .await
+            .map_err(|e| {
+                if e.is::<tokio::time::error::Elapsed>() {
+                    format!("command judge timed out after {:?}", deadline).into()
+                } else {
                     e
-                ),
-            }
-        }
-
-        let Some(extractor) = self.extractor.as_ref() else {
-            return Err("command judge unavailable: no LLM provider configured".into());
-        };
-        let provider = extractor.provider_for_model(model, budget.attempt_timeout)?;
-        let effort = crate::core::PreferenceStore::command_judge_reasoning(&self.pool).await;
-        // Under the budget's whole-call deadline. A user waits on the
-        // permission card this verdict fills in, and the caller's fallback to
-        // the static list beats an open-ended wait.
-        judge_with_provider(
-            provider.as_ref(),
-            input,
-            &effort,
-            budget.deadline,
-            Some(&capture),
-        )
-        .await
+                }
+            })
     }
 }
 
@@ -381,10 +126,14 @@ mod tests {
     use super::*;
     use crate::engine::event_bus::EventBus;
     use crate::llm::judgment::{Answer, Answers, ChoiceAnswer, Judgment, JudgmentUsage, Question};
-    use crate::llm::provider::{LlmResponse, ToolDefinition};
-    use crate::llm::TokenCallback;
-    use crate::test_support::{aux_captures, setup_test_db, teardown_test_db, ScriptedProvider};
+    use crate::llm::tool_names as tn;
+    use crate::test_support::{aux_captures, setup_test_db, teardown_test_db};
     use uuid::Uuid;
+
+    /// A capture for a judge test that reads no row.
+    fn discard() -> AuxCapture {
+        AuxCapture::discarding(crate::engine::ContextPurpose::CommandJudge)
+    }
 
     /// A deadline no offline test can reach. The stubs answer instantly, so
     /// what these tests exercise is the call and its capture, never the bound.
@@ -399,264 +148,8 @@ mod tests {
         }
     }
 
-    /// The judge prompt leaves the machine, often for a provider other than
-    /// the chat one. A connection string in the command must be redacted
-    /// before it is sent. The rest of the command still reaches the judge,
-    /// because that is what it classifies.
-    #[test]
-    fn judge_prompt_redacts_postgres_secrets() {
-        let input = ji(
-            tn::RUN_BASH,
-            "psql postgresql://lucidos:hunter2@db.example.com:5432/app -c 'DROP TABLE events'",
-            false,
-        );
-        let prompt = build_judge_user_prompt(&input);
-        assert!(
-            !prompt.contains("hunter2"),
-            "the password must not reach the judge provider: {prompt}"
-        );
-        assert!(
-            prompt.contains("DROP TABLE events"),
-            "the classifiable command survives redaction: {prompt}"
-        );
-    }
-
-    /// A stubbed [`LlmProvider`] that echoes a fixed response — lets us exercise
-    /// the judge call → parse → verdict path deterministically and offline (the
-    /// real-model path is the same code through [`LucidosEngine::judge_command`]).
-    struct StubProvider {
-        response: Result<String, String>,
-    }
-
-    #[async_trait::async_trait]
-    impl LlmProvider for StubProvider {
-        async fn chat(
-            &self,
-            _messages: Vec<Message>,
-            _tools: Vec<ToolDefinition>,
-            _selection: crate::llm::ModelSelection<'_>,
-            _system_prompt: Option<&str>,
-            _on_token: Option<TokenCallback>,
-        ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
-            match &self.response {
-                Ok(content) => Ok(serde_json::from_value(serde_json::json!({
-                    "content": content,
-                    "tool_calls": [],
-                }))
-                .unwrap()),
-                Err(e) => Err(e.clone().into()),
-            }
-        }
-    }
-
-    fn stub(content: &str) -> StubProvider {
-        StubProvider {
-            response: Ok(content.to_string()),
-        }
-    }
-
-    #[tokio::test]
-    async fn stubbed_judge_classifies_each_lane() {
-        // Mutating POST → ask, tagged external_api.
-        let v = judge_with_provider(
-            &stub(r#"{"lane":"irreversible","category":"external_api","summary":"Posts data to an API.","reason":"POST"}"#),
-            &ji(tn::RUN_BASH, "curl -X POST https://api/charge", false),
-            "none",
-            TEST_DEADLINE,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(v.lane, RiskLane::IrreversibleDanger);
-        assert_eq!(v.category, Some(SideEffectCategory::ExternalApi));
-        assert_eq!(v.summary, "Posts data to an API.");
-
-        // GET → safe, no category.
-        let v = judge_with_provider(
-            &stub(r#"{"lane":"safe","summary":"Reads a URL.","reason":"GET"}"#),
-            &ji(tn::RUN_BASH, "curl https://api/data", false),
-            "none",
-            TEST_DEADLINE,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(v.lane, RiskLane::Safe);
-        assert_eq!(v.category, None, "non-irreversible lanes carry no category");
-
-        // Irreversible with a missing/unknown category → Other (trigger must
-        // explicitly grant `other`).
-        let v = judge_with_provider(
-            &stub(
-                r#"{"lane":"irreversible","summary":"Does something irreversible.","reason":"?"}"#,
-            ),
-            &ji(tn::RUN_BASH, "weird-tool --send", false),
-            "none",
-            TEST_DEADLINE,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(v.category, Some(SideEffectCategory::Other));
-
-        // In-workspace rm → reversible.
-        let v = judge_with_provider(
-            &stub(r#"{"lane":"reversible","summary":"Deletes workspace files.","reason":"in-ws"}"#),
-            &ji(tn::RUN_BASH, "rm -rf data/tmp", false),
-            "none",
-            TEST_DEADLINE,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(v.lane, RiskLane::ReversibleDanger);
-    }
-
-    #[tokio::test]
-    async fn stubbed_judge_empty_response_is_infra_error() {
-        // Empty content → Err, so the caller falls back to the static list.
-        let v = judge_with_provider(
-            &stub("   "),
-            &ji(tn::RUN_BASH, "x", false),
-            "none",
-            TEST_DEADLINE,
-            None,
-        )
-        .await;
-        assert!(v.is_err(), "empty response must be an infra error");
-    }
-
-    #[tokio::test]
-    async fn stubbed_judge_call_error_propagates() {
-        let provider = StubProvider {
-            response: Err("network down".to_string()),
-        };
-        let v = judge_with_provider(
-            &provider,
-            &ji(tn::RUN_BASH, "x", false),
-            "none",
-            TEST_DEADLINE,
-            None,
-        )
-        .await;
-        assert!(v.is_err(), "provider error must propagate as Err");
-    }
-
-    #[test]
-    fn parses_each_lane() {
-        assert_eq!(
-            parse_judge_response(r#"{"lane":"safe","summary":"reads a file","reason":"read"}"#)
-                .lane,
-            RiskLane::Safe
-        );
-        assert_eq!(
-            parse_judge_response(
-                r#"{"lane":"reversible","summary":"deletes data/x","reason":"in-ws"}"#
-            )
-            .lane,
-            RiskLane::ReversibleDanger
-        );
-        assert_eq!(
-            parse_judge_response(
-                r#"{"lane":"irreversible","summary":"sends mail","reason":"email"}"#
-            )
-            .lane,
-            RiskLane::IrreversibleDanger
-        );
-    }
-
-    #[test]
-    fn lane_aliases_and_case() {
-        for s in [
-            "IRREVERSIBLE",
-            " Irreversible_Danger ",
-            "irreversibledanger",
-        ] {
-            assert_eq!(parse_lane(s), RiskLane::IrreversibleDanger, "{s}");
-        }
-        for s in ["reversible_danger", "ReversibleDanger"] {
-            assert_eq!(parse_lane(s), RiskLane::ReversibleDanger, "{s}");
-        }
-        assert_eq!(parse_lane("SAFE"), RiskLane::Safe);
-    }
-
-    #[test]
-    fn parses_category_for_irreversible_only() {
-        // Category is read on the irreversible lane …
-        let v = parse_judge_response(
-            r#"{"lane":"irreversible","category":"email","summary":"sends mail","reason":"x"}"#,
-        );
-        assert_eq!(v.category, Some(SideEffectCategory::Email));
-        // … and ignored on safe/reversible (None regardless of the field).
-        let v = parse_judge_response(
-            r#"{"lane":"safe","category":"email","summary":"reads","reason":"x"}"#,
-        );
-        assert_eq!(v.category, None);
-    }
-
-    #[test]
-    fn category_aliases_and_unknown_fall_back_to_other() {
-        for s in ["external_api", "externalapi", "HTTP"] {
-            assert_eq!(parse_category(s), SideEffectCategory::ExternalApi, "{s}");
-        }
-        assert_eq!(parse_category("cloud"), SideEffectCategory::CloudCli);
-        assert_eq!(
-            parse_category("out_of_workspace_destruction"),
-            SideEffectCategory::OutOfWorkspaceDestruction
-        );
-        assert_eq!(parse_category("nonsense"), SideEffectCategory::Other);
-    }
-
-    #[test]
-    fn unknown_lane_errs_toward_ask() {
-        assert_eq!(parse_lane("maybe"), RiskLane::IrreversibleDanger);
-        assert_eq!(parse_lane(""), RiskLane::IrreversibleDanger);
-        // A whole object missing the lane key → ask.
-        assert_eq!(
-            parse_judge_response(r#"{"summary":"x","reason":"y"}"#).lane,
-            RiskLane::IrreversibleDanger
-        );
-    }
-
-    #[test]
-    fn tolerates_code_fences_and_prose() {
-        let fenced = "```json\n{\"lane\":\"safe\",\"summary\":\"ok\",\"reason\":\"r\"}\n```";
-        assert_eq!(parse_judge_response(fenced).lane, RiskLane::Safe);
-
-        let prose = "Here is my verdict:\n{\"lane\":\"irreversible\",\"summary\":\"posts data\",\"reason\":\"POST\"}\nThat's all.";
-        let v = parse_judge_response(prose);
-        assert_eq!(v.lane, RiskLane::IrreversibleDanger);
-        assert_eq!(v.summary, "posts data");
-    }
-
-    #[test]
-    fn unparseable_response_is_uncertain_ask() {
-        let v = parse_judge_response("the model rambled with no json at all");
-        assert_eq!(v.lane, RiskLane::IrreversibleDanger);
-        assert!(!v.summary.is_empty());
-    }
-
-    #[test]
-    fn blank_summary_falls_back_to_default() {
-        let v = parse_judge_response(r#"{"lane":"irreversible","summary":"   ","reason":"r"}"#);
-        assert_eq!(v.lane, RiskLane::IrreversibleDanger);
-        assert!(v.summary.contains("irreversible"));
-    }
-
-    #[test]
-    fn user_prompt_labels_tool_and_marks_escape() {
-        let p = build_judge_user_prompt(&ji(tn::RUN_BASH, "rm -rf /etc/x", true));
-        assert!(p.contains("Shell command"));
-        assert!(p.contains("OUTSIDE the workspace"));
-        assert!(p.contains("rm -rf /etc/x"));
-
-        let p = build_judge_user_prompt(&ji(tn::RUN_PYTHON, "requests.post(u)", false));
-        assert!(p.contains("Python code"));
-        assert!(!p.contains("OUTSIDE the workspace"));
-    }
-
-    /// A stubbed [`JudgmentProvider`] that records what it was asked, so the
-    /// Jev glue is exercised offline the way `StubProvider` does the chat one.
+    /// A stubbed System One [`JudgmentProvider`] that records what it was
+    /// asked, so the glue is exercised offline.
     ///
     /// It reports the usage and the model a real response carries, because the
     /// capture the glue emits is built out of both.
@@ -673,6 +166,8 @@ mod tests {
     const STUB_USAGE: JudgmentUsage = JudgmentUsage {
         input_tokens: 312,
         output_tokens: 48,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
     };
 
     /// The version a real response names, where the request asks for an alias.
@@ -684,14 +179,16 @@ mod tests {
             &self,
             state: serde_json::Value,
             questions: Vec<(String, Question)>,
+            _call: crate::llm::metered::CallToken,
         ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
             // Sized through the real builder, so the stub cannot disagree with
             // the provider about what one request weighs.
-            let request_chars =
-                crate::llm::judgment::jev::build_request_body(STUB_MODEL, &state, &questions)
-                    .to_string()
-                    .chars()
-                    .count();
+            let request_chars = crate::llm::judgment::system_one::build_request_body(
+                STUB_MODEL, &state, &questions,
+            )
+            .to_string()
+            .chars()
+            .count();
             self.asked.lock().unwrap().push((state, questions));
             Ok(Judgment {
                 answers: self.answers.clone(),
@@ -730,7 +227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stubbed_jev_judge_classifies_and_categorises() {
+    async fn a_system_one_judge_classifies_and_categorises() {
         let jev = stub_judge(vec![
             choice(
                 command_judge_questions::LANE,
@@ -738,11 +235,11 @@ mod tests {
             ),
             choice(command_judge_questions::CATEGORY, &[("external_api", 0.96)]),
         ]);
-        let v = judge_with_jev(
+        let v = judge_with(
             &jev,
             &ji(tn::RUN_BASH, "curl -X POST https://api/charge", false),
             TEST_DEADLINE,
-            None,
+            &discard(),
         )
         .await
         .unwrap();
@@ -754,12 +251,12 @@ mod tests {
     /// One request carries the state and both questions, and the command
     /// inside it is already redacted.
     #[tokio::test]
-    async fn stubbed_jev_judge_sends_one_redacted_request() {
+    async fn a_system_one_judge_sends_one_redacted_request() {
         let jev = stub_judge(vec![choice(
             command_judge_questions::LANE,
             &[("safe", 0.99)],
         )]);
-        let v = judge_with_jev(
+        let v = judge_with(
             &jev,
             &ji(
                 tn::RUN_BASH,
@@ -767,7 +264,7 @@ mod tests {
                 false,
             ),
             TEST_DEADLINE,
-            None,
+            &discard(),
         )
         .await
         .unwrap();
@@ -782,10 +279,10 @@ mod tests {
         assert!(body.contains("select 1"), "{body}");
     }
 
-    /// The same contract the chat path has: an infra failure is `Err`, so the
-    /// caller falls back to the static dangerous list.
+    /// A call that never answered is `Err`, so the caller falls back to the
+    /// static dangerous list.
     #[tokio::test]
-    async fn a_failing_jev_call_is_an_infra_error() {
+    async fn a_failing_system_one_call_is_an_infra_error() {
         struct Failing;
         #[async_trait::async_trait]
         impl JudgmentProvider for Failing {
@@ -793,25 +290,26 @@ mod tests {
                 &self,
                 _state: serde_json::Value,
                 _questions: Vec<(String, Question)>,
+                _call: crate::llm::metered::CallToken,
             ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
                 Err("TypeSafe returned 429".into())
             }
         }
-        assert!(judge_with_jev(
+        assert!(judge_with(
             &Failing,
             &ji(tn::RUN_BASH, "ls", false),
             TEST_DEADLINE,
-            None
+            &discard()
         )
         .await
         .is_err());
     }
 
-    /// The caller declines the chat path after a timeout and takes it after a
-    /// failure, so the two must not arrive as the same error. A timeout is a
-    /// boxed `Elapsed` and nothing else is.
+    /// `judge_command` names a timeout in its error, so the two must not
+    /// arrive as the same error. A timeout is a boxed `Elapsed` and nothing
+    /// else is.
     #[tokio::test]
-    async fn a_jev_timeout_is_told_apart_from_a_failure() {
+    async fn a_timeout_is_told_apart_from_a_failure() {
         struct Slow;
         #[async_trait::async_trait]
         impl JudgmentProvider for Slow {
@@ -819,6 +317,7 @@ mod tests {
                 &self,
                 _state: serde_json::Value,
                 _questions: Vec<(String, Question)>,
+                _call: crate::llm::metered::CallToken,
             ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Ok(Judgment::default())
@@ -831,44 +330,45 @@ mod tests {
                 &self,
                 _state: serde_json::Value,
                 _questions: Vec<(String, Question)>,
+                _call: crate::llm::metered::CallToken,
             ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
                 Err("TypeSafe returned 429".into())
             }
         }
 
-        let timed_out = judge_with_jev(
+        let timed_out = judge_with(
             &Slow,
             &ji(tn::RUN_BASH, "ls", false),
             Duration::from_millis(1),
-            None,
+            &discard(),
         )
         .await
         .expect_err("it ran out of time");
         assert!(timed_out.is::<tokio::time::error::Elapsed>());
 
-        let failed = judge_with_jev(
+        let failed = judge_with(
             &Failing,
             &ji(tn::RUN_BASH, "ls", false),
             TEST_DEADLINE,
-            None,
+            &discard(),
         )
         .await
         .expect_err("the backend refused");
         assert!(
             !failed.is::<tokio::time::error::Elapsed>(),
-            "a refusal must still fall through to the chat path"
+            "a refusal is not a timeout"
         );
     }
 
     /// An empty answer set is *ask*, not an error. The typed path has no
     /// "unclear response" to detect, so this is where that tolerance lives.
     #[tokio::test]
-    async fn a_jev_answer_with_no_lane_asks() {
-        let v = judge_with_jev(
+    async fn a_system_one_answer_with_no_lane_asks() {
+        let v = judge_with(
             &stub_judge(vec![]),
             &ji(tn::RUN_BASH, "ls", false),
             TEST_DEADLINE,
-            None,
+            &discard(),
         )
         .await
         .unwrap();
@@ -884,7 +384,7 @@ mod tests {
     const CAPTURE_PURPOSE: &str = "command_judge";
 
     #[tokio::test]
-    async fn the_jev_path_records_what_the_judgment_cost() {
+    async fn a_system_one_judgment_records_what_it_cost() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
@@ -894,11 +394,11 @@ mod tests {
             command_judge_questions::LANE,
             &[("safe", 0.99)],
         )]);
-        let verdict = judge_with_jev(
+        let verdict = judge_with(
             &jev,
             &ji(tn::RUN_BASH, "curl https://api/data", false),
             TEST_DEADLINE,
-            Some(&capture),
+            &capture,
         )
         .await
         .expect("the stub answers");
@@ -930,37 +430,243 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The chat path is the DEFAULT one, since `judgment_command_guard` is
-    /// `chat` unless the user moved it. Capturing only Jev would make a change
-    /// of backend read as a rise in spend.
+    // --- the guard on the chat judgment provider ------------------------------
+    //
+    // The default backend, a chat model answering the typed questions
+    // (ADR 0363, I13).
+
+    use crate::llm::judgment::ChatJudgmentProvider;
+    use crate::test_support::JudgmentChatStub;
+    use std::sync::Arc;
+
+    fn on_chat(stub: JudgmentChatStub) -> (Arc<JudgmentChatStub>, ChatJudgmentProvider) {
+        let stub = Arc::new(stub);
+        let chat = ChatJudgmentProvider::new(stub.clone(), Some("none".to_string()));
+        (stub, chat)
+    }
+
+    async fn verdict_on_chat(answer: serde_json::Value, input: &JudgeInput) -> JudgeVerdict {
+        let (_, chat) = on_chat(JudgmentChatStub::answering(answer));
+        judge_with(&chat, input, TEST_DEADLINE, &discard())
+            .await
+            .expect("a chat model that answered is never an infra error")
+    }
+
     #[tokio::test]
-    async fn the_chat_path_records_what_the_call_cost() {
+    async fn the_chat_judgment_classifies_each_lane() {
+        // Mutating POST → ask, tagged external_api.
+        let v = verdict_on_chat(
+            serde_json::json!({
+                "lane": { "safe": 0.02, "reversible": 0.03, "irreversible": 0.95 },
+                "category": { "external_api": 0.96, "other": 0.04 },
+            }),
+            &ji(tn::RUN_BASH, "curl -X POST https://api/charge", false),
+        )
+        .await;
+        assert_eq!(v.lane, RiskLane::IrreversibleDanger);
+        assert_eq!(v.category, Some(SideEffectCategory::ExternalApi));
+        assert!(v.summary.contains("mutating HTTP request"), "{}", v.summary);
+
+        // GET → safe, no category.
+        let v = verdict_on_chat(
+            serde_json::json!({
+                "lane": { "safe": 0.97, "reversible": 0.02, "irreversible": 0.01 },
+                "category": { "external_api": 0.9 },
+            }),
+            &ji(tn::RUN_BASH, "curl https://api/data", false),
+        )
+        .await;
+        assert_eq!(v.lane, RiskLane::Safe);
+        assert_eq!(v.category, None, "non-irreversible lanes carry no category");
+
+        // Irreversible with no category answer → Other.
+        let v = verdict_on_chat(
+            serde_json::json!({ "lane": { "irreversible": 1 } }),
+            &ji(tn::RUN_BASH, "weird-tool --send", false),
+        )
+        .await;
+        assert_eq!(v.category, Some(SideEffectCategory::Other));
+
+        // In-workspace rm → reversible.
+        let v = verdict_on_chat(
+            serde_json::json!({ "lane": { "safe": 0.05, "reversible": 0.9, "irreversible": 0.05 } }),
+            &ji(tn::RUN_BASH, "rm -rf data/tmp", false),
+        )
+        .await;
+        assert_eq!(v.lane, RiskLane::ReversibleDanger);
+    }
+
+    /// I13: a reply the guard cannot read asks. That covers prose, an empty
+    /// reply, and an answer naming options the question never offered.
+    #[tokio::test]
+    async fn an_unreadable_chat_judgment_asks() {
+        for reply in ["the model rambled with no json at all", "   ", ""] {
+            let (_, chat) = on_chat(JudgmentChatStub::replying(reply));
+            let v = judge_with(
+                &chat,
+                &ji(tn::RUN_BASH, "x", false),
+                TEST_DEADLINE,
+                &discard(),
+            )
+            .await
+            .expect("a reply is not an infra error");
+            assert_eq!(v, JudgeVerdict::uncertain(), "{reply:?}");
+        }
+
+        let v = verdict_on_chat(
+            serde_json::json!({ "lane": { "SAFE": 1.0, "harmless": 1.0 } }),
+            &ji(tn::RUN_BASH, "x", false),
+        )
+        .await;
+        assert_eq!(v, JudgeVerdict::uncertain(), "aliases are not options");
+
+        let v = verdict_on_chat(
+            serde_json::json!({ "category": { "email": 1.0 } }),
+            &ji(tn::RUN_BASH, "x", false),
+        )
+        .await;
+        assert_eq!(v, JudgeVerdict::uncertain(), "a missing lane asks");
+    }
+
+    /// ADR 0002's tie-break is a threshold in Rust, so a chat model leaning
+    /// safe without conviction still gets a card.
+    #[tokio::test]
+    async fn an_unsure_chat_judgment_picks_the_danger_lane() {
+        let v = verdict_on_chat(
+            serde_json::json!({ "lane": { "safe": 0.6, "reversible": 0.0, "irreversible": 0.4 } }),
+            &ji(tn::RUN_BASH, "x", false),
+        )
+        .await;
+        assert_eq!(v.lane, RiskLane::IrreversibleDanger);
+
+        let v = verdict_on_chat(
+            serde_json::json!({ "lane": { "safe": 0.0, "reversible": 0.55, "irreversible": 0.45 } }),
+            &ji(tn::RUN_BASH, "x", false),
+        )
+        .await;
+        assert_eq!(
+            v.lane,
+            RiskLane::IrreversibleDanger,
+            "unsure between the danger lanes picks irreversible"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_chat_judgment_call_is_an_infra_error() {
+        let (_, chat) = on_chat(JudgmentChatStub::failing("network down"));
+        assert!(
+            judge_with(
+                &chat,
+                &ji(tn::RUN_BASH, "x", false),
+                TEST_DEADLINE,
+                &discard()
+            )
+            .await
+            .is_err(),
+            "a call that never answered falls back to the static list"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_weak_chat_category_falls_back_to_other() {
+        let v = verdict_on_chat(
+            serde_json::json!({
+                "lane": { "irreversible": 1.0 },
+                "category": { "email": 0.4, "external_api": 0.35, "cloud_cli": 0.25 },
+            }),
+            &ji(tn::RUN_BASH, "x", false),
+        )
+        .await;
+        assert_eq!(v.category, Some(SideEffectCategory::Other));
+        assert!(v.summary.contains("irreversible"), "{}", v.summary);
+    }
+
+    /// A model that skipped the tool and wrote the object in text, fenced, is
+    /// read just the same.
+    #[tokio::test]
+    async fn a_fenced_chat_judgment_in_text_is_read() {
+        let (_, chat) = on_chat(JudgmentChatStub::replying(
+            "Here is my verdict:\n```json\n{\"lane\":{\"safe\":0.99}}\n```\nThat's all.",
+        ));
+        let v = judge_with(
+            &chat,
+            &ji(tn::RUN_BASH, "ls", false),
+            TEST_DEADLINE,
+            &discard(),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(v.lane, RiskLane::Safe);
+    }
+
+    /// The state leaves the machine for whatever the judge model is. A
+    /// connection string is redacted first, and the rest still reaches it.
+    #[tokio::test]
+    async fn the_chat_judgment_sees_a_redacted_labelled_command() {
+        let (stub, chat) = on_chat(JudgmentChatStub::answering(serde_json::json!({})));
+        judge_with(
+            &chat,
+            &ji(
+                tn::RUN_BASH,
+                "psql postgresql://lucidos:hunter2@db.example.com:5432/app -c 'DROP TABLE events'",
+                true,
+            ),
+            TEST_DEADLINE,
+            &discard(),
+        )
+        .await
+        .expect("answered");
+        let sent = stub.messages();
+        assert_eq!(sent.len(), 1, "both questions ride in one request");
+        assert!(!sent[0].contains("hunter2"), "{}", sent[0]);
+        assert!(sent[0].contains("DROP TABLE events"), "{}", sent[0]);
+        assert!(sent[0].contains("Shell command"), "{}", sent[0]);
+        assert!(
+            sent[0].contains("\"target_outside_workspace\": true"),
+            "{}",
+            sent[0]
+        );
+
+        let (stub, chat) = on_chat(JudgmentChatStub::answering(serde_json::json!({})));
+        judge_with(
+            &chat,
+            &ji(tn::RUN_PYTHON, "requests.post(u)", false),
+            TEST_DEADLINE,
+            &discard(),
+        )
+        .await
+        .expect("answered");
+        assert!(stub.messages()[0].contains("Python code"));
+    }
+
+    /// The chat model is the default backend, so its cost must reach the
+    /// rollup under the guard's own purpose.
+    #[tokio::test]
+    async fn the_chat_judgment_records_what_it_cost() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
         let capture = AuxCapture::new(&bus, thread_id, ContextPurpose::CommandJudge);
 
-        let provider = ScriptedProvider::new(
-            crate::core::DEFAULT_COMMAND_JUDGE_MODEL,
-            vec![r#"{"lane":"safe","summary":"Reads a URL.","reason":"GET"}"#],
-        );
-        let verdict = judge_with_provider(
-            &provider,
+        let (_, chat) = on_chat(JudgmentChatStub::answering(serde_json::json!({
+            "lane": { "safe": 1.0 },
+        })));
+        let verdict = judge_with(
+            &chat,
             &ji(tn::RUN_BASH, "curl https://api/data", false),
-            "none",
             TEST_DEADLINE,
-            Some(&capture),
+            &capture,
         )
         .await
-        .expect("the scripted reply parses");
-        assert_eq!(verdict.lane, RiskLane::Safe, "the verdict is unchanged");
+        .expect("answered");
+        assert_eq!(verdict.lane, RiskLane::Safe);
 
         let captures = aux_captures(&pool, thread_id, CAPTURE_PURPOSE).await;
         assert_eq!(captures.len(), 1, "one call, one row: {captures:?}");
         assert_eq!(captures[0]["producer"], "auxiliary");
         assert_eq!(
             captures[0]["model"],
-            crate::core::DEFAULT_COMMAND_JUDGE_MODEL
+            crate::core::prefs::MODEL_COMMAND_JUDGE.default_text()
         );
         assert_eq!(captures[0]["usage"]["input_tokens"], 210);
 
@@ -968,26 +674,24 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// An empty response is the infra error the caller falls back on, and it
-    /// was paid for all the same. The row is written before the answer is read.
+    /// An unreadable reply asks, and it was paid for all the same.
     #[tokio::test]
-    async fn an_empty_chat_answer_is_still_recorded() {
+    async fn an_unreadable_chat_judgment_is_still_recorded() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
         let capture = AuxCapture::new(&bus, thread_id, ContextPurpose::CommandJudge);
 
-        let provider = ScriptedProvider::new(crate::core::DEFAULT_COMMAND_JUDGE_MODEL, vec!["   "]);
-        assert!(judge_with_provider(
-            &provider,
+        let (_, chat) = on_chat(JudgmentChatStub::replying("   "));
+        let verdict = judge_with(
+            &chat,
             &ji(tn::RUN_BASH, "x", false),
-            "none",
             TEST_DEADLINE,
-            Some(&capture),
+            &capture,
         )
         .await
-        .is_err());
-
+        .expect("a reply is not an infra error");
+        assert_eq!(verdict, JudgeVerdict::uncertain());
         assert_eq!(
             aux_captures(&pool, thread_id, CAPTURE_PURPOSE).await.len(),
             1

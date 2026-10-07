@@ -188,3 +188,11 @@ export const NAMED_COLOURS: readonly string[] = [
   'teal', 'thistle', 'tomato', 'turquoise', 'violet', 'wheat',
   'white', 'whitesmoke', 'yellow', 'yellowgreen',
 ];
+
+// The engine's caps on a theme value, from core/themes.
+export const MAX_MIX_DEPTH = 2;
+export const MAX_VALUE_LENGTH = 120;
+export const MAX_RESOLVED_TOKENS = 200;
+export const MAX_SHADOW_PX = 32;
+export const PX_PER_REM = 16;
+export const SHADOW_COLOUR_FUNCTIONS: readonly string[] = ['rgb', 'rgba', 'hsl', 'hsla', 'hwb', 'lab', 'lch', 'oklab', 'oklch', 'color', 'color-mix'];

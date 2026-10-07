@@ -68,6 +68,8 @@ pub mod boot_report;
 pub mod capability_manifest;
 pub mod core;
 pub mod engine;
+#[cfg(test)]
+mod engine_constants_codegen_tests;
 pub mod gateway_auth;
 pub mod llm;
 pub mod mcp;

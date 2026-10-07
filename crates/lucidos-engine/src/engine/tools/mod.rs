@@ -23,6 +23,7 @@ pub(crate) mod plugins;
 mod preferences;
 mod proxy;
 mod python;
+pub(crate) mod recall;
 pub(crate) mod repo_files;
 mod repositories;
 pub(crate) mod scheduler;
@@ -37,7 +38,7 @@ pub(crate) use capabilities::TurnCapabilities;
 ///
 /// Phase 5 grouped manifest tools delegate to their flat-alias handlers:
 /// `action` resolves to the legacy flat tool name, validated against the
-/// capability parity manifest. Only these seven names resolve. A flat alias
+/// capability parity manifest. Only these eight names resolve. A flat alias
 /// runs as itself whatever `action` it carries, and domains with bespoke
 /// handling (notifications, preferences, triggers) keep their own arms.
 pub(crate) fn dispatch_name<'a>(
@@ -51,7 +52,8 @@ pub(crate) fn dispatch_name<'a>(
         | tn::CHANGES
         | tn::THREADS
         | tn::THREAD_QUEUE
-        | tn::MEMORY => grouped::grouped_legacy_name(name, args),
+        | tn::MEMORY
+        | tn::RECALL => grouped::grouped_legacy_name(name, args),
         other => Ok(other),
     }
 }
@@ -197,7 +199,7 @@ impl LucidosEngine {
             | tn::GLOB_FILES
             | tn::GREP_FILES
             | tn::COPY_FILE
-            | tn::DELETE_FILE => to_outcome(self.execute_file_tool(name, args).await),
+            | tn::DELETE_FILE => to_outcome(self.execute_file_tool(name, args, thread_id).await),
             tn::BROWSER_OPEN
             | tn::BROWSER_EXTRACT
             | tn::BROWSER_CLICK
@@ -213,11 +215,12 @@ impl LucidosEngine {
             | tn::READ_EMAILS
             | tn::READ_EMAIL
             | tn::CONFIGURE_EMAIL
-            | tn::SAVE_EMAIL_ATTACHMENT => {
-                to_outcome(self.execute_email_tool(name, args, request_id).await)
-            }
-            tn::HTTP_REQUEST => to_outcome(self.execute_http_tool(args).await),
-            tn::PROXY_REQUEST => to_outcome(self.execute_proxy_tool(args).await),
+            | tn::SAVE_EMAIL_ATTACHMENT => to_outcome(
+                self.execute_email_tool(name, args, request_id, thread_id)
+                    .await,
+            ),
+            tn::HTTP_REQUEST => to_outcome(self.execute_http_tool(args, thread_id).await),
+            tn::PROXY_REQUEST => to_outcome(self.execute_proxy_tool(args, thread_id).await),
             // Already an outcome: this handler distinguishes a refusal from a
             // judgment, so it must not be laundered through `to_outcome`.
             tn::JUDGE => self.execute_judgment_tool(args, thread_id).await,
@@ -252,7 +255,9 @@ impl LucidosEngine {
             // stays wired as a back-compat alias → dispatched as action "set".
             tn::ENV_VARS | tn::SET_ENVIRONMENT_VARIABLE => self.execute_env_vars(name, args).await,
             tn::MANAGE_MODELS => to_outcome(self.execute_manage_models(args).await),
-            tn::WEB_SEARCH | tn::FETCH_NEWS => to_outcome(self.execute_web_tool(name, args).await),
+            tn::WEB_SEARCH | tn::FETCH_NEWS => {
+                to_outcome(self.execute_web_tool(name, args, thread_id).await)
+            }
             tn::REQUEST_CREDENTIAL | tn::CONNECT_OAUTH_ACCOUNT => to_outcome(
                 self.execute_credential_tool(name, args, thread_id, device_id)
                     .await,
@@ -276,11 +281,15 @@ impl LucidosEngine {
             tn::RUN_BASH => to_outcome(self.execute_bash_tool(args, thread_id).await),
             tn::RUN_BASH_BACKGROUND => self.execute_bash_background_tool(args, thread_id).await,
             tn::BASH_OUTPUT => self.execute_bash_output_tool(args, thread_id).await,
-            tn::BASH_KILL => self.execute_bash_kill_tool(args).await,
+            tn::BASH_KILL => self.execute_bash_kill_tool(args, thread_id).await,
             tn::CORRECT_MEMORY => to_outcome(self.execute_memory_tool(args, thread_id).await),
             tn::CORRECT_MEMORY_BY_ID => to_outcome(self.execute_correct_memory_by_id(args).await),
             tn::SEARCH_MEMORY => to_outcome(self.execute_search_memory(args).await),
             tn::MEMORY_SOURCE => to_outcome(self.execute_memory_source(args).await),
+            tn::RECALL_ZOOM => to_outcome(self.execute_recall_zoom(args, thread_id).await),
+            tn::RECALL_FIND => to_outcome(self.execute_recall_find(args, thread_id).await),
+            tn::RECALL_SEARCH => to_outcome(self.execute_recall_search(args).await),
+            tn::RECALL_DATE => to_outcome(self.execute_recall_date(args, thread_id).await),
             tn::GENERATE_IMAGE => to_outcome(self.execute_generate_image(args, thread_id).await),
             tn::SAVE_THREAD_IMAGE => {
                 to_outcome(self.execute_save_thread_image(args, thread_id).await)
@@ -679,9 +688,16 @@ impl LucidosEngine {
             // stays uuid-free by default (a uuid means nothing to the user:
             // no screen is labelled with one).
             Ok(ack) => Ok(format!(
-                "Sent to \"{}\". {}",
+                "Sent to \"{}\". {}{}",
                 ack.child_title,
-                ack.delivered_to.describe()
+                ack.delivered_to.describe(),
+                match ack.reach {
+                    crate::engine::FollowUpReach::OwnChild => "",
+                    crate::engine::FollowUpReach::Home => {
+                        " It is not your child, so no completion card comes back to you. \
+                         Read its reply later with query_events and its thread_id."
+                    }
+                }
             )),
             // Each refusal tells the model what to do instead, and none of them
             // leaks whose child a thread is beyond "not yours".
@@ -1201,6 +1217,11 @@ pub(crate) fn merge_thread_queue_policy_patch(
         &mut policy.max_queued_per_trigger,
     )?;
     apply_usize_policy_field(args, "reserved_background", &mut policy.reserved_background)?;
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_children_per_thread",
+        &mut policy.max_concurrent_children_per_thread,
+    )?;
 
     if let Some(value) = args.get("max_event_trigger_depth") {
         policy.max_event_trigger_depth =
@@ -1216,13 +1237,8 @@ pub(crate) fn merge_thread_queue_policy_patch(
             })?;
     }
 
-    if policy.max_queued_per_trigger == 0 {
-        return Err("Error: max_queued_per_trigger must be at least 1".to_string());
-    }
-    // 0 would cap every chain at its first hop, so no event trigger would ever
-    // fire. That is a config that silently switches triggers off.
-    if policy.max_event_trigger_depth == 0 {
-        return Err("Error: max_event_trigger_depth must be at least 1".to_string());
+    if let Some(reason) = policy.invalid_reason() {
+        return Err(format!("Error: {reason}"));
     }
     Ok(policy)
 }
@@ -1252,6 +1268,7 @@ fn is_thread_queue_policy_field(field: &str) -> bool {
             | "max_queued_per_trigger"
             | "reserved_background"
             | "max_event_trigger_depth"
+            | "max_concurrent_children_per_thread"
             | "overflow"
     )
 }

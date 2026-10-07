@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts, llmConfigured } from '../store';
-import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, currentBackgroundModel, currentBackgroundReasoning, currentAutocorrect, setAutocorrect, currentMotion, setMotion } from './preferences';
+import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule } from './preferences';
 import { motionPreference } from '../../utils/motion';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
@@ -1665,8 +1665,8 @@ describe('currentMaxToolCalls: mirrors the engine resolution', () => {
   it('honors a stored value, including one far above any preset', () => {
     preferences.value = { status: 'loaded', data: { max_tool_calls: '2000' } };
     expect(currentMaxToolCalls()).toBe(2000);
-    // There is no ceiling: a huge cap is the user's call to make, and the UI
-    // must show what is actually stored rather than a clamped fiction.
+    // A huge cap within the bound is the user's call. The UI must show what is
+    // actually stored rather than a clamped fiction.
     preferences.value = { status: 'loaded', data: { max_tool_calls: '1000000' } };
     expect(currentMaxToolCalls()).toBe(1_000_000);
   });
@@ -1676,112 +1676,91 @@ describe('currentMaxToolCalls: mirrors the engine resolution', () => {
     expect(currentMaxToolCalls()).toBe(750);
   });
 
-  it('raises 0 to the floor, the one value that would break the turn', () => {
-    // The loop checks `iterations > cap` after incrementing, so 0 ends the turn
-    // before the first LLM call.
-    preferences.value = { status: 'loaded', data: { max_tool_calls: '0' } };
-    expect(currentMaxToolCalls()).toBe(MAX_TOOL_CALLS_MIN);
+  it('reads a value outside the catalog bounds as unset, as the engine does', () => {
+    // 0 would end the turn before the first LLM call, and "-5" is not a cap at
+    // all. Only a write from outside Settings can store one.
+    for (const raw of ['0', '-5', String(MAX_TOOL_CALLS_MAX + 1), '1'.repeat(400)]) {
+      preferences.value = { status: 'loaded', data: { max_tool_calls: raw } };
+      expect(currentMaxToolCalls(), raw).toBe(MAX_TOOL_CALLS_DEFAULT);
+    }
+    preferences.value = { status: 'loaded', data: { max_tool_calls: String(MAX_TOOL_CALLS_MAX) } };
+    expect(currentMaxToolCalls()).toBe(MAX_TOOL_CALLS_MAX);
   });
 
-  it('shows the representable bound rather than a silently rounded number', () => {
-    // Only reachable by a write from outside this UI (CLI / HTTP / psql), since
-    // setMaxToolCalls refuses these. `Number('1'.repeat(400))` is Infinity and
-    // a 20-digit value rounds, either of which would render a figure the engine
-    // is not enforcing.
-    preferences.value = { status: 'loaded', data: { max_tool_calls: '1'.repeat(400) } };
-    expect(currentMaxToolCalls()).toBe(Number.MAX_SAFE_INTEGER);
-    preferences.value = { status: 'loaded', data: { max_tool_calls: '99999999999999999999' } };
-    expect(currentMaxToolCalls()).toBe(Number.MAX_SAFE_INTEGER);
-  });
-
-  it('falls back to the default for anything that is not a whole number', () => {
-    // "-5" and "12.5" are the cases where a bare parseInt would diverge from the
-    // engine's usize parse, reading -5 and 12 where the engine reads neither.
-    for (const raw of ['', '   ', 'abc', '-5', '12.5', '1e3', '1_000']) {
+  it('reads a number the way the engine casts it, and anything else as unset', () => {
+    for (const [raw, expected] of [['12.5', 12], ['1e3', 1000]] as const) {
+      preferences.value = { status: 'loaded', data: { max_tool_calls: raw } };
+      expect(currentMaxToolCalls(), raw).toBe(expected);
+    }
+    for (const raw of ['', '   ', 'abc', '1_000']) {
       preferences.value = { status: 'loaded', data: { max_tool_calls: raw } };
       expect(currentMaxToolCalls(), `stored ${JSON.stringify(raw)}`).toBe(MAX_TOOL_CALLS_DEFAULT);
     }
   });
 });
 
+/** A background row reads only its own stored keys. Inheritance and the
+ *  provider-aware default are resolved once, on the engine, and Settings shows
+ *  that answer while a key is unset (`useBackgroundModels`). */
+describe('a stored background selection', () => {
+  it('reads null for both halves while unset, whatever the keys it inherits hold', () => {
+    preferences.value = {
+      status: 'loaded',
+      data: { model_title: 'gemini-3.5-flash', reasoning_title: 'low' },
+    };
+    expect(storedBackgroundSelection('model_change_summary', 'reasoning_change_summary'))
+      .toEqual({ model: null, effort: null });
+  });
+
+  it('reads what is stored', () => {
+    preferences.value = {
+      status: 'loaded',
+      data: { model_summary_compaction: 'claude-sonnet-5-5', reasoning_summary_compaction: 'medium' },
+    };
+    expect(storedBackgroundSelection('model_summary_compaction', 'reasoning_summary_compaction'))
+      .toEqual({ model: 'claude-sonnet-5-5', effort: 'medium' });
+  });
+
+  it('ignores a stored tier the catalog does not accept', () => {
+    preferences.value = { status: 'loaded', data: { reasoning_summary_compaction: 'turbo' } };
+    expect(storedBackgroundSelection('model_summary_compaction', 'reasoning_summary_compaction').effort)
+      .toBeNull();
+  });
+});
+
+describe('the memory module', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('reads Classic while unset, unloaded or unknown', () => {
+    preferences.value = { status: 'not-loaded' };
+    expect(currentMemoryModule()).toBe('classic');
+    preferences.value = { status: 'loaded', data: {} };
+    expect(currentMemoryModule()).toBe('classic');
+    preferences.value = { status: 'loaded', data: { memory_module: 'bogus' } };
+    expect(currentMemoryModule()).toBe('classic');
+  });
+
+  it('reads Tree once set', () => {
+    preferences.value = { status: 'loaded', data: { memory_module: 'tree' } };
+    expect(currentMemoryModule()).toBe('tree');
+  });
+
+  it('writes the global key and applies it locally', async () => {
+    preferences.value = { status: 'loaded', data: {} };
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
+
+    await setMemoryModule('tree');
+
+    expect(spy).toHaveBeenCalledWith('memory_module', 'tree', undefined);
+    expect(currentMemoryModule()).toBe('tree');
+  });
+});
+
 /**
  * The Settings note tells the user what a cap means in wall-clock terms before
- * they pick one, which is the whole reason there is no maximum: the number is
- * theirs to choose, so it has to be legible. Coarse on purpose.
+ * they pick one: the number is theirs to choose, so it has to be legible.
+ * Coarse on purpose.
  */
-/**
- * Two keys were split out of `model_memory`, and both inherit it while unset.
- * The engine resolves the same fallback in `aux_purpose`; a Settings row that
- * resolved it differently would name a model the engine is not running.
- */
-/**
- * The change summary follows the title pair while unset, mirroring
- * `aux_purpose`'s fallback for `ContextPurpose::ChangeSummary`.
- */
-describe('the change summary inherits the title pair', () => {
-  it('follows the title model and effort until its own keys are set', () => {
-    preferences.value = { status: 'loaded', data: { model_title: 'claude-haiku-4-5', reasoning_title: 'low' } };
-    expect(currentBackgroundModel('model_change_summary')).toBe('claude-haiku-4-5');
-    expect(currentBackgroundReasoning('reasoning_change_summary')).toBe('low');
-  });
-
-  it('prefers its own keys once set', () => {
-    preferences.value = {
-      status: 'loaded',
-      data: {
-        model_title: 'claude-haiku-4-5',
-        reasoning_title: 'low',
-        model_change_summary: 'gpt-5.4-mini',
-        reasoning_change_summary: 'medium',
-      },
-    };
-    expect(currentBackgroundModel('model_change_summary')).toBe('gpt-5.4-mini');
-    expect(currentBackgroundReasoning('reasoning_change_summary')).toBe('medium');
-  });
-});
-
-describe('the keys split out of model_memory inherit it', () => {
-  beforeEach(() => {
-    preferences.value = { status: 'loaded', data: {} };
-  });
-
-  it('follows a pinned memory model until its own key is set', () => {
-    preferences.value = { status: 'loaded', data: { model_memory: 'claude-haiku-4-5' } };
-    expect(currentBackgroundModel('model_query_classification')).toBe('claude-haiku-4-5');
-    expect(currentBackgroundModel('model_conversation_summary')).toBe('claude-haiku-4-5');
-  });
-
-  it('prefers its own key once set', () => {
-    preferences.value = {
-      status: 'loaded',
-      data: { model_memory: 'claude-haiku-4-5', model_query_classification: 'gpt-5.4-mini' },
-    };
-    expect(currentBackgroundModel('model_query_classification')).toBe('gpt-5.4-mini');
-    expect(currentBackgroundModel('model_conversation_summary')).toBe('claude-haiku-4-5');
-  });
-
-  /** Query classification alone inherits the EFFORT too, because it ran at
-   *  `reasoning_memory` before the split. The summary keeps `low`, which is
-   *  higher, so inheriting would lower it. */
-  it('follows a raised memory effort for classification only', () => {
-    preferences.value = { status: 'loaded', data: { reasoning_memory: 'high' } };
-    expect(currentBackgroundReasoning('reasoning_query_classification')).toBe('high');
-    expect(currentBackgroundReasoning('reasoning_conversation_summary')).toBe('low');
-  });
-
-  it('prefers its own effort key once set', () => {
-    preferences.value = {
-      status: 'loaded',
-      data: { reasoning_memory: 'high', reasoning_query_classification: 'none' },
-    };
-    expect(currentBackgroundReasoning('reasoning_query_classification')).toBe('none');
-  });
-
-  it('spends nothing when neither key is set', () => {
-    expect(currentBackgroundReasoning('reasoning_query_classification')).toBe('none');
-  });
-});
-
 describe('estimateTurnDuration', () => {
   it('scales from minutes through hours to days', () => {
     expect(estimateTurnDuration(50)).toBe('13 min');
@@ -2022,11 +2001,11 @@ describe('the resident-block sections a call opens with', () => {
     vi.restoreAllMocks();
   });
 
-  /** Nothing stored is the registry's own defaults, which is what the engine
-   *  falls back to for a workspace that never opened this screen. */
+  /** Nothing stored is the catalog default, which is what the engine falls
+   *  back to for a workspace that never opened this screen. */
   it('reads unset as the sections that ship on', () => {
     for (const section of VOICE_RESIDENT_SECTIONS) {
-      expect(voiceSectionEnabled(section.id)).toBe(section.onByDefault);
+      expect(voiceSectionEnabled(section.id)).toBe(DEFAULT_VOICE_RESIDENT_SECTIONS.includes(section.id));
     }
   });
 
@@ -2040,7 +2019,7 @@ describe('the resident-block sections a call opens with', () => {
    *  an empty value would turn everything off at once. */
   it('turning one off writes the rest', async () => {
     await setVoiceSectionEnabled('this-thread', false);
-    expect(stored()).toBe('who-and-where,workspace-shape');
+    expect(stored()).toBe(DEFAULT_VOICE_RESIDENT_SECTIONS.filter((id) => id !== 'this-thread').join(','));
   });
 
   /** The whole point of an empty value meaning none. Without it the last

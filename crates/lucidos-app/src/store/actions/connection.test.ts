@@ -23,6 +23,7 @@ vi.mock('./thread-sync', () => ({
 vi.mock('./thread-loading', () => ({
   loadAllThreads: vi.fn().mockResolvedValue(undefined),
   refreshThreadEvents: vi.fn().mockResolvedValue(true),
+  retryStaleOpenThreadEvents: vi.fn().mockReturnValue(false),
   // runResumeSync retries every thread carrying `eventsLoadFailed` through
   // this; the mock proxy throws on an undeclared export the moment that line
   // runs, so omitting it turns a behavioural assertion into a mock error as

@@ -12,8 +12,8 @@ import {
   providerBlockLoaded,
   providerState,
   switchAction,
-  typeSafeBlockLoaded,
-  typeSafeProviderState,
+  systemOneBlockLoaded,
+  systemOneProviderState,
   type ProviderEnablementInput,
 } from '../providerEnablement';
 
@@ -43,39 +43,39 @@ describe('providerState', () => {
   });
 });
 
-describe('typeSafeProviderState', () => {
+describe('systemOneProviderState', () => {
   /** The whole point of the correction this was built to: a stored credential
    *  stands in for `/health`, so a workspace that saved nothing reads off,
    *  exactly as xAI with no key does. The preference's default of on cannot
    *  light a row up on its own. */
   it('is never set up until a credential is stored', () => {
-    expect(typeSafeProviderState({ keyStored: false, switchedOff: false }))
+    expect(systemOneProviderState({ configured: false, switchedOff: false }))
       .toBe('not-set-up');
     // Including the explicit off, which has nothing to park.
-    expect(typeSafeProviderState({ keyStored: false, switchedOff: true }))
+    expect(systemOneProviderState({ configured: false, switchedOff: true }))
       .toBe('not-set-up');
   });
 
   it('is on once a credential is stored and nothing switched it off', () => {
-    expect(typeSafeProviderState({ keyStored: true, switchedOff: false })).toBe('on');
+    expect(systemOneProviderState({ configured: true, switchedOff: false })).toBe('on');
   });
 
   /** The credential is still there. `/health` would have dropped the provider
    *  by now, so `providerState` can ask about the list first. This cannot:
    *  a stored key survives the switch, which is the point of the switch. */
   it('tells a parked provider from one never set up', () => {
-    expect(typeSafeProviderState({ keyStored: true, switchedOff: true }))
+    expect(systemOneProviderState({ configured: true, switchedOff: true }))
       .toBe('switched-off');
   });
 });
 
-describe('typeSafeBlockLoaded', () => {
+describe('systemOneBlockLoaded', () => {
   it('needs both the credentials and the preferences', () => {
-    expect(typeSafeBlockLoaded(true, true)).toBe(true);
+    expect(systemOneBlockLoaded(true, true)).toBe(true);
     // Unloaded credentials read as no key, which would draw a configured
     // provider as never set up for the length of the read.
-    expect(typeSafeBlockLoaded(false, true)).toBe(false);
-    expect(typeSafeBlockLoaded(true, false)).toBe(false);
+    expect(systemOneBlockLoaded(false, true)).toBe(false);
+    expect(systemOneBlockLoaded(true, false)).toBe(false);
   });
 });
 

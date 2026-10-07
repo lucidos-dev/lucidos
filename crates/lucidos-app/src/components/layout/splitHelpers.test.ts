@@ -124,7 +124,7 @@ describe('clampSplitRatio: a dragged split divider stops at the wall', () => {
 
   it('answers the default for a container too small for "inside" to mean anything', () => {
     for (const total of [0, 1, 2]) {
-      expect(clampSplitRatio(1, total, BOUNDS), `total ${total}`).toBe(0.4);
+      expect(clampSplitRatio(1, total, BOUNDS), `total ${total}`).toBe(DEFAULT_SPLIT_RATIO);
     }
   });
 
@@ -143,7 +143,7 @@ describe('clampSplitRatio: a dragged split divider stops at the wall', () => {
   });
 
   it('answers the default rather than NaN before the container has a width', () => {
-    expect(clampSplitRatio(100, 0, BOUNDS)).toBe(0.4);
+    expect(clampSplitRatio(100, 0, BOUNDS)).toBe(DEFAULT_SPLIT_RATIO);
   });
 });
 

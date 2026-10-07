@@ -128,18 +128,18 @@ fn generate_cross_validation_fixture() -> String {
         }
     }
 
-    // threadIsDeletable: the full cross product of thread_types × statuses ×
-    // pending × external_repo × descendants_block. No section dimension, which
-    // is the predicate's whole point.
+    // ownBlocker: the full cross product of thread_types × statuses × sections ×
+    // pending × external_repo.
     for (tt_str, tt) in &thread_types {
         for (st_str, st) in &statuses {
-            for &pending in &bools {
-                for &external in &bools {
-                    for &blocked in &bools {
-                        let result = thread_is_deletable(*tt, *st, pending, external, blocked);
+            for (sec_str, sec) in &sections {
+                for &pending in &bools {
+                    for &external in &bools {
+                        let result =
+                            json_own_blocker(own_blocker(*tt, *st, *sec, pending, external));
                         cases.push(format!(
-                            r#"    {{ "fn": "threadIsDeletable", "args": [{:?}, {:?}, {}, {}, {}], "expected": {} }}"#,
-                            tt_str, st_str, pending, external, blocked, result
+                            r#"    {{ "fn": "ownBlocker", "args": [{:?}, {:?}, {:?}, {}, {}], "expected": {} }}"#,
+                            tt_str, st_str, sec_str, pending, external, result
                         ));
                     }
                 }
@@ -147,7 +147,40 @@ fn generate_cross_validation_fixture() -> String {
         }
     }
 
+    // actionBlocker: every own blocker (or none) × is_home × every descendant
+    // blocker (or none).
+    let own_or_none: Vec<Option<OwnBlocker>> = std::iter::once(None)
+        .chain(OwnBlocker::ALL.map(Some))
+        .collect();
+    for &own in &own_or_none {
+        for &home in &bools {
+            for &descendant in &own_or_none {
+                cases.push(format!(
+                    r#"    {{ "fn": "actionBlocker", "args": [{}, {}, {}], "expected": {:?} }}"#,
+                    json_own_blocker(own),
+                    home,
+                    json_own_blocker(descendant),
+                    action_blocker(own, home, descendant).as_str()
+                ));
+            }
+        }
+    }
+
     format!("{{\n  \"cases\": [\n{}\n  ]\n}}\n", cases.join(",\n"))
+}
+
+/// An own blocker as the fixture's JSON: its slug, or `null`.
+fn json_own_blocker(own: Option<OwnBlocker>) -> String {
+    own.map_or_else(|| "null".to_string(), |o| format!("{:?}", o.as_str()))
+}
+
+/// A TS string-literal union over `slugs`.
+fn ts_union(slugs: impl IntoIterator<Item = &'static str>) -> String {
+    slugs
+        .into_iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn generate_typescript() -> String {
@@ -288,23 +321,46 @@ fn generate_typescript() -> String {
     out.push_str("  return actions;\n");
     out.push_str("}\n");
 
-    // threadIsDeletable. Deliberately NOT an `Action`: Delete is not a close
-    // layer, it lives only in the overflow menu, and its availability ignores
-    // the section. See `thread_is_deletable` in thread_lifecycle.rs.
-    out.push_str("\nexport function threadIsDeletable(\n");
+    // ownBlocker and actionBlocker: why Archive or Delete cannot run. See
+    // `own_blocker` and `action_blocker` in thread_lifecycle.rs.
+    out.push_str(&format!(
+        "\nexport type OwnBlocker = {};\n",
+        ts_union(OwnBlocker::ALL.map(OwnBlocker::as_str))
+    ));
+    out.push_str(&format!(
+        "export const OWN_BLOCKER_PRIORITY: readonly OwnBlocker[] = [{}] as const;\n",
+        OwnBlocker::ALL
+            .map(|o| format!("'{}'", o.as_str()))
+            .join(", ")
+    ));
+    out.push_str(&format!(
+        "export type Blocker = {};\n",
+        ts_union(Blocker::ALL.map(Blocker::as_str))
+    ));
+    out.push_str("\nexport function ownBlocker(\n");
     out.push_str("  threadType: ThreadType,\n");
     out.push_str("  status: ThreadStatus,\n");
+    out.push_str("  archiveState: ArchiveState,\n");
     out.push_str("  hasPendingChanges: boolean,\n");
     out.push_str("  isExternalRepo: boolean,\n");
-    out.push_str("  descendantsBlock: boolean,\n");
-    out.push_str("): boolean {\n");
+    out.push_str("): OwnBlocker | null {\n");
+    out.push_str("  if (status === 'running') return 'running';\n");
+    out.push_str("  if (status === 'waiting_for_user_answer') return 'question';\n");
+    out.push_str("  if (archiveState === 'archived') return null;\n");
     out.push_str(
-        "  if (status === 'running' || status === 'waiting_for_user_answer') return false;\n",
+        "  return hasPendingChanges && threadType === 'claude_code' && !isExternalRepo \
+         ? 'pending_change' : null;\n",
     );
-    out.push_str(
-        "  if (hasPendingChanges && threadType === 'claude_code' && !isExternalRepo) return false;\n",
-    );
-    out.push_str("  return !descendantsBlock;\n");
+    out.push_str("}\n");
+    out.push_str("\nexport function actionBlocker(\n");
+    out.push_str("  own: OwnBlocker | null,\n");
+    out.push_str("  isHome: boolean,\n");
+    out.push_str("  descendant: OwnBlocker | null,\n");
+    out.push_str("): Blocker {\n");
+    out.push_str("  if (isHome) return 'home';\n");
+    out.push_str("  if (own !== null) return own;\n");
+    out.push_str("  if (descendant !== null) return `descendant_${descendant}`;\n");
+    out.push_str("  return 'none';\n");
     out.push_str("}\n");
 
     // STATUS_TRANSITIONS / SECTION_TRANSITIONS removed in Phase 5: the

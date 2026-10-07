@@ -133,6 +133,7 @@ fn test_policy(max_total: usize) -> CapacityPolicy {
         reserved_background: 0,
         overflow: OverflowPolicy::DropOldest,
         max_event_trigger_depth: DEFAULT_MAX_EVENT_TRIGGER_DEPTH,
+        max_concurrent_children_per_thread: DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD,
     }
 }
 
@@ -1994,6 +1995,8 @@ fn affects_user_running_selects_status_transitions() {
         description: String::new(),
         coding_agent: CodingAgent::ClaudeCode,
         tool_use_id: String::new(),
+        parent_tool_use_id: None,
+        api_call_id: None,
     }));
     assert!(!affects_user_running(&ThreadEvent::ThreadSaved));
 
@@ -2490,4 +2493,74 @@ async fn a_fire_stalled_past_the_wait_threshold_reports_a_delay_once() {
         f.executor.release_one();
     }
     teardown_test_db(&f.db).await;
+}
+
+// ---------------------------------------------------------------------------
+// Keep-awake: an admitted entry holds the computer awake until its work ends.
+// ---------------------------------------------------------------------------
+
+/// Executor whose work panics.
+struct PanickingExecutor;
+
+#[async_trait]
+impl ThreadQueueExecutor for PanickingExecutor {
+    async fn execute(&self, _entry: ExecutableEntry) {
+        panic!("the work failed");
+    }
+}
+
+/// Waits for an entry's joiner to drop its keep-awake hold.
+async fn awake_hold_released(entry_id: Uuid) -> bool {
+    for _ in 0..100 {
+        if !crate::core::keep_awake::is_held(&entry_id.to_string()) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn an_entry_keeps_the_computer_awake_until_its_work_ends() {
+    let f = fixture(4).await;
+    let entry = f.queue.submit(cron_request("trig-awake"), None, None).await;
+    assert!(entry.admitted);
+    assert!(crate::core::keep_awake::is_held(
+        &entry.entry_id.to_string()
+    ));
+
+    f.executor.release_one();
+    assert!(
+        awake_hold_released(entry.entry_id).await,
+        "the hold outlived the work"
+    );
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// A panic in the work still reaches the joiner, which drops the hold.
+#[tokio::test]
+async fn an_entry_whose_work_panics_releases_its_hold() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let trigger_configs = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let queue = queue_with_executor(
+        &pool,
+        &bus,
+        &trigger_configs,
+        workspace.path(),
+        4,
+        Arc::new(PanickingExecutor),
+    );
+    let entry = queue.submit(cron_request("trig-panic"), None, None).await;
+    assert!(entry.admitted);
+    assert!(
+        awake_hold_released(entry.entry_id).await,
+        "a panic leaked the hold"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
 }

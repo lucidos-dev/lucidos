@@ -1,14 +1,18 @@
 import { signal } from '@preact/signals';
-import { useEffect, useMemo, useRef } from 'preact/hooks';
-import { useDelayedFlag } from '../../hooks/useDelayedLoading';
-import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { answerThreadQuestion, retryUnsentPick } from '../../store/actions/chat-claude-code';
 import { createTapGate } from '../../utils/tapGesture';
-import { pendingDecisions } from './pendingDecisions';
+import { pendingAnswers, unsentPicks, usePickMark, type PickMark, type UnsentPick } from '../../store/pendingDecisions';
 import { renderMarkdown, renderMarkdownInline } from '../../utils/renderMarkdown';
 import { CHOICE_CARD_ROLE, handAnsweredCardFocusToPrompt, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
-import { UserImages } from './chat-exchange-parts';
-import { followAnsweredQuestion } from './scrollState';
-import type { AnswerKind, QuestionOption } from '../../store/thread-events';
+import { UserMessageBody } from './chat-exchange-parts';
+import { followAnsweredQuestion, followConfirmedCard } from './scrollState';
+import type { AnswerKind, QuestionOption, TypedAnswer } from '../../store/thread-events';
+import { discardUnsentAnswers, retryUnsentMessage } from '../../store/actions/chat';
+import { RetryIcon } from '../shared/icons';
+import { Disclosure } from '../shared/Disclosure';
+import { unsentMessages } from '../../store/unsentMessages';
+import { sendFailureDetail, type SendFailure } from '../../store/actions/sendRetry';
 
 /** Local name for the wire `AnswerKind`. Aliased rather than restated, because
  *  this card renders every kind the engine can persist. A second copy of the
@@ -22,17 +26,21 @@ export interface QuestionBodyProps {
   options: QuestionOption[];
   multiSelect?: boolean;
   resolved?: ResolvedAnswer;
+  /** What the user typed into the composer as this card's answer, not yet
+   *  confirmed. While it sends it reads like a picked answer. Once its POST
+   *  got no answer, it draws under the live options as "Not sent". */
+  typedAnswer?: TypedAnswer;
   /** Surrounding response was canceled / aborted / failed / superseded
    *  without an answer landing — render every option disabled. */
   terminated?: boolean;
 }
 
-// Selections and optimistic answers live at module level. PromptInput reads
-// the selections and writes a multi-select answer, and the divider header reads
-// the answers to say "Sending". The QuestionBody useEffect below drains both
-// when the persisted UserQuestionAnswered lands.
+// Selections live at module level, and the optimistic answers in the store
+// (`pendingAnswers`). PromptInput reads the selections and writes a
+// multi-select answer, and the divider header reads the answers to say
+// "Sending". The QuestionBody useEffect below drains both when the persisted
+// UserQuestionAnswered lands.
 export const multiSelectedByToolUse = signal<Map<string, string[]>>(new Map());
-export const pendingAnswers = pendingDecisions<ResolvedAnswer>();
 
 export function getMultiSelectedIds(toolUseId: string): string[] {
   return multiSelectedByToolUse.value.get(toolUseId) ?? [];
@@ -84,19 +92,19 @@ function OptionContent({
   option,
   multiSelect,
   selected,
-  sending = false,
+  mark = 'mark',
 }: {
   option: QuestionOption;
   multiSelect: boolean;
   selected: boolean;
-  /** The pick is on its way to the engine: the indicator spins in its place. */
-  sending?: boolean;
+  /** What a selected option draws in its indicator slot. */
+  mark?: PickMark;
 }) {
   return (
     <>
-      {selected && sending
+      {selected && mark === 'spinner'
         ? <span class="mini-spinner question-option-sending" aria-hidden="true" />
-        : <OptionIndicator multiSelect={multiSelect} selected={selected} />}
+        : <OptionIndicator multiSelect={multiSelect} selected={selected && mark === 'mark'} />}
       <span class="question-option-label">{option.label}</span>
       {option.description && (
         <span
@@ -151,26 +159,41 @@ function QuestionText({ question }: { question: string }) {
  *  it" row that hands that phrase back as the user's answer. The agent-side half
  *  lives in the `ask_user_question` tool description and the question rules in
  *  the engine prompts. */
-export function QuestionBody({ threadId, toolUseId, question, options, multiSelect, resolved, terminated }: QuestionBodyProps) {
+export function QuestionBody({ threadId, toolUseId, question, options, multiSelect, resolved, typedAnswer, terminated }: QuestionBodyProps) {
   // Drain the module-level maps once the persisted answer lands. Without this,
-  // selections + optimistic pending leak across the session.
+  // selections + optimistic pending leak across the session. The landing the
+  // answer deferred runs now too, once the spinner has given way to the mark.
   useEffect(() => {
     if (!resolved) return;
     pendingAnswers.clear(toolUseId);
     clearMultiSelected(toolUseId);
+    unsentPicks.clear(toolUseId);
+    followConfirmedCard(toolUseId);
   }, [resolved, toolUseId]);
 
   // A dead card draws no unconfirmed pick, matching its "Unanswered" header.
   // The pick stays stored, so an answer that still lands shows it again.
-  const pending = terminated ? undefined : pendingAnswers.map.value.get(toolUseId);
+  // A typed answer still sending reads as the card's answer. Any other typed
+  // answer keeps the card as it is and draws under its options, so its text
+  // is never hidden.
+  const typedSending: ResolvedAnswer | undefined = typedAnswer?.state === 'sending'
+    ? { kind: 'FreeText', text: typedAnswer.text, image_hashes: typedAnswer.image_hashes }
+    : undefined;
+  const pending = terminated ? undefined : pendingAnswers.map.value.get(toolUseId) ?? typedSending;
   const effective = resolved ?? pending;
-  const sending = useDelayedFlag(!resolved && !!pending);
+  const pickMark = usePickMark(!!resolved, !!pending);
   if (effective) {
-    return <AnsweredBody toolUseId={toolUseId} question={question} options={options} multiSelect={multiSelect} resolved={effective} sending={sending} />;
+    // A multi-select's ticks were drawn while the reader toggled them, so they
+    // stay through the send rather than giving way to a spinner.
+    const mark = multiSelect ? 'mark' : pickMark;
+    return <AnsweredBody toolUseId={toolUseId} question={question} options={options} multiSelect={multiSelect} resolved={effective} mark={mark} />;
   }
   if (terminated) {
-    return <TerminatedQuestionBody question={question} options={options} multiSelect={multiSelect} />;
+    return <TerminatedQuestionBody question={question} options={options} multiSelect={multiSelect} typedAnswer={typedAnswer} />;
   }
+  const typedBlock = typedAnswer && typedAnswerBlock(typedAnswer);
+
+  const unsentPick = unsentPicks.map.value.get(toolUseId);
 
   if (multiSelect) {
     const selected = multiSelectedByToolUse.value.get(toolUseId) ?? [];
@@ -182,9 +205,12 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
             toolUseId={toolUseId}
             options={options}
             selectedIds={selected}
+            unsent={unsentPick}
             onActivate={(id) => toggleMultiSelectedId(toolUseId, id)}
           />
         )}
+        {unsentPick && unsentPickTextBlock(unsentPick, toolUseId)}
+        {typedBlock}
       </div>
     );
   }
@@ -192,25 +218,138 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
   const onPick = async (optionId: string) => {
     handAnsweredCardFocusToPrompt();
     pendingAnswers.set(toolUseId, { kind: 'Selected', option_id: optionId });
-    // Answering is a send: keep the reader at the live edge while the agent
-    // resumes, landing on what they just answered when they were not already
-    // riding it. Before the await, because the scroll is the composer's-tap half
-    // of the action and must not wait on the round trip. See
-    // `followAnsweredQuestion`.
+    // Answering is a send: the reader lands on the live edge once the engine
+    // confirms the answer. Called before the await, so the reader's scroll
+    // during the round trip can still cancel it. See `followAnsweredQuestion`.
     followAnsweredQuestion(toolUseId);
-    const ok = await answerThreadQuestion(threadId, toolUseId, { kind: 'Selected', option_id: optionId });
+    const outcome = await answerThreadQuestion(threadId, toolUseId, { kind: 'Selected', option_id: optionId });
+    // The pick replaces a typed answer that was not sent.
+    if (outcome === 'sent') discardUnsentAnswers(threadId, toolUseId);
     // Roll the optimistic pick back so the card goes live again. The action
-    // owns the message: a second toast here made one failed tap say two things,
-    // neither of them the cause. See `answerFailureMessage`.
-    if (!ok) pendingAnswers.clear(toolUseId);
+    // owns the only failure message, a toast or the pick's Not sent. See
+    // `answerFailureMessage`.
+    else pendingAnswers.clear(toolUseId);
   };
 
   return (
     <div class="question-body protected-surface" data-tool-use-id={toolUseId}>
       <QuestionText question={question} />
       {options.length > 0 && (
-        <LiveOptions toolUseId={toolUseId} options={options} onActivate={onPick} />
+        <LiveOptions toolUseId={toolUseId} options={options} unsent={unsentPick} onActivate={onPick} />
       )}
+      {typedBlock}
+    </div>
+  );
+}
+
+/** A typed answer drawn on a card, as an unsent answer or a still-sending one. */
+function typedAnswerBlock(answer: TypedAnswer) {
+  const unsentEventId = answer.state === 'unsent' ? answer.unsentEventId : undefined;
+  return (
+    <TypedAnswerBlock
+      text={answer.text}
+      imageHashes={answer.image_hashes}
+      unsent={unsentEventId === undefined ? undefined : {
+        failure: unsentMessages.value.get(unsentEventId)?.failure,
+        onRetry: () => void retryUnsentMessage(unsentEventId),
+      }}
+    />
+  );
+}
+
+/** The answer the user typed, under the card's options: a "Your answer" label
+ *  over their words in a user bubble. While it sends, past the delay gate,
+ *  the label spins. If its POST got no answer, "Not sent" and a retry icon sit
+ *  under it. The card's options then stay live, so a new answer replaces it. */
+function TypedAnswerBlock({
+  text,
+  imageHashes,
+  sending = false,
+  unsent,
+}: {
+  text: string | undefined;
+  imageHashes: string[];
+  sending?: boolean;
+  /** Present when the answer was not sent: the notice under it. */
+  unsent?: UnsentNoticeProps;
+}) {
+  return (
+    <div class="question-freetext">
+      <span class="question-freetext-label">
+        {sending && <span class="mini-spinner question-freetext-sending" aria-hidden="true" />}
+        Your answer
+      </span>
+      <div class="user-bubble question-freetext-text">
+        <UserMessageBody html={text ? renderMarkdown(text) : ''} imageHashes={imageHashes} />
+      </div>
+      {unsent && <UnsentNotice {...unsent} />}
+    </div>
+  );
+}
+
+/** Send an unsent pick again. Once it lands it replaces a typed answer to the
+ *  same card that was not sent, as every other answer does. */
+async function retryPick(threadId: string, toolUseId: string): Promise<void> {
+  if (await retryUnsentPick(toolUseId) === 'sent') discardUnsentAnswers(threadId, toolUseId);
+}
+
+/** The options an answer picked, in the order the card lists them. */
+function pickedOptionIds(answer: AnswerKind): string[] {
+  if (answer.kind === 'Selected') return [answer.option_id];
+  if (answer.kind === 'MultiSelected') return answer.option_ids;
+  return [];
+}
+
+/** What a multi-select answer that was not sent typed alongside its ticks, so
+ *  its Retry never sends text the user cannot see. With no option ticked, the
+ *  text carries the Not sent notice instead of an option. */
+function unsentPickTextBlock(pick: UnsentPick, toolUseId: string) {
+  if (pick.answer.kind !== 'MultiSelected') return null;
+  const { text, image_hashes: imageHashes = [], option_ids: optionIds } = pick.answer;
+  if (!text && imageHashes.length === 0) return null;
+  return (
+    <TypedAnswerBlock
+      text={text}
+      imageHashes={imageHashes}
+      unsent={optionIds.length > 0 ? undefined : { failure: pick.failure, onRetry: () => void retryPick(pick.threadId, toolUseId) }}
+    />
+  );
+}
+
+interface UnsentNoticeProps {
+  failure: SendFailure | undefined;
+  onRetry: () => void;
+}
+
+/** "Not sent" and a retry icon, for an answer none of whose attempts got a
+ *  reply. Tapping "Not sent" rolls open what the attempts ended on. */
+function UnsentNotice({ failure, onRetry }: UnsentNoticeProps) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div class="question-unsent">
+      <div class="question-unsent-row">
+        <button
+          type="button"
+          class="question-unsent-toggle"
+          aria-expanded={open}
+          data-tooltip={open ? 'Hide details' : 'Show details'}
+          onClick={() => setOpen(!open)}
+        >
+          Not sent
+        </button>
+        <button
+          type="button"
+          class="icon-btn question-unsent-retry"
+          aria-label="Retry sending your answer"
+          data-tooltip="Retry"
+          onClick={onRetry}
+        >
+          <RetryIcon />
+        </button>
+      </div>
+      <Disclosure open={open} bodyClass="question-unsent-detail">
+        {failure ? sendFailureDetail(failure) : 'Lucidos did not answer, so this answer was not sent.'}
+      </Disclosure>
     </div>
   );
 }
@@ -225,6 +364,7 @@ function LiveOptions({
   toolUseId,
   options,
   selectedIds,
+  unsent,
   onActivate,
 }: {
   toolUseId: string;
@@ -232,9 +372,14 @@ function LiveOptions({
   /** Toggled ids for a multi-select question; omitted for single-select, which
    *  is what switches `OptionButton` between toggle and one-shot pick. */
   selectedIds?: string[];
+  /** A pick whose attempts all went unanswered: its options stay marked, and
+   *  the first one carries the Not sent notice. */
+  unsent?: UnsentPick;
   onActivate: (id: string) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const unsentIds = unsent ? pickedOptionIds(unsent.answer) : [];
+  const noticeOn = options.find(opt => unsentIds.includes(opt.id))?.id;
   // Keyed on `toolUseId`, and latched inside `seedChoiceCardFocus` so it fires
   // on the card's ARRIVAL only. A failed answer rolls the optimistic pending
   // back, which remounts this component; without the latch that would re-seed
@@ -247,14 +392,24 @@ function LiveOptions({
       ref={ref}
       onKeyDown={(e) => handleChoiceCardKeyDown(e, ref.current)}
     >
-      {options.map(opt => (
-        <OptionButton
-          key={opt.id}
-          option={opt}
-          pressed={selectedIds ? selectedIds.includes(opt.id) : undefined}
-          onActivate={onActivate}
-        />
-      ))}
+      {options.map(opt => {
+        const button = (
+          <OptionButton
+            key={opt.id}
+            option={opt}
+            pressed={selectedIds ? selectedIds.includes(opt.id) : undefined}
+            unsent={unsentIds.includes(opt.id)}
+            onActivate={onActivate}
+          />
+        );
+        // A sibling of the option, never inside it: the notice holds buttons.
+        return unsent && opt.id === noticeOn ? (
+          <div key={opt.id} class="question-option-unsent">
+            {button}
+            <UnsentNotice failure={unsent.failure} onRetry={() => void retryPick(unsent.threadId, toolUseId)} />
+          </div>
+        ) : button;
+      })}
     </div>
   );
 }
@@ -270,10 +425,13 @@ function LiveOptions({
 function OptionButton({
   option,
   pressed,
+  unsent = false,
   onActivate,
 }: {
   option: QuestionOption;
   pressed?: boolean;
+  /** Picked by an answer that was not sent, so it reads as picked. */
+  unsent?: boolean;
   onActivate: (id: string) => void;
 }) {
   const gate = useMemo(() => createTapGate(), []);
@@ -281,7 +439,7 @@ function OptionButton({
   return (
     <button
       type="button"
-      class="question-option"
+      class={unsent ? 'question-option question-option-selected' : 'question-option'}
       aria-pressed={isToggle ? pressed : undefined}
       onPointerDown={e => gate.down(e)}
       onPointerMove={e => gate.move(e)}
@@ -296,7 +454,7 @@ function OptionButton({
       }}
       aria-label={`${isToggle ? 'Toggle' : 'Answer'}: ${option.label}`}
     >
-      <OptionContent option={option} multiSelect={isToggle} selected={!!pressed} />
+      <OptionContent option={option} multiSelect={isToggle} selected={!!pressed || unsent} />
     </button>
   );
 }
@@ -321,14 +479,14 @@ export function AnsweredBody({
   options,
   multiSelect,
   resolved,
-  sending = false,
+  mark = 'mark',
 }: {
   toolUseId: string;
   question: string;
   options: QuestionBodyProps['options'];
   multiSelect: boolean | undefined;
   resolved: ResolvedAnswer;
-  sending?: boolean;
+  mark?: PickMark;
 }) {
   const isSelected = (id: string) =>
     (resolved.kind === 'Selected' && resolved.option_id === id) ||
@@ -349,19 +507,14 @@ export function AnsweredBody({
               key={opt.id}
               class={`question-option-static${isSelected(opt.id) ? ' question-option-selected' : ' question-option-dimmed'}`}
             >
-              <OptionContent option={opt} multiSelect={!!multiSelect} selected={isSelected(opt.id)} sending={sending} />
+              <OptionContent option={opt} multiSelect={!!multiSelect} selected={isSelected(opt.id)} mark={mark} />
             </div>
           ))}
         </div>
       )}
       {((customText && customText.length > 0) || imageHashes.length > 0) && (
-        <div class="question-freetext">
-          <span class="question-freetext-label">Your answer</span>
-          <div class="user-bubble question-freetext-text">
-            {customText}
-            <UserImages imageHashes={imageHashes} />
-          </div>
-        </div>
+        // A typed answer picks no option, so no option row can spin for it.
+        <TypedAnswerBlock text={customText} imageHashes={imageHashes} sending={mark === 'spinner' && resolved.kind === 'FreeText'} />
       )}
       {resolved.kind === 'Canceled' && (
         <button
@@ -386,16 +539,19 @@ export function AnsweredBody({
 }
 
 /** Dead-question rendering: same layout as the live card so the user can
- *  still read the question, but every option is disabled. Pure render so
- *  tests can walk the vnode tree directly. */
+ *  still read the question, but every option is disabled. A typed answer the
+ *  engine never confirmed still draws under them. Pure render so tests can
+ *  walk the vnode tree directly. */
 export function TerminatedQuestionBody({
   question,
   options,
   multiSelect,
+  typedAnswer,
 }: {
   question: string;
   options: QuestionBodyProps['options'];
   multiSelect: boolean | undefined;
+  typedAnswer?: TypedAnswer;
 }) {
   return (
     <div class="question-body question-body-terminated protected-surface">
@@ -409,6 +565,7 @@ export function TerminatedQuestionBody({
           ))}
         </div>
       )}
+      {typedAnswer && typedAnswerBlock(typedAnswer)}
     </div>
   );
 }

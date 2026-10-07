@@ -458,7 +458,11 @@ pub(crate) fn prompts_have_images(prompts: &[InjectedPrompt]) -> bool {
 /// Build the one user message a mid-turn injection batch is appended to. The
 /// delivery is intrinsic to this builder — it exists only for the live-turn
 /// path; the orphan path uses [`coalesced_user_text_for_reprocess`].
-pub(crate) fn coalesced_user_text_message(prompts: &[InjectedPrompt]) -> Message {
+/// `workspace` is where the images' blobs live, which their handles need.
+pub(crate) fn coalesced_user_text_message(
+    workspace: &std::path::Path,
+    prompts: &[InjectedPrompt],
+) -> Message {
     let has_images = prompts_have_images(prompts);
 
     let content = if prompts.len() == 1 && !has_images {
@@ -469,9 +473,20 @@ pub(crate) fn coalesced_user_text_message(prompts: &[InjectedPrompt]) -> Message
     } else {
         let mut blocks = Vec::new();
         for prompt in prompts {
-            blocks.push(ContentBlock::Text {
-                text: framed_injected_prompt(prompt, InjectionDelivery::MidTurn),
-            });
+            let mut text = framed_injected_prompt(prompt, InjectionDelivery::MidTurn);
+            // Same label a turn-opening image gets, so the agent copies the
+            // handle instead of guessing a `thread:N`.
+            if let Some(imgs) = prompt.images.as_deref().filter(|imgs| !imgs.is_empty()) {
+                let noun = if imgs.len() == 1 { "image" } else { "images" };
+                let handles: Vec<String> =
+                    crate::engine::chat::current_image_handles(workspace, imgs)
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                let note = crate::engine::chat::handles_note(&handles);
+                text.push_str(&format!("\n\n[{noun} attached to this message{note}]"));
+            }
+            blocks.push(ContentBlock::Text { text });
             if let Some(imgs) = &prompt.images {
                 for img in imgs {
                     let fitted = img.clone().fit_for_llm();
@@ -593,6 +608,7 @@ pub(crate) struct AppendedInjections {
 }
 
 pub(crate) async fn append_injected_prompts_to_messages(
+    workspace: &std::path::Path,
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
     meta: &crate::engine::thread_events::EventMeta,
@@ -641,7 +657,7 @@ pub(crate) async fn append_injected_prompts_to_messages(
                     emit_user_prompt_injected_event(bus, thread_id, meta, prompt).await;
                 }
                 let has_images = prompts_have_images(&batch);
-                messages.push(coalesced_user_text_message(&batch));
+                messages.push(coalesced_user_text_message(workspace, &batch));
                 result.appended = true;
                 if has_images {
                     result.image_message_idxs.push(messages.len() - 1);
@@ -842,7 +858,7 @@ pub(crate) fn build_intent_tools(caps: &ToolCapabilities) -> Vec<ToolDefinition>
     tools.push(get_notification_tool());
     // Grouped notification-inbox tool (list / mark_read / mark_all_read) +
     // any other manifest-declared LLM tools — single source of truth.
-    tools.extend(crate::capability_manifest::llm_tools());
+    tools.extend(crate::capability_manifest::llm_tools_for(caps));
     tools
 }
 
@@ -1462,7 +1478,7 @@ pub(crate) fn is_bad_image_description(desc: &str) -> bool {
 /// trap the loop — after this many forces the turn finalizes normally with
 /// prose. Far below the default tool-call cap, which remains the outer
 /// backstop. (A user who configures a cap this low has deliberately chosen for
-/// the backstop to fire first; see [`crate::core::MIN_MAX_TOOL_CALLS`].)
+/// the backstop to fire first; see [`crate::core::prefs::MAX_TOOL_CALLS`].)
 pub(crate) const MAX_QUESTION_REASK: usize = 2;
 
 /// Why the loop is pushing the model to re-ask. Each cause carries its own
@@ -1491,7 +1507,7 @@ impl QuestionReaskCause {
         match self {
             Self::CallRejected => {
                 "Your previous `ask_user_question` call was rejected because a question object \
-                 had no `question` text (the `header` chip-label is not a substitute). Do NOT \
+                 had no `question` text. Do NOT \
                  answer in prose or inline the options as a typed-reply menu: the user needs \
                  the clickable question card. Re-call `ask_user_question` now with the full \
                  question text filled in on every question object."
@@ -2135,15 +2151,32 @@ pub(crate) async fn ensure_failure_terminator_emitted(
 /// iteration sized from the current `messages`, and reads the tool array off
 /// [`TurnTools`], which can move mid-turn.
 ///
-/// `capture_body` mirrors `PreferenceStore::capture_context` — read once at
-/// build time and threaded through so the loop can fill the dynamic
-/// `Conversation` section's body when the user has the preference on.
-/// Without this, the body stayed `None` even with capture on, and the
-/// modal misleadingly showed "Body not captured (capture_context off)".
+/// `sections` always carry their bodies. [`round_capture_sections`] decides
+/// per round whether a capture keeps them.
 pub(crate) struct ContextCaptureSeed<'a> {
     pub sections: &'a [crate::engine::ContextSection],
     pub model: &'a str,
-    pub capture_body: bool,
+}
+
+/// The rows one round's `ContextCaptured` persists.
+///
+/// `capture_body` is the `capture_context` preference as read for THIS round,
+/// never for the turn: a question card can hold a turn open for hours.
+pub(crate) fn round_capture_sections(
+    seed: &[crate::engine::ContextSection],
+    tail: impl IntoIterator<Item = crate::engine::ContextSection>,
+    capture_body: bool,
+) -> Vec<crate::engine::ContextSection> {
+    seed.iter()
+        .cloned()
+        .chain(tail)
+        .map(|mut section| {
+            if !capture_body {
+                section.content = None;
+            }
+            section
+        })
+        .collect()
 }
 
 /// The tool array this turn sends, and what it costs.
@@ -2163,19 +2196,30 @@ pub(crate) struct TurnTools {
     names: Vec<String>,
     defs_chars: usize,
     mcp_generation: u64,
+    /// The ceiling the MCP slice was fitted under. Fixed for the turn, so a
+    /// mid-turn refresh fits the same window the setup did.
+    mcp_char_ceiling: usize,
+    /// What the MCP slice left out, as the line the model is told.
+    mcp_dropped_notice: Option<String>,
 }
 
 impl TurnTools {
-    /// `defs` is the whole array, MCP tools included, and `mcp_generation` is
-    /// the stamp the surface they came from was read at.
-    pub(crate) fn new(defs: Vec<ToolDefinition>, mcp_generation: u64) -> Self {
+    /// `engine_defs` are the engine-authored families, and `surface` is the MCP
+    /// slice fitted under `mcp_char_ceiling`. It lands at the tail.
+    pub(crate) fn new(
+        engine_defs: Vec<ToolDefinition>,
+        surface: crate::mcp::McpToolSurface,
+        mcp_char_ceiling: usize,
+    ) -> Self {
         let mut tools = Self {
-            defs,
+            defs: engine_defs,
             names: Vec::new(),
             defs_chars: 0,
-            mcp_generation,
+            mcp_generation: 0,
+            mcp_char_ceiling,
+            mcp_dropped_notice: None,
         };
-        tools.remeasure();
+        tools.refresh_mcp(surface);
         tools
     }
 
@@ -2202,6 +2246,16 @@ impl TurnTools {
         self.mcp_generation
     }
 
+    /// The ceiling to fit the next MCP surface under.
+    pub(crate) fn mcp_char_ceiling(&self) -> usize {
+        self.mcp_char_ceiling
+    }
+
+    /// The line telling the model which MCP tools were left out, if any were.
+    pub(crate) fn mcp_dropped_notice(&self) -> Option<&str> {
+        self.mcp_dropped_notice.as_deref()
+    }
+
     /// Every MCP server the array currently offers a tool for.
     ///
     /// Read either side of a refresh to see which servers came up and which
@@ -2223,6 +2277,7 @@ impl TurnTools {
     pub(crate) fn refresh_mcp(&mut self, surface: crate::mcp::McpToolSurface) {
         self.defs
             .retain(|t| crate::mcp::McpManager::parse_mcp_tool_name(&t.name).is_none());
+        self.mcp_dropped_notice = surface.dropped_notice();
         self.defs.extend(surface.tools);
         self.mcp_generation = surface.generation;
         self.remeasure();
@@ -2264,6 +2319,22 @@ pub(crate) fn mcp_surface_correction(
     })
 }
 
+/// What the round owes the model when the set of MCP tools left out moved.
+/// `None` when it did not.
+///
+/// The turn's first message carries the setup's notice and is never
+/// rewritten, so a refresh that cuts different tools, or none, has to say so.
+pub(crate) fn mcp_dropped_correction(before: Option<&str>, after: Option<&str>) -> Option<String> {
+    match (before, after) {
+        (before, Some(after)) if before != Some(after) => Some(after.to_string()),
+        (Some(_), None) => Some(
+            "[MCP UPDATE] Every MCP tool is sent now. This corrects the tools-not-sent line above."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// Cap on the `Conversation` body, matching what `chat::process` applies to
 /// every other section body. The eval lifts it (ADR 0110): this section IS the
 /// message array, the largest addressable region a context benchmark exists to
@@ -2280,19 +2351,16 @@ const CONVERSATION_PERSIST_MAX: usize = 8_000;
 /// measured over the trimmed array.
 ///
 /// `content_chars` is the array's real size, which is the region an eval sizes.
-/// Measuring it costs one serialization on a workspace with `capture_context`
-/// off, where the body would otherwise not be built. That is the price of the
-/// field being true rather than sometimes true.
+/// [`round_capture_sections`] may drop the body, never this size.
 pub(crate) fn conversation_section(
     messages: &[Message],
     bundled_total: usize,
     context_chars: usize,
-    capture_body: bool,
 ) -> crate::engine::ContextSection {
     let serialized = serialize_messages_for_capture(messages);
     let content_chars = serialized.chars().count();
     let cap = crate::engine::eval_capture::body_cap(CONVERSATION_PERSIST_MAX);
-    let content = capture_body.then(|| match cap {
+    let content = Some(match cap {
         Some(cap) if serialized.len() > cap => {
             crate::engine::context::truncate_head_tail(&serialized, cap)
         }
@@ -2322,9 +2390,9 @@ pub(crate) fn serialize_messages_for_capture(messages: &[Message]) -> String {
             MessageContent::Blocks(blocks) => {
                 for block in blocks {
                     match block {
-                        ContentBlock::Text { text } | ContentBlock::EngineTail { text } => {
-                            out.push_str(text)
-                        }
+                        ContentBlock::Text { text }
+                        | ContentBlock::EngineTail { text }
+                        | ContentBlock::MemoryView { text } => out.push_str(text),
                         ContentBlock::ToolUse {
                             name, input, id, ..
                         } => {

@@ -34,6 +34,23 @@ pub(super) async fn submit_mcp_permission_consent(
     headers: HeaderMap,
     Json(body): Json<McpPermissionConsentRequest>,
 ) -> impl IntoResponse {
+    let card_thread = state
+        .engine
+        .pending_mcp_permission
+        .lock()
+        .unwrap()
+        .thread_of(&body.request_id);
+    if let Err(e) = super::thread_reach::refuse_permission_answer(
+        &state.pool,
+        &headers,
+        card_thread,
+        body.allowed,
+        body.persist_scope,
+    )
+    .await
+    {
+        return e.into_response();
+    }
     let actor = super::actor::user_actor(&headers, None);
     let answered = resolve_mcp_permission(
         &state.engine,

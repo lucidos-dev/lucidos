@@ -24,11 +24,12 @@ afterEach(() => {
   unsentMessages.value = new Map();
 });
 
-function mountFailed(userSeq: number): HTMLElement | null {
+/** `unsent` draws the client-only pair `showUnsentExchange` writes. */
+function mountFailed(userSeq: number, unsent = userSeq < 0): HTMLElement | null {
   const exchange = {
     ...makeExchange(
-      { type: 'MessageReceived', text: 'hello', mode: 'human', created: TS, _eventId: 'e-1' } as StoredEvent,
-      [{ seq: userSeq + 1, event: { type: 'ResponseFailed', error: 'no answer', created: TS } as StoredEvent }],
+      { type: 'MessageReceived', text: 'hello', mode: 'human', created: TS, _eventId: 'e-1', _unsent: unsent || undefined } as StoredEvent,
+      [{ seq: userSeq + 1, event: { type: 'ResponseFailed', error: 'no answer', created: TS, _unsent: unsent || undefined } as StoredEvent }],
     ),
     userSeq,
   };
@@ -64,6 +65,28 @@ describe('the failure card', () => {
     expect(card?.querySelector('strong')?.textContent).toBe('Not sent');
     expect(card?.querySelector('button.exchange-error-retry')?.textContent?.trim()).toBe('Retry');
     expect(card?.querySelector('button.exchange-error-discard')?.textContent?.trim()).toBe('Discard');
+  });
+
+  it('quotes the message it would retry, since live output can push the card far below its bubble', () => {
+    unsentMessages.value = new Map([['e-1', {
+      threadId: 'tid',
+      body: { message: 'Connection not good?', mode: 'human', event_id: 'e-1', thread_id: 'tid' } as never,
+      failedRetries: 0,
+      settlement: { kind: 'follow-up' },
+    }]]);
+    const card = mountFailed(-2);
+    expect(card?.querySelector('.exchange-error-quote')?.textContent).toBe('Connection not good?');
+  });
+
+  it('puts Retry, the primary action, last in the row', () => {
+    unsentMessages.value = new Map([['e-1', {
+      threadId: 'tid',
+      body: { message: 'hello', mode: 'human', event_id: 'e-1', thread_id: 'tid' } as never,
+      failedRetries: 0,
+      settlement: { kind: 'follow-up' },
+    }]]);
+    const buttons = [...(mountFailed(-2)?.querySelectorAll('.exchange-error-actions button') ?? [])];
+    expect(buttons.map((b) => b.textContent?.trim())).toEqual(['Discard', 'Retry']);
   });
 
   it('keeps the failed-reply card for a turn the engine recorded', () => {

@@ -149,7 +149,9 @@ fn parse_assistant_tool_use() {
     let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::ToolUse { name, input, id } => {
+        AgentEvent::ToolUse {
+            name, input, id, ..
+        } => {
             assert_eq!(name, "Read");
             assert_eq!(input["file_path"], "/tmp/test.rs");
             assert_eq!(id, "tu_1", "tool_use_id must be extracted so the QuestionCard can match answers to the originating question");
@@ -197,6 +199,7 @@ fn parse_assistant_extracts_usage() {
             output_tokens,
             cache_read_tokens,
             cache_creation_tokens,
+            ..
         } => {
             assert_eq!(model.as_deref(), Some("claude-opus-4-7"));
             assert_eq!(*input_tokens, 1234);
@@ -528,6 +531,183 @@ fn a_sub_agent_frame_still_reports_while_a_parent_message_is_open() {
     assert_eq!(usages(&parent_end), vec![(2, 0, 7_096, 168)]);
 }
 
+/// The `parent_tool_use_id` of every tool call, tool result and usage report in
+/// `events`, in order. Other events carry no parent and are skipped.
+fn parents(events: &[AgentEvent]) -> Vec<Option<&str>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolUse {
+                parent_tool_use_id, ..
+            }
+            | AgentEvent::ToolResult {
+                parent_tool_use_id, ..
+            }
+            | AgentEvent::Usage {
+                parent_tool_use_id, ..
+            } => Some(parent_tool_use_id.as_deref()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A sub-agent's call and its usage name the `Agent` call that spawned it, so
+/// the transcript can fold the sub-agent's steps under that call.
+#[test]
+fn a_sub_agent_call_and_its_usage_name_the_spawning_agent_call() {
+    let mut state = CcStreamState::default();
+    let sub = parse_line(
+        &mut state,
+        &streamed_frame("msg_sub", TOOL_BLOCK, Some("toolu_agent")),
+    );
+
+    assert_eq!(
+        parents(&sub),
+        vec![Some("toolu_agent"), Some("toolu_agent")]
+    );
+}
+
+/// The `api_call_id` of every tool call and usage report in `events`, in order.
+fn api_call_ids(events: &[AgentEvent]) -> Vec<Option<&str>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolUse { api_call_id, .. } | AgentEvent::Usage { api_call_id, .. } => {
+                Some(api_call_id.as_deref())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A sub-agent's calls in one message share its id with that message's usage,
+/// including a call that arrives after the usage was released.
+#[test]
+fn a_sub_agent_batch_and_its_usage_share_one_api_call_id() {
+    let mut state = CcStreamState::default();
+    let first = parse_line(
+        &mut state,
+        &streamed_frame("msg_sub", TOOL_BLOCK, Some("toolu_agent")),
+    );
+    let second = parse_line(
+        &mut state,
+        &streamed_frame("msg_sub", TOOL_BLOCK, Some("toolu_agent")),
+    );
+
+    assert_eq!(kinds(&first), vec!["tool_use", "usage"]);
+    assert_eq!(api_call_ids(&first), vec![Some("msg_sub"), Some("msg_sub")]);
+    assert_eq!(api_call_ids(&second), vec![Some("msg_sub")]);
+}
+
+/// The session's own batch reports its usage at `message_delta`, after every
+/// call. All of them carry the id that usage carries.
+#[test]
+fn the_sessions_batch_and_its_usage_share_one_api_call_id() {
+    let mut state = CcStreamState::default();
+    parse_line(&mut state, &message_start("msg_own", 2, 0, 7_096));
+    let mut events = parse_line(&mut state, &streamed_frame("msg_own", TOOL_BLOCK, None));
+    events.extend(parse_line(
+        &mut state,
+        &streamed_frame("msg_own", TOOL_BLOCK, None),
+    ));
+    events.extend(parse_line(&mut state, &message_delta(2, 0, 7_096, 168)));
+
+    let calls_and_usage: Vec<_> = kinds(&events)
+        .into_iter()
+        .filter(|k| *k != "other")
+        .collect();
+    assert_eq!(calls_and_usage, vec!["tool_use", "tool_use", "usage"]);
+    assert_eq!(api_call_ids(&events), vec![Some("msg_own"); 3]);
+}
+
+/// The session's own calls and usage carry no parent, so they stay top-level.
+#[test]
+fn the_parents_own_call_and_usage_carry_no_parent() {
+    let mut state = CcStreamState::default();
+    let own = parse_line(&mut state, &streamed_frame("msg_own", TOOL_BLOCK, None));
+
+    assert_eq!(parents(&own), vec![None, None]);
+}
+
+/// A sub-agent's result answers its own call, and names the same parent.
+#[test]
+fn a_sub_agent_tool_result_names_the_spawning_agent_call() {
+    let line = r#"{"type":"user","parent_tool_use_id":"toolu_agent","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#;
+
+    assert_eq!(parents(&parse_one_line(line)), vec![Some("toolu_agent")]);
+}
+
+const THINKING_BLOCK: &str = r#"{"type":"thinking","thinking":"weighing it"}"#;
+
+/// The kind of each event, in order, so a test can read the stream's shape.
+fn kinds(events: &[AgentEvent]) -> Vec<&'static str> {
+    events
+        .iter()
+        .map(|e| match e {
+            AgentEvent::ToolUse { .. } => "tool_use",
+            AgentEvent::Usage { .. } => "usage",
+            AgentEvent::Result { .. } => "result",
+            _ => "other",
+        })
+        .collect()
+}
+
+/// A sub-agent message can open with a `thinking` block. Its usage still
+/// reports after the step it measured, so the capture binds to that step.
+#[test]
+fn a_sub_agent_usage_claimed_on_a_thinking_frame_follows_its_call() {
+    let mut state = CcStreamState::default();
+    let thinking = parse_line(
+        &mut state,
+        &streamed_frame("msg_t", THINKING_BLOCK, Some("toolu_agent")),
+    );
+    let call = parse_line(
+        &mut state,
+        &streamed_frame("msg_t", TOOL_BLOCK, Some("toolu_agent")),
+    );
+
+    assert!(kinds(&thinking).is_empty(), "got {thinking:?}");
+    assert_eq!(kinds(&call), vec!["tool_use", "usage"]);
+}
+
+/// A held usage whose message never drew anything still reports, at the end
+/// of the turn: the provider billed the call.
+#[test]
+fn a_held_sub_agent_usage_reports_when_the_turn_ends() {
+    let mut state = CcStreamState::default();
+    parse_line(
+        &mut state,
+        &streamed_frame("msg_t", THINKING_BLOCK, Some("toolu_agent")),
+    );
+    let end = parse_line(
+        &mut state,
+        r#"{"type":"result","subtype":"success","result":"done","duration_ms":1}"#,
+    );
+
+    assert_eq!(kinds(&end), vec!["usage", "result"]);
+}
+
+/// A sub-agent's prose never joins the parent's reply. It arrives whole, named
+/// by the `Agent` call that spawned it, so the engine can record it apart.
+#[test]
+fn a_sub_agent_text_block_arrives_as_sub_agent_prose() {
+    let mut state = CcStreamState::default();
+    let sub = parse_line(
+        &mut state,
+        &streamed_frame("msg_sub", TEXT_BLOCK, Some("toolu_agent")),
+    );
+
+    assert!(
+        !sub.iter().any(|e| matches!(e, AgentEvent::Message { .. })),
+        "a sub-agent's text must not become parent prose, got {sub:?}"
+    );
+    assert!(sub.iter().any(|e| matches!(
+        e,
+        AgentEvent::SubAgentMessage { text, parent_tool_use_id }
+            if text == "hi" && parent_tool_use_id == "toolu_agent"
+    )));
+}
+
 /// Defensive: should a sub-agent's stream events ever ride the parent's
 /// stream, they must not open or close the parent's message.
 #[test]
@@ -628,7 +808,9 @@ fn parse_legacy_tool_result() {
     let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::ToolResult { output, status, id } => {
+        AgentEvent::ToolResult {
+            output, status, id, ..
+        } => {
             assert_eq!(output, "file contents here");
             assert_eq!(status, "success");
             assert_eq!(id, "toolu_legacy");
@@ -643,7 +825,9 @@ fn parse_legacy_tool_result_error() {
     let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::ToolResult { output, status, id } => {
+        AgentEvent::ToolResult {
+            output, status, id, ..
+        } => {
             assert_eq!(output, "not found");
             assert_eq!(status, "error");
             // Missing tool_use_id in payload → empty (legacy frame).
@@ -718,7 +902,9 @@ fn parse_user_tool_result() {
     let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::ToolResult { output, status, id } => {
+        AgentEvent::ToolResult {
+            output, status, id, ..
+        } => {
             assert_eq!(output, "result text");
             assert_eq!(status, "success");
             assert_eq!(id, "tu_1");
@@ -733,7 +919,9 @@ fn parse_user_tool_result_error() {
     let events = parse_one_line(line);
     assert_eq!(events.len(), 1);
     match &events[0] {
-        AgentEvent::ToolResult { output, status, id } => {
+        AgentEvent::ToolResult {
+            output, status, id, ..
+        } => {
             assert_eq!(output, "permission denied");
             assert_eq!(status, "error");
             assert_eq!(id, "tu_1");
@@ -756,9 +944,9 @@ fn one_tool_result(line: &str) -> (String, String, String) {
     let events = parse_one_line(line);
     assert_eq!(events.len(), 1, "expected one event from {line}");
     match &events[0] {
-        AgentEvent::ToolResult { output, status, id } => {
-            (output.clone(), status.clone(), id.clone())
-        }
+        AgentEvent::ToolResult {
+            output, status, id, ..
+        } => (output.clone(), status.clone(), id.clone()),
         other => panic!("Expected ToolResult, got {other:?}"),
     }
 }

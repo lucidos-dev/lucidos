@@ -64,6 +64,7 @@
 //! iframe runs no builds.
 
 use crate::llm::provider::ToolDefinition;
+use crate::llm::tools::Gate;
 use serde_json::{Map, Value};
 
 #[cfg(test)]
@@ -240,6 +241,9 @@ pub struct Domain {
     /// Retired flat LLM tool names that still dispatch to this domain (back-compat
     /// aliases so existing prompts/threads keep working after consolidation).
     pub llm_aliases: &'static [&'static str],
+    /// Whether a workspace's chat turns are offered the grouped tool. A gated
+    /// domain still has its routes and CLI commands in every workspace.
+    pub llm_gate: Gate,
 }
 
 impl Domain {
@@ -447,6 +451,7 @@ const PREFERENCES_DOMAIN: Domain = Domain {
     sdk: true,
     operations: PREFERENCES_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -769,6 +774,7 @@ const TRIGGERS_DOMAIN: Domain = Domain {
     sdk: true,
     operations: TRIGGERS_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -916,6 +922,7 @@ const TRIGGER_GROUPS_DOMAIN: Domain = Domain {
     sdk: false,
     operations: TRIGGER_GROUPS_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1037,7 @@ const APPS_DOMAIN: Domain = Domain {
     sdk: true,
     operations: APPS_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +1142,7 @@ const EVENTS_DOMAIN: Domain = Domain {
     sdk: false,
     operations: EVENTS_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -1262,6 +1271,7 @@ const CHANGES_DOMAIN: Domain = Domain {
     sdk: false,
     operations: CHANGES_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -1364,29 +1374,38 @@ const MODEL_CONTEXT_WINDOW_ARG: Arg = Arg {
     loc: ArgIn::Body,
     description: "Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, xAI, Gemini and local ids however large they are. The guess errs low on purpose.",
 };
+const MODEL_VISION_ARG: Arg = Arg {
+    name: "vision",
+    ty: ArgType::Bool,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Whether the model reads images. Image description offers and calls only such models. Omitted on add means false; on update, keeps the stored value.",
+};
 
 // `routes` is a Json arg, so the LLM shape of `add` is spelled out here. `id`
 // keeps the structure `args` would derive, since enable / disable / remove still
 // derive it and the union must agree. Only the top-level `provider` spells the
 // enum: the handler refuses an unknown name in a route with the list.
 const MODELS_ADD_LLM_SCHEMA: &str = r#"{
-  "id": {"type":"string","description":"Model id, also the API string unless a route overrides it. Needed by all but list."},
+  "id": {"type":"string","description":"Model id, the API string unless a route overrides it. All but list need it."},
   "label": {"type":"string","description":"Display name; defaults to the id."},
-  "provider": {"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local"],"description":"Single-route shorthand, for the first route. Adding needs this or routes."},
+  "provider": {"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local"],"description":"Single-route shorthand for the first route. Add needs it or routes."},
   "sort_order": {"type":"integer","description":"Lower sorts first."},
-  "context_window": {"anyOf":[{"type":"null"},{"type":"integer"}],"description":"The first route's window in tokens. Set it: omitted, most non-Claude ids are guessed at 200k. On update, null clears it."},
-  "routes": {"type":"array","description":"Backends in priority order. Replaces the whole list.","items":{"type":"object","properties":{"provider":{"type":"string"},"id":{"type":"string","description":"This backend's id if different, e.g. 'anthropic/claude-opus-5-5'."},"context_window":{"type":"integer"}},"required":["provider"]}}
+  "context_window": {"anyOf":[{"type":"null"},{"type":"integer"}],"description":"First route's window in tokens; omitted, most non-Claude ids get 200k. Null clears."},
+  "routes": {"type":"array","description":"Backends in priority order. Replaces the whole list.","items":{"type":"object","properties":{"provider":{"type":"string"},"id":{"type":"string","description":"This backend's id if different, e.g. 'anthropic/claude-opus-5-5'."},"context_window":{"type":"integer"}},"required":["provider"]}},
+  "vision": {"type":"boolean","description":"Reads images; only such models describe images."}
 }"#;
 // The properties `add` already declares are not repeated: the union is
 // first-wins, so a second copy would be dropped unseen.
 const MODELS_UPDATE_LLM_SCHEMA: &str = r#"{
-  "preferred_provider": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Backend to use when several routes are configured, one of them. Null clears."}
+  "preferred_provider": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Backend to use when several routes are configured. Null clears."}
 }"#;
 
 const MODELS_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "Every model, enabled and disabled, builtin and user.",
+        summary: "Every model, enabled or not, builtin or user.",
         method: Method::Get,
         path: "/models",
         args: &[],
@@ -1411,6 +1430,7 @@ const MODELS_OPS: &[Operation] = &[
             MODEL_SORT_ORDER_ARG,
             MODEL_CONTEXT_WINDOW_ARG,
             MODEL_ROUTES_ARG,
+            MODEL_VISION_ARG,
         ],
         cli_name: "add",
         sdk_name: "add",
@@ -1440,7 +1460,7 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "disable",
-        summary: "Hide it from the picker; builtins disable, never delete.",
+        summary: "Hide it from the picker; builtins cannot be deleted.",
         method: Method::Put,
         path: "/models",
         args: &[MODEL_ID_QUERY_ARG],
@@ -1455,7 +1475,7 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "update",
-        summary: "Edit routes or preferred_provider; label and sort_order on user models only.",
+        summary: "Edit any field; label and sort_order on user models only.",
         method: Method::Put,
         path: "/models",
         args: &[
@@ -1467,6 +1487,7 @@ const MODELS_OPS: &[Operation] = &[
             MODEL_CONTEXT_WINDOW_ARG,
             MODEL_ROUTES_ARG,
             MODEL_PREFERRED_PROVIDER_ARG,
+            MODEL_VISION_ARG,
         ],
         cli_name: "update",
         sdk_name: "update",
@@ -1505,6 +1526,7 @@ const MODELS_DOMAIN: Domain = Domain {
     sdk: false,
     operations: MODELS_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -1613,6 +1635,7 @@ const REPOSITORIES_DOMAIN: Domain = Domain {
     sdk: false,
     operations: REPOSITORIES_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -1712,6 +1735,7 @@ const ENV_VARS_DOMAIN: Domain = Domain {
     sdk: false,
     operations: ENV_VARS_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -1847,8 +1871,8 @@ const THREADS_OPS: &[Operation] = &[
     },
     Operation {
         action: "detach_child",
-        summary: "Stop waiting for one of YOUR direct children: it moves to top level and \
-                  keeps running. Frees no child slot. (requires: thread_id)",
+        summary: "Stop waiting for YOUR direct child: it moves to top level and keeps \
+                  running, holding its slot until done. (requires: thread_id)",
         method: Method::Post,
         path: "/threads/:thread_id/detach",
         args: &[],
@@ -1928,6 +1952,7 @@ const THREADS_DOMAIN: Domain = Domain {
     sdk: false,
     operations: THREADS_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -1943,7 +1968,7 @@ const THREADS_DOMAIN: Domain = Domain {
 // question decomposed to a bare subject name against a corpus overwhelmingly
 // about that subject, so the injected 25 came back arbitrary and the agent had
 // no way to ask again. That decomposition is fixed at the root in
-// `QUERY_CLASSIFICATION_PROMPT`; these are the backstop for the misses that
+// `SUB_QUERY_PROMPT`; these are the backstop for the misses that
 // remain, because no pre-turn guess is ever complete.
 //
 // `stats` and `entries` stay CLI-only, deliberately. Paging the whole index and
@@ -2181,6 +2206,166 @@ const MEMORY_DOMAIN: Domain = Domain {
     sdk: false,
     operations: MEMORY_OPS,
     llm_aliases: &[],
+    // A Tree turn reads the summary trees and never this memory, so the tool
+    // goes and `recall` takes its slot. The CLI stays, for Classic's own data.
+    llm_gate: Gate::MemoryClassic,
+};
+
+// ---------------------------------------------------------------------------
+// recall: the Tree memory module's recall tools (ADR 0362). The LLM tool is
+// offered only once the workspace is on Tree with its trees ready. The routes
+// and CLI commands exist everywhere, and answer from whatever is built.
+// ---------------------------------------------------------------------------
+
+const RECALL_ID_ARG: Arg = Arg {
+    name: "id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Query,
+    description: "A node id from a memory view or a recall result: w/<start>+<span> for the \
+                  workspace tree, <thread id>/<start>+<span> for a thread's.",
+};
+const RECALL_N_ARG: Arg = Arg {
+    name: "n",
+    ty: ArgType::Int,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Query,
+    description: "Levels to open, 1-6 (default 1). Each level halves the span of the lines.",
+};
+const RECALL_THREAD_ARG: Arg = Arg {
+    name: "thread",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Query,
+    description: "The thread a bare <start>+<span> id names.",
+};
+const RECALL_COST_THREAD_ARG: Arg = Arg {
+    name: "thread",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Query,
+    description: "The thread the judgment calls' cost is filed under.",
+};
+const RECALL_QUERY_ARG: Arg = Arg {
+    name: "query",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Query,
+    description: "What to find, in plain words.",
+};
+const RECALL_TEXT_ARG: Arg = Arg {
+    name: "text",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Query,
+    description: "Words the messages hold. Every word must appear.",
+};
+const RECALL_LIMIT_ARG: Arg = Arg {
+    name: "limit",
+    ty: ArgType::Int,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Query,
+    description: "Max results (1-20, default 10).",
+};
+
+/// The LLM shapes leave out `thread`: a bare id names the calling thread.
+const RECALL_ZOOM_LLM_SCHEMA: &str = r#"{
+  "id": {"type":"string","description":"A line's id, as the view or a result shows it. A bare start+span names this thread."},
+  "n": {"type":"integer","description":"Levels to open, 1-6, default 1."}
+}"#;
+const RECALL_DATE_LLM_SCHEMA: &str = r#"{
+  "id": {"type":"string","description":"A line's id, as the view or a result shows it. A bare start+span names this thread."}
+}"#;
+const RECALL_FIND_LLM_SCHEMA: &str = r#"{
+  "query": {"type":"string","description":"What you want to find, in plain words."},
+  "limit": {"type":"integer","description":"1-20, default 10."}
+}"#;
+const RECALL_SEARCH_LLM_SCHEMA: &str = r#"{
+  "text": {"type":"string","description":"Words the messages hold. Every word must appear."},
+  "limit": {"type":"integer","description":"1-20, default 10."}
+}"#;
+
+const RECALL_OPS: &[Operation] = &[
+    Operation {
+        action: "zoom",
+        summary: "Open a memory view line into the lines it summarises, down to the exact message.",
+        method: Method::Get,
+        path: "/recall/zoom",
+        args: &[RECALL_ID_ARG, RECALL_N_ARG, RECALL_THREAD_ARG],
+        cli_name: "zoom",
+        sdk_name: "zoom",
+        mutating: false,
+        llm_alias: Some("recall_zoom"),
+        llm_schema: Some(RECALL_ZOOM_LLM_SCHEMA),
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "find",
+        summary:
+            "Walk the workspace tree for lines about something, judging each line on the way down.",
+        method: Method::Get,
+        path: "/recall/find",
+        args: &[RECALL_QUERY_ARG, RECALL_LIMIT_ARG, RECALL_COST_THREAD_ARG],
+        cli_name: "find",
+        sdk_name: "find",
+        mutating: false,
+        llm_alias: Some("recall_find"),
+        llm_schema: Some(RECALL_FIND_LLM_SCHEMA),
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "search",
+        summary: "Find messages holding exact words. Returns each one's id.",
+        method: Method::Get,
+        path: "/recall/search",
+        args: &[RECALL_TEXT_ARG, RECALL_LIMIT_ARG],
+        cli_name: "search",
+        sdk_name: "search",
+        mutating: false,
+        llm_alias: Some("recall_search"),
+        llm_schema: Some(RECALL_SEARCH_LLM_SCHEMA),
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "date",
+        summary: "When the entries under a line happened, first to last.",
+        method: Method::Get,
+        path: "/recall/date",
+        args: &[RECALL_ID_ARG, RECALL_THREAD_ARG],
+        cli_name: "date",
+        sdk_name: "date",
+        mutating: false,
+        llm_alias: Some("recall_date"),
+        llm_schema: Some(RECALL_DATE_LLM_SCHEMA),
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+];
+
+const RECALL_DOMAIN: Domain = Domain {
+    name: "recall",
+    tool_name: "recall",
+    tool_summary: "Open and search the summary trees behind this turn's memory views. Each view line starts with its id.",
+    llm: true,
+    cli: true,
+    sdk: false,
+    operations: RECALL_OPS,
+    llm_aliases: &[],
+    llm_gate: Gate::MemoryTree,
 };
 
 // ---------------------------------------------------------------------------
@@ -2220,6 +2405,7 @@ const TQ_POLICY_LLM_SCHEMA: &str = r#"{
   "max_queued_per_trigger": {"type":"integer","minimum":1,"description":"Backlog before overflow applies."},
   "reserved_background": {"type":"integer","minimum":0,"description":"Reclaimed ahead of user work; 0 is pure user priority."},
   "max_event_trigger_depth": {"type":"integer","minimum":1,"description":"Trigger fires one event chain may make."},
+  "max_concurrent_children_per_thread": {"type":"integer","minimum":1},
   "overflow": {"type":"string","enum":["drop-oldest","pause-trigger"]}
 }"#;
 
@@ -2298,6 +2484,7 @@ const THREAD_QUEUE_DOMAIN: Domain = Domain {
     sdk: false,
     operations: THREAD_QUEUE_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -2422,6 +2609,7 @@ const MCP_DOMAIN: Domain = Domain {
     sdk: false,
     operations: MCP_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -2526,6 +2714,7 @@ const PLUGINS_DOMAIN: Domain = Domain {
     sdk: false,
     operations: PLUGINS_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 // ---------------------------------------------------------------------------
@@ -2721,6 +2910,7 @@ const WEBHOOKS_DOMAIN: Domain = Domain {
     sdk: false,
     operations: WEBHOOKS_OPS,
     llm_aliases: &[],
+    llm_gate: Gate::Ungated,
 };
 
 const DOMAINS: &[Domain] = &[
@@ -2734,6 +2924,7 @@ const DOMAINS: &[Domain] = &[
         sdk: true,
         operations: NOTIFICATIONS_OPS,
         llm_aliases: &[],
+        llm_gate: Gate::Ungated,
     },
     PREFERENCES_DOMAIN,
     TRIGGERS_DOMAIN,
@@ -2743,6 +2934,7 @@ const DOMAINS: &[Domain] = &[
     CHANGES_DOMAIN,
     THREADS_DOMAIN,
     MEMORY_DOMAIN,
+    RECALL_DOMAIN,
     THREAD_QUEUE_DOMAIN,
     ENV_VARS_DOMAIN,
     MODELS_DOMAIN,
@@ -2883,11 +3075,20 @@ pub fn build_llm_tool(domain: &Domain) -> ToolDefinition {
     }
 }
 
-/// All grouped LLM tools the manifest contributes (domains with `llm = true`).
+/// The grouped LLM tools of a workspace with no capability configured: the
+/// ungated domains, plus Classic's `memory`, since Classic is the default.
 pub fn llm_tools() -> Vec<ToolDefinition> {
+    llm_tools_for(&crate::llm::ToolCapabilities::default())
+}
+
+/// The grouped LLM tools one workspace is offered: every domain whose gate
+/// `caps` opens, in manifest order. A shut gate removes its tool and moves
+/// nothing else. So the memory module swaps `memory` for `recall` in one
+/// slot, and the rest of the cached array stays as it was.
+pub fn llm_tools_for(caps: &crate::llm::ToolCapabilities) -> Vec<ToolDefinition> {
     DOMAINS
         .iter()
-        .filter(|d| d.llm)
+        .filter(|d| d.llm && d.llm_gate.is_open(caps))
         .map(build_llm_tool)
         .collect()
 }
@@ -3510,6 +3711,7 @@ mod tests {
             "context_window",
             "routes",
             "preferred_provider",
+            "vision",
         ] {
             assert!(
                 props.get(p).is_some(),

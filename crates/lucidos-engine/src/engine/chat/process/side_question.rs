@@ -40,7 +40,7 @@ impl LucidosEngine {
                 thread_id,
                 question,
                 turn_started_at,
-                context_mode,
+                &capabilities.gates,
             )
             .await;
         let user_timezone = self.user_timezone.read().await.clone();
@@ -56,7 +56,6 @@ impl LucidosEngine {
                 &capabilities,
             )
             .await;
-        let tools = self.chat_turn_tools(&capabilities.gates).await;
 
         let configured = self.current_provider().configured_providers();
         let resolved = super::run::resolve_route_overrides(
@@ -70,12 +69,34 @@ impl LucidosEngine {
         )
         .await;
 
+        let provider = self.current_provider();
+        let model = resolved
+            .model
+            .clone()
+            .unwrap_or_else(|| provider.default_model().to_string());
+        // A Tree workspace's history is its memory views, read as a turn here
+        // would read them.
+        let context_window = self.context_window_for(&model, resolved.as_selection().provider);
+        let views = if capabilities.gates.memory_tree {
+            let surface = self.chat_surface(thread_id, false).await;
+            let limit = crate::engine::context::agent_context_char_budget(context_window) / 2;
+            self.turn_memory_views(thread_id, surface, &model, question, limit)
+                .await
+        } else {
+            Default::default()
+        };
+
         let framing = format!("[SIDE QUESTION]\n{SIDE_QUESTION_INSTRUCTIONS}\n[END SIDE QUESTION]");
-        let text = [history.history_context.as_str(), &framing, question]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join(super::context_mode::PART_SEPARATOR);
+        let text = [
+            views.recent.as_str(),
+            history.history_context.as_str(),
+            &framing,
+            question,
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(super::context_mode::PART_SEPARATOR);
         let mut messages = if context_mode.is_on() {
             Vec::new()
         } else {
@@ -83,41 +104,44 @@ impl LucidosEngine {
         };
         messages.push(Message {
             role: "user".to_string(),
-            content: build_user_content_with_images(
+            content: views.lead(build_user_content_with_images(
                 text,
                 &self.workspace_path,
                 &history.history_image_hashes,
                 Some(images),
-            ),
+                // `SideQuestionAsked` is not walked for thread images, so a
+                // handle printed here would resolve to nothing.
+                &[],
+            )),
         });
 
-        let provider = self.current_provider();
-        let model = resolved
-            .model
-            .clone()
-            .unwrap_or_else(|| provider.default_model().to_string());
+        let tools = self
+            .chat_turn_tools(&capabilities.gates, context_window)
+            .await;
         let capture = crate::engine::AuxCapture::new(
             &self.event_bus,
             thread_id,
             crate::engine::ContextPurpose::SideQuestion,
         );
+        let capture = capture.until(deadline);
         for _ in 0..SIDE_QUESTION_MAX_TURNS {
-            let request_chars =
-                crate::engine::context::request_chars(&system_prompt, &messages, tools.defs());
-            let response = tokio::time::timeout_at(
-                deadline,
-                provider.chat(
+            let response = capture
+                .chat(
+                    provider.as_ref(),
                     messages.clone(),
                     tools.defs().to_vec(),
                     resolved.as_selection(),
                     Some(&system_prompt),
                     None,
-                ),
-            )
-            .await
-            .map_err(|_| side_question_timeout_message(AGENT))?
-            .map_err(|e| format!("{AGENT} could not answer: {e}"))?;
-            capture.record(&model, request_chars, &response).await;
+                )
+                .await
+                .map_err(|e| {
+                    if e.is::<tokio::time::error::Elapsed>() {
+                        side_question_timeout_message(AGENT)
+                    } else {
+                        format!("{AGENT} could not answer: {e}")
+                    }
+                })?;
             if response.tool_calls.is_empty() {
                 return response
                     .content

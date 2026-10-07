@@ -24,7 +24,9 @@ import {
   PREVIEW_FRAME_MESSAGE,
   PREVIEW_HOST_MESSAGE,
   postToPreviewFrame,
+  settlePreviewFind,
 } from '../../utils/previewFrameProtocol';
+import PREVIEW_FIND_SOURCE from '../../../../../packages/lucidos-sdk/src/generated/preview-find.js?raw';
 import {
   PREVIEW_HOST_SCHEMES,
   type PreviewLinkAction,
@@ -112,7 +114,7 @@ export interface PreviewBridgeConfig {
  *  - each message is an object literal, which no prototype setter intercepts;
  *  - it posts only for a trusted event, never for a scripted `click()`.
  */
-export const PREVIEW_BRIDGE_SOURCE = String.raw`function (cfg, win, doc) {
+export const PREVIEW_BRIDGE_SOURCE = String.raw`function (cfg, win, doc, finder) {
   var self = doc.currentScript;
   if (self && self.parentNode) self.parentNode.removeChild(self);
   var host = win.parent;
@@ -207,9 +209,22 @@ export const PREVIEW_BRIDGE_SOURCE = String.raw`function (cfg, win, doc) {
       scrollToFragment(data.id, data.smooth === true);
     } else if (data.kind === 'capability' && typeof data.capability === 'string') {
       adoptCapability(data.capability);
+    } else if (data.kind === 'find' && typeof data.id === 'string') {
+      var reply = null;
+      try { reply = finder ? finder.serve(data.args) : null; } catch (err) { reply = null; }
+      if (!data.id) return;
+      post({ type: frameType, nonce: nonce, kind: 'find-result', id: data.id,
+        total: reply ? reply.total : null, current: reply ? reply.current : null,
+        capped: reply ? reply.capped : null });
     }
   });
 }`;
+
+/** The name the preview finder bundle gives its result
+ *  (`PREVIEW_FIND_GLOBAL` in `packages/lucidos-sdk/previewFind.build.mjs`).
+ *  The bundle runs inside the bridge's own function, so this is a local there,
+ *  never a window global. Pinned against the bundle text in the bridge tests. */
+export const PREVIEW_FIND_LOCAL = '__lucidosPreviewFind';
 
 /** The `<script>` tag that installs the bridge. JSON cannot close a script
  *  element once every `<` is escaped, so no artifact byte is needed. */
@@ -222,7 +237,7 @@ export function previewBridgeScript(cfg: PreviewBridgeConfig): string {
     frameType: PREVIEW_FRAME_MESSAGE,
     hostType: PREVIEW_HOST_MESSAGE,
   }).replace(/</g, '\\u003c');
-  return `<script>(${PREVIEW_BRIDGE_SOURCE})(${json}, window, document);</script>`;
+  return `<script>(function(){${PREVIEW_FIND_SOURCE}\n;(${PREVIEW_BRIDGE_SOURCE})(${json}, window, document, ${PREVIEW_FIND_LOCAL});})();</script>`;
 }
 
 /** Stamp the bridge in as the very first thing the document parses, after a
@@ -249,7 +264,10 @@ export type PreviewFrameMessage =
     kind: 'chord';
     chord: { key: string; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean };
   }
-  | { kind: 'fragment-missing'; id: string };
+  | { kind: 'fragment-missing'; id: string }
+  /** The frame's raw count, or null when its finder failed. Unchecked here:
+   *  the find bar validates a count from any frame the same way. */
+  | { kind: 'find-result'; id: string; reply: unknown };
 
 /** Longest href or anchor id the host will route. A real link is far shorter;
  *  the cap keeps a hostile frame from handing the router megabytes. */
@@ -311,6 +329,13 @@ export function readPreviewFrameMessage(
     case 'fragment-missing':
       if (!boundedString(data.id)) return null;
       return { kind: 'fragment-missing', id: data.id };
+    case 'find-result':
+      if (!boundedString(data.id)) return null;
+      return {
+        kind: 'find-result',
+        id: data.id,
+        reply: data.total === null ? null : { total: data.total, current: data.current, capped: data.capped },
+      };
     default:
       return null;
   }
@@ -384,6 +409,9 @@ export function routePreviewFrameMessage(msg: PreviewFrameMessage, ctx: PreviewF
       return;
     case 'fragment-missing':
       showToast(`No "${msg.id}" section in ${ctx.artifactPath}`, 'error');
+      return;
+    case 'find-result':
+      settlePreviewFind(msg.id, msg.reply);
       return;
   }
 }

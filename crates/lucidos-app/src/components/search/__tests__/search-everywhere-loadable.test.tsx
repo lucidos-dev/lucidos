@@ -11,10 +11,15 @@ import type { SearchResultItem } from '../../../api/client';
 
 type Answer = 'hang' | 'fail' | SearchResultItem[] | Promise<SearchResultItem[]>;
 
+/** Text search answers on its own route. Its hits never come from `answerAll`,
+ *  which only decides whether it hangs, fails or finds nothing. */
+type TextAnswer = 'hang' | 'fail' | 'none';
+
 const engine = vi.hoisted(() => ({
   answers: {} as Record<string, Answer>,
   asked: [] as string[],
   limits: [] as (number | undefined)[],
+  text: 'hang' as TextAnswer,
 }));
 
 vi.mock('../../../api/client', async (importOriginal) => ({
@@ -27,9 +32,15 @@ vi.mock('../../../api/client', async (importOriginal) => ({
     if (answer === 'fail') throw new Error('gateway down');
     return { results: { [category]: await answer } };
   },
+  searchText: async () => {
+    if (engine.text === 'hang') return new Promise(() => {});
+    if (engine.text === 'fail') throw new Error('gateway down');
+    return { status: 'ok', hits: [], truncated: false, skipped_large_files: 0 };
+  },
 }));
 
 import { SearchEverywhere } from '../SearchEverywhere';
+import { ALL_TAB_LIMIT } from '../searchSections';
 import { preferences, searchEverywhereOpen } from '../../../store/store';
 import { SPINNER_DELAY_MS } from '../../../hooks/useDelayedLoading';
 
@@ -48,6 +59,7 @@ function hit(category: string, id: string): SearchResultItem {
 
 function answerAll(answer: Answer) {
   for (const c of SERVER_CATEGORIES) engine.answers[c] = answer;
+  engine.text = answer === 'hang' || answer === 'fail' ? answer : 'none';
 }
 
 function type(text: string) {
@@ -81,10 +93,6 @@ function tab(label: string): HTMLButtonElement {
     .find(el => el.firstChild?.textContent === label)!;
 }
 
-function tabCount(label: string): string | null {
-  return tab(label).querySelector('.search-everywhere-tab-count')?.textContent ?? null;
-}
-
 function selectedTitle(): string | null | undefined {
   return results().querySelector('.selected .search-everywhere-result-title')?.textContent;
 }
@@ -94,6 +102,7 @@ beforeEach(() => {
   engine.answers = {};
   engine.asked = [];
   engine.limits = [];
+  engine.text = 'hang';
   preferences.value = { status: 'not-loaded' };
   searchEverywhereOpen.value = true;
   host = document.createElement('div');
@@ -121,10 +130,10 @@ describe('hits before everything has loaded', () => {
     expect([...engine.asked].sort()).toEqual([...SERVER_CATEGORIES].sort());
   });
 
-  it('asks each category for one more than the All tab shows, to tell 5 from 5+', async () => {
+  it('asks each category for as many hits as the All tab shows', async () => {
     type(NO_LOCAL_HITS);
     await advance(DEBOUNCE_MS);
-    expect(new Set(engine.limits)).toEqual(new Set([6]));
+    expect(new Set(engine.limits)).toEqual(new Set([ALL_TAB_LIMIT]));
   });
 
   it('asks a category tab for its own full page beside the overview', async () => {
@@ -133,17 +142,17 @@ describe('hits before everything has loaded', () => {
     await advance(DEBOUNCE_MS);
     const page = engine.asked.flatMap((c, i) => (engine.limits[i] === undefined ? [c] : []));
     expect(page).toEqual(['threads']);
-    expect(engine.asked.filter((_, i) => engine.limits[i] === 6).sort()).toEqual([...SERVER_CATEGORIES].sort());
+    expect(engine.asked.filter((_, i) => engine.limits[i] === ALL_TAB_LIMIT).sort()).toEqual([...SERVER_CATEGORIES].sort());
   });
 
   it('does not ask the overview again when the tab changes', async () => {
     answerAll([]);
     type(NO_LOCAL_HITS);
     await advance(DEBOUNCE_MS);
-    const overviewAsks = engine.limits.filter(l => l === 6).length;
+    const overviewAsks = engine.limits.filter(l => l === ALL_TAB_LIMIT).length;
     act(() => { tab('Files').click(); });
     await advance(DEBOUNCE_MS);
-    expect(engine.limits.filter(l => l === 6).length).toBe(overviewAsks);
+    expect(engine.limits.filter(l => l === ALL_TAB_LIMIT).length).toBe(overviewAsks);
   });
 
   it('drops the engine answers on close, so a reopened palette asks again', async () => {
@@ -240,7 +249,7 @@ describe('loading and failure', () => {
   });
 });
 
-describe('ranking and tab counts', () => {
+describe('ranking and tab dimming', () => {
   it('lists a section with an exact title above one that lists first by default', async () => {
     answerAll([]);
     engine.answers.apps = [{ ...hit('apps', 'habit-tracker'), title: 'Habit Tracker', subtitle: 'daily settings' }];
@@ -252,26 +261,29 @@ describe('ranking and tab counts', () => {
     expect(rowTitles()[0]).toBe('Settings');
   });
 
-  it('counts each tab once its category answers, capped at 5+', async () => {
+  it('dims only a tab whose category answered with no hits', async () => {
     answerAll([]);
-    engine.answers.files = Array.from({ length: 6 }, (_, i) => hit('files', `f${i}`));
     engine.answers.apps = [hit('apps', 'habit-tracker')];
     engine.answers.threads = 'hang';
     type(NO_LOCAL_HITS);
     await advance(DEBOUNCE_MS);
-    expect(tabCount('Files')).toBe('5+');
-    expect(tabCount('Apps')).toBe('1');
-    expect(tab('Files').getAttribute('aria-label')).toBe('Files, 5+ hits');
-    expect(tab('Apps').getAttribute('aria-label')).toBe('Apps, 1 hit');
+    expect(tab('Apps').hasAttribute('data-empty')).toBe(false);
+    expect(tab('Apps').hasAttribute('aria-label')).toBe(false);
     expect(tab('Triggers').hasAttribute('data-empty')).toBe(true);
     expect(tab('Triggers').getAttribute('aria-label')).toBe('Triggers, no hits');
-    // Still out: no count and not dimmed, so it never reads as empty.
-    expect(tabCount('Threads')).toBeNull();
+    // Still out: not dimmed, so it never reads as empty.
     expect(tab('Threads').hasAttribute('data-empty')).toBe(false);
     expect(tab('Threads').hasAttribute('aria-label')).toBe(false);
   });
 
-  it('never lets a late answer for an old query count the new one', async () => {
+  it('draws no hit counts on the tabs', async () => {
+    answerAll([hit('files', 'f')]);
+    type(NO_LOCAL_HITS);
+    await advance(DEBOUNCE_MS);
+    for (const label of ['Apps', 'Files', 'Threads']) expect(tab(label).textContent).toBe(label);
+  });
+
+  async function landLateOldAnswer(items: SearchResultItem[]) {
     let landOld: (items: SearchResultItem[]) => void = () => {};
     answerAll([]);
     engine.answers.files = new Promise(resolve => { landOld = resolve; });
@@ -281,10 +293,18 @@ describe('ranking and tab counts', () => {
     type('second');
     await advance(DEBOUNCE_MS);
     await act(async () => {
-      landOld(Array.from({ length: 6 }, (_, i) => hit('files', `old${i}`)));
+      landOld(items);
       for (let i = 0; i < 5; i++) await Promise.resolve();
     });
-    expect(tabCount('Files')).toBeNull();
+  }
+
+  it('never lets a late answer for an old query dim the new one', async () => {
+    await landLateOldAnswer([]);
+    expect(tab('Files').hasAttribute('data-empty')).toBe(false);
+  });
+
+  it('never lists a late answer for an old query under the new one', async () => {
+    await landLateOldAnswer(Array.from({ length: 6 }, (_, i) => hit('files', `old${i}`)));
     expect(rowTitles().some(t => t.startsWith('old'))).toBe(false);
   });
 
@@ -294,11 +314,19 @@ describe('ranking and tab counts', () => {
     type(NO_LOCAL_HITS);
     await advance(DEBOUNCE_MS);
     expect(tab('Threads').hasAttribute('data-empty')).toBe(false);
-    expect(tabCount('Threads')).toBeNull();
   });
 
-  it('shows no counts before a query is typed', () => {
-    expect(document.querySelector('.search-everywhere-tab-count')).toBeNull();
+  it('dims nothing before a query is typed', () => {
     expect(document.querySelector('.search-everywhere-tab[data-empty]')).toBeNull();
+  });
+
+  it('keeps the first chip as wide as "Recent" once it reads "All"', async () => {
+    const widest = (label: string) =>
+      tab(label).querySelector('.search-everywhere-widest')?.getAttribute('data-widest');
+    expect(widest('Recent')).toBe('Recent');
+    answerAll([]);
+    type(NO_LOCAL_HITS);
+    await advance(DEBOUNCE_MS);
+    expect(widest('All')).toBe('Recent');
   });
 });

@@ -8,10 +8,10 @@
  * legacy scale value, and garbage in every slot.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { PREF_FONT_FAMILY } from './generated/preference-catalog';
 import {
   readAppearancePush,
   sanitizeAppearancePush,
-  DEFAULT_FONT_PREFERENCE,
   DEFAULT_MOTION,
   DEFAULT_THEME_MODE,
   EMPTY_THEME,
@@ -24,7 +24,6 @@ import {
   MOTION_PREFS,
   REDUCED_MOTION_DURATION_SCALE,
   THEME_MODE_BG,
-  UI_SCALE_DEFAULT,
   clampUiScale,
   durationScaleFor,
   fontFeaturesFor,
@@ -133,7 +132,7 @@ describe('font key resolution', () => {
   });
 
   it('the preference defaults to following the theme', () => {
-    expect(DEFAULT_FONT_PREFERENCE).toBe(FOLLOW_THEME);
+    expect(PREF_FONT_FAMILY.fallback).toBe(FOLLOW_THEME);
     expect(FONT_PREFERENCES[0]).toBe(FOLLOW_THEME);
     expect(FONT_PREFERENCES.slice(1)).toEqual(ALL);
   });
@@ -278,7 +277,6 @@ describe('ui scale', () => {
     for (const raw of [null, undefined, '', 'huge', 'toString', 'constructor']) {
       expect(parseUiScale(raw)).toBeNull();
     }
-    expect(UI_SCALE_DEFAULT).toBe(100);
   });
 });
 

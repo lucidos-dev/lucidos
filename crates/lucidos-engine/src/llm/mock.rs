@@ -5,6 +5,10 @@ use crate::llm::provider::{
 use async_trait::async_trait;
 use std::time::Duration;
 
+/// The `LUCIDOS_MODEL` value that selects this provider: the explicit e2e
+/// opt-in. It is also the provider's model id.
+pub const MOCK_MODEL: &str = "mock";
+
 // ~100 words — long enough for streaming/cancel tests to have content to work with.
 pub(crate) const MOCK_RESPONSE: &str = "\
 The quick brown fox jumps over the lazy dog. A pangram is a sentence that \
@@ -73,7 +77,8 @@ pub const MOCK_REENTRY_RESPONSE: &str = "Picked the watch back up and finished t
 /// Returns a fixed text response, streamed word-by-word with a small delay
 /// between tokens. Activate with `LUCIDOS_MODEL=mock`.
 ///
-/// It issues a tool call only when scripted to, behind
+/// It issues a tool call only when scripted to, and only to a tool the request
+/// offers, behind
 /// [`MOCK_AWAIT_EVENT_SENTINEL`] (see [`scripted_await_event`]),
 /// [`MOCK_RUN_PYTHON_SENTINEL`] (see [`scripted_run_python`]),
 /// [`MOCK_READ_FILES_SENTINEL`] (see [`scripted_read_files`]) and
@@ -242,15 +247,23 @@ impl LlmProvider for MockProvider {
     async fn chat(
         &self,
         messages: Vec<Message>,
-        _tools: Vec<ToolDefinition>,
+        tools: Vec<ToolDefinition>,
         _selection: ModelSelection<'_>,
         _system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
+        _call: crate::llm::metered::CallToken,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         // Small initial delay to simulate network round-trip
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        if let Some(event_type) = scripted_await_event(&messages) {
+        // A real model can only call a tool the request offers. Callers that
+        // offer none (the compactor, the title writer) quote thread messages,
+        // sentinels included, and must still get text back.
+        let offers = |name: &str| tools.iter().any(|t| t.name == name);
+
+        if let Some(event_type) =
+            scripted_await_event(&messages).filter(|_| offers(crate::llm::tool_names::AWAIT_EVENT))
+        {
             // No streaming: the subscribing iteration emits no assistant text,
             // and streaming one here would leave a `TextStreamed` the
             // transcript has to explain.
@@ -279,7 +292,9 @@ impl LlmProvider for MockProvider {
             });
         }
 
-        if let Some(code) = scripted_run_python(&messages) {
+        if let Some(code) =
+            scripted_run_python(&messages).filter(|_| offers(crate::llm::tool_names::RUN_PYTHON))
+        {
             return Ok(LlmResponse {
                 content: None,
                 tool_calls: vec![ToolCall {
@@ -301,7 +316,9 @@ impl LlmProvider for MockProvider {
             });
         }
 
-        if let Some(paths) = scripted_read_files(&messages) {
+        if let Some(paths) =
+            scripted_read_files(&messages).filter(|_| offers(crate::llm::tool_names::READ_FILE))
+        {
             return Ok(LlmResponse {
                 content: None,
                 tool_calls: paths
@@ -327,7 +344,9 @@ impl LlmProvider for MockProvider {
             });
         }
 
-        if let Some((name, arguments)) = scripted_tool_call(&messages) {
+        if let Some((name, arguments)) =
+            scripted_tool_call(&messages).filter(|(name, _)| offers(name))
+        {
             return Ok(LlmResponse {
                 content: None,
                 tool_calls: vec![ToolCall {
@@ -399,7 +418,14 @@ mod tests {
     async fn mock_returns_fixed_response() {
         let provider = MockProvider::new("mock".to_string());
         let resp = provider
-            .chat(vec![], vec![], ModelSelection::default(), None, None)
+            .chat(
+                vec![],
+                vec![],
+                ModelSelection::default(),
+                None,
+                None,
+                crate::llm::metered::CallToken::for_test(),
+            )
             .await
             .unwrap();
         assert!(resp.content.is_some());
@@ -495,16 +521,81 @@ mod tests {
         assert!(already_called(&msgs, "await_event"));
     }
 
+    fn offered(names: &[&str]) -> Vec<ToolDefinition> {
+        names
+            .iter()
+            .map(|name| ToolDefinition {
+                name: name.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            })
+            .collect()
+    }
+
+    /// The summary-tree compactor and the title writer offer no tools, yet
+    /// quote thread messages that carry sentinels. A call there came back with
+    /// no text, and the compactor retried that node forever.
+    #[tokio::test]
+    async fn a_sentinel_in_a_request_offering_no_tools_answers_in_text() {
+        let provider = MockProvider::new("mock".to_string());
+        for line in [
+            format!("{MOCK_AWAIT_EVENT_SENTINEL}ReleasePublished"),
+            format!("{MOCK_RUN_PYTHON_SENTINEL} print(1)"),
+            format!("{MOCK_READ_FILES_SENTINEL} a.txt"),
+            format!(
+                r#"{MOCK_TOOL_CALL_SENTINEL} write_file {{"path":"artifacts/x.md","content":"x"}}"#
+            ),
+        ] {
+            let resp = provider
+                .chat(
+                    vec![Message {
+                        role: "user".to_string(),
+                        content: MessageContent::Text(format!("Summarise:\n{line}")),
+                    }],
+                    vec![],
+                    ModelSelection::default(),
+                    None,
+                    None,
+                    crate::llm::metered::CallToken::for_test(),
+                )
+                .await
+                .unwrap();
+            assert!(resp.tool_calls.is_empty(), "{line}");
+            assert_eq!(resp.content.as_deref(), Some(MOCK_RESPONSE), "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scripted_call_needs_its_own_tool_offered() {
+        let provider = MockProvider::new("mock".to_string());
+        let resp = provider
+            .chat(
+                assembled(
+                    "",
+                    &format!(r#"{MOCK_TOOL_CALL_SENTINEL} write_file {{"path":"a.md"}}"#),
+                ),
+                offered(&[crate::llm::tool_names::READ_FILE]),
+                ModelSelection::default(),
+                None,
+                None,
+                crate::llm::metered::CallToken::for_test(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.tool_calls.is_empty());
+    }
+
     #[tokio::test]
     async fn mock_parks_with_a_single_await_event_call() {
         let provider = MockProvider::new("mock".to_string());
         let resp = provider
             .chat(
                 assembled("", "MOCK_SUBSCRIBE_ON:ReleasePublished"),
-                vec![],
+                offered(&[crate::llm::tool_names::AWAIT_EVENT]),
                 ModelSelection::default(),
                 None,
                 None,
+                crate::llm::metered::CallToken::for_test(),
             )
             .await
             .unwrap();
@@ -527,7 +618,14 @@ mod tests {
         let provider = MockProvider::new("mock".to_string());
         let mut msgs = assembled("", "MOCK_READ_FILES: a.txt b.txt c.txt");
         let resp = provider
-            .chat(msgs.clone(), vec![], ModelSelection::default(), None, None)
+            .chat(
+                msgs.clone(),
+                offered(&[crate::llm::tool_names::READ_FILE]),
+                ModelSelection::default(),
+                None,
+                None,
+                crate::llm::metered::CallToken::for_test(),
+            )
             .await
             .unwrap();
         let paths: Vec<&str> = resp
@@ -593,7 +691,14 @@ mod tests {
             tokens_clone.lock().unwrap().push(token.to_string());
         });
         let resp = provider
-            .chat(vec![], vec![], ModelSelection::default(), None, Some(cb))
+            .chat(
+                vec![],
+                vec![],
+                ModelSelection::default(),
+                None,
+                Some(cb),
+                crate::llm::metered::CallToken::for_test(),
+            )
             .await
             .unwrap();
         assert!(resp.content.is_some());

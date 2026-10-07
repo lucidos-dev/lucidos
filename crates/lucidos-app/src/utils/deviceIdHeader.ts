@@ -6,12 +6,14 @@
  * circular import with `store/actions/devices.ts` (which imports `json()`), and
  * the gateway control client (`api/client/control.ts`) is loaded by the
  * workspace picker, which has no business pulling in the store to read one
- * string. Importing nothing solves both.
+ * string. Importing nothing from either solves both.
  *
  * Minting the id stays in `devices.ts` (`getDeviceId()`), which owns device
  * registration. Reading it is all this file does, so a surface that has no id
  * yet sends no header rather than quietly registering a device.
  */
+
+import { HEADER_DEVICE_ID } from '@lucidos/engine-constants';
 
 export const DEVICE_ID_KEY = 'lucidos-device-id';
 
@@ -22,7 +24,7 @@ export function readDeviceId(): string | null {
 }
 
 /**
- * `{ 'x-lucidos-device-id': <id> }`, or `{}` when there is no id to send.
+ * `{ [HEADER_DEVICE_ID]: <id> }`, or `{}` when there is no id to send.
  *
  * The engine resolves the actor for a mutating request off this header, so
  * omitting it is not neutral: it is the difference between an action attributed
@@ -31,5 +33,5 @@ export function readDeviceId(): string | null {
  */
 export function deviceIdHeader(): Record<string, string> {
   const id = readDeviceId();
-  return id ? { 'x-lucidos-device-id': id } : {};
+  return id ? { [HEADER_DEVICE_ID]: id } : {};
 }

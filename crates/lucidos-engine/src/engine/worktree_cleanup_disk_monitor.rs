@@ -49,16 +49,17 @@ pub(super) fn disk_low_body(
     let free_gb = free_bytes as f64 / BYTES_PER_GB;
     let lucidos_gb = lucidos_bytes as f64 / BYTES_PER_GB;
     let volume = format!("Only {free_gb:.1} GB free on the volume hosting your Lucidos workspace.");
+    let page = SettingsPage::DISK_USAGE.link();
     if lucidos_bytes >= large_footprint_bytes {
         format!(
             "{volume} Lucidos worktrees use {lucidos_gb:.1} GB: clean idle ones from \
-             {DISK_USAGE_PAGE_PATH} to reclaim space. New coding-agent sessions may fail \
+             {page} to reclaim space. New coding-agent sessions may fail \
              to spawn until disk is freed."
         )
     } else {
         format!(
             "{volume} Lucidos itself uses just {lucidos_gb:.1} GB, so most of the pressure \
-             is from other apps on your machine. {DISK_USAGE_PAGE_PATH} has the breakdown. \
+             is from other apps on your machine. {page} has the breakdown. \
              New coding-agent sessions may fail to spawn until you free space elsewhere."
         )
     }

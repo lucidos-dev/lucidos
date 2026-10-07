@@ -672,7 +672,7 @@ fn splash_page_html(label: &str, refresh_secs: Option<u32>, escape: bool) -> Str
 html,body{margin:0;height:100%}
 /* Paint the gradient on the root with a base colour + fixed attachment so it
 covers the whole viewport, the iOS standalone-PWA bottom safe-area / overscroll
-region included. The fixed `inset:0` .boot-splash element leaves that strip
+region included. The fixed, viewport-sized .boot-splash element leaves that strip
 uncovered, and iOS fills it with the flat BASE COLOUR rather than the gradient
 image, so the base is what is actually seen there, butted against the gradient
 above it. #145eb9 is the gradient's own colour at the seam (progress 0.70, the

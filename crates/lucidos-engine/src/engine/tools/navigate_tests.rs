@@ -281,6 +281,119 @@ async fn an_unknown_device_is_refused_and_nothing_is_sent() {
     teardown_test_db(&db).await;
 }
 
+/// The `file_path` carried by the next `NavigationRequested` for `thread_id`.
+async fn next_navigation_file_path(rx: &mut Receiver<EmittedEvent>, thread_id: Uuid) -> String {
+    loop {
+        let ev = rx.recv().await.expect("broadcast channel should not close");
+        if let BusEvent::Thread {
+            thread_id: tid,
+            event: ThreadEvent::NavigationRequested { payload },
+            ..
+        } = ev.typed
+        {
+            if tid != thread_id {
+                continue;
+            }
+            let payload: serde_json::Value =
+                serde_json::from_str(&payload).expect("payload is JSON");
+            return payload["file_path"]
+                .as_str()
+                .expect("file_path")
+                .to_string();
+        }
+    }
+}
+
+/// A registered repository named `example-repo`, returning its id.
+async fn register_example_repo(pool: &PgPool, bus: &EventBus) -> Uuid {
+    crate::core::repositories::RepositoryStore::register(
+        pool,
+        bus,
+        "example-repo",
+        "/home/user/src/example-repo",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("repository registers")
+    .id
+}
+
+/// The incident: the agent named the repository, every other repo-scoped tool
+/// takes a name, and the page parses that segment as a uuid. The tool said it
+/// sent, and the user saw "UUID parsing failed". The locator now leaves with
+/// the uuid, ref and path intact.
+#[tokio::test]
+async fn a_repo_file_named_by_its_repository_name_is_sent_with_the_uuid() {
+    let (bus, mut rx, pool, db) = setup().await;
+    let repo_id = register_example_repo(&pool, &bus).await;
+    let thread_id = Uuid::new_v4();
+
+    for (asked, sent) in [
+        (
+            "repo:example-repo:file:docs/guide.md".to_string(),
+            format!("repo:{repo_id}:file:docs/guide.md"),
+        ),
+        (
+            "repo:example-repo:file#feature/x:docs/a:b.md".to_string(),
+            format!("repo:{repo_id}:file#feature/x:docs/a:b.md"),
+        ),
+        (
+            format!("repo:{repo_id}:file:README.md"),
+            format!("repo:{repo_id}:file:README.md"),
+        ),
+    ] {
+        let args = json!({"target": "file", "file_path": asked});
+        navigate_ui_impl(&bus, &pool, &args, thread_id, Some(PHONE))
+            .await
+            .unwrap_or_else(|e| panic!("{asked} must send, got: {e}"));
+        assert_eq!(next_navigation_file_path(&mut rx, thread_id).await, sent);
+    }
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// A repository nobody registered would reach the page as the same raw parse
+/// error, after the agent was told it sent. It is refused first, with nothing
+/// emitted and a pointer to where the ids are listed.
+#[tokio::test]
+async fn an_unregistered_repository_is_refused_and_nothing_is_sent() {
+    let (bus, _rx, pool, db) = setup().await;
+    register_example_repo(&pool, &bus).await;
+    // Subscribed after the registration, so its own event is not in the way.
+    let mut rx = bus.subscribe();
+    let thread_id = Uuid::new_v4();
+
+    for file_path in [
+        "repo:unregistered-repo:file:docs/guide.md".to_string(),
+        format!("repo:{}:file#main:docs/guide.md", Uuid::new_v4()),
+    ] {
+        let args = json!({"target": "file", "file_path": file_path});
+        let out = navigate_ui_impl(&bus, &pool, &args, thread_id, Some(PHONE)).await;
+        let err = out.expect_err(&format!("{file_path} must be refused"));
+        assert!(
+            err.contains(&file_path),
+            "the error names what was asked: {err}"
+        );
+        assert!(
+            err.contains("manage_repositories"),
+            "and where ids are listed: {err}"
+        );
+    }
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "nothing may be emitted for a refused repository"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
 /// A blank `device` is the model filling an optional field, not a choice.
 #[tokio::test]
 async fn a_blank_device_reads_as_omitted() {

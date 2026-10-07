@@ -25,10 +25,10 @@ test.describe('Stop clears queued messages to compose', () => {
     const activeMarker = `active-${randomUUID().slice(0, 8)}`;
     const queuedOne = `queued-one-${randomUUID().slice(0, 8)}`;
     const queuedTwo = `queued-two-${randomUUID().slice(0, 8)}`;
-    const t0 = new Date().toISOString();
-    const t1 = new Date(Date.now() + 1000).toISOString();
-    const t2 = new Date(Date.now() + 2000).toISOString();
-    const t3 = new Date(Date.now() + 3000).toISOString();
+    // In the past. The retractions and the abort Stop writes are stamped now,
+    // and must sort after every seeded message, however fast the click lands.
+    const at = (secondsAgo: number) => new Date(Date.now() - secondsAgo * 1000).toISOString();
+    const [t0, t1, t2, t3] = [at(4), at(3), at(2), at(1)];
 
     psql([
       `INSERT INTO thread_summaries (` +

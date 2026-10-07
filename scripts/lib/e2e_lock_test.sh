@@ -871,6 +871,39 @@ if [ "$(emit_marker E2ELockAcquired)" = "LOCKFILE_PRESENT" ]; then
 else
     fail "E2ELockAcquired fired before the lock file existed"
 fi
+# No project list declared (the e2e-api hold, or an older entry script): no
+# field, and the payload is still valid JSON.
+if printf '%s' "$acq" | python3 -c \
+    'import json,sys; sys.exit(0 if "projects" not in json.load(sys.stdin) else 1)' 2>/dev/null; then
+    pass "an undeclared project list leaves the field out and the JSON valid"
+else
+    fail "undeclared projects produced a bad payload: $acq"
+fi
+
+echo ""
+echo "Test 11b: the acquire names the Playwright projects the hold will run"
+# The memory snapshot log prints the SUMMARY, so the projects must be there as
+# well as in the payload, or a WebKit hold reads the same as a Chromium one.
+reset_emit_sandbox
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    E2E_LOCK_OWNED=""
+    E2E_LOCK_PROJECTS="chromium,mobile-webkit"
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    wait
+    release_e2e_lock
+)
+acq="$(emit_payload E2ELockAcquired)"
+if printf '%s' "$acq" | python3 -c \
+    'import json,sys; sys.exit(0 if json.load(sys.stdin)["projects"] == "chromium,mobile-webkit" else 1)' \
+    2>/dev/null; then
+    pass "the payload carries the project list as valid JSON"
+else
+    fail "payload lacks the project list: $acq"
+fi
+assert_eq "e2e lock acquired by e2e-browser (projects: chromium,mobile-webkit)" \
+    "$(emit_call E2ELockAcquired | awk -F'\t' '{ print $(NF - 4) }')" \
+    "the summary names the projects"
 
 echo ""
 echo "Test 12: reclaiming a dead owner's lock announces THAT hold ending"

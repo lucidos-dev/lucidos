@@ -299,7 +299,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // see its row in `status_transitions`.
         "CodingAgentInputRead" => EventClass::Metadata,
         // Compose lifecycle — orthogonal to the section/status machinery.
-        "ThreadStarted" | "ThreadDiscarded" => EventClass::Metadata,
+        "ThreadStarted" | "ThreadDiscarded" | "HomeThreadCreated" => EventClass::Metadata,
         // ImageUploaded — passive bookkeeping for content-addressed blob
         // uploads. Doesn't change thread status or surface section. The
         // SSE broadcast lets peer devices prefetch; no display impact.
@@ -502,6 +502,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ThreadTriageProposed",
         "ThreadStarted",
         "ThreadDiscarded",
+        "HomeThreadCreated",
         "ImageUploaded",
         "TriggerStarted",
         "TriggerCompleted",
@@ -812,6 +813,8 @@ pub fn resolve_transition(
         // Compose lifecycle — orthogonal to section/status machinery.
         | "ThreadStarted"
         | "ThreadDiscarded"
+        // Creates the home thread's row, already in the inbox (ADR 0362).
+        | "HomeThreadCreated"
         // ImageUploaded — passive audit event for content-addressed blob
         // uploads. Same orthogonality as ThreadStarted/Discarded: no
         // section change, no status change, just a record of the attach.
@@ -1049,53 +1052,135 @@ pub fn is_blocking(
     has_pending_changes: bool,
     is_external_repo: bool,
 ) -> bool {
-    if status == ThreadStatus::Running || status == ThreadStatus::WaitingForUserAnswer {
-        return true;
-    }
-    if archive_state == ArchiveState::Archived {
-        return false;
-    }
-    if has_pending_changes && thread_type == ThreadType::CodingAgent && !is_external_repo {
-        return true;
-    }
-    false
-}
-
-/// May the owner delete this thread? The UI-side half of the delete cascade's
-/// server gate, so the action is hidden rather than offered and then refused.
-///
-/// It asks `is_blocking` of the thread ITSELF, passing `ArchiveState::Inbox`
-/// whatever the thread's real section is. That one argument is the whole
-/// difference from Archive. Delete is offered in the Archive section too:
-/// gating it on inbox would leave archived garbage undeletable, which is the
-/// case the feature exists for. Passing the real state would silently admit an
-/// archived coding-agent thread still holding a pending change, which the
-/// server refuses.
-///
-/// `descendants_block` is `blocking_descendant_count > 0`, the same projection
-/// fact Archive reads.
-///
-/// **Server mirror**: the authority is `api::threads::family::classify_family`
-/// with `FamilyVerb::Delete`, which re-asks this over the locked family. This
-/// one decides what to draw; that one decides what happens.
-pub fn thread_is_deletable(
-    thread_type: ThreadType,
-    status: ThreadStatus,
-    has_pending_changes: bool,
-    is_external_repo: bool,
-    descendants_block: bool,
-) -> bool {
-    !is_blocking(
+    own_blocker(
         thread_type,
         status,
-        ArchiveState::Inbox,
+        archive_state,
         has_pending_changes,
         is_external_repo,
-    ) && !descendants_block
+    )
+    .is_some()
 }
 
-/// May `ThreadArchived` land on a thread in `status`? A thread waiting on the
-/// user needs attention, so it is never archived, by any path (ADR 0259).
+/// Which of `is_blocking`'s clauses holds for one thread. Declaration order is
+/// priority, so `min()` over a family picks the reason to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OwnBlocker {
+    Running,
+    Question,
+    PendingChange,
+}
+
+impl OwnBlocker {
+    pub const ALL: [Self; 3] = [Self::Running, Self::Question, Self::PendingChange];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Question => "question",
+            Self::PendingChange => "pending_change",
+        }
+    }
+}
+
+/// The clause of [`is_blocking`] that holds, if any. That function is this one
+/// asked yes or no, so the two cannot disagree.
+pub fn own_blocker(
+    thread_type: ThreadType,
+    status: ThreadStatus,
+    archive_state: ArchiveState,
+    has_pending_changes: bool,
+    is_external_repo: bool,
+) -> Option<OwnBlocker> {
+    match status {
+        ThreadStatus::Running => return Some(OwnBlocker::Running),
+        ThreadStatus::WaitingForUserAnswer => return Some(OwnBlocker::Question),
+        _ => {}
+    }
+    if archive_state == ArchiveState::Archived {
+        return None;
+    }
+    (has_pending_changes && thread_type == ThreadType::CodingAgent && !is_external_repo)
+        .then_some(OwnBlocker::PendingChange)
+}
+
+/// Why Archive or Delete cannot run on a thread: the one reason the menu shows
+/// and the cascade's refusal carries. The user resolves it; nothing in the menu
+/// cancels it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blocker {
+    None,
+    Home,
+    Running,
+    Question,
+    PendingChange,
+    DescendantRunning,
+    DescendantQuestion,
+    DescendantPendingChange,
+}
+
+impl Blocker {
+    pub const ALL: [Self; 8] = [
+        Self::None,
+        Self::Home,
+        Self::Running,
+        Self::Question,
+        Self::PendingChange,
+        Self::DescendantRunning,
+        Self::DescendantQuestion,
+        Self::DescendantPendingChange,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Home => "home",
+            Self::Running => "running",
+            Self::Question => "question",
+            Self::PendingChange => "pending_change",
+            Self::DescendantRunning => "descendant_running",
+            Self::DescendantQuestion => "descendant_question",
+            Self::DescendantPendingChange => "descendant_pending_change",
+        }
+    }
+}
+
+/// The blocker for a thread, from three facts:
+///
+/// - `own`: [`own_blocker`] of the thread itself, asked with
+///   `ArchiveState::Inbox` whatever its real section. Delete is offered on an
+///   archived thread too, and the server refuses an archived coding-agent
+///   thread that still holds a pending change.
+/// - `is_home`: the home thread never ends (ADR 0362).
+/// - `descendant`: the `min()` of every descendant's [`own_blocker`], each with
+///   its real section, so an archived descendant holding a change blocks
+///   nothing.
+///
+/// **Server mirror**: `api::threads::family::classify_family` derives its
+/// refusal from this over the locked family. This decides what the menu draws;
+/// that decides what happens.
+pub fn action_blocker(
+    own: Option<OwnBlocker>,
+    is_home: bool,
+    descendant: Option<OwnBlocker>,
+) -> Blocker {
+    if is_home {
+        return Blocker::Home;
+    }
+    match (own, descendant) {
+        (Some(OwnBlocker::Running), _) => Blocker::Running,
+        (Some(OwnBlocker::Question), _) => Blocker::Question,
+        (Some(OwnBlocker::PendingChange), _) => Blocker::PendingChange,
+        (None, Some(OwnBlocker::Running)) => Blocker::DescendantRunning,
+        (None, Some(OwnBlocker::Question)) => Blocker::DescendantQuestion,
+        (None, Some(OwnBlocker::PendingChange)) => Blocker::DescendantPendingChange,
+        (None, None) => Blocker::None,
+    }
+}
+
+/// May `ThreadArchived` land on this thread? Two threads are never archived,
+/// by any path. A thread waiting on the user needs attention (ADR 0259). The
+/// home thread never ends (ADR 0362).
 ///
 /// The EventBus asks this for every `ThreadArchived`, whoever emitted it. The
 /// HTTP archive gate refuses the same thread earlier, with a 409.
@@ -1103,15 +1188,41 @@ pub fn check_archive_allowed(
     thread_type: ThreadType,
     current_section: ArchiveState,
     status: ThreadStatus,
+    is_home: bool,
 ) -> Result<(), LifecycleViolation> {
-    if status != ThreadStatus::WaitingForUserAnswer {
+    let reason = if is_home {
+        "the home thread is never archived"
+    } else if status == ThreadStatus::WaitingForUserAnswer {
+        "the thread is waiting on the user; answer or stop it first"
+    } else {
         return Ok(());
-    }
+    };
     Err(LifecycleViolation {
         event_type: "ThreadArchived".to_string(),
         thread_type,
         current_section,
-        reason: "the thread is waiting on the user; answer or stop it first".to_string(),
+        reason: reason.to_string(),
+    })
+}
+
+/// May `ThreadTitleGenerated` land on this thread? Not on the home thread: only
+/// the user names it, with a rename (ADR 0362).
+///
+/// The EventBus asks this for every generated title, whoever emitted it. The
+/// title paths skip the home thread earlier, before any model call.
+pub fn check_title_generated_allowed(
+    thread_type: ThreadType,
+    current_section: ArchiveState,
+    is_home: bool,
+) -> Result<(), LifecycleViolation> {
+    if !is_home {
+        return Ok(());
+    }
+    Err(LifecycleViolation {
+        event_type: "ThreadTitleGenerated".to_string(),
+        thread_type,
+        current_section,
+        reason: "the home thread is named only by the user".to_string(),
     })
 }
 
@@ -1149,8 +1260,8 @@ pub fn check_archive_allowed(
 ///
 /// Relationship: `is_blocking = is_attention_needing OR status == Running`,
 /// minus the stopped-child clause. A stopped child blocks nothing, because
-/// archiving its parent must stay possible (ADR 0252). `Archive`-button gating
-/// still uses `is_blocking` so a Running descendant keeps the button hidden.
+/// archiving its parent must stay possible (ADR 0252). Archive gating still
+/// uses `is_blocking`, so a Running descendant blocks the Archive button.
 ///
 /// **SQL mirrors**: keep in sync when the predicate changes.
 /// - `event_bus_projection_propagation.rs::ATTENTION_DESCENDANT_FILTER`, which

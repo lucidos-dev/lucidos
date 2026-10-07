@@ -14,7 +14,6 @@ use super::{
     emit_user_prompt_injected_event, ensure_failure_terminator_emitted, ensure_terminator_emitted,
     filter_removed_queued_prompts, round_backstop_message, tool_call_cap_message,
 };
-use crate::core::DEFAULT_MAX_TOOL_CALLS;
 use crate::llm::{Message, MessageContent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
@@ -80,10 +79,11 @@ async fn iteration_cap_emits_response_generated_terminator() {
     let meta = anchor_request(&bus, thread_id, origin_id, "long task").await;
 
     // A non-default cap on purpose: the message must name the cap that actually
-    // fired, not the compiled-in default. Passing 500 here would let a
-    // regression that reverted to the constant pass unnoticed.
+    // fired, not the catalog default. Passing the default here would let a
+    // regression that reverted to it pass unnoticed.
+    let default_cap = crate::core::prefs::MAX_TOOL_CALLS.default_number() as usize;
     let configured_cap = 42;
-    assert_ne!(configured_cap, DEFAULT_MAX_TOOL_CALLS);
+    assert_ne!(configured_cap, default_cap);
     let msg = emit_iteration_cap_response_generated(
         &bus,
         thread_id,
@@ -106,7 +106,7 @@ async fn iteration_cap_emits_response_generated_terminator() {
         msg
     );
     assert!(
-        !msg.contains(&DEFAULT_MAX_TOOL_CALLS.to_string()),
+        !msg.contains(&default_cap.to_string()),
         "the message must not name the default when a different cap fired: {}",
         msg
     );
@@ -295,8 +295,15 @@ async fn append_injected_prompts_coalesces_messages_but_emits_each_audit_row() {
     ];
 
     let mut messages = Vec::<Message>::new();
-    let appended =
-        append_injected_prompts_to_messages(&bus, thread_id, &meta, &mut messages, prompts).await;
+    let appended = append_injected_prompts_to_messages(
+        &std::env::temp_dir(),
+        &bus,
+        thread_id,
+        &meta,
+        &mut messages,
+        prompts,
+    )
+    .await;
     assert!(
         appended.appended,
         "coalescing should append one LLM message"
@@ -364,8 +371,15 @@ async fn append_injected_prompts_reports_image_bearing_message_for_pinning() {
     }];
 
     let mut messages = Vec::<Message>::new();
-    let appended =
-        append_injected_prompts_to_messages(&bus, thread_id, &meta, &mut messages, prompts).await;
+    let appended = append_injected_prompts_to_messages(
+        &std::env::temp_dir(),
+        &bus,
+        thread_id,
+        &meta,
+        &mut messages,
+        prompts,
+    )
+    .await;
 
     assert!(appended.appended);
     assert_eq!(

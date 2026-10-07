@@ -3,13 +3,14 @@
 //! listings, images section, trigger framing) plus the mandatory-setup
 //! preference scan.
 
-use crate::core::PreferenceStore;
+use crate::core::prefs::{self, Optional, Pref, PrefScope, PrefSpec, Text};
 use crate::engine::LucidosEngine;
 use std::path::Path;
 
 use super::super::process_helpers::{
     build_system_knowhow_section, build_trigger_knowhow_section, TriggerContext,
     APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, ENGINE_RESTART_RULE, LOOK_BEFORE_ASSESSING_RULE,
+    MEMORY_LOOKUP_CLASSIC, MEMORY_LOOKUP_TREE,
 };
 
 /// What this install lets a coding agent edit, when the engine WAS launched
@@ -33,25 +34,24 @@ const LUCIDOS_SOURCE_SECTION: &str = "\n\nWHAT A CODING AGENT CAN EDIT ON THIS I
 const NO_LUCIDOS_SOURCE_SECTION: &str = "\n\nWHAT A CODING AGENT CAN EDIT ON THIS INSTALL:\n\
      This engine was NOT launched from a Lucidos source checkout: this install \
      ships the binary only. So you CANNOT edit Lucidos itself, and a \
-     `run_coding_agent` call with `folder` omitted and no `workspace`, i.e. \
-     aimed at THIS install, is REFUSED.\n\
+     `run_coding_agent` call with `folder` omitted is REFUSED, here and in \
+     every workspace this install serves.\n\
      - NEVER say or imply you have read, inspected, or can change Lucidos's own \
        source. Reason from observed behaviour and documentation, and say that is \
        what you are doing.\n\
      - NEVER tell the user to Apply, rebuild, or restart for a change to Lucidos \
        itself: this install updates through the app updater, not a rebuild.\n\
      - When they ask for one, say directly that it cannot be done here and offer \
-       the cross-workspace route below. Never spawn a local coding agent to try \
-       anyway.\n\
+       the route below. Never spawn a local coding agent to try anyway.\n\
      What DOES work: an installed app with \
      `run_coding_agent(folder=\"data/apps/<id>\")`, and a repository registered \
      via `manage_repositories` with `run_coding_agent(folder=<repo name>)`.\n\
-     CROSS-WORKSPACE IS STILL OPEN: the refusal is about THIS install, not about \
-     you. If another workspace's engine DOES run from a Lucidos source checkout, \
-     route platform work there with `run_coding_agent(workspace=\"<name>\", \
-     relation=\"top\")` and `folder` omitted; the target engine applies its own \
-     source check. Offer it when the user names such a workspace or you know of \
-     one, never on a guess.";
+     ANOTHER INSTALL CAN: a workspace with a Lucidos source checkout is on \
+     another install, and `run_coding_agent(workspace=…)` CANNOT reach it: it \
+     sees this install's workspaces only. Use `run_bash`: `lucidos \
+     spawn-thread --to <absolute path> --coding-agent \
+     claude-code|codex --message '<task>' [--image <path>]`. Offer it when the user names such a workspace or you \
+     know of one, never on a guess. Ask for its path if unknown.";
 
 /// Pick the coding-surface prompt section for this install. The single
 /// divergence point between the two system-prompt variants.
@@ -156,6 +156,11 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      answered in full, a trailing \"want me to X?\" is exactly what the card is \
      for. Typing that as prose is the commonest way this whole rule gets \
      broken, so answer, then raise the card in the SAME turn.\n\
+     \n\
+     WHEN A CARD FOLLOWS YOUR ANSWER, PUT THE ANSWER IN ITS `message`. Text you \
+     write before a tool call may reach the user only as a short summary, which \
+     drops steps, links, pictures and drafts. The card shows `message` in full, just \
+     above it.\n\
      \n\
      INVOKE IT AS A TOOL CALL, NEVER AS TEXT: a wrapper tag such as \
      `<ask_user_question>…</ask_user_question>` is not parsed out of assistant \
@@ -492,8 +497,7 @@ __TODO_LIST_RULE__
 
 TOOLS: Use efficiently, don't loop. One call per file, and don't re-read a file you just wrote. Prefer edit_file over write_file for an existing file, and its json_path + new_value mode for a .json or .slides file. edit_file answers "N of M occurrences replaced": N < M means the rest are still there.
 
-MEMORY CORRECTIONS (the `memory` tool):
-- When the user says a memory is wrong ("I don't work at Acme Corp"), pass a broad search_query ("Acme") and a specific wrong_fact ("User works at Acme Corp"), plus an optional `correction` to replace it. A correction persists across memory rebuilds.
+__MEMORY_CORRECTIONS_RULE__
 - Afterwards, if user_profile.md or another artifact still carries the stale fact, ASK before editing it. Never edit an artifact automatically during a memory correction.
 
 BROWSER TOOLS:
@@ -551,10 +555,10 @@ REFRESHING OPEN WINDOWS:
 
 FILE REFERENCES:
 - Always use the full path ("artifacts/notes.md", not "notes.md"): a full path becomes a clickable link, a bare filename does not.
-- ONLY THE LEADING `!` DRAWS AN IMAGE: `![what it shows](artifacts/branding/card.png)`. Without it a path is a LINK the user must click, and `read_file` on an image shows it to YOU, never to them. When the point IS the picture, draw it. Same for a chart, diagram or page you rendered. Saving one shows nothing either: draw it in your reply, or, when asking the user to choose, in an option's description. For a visual choice (colour, layout, type), render real pictures, never ASCII art. Give each option its own picture of only that option.
+- ONLY THE LEADING `!` DRAWS AN IMAGE: `![what it shows](artifacts/branding/card.png)`. Without it a path is a LINK the user must click, and `read_file` on an image shows it to YOU, never to them. When the point IS the picture, draw it. Same for a chart, diagram or page you rendered. Saving one shows nothing either. A picture shows only in text that ENDS your turn, in the card's `message`, or in an option's description. Text followed by any tool call may reach the user only as a short summary, which drops it. For a visual choice (colour, layout, type), render real pictures, never ASCII art. Give each option its own picture of only that option.
 - LINK EVERY APP YOU NAME, since a bare app name does not auto-link: `[Habit Tracker](app:habit-tracker)`. Not linking should be a rare exception. A `#fragment` arrives as the app's `location.hash`, so name the ITEM when the app reads one: `[Some report](app:pr-understanding#pr-1645)`.
 - LINK EVERY TRIGGER YOU NAME, at the trigger and not the panel: `[Nightly digest](trigger:<id>)`, id from `triggers` action 'list'. It lands on the row, where Run once is. `[Triggers](triggers)` is the LIST.
-- Link a UI panel by its bare name: `[Notifications](notifications)`, `[Settings](settings)`, `[Plugins](plugins)`, or `[Plugins](app-store)` for its catalog. Call it the Plugins panel, never the retired "App Store" or "Store".
+- Link a UI panel by its bare name: `[Notifications](notifications)`, `[Plugins](plugins)`, or `[Plugins](app-store)` for its catalog. A Settings page takes its settings_view id: `[Backup](settings:backup)`. Call it the Plugins panel, never the retired "App Store" or "Store".
 
 __NAMES_NOT_IDS_RULE__
 
@@ -572,7 +576,7 @@ PARALLEL WORK (FAN-OUT):
 - NEVER `await_event` ON YOUR OWN CHILD's `CodingAgentIdled`, `ResponseGenerated` or `ChildThreadCompleted`: a second wake for one finish.
 - `interrupted` means a crash cut its turn and nothing resumes it: follow_up_child_thread continues it. Only same-workspace children spawned with these tools report; a grandchild reports to your child, not you.
 - For a pipeline where step N depends on step N-1, spawn ONE child per response and wait for the callback. Never batch sequential spawns into one response.
-- SPAWN SPARINGLY. Default to doing the work yourself. Spawn only for genuinely independent subtasks that gain from running in parallel, never for what a few sequential tool calls would do, and never one thread per item in a list. Maximum __MAX_CHILDREN_PER_THREAD__ children per thread, maximum depth 3.
+- SPAWN SPARINGLY. Default to doing the work yourself. Spawn only for genuinely independent subtasks that gain from running in parallel, never for what a few sequential tool calls would do, and never one thread per item in a list. At most __MAX_CONCURRENT_CHILDREN_PER_THREAD__ children running at the same time (a finished one frees its slot), maximum depth 3.
 
 __NO_IMPERSONATION_RULE__
 
@@ -594,6 +598,15 @@ CRITICAL RULES:
 
 __REPEATED_ACTION_RULE__"#;
 
+/// The head of MEMORY CORRECTIONS on Classic: the `memory` tool.
+const MEMORY_CORRECTIONS_RULE_CLASSIC: &str = "MEMORY CORRECTIONS (the `memory` tool):
+- When the user says a memory is wrong (\"I don't work at Acme Corp\"), pass a broad search_query (\"Acme\") and a specific wrong_fact (\"User works at Acme Corp\"), plus an optional `correction` to replace it. A correction persists across memory rebuilds.";
+
+/// The head of MEMORY CORRECTIONS on Tree: the log is the memory, so there is
+/// no tool to call and nothing to edit (ADR 0362).
+const MEMORY_CORRECTIONS_RULE_TREE: &str = "MEMORY CORRECTIONS:
+- Your memory is the conversation log itself, so there is nothing to edit. When the user corrects something, their words become the newest entry, and the newest ruling holds over older lines.";
+
 /// Resolve every placeholder token in [`SYSTEM_PROMPT_BASE`] and append the
 /// coding-surface section, yielding the workspace-independent body of the chat
 /// system prompt.
@@ -603,8 +616,12 @@ __REPEATED_ACTION_RULE__"#;
 /// number the loop does not use is exactly the fabricated engine internal the
 /// ENGINE INTERNALS section warns against.
 ///
+/// `max_live_children` is the capacity policy's child cap, passed in for the
+/// same reason: it is the number the recursion guard enforces.
+///
 /// `mode` is here for the same reason. The mode withdraws `todo_write`, so a
 /// body that cannot vary orders a call the tools array does not offer.
+/// `memory_tree` too: a Tree turn has `recall` where Classic has `memory`.
 ///
 /// `response_style` is the rendered *response style* section, empty on
 /// Standard. It is a parameter rather than a read, so this stays pure and the
@@ -614,7 +631,9 @@ __REPEATED_ACTION_RULE__"#;
 fn static_prompt_body(
     has_lucidos_source: bool,
     max_tool_calls: usize,
+    max_live_children: usize,
     mode: super::context_mode::ContextMode,
+    memory_tree: bool,
     response_style: &str,
 ) -> String {
     let apply_verify_rule = if has_lucidos_source {
@@ -627,11 +646,18 @@ fn static_prompt_body(
     } else {
         TODO_LIST_RULE
     };
+    let (memory_lookup, memory_corrections_rule) = if memory_tree {
+        (MEMORY_LOOKUP_TREE, MEMORY_CORRECTIONS_RULE_TREE)
+    } else {
+        (MEMORY_LOOKUP_CLASSIC, MEMORY_CORRECTIONS_RULE_CLASSIC)
+    };
 
     let body = SYSTEM_PROMPT_BASE
         .replace("__ENGINE_RESTART_RULE__", ENGINE_RESTART_RULE)
         .replace("__APPLY_VERIFY_RULE__", &apply_verify_rule)
         .replace("__LOOK_BEFORE_ASSESSING_RULE__", LOOK_BEFORE_ASSESSING_RULE)
+        .replace("__MEMORY_LOOKUP__", memory_lookup)
+        .replace("__MEMORY_CORRECTIONS_RULE__", memory_corrections_rule)
         .replace("__ASK_USER_QUESTION_RULE__", ASK_USER_QUESTION_RULE)
         .replace(
             "__WORKSPACE_ASSETS_KNOWHOW_RULE__",
@@ -646,8 +672,8 @@ fn static_prompt_body(
         .replace("__REPEATED_ACTION_RULE__", REPEATED_ACTION_RULE)
         .replace("__MAX_TOOL_CALLS__", &max_tool_calls.to_string())
         .replace(
-            "__MAX_CHILDREN_PER_THREAD__",
-            &super::super::recursion_guard::MAX_CHILDREN_PER_THREAD.to_string(),
+            "__MAX_CONCURRENT_CHILDREN_PER_THREAD__",
+            &max_live_children.to_string(),
         )
         // LAST, and that is the point. Every substitution above is engine text,
         // and this one is the user's. Splice it earlier and the passes that
@@ -658,15 +684,47 @@ fn static_prompt_body(
     format!("{}{}", body, coding_surface_section(has_lucidos_source))
 }
 
+/// A mandatory preference's handle. The two kinds read their stored row the
+/// same way, which is all the setup scan asks.
+#[derive(Clone, Copy)]
+enum MandatoryPref {
+    Optional(&'static Pref<Optional>),
+    Text(&'static Pref<Text>),
+}
+
+impl MandatoryPref {
+    fn spec(self) -> &'static PrefSpec {
+        match self {
+            Self::Optional(pref) => &pref.spec,
+            Self::Text(pref) => &pref.spec,
+        }
+    }
+
+    /// The stored row, the device's own first for a device-scoped key.
+    async fn try_stored(
+        self,
+        pool: &sqlx::PgPool,
+        device_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let per_device = self.spec().scope == PrefScope::Device;
+        match (self, per_device) {
+            (Self::Optional(pref), true) => pref.try_stored_for_device(pool, device_id).await,
+            (Self::Optional(pref), false) => pref.try_stored(pool).await,
+            (Self::Text(pref), true) => pref.try_stored_for_device(pool, device_id).await,
+            (Self::Text(pref), false) => pref.try_stored(pool).await,
+        }
+    }
+}
+
 /// The preferences a chat turn will not proceed without, as
-/// `(key, instruction, per_device)`. Any missing key flips the turn into setup
+/// `(preference, instruction)`. Any missing key flips the turn into setup
 /// mode. Each instruction names a decline value, so a "no" is stored and never
 /// asked again.
-const MANDATORY_PREFS: &[(&str, &str, bool)] = &[
-    ("timezone", "- TIMEZONE: Ask what timezone they are in and call preferences(action=\"set\", key=\"timezone\", value=\"…\") with an IANA name (e.g., \"America/New_York\", \"Europe/London\", \"Asia/Tokyo\").", false),
-    ("language", "- LANGUAGE: Ask what language they prefer, and mention that English is recommended for best results (the models are strongest in English). They can still write in any language; replies come back in whichever language they set here. Then call preferences(action=\"set\", key=\"language\", value=\"…\") to save it.", false),
-    ("push_notifications", "- PUSH NOTIFICATIONS: Ask if they want to enable push notifications for scheduled task alerts (do NOT call them \"browser\" notifications: Lucidos runs as a native desktop app too, where these are native OS alerts). When you describe how they arrive, key off the last used device in [USER DEVICE & PREFERENCES]: if its details say \"Lucidos desktop app\" they are in the native desktop app (native macOS notifications, no browser or site permission); otherwise they are in a browser/PWA (the browser will prompt for permission). If yes, call preferences(action=\"set\", key=\"push_notifications\", value=\"enabled\"). If no, call preferences(action=\"set\", key=\"push_notifications\", value=\"declined\") so you don't ask again.", true),
-    ("technical_literacy", "- TECHNICAL LITERACY: Ask \"How technical should I be with you?\" as a card with exactly these three options, label then description, word for word: \"Keep it plain\" / \"Everyday words, no jargon.\"; \"Technical\" / \"Technical terms are fine.\"; \"I write software\" / \"Talk to me like a developer.\". Store the pick with preferences(action=\"set\", key=\"technical_literacy\", value=…) as \"non-technical\", \"technical\" or \"developer\". If they decline, set value=\"not-set\" so you don't ask again. Word the rest of this reply at the level they picked.", false),
+const MANDATORY_PREFS: &[(MandatoryPref, &str)] = &[
+    (MandatoryPref::Optional(&prefs::TIMEZONE), "- TIMEZONE: Ask what timezone they are in and call preferences(action=\"set\", key=\"timezone\", value=\"…\") with an IANA name (e.g., \"America/New_York\", \"Europe/London\", \"Asia/Tokyo\")."),
+    (MandatoryPref::Optional(&prefs::LANGUAGE), "- LANGUAGE: Ask what language they prefer, and mention that English is recommended for best results (the models are strongest in English). They can still write in any language; replies come back in whichever language they set here. Then call preferences(action=\"set\", key=\"language\", value=\"…\") to save it."),
+    (MandatoryPref::Optional(&prefs::PUSH_NOTIFICATIONS), "- PUSH NOTIFICATIONS: Ask if they want to enable push notifications for scheduled task alerts (do NOT call them \"browser\" notifications: Lucidos runs as a native desktop app too, where these are native OS alerts). When you describe how they arrive, key off the last used device in [USER DEVICE & PREFERENCES]: if its details say \"Lucidos desktop app\" they are in the native desktop app (native macOS notifications, no browser or site permission); otherwise they are in a browser/PWA (the browser will prompt for permission). If yes, call preferences(action=\"set\", key=\"push_notifications\", value=\"enabled\"). If no, call preferences(action=\"set\", key=\"push_notifications\", value=\"declined\") so you don't ask again."),
+    (MandatoryPref::Text(&prefs::TECHNICAL_LITERACY), "- TECHNICAL LITERACY: Ask \"How technical should I be with you?\" as a card with exactly these three options, label then description, word for word: \"Keep it plain\" / \"Everyday words, no jargon.\"; \"Technical\" / \"Technical terms are fine.\"; \"I write software\" / \"Talk to me like a developer.\". Store the pick with preferences(action=\"set\", key=\"technical_literacy\", value=…) as \"non-technical\", \"technical\" or \"developer\". If they decline, set value=\"not-set\" so you don't ask again. Word the rest of this reply at the level they picked."),
 ];
 
 /// The device of the person who can answer setup questions this turn, if any.
@@ -732,18 +790,14 @@ impl LucidosEngine {
             Some(did) => MANDATORY_PREFS.iter().map(|pref| (did, pref)).collect(),
             None => Vec::new(),
         };
-        for (did, (key, instruction, per_device)) in prefs_to_check {
+        for (did, (pref, instruction)) in prefs_to_check {
             // A read that FAILED is not a preference that is unset. Collapsing
             // both into `None` flips the whole turn into "SETUP REQUIRED, DO
             // NOT PROCEED" below, so one transient DB error refuses the user's
             // actual request. Treat an unreadable key as configured: a missed
             // setup nag costs a prompt, a false refusal costs the turn.
-            let read = if *per_device {
-                PreferenceStore::get_for_device(&self.pool, key, did).await
-            } else {
-                PreferenceStore::get(&self.pool, key).await
-            };
-            let value = match read {
+            let key = pref.spec().key;
+            let value = match pref.try_stored(&self.pool, did).await {
                 Ok(v) => v,
                 Err(e) => {
                     log!(
@@ -756,7 +810,7 @@ impl LucidosEngine {
             };
             if value.is_none() {
                 missing_instructions.push(*instruction);
-                missing_pref_keys.push(*key);
+                missing_pref_keys.push(key);
             }
         }
 
@@ -783,13 +837,21 @@ impl LucidosEngine {
         // build that never had this setting.
         let response_style = crate::core::response_style::resolve(&self.pool).await;
 
+        let max_live_children = self
+            .thread_queue
+            .policy()
+            .await
+            .max_concurrent_children_per_thread;
+
         let system_prompt = format!(
             "{}{}",
             system_prompt,
             static_prompt_body(
                 has_lucidos_source,
                 max_tool_calls,
+                max_live_children,
                 context_mode,
+                capabilities.gates.memory_tree,
                 &response_style
             )
         );
@@ -874,23 +936,26 @@ impl LucidosEngine {
 
         let system_prompt = {
             let mut section = format!("{}\n\n## Images\n\n\
-                Images in the conversation are numbered sequentially (1-based) across all messages — user-pasted and generated. \
-                The conversation history notes which messages had images with their thread:N index \
-                (e.g. \"[attached image (thread:2)]\"). When images are included in the message content, \
-                they are labeled as \"from earlier in the conversation\" or \"attached to current message\" \
-                so you can tell which are new. \
+                Every image in the conversation has an 'img-<hex>' handle, printed beside it. \
+                The conversation history notes earlier images with their handle and thread:N index \
+                (e.g. \"[attached image (thread:2, img-…)]\"). Images in the message content are labeled \
+                \"from earlier in the conversation\" or \"attached to current message\", and the label \
+                on current images carries their handles. \
+                To name an image in a tool call, copy its handle. Do not count to work out thread:N. \
                 Older images age out of your vision after a few messages — the history then shows only a \
-                text note like \"[attached image (thread:2) — image not included]\" plus a description. \
+                text note like \"[attached image (thread:2, img-…) — image not included]\" plus a description. \
                 When the user refers to an image you can no longer see, call the view_image tool with its \
-                reference (e.g. image: 'thread:2') to load it back into your vision, then answer from what \
+                handle to load it back into your vision, then answer from what \
                 you see — do NOT claim you have no image or ask the user to re-send it. \
                 You can save any conversation image to an artifact file with the save_thread_image tool \
-                (e.g., image: 'thread:1', path: 'artifacts/photos/reaction.jpg').", system_prompt);
+                (image: its handle, path: relative to data/artifacts/, e.g. 'photos/reaction.jpg').", system_prompt);
             if capabilities.gates.image_provider {
-                section.push_str(" You can also generate or edit images with the generate_image tool. \
-                    To edit an existing image, reference it as 'thread:N' where N is its position in the thread, \
+                section.push_str(
+                    " You can also generate or edit images with the generate_image tool. \
+                    To edit an existing image, pass its handle in input_images, \
                     or use an artifact path like 'artifacts/photo.png'. \
-                    When the user says \"edit the second image\", use input_images: [\"thread:2\"].");
+                    When the user says \"edit the second image\", thread:2 also works.",
+                );
             }
             section
         };
@@ -967,6 +1032,7 @@ Do NOT refuse to discuss the user's own personal information from their own file
 mod tests {
     use super::super::super::process_helpers::{
         APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, LOOK_BEFORE_ASSESSING_RULE,
+        MEMORY_LOOKUP_CLASSIC, MEMORY_LOOKUP_TREE,
     };
     use super::super::context_mode::ContextMode;
     use super::super::turn_tail::{
@@ -975,10 +1041,13 @@ mod tests {
     };
     use super::{
         coding_surface_section, setup_device, setup_or_language_section, static_prompt_body,
-        workspace_identity_section, ASK_USER_QUESTION_RULE, MANDATORY_PREFS, NAMES_NOT_IDS_RULE,
+        workspace_identity_section, ASK_USER_QUESTION_RULE, MANDATORY_PREFS,
+        MEMORY_CORRECTIONS_RULE_CLASSIC, MEMORY_CORRECTIONS_RULE_TREE, NAMES_NOT_IDS_RULE,
         NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE, TRIGGER_VS_EVENT_WAIT_RULE,
         WORKSPACE_ASSETS_KNOWHOW_RULE,
     };
+    use crate::core::prefs::{self, PrefScope};
+    use crate::engine::thread_queue::DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD as CHILD_CAP;
     use crate::llm::ToolCapabilities;
     use std::path::{Path, PathBuf};
 
@@ -1380,7 +1449,30 @@ mod tests {
     /// subscribed to its own child's idle, and a workspace knowhow was
     /// carrying a rule the engine should state
     /// (docs/plans/2026-10-03-crash-cut-child-reports-truthfully.md).
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 123_671;
+    ///
+    /// Raised by 39 to a measured 123,710 for the Settings link in FILE
+    /// REFERENCES: `[Backup](settings:backup)` opens one Settings page. The
+    /// agent sends users to Settings pages often and could only name the route
+    /// (docs/plans/2026-10-05-backup-settings-links-and-sleep.md).
+    ///
+    /// Raised by 375 to a measured 124,085 for the card's `message`: the
+    /// `ask_user_question` field and the paragraph after ANSWER FIRST that
+    /// routes an answer into it. On Opus 5.5 prose before a tool call may
+    /// arrive only as a summary, and steps with links never reached the user
+    /// (docs/plans/2026-10-06-chat-card-message-field.md).
+    ///
+    /// Raised by 120 to a measured 124,205 for the picture rule in FILE
+    /// REFERENCES. A picture shows only in text that ends the turn or on the
+    /// card. "Draw it in your reply" sent mockups into text a tool call
+    /// followed, whose summary drops them
+    /// (docs/plans/2026-10-06-chat-pictures-go-in-the-card-message.md).
+    ///
+    /// Raised by 88 to a measured 124,293 for the child cap (ADR 0380). PARALLEL
+    /// WORK says the cap is on children running at the same time, and the
+    /// `thread_queue` schema gains `max_concurrent_children_per_thread`. An
+    /// agent read a lifetime cap and moved its work out of the family
+    /// (docs/plans/2026-10-06-child-cap-counts-live-children.md).
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 124_293;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1411,6 +1503,7 @@ mod tests {
             image_provider: false,
             judgment_provider: false,
             context_mode: false,
+            memory_tree: false,
         };
         let mut flat = crate::llm::tools::get_default_tools(&billed);
         flat.push(crate::llm::tools::get_notification_tool());
@@ -1441,15 +1534,24 @@ mod tests {
         // variant takes. A style the user wrote
         // is workspace content, like `user_profile.md`, and this meter measures
         // the engine-authored surface.
+        // Both memory modules are billed too, at whichever body is longer.
         let widest_style = crate::core::response_style::widest_shipped_section();
-        let body = std::cmp::max(
-            static_prompt_body(true, 500, ContextMode::Off, &widest_style)
+        let body = [(true, false), (false, false), (true, true), (false, true)]
+            .into_iter()
+            .map(|(source, memory_tree)| {
+                static_prompt_body(
+                    source,
+                    500,
+                    CHILD_CAP,
+                    ContextMode::Off,
+                    memory_tree,
+                    &widest_style,
+                )
                 .chars()
-                .count(),
-            static_prompt_body(false, 500, ContextMode::Off, &widest_style)
-                .chars()
-                .count(),
-        );
+                .count()
+            })
+            .max()
+            .expect("four bodies");
 
         let flat: usize = flat_chat_tools().iter().map(wire_chars).sum();
         let grouped: usize = crate::capability_manifest::llm_tools()
@@ -1673,11 +1775,13 @@ mod tests {
         ),
         (
             "ask_user_question",
-            1_950,
+            2_082,
             "the \"Other\"-option ban is deliberately mirrored between \
              ASK_USER_QUESTION_RULE and this schema, and pinned by a test in \
              each place; the nested question / options / label object is 434 \
-             chars of frozen shape",
+             chars of frozen shape. Raised from 1,950 by `message`: a tool input \
+             is never summarized, so it is the one place an always-thinking \
+             model can hand the user an answer before a card",
         ),
         (
             "edit_file",
@@ -1840,6 +1944,7 @@ mod tests {
                     image_provider: true,
                     judgment_provider: false,
                     context_mode: false,
+                    memory_tree: false,
                 },
             ),
             ("no capability at all", ToolCapabilities::default()),
@@ -1968,9 +2073,9 @@ mod tests {
 
         let mut haystack = format!(
             "{}{}{}",
-            static_prompt_body(true, 500, ContextMode::Off, ""),
-            static_prompt_body(false, 500, ContextMode::Off, ""),
-            static_prompt_body(true, 500, ContextMode::On, "")
+            static_prompt_body(true, 500, CHILD_CAP, ContextMode::Off, false, ""),
+            static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, ""),
+            static_prompt_body(true, 500, CHILD_CAP, ContextMode::On, false, "")
         );
         let mut tools = flat_chat_tools();
         tools.extend(crate::capability_manifest::llm_tools());
@@ -2056,11 +2161,15 @@ mod tests {
     fn mandatory_setup_asks_for_technical_literacy_with_storable_values() {
         use crate::core::technical_literacy::SETTABLE_IDS;
 
-        let (_, instruction, per_device) = MANDATORY_PREFS
+        let (pref, instruction) = MANDATORY_PREFS
             .iter()
-            .find(|(key, _, _)| *key == crate::core::PREF_TECHNICAL_LITERACY)
+            .find(|(pref, _)| pref.spec().key == prefs::TECHNICAL_LITERACY.key())
             .expect("technical literacy is a mandatory preference");
-        assert!(!per_device, "the level is workspace-global");
+        assert_eq!(
+            pref.spec().scope,
+            PrefScope::Global,
+            "the level is workspace-global"
+        );
         for id in SETTABLE_IDS {
             assert!(
                 instruction.contains(&format!("\"{id}\"")),
@@ -2105,7 +2214,7 @@ mod tests {
     /// then leaves no orphan newline behind.
     #[test]
     fn the_standard_body_is_byte_identical_to_a_build_with_no_style() {
-        let standard = static_prompt_body(false, 500, ContextMode::Off, "");
+        let standard = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
 
         assert!(!standard.contains("RESPONSE STYLE:"));
         assert!(!standard.contains("__RESPONSE_STYLE_RULE__"));
@@ -2119,8 +2228,8 @@ mod tests {
     #[test]
     fn a_chosen_style_adds_exactly_its_own_section() {
         let section = crate::core::response_style::widest_shipped_section();
-        let standard = static_prompt_body(false, 500, ContextMode::Off, "");
-        let styled = static_prompt_body(false, 500, ContextMode::Off, &section);
+        let standard = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
+        let styled = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, &section);
 
         assert_eq!(styled.len(), standard.len() + section.len());
         assert!(styled.contains("RESPONSE STYLE:"));
@@ -2140,7 +2249,7 @@ mod tests {
         let library = response_style::merge(&[]);
         for style in &library {
             let section = response_style::section_for(&library, &style.id, None);
-            let body = static_prompt_body(false, 500, ContextMode::Off, &section);
+            let body = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, &section);
             if style.id == response_style::STANDARD_ID {
                 assert!(!body.contains("RESPONSE STYLE:"));
                 continue;
@@ -2171,8 +2280,8 @@ mod tests {
     /// mode-on turn. The list lives under a `[TODO]` heading instead.
     #[test]
     fn the_mode_on_body_points_at_the_todo_heading_rather_than_the_tool() {
-        let off = static_prompt_body(false, 500, ContextMode::Off, "");
-        let on = static_prompt_body(false, 500, ContextMode::On, "");
+        let off = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
+        let on = static_prompt_body(false, 500, CHILD_CAP, ContextMode::On, false, "");
 
         assert!(
             off.contains("todo_write"),
@@ -2194,7 +2303,7 @@ mod tests {
     /// both before the browser, and make the fallback visible to the user.
     #[test]
     fn the_browser_section_prefers_a_proxy_or_mcp_tool_and_says_when_it_falls_back() {
-        let body = static_prompt_body(false, 500, ContextMode::Off, "");
+        let body = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
         let from = body
             .find("BROWSER TOOLS:\n")
             .expect("the prompt no longer has a BROWSER TOOLS section");
@@ -2219,7 +2328,7 @@ mod tests {
     /// stated where the model spawns, with every finishing event named.
     #[test]
     fn the_fan_out_section_says_a_direct_child_reports_back_on_its_own() {
-        let body = static_prompt_body(false, 500, ContextMode::Off, "");
+        let body = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
         let from = body
             .find("PARALLEL WORK (FAN-OUT):\n")
             .expect("the prompt no longer has a FAN-OUT section");
@@ -2247,7 +2356,7 @@ mod tests {
     /// or a spawn that depends on the one before it.
     #[test]
     fn the_batch_rule_is_general_and_keeps_both_carve_outs() {
-        let body = static_prompt_body(false, 500, ContextMode::Off, "");
+        let body = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
 
         assert!(
             body.contains("Independent tool calls go IN THE SAME RESPONSE"),
@@ -2465,6 +2574,19 @@ mod tests {
         assert!(
             section.contains("in an option's description"),
             "the section must put pictures on the question card:\n{section}"
+        );
+        // On Opus 5.5, text followed by any tool call may arrive only as a
+        // summary, which drops the `![...]` line. "Draw it in your reply" sent
+        // pictures there (docs/plans/2026-10-06-chat-pictures-go-in-the-card-message.md).
+        assert!(
+            section.contains("text that ENDS your turn")
+                && section.contains("the card's `message`")
+                && section.contains("followed by any tool call"),
+            "the section must name every place a picture shows:\n{section}"
+        );
+        assert!(
+            !section.contains("draw it in your reply"),
+            "a reply followed by a tool call loses the picture:\n{section}"
         );
         // A coding agent drew colour options in ASCII, then put one sheet of
         // all four on every option. Mirrors `SHOWING_AN_IMAGE_RULE`.
@@ -2718,28 +2840,35 @@ mod tests {
         );
     }
 
-    /// The denial is about THIS install, not about the agent. A cross-workspace
-    /// `run_coding_agent(workspace="…")` returns in
-    /// `agentic_loop_special_tool` before the local source guard, and the
-    /// TARGET engine applies its own check, so it stays valid here. An
-    /// unqualified "never spawn a coding agent for a Lucidos change" would make
-    /// that capability unreachable from every packaged install.
+    /// The denial is about THIS install, not about the agent. A workspace with
+    /// a source checkout is served by another install, which
+    /// `run_coding_agent(workspace=…)` cannot reach: it resolves a bare name
+    /// beside this install's own workspaces. The CLI's `--to <absolute path>`
+    /// is the route that works, and the prompt must name it before the agent
+    /// tries the tool.
     #[test]
-    fn no_source_variant_preserves_the_cross_workspace_route() {
+    fn no_source_variant_routes_platform_work_to_another_install_via_the_cli() {
         let section = coding_surface_section(false);
 
         assert!(
-            section.contains("CROSS-WORKSPACE IS STILL OPEN"),
-            "must keep the cross-workspace route open:\n{section}"
+            section.contains("ANOTHER INSTALL CAN"),
+            "must keep the route to another install open:\n{section}"
         );
         assert!(
-            section.contains("run_coding_agent(workspace="),
-            "must show the call shape that still works:\n{section}"
+            section.contains("lucidos spawn-thread --to <absolute path>")
+                && section.contains("--coding-agent claude-code"),
+            "must show the CLI call shape that works:\n{section}"
+        );
+        assert!(
+            section.contains("run_coding_agent(workspace=…)` CANNOT reach it"),
+            "must say the tool cannot cross installs, or the agent tries it \
+             first:\n{section}"
         );
         // The refusal has to be scoped, or the carve-out above contradicts it.
         assert!(
-            section.contains("aimed at THIS install") && section.contains("local coding agent"),
-            "the refusal must be scoped to local spawns so it doesn't read as \
+            section.contains("every workspace this install serves")
+                && section.contains("local coding agent"),
+            "the refusal must be scoped to this install so it doesn't read as \
              a blanket ban:\n{section}"
         );
     }
@@ -2866,14 +2995,49 @@ mod tests {
     #[test]
     fn the_look_rule_names_the_two_searches_and_bounds_them() {
         assert!(
-            LOOK_BEFORE_ASSESSING_RULE
-                .contains("`memory` and `threads` tools both have a 'search'"),
+            LOOK_BEFORE_ASSESSING_RULE.contains("__MEMORY_LOOKUP__"),
             "it must name what to look with:\n{LOOK_BEFORE_ASSESSING_RULE}"
+        );
+        assert!(
+            MEMORY_LOOKUP_CLASSIC.contains("`memory` and `threads` tools both have a 'search'"),
+            "{MEMORY_LOOKUP_CLASSIC}"
+        );
+        assert!(
+            MEMORY_LOOKUP_TREE.contains("`recall` and `threads` tools both have a 'search'"),
+            "{MEMORY_LOOKUP_TREE}"
         );
         assert!(
             LOOK_BEFORE_ASSESSING_RULE.contains("not browsing"),
             "the user's constraint (only when necessary) must ride with the \
              permission:\n{LOOK_BEFORE_ASSESSING_RULE}"
+        );
+    }
+
+    /// A Tree turn is not offered the `memory` tool, so its body must never
+    /// send the agent there. Only the two memory sections may differ, so the
+    /// rest of the cached tier is the same bytes on either module.
+    #[test]
+    fn a_tree_body_names_recall_and_never_the_memory_tool() {
+        let classic = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
+        let tree = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, true, "");
+
+        assert!(classic.contains(MEMORY_LOOKUP_CLASSIC));
+        assert!(classic.contains(MEMORY_CORRECTIONS_RULE_CLASSIC));
+        assert!(tree.contains(MEMORY_LOOKUP_TREE));
+        assert!(tree.contains(MEMORY_CORRECTIONS_RULE_TREE));
+        for gone in ["the `memory` tool", "`memory` and `threads`"] {
+            assert!(!tree.contains(gone), "a Tree body still says {gone:?}");
+        }
+
+        let swapped = classic
+            .replace(MEMORY_LOOKUP_CLASSIC, MEMORY_LOOKUP_TREE)
+            .replace(
+                MEMORY_CORRECTIONS_RULE_CLASSIC,
+                MEMORY_CORRECTIONS_RULE_TREE,
+            );
+        assert_eq!(
+            swapped, tree,
+            "the module must move nothing but its two sections"
         );
     }
 
@@ -3016,6 +3180,16 @@ mod tests {
         );
     }
 
+    /// An answer written before the card may reach the user only as a summary,
+    /// so the chat rule routes it into the card's `message`. The coding-agent
+    /// half lives beside those rules in `agent_session::prompts`.
+    #[test]
+    fn the_chat_rule_routes_the_answer_into_the_card_message() {
+        assert!(ASK_USER_QUESTION_RULE.contains("PUT THE ANSWER IN ITS `message`"));
+        assert!(ASK_USER_QUESTION_RULE.contains("short summary"));
+        assert!(ASK_USER_QUESTION_RULE.contains("links, pictures and drafts"));
+    }
+
     /// Lucidos has no text-entry option, so tapping an "Other, I'll type it"
     /// button returns that label as the user's answer. The rule must ban the
     /// option, explain WHY, and name both real escapes. Otherwise the agent
@@ -3118,5 +3292,17 @@ mod tests {
             "the state-change section names this block by its opening heading; \
              renaming it here silently dangles that pointer:\n{rule}"
         );
+    }
+
+    /// The prompt states the child cap the guard enforces: the live policy
+    /// value. It says the limit is on children at the same time.
+    #[test]
+    fn the_body_states_the_child_cap_it_was_given() {
+        let body = static_prompt_body(false, 500, 4, ContextMode::Off, false, "");
+        assert!(
+            body.contains("At most 4 children running at the same time"),
+            "the prompt must name the policy's cap as a limit at one moment"
+        );
+        assert!(!body.contains("__MAX_CONCURRENT_CHILDREN_PER_THREAD__"));
     }
 }

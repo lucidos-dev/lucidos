@@ -18,12 +18,14 @@ export function ReloadIcon() {
   );
 }
 
-/** One arrow turning back on itself: try the same thing again. */
+/** One arrow turning back on itself: try the same thing again. The arc ends
+ *  in a short line into the arrowhead's corner, so the head stays attached.
+ *  Every icon-only retry control draws this glyph (`one-retry-glyph.test.ts`). */
 export function RetryIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M3 12a9 9 0 1 0 3-6.7" />
-      <path d="M3 4v5h5" />
+      <path d="M3 12A9 9 0 1 0 5.64 5.64L3 8" />
+      <path d="M3 3v5h5" />
     </svg>
   );
 }
@@ -217,12 +219,13 @@ export function ImageIcon({ className }: { className?: string }) {
   );
 }
 
-/** Clock face for the *waiting indicator* (an event wait's countdown). */
+/** Clock face for the *waiting indicator* (an event wait's countdown). It sits
+ *  beside HelpIcon in the header, so it takes the same ring and joins. */
 export function EventWaitClockIcon({ className }: { className?: string }) {
   return (
-    <svg class={className} viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" />
-      <path d="M8 4.5V8l2.5 1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+    <svg class={className} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.25" />
+      <path d="M8 4.35V8l2.6 1.56" />
     </svg>
   );
 }
@@ -770,13 +773,13 @@ export function ReviewIcon() {
   );
 }
 
-// Drawer "Running" indicator — a STATIC ring spinner, the same visual family as
+// Drawer "In flight" indicator: a STATIC ring spinner, the same visual family as
 // the animated `.mini-spinner` on running thread rows (modal-overlay.css), so the
-// app shows one spinner shape. It stays static everywhere it labels the "running"
-// category (the threads-header Filter button, the Filter dropdown's Running row,
-// the RUNNING section header); only the per-thread spinners actually animate —
-// motion only where work is in flight.
-export function RunningIcon({ size }: { size?: string } = {}) {
+// app shows one spinner shape. It stays static everywhere it labels the view
+// (the threads-header Filter button, the panel's In flight row, the IN FLIGHT
+// section header). Only the per-thread spinners animate, so motion appears only
+// where a turn is running.
+export function InFlightIcon({ size }: { size?: string } = {}) {
   return (
     <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
       <circle cx="12" cy="12" r="9" pathLength="100" stroke-dasharray="75 25" transform="rotate(-90 12 12)" />
@@ -790,6 +793,17 @@ export function InboxIcon({ size }: { size?: string } = {}) {
     <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M22 12h-6l-2 3h-4l-2-3H2" />
       <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+    </svg>
+  );
+}
+
+// The home thread: a house, wherever a Home entry or a Home row is drawn.
+export function HomeIcon({ size }: { size?: string } = {}) {
+  return (
+    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 10.5 12 3l9 7.5" />
+      <path d="M5 9.5V21h14V9.5" />
+      <path d="M10 21v-6h4v6" />
     </svg>
   );
 }

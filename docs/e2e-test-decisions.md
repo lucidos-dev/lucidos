@@ -899,11 +899,14 @@ chunks already had per-chunk `--output` dirs; the per-project passes did not, so
 chromium's. Only the LAST project's survived. A targeted repro run afterwards
 (`-f <spec>`) defaulted to `test-results` too, so triaging destroyed what was left.
 
-`scripts/e2e-browser.sh` now wipes **one root once**, up front, and gives every
-invocation its own subdir under it (`set_output_dir`) — nothing is wiped mid-run:
+`scripts/e2e-browser.sh` clears what the run owns, once, up front, and gives every
+invocation its own subdir under it (`set_output_dir`). Nothing is wiped mid-run:
 
-- Full run → `test-results/full/<project>` and `test-results/full/<project>-<phase>-<n>`,
-  with the whole `test-results/` tree cleared once before the first project.
+- Full run → `test-results/full/<project>` and `test-results/full/<project>-<phase>-<n>`.
+  An all-projects run clears the whole `test-results/` tree first. A `--no-webkit`
+  run clears only `chromium` and `mobile`, and a `--webkit` run only the
+  `mobile-webkit` dirs, each with the per-run `mem-samples.log`. So the documented
+  two-invocation recipe keeps the first invocation's traces through the second.
 - Targeted run (`-f`, or any `--` passthrough) → `test-results/targeted/…`, and it
   clears **only** that root, so a preceding full run's evidence — usually the very
   thing you're reproducing against — stays intact.
@@ -911,6 +914,47 @@ invocation its own subdir under it (`set_output_dir`) — nothing is wiped mid-r
 
 There is no `--preserve-output-dir` CLI flag to reach for (the runner option exists
 but is internal), so per-invocation `--output` is the only lever.
+
+### Per-spec compressor sampling
+
+One e2e lock hold runs the whole suite, so a lock-level memory snapshot cannot
+say which spec filled the macOS VM compressor. The Playwright reporter
+`crates/lucidos-app/e2e/memSampleReporter.ts` takes one sample per test end and
+appends one line:
+
+```text
+<ISO time>  project=  spec=  title=  retry=  status=  duration_ms=  pages=  limit=  delta=  webkit_gpu=  webkit_gpu_rss_kb=
+```
+
+The fields are tab-separated. `pages` and `limit` are
+`vm.compressor.pages_compressed` and `vm.compressor.pages_compressed_limit`.
+`delta` is the change in `pages` since the previous test in the same worker slot.
+A slot's first test is measured from the start of its Playwright invocation, so
+it carries the browser launch.
+
+The page count is host wide: a delta says what the host gained while that test
+ran, not what one process holds. `webkit_gpu` counts the live Playwright WebKit
+GPU processes, matched on the executable path by the WebKit reaper's own token,
+and `webkit_gpu_rss_kb` sums their RSS. A `?` is a value the sample could not read.
+
+- **Cost and safety.** One `sysctl` and one `ps` per test, asynchronous, each
+  with a two-second timeout. Every error is swallowed, so sampling can never fail
+  or stall a test.
+- **macOS only, and only under the harness.** Elsewhere, or with no log path in
+  the environment, the reporter does nothing.
+- **Where it lands.** `e2e-browser.sh` points it at
+  `test-results/{full,targeted}/mem-samples.log`. No invocation wipes that root,
+  so the log holds every invocation of the run. A mirror goes to
+  `~/.lucidos/e2e-mem/<run id>.log`, which outlives worktree cleanup.
+  `export_e2e_mem_sample_env` in `scripts/lib/e2e.sh` owns both paths and the
+  token, and hands them to the reporter in the environment.
+- **The table.** At the end of the run, `report_e2e_mem_top_deltas` prints the
+  ten largest deltas summed by project and spec. It runs from the shell because
+  one run is many Playwright invocations, and a reporter only ever sees one.
+
+`E2ELockAcquired` also names the Playwright projects the hold will run, in its
+payload and its summary. A memory snapshot log keyed on lock events can then
+tell a WebKit hold from a Chromium one.
 
 ### The harness may not report a status it does not have
 

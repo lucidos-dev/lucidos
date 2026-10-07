@@ -41,6 +41,16 @@ function verifying(over: Partial<WebhookRefusal> = {}): WebhookRefusal {
   });
 }
 
+/** A run of nothing but missing signatures, as unsigned probes leave. */
+function unsigned(over: Partial<WebhookRefusal> = {}): WebhookRefusal {
+  return verifying({
+    refusals: 3,
+    reasons: { 'signature-missing': 3 },
+    refusing_secs: 7_200,
+    ...over,
+  });
+}
+
 describe('webhookRefusalNotice', () => {
   it('says a switched-off hook is switched off, in as many words', () => {
     // The highest-value alarm in the feature. Eighteen days of deliveries were
@@ -83,6 +93,34 @@ describe('webhookRefusalNotice', () => {
     expect(notice.detail).toContain('Nothing is wrong with the signature or the secret');
     // The Webhooks row reads the same flag, so the two surfaces agree.
     expect(webhookRefusalRowLine(off)).toContain('switched off');
+  });
+
+  it('never sends an unsigned run at the secret', () => {
+    // A sender with a secret set signs every delivery. A run with no signature
+    // at all is weak evidence against the secret. Rotating it is the one step
+    // that can break a working hook.
+    const notice = webhookRefusalNotice(unsigned());
+    expect(notice.title).toContain('unsigned requests');
+    expect(notice.detail).toContain('none of them carried a readable signature');
+    expect(notice.detail).toContain('may not be from your sender');
+    expect(notice.detail).toContain('do not rotate it');
+    expect(notice.detail).not.toContain('the secret or the signature config');
+    // The headline already names the one reason, so the tally is not repeated.
+    expect(notice.detail).not.toContain('no readable signature (3)');
+  });
+
+  it('keeps the secret words when one real mismatch sits in the run', () => {
+    // A stray probe adds a missing signature beside real failures. It must not
+    // soften the reading of the forty-one that failed the check.
+    const notice = webhookRefusalNotice(verifying());
+    expect(notice.title).not.toContain('unsigned');
+    expect(notice.detail).toContain('the secret or the signature config');
+  });
+
+  it('says switched off for an unsigned run on a hook that is off', () => {
+    const notice = webhookRefusalNotice(unsigned({ enabled: false }));
+    expect(notice.title).toContain('switched off');
+    expect(notice.title).not.toContain('unsigned');
   });
 
   it('names how many were lost and over how long', () => {
@@ -153,6 +191,9 @@ describe('webhookRefusalRowLine', () => {
     );
     expect(webhookRefusalRowLine(verifying())).toBe(
       '42 deliveries refused, because none of them verified, over 1 day',
+    );
+    expect(webhookRefusalRowLine(unsigned())).toBe(
+      '3 deliveries refused, because none of them carried a signature, over 2 hours',
     );
   });
 

@@ -169,7 +169,14 @@ async fn newest_completion_card(pool: &PgPool, parent_id: Uuid) -> (String, Stri
 
 /// Helper: emit a MessageReceived event for a thread with an optional parent.
 async fn emit_thread_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>, text: &str) {
-    bus.emit(BusEvent::Thread {
+    bus.emit(thread_message(thread_id, parent, text))
+        .await
+        .unwrap();
+}
+
+/// The human chat `MessageReceived` that [`emit_thread_message`] emits.
+fn thread_message(thread_id: Uuid, parent: Option<Uuid>, text: &str) -> BusEvent {
+    BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
             provider: None,
@@ -189,9 +196,31 @@ async fn emit_thread_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uui
             channel: Some(EventChannel::Chat),
             ..EventMeta::NONE
         },
-    })
-    .await
-    .unwrap();
+    }
+}
+
+/// Block until this database has `n` backends waiting on a lock. That is the
+/// signal that a racing statement reached its lock, rather than merely having
+/// been spawned. Scoped to `current_database()`, so a concurrent test's
+/// disposable database cannot satisfy it.
+///
+/// Panics rather than returning on timeout: a race that never materialised
+/// means the test proved nothing, and passing quietly is how it would rot.
+async fn wait_until_blocked_on_locks(pool: &PgPool, n: i64) {
+    for _ in 0..200 {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if blocked >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("fewer than {n} backends ever blocked on a lock, so the race never happened");
 }
 
 /// Helper: emit CodingAgentIdled with the given flags. When `has_changes=true`,
@@ -482,6 +511,7 @@ mod ancestor_rebroadcast;
 mod blocking_attention_counts;
 mod change_apply_archive;
 mod command_permission;
+mod committed_horizon;
 mod crash_cut_child;
 mod fan_out_callback;
 mod has_diff_and_actor;
@@ -492,6 +522,7 @@ mod live_event_waits;
 mod origin_and_resume;
 mod parked_question_delivery;
 mod parked_thread_archive;
+mod per_thread_commit_order;
 mod pinned_is_never_archived;
 mod proposal_follows_changes;
 mod proposed_apply_cycle;

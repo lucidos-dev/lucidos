@@ -248,6 +248,40 @@ pub(crate) struct QuestionWalkOutcome {
 /// Reintroduce a typed enum if a caller ever needs to branch.
 pub(crate) type QuestionWalkError = Box<dyn std::error::Error + Send + Sync>;
 
+/// The chat card's `message`, or `None` when it is absent or blank. Prose
+/// before a tool call may reach the user only as a summary. A tool input
+/// never does, so an answer the card follows belongs here.
+pub(crate) fn card_message(tool_args: &serde_json::Value) -> Option<&str> {
+    tool_args
+        .get("message")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.trim().is_empty())
+}
+
+/// A card's message, with the turn's meta so it renders in the asking turn.
+pub(crate) struct CardMessage<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) meta: &'a EventMeta,
+}
+
+/// Shows a card's message as the agent's text. Emit it just before the card:
+/// a `TextStreamed` after a card overtakes it and disables its buttons.
+pub(crate) async fn emit_card_message(
+    bus: &EventBus,
+    thread_id: Uuid,
+    message: &CardMessage<'_>,
+) -> Result<(), QuestionWalkError> {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::TextStreamed {
+            text: message.text.to_string(),
+        },
+        meta: message.meta.clone(),
+    })
+    .await
+    .map(|_| ())
+}
+
 impl LucidosEngine {
     /// Walk a batch of questions sequentially (one card on screen at a
     /// time), emit `UserQuestionAsked` for each, and block until each is
@@ -265,11 +299,14 @@ impl LucidosEngine {
     /// get the resume marker + `ContinuationRequested` spawn; chat threads
     /// skip both because the chat tool returns the answer directly as a
     /// tool result.
+    ///
+    /// The walk shows `message` once, just before it first asks the first card.
     pub(crate) async fn walk_question_batch(
         &self,
         thread_id: Uuid,
         outer_tool_use_id: &str,
         questions: &serde_json::Value,
+        message: Option<CardMessage<'_>>,
         cc_session_id: String,
         channel: crate::engine::thread_events::EventChannel,
     ) -> Result<QuestionWalkOutcome, QuestionWalkError> {
@@ -344,6 +381,13 @@ impl LucidosEngine {
                 }
             };
             if !already_asked {
+                if let Some(message) = message.as_ref().filter(|_| i == 0) {
+                    if let Err(e) = emit_card_message(&self.event_bus, thread_id, message).await {
+                        self.question_wait_registry.forget(&sub_id).await;
+                        log!("[QuestionWalk] emit card message failed {thread_id}/{sub_id}: {e}");
+                        return Err(format!("Failed to persist the card's message: {e}").into());
+                    }
+                }
                 if let Err(e) = self
                     .event_bus
                     .emit(BusEvent::Thread {
@@ -608,6 +652,12 @@ const SUPERSEDED_HOOK_VALUE: &str = "(superseded) The user did not answer this \
     input. Work from that, and do not ask this question again unless it is \
     still open after reading it.";
 
+/// Follows a typed reply that picks no option. The engine records it as the
+/// card's answer, but users often type a new request instead of answering.
+pub(crate) const TYPED_REPLY_NOTE: &str = "The user typed this instead of picking an \
+    option. It may answer your question, or it may ask or say something else. If it \
+    leaves your question open, respond to what they said, then ask the question again.";
+
 /// How an answer's images are written into the text its agent reads.
 #[derive(Clone, Copy)]
 pub(crate) enum AnswerImages<'a> {
@@ -671,6 +721,23 @@ fn with_image_lines(text: String, image_lines: Option<String>) -> String {
     }
 }
 
+/// The text the user typed with an answer, or `""` when they typed none.
+fn typed_text(answer_kind: &serde_json::Value) -> &str {
+    answer_kind
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+}
+
+/// Append [`TYPED_REPLY_NOTE`] when the answer is typed text that picks no
+/// option.
+fn with_typed_reply_note(value: String, typed_only: bool) -> String {
+    match typed_only {
+        true => format!("{value}\n\n[{TYPED_REPLY_NOTE}]"),
+        false => value,
+    }
+}
+
 /// `Canceled` produces a `(canceled)` marker rather than an empty string —
 /// an empty answer causes CC's model to read the question as unanswered and
 /// re-invoke the tool in a loop. `Superseded` carries a longer sentence for the
@@ -678,7 +745,8 @@ fn with_image_lines(text: String, image_lines: Option<String>) -> String {
 /// `MultiSelected` joins resolved labels with
 /// `", "` and appends any non-empty `text` (freetext typed in the prompt
 /// textarea while the card was on screen) on the same separator. A typed
-/// answer's images follow its text, written as `images` says.
+/// answer's images follow its text, written as `images` says. Typed text that
+/// picks no option ends with [`TYPED_REPLY_NOTE`].
 fn answer_kind_to_hook_value(
     answer_kind: &serde_json::Value,
     cc_questions: &serde_json::Value,
@@ -713,19 +781,18 @@ fn answer_kind_to_hook_value(
                         .collect()
                 })
                 .unwrap_or_default();
-            if let Some(text) = answer_kind.get("text").and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    parts.push(text.to_string());
-                }
+            let text = typed_text(answer_kind);
+            let typed_only = parts.is_empty() && !text.is_empty();
+            if !text.is_empty() {
+                parts.push(text.to_string());
             }
-            serde_json::Value::String(with_image_lines(parts.join(", "), image_lines))
+            let value = with_image_lines(parts.join(", "), image_lines);
+            serde_json::Value::String(with_typed_reply_note(value, typed_only))
         }
         "FreeText" => {
-            let text = answer_kind
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            serde_json::Value::String(with_image_lines(text.to_string(), image_lines))
+            let text = typed_text(answer_kind);
+            let value = with_image_lines(text.to_string(), image_lines);
+            serde_json::Value::String(with_typed_reply_note(value, !text.is_empty()))
         }
         "Canceled" => serde_json::Value::String("(canceled)".to_string()),
         "Superseded" => serde_json::Value::String(SUPERSEDED_HOOK_VALUE.to_string()),
@@ -768,19 +835,20 @@ struct AnsweredSubQuestion {
 /// happens not to be "Approve" is NOT approval, and an agent resumed next to a
 /// teardown-stamped rejection will otherwise reach for exactly that inference.
 fn answer_kind_note(answer_kind: &serde_json::Value) -> &'static str {
-    let has_text = answer_kind
-        .get("text")
-        .and_then(|v| v.as_str())
-        .is_some_and(|t| !t.is_empty());
+    let has_text = !typed_text(answer_kind).is_empty();
+    let picked_any = answer_kind
+        .get("option_ids")
+        .and_then(|v| v.as_array())
+        .is_some_and(|ids| !ids.is_empty());
     match answer_kind.get("kind").and_then(|k| k.as_str()) {
         Some("Selected") => "The user picked that option.",
-        Some("MultiSelected") if has_text => {
+        Some("MultiSelected") if has_text && picked_any => {
             "The user picked those options and typed the rest themselves."
         }
-        Some("MultiSelected") => "The user picked those options.",
-        Some("FreeText") => {
+        Some("MultiSelected") if picked_any => "The user picked those options.",
+        Some("FreeText" | "MultiSelected") if has_text => {
             "The user typed that themselves. It is not one of the options you \
-             offered, so it picks none of them: read it as what they actually want."
+             offered, so it picks none of them."
         }
         Some("Canceled") => "The question was canceled.",
         Some("Superseded") => {

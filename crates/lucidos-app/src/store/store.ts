@@ -1,4 +1,4 @@
-import { signal, computed, batch } from '@preact/signals';
+import { signal, computed, batch, type ReadonlySignal } from '@preact/signals';
 import { hydratePinnedAppsFromStorage } from './actions/pinnedApps';
 import { minDrawerWidth } from './paneMinimums';
 import type {
@@ -46,6 +46,7 @@ import type { SubscriptionGroup, ThreadState, ThreadStatus, Exchange } from './t
 import { changeReadyToReview, computeExchanges, isExcludedFromSections, plainEventName } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
+import { PREFERENCE_CATALOG, type PreferenceValues } from '@lucidos/preference-catalog';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import { resetContentScroll } from './savedScroll';
@@ -487,16 +488,22 @@ export const whatsNewTargetRelease = signal<string | null>(null);
 export const releaseNoticeView = signal<Loadable<ReleaseNoticeView>>({ status: 'not-loaded' });
 export const engineVersion = signal<string | null>(null);
 export const latestEngineVersion = signal<string | null>(null);
+/** The newest client build id in this checkout, from the engine's `/health`.
+ *  A build id, so it is compared only against `__LUCIDOS_APP_VERSION__`. A
+ *  packaged install reports none. */
 export const latestTauriAppVersion = signal<string | null>(null);
+/** The release the client's own updater offers (ADR 0105), or `null`. A
+ *  release, so it is compared only against `__LUCIDOS_APP_RELEASE__`. */
+export const clientOfferedRelease = signal<string | null>(null);
 /** What is in the packaged update being offered, as raw markdown, or `null` when
  *  none is offered or its manifest carries no notes.
  *
  *  The only way this client can say what a PENDING update contains. The
  *  offered version postdates the engine binary running here, so the baked
  *  changelog `changelogReleases` holds does not carry it. Falling back to that
- *  would show the notes for the version already installed. Written only by the
- *  update check, beside `latestTauriAppVersion`, so the two cannot describe
- *  different releases. */
+ *  would show the notes for the version already installed. Written only beside
+ *  the release they describe: the gateway's `latest`, or `clientOfferedRelease`
+ *  from the client's own check. */
 export const latestTauriAppNotes = signal<string | null>(null);
 /** The gateway's release check (ADR 0108), or `null` when it is unknown.
  *
@@ -592,7 +599,7 @@ export const configuredProviders = signal<string[] | null>(null);
 export const currentModel = signal(DEFAULT_CHAT_MODEL);
 
 // --- Reasoning Effort (persisted via preferences; populated by loadPreferences) ---
-export const reasoningEffort = signal('high');
+export const reasoningEffort = signal<string>(PREFERENCE_CATALOG.chat_reasoning_effort.fallback);
 
 // --- Animation speed and reduced motion ---
 // Owned by utils/motion.ts, a lean module that timers outside the store can
@@ -649,28 +656,34 @@ export const threadDrawerOpen = signal(
  *    - `attention`: the agent is stuck and the user must act, awaiting an
  *      answer or permission, or holding a failed turn (`threadNeedsAttention`).
  *    - `review`: carrying a change ready to apply (`threadInReview`).
- *    - `running`: actively working on a response (`threadIsRunning`).
+ *    - `in-flight`: running, or waiting on its own event wait or on
+ *      sub-threads (`threadIsInFlight`).
  *    - `drafts`: threads with an unsent draft (`draftThreads`).
  *
  *  The badge counts are recomputed from the rehydrated `threadMap`, so only
  *  the active SELECTION is persisted. One key stores the choice and encodes
- *  the one-active invariant. Any unknown value falls back to `all`. */
+ *  the one-active invariant. A stored `running` is the view's old name and
+ *  restores as `in-flight`. Any unknown value falls back to `all`. */
 const ALT_VIEW_KEY = 'lucidos-alt-view';
-export type DrawerView = 'all' | 'attention' | 'review' | 'running' | 'drafts';
+export type DrawerView = 'all' | 'attention' | 'review' | 'in-flight' | 'drafts';
 
 function restoreDrawerView(): DrawerView {
   const saved = localStorage.getItem(ALT_VIEW_KEY);
-  return saved === 'attention' || saved === 'review' || saved === 'running' || saved === 'drafts' ? saved : 'all';
+  if (saved === 'running') return 'in-flight';
+  return saved === 'attention' || saved === 'review' || saved === 'in-flight' || saved === 'drafts' ? saved : 'all';
 }
 
-export const drawerView = signal<DrawerView>(restoreDrawerView());
+const drawerViewState = signal<DrawerView>(restoreDrawerView());
 
-/** Select a drawer view (the sole mutator of `drawerView`). Persists the choice
- *  — clearing the key for `all` so a pristine state restores to the default —
- *  and switches the drawer to that view. Shared by the desktop and mobile
- *  threads headers via the drawer view selector. */
+/** Read-only, so `setDrawerView` stays the one writer. The drawer's transition
+ *  keys on this value (`drawerSwapKey`), so every write plays it, whoever made
+ *  it. `__tests__/drawer-view-owner-guard.test.ts` pins both halves. */
+export const drawerView: ReadonlySignal<DrawerView> = drawerViewState;
+
+/** Select a drawer view, the one way to change it. Persists the choice
+ *  (clearing the key for `all`, so a pristine state restores to the default). */
 export function setDrawerView(view: DrawerView): void {
-  drawerView.value = view;
+  drawerViewState.value = view;
   if (view === 'all') localStorage.removeItem(ALT_VIEW_KEY);
   else localStorage.setItem(ALT_VIEW_KEY, view);
 }
@@ -942,6 +955,13 @@ export function isMidTurn(status: ThreadStatus): boolean {
   return status === 'running' || status === 'waiting_for_user_answer';
 }
 
+/** Mid-turn, or watching an event it will wake on and commit after. The
+ *  client half of the engine's `unsettled_thread_ids`, which refuses a change
+ *  action under such a thread. */
+export function threadUnsettled(thread: ThreadState): boolean {
+  return isMidTurn(effectiveThreadStatus(thread)) || thread.meta.liveEventWaitCount > 0;
+}
+
 /** True when the agent is not producing output. Future events will not resolve
  *  trailing Thinking spinners in non-current exchanges, so the renderer must
  *  clean them up itself.
@@ -1056,9 +1076,7 @@ export function threadInReview(thread: ThreadState): boolean {
   if (isExcludedFromSections(thread)) return false;
   const section = getThreadDisplaySection(thread);
   if (section !== 'current' && section !== 'saved') return false;
-  const status = effectiveThreadStatus(thread);
-  if (status === 'running' || status === 'waiting_for_user_answer') return false;
-  if (thread.meta.liveEventWaitCount > 0) return false;
+  if (threadUnsettled(thread)) return false;
   return changeReadyToReview(thread.meta);
 }
 
@@ -1079,32 +1097,6 @@ export const reviewThreadCount = computed(() => {
   let count = 0;
   for (const thread of threadMap.value.values()) {
     if (threadInReview(thread)) count++;
-  }
-  return count;
-});
-
-/** Whether a thread is actively working. It sits in the Current or Saved
- *  section AND its effective status is `running`, the state the status dot
- *  labels "Running".
- *
- *  A `running` thread always routes to Current or Saved (`displaySection`), so
- *  the section gate never drops one. It only keeps the composing and discarded
- *  carve-out in lockstep with the sibling predicates. Independent of
- *  `threadNeedsAttention` and `threadInReview`, which both exclude `running`,
- *  so the three views never claim the same thread. */
-export function threadIsRunning(thread: ThreadState): boolean {
-  if (isExcludedFromSections(thread)) return false;
-  const section = getThreadDisplaySection(thread);
-  if (section !== 'current' && section !== 'saved') return false;
-  return effectiveThreadStatus(thread) === 'running';
-}
-
-/** Count of threads actively working on a response (see `threadIsRunning`)
- *  across the Current and Saved sections. Drives the selector's running badge. */
-export const runningThreadCount = computed(() => {
-  let count = 0;
-  for (const thread of threadMap.value.values()) {
-    if (threadIsRunning(thread)) count++;
   }
   return count;
 });
@@ -1319,7 +1311,9 @@ export const selectedScope = signal<Scope>(restoreScope());
  *  `resolveCodingAgent` falls back here for an override-less draft.
  *  `sendCompose` binds the result onto the thread's meta at promotion. See ADR
  *  0006 for the workspace-scoped default. */
-export const selectedCodingAgent = signal<import('../api/types').CodingAgent>('claude-code');
+export const selectedCodingAgent = signal<import('../api/types').CodingAgent>(
+  PREFERENCE_CATALOG.coding_agent_default.fallback,
+);
 
 /** Translate a Scope into the engine's `folder` request field.
  *  Lucidos gives the empty string, which the engine defaults to Lucidos.
@@ -1821,9 +1815,14 @@ export const unreadNotifications = signal<Loadable<Notification[]>>({ status: 'n
 export const unreadCount = computed(() =>
   unreadNotifications.value.status === 'loaded' ? unreadNotifications.value.data.length : 0,
 );
-const cachedFilter = localStorage.getItem('lucidos-notifications-filter');
-export const notificationsFilter = signal<'all' | 'unread'>(
-  cachedFilter === 'unread' ? 'unread' : 'all',
+export type NotificationsFilter = PreferenceValues<'notifications_filter'>;
+/** Device-local mirror of the filter, so the list opens on it before
+ *  preferences load. */
+export const NOTIFICATIONS_FILTER_STORAGE_KEY = 'lucidos-notifications-filter';
+const cachedFilter = localStorage.getItem(NOTIFICATIONS_FILTER_STORAGE_KEY);
+export const notificationsFilter = signal<NotificationsFilter>(
+  PREFERENCE_CATALOG.notifications_filter.values.find((f) => f === cachedFilter)
+    ?? PREFERENCE_CATALOG.notifications_filter.fallback,
 );
 export const notificationsHasMore = signal(false);
 export const notificationsLoadingMore = signal(false);
@@ -2393,6 +2392,17 @@ export function showPrompt(
 export type StepDetailModalState = Extract<ResponseEvent, { type: 'step' }> | null;
 export const stepDetailModal = signal<StepDetailModalState>(null);
 
+// --- Sub-agent step groups ---
+// The `Agent` calls whose sub-agent steps the reader unfolded, by tool use id,
+// kept across a reload like the turn folds (`effects.ts` persists it).
+export const OPEN_SUB_AGENT_GROUPS_KEY = 'lucidos-open-sub-agent-groups';
+export const openSubAgentGroups = signal<ReadonlySet<string>>(loadStringSet(OPEN_SUB_AGENT_GROUPS_KEY));
+export function toggleSubAgentGroup(toolUseId: string): void {
+  const next = new Set(openSubAgentGroups.value);
+  if (!next.delete(toolUseId)) next.add(toolUseId);
+  openSubAgentGroups.value = next;
+}
+
 // --- Command checkpoint diff modal ---
 // Set to a checkpoint ResponseEvent to show what that command changed; null =
 // closed. Opened by the Diff button on the checkpoint card, so the Undo beside
@@ -2545,6 +2555,12 @@ export const webhooksVersion = signal(0);
  *  stats and entries on it, because a correction removes entries it may be
  *  showing. */
 export const memoryEntriesVersion = signal(0);
+
+/** Bumped when a Tree backfill completes or resets, and on `ThreadsDeleted`.
+ *  The summary tree browser re-reads on it. Progress frames do not bump it:
+ *  the compactor sends one per built node, and the panel refresh covers a
+ *  backfill under way. */
+export const summaryTreesVersion = signal(0);
 
 /** Whether the public path a webhook delivery arrives on is reachable, per
  *  address family.

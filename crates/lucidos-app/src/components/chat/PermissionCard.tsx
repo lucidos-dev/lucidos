@@ -1,13 +1,18 @@
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
-import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { showToast } from '../../store/store';
 import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermission } from '../../store/actions/permissions';
 import { changeKindName, type AllowScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
 import { CHOICE_CARD_ROLE, handAnsweredCardFocusToPrompt, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
-import { pendingDecisions } from './pendingDecisions';
-import { followResolvedPermission } from './scrollState';
+import { pendingDecisions, usePickMark, type PickMark } from '../../store/pendingDecisions';
+import { followConfirmedCard, followResolvedPermission } from './scrollState';
+import {
+  BROAD_ALLOW_INEFFECTIVE,
+  CC_PROTECTED_PATH_MARKERS,
+  CODEX_BACKEND_TOOLS,
+  SESSION_PATH_TOOLS,
+} from '@lucidos/engine-constants';
 
 interface PermissionEvent {
   request_id: string;
@@ -261,14 +266,11 @@ export function narrowPattern(toolName: string, input: Record<string, unknown>):
   return null;
 }
 
-/** Substrings that mark a path CC treats specially for destructive Bash
- *  commands. Empirically (probed 2026-05-16): `Bash rm -rf .../.claude/...`
- *  surfaces a permission card even when bare `Bash` is in `--allowedTools`,
- *  so persisting a Broad (`Bash`) or Narrow (`Bash(rm:*)`) grant from that
- *  card lies about future suppression. The trailing `/` anchors to the
- *  actual directory — `.gitignore` / `.claude_backup` are unaffected.
- *  Mirror of `CC_PROTECTED_PATH_MARKERS` in `claude_code.rs`. */
-const CC_PROTECTED_PATH_MARKERS: readonly string[] = ['.claude/', '.git/'];
+/** Whether an engine tool list names `tool`. Each list is typed as its literal
+ *  members, so `includes` needs the wider type. */
+function listed(list: readonly string[], tool: string): boolean {
+  return list.includes(tool);
+}
 
 /** True when a `Bash` command references a path CC keeps under special
  *  permission routing (`.claude/` or `.git/`). The card hides Broad
@@ -296,18 +298,12 @@ export function inputTouchesProtectedPath(
     && CC_PROTECTED_PATH_MARKERS.some(m => command.includes(m));
 }
 
-/** Path-tools where the session-allow scope is per-file: subsequent prompts
- *  for the same `file_path` (or `notebook_path`) auto-resolve regardless of
- *  the diff being applied. Mirrors the engine's `AllowScope::Session` branch
- *  in `derive_allow_pattern`. */
-const SESSION_PATH_TOOLS: ReadonlySet<string> = new Set(['Edit', 'Write', 'NotebookEdit']);
-
 /** Pull a short display label for the session-allow button. For path-tools
  *  we show the basename; for Bash we show the command's first token; for
  *  Skill the plugin slug. Returns null when the tool has no useful identifier
  *  in the input — the button label then falls back to the bare tool name. */
 export function sessionLabel(toolName: string, input: Record<string, unknown>): string | null {
-  if (SESSION_PATH_TOOLS.has(toolName)) {
+  if (listed(SESSION_PATH_TOOLS, toolName)) {
     const key = toolName === 'NotebookEdit' ? 'notebook_path' : 'file_path';
     const path = typeof input[key] === 'string' ? (input[key] as string) : null;
     if (!path) return null;
@@ -331,17 +327,11 @@ export function sessionLabel(toolName: string, input: Record<string, unknown>): 
   return null;
 }
 
-/** Codex backend tool names (raised by the app-server approval bridge).
- *  Persisted scopes (Broad / Narrow) are meaningless for them — only Claude
- *  Code reads `cc-allowed-tools` — and `file_change` additionally derives no
- *  session pattern (see `SESSION_ALLOW_INEFFECTIVE`). Mirror of
- *  `CODEX_BACKEND_TOOLS` in `claude_code.rs`. */
-const CODEX_BACKEND_TOOLS: ReadonlySet<string> = new Set(['command_execution', 'file_change']);
-
-/** Tools whose "Allow for this thread" click would record nothing (the
- *  engine derives no session pattern) — the button is hidden so a click
- *  can't silently behave as allow-once. Mirror of the `file_change` arm in
- *  `derive_allow_pattern`'s Session branch.
+/** Tools whose "Allow for this thread" click would record nothing, because the
+ *  engine derives no session pattern. The button is hidden, so a click can't
+ *  silently behave as allow-once. Mirror of the `file_change` arm in
+ *  `derive_allow_pattern`'s Session branch. Its other `None` case, a key-less
+ *  command or path, is `sessionGrantable`.
  *
  *  `file_change` is a deliberate choice, not a data gap. Its approval input now
  *  carries the changed paths (the driver copies them off the item's
@@ -352,32 +342,15 @@ const CODEX_BACKEND_TOOLS: ReadonlySet<string> = new Set(['command_execution', '
  *  files at once, so there is no single key a grant could stand for. */
 const SESSION_ALLOW_INEFFECTIVE: ReadonlySet<string> = new Set(['file_change']);
 
-/** Tools whose bare entry in `--allowedTools` cannot be respected by CC.
- *  Two reasons a tool ends up here:
- *    - Edit/Write/NotebookEdit: `--permission-mode acceptEdits` routes them
- *      through `--permission-prompt-tool` for CC's protected paths (`.claude/`,
- *      `.git/`) and auto-approves them everywhere else, so a bare `Edit` line
- *      in `cc-allowed-tools` never helps. (The engine now answers the
- *      in-worktree half of that itself — `cc_permission::worktree_write_auto_allowed`
- *      resolves an in-worktree file write with no card at all — so these tools
- *      reach a card only for a target OUTSIDE the worktree, or under its
- *      `.git/`. The allowlist entry is still ineffective for those.)
- *    - ExitPlanMode: CC always routes plan-mode exit through the permission
- *      prompt regardless of `--allowedTools`, because the plan must be
- *      reviewed by the user before the assistant continues.
- *  The "Always allow" broad button is hidden for these tools; users wanting
- *  in-thread persistence should use the session-allow button, which the engine
- *  intercepts before CC's gate. The engine's gate refuses a stored bare line
- *  for these tools too, through the same derivation (ADR 0125). See
- *  `inputTouchesProtectedPath` for the per-input variant of the same rule
- *  (Bash commands targeting protected paths). Keep in sync with
- *  `BROAD_ALLOW_INEFFECTIVE` in `claude_code.rs`. */
-export const BROAD_ALLOW_INEFFECTIVE: ReadonlySet<string> = new Set([
-  'Edit',
-  'ExitPlanMode',
-  'NotebookEdit',
-  'Write',
-]);
+/** True when "Allow for this thread" records a grant. A command or a path tool
+ *  is keyed on its head or path, so with none the engine derives no pattern. */
+export function sessionGrantable(toolName: string, input: Record<string, unknown>): boolean {
+  if (SESSION_ALLOW_INEFFECTIVE.has(toolName)) return false;
+  const keyed = listed(SESSION_PATH_TOOLS, toolName)
+    || toolName === 'Bash'
+    || toolName === 'command_execution';
+  return !keyed || sessionLabel(toolName, input) !== null;
+}
 
 export type PermissionChoice = 'deny' | 'allow' | 'session' | 'narrow' | 'broad';
 
@@ -477,7 +450,7 @@ export const DEFAULT_PERMISSION_CHOICE: PermissionChoice = 'allow';
  *  by all three cards: coding-agent, command-guard and MCP. */
 function renderPermissionButton(
   spec: ButtonSpec,
-  state: { selected: PermissionChoice | null; answered: boolean; sending: boolean; terminated: boolean },
+  state: { selected: PermissionChoice | null; answered: boolean; mark: PickMark; terminated: boolean },
 ) {
   const isPicked = state.selected === spec.choice;
   const { disabled, stateClass } = permissionButtonState({
@@ -497,9 +470,8 @@ function renderPermissionButton(
       // answered / terminated card must not advertise a focus seed target.
       data-default-choice={spec.choice === DEFAULT_PERMISSION_CHOICE && !disabled ? 'true' : undefined}
     >
-      {isPicked && (state.sending
-        ? <span class="mini-spinner permission-btn-sending" aria-hidden="true" />
-        : <span class="permission-btn-check" aria-hidden="true">✓ </span>)}
+      {isPicked && state.mark === 'spinner' && <span class="mini-spinner permission-btn-sending" aria-hidden="true" />}
+      {isPicked && state.mark === 'mark' && <span class="permission-btn-check" aria-hidden="true">✓ </span>}
       {spec.label}
     </button>
   );
@@ -514,7 +486,7 @@ function PermissionBodyShell({
   buttons,
   selected,
   answered,
-  sending,
+  mark,
   terminated,
   note,
 }: {
@@ -523,14 +495,14 @@ function PermissionBodyShell({
   buttons: ButtonSpec[];
   selected: PermissionChoice | null;
   answered: boolean;
-  sending: boolean;
+  mark: PickMark;
   terminated: boolean;
   note: string | null;
 }) {
   const bodyStateClass = answered ? ' permission-body-answered'
     : terminated ? ' permission-body-terminated'
     : '';
-  const state = { selected, answered, sending, terminated };
+  const state = { selected, answered, mark, terminated };
   // A live card is a *choice card* (see `choiceCardNav.ts`): arrows step across
   // its buttons in DOM order, and "Allow once" takes focus on arrival so Enter
   // resolves it. The marker and the
@@ -579,21 +551,25 @@ function usePermissionDecide(
   resolve: (id: string, allowed: boolean, persist?: AllowScope) => Promise<void>,
   broadGrant: () => string,
 ) {
+  // Once the resolution lands, drain the pick and run the landing it deferred.
   useEffect(() => {
-    if (resolved) pendingVerdicts.clear(requestId);
+    if (!resolved) return;
+    pendingVerdicts.clear(requestId);
+    followConfirmedCard(requestId);
   }, [resolved, requestId]);
   // A dead card draws no unconfirmed pick, matching its "Unresolved" header.
   // The pick stays stored, so a resolution that still lands shows it again.
   const pending = terminated ? undefined : pendingVerdicts.map.value.get(requestId);
-  const sending = useDelayedFlag(!resolved && !!pending);
+  const mark = usePickMark(!!resolved, !!pending);
   const decide = async (allowed: boolean, persist?: AllowScope) => {
     handAnsweredCardFocusToPrompt();
     pendingVerdicts.set(requestId, { allowed, persist_scope: persist });
     // Deciding a card is a SUBMIT: the agent is expected to respond to it, so it
     // gets the same one reaction every other submit gets, anchored on this card's
-    // own turn. All three permission-shaped cards decide through this hook, so
-    // one call site serves them all. Before the awaited POST, because this is the
-    // button's own tap and must not wait on the round trip. See `followSubmit`.
+    // own turn, once the engine confirms it. All three permission-shaped cards
+    // decide through this hook, so one call site serves them all. Called before
+    // the awaited POST, so the reader's scroll during the round trip can still
+    // cancel it.
     followResolvedPermission(requestId);
     if (allowed && persist === 'broad') {
       // Coarse trust granted, so say exactly how much.
@@ -606,7 +582,7 @@ function usePermissionDecide(
       showToast(`Could not send decision: ${errorDetail(e)}`, 'error');
     }
   };
-  return { effective: resolved ?? pending, sending, decide };
+  return { effective: resolved ?? pending, mark, decide };
 }
 
 /** Body of a `CodingAgentPermissionRequest` divider exchange — rendered inside
@@ -614,7 +590,7 @@ function usePermissionDecide(
  *  override; SSE swaps in `resolved` once the paired
  *  `CodingAgentPermissionResolved` event arrives. */
 export function PermissionBody({ event, resolved, terminated }: PermissionBodyProps) {
-  const { effective, sending, decide } = usePermissionDecide(
+  const { effective, mark, decide } = usePermissionDecide(
     event.request_id,
     resolved,
     terminated,
@@ -623,14 +599,16 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
   );
 
   const touchesProtected = inputTouchesProtectedPath(event.tool_name, event.input);
-  const isCodexTool = CODEX_BACKEND_TOOLS.has(event.tool_name);
+  const isCodexTool = listed(CODEX_BACKEND_TOOLS, event.tool_name);
   const narrow = touchesProtected || isCodexTool
     ? null
     : narrowPattern(event.tool_name, event.input);
-  const showBroad = !BROAD_ALLOW_INEFFECTIVE.has(event.tool_name)
+  // Broad hides wherever a bare allowlist line would suppress nothing. The
+  // engine's gate refuses such a line too (ADR 0125).
+  const showBroad = !listed(BROAD_ALLOW_INEFFECTIVE, event.tool_name)
     && !isCodexTool
     && !touchesProtected;
-  const showSession = !SESSION_ALLOW_INEFFECTIVE.has(event.tool_name);
+  const showSession = sessionGrantable(event.tool_name, event.input);
   const session = sessionLabel(event.tool_name, event.input);
 
   const selected = effective ? resolvedChoice(effective) : null;
@@ -681,7 +659,7 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       buttons={buttons}
       selected={selected}
       answered={answered}
-      sending={sending}
+      mark={mark}
       terminated={!!terminated}
       note={engineResolutionNote(resolved)}
     />
@@ -865,7 +843,7 @@ export function commandHead(command: string): string | null {
 
 /** Body of a `CommandPermissionRequested` divider exchange. */
 export function CommandPermissionBody({ event, resolved, terminated }: CommandPermissionBodyProps) {
-  const { effective, sending, decide } = usePermissionDecide(
+  const { effective, mark, decide } = usePermissionDecide(
     event.request_id,
     resolved,
     terminated,
@@ -897,13 +875,15 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
       ariaLabel: 'Allow this command once',
       onClick: () => void decide(true),
     },
-    {
-      choice: 'session',
+    // A command with no readable head derives no session pattern, so the
+    // button would claim a grant the engine never records.
+    ...(sessionLabelText ? [{
+      choice: 'session' as const,
       btnClass: 'action-btn action-btn-secondary',
       label: 'Allow for this thread',
-      ariaLabel: `Allow ${sessionLabelText ?? 'this command'} for the rest of this thread`,
+      ariaLabel: `Allow ${sessionLabelText} for the rest of this thread`,
       onClick: () => void decide(true, 'session'),
-    },
+    }] : []),
     ...(narrow ? [{
       choice: 'narrow' as const,
       btnClass: 'action-btn action-btn-secondary',
@@ -927,7 +907,7 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
       buttons={buttons}
       selected={selected}
       answered={answered}
-      sending={sending}
+      mark={mark}
       terminated={!!terminated}
       note={engineResolutionNote(resolved)}
     />
@@ -970,7 +950,7 @@ interface McpPermissionBodyProps {
 
 /** Body of an `McpPermissionRequested` divider exchange. */
 export function McpPermissionBody({ event, resolved, terminated }: McpPermissionBodyProps) {
-  const { effective, sending, decide } = usePermissionDecide(
+  const { effective, mark, decide } = usePermissionDecide(
     event.request_id,
     resolved,
     terminated,
@@ -1026,7 +1006,7 @@ export function McpPermissionBody({ event, resolved, terminated }: McpPermission
       buttons={buttons}
       selected={selected}
       answered={answered}
-      sending={sending}
+      mark={mark}
       terminated={!!terminated}
       note={engineResolutionNote(resolved)}
     />

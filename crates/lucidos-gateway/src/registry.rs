@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The reserved sigil that prefixes all gateway-owned paths (`/~/…`). A
-/// workspace slug can never start with it.
+/// workspace slug can never start with it. The app reads it from the
+/// generated `gateway-constants.ts`.
 pub const SIGIL: char = '~';
 
 /// One registered workspace.

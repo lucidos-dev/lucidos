@@ -32,7 +32,7 @@ describe('status mark sizes', () => {
   });
 
   it('draws the title spinner smaller than the badge, larger than the dot', () => {
-    const spinner = block(drawerCss, '.thread-title > .thread-status .mini-spinner {');
+    const spinner = block(drawerCss, '.thread-title-text > .thread-status .mini-spinner {');
     const width = decl(spinner, 'width');
     expect(decl(spinner, 'height')).toBe(width);
     expect(rem(width)).toBeLessThan(rem(badge));
@@ -41,7 +41,7 @@ describe('status mark sizes', () => {
 
   it('draws the drawer row and the pane title with one spinner rule', () => {
     expect(drawerCss).toMatch(
-      /\.thread-row-title-text > \.thread-status \.mini-spinner,\s*\.thread-title > \.thread-status \.mini-spinner \{/,
+      /\.thread-row-title-text > \.thread-status \.mini-spinner,\s*\.thread-title-text > \.thread-status \.mini-spinner \{/,
     );
   });
 

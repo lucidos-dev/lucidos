@@ -122,6 +122,8 @@ pub struct ModelRouting {
     pub routes: Vec<RouteEntry>,
     /// The provider last picked for this model, or `None` for never picked.
     pub preferred: Option<ProviderKind>,
+    /// The *vision flag*: whether this model reads images.
+    pub vision: bool,
 }
 
 impl ModelRouting {
@@ -130,6 +132,7 @@ impl ModelRouting {
         Self {
             routes: vec![RouteEntry::new(provider, wire_id)],
             preferred: None,
+            vision: false,
         }
     }
 
@@ -242,7 +245,12 @@ pub async fn load_from_db(pool: &PgPool) -> HashMap<String, ModelRouting> {
                     .preferred_provider
                     .as_deref()
                     .and_then(ProviderKind::from_name);
-                (m.id, ModelRouting { routes, preferred })
+                let routing = ModelRouting {
+                    routes,
+                    preferred,
+                    vision: m.vision,
+                };
+                (m.id, routing)
             })
             .collect(),
         Err(e) => {
@@ -255,9 +263,33 @@ pub async fn load_from_db(pool: &PgPool) -> HashMap<String, ModelRouting> {
     }
 }
 
+/// Refill `registry` from the `models` table, replacing what it held.
+pub async fn reload(registry: &ModelRegistry, pool: &PgPool) {
+    let fresh = load_from_db(pool).await;
+    match registry.write() {
+        Ok(mut guard) => {
+            *guard = fresh;
+            crate::log!(
+                "[ModelRegistry] reloaded model→provider map ({} entries)",
+                guard.len()
+            );
+        }
+        Err(e) => crate::log!("[ModelRegistry] reload skipped (lock poisoned): {}", e),
+    }
+}
+
 /// Look up a model id in the registry, if the lock is readable.
 fn routing_for(registry: &ModelRegistry, model: &str) -> Option<ModelRouting> {
     registry.read().ok().and_then(|map| map.get(model).cloned())
+}
+
+/// Whether `model` reads images, by its row's *vision flag*.
+///
+/// A model with no row does not: a Claude Code id, a deleted model and an
+/// env-only id all answer `false`. Guessing from the id would send images to a
+/// model that rejects them, which is the failure the flag exists to stop.
+pub fn reads_images(registry: &ModelRegistry, model: &str) -> bool {
+    routing_for(registry, model).is_some_and(|routing| routing.vision)
 }
 
 /// The refusal for a provider name that names no backend.
@@ -778,7 +810,29 @@ mod tests {
                 RouteEntry::new(ProviderKind::Anthropic, id),
             ],
             preferred: None,
+            vision: false,
         }
+    }
+
+    /// Only a row's flag says a model reads images. An id with no row answers
+    /// no, however image-capable its name sounds.
+    #[test]
+    fn only_a_flagged_row_reads_images() {
+        let registry = empty();
+        registry.write().unwrap().insert(
+            "flagged".to_string(),
+            ModelRouting {
+                vision: true,
+                ..dual_routed("flagged")
+            },
+        );
+        registry
+            .write()
+            .unwrap()
+            .insert("unflagged".to_string(), dual_routed("unflagged"));
+        assert!(reads_images(&registry, "flagged"));
+        assert!(!reads_images(&registry, "unflagged"));
+        assert!(!reads_images(&registry, "claude-opus-5-5"));
     }
 
     /// The reported bug, at the layer that fixes it. A workspace holding only
@@ -921,6 +975,7 @@ mod tests {
                     RouteEntry::new(ProviderKind::OpenRouter, "anthropic/claude-opus-5-5"),
                 ],
                 preferred: None,
+                vision: false,
             },
         )]);
         let id = "claude-opus-5-5[1m]";

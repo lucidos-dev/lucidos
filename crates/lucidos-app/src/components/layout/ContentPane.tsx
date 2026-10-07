@@ -1,3 +1,4 @@
+import { FindBar } from '../shared/FindBar';
 import { useEffect, useLayoutEffect, useRef } from 'preact/hooks';
 import { activeMenuItem, appPseudoFullscreen, panelOverlay, settingsSubview, notificationDetailPending, parseRepoPath } from '../../store/store';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
@@ -10,6 +11,7 @@ import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { SkeletonProvider } from '../shared/Skeleton';
 import { NavigationCover } from '../shared/NavigationCover';
 import { FilePreviewPath } from '../files/FilePreviewPath';
+import { FilePreviewContextMenu } from '../files/FilePreviewContextMenu';
 // `lazyComponent` renders NOTHING until its chunk lands, so what the user must
 // see at once is eager. The two notification views are reached from the bell
 // in every header and from an OS push tap. Behind a chunk, its fetch swallowed
@@ -202,13 +204,14 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
           // the preview's own box the size it was as a direct child of the pane
           // body (see `.file-preview-frame`).
           return (
-            <div class="file-preview-frame">
+            <div class="file-preview-frame content-view-full-bleed">
               <FilePreviewPath path={overlay.path} />
-              <div class="file-preview-frame-body">
+              <FindBar surface="content" scope={`file:${overlay.path}`} placeholder="Find in file" />
+              <FilePreviewContextMenu path={overlay.path} layout={layout}>
                 {repo
                   ? <RepoFilePreviewWithSidebar locator={repo} layout={layout} />
                   : <FilePreviewInline path={overlay.path} layout={layout} />}
-              </div>
+              </FilePreviewContextMenu>
             </div>
           );
         })()}

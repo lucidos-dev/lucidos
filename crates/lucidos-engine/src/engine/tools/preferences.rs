@@ -1,5 +1,5 @@
 use super::super::LucidosEngine;
-use crate::core::preference_catalog::{self, PrefScope};
+use crate::core::prefs::{self, PrefAccess, PrefScope};
 use crate::core::PreferenceStore;
 use crate::llm::tool_names as tn;
 
@@ -129,9 +129,7 @@ impl LucidosEngine {
     pub(crate) async fn execute_get_backup_status(
         &self,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::core::backup::{
-            self, is_schedule_active, BackupRunStatus, PREF_BACKUP_PROVIDER, PREF_BACKUP_SCHEDULE,
-        };
+        use crate::core::backup::{self, is_schedule_active, BackupRunStatus};
 
         let pool = &self.pool;
         // A read that FAILED is not "no schedule set". `.ok().flatten()` collapsed
@@ -139,7 +137,7 @@ impl LucidosEngine {
         // "Schedule: off (automatic backups disabled)" to the agent, which relays
         // it to the user as fact. Surface the unknown instead of a plausible
         // default, per the no-silent-plausible-defaults rule.
-        let cron = match PreferenceStore::get(pool, PREF_BACKUP_SCHEDULE).await {
+        let cron = match prefs::BACKUP_SCHEDULE.try_stored(pool).await {
             Ok(v) => v,
             Err(e) => {
                 return Ok(format!(
@@ -148,7 +146,7 @@ impl LucidosEngine {
                 ))
             }
         };
-        let provider = match PreferenceStore::get(pool, PREF_BACKUP_PROVIDER).await {
+        let provider = match prefs::BACKUP_PROVIDER.try_stored(pool).await {
             Ok(v) => v,
             Err(e) => {
                 return Ok(format!(
@@ -159,9 +157,7 @@ impl LucidosEngine {
         };
         // Display only, so the default is the right answer on an unreadable
         // row; the prune caller in `scheduler::backup` skips instead.
-        let retention = backup::get_retention_count(pool)
-            .await
-            .unwrap_or(backup::DEFAULT_BACKUP_RETENTION);
+        let retention = prefs::BACKUP_RETENTION.read(pool).await.round() as usize;
         let tz: chrono_tz::Tz = self.user_timezone().await.parse().unwrap_or(chrono_tz::UTC);
 
         // Resolve the provider's account state before rendering. Reported
@@ -248,13 +244,16 @@ impl LucidosEngine {
             }
         }
 
-        out.push_str(
+        out.push_str(&format!(
             "\nChange the schedule/provider/retention with set_preference \
-             (keys: backup_schedule, backup_provider, backup_retention). Setting \
-             backup_provider only picks a destination, it does NOT connect the account: \
+             (keys: {schedule}, {provider}, {retention}). Setting \
+             {provider} only picks a destination, it does NOT connect the account: \
              that is connect_oauth_account, or the user in Settings → Accounts. Restore is \
              done from the workspace picker, not from here.",
-        );
+            schedule = prefs::BACKUP_SCHEDULE.key(),
+            provider = prefs::BACKUP_PROVIDER.key(),
+            retention = prefs::BACKUP_RETENTION.key(),
+        ));
         Ok(out)
     }
 
@@ -293,10 +292,10 @@ impl LucidosEngine {
         // Catalog gate: only agent-settable keys, with validated values. Internal
         // keys (command_guard, backup config, keybindings, …) are rejected here —
         // the agent must not disable its own command guard.
-        let spec = match preference_catalog::lookup(key) {
+        let spec = match prefs::lookup(key) {
             Some(s) => s,
             None => {
-                return Ok(match preference_catalog::internal_hint(key) {
+                return Ok(match prefs::internal_hint(key) {
                     Some(hint) => format!("Error: '{}' can't be changed with set_preference — {}.", key, hint),
                     None => format!(
                         "Error: unknown preference '{}'. Call get_preferences to see the settable keys.",
@@ -305,7 +304,7 @@ impl LucidosEngine {
                 });
             }
         };
-        if let Err(e) = preference_catalog::validate(spec, value) {
+        if let Err(e) = prefs::validate(spec, value) {
             return Ok(format!("Error: {}", e));
         }
 
@@ -355,12 +354,12 @@ impl LucidosEngine {
         // turn. (The in-thread picker CAN change a running thread — that path writes
         // a per-thread value, not this account default.)
         let effect_note = match key {
-            "chat_model" => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current model (whatever it last used), so this preference change does NOT switch the current thread's model on its next turn. To change a running thread's model, use its in-thread model picker.",
-            "chat_reasoning_effort" => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current reasoning effort (whatever it last used), so this preference change does NOT change the current thread's effort on its next turn. To change a running thread's effort, use its in-thread picker.",
+            k if k == prefs::CHAT_MODEL.key() => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current model (whatever it last used), so this preference change does NOT switch the current thread's model on its next turn. To change a running thread's model, use its in-thread model picker.",
+            k if k == prefs::CHAT_REASONING_EFFORT.key() => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current reasoning effort (whatever it last used), so this preference change does NOT change the current thread's effort on its next turn. To change a running thread's effort, use its in-thread picker.",
             // A turn builds its system prompt once, at setup. So the style the
             // user just asked for lands on their NEXT message, and claiming
             // otherwise makes this very reply read as a broken promise.
-            "response_style" | "response_styles" => " It applies from the next message, in this thread and every other: a turn builds its prompt once at the start, so this one finishes in the style it began in. It covers triggers too, and it does NOT change coding-agent sessions.",
+            k if k == prefs::RESPONSE_STYLE.key() || k == prefs::RESPONSE_STYLES.key() => " It applies from the next message, in this thread and every other: a turn builds its prompt once at the start, so this one finishes in the style it began in. It covers triggers too, and it does NOT change coding-agent sessions.",
             _ => " Open Lucidos views pick this up automatically.",
         };
         Ok(format!(
@@ -390,7 +389,10 @@ impl LucidosEngine {
         );
         // NOTE: the loop below renders one line per key, so a value that can be
         // kilobytes has to be summarised. See `summarize_pref_value`.
-        for spec in preference_catalog::CATALOG {
+        let agent_specs = prefs::CATALOG
+            .iter()
+            .filter(|spec| spec.access == PrefAccess::Agent);
+        for spec in agent_specs {
             // An empty stored value is named, never rendered as `(unset)` or
             // as a blank. It states the STATE, which is true of every key: the
             // row exists and holds nothing. What that state MEANS is per-key,
@@ -411,8 +413,8 @@ impl LucidosEngine {
                 spec.key,
                 scope,
                 current,
-                preference_catalog::allowed_values_hint(spec),
-                spec.default,
+                prefs::allowed_values_hint(spec),
+                spec.default_label(),
             ));
             // Make a shadowing device override explicit.
             if spec.scope == PrefScope::Device {
@@ -429,14 +431,17 @@ impl LucidosEngine {
             }
         }
 
-        // Known internal / managed-elsewhere keys that exist in the store — shown
-        // read-only so the agent can explain them but knows not to set them.
-        let internal: Vec<String> = preference_catalog::INTERNAL_KEYS
-            .iter()
-            .filter_map(|(k, hint)| {
+        // Human-only settings that exist in the store, shown read-only so the
+        // agent can explain them but knows not to set them. Engine bookkeeping
+        // is never printed: it holds a transport secret and migration markers.
+        let internal: Vec<String> = prefs::internal_specs()
+            .filter_map(|spec| {
+                let prefs::PrefAccess::Human { hint } = spec.access else {
+                    return None;
+                };
                 effective
-                    .get(*k)
-                    .map(|v| format!("- {} = {} (read-only: {})", k, v, hint))
+                    .get(spec.key)
+                    .map(|v| format!("- {} = {} (read-only: {})", spec.key, v, hint))
             })
             .collect();
         if !internal.is_empty() {

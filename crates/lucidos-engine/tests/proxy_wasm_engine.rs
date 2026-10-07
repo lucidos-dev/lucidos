@@ -25,8 +25,9 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use wasmtime::{Engine, Module};
 
 // ── proxy_pipeline_builder helpers ──────────────────────────────────────
@@ -463,6 +464,141 @@ async fn wasm_signer_layer_runs_echo_signer_end_to_end() {
     assert!(m.replace_body.is_none());
 }
 
+/// How often the freeze meter's thread wakes.
+const METER_TICK: Duration = Duration::from_millis(5);
+
+/// The shortest gap the meter calls a freeze. Ten ticks, so ordinary CPU
+/// contention stays charged to the code under test.
+const FREEZE_AT_LEAST: Duration = Duration::from_millis(50);
+
+/// What the meter's thread has seen: each freeze, and how far it has looked.
+struct FreezeLog {
+    freezes: Vec<(Instant, Instant)>,
+    seen_until: Instant,
+}
+
+/// Records when the host stalled this test process, so a timing bound charges
+/// the code only for time it could run in.
+///
+/// It measures one thing: gaps in its own OS thread, which wakes every
+/// [`METER_TICK`]. A process freeze shows as such a gap. So does a long
+/// scheduling delay of that thread alone, which the bound then also forgives.
+/// The signer under test cannot delay that thread, so a late signer still fails.
+struct FreezeMeter {
+    log: Arc<Mutex<FreezeLog>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl FreezeMeter {
+    fn start() -> Self {
+        let log = Arc::new(Mutex::new(FreezeLog {
+            freezes: Vec::new(),
+            seen_until: Instant::now(),
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (meter_log, meter_stop) = (log.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut last = Instant::now();
+            while !meter_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(METER_TICK);
+                let now = Instant::now();
+                let mut log = meter_log.lock().unwrap();
+                if now - last >= FREEZE_AT_LEAST {
+                    log.freezes.push((last + METER_TICK, now));
+                }
+                log.seen_until = now;
+                last = now;
+            }
+        });
+        Self { log, stop }
+    }
+
+    /// The time from `started` to `finished` that the process was not frozen.
+    /// Waits until the meter has looked past `finished`, so no freeze is missed.
+    fn active(&self, started: Instant, finished: Instant) -> Duration {
+        loop {
+            let log = self.log.lock().unwrap();
+            if log.seen_until >= finished {
+                return active_between(&log.freezes, started, finished);
+            }
+            drop(log);
+            std::thread::sleep(METER_TICK);
+        }
+    }
+}
+
+impl Drop for FreezeMeter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// `finished - started`, less the part of each freeze that falls inside it.
+fn active_between(freezes: &[(Instant, Instant)], started: Instant, finished: Instant) -> Duration {
+    let frozen: Duration = freezes
+        .iter()
+        .map(|&(from, to)| {
+            to.min(finished)
+                .saturating_duration_since(from.max(started))
+        })
+        .sum();
+    finished
+        .saturating_duration_since(started)
+        .saturating_sub(frozen)
+}
+
+#[test]
+fn a_freeze_inside_the_window_is_not_charged_to_the_code() {
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let freezes = [(at(1_000), at(2_600))];
+    assert_eq!(
+        active_between(&freezes, at(0), at(4_600)),
+        Duration::from_millis(3_000)
+    );
+}
+
+#[test]
+fn only_the_overlap_of_a_freeze_with_the_window_is_excluded() {
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let freezes = [
+        (at(0), at(1_500)),
+        (at(3_500), at(9_000)),
+        (at(9_500), at(9_900)),
+    ];
+    assert_eq!(
+        active_between(&freezes, at(1_000), at(4_000)),
+        Duration::from_millis(2_000)
+    );
+}
+
+#[test]
+fn a_window_with_no_freeze_is_charged_in_full() {
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    assert_eq!(
+        active_between(&[], at(0), at(4_600)),
+        Duration::from_millis(4_600)
+    );
+}
+
+#[test]
+fn the_meter_records_a_freeze_of_its_thread() {
+    let meter = FreezeMeter::start();
+    let started = Instant::now();
+    // Hold the log, so the meter's thread blocks as a frozen process would.
+    let held = meter.log.lock().unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    drop(held);
+    std::thread::sleep(Duration::from_millis(20));
+    let active = meter.active(started, Instant::now());
+    assert!(
+        active < Duration::from_millis(200),
+        "a 400 ms freeze must be excluded; charged {active:?}"
+    );
+}
+
 /// A non-terminating signer is killed by the execution budget rather than
 /// pinning the request-execution task forever. The outer `timeout` is a test
 /// safety net — if the budget mechanism regressed, the test fails (does not
@@ -471,6 +607,7 @@ async fn wasm_signer_layer_runs_echo_signer_end_to_end() {
 /// "WASM signer has no execution budget" finding.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_signer_layer_kills_a_runaway_looping_signer() {
+    let meter = FreezeMeter::start();
     let engine = Arc::new(build_wasmtime_engine().unwrap());
     let layer =
         signer_layer("runaway", LOOP_FOREVER_WAT, &engine).with_budget(Duration::from_millis(150));
@@ -479,9 +616,9 @@ async fn wasm_signer_layer_kills_a_runaway_looping_signer() {
     let prior = HashMap::new();
     let input = make_layer_input(&body, &prior);
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let outcome = tokio::time::timeout(Duration::from_secs(20), layer.apply(&input)).await;
-    let elapsed = started.elapsed();
+    let elapsed = meter.active(started, Instant::now());
 
     let result = outcome.expect("apply() must return — a runaway signer must not hang the task");
     let err = result.expect_err("a non-terminating signer must be rejected, not succeed");
@@ -501,37 +638,38 @@ async fn wasm_signer_layer_kills_a_runaway_looping_signer() {
 /// Five epoch ticks, far under the loopers' budget.
 const RESPONSIVE_WITHIN: Duration = Duration::from_millis(500);
 
-/// Spawn a 10 ms sleep that reports how long it took from spawn to wake-up.
+/// When a timed piece of work started, and when it finished.
+type Span = (Instant, Instant);
+
+/// Spawn a 10 ms sleep that reports when it was spawned and when it woke.
 /// Spawn it BEFORE the loopers, so it competes with them for a thread.
-fn spawn_probe() -> tokio::task::JoinHandle<Duration> {
-    let spawned = std::time::Instant::now();
+fn spawn_probe() -> tokio::task::JoinHandle<Span> {
+    let spawned = Instant::now();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(10)).await;
-        spawned.elapsed()
+        (spawned, Instant::now())
     })
 }
 
-async fn probe_latency(probe: tokio::task::JoinHandle<Duration>) -> Duration {
-    tokio::time::timeout(Duration::from_secs(20), probe)
+async fn probe_latency(meter: &FreezeMeter, probe: tokio::task::JoinHandle<Span>) -> Duration {
+    let (spawned, woke) = tokio::time::timeout(Duration::from_secs(20), probe)
         .await
         .expect("the probe must finish once the loopers end")
-        .expect("the probe task must not panic")
+        .expect("the probe task must not panic");
+    meter.active(spawned, woke)
 }
 
-/// What one `apply` returned, and how long it took.
-type TimedApply = (
-    Result<AuthMutation, (axum::http::StatusCode, String)>,
-    Duration,
-);
+/// What one `apply` returned, and when it ran.
+type TimedApply = (Result<AuthMutation, (axum::http::StatusCode, String)>, Span);
 
-/// Run `apply` for `layer` on its own task, reporting the result and its time.
+/// Run `apply` for `layer` on its own task, reporting the result and its span.
 fn spawn_apply(layer: Arc<WasmSignerLayer>) -> tokio::task::JoinHandle<TimedApply> {
     tokio::spawn(async move {
         let body = bytes::Bytes::new();
         let prior = HashMap::new();
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let result = layer.apply(&make_layer_input(&body, &prior)).await;
-        (result, started.elapsed())
+        (result, (started, Instant::now()))
     })
 }
 
@@ -540,6 +678,7 @@ fn spawn_apply(layer: Arc<WasmSignerLayer>) -> tokio::task::JoinHandle<TimedAppl
 /// fires, long before the signer's budget.
 #[tokio::test(flavor = "current_thread")]
 async fn a_looping_signer_yields_its_thread() {
+    let meter = FreezeMeter::start();
     let engine = Arc::new(build_wasmtime_engine().unwrap());
     let budget = Duration::from_secs(3);
     // One slot for the looper and one for the timed call. The timeout then
@@ -554,7 +693,7 @@ async fn a_looping_signer_yields_its_thread() {
     let probe = spawn_probe();
     let looper = spawn_apply(layer.clone());
 
-    let probe_took = probe_latency(probe).await;
+    let probe_took = probe_latency(&meter, probe).await;
     assert!(
         probe_took < RESPONSIVE_WITHIN,
         "a looping signer held the only thread; the probe waited {probe_took:?}"
@@ -562,20 +701,21 @@ async fn a_looping_signer_yields_its_thread() {
 
     let body = bytes::Bytes::new();
     let prior = HashMap::new();
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let cut_short = tokio::time::timeout(
         Duration::from_millis(300),
         layer.apply(&make_layer_input(&body, &prior)),
     )
     .await;
-    let cut_after = started.elapsed();
+    let cut_after = meter.active(started, Instant::now());
     assert!(cut_short.is_err(), "the caller's timeout must end the call");
     assert!(
         cut_after < Duration::from_secs(1),
         "the caller's 300 ms timeout fired only after {cut_after:?}"
     );
 
-    let (result, took) = looper.await.expect("the looper task must not panic");
+    let (result, (started, finished)) = looper.await.expect("the looper task must not panic");
+    let took = meter.active(started, finished);
     let err = result.expect_err("a looping signer must be refused");
     assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
     assert_eq!(
@@ -593,6 +733,7 @@ async fn a_looping_signer_yields_its_thread() {
 /// budget. One slot is what production sizing gives two workers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn looping_signers_cannot_take_every_worker() {
+    let meter = FreezeMeter::start();
     let engine = Arc::new(build_wasmtime_engine().unwrap());
     let budget = Duration::from_secs(3);
     let slots = Arc::new(tokio::sync::Semaphore::new(1));
@@ -608,7 +749,7 @@ async fn looping_signers_cannot_take_every_worker() {
         })
         .collect();
 
-    let probe_took = probe_latency(probe).await;
+    let probe_took = probe_latency(&meter, probe).await;
     assert!(
         probe_took < RESPONSIVE_WITHIN,
         "looping signers held every worker; the probe waited {probe_took:?}"
@@ -617,7 +758,8 @@ async fn looping_signers_cannot_take_every_worker() {
     let mut terminated = 0;
     let mut refused = 0;
     for looper in loopers {
-        let (result, took) = looper.await.expect("a looper task must not panic");
+        let (result, (started, finished)) = looper.await.expect("a looper task must not panic");
+        let took = meter.active(started, finished);
         let (status, body) = result.expect_err("a looping signer must be refused");
         match status {
             axum::http::StatusCode::BAD_GATEWAY => {
@@ -675,6 +817,7 @@ async fn wasm_signer_layer_rejects_a_module_declaring_oversized_memory() {
 /// budget, so the two sandbox failure modes stay distinguishable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_signer_layer_kills_a_memory_growing_signer() {
+    let meter = FreezeMeter::start();
     let engine = Arc::new(build_wasmtime_engine().unwrap());
     let layer = signer_layer("memory-bomb", MEMORY_BOMB_WAT, &engine);
 
@@ -682,9 +825,9 @@ async fn wasm_signer_layer_kills_a_memory_growing_signer() {
     let prior = HashMap::new();
     let input = make_layer_input(&body, &prior);
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let outcome = tokio::time::timeout(Duration::from_secs(20), layer.apply(&input)).await;
-    let elapsed = started.elapsed();
+    let elapsed = meter.active(started, Instant::now());
 
     let result = outcome.expect("apply() must return: a memory bomb must not hang the task");
     let err = result.expect_err("a signer growing memory without bound must be rejected");

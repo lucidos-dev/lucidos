@@ -7,9 +7,10 @@
 //! **The client stays dumb.** Binary frames are audio and text frames are the
 //! small control vocabulary in `voice::wire`. Nothing here names a provider.
 //!
-//! Four refusals happen before the upgrade, because each is a thing the caller
+//! Five refusals happen before the upgrade, because each is a thing the caller
 //! asked for and can stop asking for: voice switched off, a coding-agent
-//! thread, an unknown thread, and a thread already on a call. A thread the
+//! thread, an unknown thread, a thread that is not the home thread (or no home
+//! thread at all), and a thread already on a call. A thread the
 //! engine cannot read answers 500 there too, which is nobody's fault. A
 //! failure to reach the talker happens after, as an `error` frame, because the
 //! caller cannot have known and a person has to read it.
@@ -26,7 +27,6 @@ use uuid::Uuid;
 use super::error::ApiError;
 use super::AppState;
 use crate::voice::call::{CallTransport, CallerFrame};
-use crate::voice::naming::ThreadNamer;
 use crate::voice::wire::{ClientControl, ServerFrame};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -81,16 +81,12 @@ async fn voice(
             let opening = crate::voice::call::opening_for(&state.engine, thread_id).await;
             let doer = crate::voice::doer::ThreadTurn::new(state.engine.clone());
             let decisions = crate::voice::decision::ThreadDecisions::new(state.engine.clone());
-            // One namer for the whole call, so the loop's ask and the one
-            // below cannot both name the same thread.
-            let namer = crate::voice::naming::CallNamer::new(state.engine.clone());
             crate::voice::call::run_call(
                 &state.engine.event_bus,
                 provider.as_ref(),
                 &mut transport,
                 &doer,
                 &decisions,
-                &namer,
                 opening,
                 crate::voice::call::CallSubject {
                     thread_id,
@@ -99,11 +95,6 @@ async fn voice(
                 },
             )
             .await;
-            // The backstop under the loop's own naming. A call can end without
-            // ever reaching an exchange the loop would name: the caller says
-            // one thing, hears an answer, and rings off. The same namer, so a
-            // name already on its way is not raced by a second one.
-            namer.name_this_call(thread_id).await;
         }))
 }
 
@@ -120,8 +111,9 @@ async fn admit(
 ) -> Result<(Uuid, crate::voice::registry::VoiceSessionSlot), ApiError> {
     // The master switch, ahead of everything else. Voice is experimental and
     // off unless a workspace opted in. A call on one that did not is refused
-    // before any of it runs.
-    if !crate::core::PreferenceStore::voice_enabled(pool).await {
+    // before any of it runs. An unreadable row reads as the default, off: on
+    // would open a paid rented talker on a transient database error.
+    if !crate::core::prefs::VOICE_ENABLED.read(pool).await {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "Voice is off. Turn it on in Settings, under Voice.",
@@ -153,6 +145,37 @@ async fn admit(
             ));
         }
         crate::voice::doer::ThreadDoer::Unknown => {
+            return Err(ApiError::internal(
+                "Could not read that thread, so the call was not placed.",
+            ));
+        }
+    }
+
+    // Voice sessions live in the home thread alone (ADR 0362). The control is
+    // drawn there and nowhere else, so this is the floor under it. With the
+    // home thread switched off, no thread takes a call.
+    let home_switch = crate::core::prefs::HOME_THREAD_ENABLED.try_read(pool).await;
+    if matches!(home_switch, Ok(false)) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "A call runs on the home thread, which is off. Turn it on in Settings, \
+             under Experimental.",
+        ));
+    }
+    match crate::engine::home_thread::is_home_thread(pool, thread_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "A call runs on the home thread only. Open Home to talk.",
+            ));
+        }
+        Err(e) => {
+            log!(
+                "[Voice] Could not read whether {} is home: {}",
+                thread_id,
+                e
+            );
             return Err(ApiError::internal(
                 "Could not read that thread, so the call was not placed.",
             ));
@@ -228,6 +251,12 @@ mod tests {
         thread_id
     }
 
+    /// The workspace's home thread, the one thread a call runs on.
+    async fn the_home_thread(pool: &sqlx::PgPool) -> Uuid {
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        crate::engine::home_thread::enabled_home_thread(&bus, pool).await
+    }
+
     /// A thread a coding agent holds.
     ///
     /// `source` reads `claude_code` for a started one and for a DRAFT alike.
@@ -249,7 +278,8 @@ mod tests {
     /// Opt this workspace into voice. Every other test here is about a rule
     /// that only applies once somebody has.
     async fn voice_is_on(pool: &sqlx::PgPool) {
-        crate::core::PreferenceStore::set_row_for_test(pool, "voice_enabled", "true")
+        let key = crate::core::prefs::VOICE_ENABLED.key();
+        crate::core::PreferenceStore::set_row_for_test(pool, key, "true")
             .await
             .expect("turn voice on");
     }
@@ -260,7 +290,7 @@ mod tests {
     async fn a_call_is_refused_while_voice_is_off() {
         let (pool, db_name) = setup_test_db().await;
         let sessions = LiveVoiceSessions::new();
-        let thread_id = a_chat_thread(&pool).await;
+        let thread_id = the_home_thread(&pool).await;
 
         let error = admit(&pool, &sessions, thread_id)
             .await
@@ -307,11 +337,66 @@ mod tests {
             assert_eq!(sessions.count(), 0, "a refusal must claim no slot");
         }
 
-        // And it is who holds the thread that decides, nothing else about it.
-        let chat = a_chat_thread(&pool).await;
-        admit(&pool, &sessions, chat)
+        // The home thread is a Lucidos Agent thread, and it takes the call.
+        let home = the_home_thread(&pool).await;
+        admit(&pool, &sessions, home)
             .await
-            .expect("a call on a Lucidos Agent thread");
+            .expect("a call on the home thread");
+
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Voice sessions live in the home thread alone (ADR 0362, invariant I12).
+    /// Any other Lucidos Agent thread is refused, and the message names where
+    /// to go instead.
+    #[tokio::test]
+    async fn a_call_on_any_thread_but_home_is_refused() {
+        let (pool, db_name) = setup_test_db().await;
+        let sessions = LiveVoiceSessions::new();
+        voice_is_on(&pool).await;
+        let home = the_home_thread(&pool).await;
+        let other = a_chat_thread(&pool).await;
+
+        let error = admit(&pool, &sessions, other)
+            .await
+            .err()
+            .expect("should refuse a chat thread that is not home");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert!(error.message.contains("home thread"), "{}", error.message);
+        assert_eq!(sessions.count(), 0, "a refusal must claim no slot");
+
+        admit(&pool, &sessions, home)
+            .await
+            .expect("a call on the home thread");
+
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Voice needs the home thread. With its switch off no thread takes a
+    /// call, the hidden home thread included, and the refusal names the switch.
+    #[tokio::test]
+    async fn a_call_is_refused_while_the_home_thread_is_off() {
+        let (pool, db_name) = setup_test_db().await;
+        let sessions = LiveVoiceSessions::new();
+        voice_is_on(&pool).await;
+        let home = the_home_thread(&pool).await;
+        crate::core::PreferenceStore::set_row_for_test(
+            &pool,
+            crate::core::prefs::HOME_THREAD_ENABLED.key(),
+            "false",
+        )
+        .await
+        .expect("turn the home thread off");
+
+        for thread_id in [home, a_chat_thread(&pool).await] {
+            let error = admit(&pool, &sessions, thread_id)
+                .await
+                .err()
+                .expect("should refuse while the home thread is off");
+            assert_eq!(error.status, StatusCode::FORBIDDEN);
+            assert!(error.message.contains("Experimental"), "{}", error.message);
+        }
+        assert_eq!(sessions.count(), 0, "a refusal must claim no slot");
 
         teardown_test_db(&db_name).await;
     }
@@ -339,7 +424,7 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
         let sessions = LiveVoiceSessions::new();
         voice_is_on(&pool).await;
-        let thread_id = a_chat_thread(&pool).await;
+        let thread_id = the_home_thread(&pool).await;
 
         let (first_id, held) = admit(&pool, &sessions, thread_id)
             .await

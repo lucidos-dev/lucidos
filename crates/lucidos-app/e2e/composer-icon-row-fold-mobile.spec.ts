@@ -7,6 +7,7 @@ import {
   setVoiceEnabled,
   waitForVisibleInput,
 } from './helpers';
+import { ensureHomeThread } from './db-helpers';
 
 /** The composer row folds its middle into a ⋯ menu when it runs short of room.
  *
@@ -52,7 +53,10 @@ test.describe('the composer row folds its middle when it runs out of room', () =
 
   test('folds, keeps the three fixed controls, and still clears the draft', async ({ page }) => {
     const restore = page.viewportSize();
+    // The call toggle stands only on the home thread (ADR 0362).
+    const home = ensureHomeThread();
     await navigateToApp(page);
+    await page.evaluate((tid) => { location.hash = `#thread=${tid}`; }, home);
     const input = await waitForVisibleInput(page);
     // A draft, so the clear action joins the foldable list and there is
     // something for the folded one to act on.
@@ -64,7 +68,10 @@ test.describe('the composer row folds its middle when it runs out of room', () =
     let foldedAt = 0;
     for (const width of WIDTH_LADDER) {
       await page.setViewportSize({ width, height: restore?.height ?? 812 });
-      if (await more.count() > 0) { foldedAt = width; break; }
+      // The fold follows a resize measurement, so it lands a frame later.
+      const folded = await expect.poll(() => more.count(), { timeout: 1_000 })
+        .toBeGreaterThan(0).then(() => true, () => false);
+      if (folded) { foldedAt = width; break; }
     }
     expect(foldedAt, `the row never folded, down to ${WIDTH_LADDER.at(-1)}px`).toBeGreaterThan(0);
 

@@ -349,6 +349,98 @@ async fn coding_agent_routing_is_derived_from_the_child_row() {
     teardown_test_db(&db_name).await;
 }
 
+/// The home thread follows up a thread it never spawned, a coding-agent thread
+/// in another family included (ADR 0362). The ack says it reached it as home,
+/// and the coding-agent routing still comes from the target's own row.
+#[tokio::test]
+async fn the_home_thread_follows_up_a_coding_agent_thread_it_never_spawned() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+    let (parent, chat_child) = parent_and_child(&bus).await;
+    let cc_thread = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id: cc_thread,
+        event: ThreadEvent::MessageReceived {
+            provider: None,
+            voice_session_id: None,
+            text: "coding task".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            image_description: None,
+            parent_thread_id: Some(parent),
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let (row, ack) = crate::engine::LucidosEngine::authorize_child_follow_up(
+        &pool,
+        Some(home),
+        cc_thread,
+        None,
+        crate::engine::FollowUpUrgency::Normal,
+    )
+    .await
+    .unwrap();
+    assert!(row.uses_coding_agent());
+    assert_eq!(ack.reach, FollowUpReach::Home);
+    assert_eq!(
+        authorize(&pool, Some(home), parent).await.unwrap().reach,
+        FollowUpReach::Home
+    );
+    assert_eq!(
+        authorize(&pool, Some(parent), chat_child)
+            .await
+            .unwrap()
+            .reach,
+        FollowUpReach::OwnChild
+    );
+    assert!(matches!(
+        authorize(&pool, Some(chat_child), cc_thread).await,
+        Err(ChildFollowUpError::NotYourChild(_))
+    ));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A draft is nobody's child, so only the home thread could reach one. It is
+/// refused: a follow-up would overwrite the text the user is still writing.
+#[tokio::test]
+async fn the_home_thread_cannot_follow_up_an_unsent_draft() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+    let draft = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id: draft,
+        event: ThreadEvent::ThreadStarted {
+            mode: "lucidos".into(),
+            actor: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let refusal = authorize(&pool, Some(home), draft).await.unwrap_err();
+    assert!(matches!(refusal, ChildFollowUpError::ChildIsDraft(id) if id == draft));
+    assert_eq!(refusal.status_code(), 409);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// The label falls back to the spawn prompt when the child has no title yet,
 /// so the tool's success text can always name the child by something a human
 /// recognises rather than by a uuid.

@@ -591,6 +591,23 @@ fn build_command_passes_settings_flag_with_workspace_path() {
     );
 }
 
+/// Every mode the catalog lets a user store has a Claude Code mode, so the
+/// mapping's `unreachable!` stays unreachable.
+#[test]
+fn every_catalogued_permission_mode_maps() {
+    let crate::core::preference_catalog::PrefValue::Enum(modes) =
+        crate::core::prefs::CODING_AGENT_CLAUDE_PERMISSION_MODE
+            .spec
+            .value
+    else {
+        panic!("the permission mode is an enum");
+    };
+    for mode in modes {
+        resolve_permission_mode(Some(mode));
+    }
+    resolve_permission_mode(None);
+}
+
 #[test]
 fn build_command_sets_permission_mode_accept_edits() {
     let thread_id = uuid::Uuid::new_v4();
@@ -760,12 +777,12 @@ fn resolve_binary_override_rejects_missing_path() {
     let err = crate::runtime::spawn_env::resolve_binary_override(
         missing.to_str().unwrap(),
         "Claude Code (`claude`)",
-        "coding_agent_claude_path",
+        crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
     )
     .expect_err("nonexistent override must be rejected");
     let msg = err.to_string();
     assert!(
-        msg.contains("coding_agent_claude_path"),
+        msg.contains(crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key()),
         "error must name the preference so the user can fix it: {msg}"
     );
 }
@@ -781,7 +798,7 @@ fn resolve_binary_override_rejects_non_executable_file() {
     let err = crate::runtime::spawn_env::resolve_binary_override(
         file.to_str().unwrap(),
         "Claude Code (`claude`)",
-        "coding_agent_claude_path",
+        crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
     )
     .expect_err("non-executable override must be rejected");
     assert!(err.to_string().contains("not executable"), "{err}");
@@ -1109,6 +1126,42 @@ fn a_user_env_var_cannot_strand_a_session_that_asked_for_auto() {
         auto_opt_in(&cmd).as_deref(),
         Some(std::ffi::OsStr::new("1")),
         "the engine-owned opt-in must win over a user env var",
+    );
+}
+
+fn background_tasks_switch(cmd: &tokio::process::Command) -> Option<std::ffi::OsString> {
+    collect_envs(cmd)
+        .get(std::ffi::OsStr::new("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"))
+        .cloned()
+}
+
+#[test]
+fn every_session_runs_with_claude_codes_background_tasks_off() {
+    // A background job dies with the turn, yet Claude Code tells the model it
+    // will be notified. The switch removes `run_in_background` and stops a
+    // timed-out command from moving to the background (ADR 0358).
+    let p = std::path::Path::new("/tmp");
+    let cmd = session_command(&test_spawn_args(p, p, uuid::Uuid::new_v4()), None);
+    assert_eq!(
+        background_tasks_switch(&cmd).as_deref(),
+        Some(std::ffi::OsStr::new("1")),
+    );
+}
+
+#[test]
+fn a_user_env_var_cannot_turn_claude_codes_background_tasks_back_on() {
+    let p = std::path::Path::new("/tmp");
+    let user_env = vec![(
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".to_string(),
+        "0".to_string(),
+    )];
+    let mut args = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    args.user_env_vars = &user_env;
+    let cmd = session_command(&args, None);
+    assert_eq!(
+        background_tasks_switch(&cmd).as_deref(),
+        Some(std::ffi::OsStr::new("1")),
+        "the engine-owned switch must win over a user env var",
     );
 }
 

@@ -48,6 +48,9 @@ pub struct StandingApply {
 pub(crate) enum ArmedChange {
     /// Still pending, with files to merge.
     Ready(Uuid),
+    /// Still pending, but marked unfinished by a stopped turn. A clean turn
+    /// clears the mark on the same change, so only the settle decides.
+    Incomplete,
     /// It resolved, vanished, or emptied out, so this arm can never fire.
     Gone(&'static str),
     /// Nothing is bound and nothing is pending yet.
@@ -93,9 +96,9 @@ pub(crate) enum TurnSettle {
 
 /// Classify the settle from its two halves. Pure.
 ///
-/// `terminal_is_newest`: the thread's newest turn closer is a
-/// `ResponseGenerated`. For a coding agent only the run loop's Result arm
-/// emits one, and that arm always idles unless the engine dies first.
+/// `terminal_is_newest`: the thread's newest turn closer is a terminal, not
+/// the idle. The run loop's Result arm idles after every terminal it sends,
+/// a Stop's included, unless the engine is shutting down.
 fn classify_turn_settle(terminal_is_newest: bool, session_live: bool) -> TurnSettle {
     match (terminal_is_newest, session_live) {
         (false, _) => TurnSettle::Settled,
@@ -230,6 +233,7 @@ pub(crate) fn standing_verdict(facts: &SettleFacts) -> StandingVerdict {
             // resolution.
             ArmedChange::Unproposed if facts.has_diff => StandingVerdict::Wait,
             ArmedChange::Unproposed => StandingVerdict::Drop(NOTHING_PROPOSED),
+            ArmedChange::Incomplete => StandingVerdict::Drop(CHANGE_INCOMPLETE),
             // Handled above, before the status match.
             ArmedChange::Gone(reason) => StandingVerdict::Drop(reason),
         },
@@ -265,7 +269,7 @@ pub(crate) type ArmedChangeRow = (Uuid, ChangeStatus, i32, bool);
 /// mapping is testable without a database. `None` = the row is gone.
 ///
 /// Incomplete work never lands through an arm: only its own Apply, which
-/// confirms, lands it (ADR 0328).
+/// confirms, lands it (ADR 0328). The verdict checks that at the settle.
 pub(crate) fn classify_bound_change(row: Option<ArmedChangeRow>) -> ArmedChange {
     match row {
         None => ArmedChange::Gone(CHANGE_RESOLVED),
@@ -274,7 +278,7 @@ pub(crate) fn classify_bound_change(row: Option<ArmedChangeRow>) -> ArmedChange 
             ArmedChange::Gone(CHANGE_RESOLVED)
         }
         Some((_, _, 0, _)) => ArmedChange::Gone(CHANGE_EMPTY),
-        Some((_, _, _, true)) => ArmedChange::Gone(CHANGE_INCOMPLETE),
+        Some((_, _, _, true)) => ArmedChange::Incomplete,
         Some((id, _, _, false)) => ArmedChange::Ready(id),
     }
 }
@@ -555,7 +559,7 @@ pub(crate) async fn read_turn_settle(
     .fetch_optional(pool)
     .await;
     let terminal_is_newest = match newest {
-        Ok(event_type) => event_type.as_deref() == Some("ResponseGenerated"),
+        Ok(event_type) => event_type.is_some_and(|t| t != "CodingAgentIdled"),
         Err(e) => {
             log!(
                 "[StandingApply] turn closer lookup for {} failed: {}",
@@ -1291,15 +1295,30 @@ mod db_tests {
         .unwrap_or_else(|| panic!("seed {event_type} was not persisted"));
     }
 
-    /// A coding-agent thread whose turn just sent its terminal, with a pending
+    /// A Stop's terminal, as the run loop's Result arm sends it before its idle.
+    fn stop_terminal() -> ThreadEvent {
+        ThreadEvent::ResponseCanceled {
+            text: String::new(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+            cause: crate::engine::thread_events::CancelCause::UserStop,
+        }
+    }
+
+    /// A coding-agent thread whose turn just sent `terminal`, with a pending
     /// change bound to an arm. The terminal sets `idle`, so only the settle
     /// fact tells this apart from a settled thread.
-    async fn seed_mid_settle(pool: &PgPool, bus: &EventBus) -> (Uuid, StandingApply) {
+    async fn seed_mid_settle(
+        pool: &PgPool,
+        bus: &EventBus,
+        terminal: ThreadEvent,
+    ) -> (Uuid, StandingApply) {
         let thread = Uuid::new_v4();
         let change = Uuid::new_v4();
         start_cc_session(bus, thread, &format!("claude-code/{thread}"), None).await;
         seed_change(pool, change, thread, ChangeStatus::Pending).await;
-        seed_agent_event(bus, thread, terminal()).await;
+        seed_agent_event(bus, thread, terminal).await;
         let arm = arm_for(thread, Some(change));
         insert_arm(pool, &arm).await.expect("insert arm");
         (thread, arm)
@@ -1327,7 +1346,7 @@ mod db_tests {
     async fn an_arm_set_mid_settle_waits_for_the_idle() {
         let (pool, db) = setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
-        let (thread, arm) = seed_mid_settle(&pool, &bus).await;
+        let (thread, arm) = seed_mid_settle(&pool, &bus, terminal()).await;
         let (sessions, _session_rx) = live_session(thread);
 
         assert_eq!(verdict(&pool, &arm, &sessions).await, StandingVerdict::Wait);
@@ -1341,7 +1360,7 @@ mod db_tests {
     async fn a_lagged_re_resolve_waits_until_the_idle_is_written() {
         let (pool, db) = setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
-        let (thread, arm) = seed_mid_settle(&pool, &bus).await;
+        let (thread, arm) = seed_mid_settle(&pool, &bus, terminal()).await;
         let (sessions, _session_rx) = live_session(thread);
 
         assert_eq!(verdict(&pool, &arm, &sessions).await, StandingVerdict::Wait);
@@ -1355,6 +1374,20 @@ mod db_tests {
         teardown_test_db(&db).await;
     }
 
+    /// **Stop.** A Stop's terminal sets `idle` before the run loop commits the
+    /// stopped turn and proposes it as incomplete. Firing in that window would
+    /// merge the stopped turn's partial commits, so the arm waits for the idle.
+    #[tokio::test]
+    async fn a_stopped_turn_holds_the_arm_until_its_idle() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        let (thread, arm) = seed_mid_settle(&pool, &bus, stop_terminal()).await;
+        let (sessions, _session_rx) = live_session(thread);
+
+        assert_eq!(verdict(&pool, &arm, &sessions).await, StandingVerdict::Wait);
+        teardown_test_db(&db).await;
+    }
+
     /// **Boot.** No session is live after a restart. A thread the old engine
     /// killed between its terminal and its idle never gets that idle, and its
     /// last edits may be uncommitted. So the arm ends with a report: it must
@@ -1363,7 +1396,7 @@ mod db_tests {
     async fn a_turn_cut_off_by_a_restart_drops_its_arm() {
         let (pool, db) = setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
-        let (_thread, arm) = seed_mid_settle(&pool, &bus).await;
+        let (_thread, arm) = seed_mid_settle(&pool, &bus, terminal()).await;
 
         assert_eq!(
             verdict(&pool, &arm, &no_sessions()).await,
@@ -1379,7 +1412,7 @@ mod db_tests {
     async fn a_lucidos_agent_reply_after_the_idle_does_not_cut_the_turn_off() {
         let (pool, db) = setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
-        let (thread, arm) = seed_mid_settle(&pool, &bus).await;
+        let (thread, arm) = seed_mid_settle(&pool, &bus, terminal()).await;
         seed_agent_event(&bus, thread, idle()).await;
         seed_thread_event(&bus, thread, terminal()).await;
 
@@ -1876,6 +1909,39 @@ mod db_tests {
         teardown_test_db(&db).await;
     }
 
+    /// **A Stop's unfinished work on a resumed thread is armable**, since the
+    /// running turn's clean idle clears the mark. A settled thread holding the
+    /// same change has nothing to wait for, so it is refused.
+    #[tokio::test]
+    async fn an_incomplete_change_is_armable_while_its_thread_runs() {
+        let (pool, db) = setup_test_db().await;
+        let running = Uuid::new_v4();
+        let settled = Uuid::new_v4();
+        seed_thread(&pool, running, "running").await;
+        seed_thread(&pool, settled, "idle").await;
+        let running_change = Uuid::new_v4();
+        let settled_change = Uuid::new_v4();
+        seed_change(&pool, running_change, running, ChangeStatus::Pending).await;
+        seed_change(&pool, settled_change, settled, ChangeStatus::Pending).await;
+        sqlx::query("UPDATE changes SET incomplete = TRUE")
+            .execute(&pool)
+            .await
+            .expect("mark the changes incomplete");
+
+        async fn refusal(pool: &PgPool, thread: Uuid, change: Uuid) -> Option<String> {
+            check_arm_has_a_settle(pool, &arm_for(thread, Some(change)), &no_sessions())
+                .await
+                .err()
+                .map(|e| e.to_string())
+        }
+        assert_eq!(refusal(&pool, running, running_change).await, None);
+        let refused = refusal(&pool, settled, settled_change)
+            .await
+            .expect("a settled thread's unfinished work has nothing to wait for");
+        assert!(refused.contains(CHANGE_INCOMPLETE), "{refused}");
+        teardown_test_db(&db).await;
+    }
+
     /// The workspace-scope off takes back a single arm as well as a swept one.
     #[tokio::test]
     async fn the_workspace_scope_off_covers_both_kinds_of_arm() {
@@ -2295,6 +2361,28 @@ mod tests {
         );
     }
 
+    /// A Stop's unfinished work is what an arm on a resumed thread waits for:
+    /// the turn's clean idle clears the mark on the same change. A settle that
+    /// leaves it unfinished drops the arm, since only its own Apply lands it.
+    #[test]
+    fn an_incomplete_change_waits_for_the_settle_and_drops_if_still_unfinished() {
+        for status in ["running", "paused"] {
+            assert_eq!(
+                standing_verdict(&facts(status, ArmedChange::Incomplete)),
+                StandingVerdict::Wait,
+                "{status}"
+            );
+        }
+        let mut mid_settle = facts("idle", ArmedChange::Incomplete);
+        mid_settle.turn_settle = TurnSettle::InFlight;
+        assert_eq!(standing_verdict(&mid_settle), StandingVerdict::Wait);
+
+        assert_eq!(
+            standing_verdict(&facts("idle", ArmedChange::Incomplete)),
+            StandingVerdict::Drop(CHANGE_INCOMPLETE)
+        );
+    }
+
     /// The proposal follows the turn's terminal, so a settled thread with a
     /// diff is one whose `ChangeProposed` is still in flight. Dropping there would lose the
     /// sweep's whole point.
@@ -2332,8 +2420,8 @@ mod tests {
         );
         assert_eq!(
             classify_bound_change(Some((id, ChangeStatus::Pending, 3, true))),
-            ArmedChange::Gone(CHANGE_INCOMPLETE),
-            "a Stop's unfinished work never lands through an arm"
+            ArmedChange::Incomplete,
+            "a clean turn can still finish a Stop's work, so it is not gone"
         );
         assert_eq!(
             classify_bound_change(Some((id, ChangeStatus::SetAside, 3, false))),

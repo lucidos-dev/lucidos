@@ -6,14 +6,16 @@ import { loadedOr } from '../../store/types';
 import { sideBySideDiffAvailable } from '../../store/diffBody';
 import { wrapToggleAvailable } from '../../store/previewWrap';
 import { closeUrl, openLocalFile, openUrlOutsideApp } from '../../store/actions/artifacts';
-import { previewDiskPath } from '../../utils/previewPath';
+import { previewCopyPath, previewDiskPath } from '../../utils/previewPath';
+import { copyToClipboard } from '../../utils/clipboard';
 import { getAppFrameSrc, exitPseudoFullscreen, toggleAppSearch, popOutApp, toggleAppFullscreen } from '../../store/actions/apps';
+import { findAvailable, findSurface, toggleFind } from '../../store/actions/find-bar';
 import { panelRefreshAvailable, runPanelRefresh } from '../../store/panelRefresh';
 import { DIFF_REFRESH_PINNED, panelRefreshLive } from './RefreshIndicator';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
-import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon, SideBySideColumnsIcon, WrapTextIcon } from '../shared/icons';
+import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon, SideBySideColumnsIcon, WrapTextIcon, CopyIcon } from '../shared/icons';
 import { RENDERABLE_EXTS, REPO_RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
-import { isTauri, isIOSPwa } from '../../utils/platform';
+import { isTauri, isIOSPwa, clipboardAbilities } from '../../utils/platform';
 import { webviewReload } from '../../utils/tauri';
 import { openFileSearch } from '../files/fileSearchActions';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
@@ -127,6 +129,30 @@ export function filePreviewPopoutAction(encoded: string): HeaderActionSpec | nul
   return null;
 }
 
+/** The control that copies the previewed file's real location: the absolute
+ *  disk path the user pastes into Finder, a terminal or another app (the
+ *  Obsidian case this shipped for). Falls back to the repo- or
+ *  workspace-relative path where `previewCopyPath` cannot resolve the
+ *  absolute one yet, and the confirmation says which one landed.
+ *
+ *  Null off a non-secure origin (a plain-HTTP LAN address), the one case
+ *  `navigator.clipboard` is absent: nothing here shows the path as selectable
+ *  text, so a tap could only ever open the "no clipboard" toast. Same
+ *  `clipboardAbilities().copy` gate `CopyButton` (`AddDeviceSection.tsx`) and
+ *  `PairingGate` use. */
+export function filePreviewCopyPathAction(encoded: string): HeaderActionSpec | null {
+  if (!clipboardAbilities().copy) return null;
+  return {
+    key: 'copy-path',
+    label: 'Copy path',
+    icon: () => <CopyIcon />,
+    onClick: () => {
+      const { path, absolute } = previewCopyPath(encoded, workspacePath.value, loadedOr(repositories.value, []));
+      copyToClipboard(path, absolute ? 'Path copied' : 'Relative path copied (the full path is not known yet)');
+    },
+  };
+}
+
 /** Whether a phone's actions carry the open panel's Refresh.
  *
  *  A phone refreshes by pulling. So Refresh shows only where it predates the
@@ -158,6 +184,117 @@ function filePreviewOffers(path: string) {
 function openFilePreviewOffers(): ReturnType<typeof filePreviewOffers> | null {
   const overlay = panelOverlay.value;
   return overlay?.type === 'file-preview' ? filePreviewOffers(overlay.path) : null;
+}
+
+/** One row that spins while a refresh is in flight: the panel's own pull, or
+ *  a diff's pinned, disabled stand-in. Pure, hoisted out of the header
+ *  component so `filePreviewContentActions` can build the same row. */
+function reloadSpec(key: string, onClick: () => void, label: 'Refresh' | 'Reload' = 'Refresh', disabledTooltip?: string): HeaderActionSpec {
+  return { key, label, icon: () => <ReloadIcon />, onClick, disabledTooltip };
+}
+
+/** The Find action, over any content view the find bar can search. The
+ *  header and a preview's right-click menu both carry it. */
+function findSpec(): HeaderActionSpec {
+  return {
+    key: 'find',
+    label: 'Find',
+    tooltip: tooltipWithShortcut('Find', 'findInView'),
+    icon: () => <SearchIcon />,
+    onClick: () => toggleFind('content'),
+    extraClass: 'find-btn',
+    active: findSurface.value === 'content',
+  };
+}
+
+/** The file-preview header's actions, in order. The single source of truth
+ *  for "what can I do to this file": the header toolbar and the preview's
+ *  own right-click menu both render this list, so neither can offer
+ *  something the other doesn't.
+ *
+ *  Editing hides every one of them, since Save/Cancel live in the editor
+ *  body and refresh/source-toggle would fight the draft. That is why it
+ *  returns early rather than guarding each push. */
+export function filePreviewContentActions(path: string, mobile: boolean): HeaderActionSpec[] {
+  const { isDiff, hasRendered, editable, editing } = filePreviewOffers(path);
+  const actions: HeaderActionSpec[] = [];
+  if (editing) return actions;
+
+  if (isDiff && mobile) actions.push(reloadSpec('refresh', () => {}, 'Refresh', DIFF_REFRESH_PINNED));
+  // Second, mirroring where the app header puts its own popout, so the two
+  // content views agree about where "take this out of the shell" lives.
+  const popout = filePreviewPopoutAction(path);
+  if (popout) actions.push(popout);
+  const copyPath = filePreviewCopyPathAction(path);
+  if (copyPath) actions.push(copyPath);
+  if (findAvailable('content')) actions.push(findSpec());
+  // Diff-only: toggle between the unified hunks and the whole file in its
+  // merged end state. Orthogonal to the source/rendered toggle below. Read
+  // the effective state (which carries the added-file default) so the icon
+  // matches what's shown, and write the inverse as an explicit override.
+  if (isDiff) {
+    const wholeFile = diffWholeFileEffective.value;
+    actions.push({
+      key: 'diff-whole-file',
+      label: wholeFile ? 'Show diff' : 'Show full file',
+      icon: () => (wholeFile ? <DiffIcon /> : <FileIcon />),
+      onClick: () => { diffWholeFile.value = !wholeFile; },
+      extraClass: 'diff-whole-file-toggle',
+    });
+  }
+  // Side-by-side is a rendering of the HUNKS: offered only when the hunks are
+  // what's showing (not the whole merged file, not the rendered markdown
+  // diff), and only where two columns fit. Both conditions are the body's
+  // own (`diffBodyKind`, `diffFitsSideBySide`), so the control cannot appear
+  // over a view it would do nothing to.
+  if (sideBySideDiffAvailable.value) {
+    const sideBySideOn = diffSideBySide.value;
+    actions.push({
+      key: 'diff-side-by-side',
+      label: sideBySideOn ? 'Show unified' : 'Show side by side',
+      icon: () => (sideBySideOn ? <DiffIcon /> : <SideBySideColumnsIcon />),
+      onClick: () => { diffSideBySide.value = !sideBySideOn; },
+      extraClass: 'diff-side-by-side-toggle',
+    });
+  }
+  if (hasRendered) {
+    const isSource = filePreviewSource.value;
+    const label = isSource ? 'Show rendered' : 'Show source';
+    actions.push({
+      key: 'source-toggle',
+      label,
+      tooltip: tooltipWithShortcut(label, 'toggleSourceView'),
+      icon: () => (isSource ? <EyeIcon /> : <CodeIcon />),
+      onClick: toggleSourceView,
+    });
+  }
+  // Only over the line-numbered source view, the one body wrapping acts on
+  // (`wrapToggleAvailable`). The control STAYS while wrapping is on, and
+  // reads as pressed: it is how the reader turns it back off, and the
+  // pinned-gutter pan is the other half of the same choice.
+  if (wrapToggleAvailable.value) {
+    const wrapOn = filePreviewWrap.value;
+    const label = wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines';
+    actions.push({
+      key: 'wrap-toggle',
+      label,
+      tooltip: tooltipWithShortcut(label, 'toggleLineWrap'),
+      icon: () => <WrapTextIcon />,
+      onClick: toggleLineWrap,
+      active: wrapOn,
+      extraClass: 'file-preview-wrap-toggle',
+    });
+  }
+  if (editable) {
+    actions.push({
+      key: 'edit',
+      label: 'Edit file',
+      icon: () => <EditIcon />,
+      onClick: () => { filePreviewEditing.value = true; },
+      extraClass: 'file-edit-btn',
+    });
+  }
+  return actions;
 }
 
 /** Flips source and rendered, where the header offers it. The header button
@@ -232,10 +369,6 @@ export function ContentHeaderActions({ layout }: Props) {
     actions.push(spec);
   }
 
-  function reloadSpec(key: string, onClick: () => void, label: 'Refresh' | 'Reload' = 'Refresh', disabledTooltip?: string): HeaderActionSpec {
-    return { key, label, icon: () => <ReloadIcon />, onClick, disabledTooltip };
-  }
-
   // The open panel's refresh (the panel refresh contract), first so it folds
   // first. A phone spins the leading slot instead, which no action can fold.
   const mobile = layout === 'mobile';
@@ -247,6 +380,7 @@ export function ContentHeaderActions({ layout }: Props) {
   if (overlay?.type === 'app-ui') {
     const popout = appPopoutAction();
     if (popout) addAction(popout);
+    addAction(findSpec());
     const label = isFullscreen ? 'Exit fullscreen' : 'Fullscreen';
     addAction({
       key: 'fullscreen',
@@ -267,85 +401,7 @@ export function ContentHeaderActions({ layout }: Props) {
       onClick: closeUrl,
     });
   } else if (overlay?.type === 'file-preview') {
-    const { isDiff, hasRendered, editable, editing } = filePreviewOffers(overlay.path);
-
-    // While editing, Save/Cancel live in the editor body (FilePreviewInline) and
-    // refresh/source-toggle would fight the draft — so the header drops them and
-    // keeps only the global actions. The preview registers no refresh then, nor
-    // for a diff, which is pinned to its change and says so on its Refresh.
-    if (!editing) {
-      if (isDiff && mobile) addAction(reloadSpec('refresh', () => {}, 'Refresh', DIFF_REFRESH_PINNED));
-      // Second, mirroring where the app header puts its own popout, so the two
-      // content views agree about where "take this out of the shell" lives.
-      const popout = filePreviewPopoutAction(overlay.path);
-      if (popout) addAction(popout);
-      // Diff-only: toggle between the unified hunks and the whole file in its
-      // merged end state. Orthogonal to the source/rendered toggle below. Read
-      // the effective state (which carries the added-file default) so the icon
-      // matches what's shown, and write the inverse as an explicit override.
-      if (isDiff) {
-        const wholeFile = diffWholeFileEffective.value;
-        addAction({
-          key: 'diff-whole-file',
-          label: wholeFile ? 'Show diff' : 'Show full file',
-          icon: () => (wholeFile ? <DiffIcon /> : <FileIcon />),
-          onClick: () => { diffWholeFile.value = !wholeFile; },
-          extraClass: 'diff-whole-file-toggle',
-        });
-      }
-      // Side-by-side is a rendering of the HUNKS, so it is offered only when the
-      // hunks are what's showing (not the whole merged file, not the rendered
-      // markdown diff) and only where two columns fit. Both conditions are the
-      // body's own (`diffBodyKind`, `diffFitsSideBySide`), so the control cannot
-      // appear over a view it would do nothing to.
-      if (sideBySideDiffAvailable.value) {
-        const sideBySideOn = diffSideBySide.value;
-        addAction({
-          key: 'diff-side-by-side',
-          label: sideBySideOn ? 'Show unified' : 'Show side by side',
-          icon: () => (sideBySideOn ? <DiffIcon /> : <SideBySideColumnsIcon />),
-          onClick: () => { diffSideBySide.value = !sideBySideOn; },
-          extraClass: 'diff-side-by-side-toggle',
-        });
-      }
-      if (hasRendered) {
-        const isSource = filePreviewSource.value;
-        const label = isSource ? 'Show rendered' : 'Show source';
-        addAction({
-          key: 'source-toggle',
-          label,
-          tooltip: tooltipWithShortcut(label, 'toggleSourceView'),
-          icon: () => (isSource ? <EyeIcon /> : <CodeIcon />),
-          onClick: toggleSourceView,
-        });
-      }
-      // Only over the line-numbered source view, the one body wrapping acts on
-      // (`wrapToggleAvailable`). The control STAYS while wrapping is on, and
-      // reads as pressed: it is how the reader turns it back off, and the
-      // pinned-gutter pan is the other half of the same choice.
-      if (wrapToggleAvailable.value) {
-        const wrapOn = filePreviewWrap.value;
-        const label = wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines';
-        addAction({
-          key: 'wrap-toggle',
-          label,
-          tooltip: tooltipWithShortcut(label, 'toggleLineWrap'),
-          icon: () => <WrapTextIcon />,
-          onClick: toggleLineWrap,
-          active: wrapOn,
-          extraClass: 'file-preview-wrap-toggle',
-        });
-      }
-      if (editable) {
-        addAction({
-          key: 'edit',
-          label: 'Edit file',
-          icon: () => <EditIcon />,
-          onClick: () => { filePreviewEditing.value = true; },
-          extraClass: 'file-edit-btn',
-        });
-      }
-    }
+    for (const a of filePreviewContentActions(overlay.path, mobile)) addAction(a);
   } else if (!overlay && activeMenuItem.value === 'files') {
     addAction({
       key: 'search',
@@ -395,11 +451,9 @@ export function ContentHeaderActions({ layout }: Props) {
   // The ⋯ trigger would stand in the same box, so the cluster is two boxes
   // either way and the menu buys only a tap. See `mobileCollapseCount`.
   const hostRef = useRef<HTMLDivElement>(null);
-  // Three or more context actions fold whole, at any width: see
-  // `alwaysCollapseFrom`. Two still ride the row when there is room for them.
-  const collapsedCount = useHeaderActionCollapse(hostRef, actions.length, layout, COLLAPSE_TARGETS, {
-    alwaysCollapseFrom: 3,
-  });
+  // Room alone decides: every action rides while it fits, then the two
+  // nearest the title fold first and one more follows per step.
+  const collapsedCount = useHeaderActionCollapse(hostRef, actions.length, layout, COLLAPSE_TARGETS);
 
   return (
     <div class="content-header-actions" ref={hostRef}>

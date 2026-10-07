@@ -68,6 +68,13 @@ pub enum AgentEvent {
         text: String,
         opens_block: bool,
     },
+    /// A whole block of prose a Claude Code sub-agent wrote, named by the
+    /// `Agent` call that spawned it. Kept apart from `Message` because it is
+    /// the sub-agent's narration, never the session's reply.
+    SubAgentMessage {
+        text: String,
+        parent_tool_use_id: String,
+    },
     /// Streamed reasoning/thinking fragment — human-readable extended-thinking
     /// text the agent emitted before (or between) its visible output. CC sends it
     /// as a `stream_event` → `content_block_delta` with `delta.type:
@@ -97,6 +104,12 @@ pub enum AgentEvent {
         name: String,
         input: serde_json::Value,
         id: String,
+        /// The `Agent` call whose sub-agent this came from. `None` for the
+        /// session's own work, and always `None` from Codex.
+        parent_tool_use_id: Option<String>,
+        /// The API call that produced this tool call, matching its `Usage`.
+        /// Always `None` from Codex, which reports usage per turn.
+        api_call_id: Option<String>,
     },
     /// Tool result returned to the agent. `id` matches the originating
     /// `ToolUse.id` so the engine can pair calls and results across event
@@ -106,6 +119,9 @@ pub enum AgentEvent {
         output: String,
         status: String,
         id: String,
+        /// The `Agent` call whose sub-agent this came from. `None` for the
+        /// session's own work, and always `None` from Codex.
+        parent_tool_use_id: Option<String>,
     },
     /// The agent took the oldest forwarded inputs it had not taken yet.
     ///
@@ -136,6 +152,12 @@ pub enum AgentEvent {
         output_tokens: u32,
         cache_read_tokens: u32,
         cache_creation_tokens: u32,
+        /// The `Agent` call whose sub-agent this came from. `None` for the
+        /// session's own work, and always `None` from Codex.
+        parent_tool_use_id: Option<String>,
+        /// Which API call this was: Claude Code's `message.id`. `None` from
+        /// Codex, and for a Claude Code frame that carries no id.
+        api_call_id: Option<String>,
     },
     /// Claude Code's driver read the last output line and flushed any call
     /// left open. Only `Exited` can follow, once the process group is torn

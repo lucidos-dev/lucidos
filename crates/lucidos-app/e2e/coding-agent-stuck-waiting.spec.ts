@@ -151,7 +151,11 @@ test.describe('CC stuck-in-waiting regression', () => {
       await expect(threadInReview).toHaveCount(0, { timeout: 5_000 });
 
       await ensureOnThreadPane(page);
-      await expect(page.locator('.thread-action-buttons:visible')).toHaveCount(0, { timeout: 5_000 });
+      // An archived thread offers only Move to Current: no change action is left.
+      // The row also holds the composer's own controls, so count thread actions.
+      const actions = page.locator('.thread-action-buttons:visible [data-thread-action]');
+      await expect(actions.filter({ hasText: 'Move to Current' })).toHaveCount(1, { timeout: 5_000 });
+      await expect(actions.filter({ hasNotText: 'Move to Current' })).toHaveCount(0);
 
       const status = psql(`SELECT status FROM thread_summaries WHERE thread_id = '${threadId}'`);
       expect(status).toBe('idle');

@@ -15,6 +15,17 @@ async function pageDeviceId(page: Page): Promise<string | null> {
   }
 }
 
+/** The device id the shell writes during boot, once it is there. A read right
+ *  after navigation can run before the shell has written it. */
+export async function shellDeviceId(page: Page): Promise<string> {
+  let id: string | null = null;
+  await expect.poll(async () => {
+    id = await pageDeviceId(page);
+    return id;
+  }, { message: 'the shell registered a device' }).toBeTruthy();
+  return id as unknown as string;
+}
+
 /** `page.request`, identifying itself the way the page does.
  *
  *  `page.request` shares the browser context's cookies but NOT its
@@ -108,6 +119,23 @@ export function isMobileViewport(page: Page): boolean {
   return vp ? vp.width < 769 : false;
 }
 
+type TouchStep =
+  | { type: 'touchStart' | 'touchMove'; x: number; y: number }
+  | { type: 'touchEnd' };
+
+/** Drive one CDP touch press, every step sent in a single burst. Chromium only.
+ *
+ *  Awaiting each step lets a loaded host stretch the press past
+ *  `LONG_PRESS_DELAY_MS`. The prompt's buttons then read a hold, and the lift
+ *  turns on side-question mode instead of sending. */
+export async function touchPress(page: Page, steps: TouchStep[]): Promise<void> {
+  const cdp = await page.context().newCDPSession(page);
+  await Promise.all(steps.map((s) => cdp.send('Input.dispatchTouchEvent', {
+    type: s.type,
+    touchPoints: s.type === 'touchEnd' ? [] : [{ x: s.x, y: s.y }],
+  })));
+}
+
 /** Distinguishes one settle wait from the next, for `ensureMobileView`'s pane
  *  and `openThreadDrawer`'s drawer. Both compare a measurement against the
  *  frame before, and both keep that frame on `window`. Without a token the
@@ -144,8 +172,9 @@ export async function ensureMobileView(page: Page, viewName: 'thread' | 'threads
  *  deterministically rather than flakily.
  *
  *  Index-free on purpose: at rest exactly one pane sits at viewport left 0, and
- *  mid-slide none does. Held across two frames, so a transition that has not
- *  started yet cannot answer for one that has ended.
+ *  mid-slide none does. Except at the start: the LEAVING pane still reads left
+ *  0 for the slide's first frames, so the track must also have no transition
+ *  running. Held across two frames, as the transition starts on a style flush.
  *
  *  **Called by `openThreadDrawer` alone, deliberately.** Inside
  *  `ensureMobileView` it would hand every mobile spec up to 300ms of extra
@@ -158,7 +187,9 @@ export async function waitForPaneAtRest(page: Page): Promise<void> {
   await page.waitForFunction((token) => {
     const panes = Array.from(document.querySelectorAll('.mobile-swipe-pane'));
     if (panes.length === 0) return true; // desktop layout, nothing slides
-    const atRest = panes.some(p => Math.abs(p.getBoundingClientRect().left) < 0.5);
+    const track = document.querySelector('.mobile-swipe-track');
+    const sliding = !!track && track.getAnimations().length > 0;
+    const atRest = !sliding && panes.some(p => Math.abs(p.getBoundingClientRect().left) < 0.5);
     const win = window as unknown as { __luPaneSettle?: { token: number; atRest: boolean } };
     const prev = win.__luPaneSettle;
     win.__luPaneSettle = { token, atRest };
@@ -225,6 +256,19 @@ export async function navigateToApp(page: Page): Promise<void> {
   await gotoWithRetry(page, '/');
   await ensureOnThreadPane(page);
   await waitForVisibleInput(page);
+  await waitForWorkspaceReady(page);
+}
+
+/** Wait until the workspace has reported ready, which is when the boot splash
+ *  starts to leave. The shell is live under the splash from its first frame,
+ *  but nobody can see it, and its layout is still settling. A fresh e2e
+ *  workspace boots in about 100ms, well inside the splash's hold. */
+export async function waitForWorkspaceReady(page: Page): Promise<void> {
+  await page.waitForFunction(
+    () => document.querySelector('.boot-splash:not(.boot-splash-leaving)') === null,
+    undefined,
+    { timeout: 30_000 },
+  );
 }
 
 /** Start this page with the *follow seed* DISARMED, before the app boots.
@@ -604,7 +648,7 @@ export async function clickVisibleElement(page: Page, selector: string, text?: s
 }
 
 /** Open the unified Filter panel and pick a drawer view by its row label
- *  ("All" | "Needs attention" | "Review" | "Running" | "Drafts"). The rows live
+ *  ("All statuses" | "Needs attention" | "Review" | "In flight" | "Drafts"). The rows live
  *  in the panel's Status section; picking one applies it and closes the panel.
  *  The panel renders inside the thread drawer pane, which is the same component
  *  on both layouts, so this is dual-layout safe: the single Filter button
@@ -963,14 +1007,20 @@ export async function clickChangeAction(
  *  turn, so a "any panel exists" check would return early.
  *
  *  Only a response panel carries a turn's status. A user bubble's Sent, Read
- *  or Queued tag shares the label class, and a queued message sits last. */
+ *  or Queued tag shares the label class, and a queued message sits last.
+ *
+ *  Resolve only once a turn is on screen: an empty transcript is not a
+ *  finished one. */
 export async function waitForCCToFinish(page: Page, timeout = 120_000): Promise<void> {
   await page.waitForFunction(() => {
-    const labels = document.querySelectorAll('.response-panel .exchange-status-label');
-    const visible = Array.from(labels).filter(el => {
+    const shown = (el: Element) => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0;
-    });
+    };
+    // On desktop the transcript draws nothing while the first send's prompt
+    // slides into place.
+    if (!Array.from(document.querySelectorAll('.response-panel')).some(shown)) return false;
+    const visible = Array.from(document.querySelectorAll('.response-panel .exchange-status-label')).filter(shown);
     if (visible.length === 0) return true;
     const last = visible[visible.length - 1];
     const text = last.textContent ?? '';

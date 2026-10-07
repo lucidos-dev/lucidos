@@ -166,7 +166,7 @@ async fn write_missing(
         if present.contains(&event_id) {
             continue;
         }
-        let event = crate::engine::aux_capture::auxiliary_capture(
+        let event = crate::engine::model_call::auxiliary_capture(
             purpose,
             &call.model,
             call.request_chars,

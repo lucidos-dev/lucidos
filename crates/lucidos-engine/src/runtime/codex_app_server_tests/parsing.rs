@@ -176,7 +176,9 @@ fn plan_update_emits_normalized_todo_list_pair() {
         }),
     );
     match &evs[..] {
-        [AgentEvent::ToolUse { name, input, id }, AgentEvent::ToolResult {
+        [AgentEvent::ToolUse {
+            name, input, id, ..
+        }, AgentEvent::ToolResult {
             status,
             id: result_id,
             ..
@@ -316,7 +318,7 @@ fn command_execution_pairs_tool_use_and_result() {
     );
     assert!(matches!(
         &evs[..],
-        [AgentEvent::ToolUse { name, id, input }]
+        [AgentEvent::ToolUse { name, id, input, .. }]
             if name == "command_execution" && id == "i2"
                && input["command"] == "ls -la"
     ));
@@ -331,7 +333,7 @@ fn command_execution_pairs_tool_use_and_result() {
     );
     assert!(matches!(
         &evs[..],
-        [AgentEvent::ToolResult { id, status, output }]
+        [AgentEvent::ToolResult { id, status, output, .. }]
             if id == "i2" && status == "success" && output == "file.txt\n"
     ));
 }
@@ -419,7 +421,7 @@ fn approval_gated_command_started_waits_until_acceptance() {
     let evs = t.note_approval_resolved("i7", true);
     assert!(matches!(
         &evs[..],
-        [AgentEvent::ToolUse { name, id, input }]
+        [AgentEvent::ToolUse { name, id, input, .. }]
             if name == "command_execution" && id == "i7" && input["command"] == "sudo ls"
     ));
 
@@ -434,7 +436,7 @@ fn approval_gated_command_started_waits_until_acceptance() {
     );
     assert!(matches!(
         &evs[..],
-        [AgentEvent::ToolResult { id, status, output }]
+        [AgentEvent::ToolResult { id, status, output, .. }]
             if id == "i7" && status == "success" && output == "ok\n"
     ));
 }

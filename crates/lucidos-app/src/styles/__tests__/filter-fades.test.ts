@@ -148,7 +148,9 @@ describe('nothing in the button hops when a fade starts or ends', () => {
     '.app-header .filter-glyph > .crossfade-layer',
     '.app-header .badge.filter-badge',
   ])('%s stays on its own layer at rest', (selector) => {
-    expect(rule(shell, selector).props.get('will-change')).toBe('opacity');
+    // The badge also names `transform`, for badges.css (badge-glyph-centring.test.ts).
+    const hints = (rule(shell, selector).props.get('will-change') ?? '').split(/\s*,\s*/);
+    expect(hints).toContain('opacity');
   });
 });
 

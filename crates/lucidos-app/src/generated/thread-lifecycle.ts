@@ -58,6 +58,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ThreadTriageProposed: 'metadata',
   ThreadStarted: 'metadata',
   ThreadDiscarded: 'metadata',
+  HomeThreadCreated: 'metadata',
   ImageUploaded: 'metadata',
   TriggerStarted: 'start',
   TriggerCompleted: 'terminal',
@@ -219,16 +220,32 @@ export function availableThreadActions(
   return actions;
 }
 
-export function threadIsDeletable(
+export type OwnBlocker = 'running' | 'question' | 'pending_change';
+export const OWN_BLOCKER_PRIORITY: readonly OwnBlocker[] = ['running', 'question', 'pending_change'] as const;
+export type Blocker = 'none' | 'home' | 'running' | 'question' | 'pending_change' | 'descendant_running' | 'descendant_question' | 'descendant_pending_change';
+
+export function ownBlocker(
   threadType: ThreadType,
   status: ThreadStatus,
+  archiveState: ArchiveState,
   hasPendingChanges: boolean,
   isExternalRepo: boolean,
-  descendantsBlock: boolean,
-): boolean {
-  if (status === 'running' || status === 'waiting_for_user_answer') return false;
-  if (hasPendingChanges && threadType === 'claude_code' && !isExternalRepo) return false;
-  return !descendantsBlock;
+): OwnBlocker | null {
+  if (status === 'running') return 'running';
+  if (status === 'waiting_for_user_answer') return 'question';
+  if (archiveState === 'archived') return null;
+  return hasPendingChanges && threadType === 'claude_code' && !isExternalRepo ? 'pending_change' : null;
+}
+
+export function actionBlocker(
+  own: OwnBlocker | null,
+  isHome: boolean,
+  descendant: OwnBlocker | null,
+): Blocker {
+  if (isHome) return 'home';
+  if (own !== null) return own;
+  if (descendant !== null) return `descendant_${descendant}`;
+  return 'none';
 }
 export const MESSAGE_COUNT_EVENTS: ReadonlySet<string> = new Set([
   'MessageReceived',

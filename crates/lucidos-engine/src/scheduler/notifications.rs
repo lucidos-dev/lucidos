@@ -300,25 +300,57 @@ pub async fn verify_event_anchors(
     Ok(Ok(()))
 }
 
-/// A tap that deep-links to one Settings sub-section, the same way the LLM's
-/// `navigate_ui` does.
+/// One Settings page an engine notification can send the reader to: the route
+/// written the way the UI's breadcrumbs read, and the view id that opens it.
 ///
-/// `view` must be one of `NAVIGABLE_SETTINGS_VIEWS` (`llm/tools/misc.rs`), which
-/// is the set the frontend router renders. Anything else toasts "Unknown
-/// settings section" instead of navigating, turning the tap back into the dead
-/// end it replaced.
+/// Holding both in one value is what keeps a notification's body and its tap on
+/// the same page. A System subpanel reads "Settings → System → X", not
+/// "Settings → X".
 ///
-/// The body shipping with the tap must NAME the same page. A reader who met the
-/// notification where the tap is not to hand, a dismissed lock-screen banner,
-/// has only the written route. Spell it the way the UI's own breadcrumbs read:
-/// a System subpanel is "Settings → System → X", not "Settings → X".
-pub fn settings_tap(view: &str) -> Tap {
-    Tap::Navigate {
-        to: Box::new(NavigateUi {
-            target: NavigateTarget::Settings,
-            settings_view: Some(view.to_string()),
-            ..Default::default()
-        }),
+/// `view` must be one of `NAVIGABLE_SETTINGS_VIEWS` (`llm/tools/misc.rs`), the
+/// set the frontend router renders. Anything else toasts "Unknown settings
+/// section" instead of navigating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsPage {
+    pub path: &'static str,
+    pub view: &'static str,
+}
+
+impl SettingsPage {
+    pub const ACCOUNTS: Self = Self {
+        path: "Settings → Accounts",
+        view: "accounts",
+    };
+    pub const BACKUP: Self = Self {
+        path: "Settings → System → Backup",
+        view: "backup",
+    };
+    pub const DISK_USAGE: Self = Self {
+        path: "Settings → System → Disk Usage",
+        view: "disk-usage",
+    };
+
+    /// Every page above, for the test that holds each to a renderable view.
+    #[cfg(test)]
+    pub const ALL: [Self; 3] = [Self::ACCOUNTS, Self::BACKUP, Self::DISK_USAGE];
+
+    /// A tap that deep-links here, the same way the LLM's `navigate_ui` does.
+    pub fn tap(self) -> Tap {
+        Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::Settings,
+                settings_view: Some(self.view.to_string()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// The route as a markdown link to this page, for a notification body.
+    ///
+    /// The label is the route itself, so every plain-text surface (OS banner,
+    /// toast, inbox row) still reads the route after markdown is stripped.
+    pub fn link(self) -> String {
+        format!("[{}](settings:{})", self.path, self.view)
     }
 }
 
@@ -961,6 +993,42 @@ mod tests {
         };
         let err = resolve_thread_tap_id(&mut idless, Some(Uuid::new_v4())).expect_err("refused");
         assert!(err.contains("has none"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // SettingsPage
+    // -----------------------------------------------------------------------
+
+    /// A view outside the router's set toasts "Unknown settings section", so
+    /// both the tap and the body link would be dead ends.
+    #[test]
+    fn every_settings_page_is_a_renderable_view() {
+        for page in SettingsPage::ALL {
+            assert!(
+                crate::llm::tools::NAVIGABLE_SETTINGS_VIEWS.contains(&page.view),
+                "{page:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_page_link_and_tap_name_the_same_view() {
+        let page = SettingsPage::BACKUP;
+        assert_eq!(page.link(), "[Settings → System → Backup](settings:backup)");
+        let Tap::Navigate { to } = page.tap() else {
+            panic!("a settings tap navigates");
+        };
+        assert_eq!(to.target, NavigateTarget::Settings);
+        assert_eq!(to.settings_view.as_deref(), Some("backup"));
+    }
+
+    /// The OS banner, the toast and the inbox row strip markdown. They must
+    /// still read the route, and never show the link syntax.
+    #[test]
+    fn a_settings_link_reads_as_its_route_in_plain_text() {
+        let body = format!("Open {} to retry.", SettingsPage::BACKUP.link());
+        let plain = crate::scheduler::notification_plain_text::plain_text_body(&body);
+        assert_eq!(plain, "Open Settings → System → Backup to retry.");
     }
 
     // -----------------------------------------------------------------------

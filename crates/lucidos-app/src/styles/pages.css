@@ -90,8 +90,8 @@
     /* --space-lg (1rem) gutter shared across content-pane views — the Settings
        view lines its content up with the notification/apps/plugins/list views.
        This is the side room the settings-row nav-focus marker clears within (see
-       settings/base.css). The content column sets the top spacing, and there
-       is no bottom padding, for the reason given there (panels/content.css). */
+       settings/base.css). The pane sets the top spacing and the end space
+       below (panels/content.css). */
     padding-inline: var(--space-lg);
 }
 

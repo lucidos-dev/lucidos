@@ -32,7 +32,7 @@ fn side_question_error(
         SideQuestionFailure::UnknownImage(message) => ApiError::bad_request(message),
         SideQuestionFailure::AlreadyAsked => ApiError::new(
             StatusCode::CONFLICT,
-            "A side question with this id was already asked.",
+            "A side question with this id is still running or was answered.",
         ),
         SideQuestionFailure::NotAsked => ApiError::new(
             StatusCode::NOT_FOUND,

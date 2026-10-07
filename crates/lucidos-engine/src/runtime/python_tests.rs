@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::actor::{ENV_AGENT_ORIGIN_TOKEN, HEADER_AGENT_ORIGIN_TOKEN};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -627,20 +628,27 @@ async fn warmed_runtime(workspace: &std::path::Path, ceiling: Duration) -> Pytho
     runtime.with_execution_timeout(ceiling)
 }
 
-/// The ceiling the rest of the system quotes. `llm/tools/exec.rs` states it in
-/// three tool descriptions, and `system-knowhow/running-python.md` puts it in
-/// the pick-your-tool table. A change here that leaves those alone puts the
-/// docs back to describing a mechanism that does not exist.
+/// The ceiling the rest of the system quotes. `llm/tools/exec.rs` renders it
+/// from the constant. `system-knowhow/running-python.md` is prose and cannot,
+/// so this pins the doc to the constant instead.
 #[test]
-fn the_default_ceiling_is_the_300s_the_docs_promise() {
+fn the_default_ceiling_is_the_one_the_docs_promise() {
     let dir = tempdir().unwrap();
     let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
     assert_eq!(
         runtime.execution_timeout,
-        Duration::from_secs(300),
-        "run_python's sync ceiling is documented as 300s in llm/tools/exec.rs \
-         and system-knowhow/running-python.md"
+        Duration::from_secs(EXECUTION_TIMEOUT_SECS)
     );
+    let doc = include_str!("../../../../system-knowhow/running-python.md");
+    for quoted in [
+        format!("{EXECUTION_TIMEOUT_SECS} s ceiling"),
+        format!("timed out after {EXECUTION_TIMEOUT_SECS}s"),
+    ] {
+        assert!(
+            doc.contains(&quoted),
+            "system-knowhow/running-python.md must quote the ceiling as {quoted:?}"
+        );
+    }
     assert_eq!(
         EXECUTION_TIMEOUT_SECS,
         crate::llm::tools::MAX_TIMEOUT_SECS,
@@ -1231,7 +1239,7 @@ async fn agent_origin_shim_forwards_token_on_urllib_request_to_engine_port() {
     let thread_id = "11111111-2222-3333-4444-555555555555";
     let env = vec![
         (
-            "LUCIDOS_AGENT_ORIGIN_TOKEN".to_string(),
+            ENV_AGENT_ORIGIN_TOKEN.to_string(),
             "test-token-xyz".to_string(),
         ),
         ("LUCIDOS_THREAD_ID".to_string(), thread_id.to_string()),
@@ -1256,8 +1264,8 @@ print('done')
 
     let headers = capture.await.expect("capture task");
     assert!(
-        headers.contains("x-lucidos-agent-origin-token"),
-        "expected x-lucidos-agent-origin-token in captured headers, got: {headers:?}"
+        headers.contains(HEADER_AGENT_ORIGIN_TOKEN),
+        "expected {HEADER_AGENT_ORIGIN_TOKEN} in captured headers, got: {headers:?}"
     );
     assert!(
         !headers.contains("x-lucidos-source-thread-id"),
@@ -1292,7 +1300,7 @@ async fn agent_origin_shim_does_not_forward_token_when_env_missing() {
     // Empty-string overrides clear any inherited engine env so the
     // shim's `if _TOKEN and _PORT:` gate is exercised honestly.
     let env = vec![
-        ("LUCIDOS_AGENT_ORIGIN_TOKEN".to_string(), String::new()),
+        (ENV_AGENT_ORIGIN_TOKEN.to_string(), String::new()),
         ("LUCIDOS_API_PORT".to_string(), String::new()),
         ("LUCIDOS_THREAD_ID".to_string(), String::new()),
     ];
@@ -1313,7 +1321,7 @@ print('done')
 
     let headers = capture.await.expect("capture task");
     assert!(
-        !headers.contains("x-lucidos-agent-origin-token"),
+        !headers.contains(HEADER_AGENT_ORIGIN_TOKEN),
         "token must not leak when env vars are empty, got: {headers:?}"
     );
 }
@@ -1340,7 +1348,7 @@ async fn agent_origin_shim_does_not_forward_token_on_non_engine_port() {
     let fake_engine_port = real_port.wrapping_add(1);
     let env = vec![
         (
-            "LUCIDOS_AGENT_ORIGIN_TOKEN".to_string(),
+            ENV_AGENT_ORIGIN_TOKEN.to_string(),
             "test-token-xyz".to_string(),
         ),
         ("LUCIDOS_API_PORT".to_string(), fake_engine_port.to_string()),
@@ -1362,7 +1370,7 @@ print('done')
 
     let headers = capture.await.expect("capture task");
     assert!(
-        !headers.contains("x-lucidos-agent-origin-token"),
+        !headers.contains(HEADER_AGENT_ORIGIN_TOKEN),
         "token must not leak to a non-engine localhost port, got: {headers:?}"
     );
 }
@@ -1402,7 +1410,7 @@ async fn agent_origin_shim_survives_shadowing_sitecustomize() {
 
     let env = vec![
         (
-            "LUCIDOS_AGENT_ORIGIN_TOKEN".to_string(),
+            ENV_AGENT_ORIGIN_TOKEN.to_string(),
             "test-token-xyz".to_string(),
         ),
         (
@@ -1437,7 +1445,20 @@ print('done')
     );
     let headers = capture.await.expect("capture task");
     assert!(
-        headers.contains("x-lucidos-agent-origin-token"),
+        headers.contains(HEADER_AGENT_ORIGIN_TOKEN),
         "token forwarding must survive a shadowing sitecustomize (the Homebrew bug), got: {headers:?}"
     );
+}
+
+/// Every placeholder in the shim template has to be filled. One left behind
+/// is a Python string literal naming a header nobody reads.
+#[test]
+fn agent_origin_shim_fills_every_placeholder() {
+    let shim = agent_origin_shim_py();
+    assert!(
+        !shim.contains("{ENV_") && !shim.contains("{HEADER_"),
+        "{shim}"
+    );
+    assert!(shim.contains(ENV_AGENT_ORIGIN_TOKEN));
+    assert!(shim.contains(HEADER_AGENT_ORIGIN_TOKEN));
 }

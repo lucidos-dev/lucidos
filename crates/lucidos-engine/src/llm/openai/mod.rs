@@ -210,26 +210,6 @@ impl OpenAiProvider {
         })
     }
 
-    /// Cap every HTTP attempt this provider makes at `timeout`, the SSE body
-    /// included. Builder-style, so the ordinary constructors keep their
-    /// unbounded-stream behaviour and only the caller that wants a bound pays
-    /// for it.
-    ///
-    /// Same single caller and same reason as
-    /// [`crate::llm::VertexProvider::with_request_timeout`]. An *auxiliary
-    /// model call* runs under a deadline that has to contain the provider's own
-    /// retries, and only a bounded attempt lets it.
-    pub fn with_request_timeout(
-        mut self,
-        timeout: Duration,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        self.streaming_client = reqwest::Client::builder()
-            .timeout(timeout)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .build()?;
-        Ok(self)
-    }
-
     /// Whether this request should take the Responses API path. OpenRouter /
     /// local backends pin Chat Completions via `force_chat_completions`;
     /// direct OpenAI keeps the GPT-5/codex → Responses split.
@@ -450,34 +430,15 @@ impl LlmProvider for OpenAiProvider {
         selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
+        _call: crate::llm::metered::CallToken,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let ModelSelection {
-            model: model_override,
-            reasoning_effort,
-            ..
-        } = selection;
-        let model = model_override.unwrap_or(&self.model);
-
+        let model = selection.model.unwrap_or(&self.model);
         if self.should_use_responses(model) {
-            self.chat_responses(
-                &messages,
-                &tools,
-                model,
-                system_prompt,
-                on_token,
-                reasoning_effort,
-            )
-            .await
+            self.chat_responses(&messages, &tools, selection, system_prompt, on_token)
+                .await
         } else {
-            self.chat_completions(
-                &messages,
-                &tools,
-                model,
-                system_prompt,
-                on_token,
-                reasoning_effort,
-            )
-            .await
+            self.chat_completions(&messages, &tools, selection, system_prompt, on_token)
+                .await
         }
     }
 

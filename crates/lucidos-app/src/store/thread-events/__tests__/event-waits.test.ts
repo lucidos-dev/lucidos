@@ -7,7 +7,7 @@ import {
   plainEventName,
   secondsRemaining,
 } from '../event-waits';
-import { resolveVisualStatus } from '../../../components/shared/ThreadStatusIcon';
+import { resolveVisualStatus } from '../../../components/shared/threadVisualStatus';
 import { awaitedSubject, eventWaitStoppedSummary, waitingFor } from '../thread-event-types';
 import type { EventWaitSummary, ThreadEvent } from '../thread-event-types';
 import { applyAggregateToMeta, type ThreadAggregate, type ThreadMeta } from '../thread-meta';

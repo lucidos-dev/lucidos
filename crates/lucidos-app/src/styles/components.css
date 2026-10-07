@@ -834,6 +834,8 @@
 
 .toast-inline .toast-actions {
     flex-wrap: nowrap;
+    /* The growing body already places these at the toast's right end. */
+    justify-content: flex-end;
 }
 
 /* The spinner keeps the app's standard ring size and centres in the icon's box.
@@ -1056,10 +1058,23 @@
     }
 }
 
-.folder-arrow {
-    font-size: var(--font-size-2xs);
-    color: var(--text-muted);
+.folder-chevron {
+    flex: 0 0 auto;
+    display: inline-flex;
     width: 0.75rem;
+    height: 0.75rem;
+    color: var(--text-muted);
+    transition: transform var(--duration-fast) ease;
+}
+
+.folder-chevron svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.folder-chevron[data-open="true"] {
+    transform: rotate(90deg);
 }
 
 .folder-icon {

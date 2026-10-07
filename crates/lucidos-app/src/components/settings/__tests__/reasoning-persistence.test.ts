@@ -38,6 +38,7 @@ const LOCAL_MODEL: ModelInfo = {
     },
   ],
   preferred_provider: null,
+  vision: false,
   sort_order: 1000,
   source: 'user',
   enabled: true,

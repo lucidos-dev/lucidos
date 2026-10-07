@@ -80,8 +80,8 @@ describe('drawer status mark starts the title line', () => {
 
   it('draws the thread pane title\'s mark the same way, so the two read alike', () => {
     const shared = cssRules(drawerCss).find(r => selectorList(r.selector).includes(MARK));
-    expect(selectorList(shared!.selector)).toContain('.thread-title > .thread-status');
-    const idle = cssRules(drawerCss).find(r => selectorList(r.selector).includes('.thread-title > .thread-status-idle'));
+    expect(selectorList(shared!.selector)).toContain('.thread-title-text > .thread-status');
+    const idle = cssRules(drawerCss).find(r => selectorList(r.selector).includes('.thread-title-text > .thread-status-idle'));
     expect(idle?.props.get('display')).toBe('none');
   });
 

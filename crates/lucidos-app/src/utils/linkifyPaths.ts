@@ -128,6 +128,7 @@ function rewriteArtifactAnchor(
 const DATA_APP_ID_ATTR = /\sdata-app-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_APP_FRAGMENT_ATTR = /\sdata-app-fragment\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_NAV_TARGET_ATTR = /\sdata-nav-target\s*=\s*(?:"[^"]*"|'[^']*')/i;
+const DATA_SETTINGS_VIEW_ATTR = /\sdata-settings-view\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_TRIGGER_ID_ATTR = /\sdata-trigger-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
 
 /** UI panels reachable from a markdown link like `[Notifications](notifications)`.
@@ -179,6 +180,18 @@ export function extractNavTargetFromHref(href: string): string | null {
   // `notifications/foo` is meaningless (no such sub-path exists).
   if (candidate.includes('/')) return null;
   return NAV_TARGETS.has(candidate) ? candidate : null;
+}
+
+/** Extract the Settings page a `settings:<view>` href names, such as
+ *  `[Settings → System → Backup](settings:backup)` in an engine notification.
+ *  `<view>` is a `navigate_ui` `settings_view` id.
+ *
+ *  Only the SHAPE is checked here. `handleNavigationRequest` validates the view
+ *  and toasts one it cannot render, so a stale id is named, never swallowed.
+ *  Bare `settings` (the Settings home) stays with `extractNavTargetFromHref`. */
+export function extractSettingsViewFromHref(href: string): string | null {
+  const m = /^settings:([a-z0-9-]+)\/?$/i.exec(href);
+  return m ? m[1] : null;
 }
 
 /** Does this href carry a URL scheme (`https:`, `mailto:`, `app:`, `file:`)?
@@ -430,22 +443,27 @@ function isWorkspaceAbsoluteRoute(href: string): boolean {
 /** Mirror of `rewriteArtifactAnchor` / `rewriteAppAnchor` for navigation
  *  panels. Returns a replacement opening tag with
  *  `class="nav-link" data-nav-target="<target>"` so the chat click handler
- *  routes through `handleNavigationRequest({ target })`. Returns null when the
- *  href is not a panel name, and the caller falls through to the next
- *  rewriter. */
+ *  routes through `handleNavigationRequest({ target })`. A `settings:<view>`
+ *  href also carries `data-settings-view="<view>"`. Returns null when the
+ *  href is neither, and the caller falls through to the next rewriter. */
 function rewriteNavAnchor(tag: string): string | null {
   const m = tag.match(HREF_ATTR);
   if (!m) return null;
   const href = m[1] ?? m[2];
   if (!href) return null;
-  const target = extractNavTargetFromHref(href);
+  const settingsView = extractSettingsViewFromHref(href);
+  const target = settingsView ? 'settings' : extractNavTargetFromHref(href);
   if (!target) return null;
-  const escapedTarget = target.replace(/"/g, '&quot;');
+  const viewAttr = settingsView ? ` data-settings-view="${escapeAttr(settingsView)}"` : '';
   const stripped = tag
     .replace(HREF_ATTR, '')
     .replace(CLASS_ATTR, '')
-    .replace(DATA_NAV_TARGET_ATTR, '');
-  return stripped.replace(/^<a/i, `<a href="#" class="nav-link" data-nav-target="${escapedTarget}"`);
+    .replace(DATA_NAV_TARGET_ATTR, '')
+    .replace(DATA_SETTINGS_VIEW_ATTR, '');
+  return stripped.replace(
+    /^<a/i,
+    `<a href="#" class="nav-link" data-nav-target="${escapeAttr(target)}"${viewAttr}`,
+  );
 }
 
 /** An app entry point, plus the place inside the app a link named. */

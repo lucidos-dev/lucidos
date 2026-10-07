@@ -17,6 +17,7 @@
 //! a raised setting lets the real `lucidos proxy` binary outlast 30 seconds.
 
 use crate::support::{apis_json_lock, base_url, http_client, user_client, workspace_tree_lock};
+use lucidos_engine::core::prefs;
 use serde_json::json;
 use std::time::Duration;
 
@@ -106,7 +107,7 @@ async fn a_raised_proxy_timeout_lets_lucidos_proxy_outlast_thirty_seconds() {
         .expect("apis.json write failed")
         .status()
         .as_u16();
-    let raised = put_preference("proxy_timeout_secs", "45").await;
+    let raised = put_preference(prefs::PROXY_TIMEOUT_SECS.key(), "45").await;
 
     // Blocking, so it runs off this test's runtime, which also drives the
     // upstream. The CLI's stdout is the upstream's body on success.
@@ -120,7 +121,7 @@ async fn a_raised_proxy_timeout_lets_lucidos_proxy_outlast_thirty_seconds() {
     .expect("the CLI task");
 
     // Restore before asserting, so a failure leaves nothing behind.
-    delete_preference("proxy_timeout_secs").await;
+    delete_preference(prefs::PROXY_TIMEOUT_SECS.key()).await;
     let _ = user_client()
         .await
         .delete(format!("{}/api/v1/data/config/apis.json", base_url()))
@@ -147,7 +148,7 @@ async fn a_raised_proxy_timeout_lets_lucidos_proxy_outlast_thirty_seconds() {
 #[tokio::test]
 async fn a_proxy_timeout_outside_the_range_is_refused_over_http() {
     for bad in ["601", "0", "soon"] {
-        let result = put_preference("proxy_timeout_secs", bad).await;
+        let result = put_preference(prefs::PROXY_TIMEOUT_SECS.key(), bad).await;
         assert_eq!(
             result["success"],
             json!(false),
@@ -155,11 +156,11 @@ async fn a_proxy_timeout_outside_the_range_is_refused_over_http() {
         );
         let error = result["error"].as_str().unwrap_or_default();
         assert!(
-            error.contains("proxy_timeout_secs"),
+            error.contains(prefs::PROXY_TIMEOUT_SECS.key()),
             "the refusal must name the key: {error}"
         );
     }
-    let result = put_preference("proxy_timeout_secs", "601").await;
+    let result = put_preference(prefs::PROXY_TIMEOUT_SECS.key(), "601").await;
     let error = result["error"].as_str().unwrap_or_default();
     assert!(
         error.contains("600"),
@@ -176,9 +177,86 @@ async fn a_proxy_timeout_outside_the_range_is_refused_over_http() {
         .expect("preferences JSON");
     // The raise test may hold its own value at this moment, so check for the
     // refused values rather than for absence.
-    let value = stored["preferences"]["proxy_timeout_secs"].as_str();
+    let value = stored["preferences"][prefs::PROXY_TIMEOUT_SECS.key()].as_str();
     assert!(
         !matches!(value, Some("601" | "0" | "soon")),
         "a refused value was stored: {stored}"
     );
+}
+
+/// An upstream on loopback that answers every request with `body` as JSON.
+async fn spawn_json_upstream(body: serde_json::Value) -> String {
+    let app = axum::Router::new().fallback(move || {
+        let body = body.clone();
+        async move { axum::Json(body) }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// A model call through the proxy records what it cost (ADR 0242). The
+/// builtin `local` proxy reaches a loopback upstream that answers in OpenAI's
+/// shape. No origin token rides on the request, so the row lands on the home
+/// thread, and the caller still gets the reply unchanged.
+#[tokio::test]
+async fn a_model_call_through_the_proxy_records_its_cost() {
+    let model = format!("e2e-proxied-{}", uuid::Uuid::new_v4());
+    let reply = json!({
+        "model": model,
+        "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+        "usage": {"prompt_tokens": 321, "completion_tokens": 12},
+    });
+    let upstream = spawn_json_upstream(reply.clone()).await;
+    let pointed = put_preference(prefs::LOCAL_BASE_URL.key(), &upstream).await;
+
+    let resp = http_client()
+        .post(format!(
+            "{}/api/v1/proxy/local/chat/completions",
+            base_url()
+        ))
+        .json(&json!({"model": "local-model", "messages": []}))
+        .send()
+        .await
+        .expect("proxy request failed");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+
+    let mut row = None;
+    for _ in 0..50 {
+        let rows: Vec<serde_json::Value> = user_client()
+            .await
+            .get(format!(
+                "{}/api/v1/events/query?event_type=ContextCaptured&limit=200",
+                base_url()
+            ))
+            .send()
+            .await
+            .expect("events query failed")
+            .json()
+            .await
+            .expect("an event list");
+        row = rows.into_iter().find(|r| r["payload"]["model"] == model);
+        if row.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Restore before asserting, so a failure leaves nothing behind.
+    delete_preference(prefs::LOCAL_BASE_URL.key()).await;
+
+    assert_eq!(
+        pointed["success"],
+        json!(true),
+        "the base URL was refused: {pointed}"
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, reply, "the caller gets the reply unchanged");
+    let row = row.expect("the proxied call recorded a row");
+    assert_eq!(row["payload"]["purpose"], "proxy");
+    assert_eq!(row["payload"]["usage"]["input_tokens"], 321);
+    assert_eq!(row["payload"]["usage"]["output_tokens"], 12);
 }

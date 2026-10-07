@@ -102,7 +102,9 @@ test.describe('An unsent message survives a page reload', () => {
     await sendMessage(page, followUp);
     await expect.poll(() => storedCount(page)).toBe(1);
 
-    await page.unroute(CHAT_ROUTE);
+    // The hold stays through the reload, which is what cuts the POST off.
+    // Unrouting first would release the held POST to the engine, which then
+    // takes the message, so no Not sent card would be owed.
     await page.reload();
     await expect(notSentCard(page)).toHaveCount(1, { timeout: 15_000 });
     // Unloading may reject the held POST first, and the page then records "no

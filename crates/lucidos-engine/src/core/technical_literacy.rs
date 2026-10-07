@@ -16,7 +16,7 @@
 
 use sqlx::PgPool;
 
-use crate::core::{PreferenceStore, PREF_TECHNICAL_LITERACY};
+use crate::core::prefs;
 
 /// One of the three levels, from least to most technical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,18 +148,11 @@ impl TechnicalLiteracy {
 ///
 /// A missing row, an unknown value and a failed read all resolve to `None`. A
 /// turn that fails on a bad row is worse than one that runs without the level.
+///
+/// Reads the raw row rather than the handle's value, because the retired
+/// [`MERGED_EVERYDAY_ID`] is no catalog value and still has to parse.
 pub async fn read(pool: &PgPool) -> Option<TechnicalLiteracy> {
-    let raw = match PreferenceStore::get(pool, PREF_TECHNICAL_LITERACY).await {
-        Ok(raw) => raw?,
-        Err(e) => {
-            log!(
-                "[TechnicalLiteracy] failed to read '{}': {}. Leaving it unset",
-                PREF_TECHNICAL_LITERACY,
-                e
-            );
-            return None;
-        }
-    };
+    let raw = prefs::TECHNICAL_LITERACY.stored(pool).await?;
     if raw.trim().is_empty() || raw.trim() == NOT_SET_ID {
         return None;
     }
@@ -167,7 +160,7 @@ pub async fn read(pool: &PgPool) -> Option<TechnicalLiteracy> {
     if level.is_none() {
         log!(
             "[TechnicalLiteracy] '{}' holds unknown level '{}'. Leaving it unset",
-            PREF_TECHNICAL_LITERACY,
+            prefs::TECHNICAL_LITERACY.key(),
             raw
         );
     }
@@ -311,7 +304,7 @@ mod tests {
         let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
         let knowhow = std::fs::read_to_string(repo.join("system-knowhow/setup-interview.md"))
             .expect("the setup interview knowhow ships");
-        assert!(knowhow.contains(crate::core::PREF_TECHNICAL_LITERACY));
+        assert!(knowhow.contains(prefs::TECHNICAL_LITERACY.key()));
         for level in TechnicalLiteracy::ALL {
             let row = format!(
                 "| {} | {} | `{}` |",
@@ -333,7 +326,8 @@ mod tests {
         let seed = |value: &'static str| {
             let pool = pool.clone();
             async move {
-                crate::test_support::seed_preference(&pool, PREF_TECHNICAL_LITERACY, value)
+                let key = prefs::TECHNICAL_LITERACY.key();
+                crate::test_support::seed_preference(&pool, key, value)
                     .await
                     .unwrap()
             }

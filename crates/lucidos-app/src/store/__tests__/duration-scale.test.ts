@@ -167,14 +167,14 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     what: "runs the image viewer's swipe cleanup if transitionend never fires",
   },
   {
+    file: '../../hooks/panelStepMorph.ts',
+    expr: /scaledDurationMs\(STEP_MORPH_MS\) \+ STEP_MORPH_SLACK_MS/,
+    what: 'settles a step morph if its finish event never arrives',
+  },
+  {
     file: '../../components/layout/Drawer.tsx',
     expr: /scaledDurationMs\(DRAWER_SLIDE_OUT_MS\) \+ DRAWER_SLIDE_OUT_SLACK_MS/,
     what: 'closes the menu drawer if its slide-out end never arrives',
-  },
-  {
-    file: '../../components/chat/PromptInput.tsx',
-    expr: /scaledDurationMs\(SEND_HOLD_SLIDE_MS\) \+ SEND_HOLD_SLIDE_SLACK_MS/,
-    what: 'keeps the side question pill drawn while its half slides back',
   },
   // The only entry whose transition is INLINE rather than a token. The FLIP
   // writes `transform` and `height` durations onto the element itself, so

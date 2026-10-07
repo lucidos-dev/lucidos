@@ -199,8 +199,7 @@ fn failure_notification_message(body: &str) -> String {
 }
 
 /// Emit a `NotificationCreated` for a trigger failure and send push to all devices.
-/// Failure notifications never deep-link to the trigger's owning app — see the
-/// "Deep-link discipline" guidance in `system-knowhow/triggers.md`.
+/// Failure notifications never deep-link to the trigger's owning app.
 async fn emit_failure_notification(
     engine: &SharedEngine,
     config: &TriggerConfig,

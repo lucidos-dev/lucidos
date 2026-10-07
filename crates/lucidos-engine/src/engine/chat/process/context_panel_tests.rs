@@ -420,7 +420,10 @@ fn a_keep_overwrites_the_first_seen_round() {
 fn elided_rows_are_counted_out_loud() {
     let items: Vec<PanelItem> = (0..30).map(|i| item(i as u8, 100, 0)).collect();
     let rendered = panel(&items, 1_000);
-    assert!(rendered.contains("30 items under 500 chars"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("30 items under {ROW_MIN_CHARS} chars")),
+        "{rendered}"
+    );
 }
 
 /// Largest first, because those are the only ones where letting go pays.
@@ -683,6 +686,9 @@ fn the_two_elision_reasons_are_counted_separately() {
     let mut items: Vec<PanelItem> = (0..MAX_ROWS + 3).map(|i| item(i as u8, 5_000, 0)).collect();
     items.push(item(250, 100, 0));
     let rendered = panel(&items, 1_000);
-    assert!(rendered.contains("1 items under 500 chars"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("1 items under {ROW_MIN_CHARS} chars")),
+        "{rendered}"
+    );
     assert!(rendered.contains("3 more items did not fit"), "{rendered}");
 }

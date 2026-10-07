@@ -42,6 +42,7 @@ import {
 import { workspaceState, type WorkspaceState } from '../../utils/workspaceState';
 import { BellIcon } from '../shared/icons';
 import { workspaceActionRow } from './WorkspaceActionRow';
+import { GlyphBadge } from '../shared/GlyphBadge';
 
 /** The indent an unfolded action takes under a row of THIS group, whose rows
  *  are `.brand-menu-item`s leading with the bell. The switcher passes its own,
@@ -196,7 +197,7 @@ function notifyRow(row: NotifyRow, props: NotificationsGroupProps) {
           ellipsise, and its unread count as a pill), so a second pair would be
           two rules to keep in step for one appearance. */}
       <span class="brand-menu-ws-name">{row.name}</span>
-      <span class="brand-menu-ws-badge" aria-hidden="true">{countLabel(row.count)}</span>
+      <GlyphBadge class="brand-menu-ws-badge" aria-hidden="true">{countLabel(row.count)}</GlyphBadge>
     </button>
   );
 }

@@ -1,6 +1,7 @@
 import { Fragment } from 'preact';
 import type { ComponentChild, ComponentChildren } from 'preact';
 import { OverflowMenu, type OverflowMenuContext } from '../shared/OverflowMenu';
+import { keepFocusOnPress } from '../../utils/dom';
 
 /** One header action as DATA, so the same record renders either as a full-size
  *  header icon button or as a row inside the collapsed ⋯ overflow menu. `icon`
@@ -42,6 +43,9 @@ export interface HeaderActionSpec {
    *  composer's toggles each take their own paint keyed on `data-role`, so they
    *  ask for the bare `active` those rules select on. */
   activeClass?: string;
+  /** The press leaves focus where it is, so a field being typed in keeps the
+   *  iOS keyboard up. For a toggle the reader presses mid-sentence. */
+  keepsFocus?: boolean;
   /** Disabled with an explanatory tooltip (diff-pinned refresh). */
   disabledTooltip?: string;
   /** The full-size rendering, where the default button cannot express it: a
@@ -99,6 +103,7 @@ export function renderHeaderAction(a: HeaderActionSpec, attrs: Record<string, st
       {...rowAttrs}
       class={cls}
       onClick={a.onClick}
+      onMouseDown={a.keepsFocus ? keepFocusOnPress : undefined}
       aria-label={a.label}
       aria-pressed={a.active}
       data-tooltip={tooltip}

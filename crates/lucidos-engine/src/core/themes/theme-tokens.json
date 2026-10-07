@@ -896,7 +896,7 @@
       "group": "shape",
       "kind": "length",
       "label": "Round radius",
-      "description": "Corner radius of circles and pills: round buttons, dots, badges and chips. Set it to 0 to square them.",
+      "description": "Corner radius of circles and pills: round buttons, dots and chips. Set it to 0 to square them. Badges on icons stay round in every theme.",
       "frames": true,
       "default": {
         "dark": "999px",

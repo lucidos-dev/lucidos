@@ -50,7 +50,7 @@ describe('the Filter glyph crossfades', () => {
   it('moves the shown flag between the same nodes on every change', () => {
     show('all');
     const before = layers();
-    for (const glyph of ['filtered', 'all', 'review', 'running', 'all'] as const) {
+    for (const glyph of ['filtered', 'all', 'review', 'in-flight', 'all'] as const) {
       show(glyph);
       expect(layers()).toEqual(before);
       expect(current().map(l => l.dataset.layer)).toEqual([glyph]);

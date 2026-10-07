@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { brandBadgeState, brandBadgeLabel, BrandBadge, UnreadBrandBadge, unreadBadgeLabel } from './BrandBadge';
+import { GlyphBadge } from '../shared/GlyphBadge';
 import { vnodeToText } from '../chat/__tests__/vnodeToText';
 import { crossWorkspaceUnreadTotal, peerWorkspaces } from '../../store/actions/app-badge';
 import type { ActivityRow } from '../../store/actions/activityRows';
@@ -20,6 +21,7 @@ import {
   engineRestarting,
   mobileView,
 } from '../../store/store';
+vi.mock('../shared/GlyphBadge', () => import('../shared/__tests__/glyphBadgeStub'));
 
 describe('brandBadgeState / brandBadgeLabel', () => {
   /** The badge is driven by the activity group's rows, which the component
@@ -173,10 +175,10 @@ describe('BrandBadge', () => {
     ['busy', () => { engineBuilding.value = true; }],
     ['ready', () => { engineVersionReady.value = true; }],
     ['pending', () => { engineVersionPending.value = true; }],
-  ])('is a plain span with no handler in the %s state', (_state, arrange) => {
+  ])('is a GlyphBadge with no handler in the %s state', (_state, arrange) => {
     arrange();
     const badge = findByClass(BrandBadge(), 'brand-badge')[0] as VNode<Record<string, unknown>> | undefined;
-    expect(badge?.type).toBe('span');
+    expect(badge?.type).toBe(GlyphBadge);
     expect(badge?.props.onClick).toBeUndefined();
   });
 

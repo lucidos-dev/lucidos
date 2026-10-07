@@ -2,6 +2,8 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-23
+- **Amended by**: [0369](0369-a-threads-own-stop-is-not-news.md). A thread's own stop
+  no longer wakes it, and `lucidos hardened mark` stops the thread's leftover tasks.
 
 ## Context
 

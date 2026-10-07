@@ -50,10 +50,10 @@ describe('a callback under an open question', () => {
   ]));
   const last = exchanges.length - 1;
 
-  it('reads "Held until you reply", never "Requesting"', () => {
+  it('is held, never "Requesting"', () => {
     expect(exchanges[last].userEvent.type).toBe('UserPromptInjected');
     expect(parkedStatus(exchanges, last)).toBe('held');
-    expect(statusLabel('held', false).label).toBe('Held until you reply');
+    expect(statusLabel('held', false).label).toBe('Not read yet');
   });
 
   it('leaves the question itself asking for the answer', () => {
@@ -68,6 +68,37 @@ describe('a callback under an open question', () => {
       ev(3, CHILD_RETURNED),
     ]));
     expect(parkedStatus(childLast, childLast.length - 1)).toBe('held');
+  });
+
+  it('holds an older callback behind the card, not only the newest', () => {
+    const older = exchanges.findIndex(e => e.userEvent.type === 'ChildThreadCompleted');
+    expect(older).toBeLessThan(last);
+    const behind = exchangeStatus(exchanges[older], '', false, false, false, true, true, true);
+    expect(behind).toBe('held');
+    // Not behind the card, the same exchange settles as before.
+    expect(exchangeStatus(exchanges[older], '', false, false, false, true, true, false)).not.toBe('held');
+  });
+
+  it('never holds a stopped child note, which wakes nothing', () => {
+    const stopped = groupIntoExchanges(new Map([
+      ev(1, { type: 'MessageReceived', text: 'run the loop' }),
+      ev(2, QUESTION),
+      ev(3, { type: 'ChildThreadStopped', child_thread_id: 'c1' } as ThreadEvent),
+    ]));
+    const i = stopped.length - 1;
+    expect(stopped[i].userEvent.type).toBe('ChildThreadStopped');
+    expect(exchangeStatus(stopped[i], '', true, false, false, true, true, true)).not.toBe('held');
+  });
+
+  it('never holds a change record, which the agent does not read', () => {
+    const applied = groupIntoExchanges(new Map([
+      ev(1, { type: 'MessageReceived', text: 'run the loop' }),
+      ev(2, QUESTION),
+      ev(3, { type: 'ChangeApplied', change_id: 'ch1' } as ThreadEvent),
+    ]));
+    const i = applied.length - 1;
+    expect(applied[i].userEvent.type).toBe('ChangeApplied');
+    expect(exchangeStatus(applied[i], '', true, false, true, true, true, true)).not.toBe('held');
   });
 
   it('holds on a coding-agent thread too', () => {

@@ -1,11 +1,13 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { applyingNowThreadIds, archivingThreadIds, toasts } from '../store';
+import { applyingNowThreadIds, archivingThreadIds, changes, toasts } from '../store';
 
 vi.mock('../../api/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/client')>();
   return {
     ...actual,
     applyNow: vi.fn(),
+    applyChange: vi.fn(),
+    fetchChanges: vi.fn(),
   };
 });
 
@@ -15,13 +17,16 @@ vi.mock('../../components/chat/scrollState', () => ({
 }));
 
 import { endClaudeCodeAndApply } from '../actions/chat-claude-code';
-import { applyNow, ApiError } from '../../api/client';
+import { applyNow, applyChange, fetchChanges, ApiError, type Change, type ChangesState } from '../../api/client';
 
 const mockedApplyNow = vi.mocked(applyNow);
+const mockedApplyChange = vi.mocked(applyChange);
+const mockedFetchChanges = vi.mocked(fetchChanges);
 
 beforeEach(() => {
   applyingNowThreadIds.value = new Map();
   archivingThreadIds.value = new Set();
+  changes.value = { status: 'not-loaded' };
   toasts.value = [];
   vi.clearAllMocks();
   vi.useFakeTimers();
@@ -122,6 +127,50 @@ describe('endClaudeCodeAndApply 409 safety timeout', () => {
 
     // Should not have called the API or set applying state
     expect(mockedApplyNow).not.toHaveBeenCalled();
+    expect(applyingNowThreadIds.value.has('thread-1')).toBe(false);
+  });
+});
+
+describe('endClaudeCodeAndApply with no live session', () => {
+  const pendingChange = { id: 'change-1', thread_id: 'thread-1', status: 'pending', file_count: 1 } as Change;
+  const served = (pending: Change[]): ChangesState => ({
+    pending,
+    applied: [],
+    total_pending: pending.length,
+    restart_required: false,
+    restart_groups: [],
+    client_update_available: false,
+    has_more_applied: false,
+    apply_all_in_progress: false,
+  });
+
+  it('re-reads the changes list rather than trusting a cache that lags the proposal', async () => {
+    // The cache predates the proposal. Trusting it said "No pending changes".
+    changes.value = { status: 'loaded', data: [] };
+    mockedApplyNow.mockRejectedValueOnce(new ApiError(404, 'no session'));
+    mockedFetchChanges.mockResolvedValueOnce(served([pendingChange]));
+    mockedApplyChange.mockResolvedValueOnce({ status: 'applied' } as Awaited<ReturnType<typeof applyChange>>);
+
+    await endClaudeCodeAndApply('thread-1');
+
+    expect(mockedApplyChange).toHaveBeenCalledWith('change-1');
+    expect(toasts.value.some((t) => /no pending changes/i.test(t.message))).toBe(false);
+  });
+
+  it('never calls the change absent when the list could not be read', async () => {
+    changes.value = { status: 'loaded', data: [] };
+    mockedApplyNow.mockRejectedValueOnce(new ApiError(404, 'no session'));
+    // Transport failures on both attempts leave the stale cache in place.
+    mockedFetchChanges
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockRejectedValueOnce(new TypeError('Load failed'));
+
+    await endClaudeCodeAndApply('thread-1');
+
+    expect(mockedApplyChange).not.toHaveBeenCalled();
+    const toast = toasts.value.find((t) => t.key === 'applying-thread-1');
+    expect(toast?.message).toMatch(/not applied/i);
+    expect(toast?.message).not.toMatch(/no pending changes/i);
     expect(applyingNowThreadIds.value.has('thread-1')).toBe(false);
   });
 });

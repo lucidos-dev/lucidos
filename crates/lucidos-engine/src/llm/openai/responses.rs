@@ -5,6 +5,7 @@
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolDefinition,
 };
+use crate::llm::ModelSelection;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -40,7 +41,9 @@ impl OpenAiProvider {
                             // A tail block is ordinary text here. Only the
                             // engine and the Anthropic cache anchor care who
                             // wrote it.
-                            ContentBlock::Text { text } | ContentBlock::EngineTail { text } => {
+                            ContentBlock::Text { text }
+                            | ContentBlock::EngineTail { text }
+                            | ContentBlock::MemoryView { text } => {
                                 text_parts.push(text.clone());
                             }
                             ContentBlock::ToolUse {
@@ -407,11 +410,12 @@ impl OpenAiProvider {
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
-        model: &str,
+        selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
-        reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let model = selection.model.unwrap_or(&self.model);
+        let reasoning_effort = selection.reasoning_effort;
         let body =
             self.build_responses_body(model, messages, tools, system_prompt, reasoning_effort);
 
@@ -438,7 +442,14 @@ impl OpenAiProvider {
             let builder = self
                 .apply_headers(self.streaming_client.post(&self.responses_url))
                 .json(&body);
-            let resp = match crate::llm::send_streaming_request(builder, model, attempt).await {
+            let resp = match crate::llm::send_streaming_request(
+                builder,
+                model,
+                attempt,
+                selection.attempt_timeout,
+            )
+            .await
+            {
                 crate::llm::StreamSend::Got(r) => r,
                 crate::llm::StreamSend::Retry => continue,
                 crate::llm::StreamSend::Failed(e) => return Err(e),

@@ -1,11 +1,14 @@
 pub mod anthropic;
 pub mod anthropic_wire;
+mod aux_provider;
 /// Temporary diagnostic, off unless `LUCIDOS_CACHE_PROBE` is set. Tracked in
 /// `docs/temporary-measures.md`.
 pub(crate) mod cache_probe;
 pub mod image;
 pub mod judgment;
+pub mod metered;
 pub mod mock;
+pub use mock::MOCK_MODEL;
 pub mod model_registry;
 pub mod openai;
 pub mod provider;
@@ -16,6 +19,7 @@ pub mod routing;
 pub mod tool_names;
 pub mod tools;
 pub mod unconfigured;
+pub mod usage_wire;
 pub mod validate;
 pub mod vertex;
 pub mod web_search;
@@ -23,9 +27,10 @@ pub mod web_search;
 pub use anthropic::{
     resolve_anthropic_auth, AnthropicAuth, AnthropicAuthSource, AnthropicProvider,
 };
+pub(crate) use aux_provider::AuxProvider;
 pub use image::{ImageProvider, ImageSize};
 pub use judgment::{
-    Answers, ChoiceAnswer, JevProvider, Judgment, JudgmentProvider, NoulCriteria, Question,
+    Answers, ChoiceAnswer, Judgment, JudgmentProvider, NoulCriteria, Question, SystemOneProvider,
     JEV_DEFAULT_MODEL,
 };
 pub use model_registry::{ModelRegistry, ProviderKind};
@@ -131,6 +136,27 @@ pub fn is_transient_error(err: &str) -> bool {
         || contains_status_token(&lower, "502")
 }
 
+/// Whether a failed call says the provider has no capacity for us right now:
+/// a rate limit, an overload, or a timeout. A caller that adapts how many
+/// calls it runs at once backs off on one.
+pub fn is_capacity_error(err: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "overloaded",
+        "resource_exhausted",
+        "resource exhausted",
+        "quota",
+        "timed out",
+    ];
+    let lower = err.to_lowercase();
+    PHRASES.iter().any(|p| lower.contains(p))
+        || ["429", "529", "503"]
+            .iter()
+            .any(|code| contains_status_token(&lower, code))
+}
+
 /// Whether a stream/parse error message indicates a retryable condition.
 /// Superset of `is_transient_error` — also includes stream parsing errors and
 /// known intermittent validation blips from regional API replicas (rare 400s
@@ -150,9 +176,12 @@ pub fn is_retryable_error(err: &str) -> bool {
 
 /// Whether an HTTP response should trigger a retry — combines status-code and
 /// body checks (covers transient 5xx/429/529 plus known 400 validation blips
-/// that succeed on retry) and bounds attempts at `MAX_RETRIES`.
+/// that succeed on retry) and bounds attempts at `MAX_RETRIES`. A 2xx is never
+/// retried: its body is the model's billed answer, not an error message.
 pub fn should_retry_http(status: u16, body: &str, attempt: u32) -> bool {
-    (is_retryable_status(status) || is_retryable_error(body)) && attempt <= MAX_RETRIES
+    !(200..300).contains(&status)
+        && (is_retryable_status(status) || is_retryable_error(body))
+        && attempt <= MAX_RETRIES
 }
 
 /// Calculate exponential backoff delay for a given attempt (1-indexed).
@@ -262,18 +291,37 @@ pub(crate) enum StreamSend {
 /// timeout both retry up to `MAX_RETRIES` (both are network stalls), then fail.
 /// The caller builds the full `RequestBuilder` (URL + headers + body) and reads
 /// the SSE stream itself on `Got` — only the send/retry handling is shared.
+///
+/// `attempt_timeout` is [`ModelSelection::attempt_timeout`], applied by
+/// [`cap_attempt`]. A required argument, so no streaming site can drop it.
 pub(crate) async fn send_streaming_request(
     builder: reqwest::RequestBuilder,
     model: &str,
     attempt: u32,
+    attempt_timeout: Option<Duration>,
 ) -> StreamSend {
     send_streaming_request_with_timeout(
-        builder,
+        cap_attempt(builder, attempt_timeout),
         model,
         attempt,
         Duration::from_secs(STREAM_HEADER_TIMEOUT_SECS),
     )
     .await
+}
+
+/// Cap one HTTP attempt, the body included, at `attempt_timeout`.
+///
+/// Per request rather than per client, because the router's backends are
+/// shared by turns and auxiliary calls. The request's timeout overrides the
+/// client's, so a 900s client still gives up within an auxiliary budget.
+pub(crate) fn cap_attempt(
+    builder: reqwest::RequestBuilder,
+    attempt_timeout: Option<Duration>,
+) -> reqwest::RequestBuilder {
+    match attempt_timeout {
+        Some(timeout) => builder.timeout(timeout),
+        None => builder,
+    }
 }
 
 /// Inner implementation with the header-phase timeout injected, so tests can
@@ -462,6 +510,30 @@ mod tests {
         assert!(is_transient_error("got 503,"));
     }
 
+    /// Only a sign that the provider is out of capacity counts. An auth or
+    /// request error says nothing about how many calls it takes at once.
+    #[test]
+    fn a_capacity_error_is_a_rate_limit_an_overload_or_a_timeout() {
+        for err in [
+            "API error 429: Too Many Requests",
+            "rate_limit_exceeded",
+            "HTTP 529 overloaded_error",
+            "RESOURCE_EXHAUSTED: quota exceeded for model",
+            "status 503",
+            "timed out after 120s",
+        ] {
+            assert!(is_capacity_error(err), "{err}");
+        }
+        for err in [
+            "API error 401: invalid x-api-key",
+            "API error 400: prompt is too long",
+            "request id 4291abc",
+            "the model returned an empty line",
+        ] {
+            assert!(!is_capacity_error(err), "{err}");
+        }
+    }
+
     #[test]
     fn test_with_retry_context() {
         assert_eq!(
@@ -548,6 +620,51 @@ mod tests {
         }
     }
 
+    /// An auxiliary attempt gives up at its own cap, not at the 120s header
+    /// bound. Without the cap the router's long-lived clients would let one
+    /// attempt eat the purpose's whole deadline (ADR 0107).
+    #[tokio::test]
+    async fn an_auxiliary_attempt_gives_up_within_its_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let builder = reqwest::Client::new()
+            .post(format!("http://{}/", addr))
+            .body("{}");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            send_streaming_request(
+                builder,
+                "test-model",
+                MAX_RETRIES + 1,
+                Some(Duration::from_millis(200)),
+            ),
+        )
+        .await
+        .expect("the attempt cap must end the attempt long before the header bound");
+        assert!(matches!(outcome, StreamSend::Failed(_)));
+    }
+
+    /// A turn passes no cap, so its request keeps the client's behaviour and a
+    /// long valid stream is never cut off.
+    #[test]
+    fn only_a_capped_call_carries_a_request_timeout() {
+        let request = |cap| {
+            cap_attempt(reqwest::Client::new().post("http://localhost/"), cap)
+                .build()
+                .expect("build the request")
+        };
+        assert_eq!(request(None).timeout(), None);
+        let cap = Duration::from_secs(20);
+        assert_eq!(request(Some(cap)).timeout(), Some(&cap));
+    }
+
     /// A character split across two reads must arrive whole. Decoding each
     /// chunk on its own yields two U+FFFD instead, which corrupts model text
     /// and any file written from a tool argument.
@@ -585,5 +702,16 @@ mod tests {
         assert!(!is_retryable_status(400));
         assert!(!is_retryable_status(401));
         assert!(!is_retryable_status(404));
+    }
+
+    #[test]
+    fn a_successful_response_is_never_retried_whatever_its_body_says() {
+        // A billed answer can mention a rate limit or carry a 503 token count.
+        let body = r#"{"text":"the rate limit timed out","promptTokenCount": 503}"#;
+        assert!(is_retryable_error(body));
+        for status in [200, 201, 204, 299] {
+            assert!(!should_retry_http(status, body, 1), "status {status}");
+        }
+        assert!(should_retry_http(400, body, 1));
     }
 }

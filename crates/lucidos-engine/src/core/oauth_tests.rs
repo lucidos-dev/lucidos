@@ -1,5 +1,9 @@
 use super::*;
 
+// The redirect URIs below spell `14981` and `/oauth/callback` literally on
+// purpose. They are a wire pin: users register that exact URI with each
+// provider, so a change to `CALLBACK_PORT` or `CALLBACK_PATH` must fail here.
+
 /// What a credential that says nothing about authorization parameters sends,
 /// i.e. what every connection made before the field existed sends. Spelled as
 /// `parse(None)` rather than a literal so a test can never assert against a
@@ -1573,11 +1577,14 @@ async fn releasing_an_empty_slot_supersedes_nothing() {
 #[test]
 fn a_port_clash_explains_itself_and_every_other_error_keeps_its_words() {
     let msg = callback_bind_error(
-        14981,
+        CALLBACK_PORT,
         std::io::Error::new(std::io::ErrorKind::AddrInUse, "Address already in use"),
     )
     .to_string();
-    assert!(msg.contains("14981"), "the port must be named: {msg}");
+    assert!(
+        msg.contains(&CALLBACK_PORT.to_string()),
+        "the port must be named: {msg}"
+    );
     assert!(
         msg.contains("another Lucidos workspace"),
         "the likely cause must be named: {msg}"

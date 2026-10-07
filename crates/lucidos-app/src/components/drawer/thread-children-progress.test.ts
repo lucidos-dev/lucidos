@@ -14,7 +14,7 @@ import { threadMap, threadsLoaded } from '../../store/store';
 import { displaySection } from '../../generated/thread-lifecycle';
 import type { ThreadState, ThreadMeta, ThreadStatus } from '../../store/thread-events';
 import type { ArchiveState } from '../../generated/thread-lifecycle';
-import { resolveVisualStatus, visualStatusFor } from '../shared/ThreadStatusIcon';
+import { resolveVisualStatus, visualStatusFor } from '../shared/threadVisualStatus';
 import { familyDisclosureLabel } from './ThreadDrawer';
 
 function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadState {

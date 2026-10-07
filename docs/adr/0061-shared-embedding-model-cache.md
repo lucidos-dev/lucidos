@@ -54,8 +54,9 @@ cache across every workspace.
 
 **Applying the default by setting the variable is load-bearing, not a style
 choice.** `fastembed` reads `FASTEMBED_CACHE_DIR` itself inside
-`InitOptions::new`, while the engine pre-fetches the files through `hf-hub`
-directly (that is how the download reports byte progress at all). The two halves
+`InitOptions::new`. The engine pre-fetches the files into `hf-hub`'s cache
+layout itself, which is how the download reports byte progress and how every
+read gets a deadline. It takes the same blob `flock` as `hf-hub`. The two halves
 must resolve the same directory or the model downloads twice, so a default only
 the engine's own resolver knew about would defeat the change it was making.
 

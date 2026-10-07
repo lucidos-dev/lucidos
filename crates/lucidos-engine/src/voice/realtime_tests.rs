@@ -62,7 +62,10 @@ fn an_unnamed_transcriber_falls_back_rather_than_going_mute() {
             transcriber: blank.to_string(),
             ..opening()
         };
-        assert_eq!(transcription_of(&unnamed)["model"], TRANSCRIBE_MODEL);
+        assert_eq!(
+            transcription_of(&unnamed)["model"],
+            crate::core::prefs::MODEL_VOICE_TRANSCRIBER.default_text()
+        );
     }
 }
 

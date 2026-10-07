@@ -16,7 +16,7 @@
 import { describe, it, expect } from 'vitest';
 import { exchangeTimestamp, groupIntoExchanges, type StoredEvent, type ThreadEvent } from '../thread-events';
 import { legacyOrigin } from '../thread-events/exchange-grouping';
-import { resolveVisualStatus } from '../../components/shared/ThreadStatusIcon';
+import { resolveVisualStatus } from '../../components/shared/threadVisualStatus';
 import { resolveThreadLinkTitle } from '../../components/chat/MessageRoutePanel';
 import { actorInitiator } from '../../components/chat/ChatExchange';
 

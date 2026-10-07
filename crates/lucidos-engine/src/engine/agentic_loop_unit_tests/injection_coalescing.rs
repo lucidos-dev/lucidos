@@ -53,10 +53,13 @@ mod injection_coalescing_tests {
 
     #[test]
     fn coalesced_user_text_message_uses_one_llm_message_for_multiple_prompts() {
-        let msg = coalesced_user_text_message(&[
-            prompt("first follow-up", InjectedPromptKind::UserText),
-            prompt("second follow-up", InjectedPromptKind::UserText),
-        ]);
+        let msg = coalesced_user_text_message(
+            std::path::Path::new(""),
+            &[
+                prompt("first follow-up", InjectedPromptKind::UserText),
+                prompt("second follow-up", InjectedPromptKind::UserText),
+            ],
+        );
 
         assert_eq!(msg.role, "user");
         match msg.content {
@@ -167,7 +170,7 @@ mod injection_coalescing_tests {
         let reprocess = coalesced_user_text_for_reprocess(&prompts);
         assert!(reprocess.starts_with("[USER MESSAGE"), "{reprocess}");
 
-        match coalesced_user_text_message(&prompts).content {
+        match coalesced_user_text_message(std::path::Path::new(""), &prompts).content {
             MessageContent::Text(text) => {
                 assert!(text.starts_with("[USER INTERJECTION"), "{text}");
             }
@@ -184,7 +187,7 @@ mod injection_coalescing_tests {
         }]);
         let second = prompt("after image", InjectedPromptKind::UserText);
 
-        let msg = coalesced_user_text_message(&[first, second]);
+        let msg = coalesced_user_text_message(std::path::Path::new(""), &[first, second]);
         match msg.content {
             MessageContent::Blocks(blocks) => {
                 assert!(matches!(blocks[0], ContentBlock::Text { .. }));
@@ -204,6 +207,41 @@ mod injection_coalescing_tests {
             }
             MessageContent::Text(_) => panic!("image prompts must use blocks"),
         }
+    }
+
+    /// An image sent mid-turn names its handle, as a turn-opening one does.
+    /// Unlabeled, the agent has to guess its `thread:N` to save or edit it.
+    #[test]
+    fn a_mid_turn_image_is_labeled_with_its_handle() {
+        use base64::Engine as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D,
+        ];
+        let image = crate::api::ChatImage {
+            base64: base64::engine::general_purpose::STANDARD.encode(png),
+            mime_type: "image/png".to_string(),
+        };
+        // Stored as the mid-turn `MessageReceived` stores it, before injection.
+        let images = std::slice::from_ref(&image);
+        crate::engine::chat::images_to_hashes(tmp.path(), Some(images));
+        let handle = crate::engine::chat::current_image_handles(tmp.path(), images)
+            .pop()
+            .flatten()
+            .expect("a stored PNG has a handle");
+        let mut with_image = prompt("save this", InjectedPromptKind::UserText);
+        with_image.images = Some(vec![image]);
+
+        let MessageContent::Blocks(blocks) =
+            coalesced_user_text_message(tmp.path(), &[with_image]).content
+        else {
+            panic!("image prompts must use blocks");
+        };
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text } if text.contains(&handle)),
+            "the prompt text must name {handle}, got {:?}",
+            blocks[0]
+        );
     }
 
     #[test]

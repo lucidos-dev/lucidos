@@ -255,7 +255,7 @@ impl AgentRuntime for CodexRuntime {
             super::spawn_env::resolve_binary_override(
                 path,
                 "Codex (`codex`)",
-                crate::core::PREF_CODING_AGENT_CODEX_PATH,
+                crate::core::prefs::CODING_AGENT_CODEX_PATH.key(),
             )?;
         }
         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -602,7 +602,10 @@ pub(super) fn lucidos_mcp_server_config_json(
             },
         }),
     );
-    obj.insert("tool_timeout_sec".to_string(), 86400.into());
+    obj.insert(
+        "tool_timeout_sec".to_string(),
+        crate::engine::cc_settings::USER_ANSWER_WAIT_SECS.into(),
+    );
     serde_json::Value::Object(obj)
 }
 

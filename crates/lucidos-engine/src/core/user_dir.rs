@@ -1,12 +1,20 @@
 use std::path::Path;
 use std::process::Command;
 
-/// Ensure the user-level Lucidos directory is a git repo. No-op if .git/ already exists or dir doesn't exist.
+/// The repo tracks `knowhow/` and nothing else. The directory also holds the
+/// local token and the paired devices. A staged blob copies a file without its
+/// permissions.
+const USER_DIR_GITIGNORE: &str = "/*\n!/.gitignore\n!/knowhow/\n";
+
+/// Ensure the user-level Lucidos directory is a git repo that tracks only
+/// `knowhow/`, with `.git` readable by its owner alone. A no-op when the
+/// directory does not exist.
 pub fn ensure_git_init(user_dir: &Path) {
     if !user_dir.exists() {
         return;
     }
     if user_dir.join(".git").exists() {
+        restrict_git_dir(user_dir);
         return;
     }
     log!("[UserDir] Initializing git repo at {}", user_dir.display());
@@ -17,9 +25,18 @@ pub fn ensure_git_init(user_dir: &Path) {
     match output {
         Ok(o) if o.status.success() => {
             log!("[UserDir] Git repo initialized");
+            restrict_git_dir(user_dir);
+            if let Err(e) = std::fs::write(user_dir.join(".gitignore"), USER_DIR_GITIGNORE) {
+                log!("[UserDir] Could not write .gitignore, so nothing is staged: {e}");
+                return;
+            }
+            let mut stage = vec!["add", "--", ".gitignore"];
+            if user_dir.join("knowhow").is_dir() {
+                stage.push("knowhow");
+            }
             // Initial commit so there's a HEAD for subsequent auto_commit calls
             match Command::new("git")
-                .args(["add", "."])
+                .args(&stage)
                 .current_dir(user_dir)
                 .output()
             {
@@ -50,6 +67,23 @@ pub fn ensure_git_init(user_dir: &Path) {
         Err(e) => log!("[UserDir] Failed to run git: {}", e),
     }
 }
+
+/// Make `.git` owner-only. Git writes its objects world-readable, so this is
+/// what keeps a secret an older engine already staged away from other accounts.
+#[cfg(unix)]
+fn restrict_git_dir(user_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let git_dir = user_dir.join(".git");
+    if let Err(e) = std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o700)) {
+        log!(
+            "[UserDir] Could not make {} owner-only: {e}",
+            git_dir.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_git_dir(_user_dir: &Path) {}
 
 /// Stage a file and commit in the user dir. Best-effort — logs errors but does not propagate.
 pub fn auto_commit(user_dir: &Path, relative_path: &str, message: &str) {
@@ -121,6 +155,57 @@ mod tests {
             dir.join(".git").exists(),
             "should have initialized git repo"
         );
+    }
+
+    /// The first boot ran `git add .` over the whole directory, which copied
+    /// the 0600 local token into a world-readable git object.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_git_init_never_stages_outside_knowhow() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".lucidos");
+        std::fs::create_dir_all(dir.join("knowhow")).unwrap();
+        std::fs::write(dir.join("knowhow/a.md"), "Content.").unwrap();
+        std::fs::write(dir.join("local-token"), "secret-token-bytes").unwrap();
+        std::fs::write(dir.join("paired-devices.json"), "{}").unwrap();
+
+        ensure_git_init(&dir);
+
+        let tracked = git_stdout(&dir, &["ls-files"]);
+        assert_eq!(tracked, ".gitignore\nknowhow/a.md\n");
+        let blob = git_stdout(&dir, &["hash-object", "local-token"]);
+        let found = Command::new("git")
+            .args(["cat-file", "-e", blob.trim()])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(!found.status.success(), "no object holds the token");
+        let mode = std::fs::metadata(dir.join(".git"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// An older engine already staged everything. Making `.git` owner-only is
+    /// what closes those objects to other accounts.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_git_init_makes_an_existing_git_dir_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".lucidos");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::set_permissions(dir.join(".git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_git_init(&dir);
+
+        let mode = std::fs::metadata(dir.join(".git"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]

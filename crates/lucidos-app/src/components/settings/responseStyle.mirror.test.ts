@@ -10,7 +10,6 @@ import {
   MAX_INSTRUCTION_CHARS,
   MAX_LABEL_CHARS,
   MAX_STYLES,
-  STANDARD_ID,
 } from './responseStyle';
 
 /** The engine's own copy of the *style library* bounds.
@@ -47,10 +46,5 @@ describe('the style-library bounds mirror the engine', () => {
     expect(MAX_LABEL_CHARS).toBe(rustUsize('MAX_LABEL_CHARS'));
     expect(MAX_INSTRUCTION_CHARS).toBe(rustUsize('MAX_INSTRUCTION_CHARS'));
     expect(MAX_STYLES).toBe(rustUsize('MAX_STYLES'));
-  });
-
-  it('agrees on the off switch id', () => {
-    const match = RUST.match(/pub const STANDARD_ID: &str = "([a-z-]+)";/);
-    expect(match?.[1]).toBe(STANDARD_ID);
   });
 });

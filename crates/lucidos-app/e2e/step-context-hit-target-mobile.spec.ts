@@ -74,10 +74,18 @@ async function probeMiddleCounter(page: Page, offsets: number[]): Promise<Probe>
     const cx = (box.left + box.right) / 2;
     const cy = (box.top + box.bottom) / 2;
     const reaches = (x: number, y: number) => document.elementFromPoint(x, y)?.closest('[data-role="step-context"]') === counter;
+    // How far the reach runs from the centre, bisected to well under a
+    // hundredth of a pixel. A coarse step would undercount every edge.
     const walk = (dx: number, dy: number) => {
-      let d = 0;
-      while (d < 120 && reaches(cx + dx * (d + 0.5), cy + dy * (d + 0.5))) d += 0.5;
-      return d;
+      let inside = 0;
+      let outside = 120;
+      if (reaches(cx + dx * outside, cy + dy * outside)) return outside;
+      while (outside - inside > 1 / 128) {
+        const d = (inside + outside) / 2;
+        if (reaches(cx + dx * d, cy + dy * d)) inside = d;
+        else outside = d;
+      }
+      return inside;
     };
     const main = rect(row.querySelector('[data-role="step-main"]')!);
     const rowBox = rect(row);
@@ -163,8 +171,7 @@ test.describe('The step context counter takes a near miss on a phone', () => {
       expect(p.text.left - p.main.right, `${where}: the gap before the counter changed`)
         .toBeCloseTo(0.625 * rootPx, 0);
 
-      // At least 44px wide at the 16px root, scaled with it. The half-px walk
-      // loses up to a step at each end.
+      // At least 44px wide at the 16px root, scaled with it.
       expect(p.hit.right - p.hit.left, `${where}: hit width`).toBeGreaterThanOrEqual((44 * rootPx) / 16);
       // Never past the pane, where it would cover the edge-swipe strip's job.
       expect(p.hit.right, `${where}: the reach left the pane`).toBeLessThanOrEqual(p.paneRight);

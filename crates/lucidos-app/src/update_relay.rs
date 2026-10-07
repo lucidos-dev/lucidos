@@ -5,7 +5,7 @@
 //! hidden and shows the picker. A hidden WKWebView can also be suspended. So a
 //! relay living in a page would work only while a window happened to be awake.
 //!
-//! Each heartbeat carries this client's version, its remote install blocker,
+//! Each heartbeat carries this client's release, its remote install blocker,
 //! and the latest progress frame of a relayed run. The reply may hand it a
 //! request, which it runs through the same `run_app_update` a click runs.
 
@@ -18,6 +18,10 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
 const HEARTBEAT_PATH: &str = "/~/api/v1/control/desktop-client/heartbeat";
+
+/// The version a heartbeat reports. The gateway compares it against its newest
+/// release, so it must be the release and never the client build id.
+const HEARTBEAT_VERSION: &str = crate::LUCIDOS_RELEASE;
 
 /// Idle cadence. The gateway counts a client attached for three of these.
 const IDLE_INTERVAL: Duration = Duration::from_secs(5);
@@ -135,11 +139,10 @@ fn beat_forever(
     nudge: Sender<()>,
     nudged: Receiver<()>,
 ) {
-    let version = env!("LUCIDOS_APP_VERSION");
     loop {
         let progress = feed.take();
         let blocker = crate::updater::remote_install_blocker();
-        let body = heartbeat_body(version, blocker.as_deref(), progress.as_ref());
+        let body = heartbeat_body(HEARTBEAT_VERSION, blocker.as_deref(), progress.as_ref());
         match crate::desktop::gateway_body(port, "POST", HEARTBEAT_PATH, Some(&body)) {
             Some(reply) => {
                 if let Some(ticket) = requested(&reply) {
@@ -212,6 +215,18 @@ mod tests {
                 "progress": { "request": "r-1", "frame": progress.frame },
             })
         );
+    }
+
+    // The gateway offers the relay only when its newest release is newer than
+    // this. A CalVer build id is never older than a release, so it hid the relay.
+    #[test]
+    fn a_heartbeat_reports_the_release_not_the_build_id() {
+        let release = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../RELEASE"),
+        )
+        .unwrap();
+        assert_eq!(HEARTBEAT_VERSION, release.trim());
+        assert_ne!(HEARTBEAT_VERSION, env!("LUCIDOS_APP_VERSION"));
     }
 
     #[test]

@@ -44,6 +44,23 @@ pub(super) async fn submit_mcp_consent(
     headers: HeaderMap,
     Json(body): Json<McpConsentResponse>,
 ) -> impl IntoResponse {
+    let card_thread = state
+        .engine
+        .pending_cc_permission
+        .lock()
+        .unwrap()
+        .thread_of(&body.request_id);
+    if let Err(e) = super::thread_reach::refuse_permission_answer(
+        &state.pool,
+        &headers,
+        card_thread,
+        body.allowed,
+        body.persist_scope,
+    )
+    .await
+    {
+        return e.into_response();
+    }
     let actor = super::actor::user_actor(&headers, None);
     let answered = resolve_coding_agent_permission(
         &state.engine,
@@ -97,7 +114,7 @@ pub(super) async fn set_mcp_auto_approve(
 ///
 /// Mirrors the chat path's own order, so the page states the window the request
 /// packer will size against. `LlmProvider::default_model()` alone is NOT that
-/// window. It is `LUCIDOS_MODEL` or the compiled-in `DEFAULT_CHAT_MODEL`, fixed
+/// window. It is `LUCIDOS_MODEL` or the `prefs::CHAT_MODEL` default, fixed
 /// at boot, so it drops the `[1m]` marker a saved preference carries. The page
 /// reported a 1M model's tools as a share of 200k.
 async fn resolved_chat_model(pool: &PgPool, provider_default: &str) -> String {
@@ -114,6 +131,10 @@ async fn resolved_chat_model(pool: &PgPool, provider_default: &str) -> String {
 /// `tool_definitions_chars` and `estimate_tokens_from_chars` the request packer
 /// and the Context Viewer use. A second ratio in the frontend is what once
 /// reported a 205k prompt as 361k.
+///
+/// `budget` states what a request really sends once the MCP tool ceiling
+/// applies, and what the ceiling drops. Its share must stay chars against the
+/// request's own char budget, the unit and total the packer fills.
 pub(super) async fn list_mcp_servers(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -130,12 +151,14 @@ pub(super) async fn list_mcp_servers(
     let model =
         resolved_chat_model(&state.pool, state.engine.current_provider().default_model()).await;
     let context_window = state.engine.context_window_for(&model, None);
+    let budget = state.engine.mcp_manager.budget(context_window).await;
 
     Ok(Json(serde_json::json!({
         "servers": servers,
         "totals": totals,
         "model": model,
         "context_window": context_window,
+        "budget": budget,
     })))
 }
 
@@ -458,7 +481,7 @@ mod tests {
         crate::core::PreferenceStore::set(
             &pool,
             &bus,
-            crate::core::PREF_CHAT_MODEL,
+            crate::core::prefs::CHAT_MODEL.key(),
             "claude-opus-5[1m]",
             None,
         )
@@ -472,7 +495,8 @@ mod tests {
 
         // Blank is unset, not a model id: a stored empty string must not name
         // the page's model as "".
-        crate::core::PreferenceStore::set(&pool, &bus, crate::core::PREF_CHAT_MODEL, "  ", None)
+        let key = crate::core::prefs::CHAT_MODEL.key();
+        crate::core::PreferenceStore::set(&pool, &bus, key, "  ", None)
             .await
             .expect("blank the chat model preference");
         assert_eq!(

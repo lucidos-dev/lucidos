@@ -34,7 +34,7 @@ pub(crate) fn short_thread_id(thread_id: uuid::Uuid) -> String {
 /// Return the persistent directory for CC worktrees: `<workspace>/.lucidos/worktrees/`.
 /// Creates the directory if it doesn't exist.
 pub(crate) fn worktrees_dir(workspace_path: &Path) -> PathBuf {
-    let dir = workspace_path.join(".lucidos/worktrees");
+    let dir = workspace_path.join(crate::paths::WORKTREES_SUBPATH);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log!(
             "[Git] Failed to create worktrees dir {}: {}",
@@ -357,7 +357,46 @@ pub(crate) async fn worktree_add(
             e
         );
     }
-    git_cmd(&["checkout", "HEAD", "--"], wt_path).await
+    // Killed on timeout, so no checkout is still writing into the tree the
+    // failure path removes.
+    let checkout = git_cmd_kill_on_timeout(&["checkout", "HEAD", "--"], wt_path).await;
+    if !matches!(&checkout, Ok(o) if o.status.success()) {
+        let created_branch = extra_args
+            .iter()
+            .position(|a| *a == "-b")
+            .and_then(|i| extra_args.get(i + 1).copied());
+        remove_unpopulated_worktree(repo_root, wt_str, created_branch).await;
+    }
+    checkout
+}
+
+/// Undo a `worktree add --no-checkout` whose checkout failed. A tree left in
+/// place has an empty index. A later spawn reuses it as live, and the first
+/// `add -A` commits the deletion of every tracked file. This call created the
+/// tree and any `-b` branch moments ago, so removing them deletes no user work.
+async fn remove_unpopulated_worktree(repo_root: &Path, wt_str: &str, created_branch: Option<&str>) {
+    let removed = git_cmd(&["worktree", "remove", "--force", wt_str], repo_root).await;
+    log!(
+        "[Git] Checkout failed in new worktree {}, removing it: {}",
+        wt_str,
+        describe_git_outcome(&removed)
+    );
+    if let Some(branch) = created_branch {
+        let deleted = git_cmd(&["branch", "-D", branch], repo_root).await;
+        log!(
+            "[Git] Deleting branch {} created for that worktree: {}",
+            branch,
+            describe_git_outcome(&deleted)
+        );
+    }
+}
+
+fn describe_git_outcome(outcome: &Result<std::process::Output, String>) -> String {
+    match outcome {
+        Ok(o) if o.status.success() => "ok".to_string(),
+        Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+        Err(e) => e.clone(),
+    }
 }
 
 /// Run `git worktree add <args>` from `repo_root`, first clearing any stale

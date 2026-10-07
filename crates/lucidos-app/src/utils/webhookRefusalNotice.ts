@@ -102,6 +102,17 @@ function switchedOff(refusal: WebhookRefusal): boolean {
   return reportedRefusalCause(refusal) === 'disabled';
 }
 
+/** Is every refusal in the run a delivery with no readable signature?
+ *
+ *  A sender with a secret set signs every delivery. So a run of nothing else
+ *  says the requests may not be from the sender, and says little about the
+ *  secret. One mismatch in the run is real evidence, and keeps the secret
+ *  words. See `docs/adr/0365-a-burst-is-not-an-outage.md`. */
+function unsignedOnly(refusal: WebhookRefusal): boolean {
+  const counted = Object.entries(refusal.reasons).filter(([, count]) => count > 0);
+  return counted.length > 0 && counted.every(([key]) => key === 'signature-missing');
+}
+
 /** What the app bar states while a hook is throwing deliveries away.
  *
  *  The title is the fact and the detail is the consequence, matching the two
@@ -111,7 +122,10 @@ function switchedOff(refusal: WebhookRefusal): boolean {
  *  so telling its owner to check the signature sends them somewhere there is
  *  nothing to find. That wrong turn has already cost a long investigation once.
  *  So the `disabled` title says SWITCHED OFF in as many words, and its fix is
- *  one click on the screen the other button opens. */
+ *  one click on the screen the other button opens.
+ *
+ *  A run of nothing but unsigned requests gets its own words too. It points
+ *  away from the secret, because rotating that can break a working hook. */
 export function webhookRefusalNotice(
   refusal: WebhookRefusal,
 ): { title: string; detail: string } {
@@ -123,6 +137,17 @@ export function webhookRefusalNotice(
         'before it was read. Nothing is wrong with the signature or the secret: ' +
         'the webhook is off. Switch it back on, or delete it and repoint the sender. ' +
         `Rechecked ${CHECK_INTERVAL}.`,
+    };
+  }
+  if (unsignedOnly(refusal)) {
+    return {
+      title: `"${refusal.webhook_name}" is refusing unsigned requests`,
+      detail:
+        `${arrived(refusal)} over ${age(refusal)}, and none of them carried a readable ` +
+        'signature. A sender with a secret set signs every delivery, so these may not ' +
+        'be from your sender. That is no sign the secret is wrong, so do not rotate it. ' +
+        'If they are your sender\'s, check that it has a secret set and signs the way ' +
+        `this webhook expects. Rechecked ${CHECK_INTERVAL}.`,
     };
   }
   const because = refusalReasonsPhrase(refusal);
@@ -141,8 +166,11 @@ export function webhookRefusalNotice(
  *  The row already names the hook, so this states what is happening to its
  *  deliveries and nothing else. */
 export function webhookRefusalRowLine(refusal: WebhookRefusal): string {
-  const what = switchedOff(refusal)
-    ? 'thrown away, because this webhook is switched off'
-    : 'refused, because none of them verified';
-  return `${lost(refusal)} ${what}, over ${age(refusal)}`;
+  return `${lost(refusal)} ${rowReason(refusal)}, over ${age(refusal)}`;
+}
+
+function rowReason(refusal: WebhookRefusal): string {
+  if (switchedOff(refusal)) return 'thrown away, because this webhook is switched off';
+  if (unsignedOnly(refusal)) return 'refused, because none of them carried a signature';
+  return 'refused, because none of them verified';
 }

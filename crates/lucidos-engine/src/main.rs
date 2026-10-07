@@ -185,12 +185,9 @@ async fn read_vertex_region_pref(
         .acquire_timeout(std::time::Duration::from_secs(5))
         .connect(database_url)
         .await?;
-    let stored = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM preferences WHERE key = $1 AND device_id IS NULL",
-    )
-    .bind(lucidos_engine::core::PREF_VERTEX_REGION)
-    .fetch_optional(&pool)
-    .await;
+    let stored = lucidos_engine::core::prefs::VERTEX_REGION
+        .try_stored(&pool)
+        .await;
     match stored {
         Ok(value) => Ok(value.filter(|s| !s.is_empty())),
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some(PG_UNDEFINED_TABLE) => {
@@ -209,7 +206,9 @@ fn vertex_region_from_env_or_default() -> (String, &'static str) {
     {
         Some(region) => (region, "VERTEX_REGION"),
         None => (
-            lucidos_engine::core::DEFAULT_VERTEX_REGION.to_string(),
+            lucidos_engine::core::prefs::VERTEX_REGION
+                .default_text()
+                .to_string(),
             "the default",
         ),
     }
@@ -461,8 +460,7 @@ async fn run_restore_archive() -> Result<(), Box<dyn std::error::Error + Send + 
 /// gateway rather than straight to this port.
 async fn resolve_bind_choice(engine: &SharedEngine) -> net_config::BindChoice {
     let loopback_signal = std::env::var("LUCIDOS_BIND_LOOPBACK")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
+        .is_ok_and(|v| lucidos_engine::core::prefs::env_switch_is_on(&v));
     let bind_addr_env = std::env::var("LUCIDOS_BIND_ADDR").ok();
     let bind_all_env = std::env::var("LUCIDOS_BIND_ALL").ok();
     let net = net_config::read_network_toml();
@@ -475,11 +473,9 @@ async fn resolve_bind_choice(engine: &SharedEngine) -> net_config::BindChoice {
     // chose a bind". A transient DB error then sends the user hunting a
     // connection refused on the address they did choose.
     let per_workspace_bind = if !loopback_signal && !net.engine_inherit {
-        match lucidos_engine::core::preferences::PreferenceStore::get(
-            engine.pool(),
-            net_config::NETWORK_BIND_PREF_KEY,
-        )
-        .await
+        match lucidos_engine::core::prefs::NETWORK_BIND
+            .try_stored(engine.pool())
+            .await
         {
             Ok(stored) => stored,
             Err(e) => {
@@ -548,6 +544,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     std::fs::create_dir_all(&workspace_path)?;
     log!("[Startup] Using workspace: {}", workspace_path.display());
+    // Names the keep-awake assertion, so `pmset -g assertions` tells one
+    // workspace's engine from another's.
+    if let Some(name) = workspace_path.file_name().and_then(|n| n.to_str()) {
+        lucidos_engine::core::keep_awake::set_workspace(name);
+    }
 
     // Point the embedding-model cache at the shared per-user directory unless
     // something already chose one. See ADR 0061. Runs BEFORE
@@ -647,8 +648,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let vertex_region = lucidos_engine::llm::vertex::location_handle(initial_region.clone());
 
-    let model = std::env::var("LUCIDOS_MODEL")
-        .unwrap_or_else(|_| lucidos_engine::core::DEFAULT_CHAT_MODEL.to_string());
+    let model = std::env::var("LUCIDOS_MODEL").unwrap_or_else(|_| {
+        lucidos_engine::core::prefs::CHAT_MODEL
+            .default_text()
+            .to_string()
+    });
 
     log!("[Startup] Using default model: {}", model);
 
@@ -663,7 +667,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //
     // Once a provider is configured, the credential subscriber swaps it in
     // without a restart, and a later boot finds it here.
-    let model_is_mock = model == "mock";
+    let model_is_mock = model == lucidos_engine::llm::MOCK_MODEL;
     let boot_without_provider = lucidos_engine::llm::boot_without_provider_enabled();
 
     if !model_is_mock {
@@ -709,10 +713,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
     if let Some(pool) = &boot_pool {
-        let registry_map = lucidos_engine::llm::model_registry::load_from_db(pool).await;
-        if let Ok(mut guard) = model_registry.write() {
-            *guard = registry_map;
-        }
+        lucidos_engine::llm::model_registry::reload(&model_registry, pool).await;
     }
 
     let provider_ctx = ProviderBuildContext {
@@ -1071,6 +1072,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await;
 
+    // One home thread per workspace, created once while its switch is on.
+    if let Err(e) = lucidos_engine::engine::home_thread::ensure_home_thread_if_enabled(
+        &shared_engine.event_bus,
+        shared_engine.pool(),
+    )
+    .await
+    {
+        log!("[Startup] Failed to create the home thread: {}", e);
+    }
+
     // Started BEFORE the recovery sweep below. Recovery broadcasts terminators
     // this consumer must see to flip abandoned todos, and a tokio broadcast
     // channel does not replay history for a late subscriber.
@@ -1278,6 +1289,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());
     lucidos_engine::engine::change_summary_consumer::spawn(shared_engine.clone());
+    lucidos_engine::engine::summary_tree::spawn(shared_engine.clone());
     lucidos_engine::engine::agent_recovery::spawn_archive_net(shared_engine.clone());
 
     // Serve the last discovered Claude Code model list, and refresh it in the

@@ -32,14 +32,14 @@ const BACKGROUND_REFUSAL: &str =
 const REMOTE_REFUSAL: &str =
     "Lucidos refuses a remote subagent. It always runs in the background, and \
      its report would never reach you once your turn ends. Call Agent again \
-     without `isolation: \"remote\"` and with `run_in_background: false`.";
+     without `isolation: \"remote\"`.";
 
 fn definition_refusal(agent_type: &str, setting: &str) -> String {
     format!(
         "Lucidos refuses subagent_type `{agent_type}`. Its definition sets \
          `{setting}`, so it runs in the background whatever the call says, and \
          your turn ending kills it before its report reaches you. Call Agent \
-         again with another subagent_type and `run_in_background: false`."
+         again with another subagent_type."
     )
 }
 
@@ -258,6 +258,20 @@ mod tests {
             refusal(&input, None, TASKS_DISABLED).as_deref(),
             Some(REMOTE_REFUSAL)
         );
+    }
+
+    /// Both remote refusals fire with background tasks disabled too, where
+    /// the flag is not in the schema and naming it would fail the retry.
+    #[test]
+    fn a_remote_refusal_never_asks_for_the_background_flag() {
+        let far = definition("far", false, true);
+        let input = json!({"subagent_type": "far"});
+        for reason in [
+            REMOTE_REFUSAL.to_string(),
+            refusal(&input, Some(&far), TASKS_DISABLED).expect("refused"),
+        ] {
+            assert!(!reason.contains("run_in_background"), "{reason}");
+        }
     }
 
     #[test]

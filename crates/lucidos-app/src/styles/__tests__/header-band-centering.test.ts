@@ -21,6 +21,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
+import { UI_SCALE_MIN } from '@lucidos/appearance';
 import { block, cssRules, decl, focusRingWidthRem, rulesTargeting, selectorList, type CssRule } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
@@ -263,7 +264,8 @@ describe('on the overlay build the leading control only steps sideways', () => {
     // rather than restating 0.5rem or 80px.
     expect(reserve).toContain('calc(var(--header-lead-inset) + var(--header-icon-box))');
     // …and the trailing one is still the actions at their widest.
-    expect(reserve).toContain('3 * var(--header-icon-box)');
+    expect(reserve).toContain('var(--brand-trail-end)');
+    expect(desktopRule(':root').props.get('--brand-trail-end')).toContain('3 * var(--header-icon-box)');
   });
 
   it('the cluster\'s floor IS its natural width, so the chevrons hug the mark', () => {
@@ -451,14 +453,8 @@ describe('both desktop builds show one bar of the same height', () => {
     // The one term here that does not scale with the bar. --titlebar-inset is
     // 28 fixed px from the OS (`titlebar_inset_script`, lucidos-app/src/lib.rs)
     // while --desktop-bar-height is rem, so shrinking the bar walks the
-    // overlay build's header toward zero and then negative. The scale bounds
-    // live in the shared appearance contract, which the two FOUC scripts read
-    // too.
-    const appearance = readFileSync(
-      resolve(stylesDir, '../../../../packages/lucidos-sdk/src/appearance.ts'), 'utf-8',
-    );
-    const minScale = Number(/UI_SCALE_MIN\s*=\s*([\d.]+)/.exec(appearance)?.[1]);
-    expect(minScale, 'UI_SCALE_MIN not found in appearance.ts').toBeGreaterThan(0);
+    // overlay build's header toward zero and then negative.
+    const minScale = UI_SCALE_MIN;
 
     const root = shellRules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
     const barRem = Number(/^([\d.]+)rem$/.exec(root!.props.get('--desktop-bar-height')!)?.[1]);

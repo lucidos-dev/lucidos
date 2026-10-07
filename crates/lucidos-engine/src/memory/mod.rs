@@ -9,7 +9,8 @@ pub(crate) mod query_judgment;
 pub mod reembed;
 
 pub use embedder_slot::{EmbedderSlot, EmbeddingModelLoadState, EmbeddingModelStatus};
-pub use extractor::{ExtractedFact, MemoryExtractor, QueryClassification, EXTRACTOR_VERSION};
+pub(crate) use extractor::{classify_query, extract_facts, fallback_fact, summarize_conversation};
+pub use extractor::{ExtractedFact, QueryClassification, EXTRACTOR_VERSION};
 pub use fastembed::FastEmbedProvider;
 pub use model_download::{
     apply_default_cache_dir, ensure_model_cached, CacheOutcome, DownloadFrame,

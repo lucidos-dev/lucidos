@@ -104,6 +104,7 @@ impl LucidosEngine {
                             artifact_path: path.clone(),
                             commit: commit_sha.clone(),
                             source: Some("run_python".to_string()),
+                            writer_thread_id: Some(thread_id),
                         }))
                         .await?;
                 }
@@ -113,6 +114,7 @@ impl LucidosEngine {
                             artifact_path: path.clone(),
                             commit: commit_sha.clone(),
                             source: Some("run_python".to_string()),
+                            writer_thread_id: Some(thread_id),
                         }))
                         .await?;
                 }

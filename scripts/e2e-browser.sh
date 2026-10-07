@@ -3,6 +3,7 @@
 #
 # Usage:
 #   ./scripts/e2e-browser.sh [options] [-- playwright args]
+#   ./scripts/e2e-browser.sh --github [options]   # on GitHub's runners, ADR 0382
 #
 # Options:
 #   -h, --headed     Run with visible browser
@@ -36,6 +37,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/e2e_github.sh
+source "$SCRIPT_DIR/lib/e2e_github.sh"
+e2e_github_handoff browser "$@"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 source "$SCRIPT_DIR/lib/e2e.sh"
@@ -75,6 +79,11 @@ if [ -n "$USE_IOS" ]; then
     exec "$SCRIPT_DIR/e2e-ios.sh" "${IOS_ARGS[@]}"
 fi
 
+# Named in this hold's E2ELockAcquired, so a memory snapshot can tell a WebKit
+# hold from a Chromium one. Ignored under the umbrella, which holds the lock.
+# shellcheck disable=SC2034 # read by _e2e_announce_lock_acquired in scripts/lib/e2e_lock.sh
+E2E_LOCK_PROJECTS="$(e2e_browser_lock_projects "$USE_WEBKIT" "$SKIP_WEBKIT" "$TEST_FILE" \
+    ${PW_ARGS[@]+"${PW_ARGS[@]}"})"
 setup_e2e_session e2e-browser --cleanup-worktrees-on-teardown
 
 # Host-load backpressure guard — the e2e lock is now held (by setup_e2e_session in
@@ -150,7 +159,7 @@ fi
 # Every invocation of a project appends its output here, so the project can be
 # added up into one verdict (report_playwright_totals). Truncated per project,
 # removed on the way out.
-PW_TALLY_LOG="$(mktemp -t lucidos-pw-tally)"
+PW_TALLY_LOG="$(mktemp "${TMPDIR:-/tmp}/lucidos-pw-tally.XXXXXX")"
 
 # Every exit path funnels through here so the sampler is drained and the run is
 # classified exactly once, whichever branch below ran.
@@ -164,6 +173,7 @@ finish() {
     report_webkit_chunk_range
     report_webkit_phase_selection
     report_webkit_excluded "$SKIP_WEBKIT"
+    report_e2e_mem_top_deltas
     rm -f "$PW_TALLY_LOG"
     exit "$rc"
 }
@@ -196,7 +206,7 @@ run_playwright() {
         set -e
         return "$rc"
     fi
-    inv_log="$(mktemp -t lucidos-pw-invocation)"
+    inv_log="$(mktemp "${TMPDIR:-/tmp}/lucidos-pw-invocation.XXXXXX")"
     tee "$inv_log" < "$fifo" &
     tee_pid=$!
     set +e
@@ -247,8 +257,8 @@ done
 # invocations: one per project, plus one per mobile-webkit chunk. On the default
 # each pass therefore erased the previous pass's retained traces + screenshots and
 # only the LAST project's survived, so an unattended nightly failure left nothing to
-# triage with. Fix: wipe ONE root here, then give every invocation its own subdir
-# under it (set_output_dir) — nothing is wiped mid-run. (These are Playwright's
+# triage with. Fix: clear what this run owns here, then give every invocation its
+# own subdir under it (set_output_dir) — nothing is wiped mid-run. (These are Playwright's
 # "output artifacts", NOT Lucidos *artifacts* — they're ephemeral, gitignored test
 # output, so the naming here stays on `output` to keep the glossary term clean.)
 if [ -n "$TEST_FILE" ] || [ "${#PW_ARGS[@]}" -gt 0 ]; then
@@ -257,11 +267,20 @@ if [ -n "$TEST_FILE" ] || [ "${#PW_ARGS[@]}" -gt 0 ]; then
     PW_OUTPUT_ROOT="test-results/targeted"
     rm -rf "$PW_OUTPUT_ROOT"
 else
-    # Full run: clean slate for the whole tree, which also clears any leftover
-    # targeted dirs and the earlier flat layout.
+    # Full run: clear only the projects this run owns, plus the per-run memory
+    # log. The documented recipe runs `--no-webkit` then `--webkit` as two
+    # invocations, so the second must keep the first's failure traces.
     PW_OUTPUT_ROOT="test-results/full"
-    rm -rf test-results
+    if [ -n "$USE_WEBKIT" ]; then
+        rm -rf "$PW_OUTPUT_ROOT/mobile-webkit" "$PW_OUTPUT_ROOT"/mobile-webkit-* "$PW_OUTPUT_ROOT/mem-samples.log"
+    elif [ -n "$SKIP_WEBKIT" ]; then
+        rm -rf "$PW_OUTPUT_ROOT/chromium" "$PW_OUTPUT_ROOT/mobile" "$PW_OUTPUT_ROOT/mem-samples.log"
+    else
+        rm -rf test-results
+    fi
 fi
+# The per-test compressor samples live at the root, which no invocation wipes.
+export_e2e_mem_sample_env "$PWD/$PW_OUTPUT_ROOT"
 
 # Per-invocation --output, kept as an array so "pinned by the caller" passes no
 # argument at all rather than an empty one.
@@ -752,7 +771,7 @@ _run_browser_project_body() {
             # ignored files would make `playwright test` exit "no tests found" (rc 1)
             # and fail the chunk spuriously. Excluding them keeps every chunk real.
             case "$base" in *-desktop.spec.ts) continue ;; esac
-            if grep -q "pickComposeDestination" "$f" 2>/dev/null; then
+            if e2e_spec_needs_claude_code "$f"; then
                 cc_specs+=("$base")
             else
                 nav_specs+=("$base")
@@ -888,11 +907,15 @@ else
     # reset recreates the database and restarts the engine on it, on the same
     # binary, since build_e2e_engine_once never recompiles mid-suite. So every
     # project sees a brand-new workspace database, seeds included.
-    PROJECTS=(chromium mobile mobile-webkit)
     # --no-webkit leaves the expensive project for its own run. Dropped from the
     # list rather than skipped inside it, so the per-project table below reports
     # what actually ran; report_webkit_excluded says what did not.
-    [ -n "$SKIP_WEBKIT" ] && PROJECTS=(chromium mobile)
+    PROJECTS=()
+    while IFS= read -r project; do
+        PROJECTS+=("$project")
+    done <<EOF
+$(e2e_browser_projects ${SKIP_WEBKIT:+--no-webkit})
+EOF
     # A targeted spec runs only on the projects that do not testIgnore it.
     if [ -n "$TEST_FILE" ]; then
         RUNS_SPEC=()

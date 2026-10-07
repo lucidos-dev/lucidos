@@ -255,6 +255,35 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     expect(followingLiveEdge.value).toBe(true);
   });
 
+  it('does NOT read focus on a control already in full view as a placement', () => {
+    // A tap focuses the option it lands on, and the browser reveals nothing.
+    // Stamped anyway, the next platform clamp read as the reader placing
+    // themselves. On a phone the composer shrinks right after an answer, so
+    // that clamp cancelled the answer's landing. Reported.
+    const { el, onScroll } = ridingAndAnchored();
+    const tappedOption = {
+      nodeName: 'BUTTON',
+      getBoundingClientRect: () => ({ width: 300, height: 40, top: 400, bottom: 440, left: 20, right: 320 }),
+    };
+
+    el.fire('focusin', { target: tappedOption });
+    platformScrollsTo(el, 400, onScroll);
+
+    expect(el.scrollTop).toBe(2500);   // the platform, so carried back
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('does NOT read focus on the transcript itself as a placement', () => {
+    // A tap on plain text focuses the container, which scrolls nothing.
+    const { el, onScroll } = ridingAndAnchored();
+
+    el.fire('focusin', { target: el });
+    platformScrollsTo(el, 400, onScroll);
+
+    expect(el.scrollTop).toBe(2500);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
   it('counts a scrollbar DRAG for as long as the thumb is held', () => {
     // The press stamps once; a slow haul down the bar can outlast the window,
     // so the moves under it keep the signal fresh.

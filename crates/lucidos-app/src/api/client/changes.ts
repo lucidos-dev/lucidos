@@ -1,4 +1,5 @@
 import { API, json, mutatingFetch, text, throwIfNotOk } from './_core';
+import { changeFileUrl } from './fileUrls';
 import type { DiffFile, RepoDiff } from '../../store/store';
 
 // --- Changes ---
@@ -260,15 +261,6 @@ export interface ThreadCcDiff {
  *  Used for external-repo Claude Code sessions that never produce a Lucidos `Change`. */
 export async function getThreadCcDiff(threadId: string): Promise<ThreadCcDiff> {
   return json(`${API}/threads/${encodeURIComponent(threadId)}/cc-diff`);
-}
-
-/** URL of the full "after" version of a file in a change. Served with a
- *  content-type inferred from the extension, so a media preview can point an
- *  <img>/<video>/<audio>/<iframe> `src` at it. An HTML, SVG or XML body comes
- *  sandboxed with script off, as `repoFileUrl` does. */
-export function changeFileUrl(changeId: string, path: string): string {
-  const params = new URLSearchParams({ path });
-  return `${API}/changes/${encodeURIComponent(changeId)}/file?${params}`;
 }
 
 export async function getChangeFileContent(changeId: string, path: string): Promise<string> {

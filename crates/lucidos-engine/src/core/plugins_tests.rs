@@ -36,14 +36,134 @@ fn parses_valid_manifest() {
     assert_eq!(m.version, "0.1.0");
     assert_eq!(m.name, "Browser Skills");
     assert_eq!(m.source.as_deref(), Some("https://github.com/x/y"));
-    assert_eq!(m.engine, None);
+}
+
+// --- check_engine_requirement ---
+
+fn manifest_with_engine(engine_line: &str) -> serde_json::Value {
+    parse_manifest(&format!("{VALID_MANIFEST}{engine_line}\n"))
+        .unwrap()
+        .raw
+}
+
+fn v(s: &str) -> Result<semver::Version, String> {
+    Ok(semver::Version::parse(s).unwrap())
 }
 
 #[test]
-fn parses_optional_engine() {
-    let toml = format!("{}engine = \">=0.5.0\"\n", VALID_MANIFEST);
-    let m = parse_manifest(&toml).unwrap();
-    assert_eq!(m.engine.as_deref(), Some(">=0.5.0"));
+fn engine_requirement_met_by_the_same_and_newer_releases() {
+    let m = manifest_with_engine(r#"engine = ">=0.46.1""#);
+    assert_eq!(check_engine_requirement(&m, &v("0.46.1")), Ok(()));
+    assert_eq!(check_engine_requirement(&m, &v("0.99.0")), Ok(()));
+}
+
+#[test]
+fn engine_requirement_unmet_names_plugin_requirement_and_running_release() {
+    let m = manifest_with_engine(r#"engine = ">=0.46.1""#);
+    let mismatch = check_engine_requirement(&m, &v("0.46.0")).unwrap_err();
+    assert_eq!(
+        mismatch,
+        EngineMismatch::Unsatisfied {
+            requirement: ">=0.46.1".into(),
+            running: semver::Version::new(0, 46, 0),
+        }
+    );
+    assert_eq!(mismatch.short_reason(), "Needs Lucidos 0.46.1 or later");
+    assert_eq!(
+        mismatch.refusal("Theme Studio", "0.1.0"),
+        "Theme Studio 0.1.0 needs Lucidos 0.46.1 or later. This is Lucidos 0.46.0. \
+         Update Lucidos first."
+    );
+}
+
+#[test]
+fn a_requirement_that_is_not_a_floor_is_quoted_as_written() {
+    let m = manifest_with_engine(r#"engine = ">=0.40, <0.46""#);
+    let mismatch = check_engine_requirement(&m, &v("0.46.1")).unwrap_err();
+    assert_eq!(mismatch.short_reason(), "Needs Lucidos >=0.40, <0.46");
+}
+
+#[test]
+fn an_invalid_engine_string_is_refused_with_the_value_quoted() {
+    let m = manifest_with_engine(r#"engine = "the latest one""#);
+    let mismatch = check_engine_requirement(&m, &v("0.46.1")).unwrap_err();
+    assert_eq!(
+        mismatch,
+        EngineMismatch::Invalid {
+            value: "\"the latest one\"".into()
+        }
+    );
+    let refusal = mismatch.refusal("Theme Studio", "0.1.0");
+    assert!(refusal.contains("engine = \"the latest one\""), "{refusal}");
+    assert!(refusal.starts_with("Theme Studio 0.1.0 "), "{refusal}");
+}
+
+#[test]
+fn an_empty_or_non_string_engine_is_refused() {
+    for line in [r#"engine = """#, "engine = 46", r#"engine = [">=0.46.1"]"#] {
+        let m = manifest_with_engine(line);
+        assert!(
+            matches!(
+                check_engine_requirement(&m, &v("0.46.1")),
+                Err(EngineMismatch::Invalid { .. })
+            ),
+            "{line} must be refused"
+        );
+    }
+}
+
+#[test]
+fn a_manifest_without_engine_takes_any_release_even_an_unreadable_one() {
+    let m = parse_manifest(VALID_MANIFEST).unwrap().raw;
+    assert_eq!(check_engine_requirement(&m, &v("0.1.0")), Ok(()));
+    assert_eq!(
+        check_engine_requirement(&m, &Err("no RELEASE".into())),
+        Ok(())
+    );
+    assert_eq!(engine_requirement_of(&m), None);
+}
+
+#[test]
+fn a_requirement_against_an_unreadable_release_is_refused() {
+    let m = manifest_with_engine(r#"engine = ">=0.46.1""#);
+    let mismatch = check_engine_requirement(&m, &Err("no RELEASE".into())).unwrap_err();
+    assert_eq!(
+        mismatch,
+        EngineMismatch::UnknownRelease {
+            error: "no RELEASE".into()
+        }
+    );
+    assert!(mismatch.refusal("P", "1.0.0").ends_with("no RELEASE"));
+}
+
+#[test]
+fn a_prerelease_running_version_compares_as_its_release() {
+    let m = manifest_with_engine(r#"engine = ">=0.46.1""#);
+    assert_eq!(check_engine_requirement(&m, &v("0.46.2-dev")), Ok(()));
+    assert_eq!(check_engine_requirement(&m, &v("0.46.1-rc.1+abc")), Ok(()));
+    let mismatch = check_engine_requirement(&m, &v("0.46.0-dev")).unwrap_err();
+    assert!(mismatch
+        .refusal("P", "1.0.0")
+        .contains("This is Lucidos 0.46.0."));
+}
+
+/// A dirty build of RELEASE 0.46.1 is the dev build of 0.46.2, so it meets a
+/// 0.46.2 floor. `reported_release` is the rule `running_release` applies.
+#[test]
+fn a_dirty_dev_build_counts_as_the_release_it_is_becoming() {
+    let m = manifest_with_engine(r#"engine = ">=0.46.2""#);
+    let clean = crate::engine::release_notices::reported_release("0.46.1", false);
+    let dirty = crate::engine::release_notices::reported_release("0.46.1", true);
+    assert!(check_engine_requirement(&m, &clean).is_err());
+    assert_eq!(check_engine_requirement(&m, &dirty), Ok(()));
+}
+
+#[test]
+fn engine_requirement_of_returns_the_value_as_authored() {
+    let m = manifest_with_engine(r#"engine = ">=0.46.1""#);
+    assert_eq!(engine_requirement_of(&m).as_deref(), Some(">=0.46.1"));
+    let m = manifest_with_engine("engine = 46");
+    assert_eq!(engine_requirement_of(&m).as_deref(), Some("46"));
 }
 
 #[test]
@@ -111,7 +231,7 @@ source = "https://github.com/a/b"
 
 #[test]
 fn rejects_too_long_id() {
-    let id = "a".repeat(65);
+    let id = "a".repeat(super::MAX_ID_LEN + 1);
     let toml = format!(
         r#"
 id = "{}"

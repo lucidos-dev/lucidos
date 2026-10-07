@@ -6,9 +6,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, type VNode } from 'preact';
 import { act } from 'preact/test-utils';
+const askAgain = vi.hoisted(() => vi.fn((..._args: unknown[]) => new Promise<string>(() => {})));
 vi.mock('../../../api/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../api/client')>();
-  return { ...actual, dismissSideQuestion: () => Promise.resolve() };
+  return { ...actual, dismissSideQuestion: () => Promise.resolve(), askSideQuestion: askAgain };
 });
 const openRepoFileLink = vi.hoisted(() => vi.fn(async () => {}));
 vi.mock('../../../store/actions/repoFileLink', () => ({ openRepoFileLink }));
@@ -38,7 +39,7 @@ function show(items: SideQuestion[]) {
   });
 }
 
-const asked = { threadId: 't1', imageHashes: [], afterSeq: 0, dismissed: false };
+const asked = { threadId: 't1', imageHashes: [], afterSeq: 0, dismissed: false, asks: 1 };
 
 beforeEach(() => {
   host = document.createElement('div');
@@ -62,9 +63,18 @@ it('renders nothing for a thread without side questions', () => {
 it('renders the answer as markdown, with the not-recorded note', () => {
   show([{ ...asked, id: 'a', question: 'what is X?', status: 'answered', answer: 'X is **bold**.' }]);
   const card = host.querySelector('[data-role="side-question-card"]')!;
-  expect(card.querySelector('.side-question-question')!.textContent).toBe('what is X?');
+  expect(card.querySelector('.side-question-question')!.textContent!.trim()).toBe('what is X?');
   expect(card.querySelector('.markdown-content strong')!.textContent).toBe('bold');
   expect(card.textContent).toContain(SIDE_QUESTION_NOTE);
+});
+
+// The question is the user's own words, so it renders as markdown like a
+// message they send. A pasted fence printed its backticks.
+it('renders the question as markdown, so a fence becomes a code block', () => {
+  show([{ ...asked, id: 'a', question: 'why?\n\n```\nfn main() {}\n```', status: 'pending' }]);
+  const question = host.querySelector('.side-question-question')!;
+  expect(question.querySelector('pre code')!.textContent).toBe('fn main() {}');
+  expect(question.textContent).not.toContain('```');
 });
 
 // The card sits outside the turn body, so it carries the link router itself.
@@ -97,6 +107,21 @@ it('shows a failure as an alert', () => {
   expect(alert.textContent).toBe('Side questions are not available in Codex threads.');
 });
 
+it('offers Retry on a failure only, and turns the card back to Thinking in place', () => {
+  show([
+    { ...asked, id: 'a', question: 'q', status: 'failed', error: 'Load failed' },
+    { ...asked, id: 'b', question: 'r', status: 'answered', answer: 'yes' },
+  ]);
+  const retries = host.querySelectorAll<HTMLButtonElement>('button.side-question-retry');
+  expect(retries).toHaveLength(1);
+  expect(retries[0].textContent).toBe('Retry');
+  act(() => { retries[0].click(); });
+  expect(askAgain).toHaveBeenCalledWith('t1', 'a', 'q', []);
+  const [card] = host.querySelectorAll('[data-role="side-question-card"]');
+  expect(card.getAttribute('data-status')).toBe('pending');
+  expect(card.querySelector('[role="alert"]')).toBeNull();
+});
+
 it('folds one card of a stack from its head, keeping the card in place', () => {
   show([
     { ...asked, id: 'a', question: 'first', status: 'answered', answer: '1' },
@@ -112,7 +137,7 @@ it('folds one card of a stack from its head, keeping the card in place', () => {
   expect(folded.hasAttribute('data-collapsed')).toBe(true);
   expect(folded.querySelector('.side-question-summary')!.textContent).toBe('first');
   expect(folded.querySelector('.side-question-question')).toBeNull();
-  expect(open.querySelector('.side-question-question')!.textContent).toBe('second');
+  expect(open.querySelector('.side-question-question')!.textContent!.trim()).toBe('second');
 });
 
 it('unfolds a folded card from its head, and rolls its body through Disclosure', () => {
@@ -126,7 +151,7 @@ it('unfolds a folded card from its head, and rolls its body through Disclosure',
   act(() => { head.click(); });
   expect(head.getAttribute('aria-expanded')).toBe('true');
   expect(card.hasAttribute('data-collapsed')).toBe(false);
-  expect(card.querySelector('.disclosure .side-question-body .markdown-content')!.textContent!.trim()).toBe('X');
+  expect(card.querySelector('.disclosure .side-question-body > .markdown-content')!.textContent!.trim()).toBe('X');
 });
 
 describe('placeSideQuestions', () => {
@@ -134,7 +159,7 @@ describe('placeSideQuestions', () => {
     ({ userEvent: { _eventId: id } as StoredEvent, userSeq, steps: [] });
   const turn = (id: string): VNode => <div key={`id:${id}`} />;
   const card = (id: string, afterSeq: number | null): SideQuestion =>
-    ({ id, threadId: 't1', question: id, imageHashes: [], afterSeq, dismissed: false, status: 'pending' });
+    ({ id, threadId: 't1', question: id, imageHashes: [], afterSeq, dismissed: false, asks: 1, status: 'pending' });
   const order = (nodes: VNode[]) => nodes.map((n) => String(n.key));
   const group = (above: string) => `side-questions:after:${above}`;
 

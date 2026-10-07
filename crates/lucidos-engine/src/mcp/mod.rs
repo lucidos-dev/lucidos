@@ -258,6 +258,192 @@ impl McpCostTotals {
 pub struct McpToolSurface {
     pub tools: Vec<ToolDefinition>,
     pub generation: u64,
+    /// What did not fit under the ceiling, per server. Empty when all fit.
+    pub dropped: Vec<McpDroppedTools>,
+}
+
+impl McpToolSurface {
+    /// The one line that tells the model some tools were not sent, so it can
+    /// tell the user. `None` when nothing was dropped.
+    pub fn dropped_notice(&self) -> Option<String> {
+        (!self.dropped.is_empty()).then(|| {
+            format!(
+                "[MCP TOOLS NOT SENT] The running MCP servers offer more tools than fit \
+                 their share of this model's context, so these were left out: {}. Tell \
+                 the user, and suggest switching tools off in Settings or stopping a server.",
+                describe_dropped(&self.dropped)
+            )
+        })
+    }
+}
+
+/// The tools of one server that did not fit under the ceiling, by wire name,
+/// in the server's own listed order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct McpDroppedTools {
+    pub server_id: String,
+    pub tools: Vec<String>,
+}
+
+/// How many dropped names one server lists before it says "and N more".
+const DROPPED_NAMES_SHOWN: usize = 10;
+
+/// `server 'github' (3: a, b, c)`, joined with `; `.
+fn describe_dropped(dropped: &[McpDroppedTools]) -> String {
+    dropped
+        .iter()
+        .map(|d| {
+            let shown: Vec<&str> = d
+                .tools
+                .iter()
+                .take(DROPPED_NAMES_SHOWN)
+                .map(String::as_str)
+                .collect();
+            let more = d.tools.len().saturating_sub(DROPPED_NAMES_SHOWN);
+            let tail = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            format!(
+                "server '{}' ({}: {}{})",
+                d.server_id,
+                d.tools.len(),
+                shown.join(", "),
+                tail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The share of a request's char budget the MCP tools may take, as a divisor.
+///
+/// A `tools/list` is third-party input of any size, so the MCP tools must
+/// never take more than this share. A quarter leaves the system prompt, the
+/// engine's own tools and the conversation the rest.
+const MCP_BUDGET_DIVISOR: usize = 4;
+
+/// Chars every running server's tools may take together, for a model with
+/// this context window. Shared by the request path and the cost report.
+pub fn mcp_tool_char_ceiling(context_window: usize) -> usize {
+    crate::engine::context::agent_context_char_budget(context_window) / MCP_BUDGET_DIVISOR
+}
+
+/// From this share of the MCP tool ceiling, the cost report warns before any tool
+/// is left out.
+const MCP_WARNING_PERCENT: usize = 80;
+
+/// The running servers against the request budget, as the cost report states
+/// it. Chars throughout, the unit the request packer budgets in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct McpBudget {
+    /// What a whole request may carry: system prompt, tools and messages.
+    pub request_chars: usize,
+    /// The part of it every running server's tools may take together.
+    pub mcp_ceiling_chars: usize,
+    /// What a request really carries once the ceiling applies. Less than the
+    /// totals' offered figures exactly when something is dropped.
+    pub sent_tools: usize,
+    pub sent_chars: usize,
+    pub sent_tokens: usize,
+    /// What the running servers lose to that ceiling right now.
+    pub dropped: Vec<McpDroppedTools>,
+    /// One line for the page once the tools are past or near the ceiling.
+    pub warning: Option<String>,
+}
+
+impl McpBudget {
+    fn new(context_window: usize, sent: &[ToolDefinition], dropped: Vec<McpDroppedTools>) -> Self {
+        let sent_chars = tool_definitions_chars(sent);
+        let mcp_ceiling_chars = mcp_tool_char_ceiling(context_window);
+        let left_out: usize = dropped.iter().map(|d| d.tools.len()).sum();
+        let warning = if left_out > 0 {
+            Some(format!(
+                "{left_out} {} left out of every request, because the running servers \
+                 offer more than the MCP share of the context: {}. Switch tools off or \
+                 stop a server.",
+                if left_out == 1 {
+                    "tool is"
+                } else {
+                    "tools are"
+                },
+                describe_dropped(&dropped)
+            ))
+        } else if sent_chars.saturating_mul(100)
+            >= mcp_ceiling_chars.saturating_mul(MCP_WARNING_PERCENT)
+            && sent_chars > 0
+        {
+            Some(format!(
+                "MCP tools fill {}% of their share of the context. Past it, tools are \
+                 left out of requests.",
+                sent_chars.saturating_mul(100) / mcp_ceiling_chars.max(1)
+            ))
+        } else {
+            None
+        };
+        Self {
+            request_chars: crate::engine::context::agent_context_char_budget(context_window),
+            mcp_ceiling_chars,
+            sent_tools: sent.len(),
+            sent_chars,
+            sent_tokens: estimate_tokens_from_chars(sent_chars),
+            dropped,
+            warning,
+        }
+    }
+}
+
+/// Fit each server's offered tools under `ceiling`, deterministically.
+///
+/// Servers are taken in id order. Each gets a max-min fair share: a server
+/// asking for less than an even split keeps all of it, and what it leaves
+/// goes to the rest. Within its share a server keeps its tools in its own
+/// listed order, skipping any that no longer fit.
+fn fit_to_ceiling(
+    mut servers: Vec<(String, Vec<ToolDefinition>)>,
+    ceiling: usize,
+) -> (Vec<ToolDefinition>, Vec<McpDroppedTools>) {
+    servers.sort_by(|a, b| a.0.cmp(&b.0));
+    let costs: Vec<Vec<usize>> = servers
+        .iter()
+        .map(|(_, defs)| {
+            defs.iter()
+                .map(|d| tool_definitions_chars(std::slice::from_ref(d)))
+                .collect()
+        })
+        .collect();
+
+    let mut by_demand: Vec<usize> = (0..servers.len()).collect();
+    by_demand.sort_by_key(|&i| (costs[i].iter().sum::<usize>(), i));
+    let mut shares = vec![0; servers.len()];
+    let mut left = ceiling;
+    for (served, &i) in by_demand.iter().enumerate() {
+        let even_split = left / (by_demand.len() - served);
+        shares[i] = costs[i].iter().sum::<usize>().min(even_split);
+        left -= shares[i];
+    }
+
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for (((server_id, defs), costs), mut share) in servers.into_iter().zip(costs).zip(shares) {
+        let mut dropped_here = Vec::new();
+        for (definition, cost) in defs.into_iter().zip(costs) {
+            if cost <= share {
+                share -= cost;
+                kept.push(definition);
+            } else {
+                dropped_here.push(definition.name);
+            }
+        }
+        if !dropped_here.is_empty() {
+            dropped.push(McpDroppedTools {
+                server_id,
+                tools: dropped_here,
+            });
+        }
+    }
+    (kept, dropped)
 }
 
 /// What a start attempt resolved to. Starting an already-running server is not
@@ -805,7 +991,8 @@ impl McpManager {
     }
 
     /// The tools every running server offers, namespaced as
-    /// `mcp__{server_id}__{tool_name}`, and the generation they were read at.
+    /// `mcp__{server_id}__{tool_name}` and fitted under `char_ceiling`, and
+    /// the generation they were read at.
     ///
     /// Runs once per LLM call, off the manifest snapshots, so it never waits on
     /// a tool call in flight.
@@ -813,33 +1000,37 @@ impl McpManager {
     /// The stamp is taken under the same read lock as the tools, which is what
     /// makes the two describe one moment. A caller comparing a newer stamp
     /// against older tools would skip the very change it was watching for.
-    pub async fn tool_surface(&self) -> McpToolSurface {
+    pub async fn tool_surface(&self, char_ceiling: usize) -> McpToolSurface {
         let running = self.running.read().await;
         let generation = self.tool_surface_generation.load(Ordering::Acquire);
-        let mut tools = Vec::new();
+        let (tools, dropped) = fit_to_ceiling(offered_by_server(&running), char_ceiling);
+        drop(running);
 
-        for (server_id, entry) in running.iter() {
-            for offer in tool_offers(
-                server_id,
-                &entry.server_config.name,
-                &entry.tools,
-                &entry.server_config.disabled_tools,
-            ) {
-                if offer.wire_name.is_none() {
-                    log!(
-                        "[MCP] Tool '{}' on server '{}' has no name that fits the tool-name limit, not offering it",
-                        offer.tool.name,
-                        server_id
-                    );
-                    continue;
-                }
-                if let Some(definition) = offer.into_offered() {
-                    tools.push(definition);
-                }
-            }
+        if !dropped.is_empty() {
+            log!(
+                "[MCP] Tools past the {}-char MCP tool ceiling, not offering them: {}",
+                char_ceiling,
+                describe_dropped(&dropped)
+            );
         }
+        McpToolSurface {
+            tools,
+            generation,
+            dropped,
+        }
+    }
 
-        McpToolSurface { tools, generation }
+    /// Where the running servers stand against the request budget of a model
+    /// with `context_window`, for the cost report. The fit is the one the
+    /// request applies, so the sent figures are what a request carries.
+    pub async fn budget(&self, context_window: usize) -> McpBudget {
+        let running = self.running.read().await;
+        let (sent, dropped) = fit_to_ceiling(
+            offered_by_server(&running),
+            mcp_tool_char_ceiling(context_window),
+        );
+        drop(running);
+        McpBudget::new(context_window, &sent, dropped)
     }
 
     /// Get tool definitions for stopped servers (name + description only, no params).
@@ -916,6 +1107,37 @@ impl ToolOffer<'_> {
             .as_ref()
             .map_or(0, |d| tool_definitions_chars(std::slice::from_ref(d)))
     }
+}
+
+/// The definitions each running server would put in a request, before any
+/// ceiling applies.
+fn offered_by_server(
+    running: &HashMap<String, RunningServer>,
+) -> Vec<(String, Vec<ToolDefinition>)> {
+    running
+        .iter()
+        .map(|(server_id, entry)| {
+            let offered = tool_offers(
+                server_id,
+                &entry.server_config.name,
+                &entry.tools,
+                &entry.server_config.disabled_tools,
+            )
+            .into_iter()
+            .filter_map(|offer| {
+                if offer.wire_name.is_none() {
+                    log!(
+                        "[MCP] Tool '{}' on server '{}' has no name that fits the tool-name limit, not offering it",
+                        offer.tool.name,
+                        server_id
+                    );
+                }
+                offer.into_offered()
+            })
+            .collect();
+            (server_id.clone(), offered)
+        })
+        .collect()
 }
 
 /// Resolve every tool of one server into an offer.
@@ -1367,6 +1589,195 @@ mod tests {
         assert!(
             resolve_wire_tool_name("backstage", &tools, "catalog.get-catalog-entity").is_none()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The MCP tool ceiling
+    // -----------------------------------------------------------------------
+
+    /// `count` tools of about 1.5 KB each, the size a real server ships.
+    fn heavy_definitions(server_id: &str, count: usize) -> Vec<ToolDefinition> {
+        let names: Vec<String> = (0..count).map(|i| format!("tool_{i:03}")).collect();
+        let tools: Vec<McpTool> = names
+            .iter()
+            .map(|n| McpTool {
+                name: n.clone(),
+                description: Some(format!("{n}: {}", "Explains itself at length. ".repeat(40))),
+                input_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "target": { "type": "string", "description": n } },
+                })),
+            })
+            .collect();
+        tool_offers(server_id, server_id, &tools, &[])
+            .into_iter()
+            .filter_map(ToolOffer::into_offered)
+            .collect()
+    }
+
+    fn names(defs: &[ToolDefinition]) -> Vec<&str> {
+        defs.iter().map(|d| d.name.as_str()).collect()
+    }
+
+    /// The reported failure: a big `tools/list` took the whole request budget,
+    /// so the conversation was trimmed to nothing and then every turn failed.
+    #[test]
+    fn a_500_tool_manifest_is_bounded_and_leaves_the_conversation_room() {
+        let defs = heavy_definitions("github", 500);
+        let total_budget = crate::engine::context::agent_context_char_budget(200_000);
+        assert!(
+            tool_definitions_chars(&defs) > total_budget,
+            "the manifest alone must overflow the request, or this proves nothing"
+        );
+
+        let ceiling = mcp_tool_char_ceiling(200_000);
+        let (kept, dropped) = fit_to_ceiling(vec![("github".to_string(), defs)], ceiling);
+
+        assert!(!kept.is_empty(), "the server keeps what fits");
+        assert!(tool_definitions_chars(&kept) <= ceiling);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].server_id, "github");
+        assert_eq!(kept.len() + dropped[0].tools.len(), 500);
+
+        let message_budget = total_budget.saturating_sub(tool_definitions_chars(&kept));
+        assert!(message_budget > 0);
+        assert!(
+            message_budget >= total_budget / 4 * 3,
+            "the conversation keeps the bulk of the window: {message_budget} of {total_budget}"
+        );
+    }
+
+    /// A small server is never squeezed to make room for a big one. The big
+    /// one keeps its own listed order and loses its tail.
+    #[test]
+    fn each_server_gets_a_fair_share_and_drops_from_its_own_tail() {
+        let small = heavy_definitions("slack", 3);
+        let big = heavy_definitions("github", 200);
+        let ceiling = tool_definitions_chars(&small) + tool_definitions_chars(&big[..10]);
+
+        let (kept, dropped) = fit_to_ceiling(
+            vec![
+                ("slack".to_string(), small.clone()),
+                ("github".to_string(), big.clone()),
+            ],
+            ceiling,
+        );
+
+        let kept = names(&kept);
+        assert_eq!(
+            &kept[..10],
+            &names(&big[..10])[..],
+            "github comes first, by id"
+        );
+        assert_eq!(&kept[10..], &names(&small)[..], "slack keeps every tool");
+        assert_eq!(
+            dropped,
+            vec![McpDroppedTools {
+                server_id: "github".to_string(),
+                tools: names(&big[10..]).iter().map(|n| n.to_string()).collect(),
+            }]
+        );
+    }
+
+    /// The array is the first prompt-cache segment, so one map must always
+    /// yield one array, whatever order the servers come in.
+    #[test]
+    fn the_fit_does_not_depend_on_the_order_servers_arrive_in() {
+        let a = heavy_definitions("alpha", 40);
+        let b = heavy_definitions("beta", 40);
+        let ceiling = tool_definitions_chars(&a);
+
+        let forward = fit_to_ceiling(
+            vec![
+                ("alpha".to_string(), a.clone()),
+                ("beta".to_string(), b.clone()),
+            ],
+            ceiling,
+        );
+        let backward = fit_to_ceiling(
+            vec![("beta".to_string(), b), ("alpha".to_string(), a)],
+            ceiling,
+        );
+
+        assert_eq!(names(&forward.0), names(&backward.0));
+        assert_eq!(forward.1, backward.1);
+        assert_eq!(forward.1.len(), 2, "both servers lose their tail");
+    }
+
+    #[test]
+    fn the_dropped_notice_is_one_line_naming_server_and_tools() {
+        let surface = McpToolSurface {
+            tools: Vec::new(),
+            generation: 0,
+            dropped: vec![McpDroppedTools {
+                server_id: "github".to_string(),
+                tools: (0..25).map(|i| format!("mcp__github__t{i}")).collect(),
+            }],
+        };
+        let notice = surface.dropped_notice().expect("tools were dropped");
+        assert_eq!(notice.lines().count(), 1, "{notice}");
+        assert!(
+            notice.contains("server 'github' (25: mcp__github__t0"),
+            "{notice}"
+        );
+        assert!(notice.contains("and 15 more"), "{notice}");
+        assert!(!notice.contains("mcp__github__t10"), "{notice}");
+
+        let clean = McpToolSurface {
+            dropped: Vec::new(),
+            ..surface
+        };
+        assert_eq!(clean.dropped_notice(), None);
+    }
+
+    /// One definition costing exactly `chars`.
+    fn definition_of(chars: usize) -> ToolDefinition {
+        let with = |description: String| ToolDefinition {
+            name: "mcp__srv__t".to_string(),
+            description,
+            parameters: serde_json::json!({ "type": "object" }),
+        };
+        let base = tool_definitions_chars(&[with(String::new())]);
+        let definition = with("x".repeat(chars - base));
+        assert_eq!(
+            tool_definitions_chars(std::slice::from_ref(&definition)),
+            chars
+        );
+        definition
+    }
+
+    /// The page states the share against the budget a request really has, in
+    /// the packer's own unit, and warns before anything is left out.
+    #[test]
+    fn the_budget_report_agrees_with_the_request_budget_and_warns_near_the_ceiling() {
+        let ceiling = mcp_tool_char_ceiling(200_000);
+        let quiet = McpBudget::new(200_000, &[definition_of(ceiling / 2)], Vec::new());
+        assert_eq!(
+            quiet.request_chars,
+            crate::engine::context::agent_context_char_budget(200_000)
+        );
+        assert_eq!(quiet.mcp_ceiling_chars, ceiling);
+        assert_eq!((quiet.sent_tools, quiet.sent_chars), (1, ceiling / 2));
+        assert_eq!(quiet.sent_tokens, estimate_tokens_from_chars(ceiling / 2));
+        assert_eq!(quiet.warning, None);
+
+        let near = McpBudget::new(200_000, &[definition_of(ceiling / 10 * 9)], Vec::new());
+        let warning = near.warning.expect("90% of the ceiling warns");
+        assert!(warning.contains("90%"), "{warning}");
+
+        let past = McpBudget::new(
+            200_000,
+            &[definition_of(ceiling)],
+            vec![McpDroppedTools {
+                server_id: "github".to_string(),
+                tools: vec!["mcp__github__a".to_string(), "mcp__github__b".to_string()],
+            }],
+        );
+        let warning = past.warning.expect("dropped tools warn");
+        assert!(warning.starts_with("2 tools are left out"), "{warning}");
+        assert!(warning.contains("server 'github'"), "{warning}");
+
+        assert_eq!(McpBudget::new(200_000, &[], Vec::new()).warning, None);
     }
 
     // -----------------------------------------------------------------------
@@ -1910,6 +2321,35 @@ done
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
+    /// The ceiling applies to what a running server really offers, and the
+    /// cost report sees the same cut the request does.
+    #[tokio::test]
+    async fn a_running_server_past_the_ceiling_is_cut_and_the_report_says_so() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta", "gamma"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        manager.start_server("stub").await.unwrap();
+
+        let all = manager.tool_surface(usize::MAX).await;
+        assert!(all.dropped.is_empty());
+        let one_tool = tool_definitions_chars(&all.tools[..1]);
+
+        let cut = manager.tool_surface(one_tool).await;
+        assert_eq!(cut.tools.len(), 1);
+        assert_eq!(cut.dropped.len(), 1);
+        assert_eq!(cut.dropped[0].tools.len(), 2);
+        assert!(cut.dropped_notice().is_some());
+
+        // A window small enough that its ceiling fits no tool at all.
+        let budget = manager.budget(0).await;
+        assert_eq!(budget.mcp_ceiling_chars, 0);
+        assert_eq!((budget.sent_tools, budget.sent_chars), (0, 0));
+        assert_eq!(budget.dropped[0].tools.len(), 3);
+        assert!(budget.warning.is_some());
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
     /// Switching a tool off has to reach the definitions the NEXT request
     /// carries, not just the DB. The running snapshot is what that path reads.
     #[tokio::test]
@@ -1925,7 +2365,7 @@ done
             names
         };
         assert_eq!(
-            offered(manager.tool_surface().await),
+            offered(manager.tool_surface(usize::MAX).await),
             vec![
                 "mcp__stub__alpha".to_string(),
                 "mcp__stub__beta".to_string()
@@ -1939,7 +2379,7 @@ done
             .expect("the server exists");
 
         assert_eq!(
-            offered(manager.tool_surface().await),
+            offered(manager.tool_surface(usize::MAX).await),
             vec!["mcp__stub__alpha".to_string()],
             "a disabled tool must leave the request without a restart"
         );
@@ -1954,7 +2394,7 @@ done
             .await
             .unwrap()
             .expect("the server exists");
-        assert_eq!(manager.tool_surface().await.tools.len(), 2);
+        assert_eq!(manager.tool_surface(usize::MAX).await.tools.len(), 2);
 
         assert!(manager
             .set_disabled_tools("missing", &[], None)
@@ -2022,7 +2462,7 @@ done
         assert!(!stub.is_alive(), "the process must not outlive its row");
         assert!(McpServerStore::get(&pool, "stub").await.unwrap().is_none());
         assert!(
-            manager.tool_surface().await.tools.is_empty(),
+            manager.tool_surface(usize::MAX).await.tools.is_empty(),
             "a removed server must not keep offering tools"
         );
         assert!(manager.list_servers().await.unwrap().is_empty());
@@ -2074,7 +2514,7 @@ done
         let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
         manager.start_server("stub").await.unwrap();
-        let live = manager.tool_surface().await;
+        let live = manager.tool_surface(usize::MAX).await;
         assert_eq!(live.tools.len(), 2);
 
         // A start is the recovery the model is told to reach for.
@@ -2105,7 +2545,7 @@ done
             "its manifest is remembered now, not read off the process"
         );
 
-        let dropped = manager.tool_surface().await;
+        let dropped = manager.tool_surface(usize::MAX).await;
         assert!(
             dropped.tools.is_empty(),
             "a dead server must stop costing tokens on every request"
@@ -2130,7 +2570,7 @@ done
 
         let before_start = manager.tool_surface_generation();
         manager.start_server("stub").await.unwrap();
-        let started = manager.tool_surface().await;
+        let started = manager.tool_surface(usize::MAX).await;
         assert_eq!(started.tools.len(), 2);
         assert_ne!(
             started.generation, before_start,
@@ -2155,7 +2595,7 @@ done
             .await
             .unwrap()
             .expect("the server exists");
-        let disabled = manager.tool_surface().await;
+        let disabled = manager.tool_surface(usize::MAX).await;
         assert_eq!(disabled.tools.len(), 1);
         assert_ne!(disabled.generation, started.generation);
 
@@ -2173,7 +2613,7 @@ done
         assert_eq!(manager.tool_surface_generation(), disabled.generation);
 
         manager.stop_server("stub").await.unwrap();
-        let stopped = manager.tool_surface().await;
+        let stopped = manager.tool_surface(usize::MAX).await;
         assert!(
             stopped.tools.is_empty(),
             "a stopped server stops being callable"
@@ -2216,7 +2656,7 @@ done
             .await
             .expect("a call to another server must not wait for the slow one")
             .expect("the quick server answers");
-            let surface = tokio::time::timeout(budget, manager.tool_surface())
+            let surface = tokio::time::timeout(budget, manager.tool_surface(usize::MAX))
                 .await
                 .expect("tool assembly must not wait for a call in flight");
             (answered, surface)
@@ -2399,7 +2839,7 @@ done
         assert!(!status.running);
         assert_eq!(status.tools_source, McpToolsSource::NeverObserved);
         assert!(status.tools.is_empty());
-        assert!(manager.tool_surface().await.tools.is_empty());
+        assert!(manager.tool_surface(usize::MAX).await.tools.is_empty());
 
         // A server that genuinely advertises nothing is the other thing, and
         // it starts.

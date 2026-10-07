@@ -92,6 +92,27 @@ coding-agent worktree. See ADR 0021.)
 **Inside `/harden`, stay in the turn.** Apply reads the next idle as a finished
 `/harden`, so there use the exit-file join `/harden` Phase 4.5 describes.
 
+## GitHub mode: the same run on GitHub's runners
+
+`./scripts/e2e.sh --github` runs the suites on GitHub instead of this host
+(ADR 0382). Every e2e script takes the flag, and its filters mean the same.
+Reach for it when this host is busy, or another run holds the e2e lock.
+
+- **It tests the committed HEAD.** It refuses a dirty tree, so commit first.
+- **Only the Claude Code specs run here**, as the local leg, under the e2e
+  lock. The leg waits up to an hour for a held lock rather than failing. A
+  selection without them takes no lock and builds nothing here.
+- **It is a long wait.** A cold run builds the engine before any test starts.
+  Run it as a background task, exactly like a local run.
+- **Exit 76 means no verdict**: the push was refused, the run never started or
+  was cancelled, or a shard left no output. Report it. Never read it as green.
+- **The output stays** under `test-results/github/<run-id>/`. For a failed
+  shard, `gh run download <run> --repo lucidos-dev/lucidos -n e2e-traces-<shard>`
+  fetches its Playwright traces and engine log.
+- **Fix a failure locally.** Reproduce it with the targeted sub-scripts below.
+  Rerun one spec on GitHub with `./scripts/e2e-browser.sh --github -f <spec>`
+  only when it fails nowhere else.
+
 ## A memory stop is the harness's to recover, never yours
 
 The harness waits out a host in memory trouble and resumes on its own, so one

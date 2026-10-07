@@ -114,16 +114,21 @@
     opacity: 0.5;
 }
 
-.search-everywhere-tab-count {
-    margin-left: 0.375rem;
-    font-size: var(--font-size-xs);
-    font-variant-numeric: tabular-nums;
-    color: var(--text-muted);
+/* Keeps the width of the widest label it can show, so no chip moves as the
+   query starts. That widest label lies invisibly under the real one in the
+   same grid cell. */
+.search-everywhere-widest {
+    display: inline-grid;
 }
 
-.search-everywhere-tab.active .search-everywhere-tab-count {
-    color: inherit;
-    opacity: 0.7;
+.search-everywhere-widest::before {
+    content: attr(data-widest);
+    visibility: hidden;
+}
+
+.search-everywhere-widest::before,
+.search-everywhere-widest > * {
+    grid-area: 1 / 1;
 }
 
 /* The transparent outline is the forced-colors fallback, same as
@@ -213,6 +218,14 @@
     line-clamp: 2;
     overflow: hidden;
     overflow-wrap: anywhere;
+}
+
+/* The Text tab's totals, above its lines. */
+.search-everywhere-summary {
+    padding: 0.375rem var(--surface-inset);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-family: var(--font-ui);
 }
 
 /* Laid out like a result row, so the spinner sits in the icon column. */

@@ -39,9 +39,10 @@ describe('the What\'s New badge dot', () => {
     expect(decl(corner, 'position')).toBe(null);
     expect(decl(corner, 'background')).toBe(null);
     // What IS its own: an empty box stays round, where `.badge` pads and
-    // line-boxes for a glyph.
+    // line-boxes for a glyph. The round corner itself is every badge's, in
+    // badges.css (radius-token-guard.test.ts).
     expect(decl(corner, 'padding')).toBe('0');
-    expect(decl(corner, 'border-radius')).toBe('var(--radius-round)');
+    expect(decl(corner, 'border-radius')).toBe(null);
   });
 
   it('outranks `.badge`, which a later sheet would otherwise win on order', () => {

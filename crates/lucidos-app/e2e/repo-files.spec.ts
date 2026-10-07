@@ -5,13 +5,15 @@ import {
 } from './helpers';
 import { WORKSPACE, psql, git, getDbPort } from './db-helpers';
 import { randomUUID } from 'crypto';
-import { writeFileSync } from 'fs';
-import { resolve } from 'path';
+import { execFileSync } from 'child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join, resolve } from 'path';
 
-/** Register the e2e workspace as a repository via API. */
-async function registerRepo(page: Page, name: string): Promise<string> {
+/** Register a repository via API: the e2e workspace unless `path` names another. */
+async function registerRepo(page: Page, name: string, path: string = WORKSPACE): Promise<string> {
   const resp = await apiRequest(page).post('/api/v1/repositories', {
-    data: { name, path: WORKSPACE, description: 'e2e test repo' },
+    data: { name, path, description: 'e2e test repo' },
   });
   expect(resp.ok()).toBeTruthy();
   const body = await resp.json();
@@ -23,13 +25,37 @@ async function removeRepo(page: Page, id: string): Promise<void> {
   await apiRequest(page).delete(`/api/v1/repositories/${id}`);
 }
 
+/** A committed scratch repo holding one folder and one plain-text file, which
+ *  previews as code. The tree these tests browse is their own: a fresh e2e
+ *  workspace tracks no folder at all. */
+function createScratchRepo(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'lucidos-e2e-repo-'));
+  mkdirSync(join(dir, 'src'));
+  writeFileSync(join(dir, 'notes.txt'), 'scratch repo\n');
+  writeFileSync(join(dir, 'src', 'main.txt'), 'hello from the scratch repo\n');
+  const run = (...args: string[]) => execFileSync('git', args, { cwd: dir });
+  run('init', '-q', '-b', 'main');
+  run('add', '.');
+  run('-c', 'user.name=e2e', '-c', 'user.email=e2e@example.com', 'commit', '-q', '-m', 'seed');
+  return dir;
+}
+
 test.describe('Repo File Explorer', () => {
   let repoId: string;
+  let repoPath: string;
   const repoName = `e2e-repo-${Date.now()}`;
+
+  test.beforeAll(() => {
+    repoPath = createScratchRepo();
+  });
+
+  test.afterAll(() => {
+    if (repoPath) rmSync(repoPath, { recursive: true, force: true });
+  });
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    repoId = await registerRepo(page, repoName);
+    repoId = await registerRepo(page, repoName, repoPath);
   });
 
   test.afterEach(async ({ page }) => {

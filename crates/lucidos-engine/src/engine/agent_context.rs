@@ -1,23 +1,23 @@
 use crate::core::devices::SeenDevice;
-use crate::core::{DeviceStore, EventRow, EventStore, PreferenceStore};
+use crate::core::{prefs, DeviceStore, EventRow, EventStore, PreferenceStore};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use uuid::Uuid;
 
 const SAFE_PREFERENCE_KEYS: &[&str] = &[
-    "timezone",
-    "language",
-    "theme-mode",
-    "theme",
-    "font-family",
-    "ui-scale",
-    "motion",
+    prefs::TIMEZONE.key(),
+    prefs::LANGUAGE.key(),
+    prefs::THEME_MODE.key(),
+    prefs::THEME.key(),
+    prefs::FONT_FAMILY.key(),
+    prefs::UI_SCALE.key(),
+    prefs::MOTION.key(),
     "text-size",
     "font-size",
-    "push_notifications",
-    "chat_model",
-    "chat_reasoning_effort",
-    "image_model",
+    prefs::PUSH_NOTIFICATIONS.key(),
+    prefs::CHAT_MODEL.key(),
+    prefs::CHAT_REASONING_EFFORT.key(),
+    prefs::IMAGE_MODEL.key(),
 ];
 
 /// Build the user environment block shared by the chat agent and coding-agent
@@ -338,18 +338,28 @@ mod tests {
             Some("Ios pwa"),
         )
         .await;
-        crate::test_support::seed_preference(&pool, "theme-mode", "dark")
+        crate::test_support::seed_preference(&pool, prefs::THEME_MODE.key(), "dark")
             .await
             .unwrap();
-        crate::test_support::seed_preference_for_device(&pool, "theme-mode", "light", "device-ios")
-            .await
-            .unwrap();
-        crate::test_support::seed_preference_for_device(&pool, "ui-scale", "125", "device-ios")
-            .await
-            .unwrap();
+        crate::test_support::seed_preference_for_device(
+            &pool,
+            prefs::THEME_MODE.key(),
+            "light",
+            "device-ios",
+        )
+        .await
+        .unwrap();
+        crate::test_support::seed_preference_for_device(
+            &pool,
+            prefs::UI_SCALE.key(),
+            "125",
+            "device-ios",
+        )
+        .await
+        .unwrap();
         // Written through the guarded silent door, matching production: a
         // transport secret is not a setting, so it must not announce.
-        PreferenceStore::set_silent(&pool, "vapid_keys", r#"{"private":"secret"}"#)
+        PreferenceStore::set_silent(&pool, prefs::VAPID_KEYS.key(), r#"{"private":"secret"}"#)
             .await
             .unwrap();
 
@@ -376,12 +386,17 @@ mod tests {
     #[tokio::test]
     async fn context_names_the_effective_theme_with_the_device_override_winning() {
         let (pool, db_name) = setup_test_db().await;
-        crate::test_support::seed_preference(&pool, "theme", "minimal")
+        crate::test_support::seed_preference(&pool, prefs::THEME.key(), "minimal")
             .await
             .unwrap();
-        crate::test_support::seed_preference_for_device(&pool, "theme", "mono", "device-ios")
-            .await
-            .unwrap();
+        crate::test_support::seed_preference_for_device(
+            &pool,
+            prefs::THEME.key(),
+            "mono",
+            "device-ios",
+        )
+        .await
+        .unwrap();
 
         let on_device = build_user_device_preferences_context(&pool, Some("device-ios")).await;
         assert!(on_device.contains("- theme: mono"), "{on_device}");
@@ -397,9 +412,12 @@ mod tests {
     #[test]
     fn the_theme_line_sits_beside_the_theme_mode_line() {
         let prefs = HashMap::from([
-            ("theme-mode".to_string(), "dark".to_string()),
-            ("theme".to_string(), "nord".to_string()),
-            ("font-family".to_string(), "theme".to_string()),
+            (prefs::THEME_MODE.key().to_string(), "dark".to_string()),
+            (prefs::THEME.key().to_string(), "nord".to_string()),
+            (
+                prefs::FONT_FAMILY.key().to_string(),
+                prefs::THEME.key().to_string(),
+            ),
         ]);
         assert_eq!(
             format_preference_lines(&prefs),
@@ -558,11 +576,11 @@ mod tests {
     #[test]
     fn preference_lines_filter_non_allowlisted_preferences() {
         let prefs = HashMap::from([
-            ("theme-mode".to_string(), "light".to_string()),
-            ("ui-scale".to_string(), "125".to_string()),
-            ("language".to_string(), "".to_string()),
+            (prefs::THEME_MODE.key().to_string(), "light".to_string()),
+            (prefs::UI_SCALE.key().to_string(), "125".to_string()),
+            (prefs::LANGUAGE.key().to_string(), "".to_string()),
             (
-                "vapid_keys".to_string(),
+                prefs::VAPID_KEYS.key().to_string(),
                 r#"{"private":"secret"}"#.to_string(),
             ),
         ]);
@@ -572,7 +590,7 @@ mod tests {
 
         assert!(context.contains("- theme-mode: light"));
         assert!(context.contains("- ui-scale: 125"));
-        assert!(!context.contains("language"));
+        assert!(!context.contains(prefs::LANGUAGE.key()));
         assert!(!context.contains("vapid"));
         assert!(!context.contains("secret"));
     }

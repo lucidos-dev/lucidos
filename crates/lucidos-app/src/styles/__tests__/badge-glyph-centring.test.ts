@@ -16,13 +16,23 @@
  * edges too. So the digit jumped a full pixel against its pill as the badge
  * moved by a fraction of one. The mark's unread count sat 0.5px low.
  *
- * `styles/badges.css` fixes all three in one place. What the fix depends on is
- * not visible from any one badge's own stylesheet, so these are the scans:
+ * The same grid, across, was the fourth. Chrome snaps a pill's sides to whole
+ * pixels and places the glyph at its exact x. The drawer's attention count sat
+ * half a pixel left at 200%.
+ *
+ * The fifth was the font. Centring places a glyph's advance, and Fira Code
+ * draws its bold "3" 0.027em left of it. The mark's "3" hugged its pill's left.
+ *
+ * `styles/badges.css` fixes all five in one place, the fifth with a shift that
+ * `GlyphBadge` measures. What the fix depends on is not visible from any one
+ * badge's own stylesheet, so these are the scans:
  *
  *  - the trim reaches the text, which needs the badge to stop being a flex box;
  *  - no badge inherits the tracking that leans it left;
  *  - the rules cover every badge that carries a number or a sign;
  *  - the pill height and the baseline's offset are whole pixels;
+ *  - each badge is one layer, and its width is a whole pixel;
+ *  - each badge's text renders through GlyphBadge, whose ink span moves by paint only;
  *  - badges.css is imported LAST, which lets it win their `display` and box;
  *  - no badge hands its font to a pseudo-element, which the trim cannot see.
  *
@@ -37,7 +47,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { cssRules, rulesTargeting, selectorList, styleSheetPaths } from './css-rule-helpers';
+import { clientSourcePaths, cssRules, rulesTargeting, selectorList, styleSheetPaths } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
@@ -224,6 +234,97 @@ describe('the pill and the baseline sit on whole pixels', () => {
       const reaching = rulesTargeting(badgesCss, g).filter(r => r.selector !== shared!.selector);
       expect(reaching.map(r => r.selector)).toEqual([]);
     }
+  });
+});
+
+describe('the pill and the glyph share one grid across the badge', () => {
+  // Chrome snaps a pill's left and right edges to whole CSS pixels and places
+  // the glyph at its exact x. A badge on a fractional x therefore drew its
+  // digit up to half a pixel off the pill's middle.
+  const layer = cssRules(badgesCss).find(r => r.props.get('will-change') === 'transform');
+  const width = cssRules(badgesCss).find(r => r.props.has('width'));
+  const sheets = (): Array<{ path: string; css: string }> =>
+    styleSheetPaths(resolve(stylesDir, '..'))
+      .filter(p => !p.endsWith('badges.css'))
+      .map(path => ({ path: path.split('/src/')[1], css: readFileSync(path, 'utf-8') }));
+
+  it('puts every glyph badge on its own layer, ungated', () => {
+    // A layer lands on a whole pixel with the pill and glyph drawn inside it at
+    // one offset, so the two move together.
+    expect(layer, 'no will-change rule in badges.css').toBeDefined();
+    expect(layer!.atRules).toBe('');
+    expect(selectorList(layer!.selector)).toEqual(SHARED_SELECTORS);
+  });
+
+  it('rounds a content-sized pill UP to a whole-pixel width', () => {
+    // Inside the layer, a pill 32.48px wide still has its right edge rounded
+    // alone. Rounding up never clips the content.
+    expect(width, 'no width rule in badges.css').toBeDefined();
+    expect(width!.atRules).toBe('@supports (width: calc-size(fit-content, size))');
+    expect(width!.props.get('width')).toBe('calc-size(fit-content, round(up, size, 1px))');
+    expect(selectorList(width!.selector)).toEqual(SHARED_SELECTORS);
+  });
+
+  it('lets no other rule drop the layer', () => {
+    // Measured: `will-change: opacity` alone gives no snapped layer at rest.
+    const offenders: string[] = [];
+    for (const { path, css } of sheets()) {
+      for (const cls of GLYPH_BADGES) {
+        for (const rule of rulesTargeting(css, cls)) {
+          const hint = rule.props.get('will-change');
+          if (hint !== undefined && !hint.split(/\s*,\s*/).includes('transform')) {
+            offenders.push(`${path}: ${rule.selector} { will-change: ${hint} }`);
+          }
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('lets no badge state a width, only the min-width it is floored at', () => {
+    // A badge's own `width` would beat the rounding wherever it outranks it,
+    // and pin a box the content can outgrow.
+    const offenders: string[] = [];
+    for (const { path, css } of sheets()) {
+      for (const cls of GLYPH_BADGES) {
+        for (const rule of rulesTargeting(css, cls)) {
+          if (rule.props.has('width')) offenders.push(`${path}: ${rule.selector}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe('the ink, not the advance, sits in the middle', () => {
+  // Fira Code's bold "3" sits 0.027em left of its slot. GlyphBadge measures
+  // that gap per text and font, and badges.css moves the text's own span.
+  const ink = cssRules(badgesCss).find(r => r.selector === '.badge-ink');
+
+  it('moves the ink span by its measured shift, in paint only, ungated', () => {
+    // Relative positioning leaves the pill's width and the line's centring alone.
+    expect(ink, 'no .badge-ink rule in badges.css').toBeDefined();
+    expect(ink!.atRules).toBe('');
+    expect(ink!.props.get('position')).toBe('relative');
+    expect(ink!.props.get('left')).toBe('var(--badge-ink-shift, 0em)');
+  });
+
+  it('renders every glyph badge through GlyphBadge, which states the shift', () => {
+    // The dots draw no glyph. The "?" is drawn by a pseudo-element, so it has
+    // no text to measure.
+    const measured = GLYPH_BADGES.filter(c => c !== 'thread-status-question-badge');
+    const offenders: string[] = [];
+    for (const path of clientSourcePaths(resolve(stylesDir, '..'))) {
+      if (path.endsWith('/GlyphBadge.tsx')) continue;
+      const source: string = readFileSync(path, 'utf-8');
+      for (const tag of source.matchAll(/<([a-z]+)\b[^>]*?\bclass=(?:"([^"]*)"|\{`([^`]*)`\})/g)) {
+        const classes: string[] = (tag[2] ?? tag[3]).replace(/\$\{[^}]*\}/g, ' ').split(/\s+/);
+        if (classes.some(c => measured.includes(c)) && !classes.some(c => GLYPHLESS.includes(c))) {
+          offenders.push(`${path.split('/src/')[1]}: <${tag[1]} class="${tag[2] ?? tag[3]}">`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 });
 

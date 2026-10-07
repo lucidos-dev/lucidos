@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 mod actions;
 pub(crate) mod archive;
-mod archive_all;
+pub(crate) mod archive_all;
 mod background_tasks;
 mod delete;
 mod detach;

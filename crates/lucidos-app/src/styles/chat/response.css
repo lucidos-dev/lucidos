@@ -1252,17 +1252,85 @@
 /* A small muted "who said this" mark, over the answer it labels. Sentence
    case: capitals would shout over the answer it only names. */
 .question-freetext-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
 }
 
+/* The typed answer is on its way to the engine. Accent, like the spinner on
+   a picked option. */
+.question-freetext-sending.mini-spinner {
+    --spinner-color: var(--accent);
+}
+
+/* An answer that was not sent: "Not sent" and its retry, on the right edge
+   like the "Your answer" label above a typed answer. */
+.question-unsent-row {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-sm);
+    font-size: var(--font-size-xs);
+    color: var(--accent-red);
+}
+
+/* Gives back the icon button's own padding, so the glyph, not its box, sits
+   on the bubble's right edge. The tap target keeps its full size. */
+.question-unsent-retry.icon-btn {
+    margin-right: -0.25rem;
+}
+
+/* "Not sent" opens the details, so it is a button that reads as the label. */
+.question-unsent-toggle {
+    padding: 0;
+    background: none;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .question-unsent-toggle:hover {
+        text-decoration: underline;
+    }
+}
+
+.question-unsent-detail {
+    padding-top: var(--space-xs);
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    text-align: right;
+}
+
+/* A tapped answer that was not sent: "Not sent" and its retry sit at the top
+   right inside the picked option, beside the option rather than in it, since
+   they are buttons. The option's label stops short of them. */
+.question-option-unsent {
+    position: relative;
+}
+
+/* Room for the notice: "Not sent" at --font-size-xs, the gap, and the icon
+   button. */
+.question-option-unsent > .question-option {
+    width: 100%;
+    padding-right: 7rem;
+}
+
+/* Only the row sits over the option. The details roll open under it, in
+   flow, so they never cover the option's label. */
+.question-option-unsent .question-unsent-row {
+    position: absolute;
+    top: var(--space-xs);
+    right: var(--space-sm);
+}
+
 /* Surface, radius, padding and leading all come from `.user-bubble`. What is
-   added here is what a typed answer carries and a message bubble does not: its
-   own line breaks, and a long unbroken token that must not widen the card. */
+   added here is a long unbroken token that must not widen the card. */
 .question-freetext-text {
     color: var(--text-primary);
     word-break: break-word;
-    white-space: pre-wrap;
 }
 
 /* Right-align inside the .question-body flex column. The full-opacity
@@ -1480,6 +1548,8 @@
 
 .allowlist-actions {
     display: flex;
+    /* Revert and Save pack right; the spacer keeps Add pattern with the list. */
+    justify-content: flex-end;
     gap: 0.5rem;
     align-items: center;
     margin-top: 0.625rem;
@@ -1688,8 +1758,23 @@ body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
     margin: 0;
     opacity: 0.85;
 }
+/* The unsent message, in the user's own words and colour, clamped so a long
+   message cannot bury the actions. */
+.exchange-error-quote {
+    margin: 0 0 0.25rem;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+    overflow: hidden;
+}
+/* The primary action sits rightmost, at the row's end. */
 .exchange-error-actions {
     display: flex;
+    justify-content: flex-end;
     gap: var(--space-sm);
     margin-top: var(--space-sm);
 }

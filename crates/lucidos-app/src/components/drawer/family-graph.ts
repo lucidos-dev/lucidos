@@ -1,5 +1,6 @@
 import { computed } from '@preact/signals';
-import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadNeedsAttention, threadInReview, threadIsRunning, type ThreadChannel } from '../../store/store';
+import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadNeedsAttention, threadInReview, type ThreadChannel } from '../../store/store';
+import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { byRecent, byCreated, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
 import type { ThreadState } from '../../store/thread-events';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
@@ -16,13 +17,20 @@ const SECTION_PRIORITY: Record<DisplaySection, number> = {
     archive: 2,
 };
 
+/** Whether the lifecycle sections hold this thread. The home thread is in
+ *  none: the thread header opens it instead (ADR 0362). Each of its
+ *  sub-threads roots a family of its own. */
+function inLifecycleSections(t: ThreadState): boolean {
+    return !isExcludedFromSections(t) && !t.meta.home;
+}
+
 /** Shared empty set for a caller with no revealed-archived state of its own. */
 const EMPTY_STRING_SET: ReadonlySet<string> = new Set();
 
-/** Walk parentThreadId up to the topmost ancestor present in `byId`. Stops at
- *  the first ancestor not in the map (paginated out / filtered) and returns
- *  that ancestor's child as the root — so an orphan child is its own family
- *  root. On a parentThreadId cycle (data corruption), returns the
+/** Walk parentThreadId up to the topmost ancestor present in `byId`. It stops
+ *  at the first ancestor not in the map (paginated out / filtered) or at the
+ *  home thread. That ancestor's child is the root, so an orphan child is its
+ *  own family root. On a parentThreadId cycle (data corruption), returns the
  *  lexicographically-smallest id in the cycle so every member converges on the
  *  same root — without that, two cycle members would get different roots and
  *  break the "every family member maps to the same record" invariant. */
@@ -31,7 +39,7 @@ function rootAncestorId(start: ThreadState, byId: ReadonlyMap<string, ThreadStat
     const visited = new Set<string>([current.meta.id]);
     while (current.meta.parentThreadId) {
         const parent = byId.get(current.meta.parentThreadId);
-        if (!parent) return current.meta.id;
+        if (!parent || parent.meta.home) return current.meta.id;
         if (visited.has(parent.meta.id)) {
             let min = current.meta.id;
             for (const id of visited) if (id < min) min = id;
@@ -48,9 +56,9 @@ function rootAncestorId(start: ThreadState, byId: ReadonlyMap<string, ThreadStat
  *  pass over the input avoids 3× parent-chain walks per render. */
 export type FamilyGraph = {
     byId: ReadonlyMap<string, ThreadState>;
-    /** Excluded threads (composing/discarded) are absent — callers iterate the
-     *  input list and skip via `isExcludedFromSections`, or look up here and
-     *  treat `undefined` as "skip". */
+    /** Threads no lifecycle section holds (composing, discarded, the home
+     *  thread) are absent. Callers iterate the input list and skip via
+     *  `inLifecycleSections`, or look up here and treat `undefined` as "skip". */
     rootByThread: ReadonlyMap<string, string>;
 };
 
@@ -59,7 +67,7 @@ export function computeFamilyGraph(threads: ThreadState[]): FamilyGraph {
     for (const t of threads) byId.set(t.meta.id, t);
     const rootByThread = new Map<string, string>();
     for (const t of threads) {
-        if (isExcludedFromSections(t)) continue;
+        if (!inLifecycleSections(t)) continue;
         rootByThread.set(t.meta.id, rootAncestorId(t, byId));
     }
     return { byId, rootByThread };
@@ -142,7 +150,7 @@ export type FamilyDecorations = {
 function buildChildrenByParent(threads: ThreadState[]): Map<string, string[]> {
     const childrenByParent = new Map<string, string[]>();
     for (const t of threads) {
-        if (isExcludedFromSections(t)) continue;
+        if (!inLifecycleSections(t)) continue;
         const parentId = t.meta.parentThreadId;
         if (!parentId) continue;
         const siblings = childrenByParent.get(parentId);
@@ -191,7 +199,7 @@ export function computeHiddenArchivedThreads(
     const hidden = new Set<string>();
     const hiddenDirectChildCount = new Map<string, number>();
     for (const t of threads) {
-        if (isExcludedFromSections(t)) continue;
+        if (!inLifecycleSections(t)) continue;
         const id = t.meta.id;
         const root = graph.rootByThread.get(id);
         if (root === undefined || root === id) continue; // family root is never hidden
@@ -281,7 +289,7 @@ export type FamilySectionMap = ReadonlyMap<string, DisplaySection>;
 export function computeFamilySections(threads: ThreadState[], graph: FamilyGraph): Map<string, DisplaySection> {
     const familySection = new Map<string, DisplaySection>();
     for (const t of threads) {
-        if (isExcludedFromSections(t)) continue;
+        if (!inLifecycleSections(t)) continue;
         const sec = getThreadDisplaySection(t);
         const root = graph.rootByThread.get(t.meta.id);
         if (root === undefined) continue;
@@ -315,7 +323,7 @@ export function computeFamilyDecorations(
     const liftedRoots = new Set<string>();
     const archivedSubThreads = new Set<string>();
     for (const t of threads) {
-        if (isExcludedFromSections(t)) continue;
+        if (!inLifecycleSections(t)) continue;
         const root = graph.rootByThread.get(t.meta.id);
         if (root === undefined) continue;
         const routed = familySection.get(root);
@@ -409,7 +417,7 @@ export function categorizeThreads(
     };
 
     for (const t of threads) {
-        if (isExcludedFromSections(t)) continue;
+        if (!inLifecycleSections(t)) continue;
         const status = effectiveThreadStatus(t);
         out.statusMap.set(t.meta.id, status);
         const display = familySection.get(rootByThread.get(t.meta.id)!)!;
@@ -689,20 +697,52 @@ export function reviewThreads(threads: ReadonlyMap<string, ThreadState>): Thread
     return out;
 }
 
-/** Running view rows: every Current/Saved thread actively working on a response
- *  (see `threadIsRunning`). Mirrors `attentionThreads`/`reviewThreads`: bypasses
- *  the channel/trigger/repo filters and the lifecycle section grouping. Single
- *  tier (all running), so ordered purely most-recent-first. Shares its predicate
- *  with the selector's badge count (`runningThreadCount`) so the two can never
- *  disagree. */
-export function runningThreads(threads: ReadonlyMap<string, ThreadState>): ThreadState[] {
+/** Whether a thread is in flight: it sits in the Current or Saved section and
+ *  its status dot reads `running` or `waiting`. That is a running turn, its own
+ *  event wait, or sub-threads that have not finished.
+ *
+ *  Reading the dot keeps the three status views disjoint. The dot puts a
+ *  question, a failure and a pause ahead of `waiting`, and Needs attention owns
+ *  those. A ready change with only sub-threads reads `changes`, which is
+ *  Review's. A stopped sub-thread needs the user even while its own children
+ *  run, so Needs attention keeps it. */
+export function threadIsInFlight(thread: ThreadState): boolean {
+    if (isExcludedFromSections(thread)) return false;
+    const section = getThreadDisplaySection(thread);
+    if (section !== 'current' && section !== 'saved') return false;
+    if (threadNeedsAttention(thread)) return false;
+    const dot = threadVisualStatus(thread);
+    return dot === 'running' || dot === 'waiting';
+}
+
+/** In flight view rows: every thread `threadIsInFlight` takes, roots
+ *  most-recent-first, each sub-thread nested under its parent when the parent
+ *  is in flight too. Mirrors `attentionThreads`/`reviewThreads`: bypasses the
+ *  channel/trigger/repo filters and the lifecycle section grouping. */
+export function inFlightThreads(threads: ReadonlyMap<string, ThreadState>): NestedThread[] {
     const out: ThreadState[] = [];
     for (const t of threads.values()) {
-        if (threadIsRunning(t)) out.push(t);
+        if (threadIsInFlight(t)) out.push(t);
     }
     out.sort(byRecent);
-    return out;
+    return nestByParent(out);
 }
+
+/** Whether the In flight header shimmers: only while a row's turn is running.
+ *  A thread parked on a wait is in flight but doing nothing right now. */
+export function inFlightHasRunning(rows: readonly NestedThread[]): boolean {
+    return rows.some(n => effectiveThreadStatus(n.thread) === 'running');
+}
+
+/** Number of rows the In flight view renders. Same predicate as
+ *  `inFlightThreads`, so the selector count and the list never disagree. */
+export const inFlightThreadCount = computed<number>(() => {
+    let count = 0;
+    for (const t of threadMap.value.values()) {
+        if (threadIsInFlight(t)) count++;
+    }
+    return count;
+});
 
 export type ThreadSections = {
     current: ThreadState[];

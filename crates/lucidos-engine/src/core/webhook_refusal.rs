@@ -105,15 +105,22 @@ pub const DISABLED_REFUSALS_BEFORE_DEGRADED: i64 = 1;
 /// 15-minute strikes). It is longer than the burst one workflow run produces,
 /// so a sender retrying one payload cannot page anyone inside it.
 ///
+/// **For a hook that is on, the refusals themselves must span it**, first to
+/// last. The run's age to now is not enough: three unsigned probes inside one
+/// minute, then silence, would pass it half an hour later. A switched-off hook
+/// keeps the run's age, since its one certain refusal spans nothing.
+///
 /// **The count and the clock are both required, and neither works alone.** A
 /// purely time-based window false-negatives on a hook that takes three
 /// deliveries a day, which has nothing inside any useful window. A purely
 /// count-based one cannot tell three refusals in four seconds from three over
 /// three days.
 ///
-/// Together they handle both shapes. A busy hook reaches the count in seconds
-/// and then waits out the clock. A quiet hook passes the clock at once and
-/// waits for the count.
+/// Together they handle both shapes. A busy broken hook reaches the count in
+/// seconds and keeps refusing until the span passes the clock. A quiet hook
+/// spans the clock between deliveries and waits for the count.
+///
+/// See `docs/adr/0365-a-burst-is-not-an-outage.md`.
 pub const REFUSAL_RUN_BEFORE_DEGRADED_SECS: i64 = 30 * 60;
 
 /// How long a run may go without a new refusal before it stops being news.
@@ -152,7 +159,7 @@ pub fn judge(hook: &Webhook) -> RefusalVerdict {
     let (Some(run_secs), Some(cause)) = (run.run_secs, run.cause) else {
         return RefusalVerdict::Clear;
     };
-    if run_secs < REFUSAL_RUN_BEFORE_DEGRADED_SECS || gone_quiet(run) {
+    if gone_quiet(run) {
         return RefusalVerdict::Clear;
     }
     // **The live flag wins over the stored cause, in BOTH directions.** The
@@ -166,18 +173,43 @@ pub fn judge(hook: &Webhook) -> RefusalVerdict {
     // the certainty comes from the flag, not from the count.
     //
     // On, a disabled run names a fault that is over, whatever its tally says.
-    let (cause, floor) = if !hook.enabled {
-        (RefusalCause::Disabled, DISABLED_REFUSALS_BEFORE_DEGRADED)
+    //
+    // The clock reads a different span per cause. Off, one refusal is certain,
+    // so the run's age is enough. On, the refusals themselves must span it,
+    // because a burst followed by silence is a stray sender, not an outage.
+    let (cause, floor, lasted_secs) = if !hook.enabled {
+        (
+            RefusalCause::Disabled,
+            DISABLED_REFUSALS_BEFORE_DEGRADED,
+            run_secs,
+        )
     } else if cause == RefusalCause::Verification {
-        (RefusalCause::Verification, REFUSALS_BEFORE_DEGRADED)
+        let Some(span_secs) = refusals_span_secs(run) else {
+            return RefusalVerdict::Clear;
+        };
+        (
+            RefusalCause::Verification,
+            REFUSALS_BEFORE_DEGRADED,
+            span_secs,
+        )
     } else {
         return RefusalVerdict::Clear;
     };
-    if run.refusals >= floor {
+    if run.refusals >= floor && lasted_secs >= REFUSAL_RUN_BEFORE_DEGRADED_SECS {
         RefusalVerdict::Refusing(cause)
     } else {
         RefusalVerdict::Clear
     }
+}
+
+/// How far apart the run's first and last refusals are, in seconds.
+///
+/// The difference of the two ages Postgres measured against one `now()`, so it
+/// is exactly `last_refused_at - refusal_run_since` and reads no host clock.
+/// `last_refused_at` is always the run's newest refusal, because one statement
+/// writes both, and the probe skip skips both.
+fn refusals_span_secs(run: &RefusalRun) -> Option<i64> {
+    Some(run.run_secs? - run.quiet_secs?)
 }
 
 /// Has the run stopped growing for long enough to stop being news?
@@ -254,6 +286,8 @@ fn resolution(declared: &Declared, hook: Option<&Webhook>) -> Resolution {
     }
     // Nothing verified and deliveries are still arriving, so the run must have
     // changed shape under the declaration: the flag moved, or the cause did.
+    // An engine that tightened the rule also lands here, once, for a run the
+    // old rule declared and the new one does not.
     Resolution::Reconfigured
 }
 

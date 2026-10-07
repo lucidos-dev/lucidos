@@ -169,11 +169,10 @@ describe('computeHeaderCollapse', () => {
     }
   });
 
-  it('the reserve holds the widest cluster the row can carry, so mid-widths never fold', () => {
+  it('the reserve holds two icons and the bell, so mid-widths never fold them', () => {
     // The claim --content-side-reserve is sized on: two context icons riding
     // the row plus the bell, and the two gaps between them, plus the two gaps
-    // the fit model charges the centred box. A set of three or more folds whole
-    // (alwaysCollapseFrom), so nothing wider ever stands here.
+    // the fit model charges the centred box.
     const widest = appUiInput({ actionWidths: [ICON, ICON] });
     expect(iconsRowWidth(widest, 0) + 2 * GAP).toBe(RESERVE);
 
@@ -187,9 +186,26 @@ describe('computeHeaderCollapse', () => {
         containerWidth: w,
         centreWidth,
         leadingWidth: (w - centreWidth) / 2,
-        alwaysCollapseFrom: 3,
       })).toEqual({ collapsed: 0, titleEllipsized: false });
     }
+  });
+
+  it('a third icon rides only where the box leaves more than the reserve', () => {
+    // Room alone decides. On the middle arm a third icon would cross the
+    // reserve, so two fold into ⋯ and the cluster is three boxes again. Where
+    // the box sits at its span cap, the row has room and nothing folds.
+    const three = appUiInput({ actionWidths: [ICON, ICON, ICON] });
+    for (const w of [400, 450, 500, 550]) {
+      const centreWidth = boxWidth(w);
+      expect(computeHeaderCollapse({
+        ...three, containerWidth: w, centreWidth, leadingWidth: (w - centreWidth) / 2,
+      })).toEqual({ collapsed: 2, titleEllipsized: false });
+    }
+    const wide = 2000;
+    const capped = boxWidth(wide);
+    expect(computeHeaderCollapse({
+      ...three, containerWidth: wide, centreWidth: capped, leadingWidth: (wide - capped) / 2,
+    })).toEqual({ collapsed: 0, titleEllipsized: false });
   });
 
   it('folds on the min-span arm, where the box stops giving way', () => {
@@ -204,7 +220,6 @@ describe('computeHeaderCollapse', () => {
       containerWidth: w,
       centreWidth,
       leadingWidth: (w - centreWidth) / 2,
-      alwaysCollapseFrom: 3,
     };
     expect(computeHeaderCollapse(input).collapsed).toBe(2);
     // Unfolded it really would have reached the box: that is what it dodged.
@@ -226,32 +241,6 @@ describe('computeHeaderCollapse', () => {
       if (seen[seen.length - 1] !== collapsed) seen.push(collapsed);
     }
     expect(seen).toEqual([0, 2, 3]);
-  });
-
-  // The content pane's rule: past a couple of context icons the row stops
-  // reading as "what I can do here", so the whole set folds into ⋯ at any width
-  // and the menu names each one in words.
-  describe('alwaysCollapseFrom', () => {
-    it('folds a set at or past the threshold whole, however roomy the row', () => {
-      const input = appUiInput({ containerWidth: 4000, alwaysCollapseFrom: 3 });
-      expect(computeHeaderCollapse(input)).toEqual({ collapsed: 3, titleEllipsized: false });
-    });
-
-    it('leaves a smaller set to the measurement', () => {
-      const two = appUiInput({ actionWidths: [ICON, ICON], alwaysCollapseFrom: 3 });
-      expect(computeHeaderCollapse({ ...two, containerWidth: 4000 }))
-        .toEqual({ collapsed: 0, titleEllipsized: false });
-      // ...and it still collapses when the room runs out.
-      expect(computeHeaderCollapse({ ...two, containerWidth: exactWidth(two, 0) - 1 }).collapsed)
-        .toBe(2);
-    });
-
-    it('still reports the centre zone giving way once the folded row does not fit', () => {
-      const input = appUiInput({ alwaysCollapseFrom: 3 });
-      const width = exactWidth(input, 3) - 1;
-      expect(computeHeaderCollapse({ ...input, containerWidth: width }))
-        .toEqual({ collapsed: 3, titleEllipsized: true });
-    });
   });
 
   it('collapse count is monotonic as the container narrows (no flip-flop between steps)', () => {

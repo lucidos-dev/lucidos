@@ -60,6 +60,7 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
         _selection: crate::llm::ModelSelection<'_>,
         _system_prompt: Option<&str>,
         _on_token: Option<crate::llm::provider::TokenCallback>,
+        _call: crate::llm::metered::CallToken,
     ) -> Result<crate::llm::provider::LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let next = self
             .replies
@@ -81,6 +82,92 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
             model_only_text: None,
             content_is_progress_notes: false,
         })
+    }
+
+    fn default_model(&self) -> &str {
+        &self.model
+    }
+}
+
+/// An `LlmProvider` that answers a chat judgment, and keeps every user
+/// message and tool list it was sent.
+///
+/// One reply serves every call. The usage matches [`ScriptedProvider`]'s, so a
+/// capture test asserts the same numbers on either.
+pub struct JudgmentChatStub {
+    reply: Result<serde_json::Value, String>,
+    model: String,
+    pub sent: std::sync::Mutex<Vec<(String, Vec<crate::llm::provider::ToolDefinition>)>>,
+}
+
+impl JudgmentChatStub {
+    fn new(reply: Result<serde_json::Value, String>) -> Self {
+        Self {
+            reply,
+            model: crate::core::prefs::MODEL_COMMAND_JUDGE
+                .default_text()
+                .to_string(),
+            sent: std::sync::Mutex::new(vec![]),
+        }
+    }
+
+    /// Answers through the answer tool with these arguments.
+    pub fn answering(arguments: serde_json::Value) -> Self {
+        Self::new(Ok(serde_json::json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "call-1",
+                "name": crate::llm::judgment::chat::ANSWER_TOOL,
+                "arguments": arguments,
+            }],
+        })))
+    }
+
+    /// Ignores the tool and replies in text.
+    pub fn replying(text: &str) -> Self {
+        Self::new(Ok(serde_json::json!({ "content": text, "tool_calls": [] })))
+    }
+
+    /// The call itself fails.
+    pub fn failing(error: &str) -> Self {
+        Self::new(Err(error.to_string()))
+    }
+
+    /// The user messages sent so far.
+    pub fn messages(&self) -> Vec<String> {
+        self.sent
+            .lock()
+            .expect("sent")
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::llm::provider::LlmProvider for JudgmentChatStub {
+    async fn chat(
+        &self,
+        messages: Vec<crate::llm::provider::Message>,
+        tools: Vec<crate::llm::provider::ToolDefinition>,
+        _selection: crate::llm::ModelSelection<'_>,
+        _system_prompt: Option<&str>,
+        _on_token: Option<crate::llm::provider::TokenCallback>,
+        _call: crate::llm::metered::CallToken,
+    ) -> Result<crate::llm::provider::LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let text = messages
+            .iter()
+            .map(|m| match &m.content {
+                crate::llm::provider::MessageContent::Text(t) => t.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.sent.lock().expect("sent").push((text, tools));
+        let mut reply = self.reply.clone()?;
+        reply["input_tokens"] = 210.into();
+        reply["output_tokens"] = 4.into();
+        Ok(serde_json::from_value(reply)?)
     }
 
     fn default_model(&self) -> &str {

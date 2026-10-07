@@ -27,6 +27,7 @@ import { loadDevices, devices, getDeviceId } from './devices';
 import { loadWebhookIngress } from './webhookIngress';
 import { loadWebhookRefusals } from './webhookRefusals';
 import { pruneNavHistory, type NavEntry } from './navigation';
+import { clearAppStorage } from './app-bridge';
 
 export const RECENTS_KEY = 'lucidos-search-recents';
 
@@ -221,6 +222,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
         pruneNavHistory((entry) => isNavEntryStale(entry, 'app', appId));
         removePinnedAppLocal(appId);
         closeOverlayIfStale('app', appId);
+        clearAppStorage(appId);
       }
       void loadApps();
       break;

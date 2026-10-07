@@ -1210,6 +1210,7 @@ impl LucidosEngine {
                     Some(pre_sha),
                     Some(post_sha),
                     actor,
+                    Some(change.thread_id.unwrap_or(thread_id)),
                 )
                 .await;
                 // The dev post-apply refresh (background engine rebuild /

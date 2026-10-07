@@ -1,6 +1,6 @@
 # 0220: A typed judgment is a sibling of a chat completion, and Jev is opt-in beside the path it does not replace
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by [ADR 0363](0363-any-system-one-endpoint-and-a-chat-judgment-provider.md): its fallback clause is superseded
 - **Date**: 2026-09-19
 
 ## Context

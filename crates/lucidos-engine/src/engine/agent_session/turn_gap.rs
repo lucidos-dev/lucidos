@@ -52,9 +52,10 @@
 //! the agent to say so (ADR 0278).
 //!
 //! `BackgroundBashCompleted` is covered too, minus the ones an event wait
-//! delivered: that delivery is the prompt the re-opened turn carries. What
-//! reaches here is the one nobody delivered. A task whose wait a cap refused
-//! is one example.
+//! delivered: that delivery is the prompt the re-opened turn carries. Also
+//! minus a task the thread stopped itself, which stood its watch down
+//! (ADR 0369). What reaches here is the one nobody delivered. A task whose
+//! wait a cap refused is one example.
 //!
 //! A **restart that cut off the last turn** is covered as well. The engine
 //! stops the session at teardown. Claude Code then closes the running tool call
@@ -157,6 +158,11 @@ const EXTRA_BOUNDARY_EVENT_TYPES: &[&str] = &["CodingAgentPromptSent"];
 /// A change description is the agent's own summary and can be long; keep the
 /// bullet readable.
 const MAX_DESCRIPTION_CHARS: usize = 80;
+
+/// How long after its own stand-down a killed task's completion still counts
+/// as the thread's own stop. The reap takes the 3 s stop grace plus the drain,
+/// so a minute is generous even on a saturated host.
+const SELF_STOP_REAP_WINDOW_SECS: i64 = 60;
 
 /// Apply errors are user-facing toast copy and can carry a git stderr dump.
 const MAX_ERROR_CHARS: usize = 200;
@@ -372,6 +378,11 @@ pub(crate) async fn compute_turn_gap_note(
     // A completion an event wait already delivered is dropped: the delivery is
     // the prompt this turn carries, so a note line would say it twice, and
     // claim nobody told the agent.
+    //
+    // So is a killed task whose watch this thread stood down just before.
+    // That is the thread's own stop (ADR 0369), and its reap usually lands
+    // after the turn that issued it ended. An older stand-down is a watch the
+    // agent dropped, and a later kill by somebody else is still news.
     let rows: Vec<(String, serde_json::Value)> = sqlx::query_as::<_, (String, serde_json::Value)>(
         "SELECT e.event_type, e.payload - 'stdout' - 'stderr' - 'text' FROM events e \
          WHERE e.thread_id = $1 AND e.event_type = ANY($2) \
@@ -388,6 +399,15 @@ pub(crate) async fn compute_turn_gap_note(
              WHERE d.thread_id = $1 AND d.event_type = 'EventWaitDelivered' \
                AND d.payload->>'event_id' = e.id::text \
            )) \
+           AND NOT (e.event_type = 'BackgroundBashCompleted' \
+             AND e.payload->>'killed' = 'true' AND EXISTS ( \
+               SELECT 1 FROM events c, jsonb_array_elements(c.payload->'on') watched \
+               WHERE c.thread_id = $1 AND c.event_type = 'EventWaitCanceled' \
+                 AND c.payload->>'cause' = 'agent_stand_down' \
+                 AND c.sequence < e.sequence \
+                 AND c.created >= e.created - make_interval(secs => $6) \
+                 AND watched->'condition'->>'task_id' = e.payload->>'task_id' \
+           )) \
          ORDER BY e.sequence ASC",
     )
     .bind(thread_id)
@@ -401,6 +421,7 @@ pub(crate) async fn compute_turn_gap_note(
     .bind(origin_sequence)
     .bind(current_origin_id)
     .bind(boundary_event_types())
+    .bind(SELF_STOP_REAP_WINDOW_SECS)
     .fetch_all(pool)
     .await
     .map_err(|e| {

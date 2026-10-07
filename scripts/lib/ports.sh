@@ -24,9 +24,10 @@ LUCIDOS_PORT_WALK_LIMIT=1000
 #
 # The shell twin of merge_ports_file in crates/lucidos-gateway/src/stack.rs, and
 # it exists for the same reason: this file has several owners. allocate_ports
-# writes the two port keys, detect_tls writes PROTO, swap_ports writes the
-# Postgres keys, and the gateway republishes API_PORT and PROTO on every spawn
-# and re-adoption. scripts/status.sh sources the result.
+# writes the two port keys and swap_ports the Postgres keys. detect_tls writes
+# PROTO, and adopt_engine_scheme or record_engine_scheme correct it from the
+# live engine. The gateway republishes API_PORT and PROTO on every spawn and
+# re-adoption. scripts/status.sh sources the result.
 #
 # A truncating write is what broke that. _finalize_ports used to `cat >` the
 # file with the two port keys, so any launch path that allocated ports without

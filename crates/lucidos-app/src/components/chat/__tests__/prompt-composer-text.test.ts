@@ -95,7 +95,7 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
 
 function submitBody(): string {
-  const fn = promptSource.match(/async function submit\(asSideQuestion = false\)[\s\S]*?\n {2}\}/);
+  const fn = promptSource.match(/async function submit\(\)[\s\S]*?\n {2}\}/);
   expect(fn, 'submit() not found').not.toBeNull();
   return fn![0];
 }

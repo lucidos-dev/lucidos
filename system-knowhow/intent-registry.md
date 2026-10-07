@@ -1,43 +1,43 @@
 ---
-name: Intent Registry — Source of "Available Intents"
+name: Intent Registry (source of "Available Intents")
 description: How the engine builds the "Available Intents" list it exposes via execute_intent: filesystem-driven, no cache, no projection. Trigger files in apps/<app>/triggers/ also count as intents, the usual source of "phantom intent" confusion.
 ---
 
 # Intent Registry
 
-The "## Available Intents" section of the engine system prompt is built fresh from disk every time a chat thread starts (or any time the system prompt is reconstructed). There is no DB table, no projection, no cache to invalidate — the engine walks three filesystem locations and emits one entry per `.md` file it finds.
+The engine builds the "## Available Intents" section of the chat system prompt fresh from disk on every turn. There is no DB table, projection or cache. The engine walks three filesystem locations and emits one entry per `.md` file.
 
-If an intent ID appears in the prompt but you can't find it under `apps/<app>/intents/`, **check the trigger directory next** (see "Three sources" below). It is the most common source of confusion for both users and audit scripts.
+If an intent ID shows in the prompt but not under `apps/<app>/intents/`, **check the trigger directory next** (see "Three sources" below). This confuses users and audit scripts more than anything else here.
 
 ## Three sources
 
-`crates/lucidos-engine/src/core/intents.rs` — `IntentStore::load_all` walks:
+`IntentStore::load_all` in `crates/lucidos-engine/src/core/intents.rs` walks:
 
 | Source | ID format | Notes |
 |---|---|---|
 | `data/apps/<app>/intents/<name>.md` | `<app>/<name>` | App-scoped intents the user invokes on demand. |
-| `data/apps/<app>/triggers/<name>.md` | `<app>/<name>` | App-scoped trigger procedures. **Also exposed as intents** — the LLM can invoke them via `execute_intent` even when the trigger isn't firing. |
+| `data/apps/<app>/triggers/<name>.md` | `<app>/<name>` | App-scoped trigger procedures. **Also exposed as intents**: the LLM can invoke them via `execute_intent` even when the trigger isn't firing. |
 | `data/triggers/<dir>/*.md` | `<stem>` (filename without `.md`) | Standalone trigger procedures. Same dual role: schedule fires the procedure; the LLM can also invoke it on demand. |
 
-Notably absent: there is no top-level `data/intents/` source. Files placed there are silently ignored by the registry.
+There is no top-level `data/intents/` source. The registry silently ignores files placed there.
 
-The same paths are searched in reverse by `IntentStore::load(id)` when `execute_intent(id)` runs, so the loader and the prompt are in lockstep by construction — anything listed in the prompt is loadable, and anything loadable is listed.
+`IntentStore::load(id)` searches the same paths when `execute_intent(id)` runs. So the loader and the prompt agree by construction: anything listed is loadable, and anything loadable is listed.
 
 ## Why trigger files double as intents
 
-A trigger has two dimensions: *when to fire* (schedule, lives in the `TriggerCreated` event payload) and *what to do when it fires* (procedure, lives in the `.md` file under `triggers/`). Exposing the procedure as an intent lets the user manually invoke it ("run the morning dashboard now") without duplicating the recipe — one file, two firing modes.
+A trigger has two parts: *when to fire* (the schedule, in the `TriggerCreated` event payload) and *what to do* (the procedure, in the `.md` file under `triggers/`). As an intent, the procedure also runs on request ("run the morning dashboard now"). One file, two firing modes.
 
-This is also why an audit that walks only `apps/<app>/intents/` will report trigger-derived IDs as "phantom" intents. They are real; they just live next door under `triggers/`.
+So an audit that walks only `apps/<app>/intents/` reports trigger-derived IDs as "phantom" intents. They are real, and live next door under `triggers/`.
 
 ## An empty registry means no `execute_intent` tool at all
 
-The tool is **capability-gated** (ADR 0088): a workspace whose registry is empty is not offered `execute_intent`, because there is no id it could be passed. So "the tool is missing" and "the registry found nothing" are one fact. The fix for both is a `.md` file under one of the three sources above.
+The tool is **capability-gated** (ADR 0088). A workspace with an empty registry gets no `execute_intent`, because no id exists to pass it. So "the tool is missing" and "the registry found nothing" are one fact. The fix for both is a `.md` file under one of the three sources.
 
-The gate is a function of the workspace, never of the thread, so every thread in a workspace agrees about it. It also opens by itself: the registry is recomputed per turn, so the first intent file makes the tool appear on the next thread with nothing to restart.
+The gate depends on the workspace, never the thread, so every thread in a workspace agrees about it. It also opens by itself: the first intent file makes the tool appear on the next turn, with nothing to restart.
 
 ## Invalidation
 
-None needed. The list is recomputed every time `process_chat_message` builds the system prompt. Add, remove, or rename a `.md` file under any of the three sources and the next thread sees the change. There is nothing to purge, regenerate, or clear.
+None needed. `read_turn_capabilities` rescans the three sources every turn, and `build_chat_system_prompt` lists that same snapshot. Add, remove or rename a `.md` file and the next turn sees it.
 
 ## How to enumerate the live registry from a shell
 
@@ -48,4 +48,4 @@ ls $DATA/apps/*/triggers/*.md 2>/dev/null
 ls $DATA/triggers/*/*.md      2>/dev/null
 ```
 
-The active engine system prompt's "## Available Intents" section is the ground truth — if the shell list and the prompt section disagree, the engine wins (something in the loader rejected a file, e.g. invalid frontmatter).
+The live system prompt's "## Available Intents" section is the ground truth. If it disagrees with the shell list, the engine wins: the loader rejected a file (for example, for invalid frontmatter).

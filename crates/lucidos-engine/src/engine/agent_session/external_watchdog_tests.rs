@@ -575,6 +575,7 @@ async fn emit_agent_output(bus: &EventBus, thread_id: Uuid) {
             result: "ok".into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             tool_use_id: "tu-out".into(),
+            parent_tool_use_id: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

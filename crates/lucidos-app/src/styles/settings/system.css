@@ -204,29 +204,24 @@
    splits the pane between them, which hands a routine Refresh Client the same
    weight as a rebuild.
 
-   Network Access wears this class too, so the base rule stays neutral and the
-   System page states its own alignment below. */
+   The row packs right, weightiest action last, on System and on Network
+   Access alike. On System that is already the DOM order (Rebuild & Restart is
+   last), so reordering the buttons also reorders their weight. */
 .system-actions {
     display: flex;
+    justify-content: flex-end;
     gap: 0.5rem;
     flex-wrap: wrap;
 }
 
-/* On System the row CLOSES its section, so it sits at the far edge with a step
-   of its own above it. What precedes it there is a stack of notices, and an
-   action flush under the last of them reads as part of that message. Rightmost
-   is the weightiest action, which is already the DOM order (Rebuild & Restart
-   is last), so reordering the buttons also reorders their weight.
+/* On System the row CLOSES its section, so it takes a step of its own above it.
+   What precedes it there is a stack of notices, and an action flush under the
+   last of them reads as part of that message.
 
    `padding`, not `margin`: the notice above carries a bottom margin, adjacent
    siblings collapse to the larger of the two, and a step that only wins by the
-   difference is no step.
-
-   Scoped to `.system-page` because Network Access has no such column. Its lone
-   Save would fly to the far side of an uncapped pane, a screen away from the
-   field it saves. */
+   difference is no step. */
 .system-page .system-actions {
-    justify-content: flex-end;
     padding-top: var(--space-sm);
 }
 

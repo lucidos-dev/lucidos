@@ -173,7 +173,7 @@ const CLIENT_LOG_MAX_DATA_LEN: usize = 4096;
 /// Max entries one batched `/internal/client-logs` request may carry, so a
 /// misbehaving client can't flood the engine.log tail in a single POST. The
 /// frontend perf queue flushes well under this.
-const CLIENT_LOG_MAX_BATCH: usize = 100;
+pub(crate) const CLIENT_LOG_MAX_BATCH: usize = 100;
 
 /// Validate one breadcrumb's caps, returning its serialized `data` on success.
 /// `Err(reason)` on a cap violation (the caller maps it to a 400). Pure — does
@@ -422,6 +422,11 @@ fn marker_write_refusal(headers: &HeaderMap) -> Option<axum::response::Response>
 /// which `/harden` Phase 5 runs once every phase completes. Replaces
 /// the prior worktree-keyed file marker, which was lost when stale-session
 /// recovery removed the worktree before the apply check ran.
+///
+/// Called from a thread, the marker is that thread declaring itself finished.
+/// So it stops the thread's leftover background tasks, which started before
+/// the certification and cannot change it, and names every wait still live
+/// (ADR 0369).
 pub(super) async fn mark_hardened(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -436,7 +441,25 @@ pub(super) async fn mark_hardened(
         .record_hardened(&repo_root, &body.branch_name, &body.head_sha)
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            let report = match calling_thread(&headers) {
+                Some(thread_id) => HardenedReport {
+                    stopped_background_tasks: state
+                        .engine
+                        .stop_background_tasks_of(thread_id)
+                        .await,
+                    still_waiting_on: state
+                        .engine
+                        .list_event_waits_for_thread(thread_id)
+                        .await
+                        .into_iter()
+                        .map(|w| w.reason)
+                        .collect(),
+                },
+                None => HardenedReport::default(),
+            };
+            Json(report.to_json()).into_response()
+        }
         Err(e) => {
             crate::log!(
                 "[Internal] record_hardened failed for {}: {}",
@@ -449,6 +472,43 @@ pub(super) async fn mark_hardened(
             )
                 .into_response()
         }
+    }
+}
+
+/// The thread a marker write came from, when a thread's own subprocess sent it.
+fn calling_thread(headers: &HeaderMap) -> Option<uuid::Uuid> {
+    use crate::api::actor::{subprocess_origin, SubprocessOrigin};
+    match subprocess_origin(headers) {
+        SubprocessOrigin::Subprocess {
+            source_thread_id, ..
+        } => source_thread_id,
+        SubprocessOrigin::NotSubprocess => None,
+    }
+}
+
+/// What recording the marker did to the calling thread, for `lucidos hardened
+/// mark` to print. Empty for a caller with no thread.
+#[derive(Debug, Default)]
+struct HardenedReport {
+    stopped_background_tasks: Vec<crate::engine::event_wait::StoppedTask>,
+    /// Every wait still live on the thread, by its reason.
+    still_waiting_on: Vec<String>,
+}
+
+impl HardenedReport {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "stopped_background_tasks": self
+                .stopped_background_tasks
+                .iter()
+                .map(|t| serde_json::json!({
+                    "task_id": t.task_id,
+                    "label": t.label,
+                    "ended_with_others": t.ended_with_others,
+                }))
+                .collect::<Vec<_>>(),
+            "still_waiting_on": self.still_waiting_on,
+        })
     }
 }
 
@@ -913,6 +973,7 @@ pub(super) async fn ask_user_question(
             thread_id,
             &body.tool_use_id,
             &body.questions,
+            None,
             body.session_id.clone(),
             EventChannel::ClaudeCode,
         )
@@ -1100,6 +1161,64 @@ mod tests {
             lucidos_local_token::HEADER_LOCAL_TOKEN,
             local,
         )])));
+    }
+
+    /// Only a thread's own subprocess makes the marker stop anything (ADR
+    /// 0369). A thread-less script, the user's shell and e2e stop nothing.
+    #[test]
+    fn only_a_thread_bound_caller_names_a_thread_to_stop_work_on() {
+        let thread = Uuid::new_v4();
+        let bound = minted_origin_token(Some(thread));
+        assert_eq!(
+            calling_thread(&marker_headers(&[(
+                crate::api::actor::HEADER_AGENT_ORIGIN_TOKEN,
+                &bound,
+            )])),
+            Some(thread)
+        );
+        let threadless = minted_origin_token(None);
+        assert_eq!(
+            calling_thread(&marker_headers(&[(
+                crate::api::actor::HEADER_AGENT_ORIGIN_TOKEN,
+                &threadless,
+            )])),
+            None
+        );
+        let local = crate::api::local_auth::publish_test_local_token();
+        assert_eq!(
+            calling_thread(&marker_headers(&[(
+                lucidos_local_token::HEADER_LOCAL_TOKEN,
+                local,
+            )])),
+            None
+        );
+    }
+
+    /// The shape `lucidos hardened mark` parses: both keys always present, so
+    /// a caller with no thread reads two empty lists rather than a missing key.
+    #[test]
+    fn the_hardened_report_carries_both_lists_even_when_empty() {
+        assert_eq!(
+            HardenedReport::default().to_json(),
+            serde_json::json!({ "stopped_background_tasks": [], "still_waiting_on": [] })
+        );
+        let report = HardenedReport {
+            stopped_background_tasks: vec![crate::engine::event_wait::StoppedTask {
+                task_id: "t1".into(),
+                label: "make lint".into(),
+                ended_with_others: vec![],
+            }],
+            still_waiting_on: vec!["the release build to finish".into()],
+        };
+        assert_eq!(
+            report.to_json(),
+            serde_json::json!({
+                "stopped_background_tasks": [
+                    { "task_id": "t1", "label": "make lint", "ended_with_others": [] }
+                ],
+                "still_waiting_on": ["the release build to finish"],
+            })
+        );
     }
 
     /// The gateway adds its own local token and the device it authenticated to

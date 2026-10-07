@@ -165,20 +165,12 @@ pub(crate) struct SummaryCall {
 }
 
 impl SummaryCall {
-    async fn resolve(
-        pool: &sqlx::PgPool,
-        extractor: &crate::memory::MemoryExtractor,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let call = crate::engine::aux_purpose::AuxCall::resolve(
-            pool,
-            crate::engine::ContextPurpose::ChangeSummary,
-        )
-        .await;
-        Ok(Self {
-            provider: extractor.provider_for_model(call.model(), call.attempt_timeout())?,
+    fn from_call(call: &crate::engine::aux_purpose::AuxCall) -> Self {
+        Self {
+            provider: call.provider(),
             effort: call.reasoning().map(str::to_string),
             deadline: call.deadline(),
-        })
+        }
     }
 }
 
@@ -216,24 +208,11 @@ async fn summarize_once(
     change_id: Uuid,
     description: &str,
 ) {
-    let Some(extractor) = engine.extractor() else {
-        log!(
-            "[ChangeSummary] No background model is configured, change {} keeps its commit subject",
-            change_id
-        );
-        return;
-    };
-    let call = match SummaryCall::resolve(engine.pool(), extractor).await {
-        Ok(call) => call,
-        Err(e) => {
-            log!(
-                "[ChangeSummary] Could not build the model for {}: {}",
-                change_id,
-                e
-            );
-            return;
-        }
-    };
+    let call = SummaryCall::from_call(
+        &engine
+            .aux_call(crate::engine::ContextPurpose::ChangeSummary)
+            .await,
+    );
     let started = std::time::Instant::now();
     match write_summary(&engine.event_bus, &call, thread_id, change_id, description).await {
         Ok(summary) => {
@@ -328,13 +307,12 @@ async fn summary_attempts(
     use crate::llm::provider::{Message, MessageContent};
 
     let input = model_input(description);
-    let request_chars = SYSTEM_PROMPT.chars().count() + input.chars().count();
     let mut last_err: Box<dyn std::error::Error + Send + Sync> =
         "the model produced no candidate".into();
     for _ in 0..MAX_ATTEMPTS {
-        let response = call
-            .provider
+        let response = capture
             .chat(
+                call.provider.as_ref(),
                 vec![Message {
                     role: "user".to_string(),
                     content: MessageContent::Text(input.clone()),
@@ -345,9 +323,6 @@ async fn summary_attempts(
                 None,
             )
             .await?;
-        capture
-            .record(call.provider.default_model(), request_chars, &response)
-            .await;
         match validate_summary(response.content.as_deref().unwrap_or_default()) {
             Ok(summary) => return Ok(summary),
             Err(e) => last_err = e,

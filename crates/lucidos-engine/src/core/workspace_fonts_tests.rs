@@ -234,7 +234,7 @@ fn each_broken_font_is_left_out_and_reported_with_its_reason() {
     assert!(reason_for(&fonts, "ws-mislabelled").contains("different font format"));
     assert!(reason_for(&fonts, "ws-collection").contains("collection"));
     assert!(reason_for(&fonts, "ws-bad-manifest").contains("not a valid font.json"));
-    assert!(reason_for(&fonts, "ws-too-many-faces").contains("1 to 16"));
+    assert!(reason_for(&fonts, "ws-too-many-faces").contains(&format!("1 to {MAX_FACES}")));
     assert!(reason_for(&fonts, "ws-no-manifest").contains("no font.json"));
     assert!(reason_for(&fonts, "ws-Bad_Slug").contains("not a font directory name"));
 }

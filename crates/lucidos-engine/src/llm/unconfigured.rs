@@ -52,6 +52,7 @@ impl LlmProvider for UnconfiguredProvider {
         _selection: ModelSelection<'_>,
         _system_prompt: Option<&str>,
         _on_token: Option<TokenCallback>,
+        _call: crate::llm::metered::CallToken,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         Err(NO_PROVIDER_MESSAGE.into())
     }
@@ -84,7 +85,14 @@ mod tests {
     async fn chat_returns_clear_actionable_error_never_mock() {
         let provider = UnconfiguredProvider::new();
         let result = provider
-            .chat(vec![], vec![], ModelSelection::default(), None, None)
+            .chat(
+                vec![],
+                vec![],
+                ModelSelection::default(),
+                None,
+                None,
+                crate::llm::metered::CallToken::for_test(),
+            )
             .await;
         let err = result.expect_err("unconfigured provider must error, never return content");
         let msg = err.to_string();

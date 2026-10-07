@@ -19,6 +19,7 @@
  */
 import { scaledDurationMs } from './motion';
 import { startIdlePrefetch } from './idlePrefetch';
+import { markBoot } from './bootTiming';
 
 const SPLASH_SELECTOR = '.boot-splash';
 const STATUS_SELECTOR = '.boot-splash-status';
@@ -26,17 +27,17 @@ const LEAVING_CLASS = 'boot-splash-leaving';
 // The `.boot-splash-status-swap` fade-out in index.html, at 1x. The words swap
 // once it has run, while the line is invisible.
 const SWAP_CLASS = 'boot-splash-status-swap';
-const STATUS_SWAP_MS = 150;
+export const STATUS_SWAP_MS = 150;
 // Set by the inline handover script in index.html when the gateway boot splash
 // had already built the mark on this url, so this document skips its reveal.
 const FORMED_CLASS_SELECTOR = '.boot-splash-formed';
-// Set by the inline quiet-cover script in index.html on a document whose load
-// CONTINUES a session rather than starting one, which carries no mark at all.
+// Set on <html> by the quiet script in index.html's <head>. It marks a document
+// whose load CONTINUES a session rather than starting one, so it carries no mark.
 // Two triggers: a user-requested refresh (permanent) and a notification-tap
 // deep link (whose URL form is the temporary half, tracked at
 // docs/temporary-measures.md § "Cross-document notification-tap reload on iOS").
 // The cover itself is permanent either way: do NOT delete it with that measure.
-const QUIET_CLASS_SELECTOR = '.boot-splash-quiet';
+const QUIET_ATTRIBUTE = 'data-boot-splash-quiet';
 
 // The longest `.boot-splash-leaving` fade in index.html, the veil's 0.65s at 1x
 // (the mark and the status finish inside it). The removal fallback, used when
@@ -61,8 +62,8 @@ export function bootSplashPresent(): boolean {
  *  - `boot-splash-formed` (gateway handover): the mark was already built by the
  *    gateway boot splash on this url and is standing on screen, so this document
  *    only carries it.
- *  - `boot-splash-quiet` (a refresh, or a notification tap): the document
- *    carries no mark at all. See QUIET_CLASS_SELECTOR above.
+ *  - `data-boot-splash-quiet` (a refresh, or a notification tap): the document
+ *    carries no mark at all. See QUIET_ATTRIBUTE above.
  *
  *  Both arms are permanent.
  *
@@ -72,7 +73,7 @@ export function bootSplashPresent(): boolean {
 export function bootSplashPlaysNoReveal(): boolean {
   return (
     document.querySelector(SPLASH_SELECTOR + FORMED_CLASS_SELECTOR) !== null ||
-    document.querySelector(SPLASH_SELECTOR + QUIET_CLASS_SELECTOR) !== null
+    document.documentElement.hasAttribute(QUIET_ATTRIBUTE)
   );
 }
 
@@ -171,6 +172,7 @@ export function dismissBootSplash(): void {
   // and on-demand surfaces may load (ADR 0288). Not before: the prefetch parses
   // on the main thread, and WebKit has no idle callback to keep it off the fade.
   const lifted = () => {
+    markBoot('splashLifted');
     for (const canvas of canvases) {
       canvas.style.background = '';
       canvas.style.transition = '';

@@ -73,6 +73,12 @@ describe('the follow toggle is always shown', () => {
     expect(block).toMatch(/onClick: \(\) => setFollowLiveEdge\(!followOn\),/);
   });
 
+  it('keeps the keyboard up when pressed', () => {
+    // The reader arms and disarms it while typing. A press that blurred the
+    // prompt dropped the iOS keyboard mid-sentence.
+    expect(toggleBlock()).toMatch(/keepsFocus: true,/);
+  });
+
   it('imports the seed from scrollState rather than reaching for storage itself', () => {
     expect(source).toMatch(/import\s*\{[^}]*\bfollowLiveEdgeSeed\b[^}]*\}\s*from\s*['"]\.\/scrollState['"]/);
     expect(toggleBlock()).not.toContain('localStorage');

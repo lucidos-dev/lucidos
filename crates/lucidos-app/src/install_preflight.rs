@@ -43,7 +43,7 @@ pub fn conflict_notice(
     inventory: &Inventory,
     port: u16,
     serving_release: Option<&str>,
-    app_version: &str,
+    app_release: &str,
 ) -> Option<ConflictNotice> {
     let conflict = inventory.conflicts.iter().find(|c| c.port == port)?;
     let mut body = format!(
@@ -70,10 +70,10 @@ pub fn conflict_notice(
         "\nOnly one of them can answer on that port, and whichever started \
          first wins. So this app may be driving the other install's engine.\n",
     );
-    if let Some(running) = serving_release.filter(|r| *r != app_version) {
+    if let Some(running) = serving_release.filter(|r| *r != app_release) {
         body.push_str(&format!(
             "\nRight now port {port} is answered by Lucidos {running}, \
-             and this app is {app_version}.\n"
+             and this app is {app_release}.\n"
         ));
     }
     body.push_str(
@@ -99,10 +99,10 @@ pub fn should_announce(fingerprint: &str, acknowledged: Option<&str>) -> bool {
 /// The record is written before the dialog is shown rather than after it is
 /// dismissed. The promise is to say it once, and a user who dismisses a warning
 /// without reading it has still been told.
-pub fn take_notice(app_data: &Path, port: u16, app_version: &str) -> Option<ConflictNotice> {
+pub fn take_notice(app_data: &Path, port: u16, app_release: &str) -> Option<ConflictNotice> {
     let inventory = lucidos_installs::scan_this_machine(Some(app_data.to_path_buf()));
     let serving = serving_release(port);
-    let notice = conflict_notice(&inventory, port, serving.as_deref(), app_version)?;
+    let notice = conflict_notice(&inventory, port, serving.as_deref(), app_release)?;
     if !should_announce(&notice.fingerprint, read_ack(app_data).as_deref()) {
         return None;
     }

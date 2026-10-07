@@ -11,6 +11,7 @@ fn every_child_follow_up_error_maps_to_its_declared_status() {
         (ChildFollowUpError::UnknownChild(id), 404),
         (ChildFollowUpError::NotYourChild(id), 403),
         (ChildFollowUpError::ChildDiscarded(id), 409),
+        (ChildFollowUpError::ChildIsDraft(id), 409),
         (ChildFollowUpError::SelfTarget(id), 400),
         (ChildFollowUpError::NoCaller, 403),
         (ChildFollowUpError::CrossWorkspaceUnsupported, 400),
@@ -106,6 +107,7 @@ fn the_response_carries_the_child_title_and_a_readable_delivery() {
     let child_thread_id = Uuid::new_v4();
     let ack = FollowUpAck {
         child_thread_id,
+        reach: FollowUpReach::OwnChild,
         child_title: "Research the pricing page".into(),
         delivered_to: FollowUpDelivery::WaitingForUserAnswer,
     };
@@ -113,6 +115,7 @@ fn the_response_carries_the_child_title_and_a_readable_delivery() {
     assert_eq!(json["child_thread_id"], child_thread_id.to_string());
     assert_eq!(json["child_title"], "Research the pricing page");
     assert_eq!(json["delivered_to"], "waiting-for-user-answer");
+    assert_eq!(json["reach"], "own-child");
     assert!(
         json["detail"]
             .as_str()

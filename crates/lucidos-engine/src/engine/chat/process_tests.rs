@@ -52,6 +52,7 @@ fn run_build(
         file_context_section,
         url_context_section,
         mcp_stopped_context,
+        "",
         setup_reminder,
         thread_depth_context,
         // Empty for the same reason as the two tail blocks below, and filled
@@ -68,7 +69,6 @@ fn run_build(
         },
         loaded,
         resume,
-        false,
     )
 }
 
@@ -847,6 +847,7 @@ fn build_capture_sections_bills_the_todo_list_block() {
         "",
         "",
         "",
+        "",
         block,
         "user msg",
         &TurnTail {
@@ -856,7 +857,6 @@ fn build_capture_sections_bills_the_todo_list_block() {
         },
         &[],
         &[],
-        true,
     );
 
     let row = sections
@@ -894,6 +894,48 @@ fn build_capture_sections_bills_the_todo_list_block() {
     );
 }
 
+/// The MCP tools-not-sent line rides in the first user message, so the
+/// capture bills it on a row of its own.
+#[test]
+fn build_capture_sections_bills_the_mcp_tools_not_sent_notice() {
+    let notice = "[MCP TOOLS NOT SENT] server 'github' (2: a, b)";
+    let sections = build_capture_sections(
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        notice,
+        "",
+        "",
+        "",
+        "user msg",
+        &TurnTail {
+            engine_build: "",
+            client_url: "",
+            current_time: CLOCK_BLOCK,
+        },
+        &[],
+        &[],
+    );
+
+    let row = sections
+        .iter()
+        .find(|s| s.name == "MCP Tools Not Sent")
+        .expect("the notice needs a row of its own");
+    assert_eq!(row.role, ContextRole::User);
+    assert_eq!(row.group.as_deref(), Some("System notices"));
+    assert_eq!(row.content.as_deref(), Some(notice));
+}
+
 /// The two blocks ADR 0084 moved out of the system prompt are billed where
 /// they now ride: the request tail, one row each. Without their own rows the
 /// viewer's budget bar would lose them entirely, since they left the System
@@ -920,6 +962,7 @@ fn build_capture_sections_surfaces_the_two_relocated_tail_blocks() {
         "",
         "",
         "",
+        "",
         "user msg",
         &TurnTail {
             engine_build: "[ENGINE BUILD]\nCURRENT\n[END ENGINE BUILD]",
@@ -928,7 +971,6 @@ fn build_capture_sections_surfaces_the_two_relocated_tail_blocks() {
         },
         &[],
         &[],
-        false,
     );
 
     let names: Vec<_> = sections.iter().map(|s| s.name.as_str()).collect();
@@ -958,7 +1000,7 @@ fn build_capture_sections_surfaces_the_two_relocated_tail_blocks() {
 
 /// Phase 5.2: each loaded knowhow doc gets its own collapsible row under
 /// the "Loaded knowhow" inner group. Char count reflects the body so the
-/// viewer's budget bar stays honest even when capture_body is false.
+/// viewer's budget bar stays honest when a round drops the body.
 #[test]
 fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
     let docs = vec![
@@ -1000,14 +1042,13 @@ fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
     assert_eq!(knowhow[0].name, "knowhow: doc-a");
     assert_eq!(knowhow[1].name, "knowhow: doc-b");
     assert!(knowhow.iter().all(|s| s.role == ContextRole::User));
-    // Both sizes are real (capture_body is false so content is None, but
-    // the viewer's budget bar reads the delta, not the body). Nothing else
-    // counts a knowhow doc's chars, so the delta is its own size.
+    // Nothing else counts a knowhow doc's chars, so the delta is its own size.
     assert_eq!(knowhow[0].budget_delta_chars, "BODY A".chars().count());
     assert_eq!(knowhow[1].budget_delta_chars, "BODY BBBB".chars().count());
     assert_eq!(knowhow[0].content_chars, Some("BODY A".chars().count()));
     assert_eq!(knowhow[1].content_chars, Some("BODY BBBB".chars().count()));
-    assert!(knowhow.iter().all(|s| s.content.is_none()));
+    assert_eq!(knowhow[0].content.as_deref(), Some("BODY A"));
+    assert_eq!(knowhow[1].content.as_deref(), Some("BODY BBBB"));
 }
 
 /// Phase 5.3: each `(ToolUse, ToolResult)` pair from `resume_tool_blocks`
@@ -1080,10 +1121,9 @@ fn build_capture_sections_emits_one_row_per_resume_tool_pair() {
     assert!(prior.iter().any(|s| s.name == "ToolUse: query_events"));
     assert!(prior.iter().any(|s| s.name == "ToolUse: load_knowhow"));
     assert!(prior.iter().all(|s| s.group.is_none()));
-    // capture_body=false so bodies are dropped; both sizes still reflect
-    // the assembled "ToolUse: …\n\nToolResult:\n…" body so the viewer's
-    // prior-messages budget stays accurate.
-    assert!(prior.iter().all(|s| s.content.is_none()));
+    // Both sizes reflect the assembled "ToolUse: …\n\nToolResult:\n…" body,
+    // so the viewer's prior-messages budget stays accurate.
+    assert!(prior.iter().all(|s| s.content.is_some()));
     assert!(prior.iter().all(|s| s.budget_delta_chars > 0));
     assert!(prior
         .iter()
@@ -1122,17 +1162,17 @@ fn build_capture_sections_includes_device_preferences_context() {
     assert!(section.budget_delta_chars > 0);
 }
 
-/// Capturing a body honors the `capture_body` flag: rows get full bodies
-/// (truncated at SECTION_PERSIST_MAX) when on, `None` when off. The
-/// truncation cap itself is exercised by the existing types::tests; this
-/// test just guards the on/off wiring through the new free function.
+/// The turn's section list always carries its bodies, whatever the
+/// `capture_context` switch said when the turn started. The loop drops them
+/// per round (`round_capture_sections`), so a switch flipped while a question
+/// card held the turn open reaches the rounds after the answer.
 #[test]
-fn build_capture_sections_honors_capture_body_flag() {
+fn build_capture_sections_always_carries_the_bodies() {
     let docs = vec![LoadedKnowhow {
         id: "doc".into(),
         body: "BODY".into(),
     }];
-    let on = build_capture_sections(
+    let sections = run_build(
         "sys",
         "",
         "",
@@ -1148,55 +1188,17 @@ fn build_capture_sections_honors_capture_body_flag() {
         "",
         "",
         "",
-        "",
         "user",
-        &TurnTail {
-            engine_build: "",
-            client_url: "",
-            current_time: "clock",
-        },
         &docs,
         &[],
-        true,
     );
-    let off = build_capture_sections(
-        "sys",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "user",
-        &TurnTail {
-            engine_build: "",
-            client_url: "",
-            current_time: "clock",
-        },
-        &docs,
-        &[],
-        false,
-    );
-    let sys_on = on.iter().find(|s| s.name == "System Instructions").unwrap();
-    let sys_off = off
+    let system = sections
         .iter()
         .find(|s| s.name == "System Instructions")
         .unwrap();
-    assert_eq!(sys_on.content.as_deref(), Some("sys"));
-    assert!(sys_off.content.is_none());
-    let kh_on = on.iter().find(|s| s.name == "knowhow: doc").unwrap();
-    let kh_off = off.iter().find(|s| s.name == "knowhow: doc").unwrap();
-    assert_eq!(kh_on.content.as_deref(), Some("BODY"));
-    assert!(kh_off.content.is_none());
+    assert_eq!(system.content.as_deref(), Some("sys"));
+    let knowhow = sections.iter().find(|s| s.name == "knowhow: doc").unwrap();
+    assert_eq!(knowhow.content.as_deref(), Some("BODY"));
 }
 
 /// The cap clips the BODY and never either count.
@@ -1361,7 +1363,7 @@ fn chat_prompt_forbids_faking_repeated_actions() {
 use super::run::message_can_answer_pending_question;
 use super::run::resolve_route_overrides;
 use super::PreEmittedOrigin;
-use crate::core::{PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT};
+use crate::core::prefs;
 use crate::engine::thread_events::ActorMode;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
@@ -1393,10 +1395,10 @@ fn registry_with(id: &str, provider: crate::llm::ProviderKind) -> crate::llm::Mo
 #[tokio::test]
 async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
     let (pool, db_name) = setup_test_db().await;
-    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "gemini-3.5-flash")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "gemini-3.5-flash")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "max")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "max")
         .await
         .unwrap();
 
@@ -1420,7 +1422,7 @@ async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
 #[tokio::test]
 async fn coding_agent_route_preserves_explicit_agent_effort_pick() {
     let (pool, db_name) = setup_test_db().await;
-    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
         .await
         .unwrap();
 
@@ -1444,10 +1446,10 @@ async fn coding_agent_route_preserves_explicit_agent_effort_pick() {
 #[tokio::test]
 async fn chat_route_still_inherits_chat_model_and_effort_defaults() {
     let (pool, db_name) = setup_test_db().await;
-    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "claude-opus-4-8[1m]")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "claude-opus-4-8[1m]")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
         .await
         .unwrap();
 
@@ -1474,10 +1476,10 @@ async fn chat_route_still_inherits_chat_model_and_effort_defaults() {
 #[tokio::test]
 async fn chat_route_reuses_thread_last_model_over_preference() {
     let (pool, db_name) = setup_test_db().await;
-    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "account-model")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "account-model")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
         .await
         .unwrap();
     let tid = uuid::Uuid::new_v4();
@@ -1518,10 +1520,10 @@ async fn chat_route_reuses_thread_last_model_over_preference() {
 #[tokio::test]
 async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
     let (pool, db_name) = setup_test_db().await;
-    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "account-model")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "account-model")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
         .await
         .unwrap();
     let tid = uuid::Uuid::new_v4();
@@ -1565,10 +1567,10 @@ async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
 #[tokio::test]
 async fn trigger_route_prefers_the_triggers_own_model_and_effort() {
     let (pool, db_name) = setup_test_db().await;
-    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "account-model")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "account-model")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
         .await
         .unwrap();
 
@@ -1598,10 +1600,10 @@ async fn trigger_route_resolves_model_and_effort_independently() {
     // An adaptive Claude account model, so every tier is available and the
     // clamp is a no-op: this test is about the two fields resolving
     // independently, not about clamping (covered separately below).
-    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "claude-opus-5")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "claude-opus-5")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
         .await
         .unwrap();
 
@@ -1655,7 +1657,7 @@ async fn trigger_route_resolves_model_and_effort_independently() {
 #[tokio::test]
 async fn a_resolved_effort_is_clamped_to_what_the_resolved_model_supports() {
     let (pool, db_name) = setup_test_db().await;
-    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "xhigh")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "xhigh")
         .await
         .unwrap();
     let registry = registry_with("muse-glimmer:30b-mlx", crate::llm::ProviderKind::Local);

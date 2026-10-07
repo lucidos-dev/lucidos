@@ -21,7 +21,7 @@ const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
 const menuSource = readFileSync(resolve(here, '../CodingAgentControlMenu.tsx'), 'utf-8');
 
 describe('PromptInput submit routes a side question before any send', () => {
-  const submit = promptSource.match(/async function submit\(asSideQuestion = false\)[\s\S]*?\n {2}\}/)?.[0] ?? '';
+  const submit = promptSource.match(/async function submit\(\)[\s\S]*?\n {2}\}/)?.[0] ?? '';
 
   it('decides the route ahead of the upload queue and the send', () => {
     expect(submit, 'submit() not found').not.toBe('');
@@ -32,14 +32,14 @@ describe('PromptInput submit routes a side question before any send', () => {
   });
 
   // In the mode the box asks, so a multi-select card stops taking its text and
-  // the lone Submit reads Ask.
+  // a typed box shows the round Ask in place of the card's Submit.
   it('lets side-question mode win over a waiting card', () => {
     expect(promptSource).toMatch(/const hasPendingMultiQ = pendingMultiQ !== null && !sideQuestionMode;/);
-    expect(promptSource).toContain("{sideQuestionMode ? 'Ask' : 'Submit'}");
+    expect(promptSource).toContain('{answersCard ? answerControl : sendButton}');
   });
 
-  it('asks in side-question mode as well as from the hold', () => {
-    expect(submit).toMatch(/routeSideQuestion\(msg, \{[\s\S]*?\}, asSideQuestion \|\| sideQuestionMode\)/);
+  it('asks whenever side-question mode is on', () => {
+    expect(submit).toMatch(/routeSideQuestion\(msg, \{[\s\S]*?\}, sideQuestionMode\)/);
   });
 
   it('the ask branch asks with the images, or waits for them, and never sends', () => {

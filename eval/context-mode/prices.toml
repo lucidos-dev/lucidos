@@ -38,8 +38,8 @@
 # defaulting to zero.
 #
 # "Runs against" covers auxiliary work as well as the model under test. A thread
-# bills its title, memory and summary calls to the extractor default, and those
-# tokens are priced at that model's rate, not the one under test.
+# bills its title, memory and summary calls to the background model the fixture
+# pins, and those tokens are priced at that model's rate, not the one under test.
 #
 # `input_per_mtok` prices FRESH input alone, which is the stored input total
 # with both cache counts taken out of it. The harness derives that in one place,
@@ -63,6 +63,23 @@ input_per_mtok = 5.0
 output_per_mtok = 25.0
 cache_read_per_mtok = 0.5
 cache_creation_per_mtok = 6.25
+
+[[model]]
+# Opus 5.5 lists at $4 in, $20 out and $0.20 per cache read, half the 0.1x
+# rule above. The cache write keeps the 1.25x rule.
+id = "claude-opus-5-5"
+input_per_mtok = 4.0
+output_per_mtok = 20.0
+cache_read_per_mtok = 0.2
+cache_creation_per_mtok = 5.0
+
+[[model]]
+# Same rates as the row above. The 1M window carries no premium.
+id = "claude-opus-5-5[1m]"
+input_per_mtok = 4.0
+output_per_mtok = 20.0
+cache_read_per_mtok = 0.2
+cache_creation_per_mtok = 5.0
 
 [[model]]
 # $2/$10 launched as introductory pricing and is now the standard price. The
@@ -127,8 +144,8 @@ cache_creation_per_mtok = 12.50
 
 [[model]]
 # Never the model under test, and observed on every run all the same. The
-# fixture seeds `chat_model` alone and deletes every other preference row, so
-# title, memory and summary work resolves to the memory extractor's default.
+# fixture pins the memory tasks to this model and leaves titles on their
+# catalog default, which is also this model.
 #
 # Vertex prices context caching at 0.1x input. Cache creation is 0.00 because
 # Vertex bills cached storage per hour rather than per write, and the engine's

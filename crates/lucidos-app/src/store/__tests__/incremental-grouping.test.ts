@@ -193,6 +193,23 @@ describe('incremental grouping ≡ full grouping', () => {
     ]);
   });
 
+  it('a coding-agent follow-up abort keeps its boundary despite the shared req id', () => {
+    // The session's one request_event_id is on every turn's terminal, so the
+    // earlier ResponseGenerated must not supersede the follow-up's abort.
+    const cc = { channel: 'claude_code', request_event_id: 'req-1' };
+    const thread = replay(
+      [
+        { seq: 1, event: { type: 'MessageReceived', text: 'one' } as ThreadEvent },
+        { seq: 2, event: { type: 'ResponseGenerated', text: 'done', ...cc } as unknown as ThreadEvent },
+        { seq: 3, event: { type: 'MessageReceived', text: 'two' } as ThreadEvent },
+        { seq: 4, event: { type: 'ResponseAborted', cause: 'recovery_after_restart', ...cc } as unknown as ThreadEvent },
+      ],
+      'claude_code',
+    );
+    const exchanges = computeExchanges(thread);
+    expect(exchanges[exchanges.length - 1].userEvent.type).toBe('ResponseAborted');
+  });
+
   it('out-of-order created timestamp forces a rebuild and stays equivalent', () => {
     const thread = makeThreadState();
     const map = new Map([['thread-1', thread]]);

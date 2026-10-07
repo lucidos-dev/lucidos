@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { clampToastText } from './toastMessage';
+import { clampToastText, ERROR_MAX_CHARS, TOAST_MAX_CHARS } from './toastMessage';
 
 /**
  * A toast is a summary, so its title and message are bounded before they are
@@ -26,7 +26,7 @@ describe('clampToastText', () => {
 
   it('clamps a long error and marks the cut with an ellipsis', () => {
     const out = clampToastText(`Sync failed: ${'detail '.repeat(200)}`, 'error');
-    expect(out.length).toBeLessThanOrEqual(200);
+    expect(out.length).toBeLessThanOrEqual(ERROR_MAX_CHARS);
     expect(out.endsWith('…')).toBe(true);
     expect(out.startsWith('Sync failed: ')).toBe(true);
   });
@@ -35,7 +35,7 @@ describe('clampToastText', () => {
     // An app reaches `showToast` through the frame bridge with whatever string
     // it likes, and its type is its own choice.
     const out = clampToastText('x'.repeat(50_000), 'info');
-    expect(out.length).toBeLessThanOrEqual(2000);
+    expect(out.length).toBeLessThanOrEqual(TOAST_MAX_CHARS);
     expect(out.endsWith('…')).toBe(true);
   });
 

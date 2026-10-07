@@ -14,6 +14,7 @@
 //! preference rather than a table.
 
 use crate::support::{base_url, user_client};
+use lucidos_engine::core::prefs;
 use serde_json::json;
 
 /// The merged library as the Settings editor sees it.
@@ -49,7 +50,11 @@ fn row(styles: &[serde_json::Value], id: &str) -> serde_json::Value {
 /// status alone would call every refusal a save.
 async fn put_document(client: &reqwest::Client, api: &str, document: &str) -> serde_json::Value {
     let resp = client
-        .put(format!("{}/api/v1/preferences?key=response_styles", api))
+        .put(format!(
+            "{}/api/v1/preferences?key={}",
+            api,
+            prefs::RESPONSE_STYLES.key()
+        ))
         .json(&json!({ "value": document }))
         .send()
         .await

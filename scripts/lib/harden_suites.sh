@@ -19,7 +19,7 @@ HS_DRIVER_MODULES="runtime::codex::driver_tests runtime::codex_app_server::drive
 # suite gets a lane of its own.
 hs_is_cargo_suite() {
     case "$1" in
-        rust | shell-lint | app-lib | cli | engine-filtered | driver) return 0 ;;
+        rust | shell-lint | app-lib | cli | gateway | engine-filtered | driver) return 0 ;;
     esac
     return 1
 }
@@ -198,12 +198,35 @@ hs_vitest_inputs() { # <root>
         }' | hs_normalize_paths "$1" | sort -u
 }
 
-# The engine tests a system-knowhow edit needs. The engine reads those files at
-# run time rather than compiling them in, so no compile input selects them.
-# The full engine suite subsumes the filter when Rust is selected anyway.
+# The files outside system-knowhow/ that a `value_pins_tests` module reads, one
+# list per crate. Each holds a copy of a Rust constant it cannot import (ADR
+# 0368). harden_suites_test.sh checks each list against the paths its test names.
+HS_GATEWAY_PINNED="install.sh scripts/lib/service.sh scripts/lib/workspace_constants.sh crates/lucidos-app/tauri.conf.json README.md"
+HS_ENGINE_PINNED="scripts/lib/workspace_constants.sh scripts/status.sh README.md"
+
+hs_is_listed() { # <path> <space-separated list>
+    case " $2 " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
+
+# The engine tests a system-knowhow or engine-pinned edit needs. The engine
+# reads those files at run time rather than compiling them in, so no compile
+# input selects them. The full engine suite subsumes the filter when Rust is
+# selected anyway.
 hs_engine_filters() { # changed paths on stdin
-    grep -q '^system-knowhow/' \
-        && echo "always_loaded_context_stays_under_budget system_knowhow_descriptions_stay_routing_sized"
+    local p knowhow="" pinned="" filters=""
+    while IFS= read -r p; do
+        case "$p" in system-knowhow/*) knowhow=1 ;; esac
+        if hs_is_listed "$p" "$HS_ENGINE_PINNED"; then pinned=1; fi
+    done
+    if [ -n "$knowhow" ]; then
+        filters="always_loaded_context_stays_under_budget system_knowhow_descriptions_stay_routing_sized "
+    fi
+    if [ -n "$knowhow$pinned" ]; then
+        echo "${filters}value_pins_tests"
+    fi
     return 0
 }
 
@@ -215,7 +238,7 @@ hs_engine_filters() { # changed paths on stdin
 # files that way, and `make test` never runs its tests. A path in the
 # vitest-inputs file (hs_vitest_inputs) selects the Vitest suite.
 hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file]
-    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} p rust="" shell="" app="" cli="" ts="" css="" vitest="" install="" release="" self="" scope="" codex="" paths=""
+    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} p rust="" shell="" app="" cli="" gateway="" ts="" css="" vitest="" install="" release="" self="" scope="" codex="" paths=""
     while IFS= read -r p; do
         [ -n "$p" ] || continue
         paths="$paths$p
@@ -237,6 +260,7 @@ hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-fi
         case "$p" in
             *.sh | .shellcheckrc | Makefile) shell=1 ;;
         esac
+        if hs_is_listed "$p" "$HS_GATEWAY_PINNED"; then gateway=1; fi
         case "$p" in
             install.sh | uninstall.sh | scripts/lib/service.sh | scripts/lib/stage_runtime.sh | \
                 scripts/lib/headless_tarball.sh | scripts/lib/install_common.sh) install=1 ;;
@@ -265,6 +289,8 @@ hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-fi
     if [ -z "$rust" ] && [ -n "$(printf '%s' "$paths" | hs_engine_filters)" ]; then
         echo engine-filtered
     fi
+    # `make test` runs the gateway's tests, so the Rust suite subsumes this one.
+    [ -z "$rust" ] && [ -n "$gateway" ] && echo gateway
     if [ -n "$ts" ]; then
         echo ts
     else
@@ -299,6 +325,7 @@ hs_suite_command() { # <suite> <early|normal> <changed-paths-file>
         shell-lint) echo "make lint" ;;
         app-lib) echo "cargo test --locked -p lucidos-app --lib" ;;
         cli) echo "cargo test --locked -p lucidos-cli" ;;
+        gateway) echo "cargo test --locked -p lucidos-gateway" ;;
         engine-filtered) echo "./scripts/test-engine.sh -- -- $(hs_engine_filters < "$paths_file")" ;;
         driver) echo "./scripts/test-engine.sh -- -- $HS_DRIVER_MODULES" ;;
         ts) echo "cd crates/lucidos-app && npx tsc --noEmit && npm test && npx vite build" ;;

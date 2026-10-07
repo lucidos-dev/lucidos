@@ -51,7 +51,7 @@ pub const GREP_MAX_LINE_CHARS: usize = 300;
 /// across all returned matches. ~50 KB ≈ ~12k tokens — comfortably under any
 /// model's context budget for a single tool result.
 pub const GREP_MAX_TOTAL_BYTES: usize = 50 * 1024;
-const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+pub(crate) const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 /// Cap on the patterns one brace expansion may produce. Nesting multiplies, so
 /// nine two-way groups already reach 512, and each alternative costs a compile
 /// plus one comparison per file walked. The widest pattern a month of workspace
@@ -298,22 +298,22 @@ pub fn glob_entries(
     })
 }
 
-fn looks_binary(bytes: &[u8]) -> bool {
+pub(crate) fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(BINARY_SNIFF_BYTES).any(|b| *b == 0)
 }
 
+pub(crate) const ELLIPSIS: char = '…';
+
+/// The first `max_chars` characters, trailed by [`ELLIPSIS`] if cut.
 /// Char-aware so we never split a multi-byte UTF-8 sequence — `&s[..N]` would
 /// panic on inputs like the Polish/Norwegian artifacts we routinely grep.
-fn cap_line(s: &str) -> String {
+pub(crate) fn cap_chars(s: &str, max_chars: usize) -> String {
     let mut chars = s.chars();
-    let head: String = chars.by_ref().take(GREP_MAX_LINE_CHARS).collect();
+    let mut head: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
-        let mut out = head;
-        out.push('…');
-        out
-    } else {
-        head
+        head.push(ELLIPSIS);
     }
+    head
 }
 
 /// Search file contents for a regex pattern. Walks the same directories as
@@ -410,14 +410,14 @@ pub fn grep_entries(
                 }
                 let before_start = idx.saturating_sub(context_lines);
                 let after_end = (idx + 1 + context_lines).min(lines.len());
-                let capped_line = cap_line(line);
+                let capped_line = cap_chars(line, GREP_MAX_LINE_CHARS);
                 let context_before: Vec<String> = lines[before_start..idx]
                     .iter()
-                    .map(|s| cap_line(s))
+                    .map(|s| cap_chars(s, GREP_MAX_LINE_CHARS))
                     .collect();
                 let context_after: Vec<String> = lines[idx + 1..after_end]
                     .iter()
-                    .map(|s| cap_line(s))
+                    .map(|s| cap_chars(s, GREP_MAX_LINE_CHARS))
                     .collect();
                 let match_bytes = capped_line.len()
                     + context_before.iter().map(|s| s.len()).sum::<usize>()

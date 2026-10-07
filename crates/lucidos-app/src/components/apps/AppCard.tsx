@@ -9,6 +9,9 @@ import { useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 export interface AppPluginInfo {
   marketplaceName: string;
   updateAvailable: boolean;
+  /** A newer version exists that this Lucidos cannot install, in the engine's
+   *  words ("Needs Lucidos 0.46.1 or later"). Never set with `updateAvailable`. */
+  updateBlockedReason?: string;
   plugin: MarketplacePlugin;
 }
 
@@ -49,6 +52,9 @@ export function AppRow({ app, onOpen, onEdit, onDelete, pluginInfo, onUpdate }: 
           )}
           {pluginInfo?.updateAvailable && (
             <span class="label">Update available</span>
+          )}
+          {pluginInfo?.updateBlockedReason && (
+            <span class="label label-warning">{pluginInfo.updateBlockedReason}</span>
           )}
         </div>
         {(sk || app?.description) && (

@@ -29,7 +29,7 @@ in `engine/chat/held_deliveries.rs`.
   dispatcher and both boot sweeps all reach `process_message_with_steps`.
 - **Holding writes nothing.** Both deliveries are persisted before dispatch, and
   the anchor already keeps `waiting_for_user_answer`, so the transcript already
-  reads "Held until you reply". The event store stays the only state.
+  reads it as not read yet. The event store stays the only state.
 - **The answer is the release.** It is the one place an answer finds no live
   turn, and it already starts exactly one turn. Folding the deliveries into it
   keeps one turn per answer, the way queued messages fold into a resume.

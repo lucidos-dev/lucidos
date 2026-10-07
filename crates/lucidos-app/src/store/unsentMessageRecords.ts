@@ -29,6 +29,9 @@ export interface UnsentMessageRecord {
   failedRetries: number;
   /** The page load that owns the record (`store/pageOwner.ts`). */
   ownerId: string;
+  /** The question card the text was typed to answer, by tool-use id. It
+   *  brings the unsent answer back onto that card after a reload. */
+  answersQuestion?: string;
 }
 
 type UnsentPatch = Pick<UnsentMessageRecord, 'phase' | 'failedRetries'> | Pick<UnsentMessageRecord, 'ownerId'>;

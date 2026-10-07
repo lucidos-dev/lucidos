@@ -20,6 +20,7 @@
  */
 
 import type { Connect, Plugin } from 'vite';
+import { slugifyWorkspaceName } from '../src/utils/slug';
 
 /** Env vars the engine sets when it spawns the preview. Mirrored in Rust as
  *  `frontend_preview::PREVIEW_GATEWAY_ORIGIN_ENV` / `PREVIEW_WORKSPACE_ID_ENV`. */
@@ -35,9 +36,6 @@ export const PREVIEW_WORKSPACE_ID_ENV = 'LUCIDOS_FRONTEND_PREVIEW_WORKSPACE_ID';
  */
 export const PREVIEW_PROXIED_PREFIXES = ['/api', '/app', '/data'] as const;
 
-/** Mirrors the gateway's slug rule, so a junk value never becomes a path. */
-const SLUG_SHAPE = /^[a-z0-9][a-z0-9-]*$/;
-
 export interface PreviewGateway {
   /** `{scheme}://127.0.0.1:{port}`, the gateway on loopback. */
   origin: string;
@@ -50,7 +48,8 @@ export function previewGatewayFromEnv(
 ): PreviewGateway | undefined {
   const origin = env[PREVIEW_GATEWAY_ORIGIN_ENV]?.trim();
   const workspaceId = env[PREVIEW_WORKSPACE_ID_ENV]?.trim();
-  if (!origin || !workspaceId || !SLUG_SHAPE.test(workspaceId)) return undefined;
+  // A slug is what the gateway's slugify would produce, so junk never becomes a path.
+  if (!origin || !workspaceId || slugifyWorkspaceName(workspaceId) !== workspaceId) return undefined;
   return { origin, workspaceId };
 }
 

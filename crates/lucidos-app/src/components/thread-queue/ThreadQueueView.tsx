@@ -119,17 +119,19 @@ function ThreadQueueRow({ entry }: { entry?: ThreadQueueEntry }) {
   );
 }
 
-/** Numeric policy fields rendered as labeled inputs, in display order. */
-const POLICY_FIELDS: Array<{ key: keyof CapacityPolicy & string; label: string }> = [
-  { key: 'max_concurrent_total', label: 'Max concurrent (total)' },
-  { key: 'reserved_background', label: 'Reserved for background' },
-  { key: 'max_concurrent_event_trigger', label: 'Max concurrent event triggers' },
-  { key: 'max_concurrent_cron', label: 'Max concurrent scheduled' },
-  { key: 'max_concurrent_sub_thread', label: 'Max concurrent sub-threads' },
-  { key: 'max_concurrent_coding_agent', label: 'Max concurrent coding agents' },
-  { key: 'max_concurrent_per_trigger', label: 'Max concurrent per trigger' },
-  { key: 'max_queued_per_trigger', label: 'Max queued per trigger' },
-  { key: 'max_event_trigger_depth', label: 'Max event chain depth' },
+/** Numeric policy fields rendered as labeled inputs, in display order. `min`
+ *  is 1 where the engine refuses 0 (`CapacityPolicy::invalid_reason`). */
+const POLICY_FIELDS: Array<{ key: keyof CapacityPolicy & string; label: string; min: 0 | 1 }> = [
+  { key: 'max_concurrent_total', label: 'Max concurrent (total)', min: 0 },
+  { key: 'reserved_background', label: 'Reserved for background', min: 0 },
+  { key: 'max_concurrent_event_trigger', label: 'Max concurrent event triggers', min: 0 },
+  { key: 'max_concurrent_cron', label: 'Max concurrent scheduled', min: 0 },
+  { key: 'max_concurrent_sub_thread', label: 'Max concurrent sub-threads', min: 0 },
+  { key: 'max_concurrent_coding_agent', label: 'Max concurrent coding agents', min: 0 },
+  { key: 'max_concurrent_per_trigger', label: 'Max concurrent per trigger', min: 0 },
+  { key: 'max_queued_per_trigger', label: 'Max queued per trigger', min: 1 },
+  { key: 'max_event_trigger_depth', label: 'Max event chain depth', min: 1 },
+  { key: 'max_concurrent_children_per_thread', label: 'Max running children per thread', min: 1 },
 ];
 
 function CapacityPolicyEditor({ policy }: { policy: CapacityPolicy }) {
@@ -151,16 +153,16 @@ function CapacityPolicyEditor({ policy }: { policy: CapacityPolicy }) {
   return (
     <div class="thread-queue-policy" data-role="capacity-policy">
       <div class="thread-queue-policy-grid">
-        {POLICY_FIELDS.map(({ key, label }) => (
+        {POLICY_FIELDS.map(({ key, label, min }) => (
           <label class="thread-queue-policy-field" key={key}>
             <span>{label}</span>
             <input
               type="number"
-              min={key === 'max_queued_per_trigger' ? 1 : 0}
+              min={min}
               value={draft[key] as number}
               onInput={(e) => {
                 const n = parseInt((e.target as HTMLInputElement).value, 10);
-                if (!Number.isNaN(n) && n >= 0) setDraft({ ...draft, [key]: n });
+                if (!Number.isNaN(n) && n >= min) setDraft({ ...draft, [key]: n });
               }}
             />
           </label>

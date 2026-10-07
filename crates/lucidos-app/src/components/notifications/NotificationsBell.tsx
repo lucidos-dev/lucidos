@@ -2,6 +2,7 @@ import { unreadCount } from '../../store/store';
 import { switchMenuItem } from '../../store/actions/menu';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { BellIcon } from '../shared/icons';
+import { GlyphBadge } from '../shared/GlyphBadge';
 
 export function NotificationsBell() {
   const count = unreadCount.value;
@@ -15,9 +16,9 @@ export function NotificationsBell() {
     >
       <BellIcon />
       {count > 0 && (
-        <span class="badge">
+        <GlyphBadge class="badge">
           {count > 999 ? '999+' : count}
-        </span>
+        </GlyphBadge>
       )}
     </button>
   );

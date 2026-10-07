@@ -16,11 +16,12 @@ pub(crate) fn cc_settings_path_for_workspace(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".lucidos/cc-settings.json")
 }
 
-/// CC's default PreToolUse hook timeout is 60 seconds. The hook long-polls
-/// the engine for the user's answer; the user may take minutes (or hours).
-/// Match the 24-hour `MCP_TOOL_TIMEOUT` ceiling we already use for the MCP
-/// permission server. Value is in seconds.
-const HOOK_TIMEOUT_SECONDS: u64 = 86_400;
+/// How long a coding agent waits for the user's answer, in seconds: 24 hours.
+/// The user may take minutes or hours. Every agent-side cap on that wait is
+/// lifted to this one value: CC's PreToolUse hook timeout (default 60 s), its
+/// `MCP_TOOL_TIMEOUT` and `MCP_TIMEOUT`, and Codex's `tool_timeout_sec`. A
+/// shorter one forces a retry, which surfaces a duplicate card.
+pub(crate) const USER_ANSWER_WAIT_SECS: u64 = 86_400;
 
 /// The one working directory a CC session gets beyond its own worktree:
 /// [`crate::core::DATA_DIR`], holding the artifacts, knowhow, apps and triggers
@@ -131,7 +132,7 @@ pub(crate) fn build_cc_settings_json(additional_directories: &[PathBuf]) -> Stri
                     "hooks": [{
                         "type": "command",
                         "command": "lucidos ask-user-question-hook",
-                        "timeout": HOOK_TIMEOUT_SECONDS
+                        "timeout": USER_ANSWER_WAIT_SECS
                     }]
                 },
                 {
@@ -339,7 +340,7 @@ mod tests {
         );
         assert_eq!(
             entries[0]["hooks"][0]["timeout"],
-            serde_json::json!(HOOK_TIMEOUT_SECONDS),
+            serde_json::json!(USER_ANSWER_WAIT_SECS),
             "must override CC's 60s default so long-running user thinking doesn't kill the hook"
         );
     }

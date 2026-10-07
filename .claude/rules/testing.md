@@ -54,6 +54,28 @@ follow:
 and the rejected template-database alternative: `docs/e2e-test-decisions.md`
 § "The e2e database is rebuilt from zero, never truncated".
 
+## GitHub mode (`--github`)
+
+Every e2e script takes `--github`: `./scripts/e2e.sh --github`,
+`./scripts/e2e-browser.sh --github -f chat.spec.ts`, and so on. The suites run
+on GitHub's runners, and the report and exit code match a local run (ADR 0382).
+The driver is `scripts/e2e-github.sh`, the runner half
+`scripts/e2e-github-shard.sh`, the workflow `.github/workflows/e2e.yml`.
+
+- **What runs where.** Linux runs API, WASM, embedder, `chromium` and `mobile`.
+  macOS runs `mobile-webkit`, on the port iOS ships. Specs that spawn a real
+  Claude Code (`e2e_spec_needs_claude_code`) run on this host as the local leg.
+- **What gets pushed.** HEAD, stripped and scanned like a release, as a
+  parentless commit on an `e2e/<run-id>` branch of the mirror. The driver
+  deletes the branch afterwards, and each run sweeps finished ones over a day
+  old.
+- **No secrets in the workflow, ever.** That is why the Claude Code specs stay
+  local. `./scripts/check-e2e-workflow.sh` enforces the workflow's limits.
+- **Exit 76** means the run produced no verdict.
+- **Harness changes must stay runner-safe.** A shard reaches Postgres only
+  through `shared_pg_psql` and `LUCIDOS_EXTERNAL_PG_PORT`, because macOS runners
+  have no Docker. Shell must work under GNU tools as well as BSD.
+
 ## Browser E2E (Playwright)
 
 Tests in `crates/lucidos-app/e2e/`. Chat, streaming, cancellation, CC sessions, changes UI, threads, reload resilience.

@@ -16,37 +16,34 @@ The pipeline is: `pg_dump` the workspace database → `tar` the workspace files 
 
 Included:
 
-- The workspace **database** (a `pg_dump` custom-format archive at the archive
-  root) — the event store and all projections.
+- The workspace **database**: the event store and all projections, as a
+  `pg_dump` custom-format archive at the archive root.
 - The workspace **files** under the workspace dir, **including `.git/`** (artifact
   version history).
 
 Excluded:
 
-- **`.lucidos/`** — ephemeral runtime/cache, rebuildable.
-- **`data/postgres/`** and any `data/postgres.*` siblings — the live PGDATA is
-  captured via `pg_dump`, not copied.
-- **`~/.lucidos/`** (the user-level shared dir) — NOT backed up. It is
-  machine-global state (the gateway registry, deleted-workspace stashes, caches)
-  that restore would have to discard anyway, so backing it up was pure dead
-  weight. (Implication: user-level integration data under `~/.lucidos` is not
-  protected by a workspace backup.)
+- **`.lucidos/`**: ephemeral runtime/cache, rebuildable.
+- **`data/postgres/`** and any `data/postgres.*` siblings: `pg_dump` captures
+  the live PGDATA instead.
+- **`~/.lucidos/`** (the user-level shared dir). It holds machine-global state
+  (the gateway registry, deleted-workspace stashes, caches) that restore would
+  discard anyway. So a workspace backup does not protect user-level integration
+  data under `~/.lucidos`.
 - Anything matched by the workspace's optional **`data/.backupignore`**
   (gitignore-style, workspace-relative paths).
-- **Symlinks**, with one exception. A link is not followed, so what it points at
-  is not archived. The exception is a top-level **`data`** symlink relocating
-  the whole tree to another disk, which IS followed and backed up. `.backupignore`
-  matches the path inside the workspace, which is where the link lives, so it
-  cannot refuse a link's target. Following every link would put files from
-  anywhere on the machine into the archive you upload to your provider.
+- **Symlinks**: the backup does not follow them, so their targets are not
+  archived. Following every link would upload files from anywhere on the
+  machine. The exception is a top-level **`data`** symlink that relocates the
+  whole tree to another disk: the backup follows it. `.backupignore` matches the
+  link's path inside the workspace, so it cannot refuse a link's target.
 
 ## The schedule (in the user's timezone)
 
-The schedule is a **6-field cron expression** — `second minute hour day-of-month
-month day-of-week` — interpreted in the **user's timezone** (the `timezone`
-preference), exactly like triggers. So `0 0 3 * * *` ("daily at 03:00") fires at
-03:00 **local** time, not UTC. Changing the `timezone` preference re-aligns the
-backup automatically (no restart).
+The schedule is a **6-field cron expression** (`second minute hour day-of-month
+month day-of-week`) in the **user's timezone** (the `timezone` preference), like
+triggers. So `0 0 3 * * *` ("daily at 03:00") fires at 03:00 **local** time, not
+UTC. Changing the `timezone` preference re-aligns the backup with no restart.
 
 The schedule, provider, and retention are ordinary agent-settable preferences:
 
@@ -56,54 +53,57 @@ The schedule, provider, and retention are ordinary agent-settable preferences:
 | `backup_provider` | `google_drive` \| `dropbox` | Where to upload. Independent of `backup_schedule`: a destination stays configured with the schedule `off`, and the Backup page opens on it. The account itself is connected in **Settings → Accounts**, not here. |
 | `backup_retention` | `1`–`50` | How many recent backups to keep; older ones are pruned after each success. |
 
-Set them with `set_preference` — e.g. `set_preference(key="backup_schedule",
+Set them with `set_preference`, for example `set_preference(key="backup_schedule",
 value="0 0 3 * * *")` then `set_preference(key="backup_provider",
-value="google_drive")`. The change re-registers the schedule immediately (no
-restart). Enabling a schedule with no connected account will let backups run but
-the upload fails.
+value="google_drive")`. The schedule re-registers immediately, with no restart.
+With no connected account, scheduled backups still run but the upload fails.
+
+**A backup keeps the computer awake while it runs**, as all Lucidos work does
+(ADR 0366). On macOS that is an idle-sleep assertion named after the workspace,
+visible in `pmset -g assertions`. Lid close, an explicit Sleep or a dying
+battery still sleep the Mac. So the upload survives a sleep anyway. The
+resumable upload retries the step that lost its connection. A failed run starts
+with how long the computer slept, for example "The computer slept for 13
+minutes during this backup."
 
 ## Where each half is configured (do not mix these up)
 
-Two different Settings pages own two different halves, and telling the user the
-wrong one is the single most common way this flow goes wrong:
+Two Settings pages own two halves. Naming the wrong one is the most common way
+this flow goes wrong:
 
 | What | Where | What lives there |
 |---|---|---|
 | **The backup itself** | Settings → System → Backup | Provider dropdown, *Back up now*, the schedule, retention, the encryption key, and a health card (last run, last cloud backup, staleness). The dropdown opens on the configured `backup_provider` and **writes** it: picking one there is the same act as `set_preference(key="backup_provider", …)`. |
 | **The provider account** | **Settings → Accounts** | The *Connected accounts* list. This is the ONLY place a Google / Dropbox account is connected, and the only place its OAuth app registration is stored. |
 
-The Backup page has no account UI at all. It shows a red line linking to
-Settings → Accounts when the selected provider has no connected account. So:
+The Backup page has no account UI. When the selected provider has no connected
+account, it shows a red line linking to Settings → Accounts. So:
 
 - Never tell the user to "connect Dropbox in Settings → System → Backup". There
-  is nothing to connect there and they will not find it.
-- Setting `backup_provider` does NOT connect anything. Check
-  `get_backup_status` after setting it: it reports whether that provider's
-  account is connected, and backups are not actually working until it says so.
+  is nothing to connect there.
+- Setting `backup_provider` does NOT connect anything. Call `get_backup_status`
+  afterwards: backups do not work until it reports the account connected.
 - If it is not connected, connect it yourself with `connect_oauth_account`
   (see `system-knowhow/oauth-providers.md`), or send the user to
   Settings → Accounts. Do not report the setup as complete before then.
 
 ## What each provider's account needs
 
-A connected account is not automatically a *working* account: it also has to
-carry the scopes the backup uses. The Backup page reports that as its own state
-(connected but not ready) and offers **Grant access**, which re-runs the
-authorization with the right scopes.
+A connected account must also carry the scopes the backup uses. The Backup page
+shows a missing scope as its own state (connected but not ready). It offers
+**Grant access**, which re-runs the authorization with the right scopes.
 
-**Both surfaces name the scopes that are missing**, and they name the same ones:
-the page reads "<provider> is missing the `files.metadata.read` permission" and
-`get_backup_status` lists them on its `Provider:` line. Use them. A grant that
-came back one scope short looks exactly like an authorization that never
-happened if you only report "not granted", and the remedy differs: the short
-grant usually means the permission is not enabled in the provider's own console,
-so pressing *Grant access* again changes nothing until that is fixed. See the
-Dropbox App Console rule below.
+**Both surfaces name the same missing scopes**: the page reads "<provider> is
+missing the `files.metadata.read` permission", and `get_backup_status` lists them
+on its `Provider:` line. Report them by name, not as "not granted". A grant one
+scope short usually means the provider's own console does not enable that
+permission. Pressing *Grant access* again changes nothing until the user fixes
+that (see the Dropbox App Console rule below).
 
 **Google Drive** needs `https://www.googleapis.com/auth/drive.file`. A Google
 account connected for calendar or mail alone will not upload.
 
-**Dropbox** needs four scopes, and one extra step nothing else in Lucidos has:
+**Dropbox** needs four scopes, plus one extra step:
 
 | Scope | Used for |
 |---|---|
@@ -113,55 +113,51 @@ account connected for calendar or mail alone will not upload.
 | `account_info.read` | Naming the connected account |
 
 The extra step: **the Permissions tab of the user's app in the Dropbox App
-Console has to permit each of those first**, because an authorization request can
-only narrow what the console allows, never widen it. And **enabling a permission
-there does not change an account that is already connected**: the existing token
-and grant keep the scopes they were issued with, so after changing the console
-the user must reconnect (Settings → Accounts, or *Grant access* on the Backup
-page). A token refresh will not do it, since refreshing renews the scopes the
-token already has.
+Console must permit each scope first**. An authorization request can only narrow
+what the console allows, never widen it. And **enabling a permission there does
+not change an account that is already connected**: the token keeps the scopes it
+was issued with. So after a console change the user must reconnect (Settings →
+Accounts, or *Grant access* on the Backup page). A token refresh will not do it.
 
 So when a Dropbox backup fails with *"does not have the required scope
-'files.content.write'"*, the fix is both halves in order: enable the permissions
-in the App Console, then reconnect. Telling the user only to tick the box leaves
-them looking at the same error.
+'files.content.write'"*, give both halves in order: enable the permissions in the
+App Console, then reconnect. Ticking the box alone leaves the same error.
 
-While you are there: a Dropbox client registration also needs
-`authorize_params: token_access_type=offline`, or the connection carries no
-refresh token and stops working within hours. See
+A Dropbox client registration also needs
+`authorize_params: token_access_type=offline`. Without it the connection carries
+no refresh token and stops working within hours. See
 `system-knowhow/oauth-providers.md`.
 
-## Reading status — `get_backup_status`
+## Reading status: `get_backup_status`
 
 Call **`get_backup_status`** (read-only, no arguments) to report:
 
 - the schedule + the **next** scheduled run (computed in the user's timezone),
 - the provider and retention, **and whether that provider's account is
-  connected** (the upload leg fails until it is, so treat a not-connected
-  verdict as "backups are not set up yet"),
+  connected** (the upload fails until it is, so treat "not connected" as
+  "backups are not set up yet"),
 - the **last** run with its **duration** and (on success) filename + size,
-- a **recent run history** (start/finish/size for each — the durable record lives
+- a **recent run history** (start/finish/size for each; the durable record lives
   in the `BackupCompleted` / `BackupFailed` events),
 - whether backups are **stale** (none recent).
 
 Use it to answer "when's my next/last backup?", "how big/long are my backups?",
 or to check before changing the schedule.
 
-The **workspace picker** states a short version of the same thing on every row:
-"Backed up 3h ago", or a warning when the last good backup is stale, has never
-happened, or backups were never set up. It is one line about one workspace, and
-it goes quiet for a workspace that is not running. So it answers "is my data
-safe?" at a glance and nothing more; `get_backup_status` is where the detail is.
+The **workspace picker** shows one line per workspace row: "Backed up 3h ago", or
+a warning when the last good backup is stale, never happened, or was never set
+up. The line goes quiet for a workspace that is not running. It answers "is my
+data safe?" at a glance; `get_backup_status` holds the detail.
 
 ## Encryption key
 
-Backups are encrypted with a per-workspace key. The first backup that needs one
+A per-workspace key encrypts each backup. The first backup that needs one
 creates it: a manual backup, turning a schedule on, or a scheduled run. Lucidos
 then notifies the user to store it. It **cannot be recovered** and is **required
 to restore**. The user can view and copy it in Settings → System → Backup.
 
 ## Restore
 
-Restore is **not** an engine operation and not something the agent does: it
-happens from the **workspace picker** (the gateway provisions a new workspace and
-unpacks the archive into it). Point the user there.
+Restore is **not** an engine operation, and the agent does not do it. It
+happens in the **workspace picker**: the gateway provisions a new workspace and
+unpacks the archive into it. Point the user there.

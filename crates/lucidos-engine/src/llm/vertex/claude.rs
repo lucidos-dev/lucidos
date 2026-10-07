@@ -10,17 +10,19 @@ use crate::llm::anthropic_wire::{
     build_claude_request, parse_claude_stream, parse_context_suffix, WireTarget,
 };
 use crate::llm::provider::{LlmResponse, Message, TokenCallback, ToolDefinition};
+use crate::llm::ModelSelection;
 
 impl VertexProvider {
     pub(super) async fn chat_claude(
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
-        model: &str,
+        selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
-        reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let model = selection.model.unwrap_or(&self.model);
+        let reasoning_effort = selection.reasoning_effort;
         // Vertex carries the model in the URL, so strip the [1m] suffix for the
         // endpoint; the request builder folds the 1M beta into the body.
         let (base_model, _) = parse_context_suffix(model);
@@ -57,7 +59,14 @@ impl VertexProvider {
                 builder = builder.header("anthropic-beta", beta);
             }
             let builder = builder.json(&request);
-            let resp = match crate::llm::send_streaming_request(builder, model, attempt).await {
+            let resp = match crate::llm::send_streaming_request(
+                builder,
+                model,
+                attempt,
+                selection.attempt_timeout,
+            )
+            .await
+            {
                 crate::llm::StreamSend::Got(r) => r,
                 crate::llm::StreamSend::Retry => continue,
                 crate::llm::StreamSend::Failed(e) => return Err(e),

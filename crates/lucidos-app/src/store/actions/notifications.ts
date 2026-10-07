@@ -12,6 +12,7 @@ import {
   notificationDetailPending,
   activeMenuItem,
   focusedPane,
+  type NotificationsFilter,
 } from '../store';
 import { toFailed, setLoadingIfFresh, type Notification } from '../types';
 import { savePreference } from './preferences';
@@ -246,7 +247,7 @@ export function refreshActiveNotificationsTab(): Promise<void> {
  *  "Unread" tab renders `unreadNotifications` (the bell badge's single source),
  *  so switching to it refreshes that set in place — badge and list stay one
  *  array. The "All" tab renders the paginated `notifications` browse list. */
-export function setNotificationsFilter(filter: 'all' | 'unread'): void {
+export function setNotificationsFilter(filter: NotificationsFilter): void {
   notificationsFilter.value = filter;
   void refreshActiveNotificationsTab();
   void savePreference('notifications_filter', filter);

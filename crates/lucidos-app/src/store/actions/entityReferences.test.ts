@@ -104,6 +104,18 @@ describe('processSSEForReferences', () => {
       expect(recents[0].id).toBe('some-thread');
     });
 
+    it('clears the app storage the deleted app kept on this device', () => {
+      // No workspace in tests, so the stored keys are the bare layout.
+      localStorage.setItem('appbridge:habit-tracker:app:room', 'kitchen');
+      sessionStorage.setItem('appbridge:habit-tracker:sdk:scroll', '420');
+      localStorage.setItem('appbridge:demo-director:app:room', 'studio');
+      processSSEForReferences('AppDeleted', { app_id: 'habit-tracker' });
+      expect(localStorage.getItem('appbridge:habit-tracker:app:room')).toBeNull();
+      expect(sessionStorage.getItem('appbridge:habit-tracker:sdk:scroll')).toBeNull();
+      expect(localStorage.getItem('appbridge:demo-director:app:room')).toBe('studio');
+      localStorage.removeItem('appbridge:demo-director:app:room');
+    });
+
     it('prunes app-ui entry from nav stack', () => {
       setNavStack([
         { overlay: { type: 'app-ui', app: { id: 'habit-tracker' } } },

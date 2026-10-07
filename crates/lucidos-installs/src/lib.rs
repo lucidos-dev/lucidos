@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 // these literals out of this file and fails when the two drift.
 
 /// The `.app` bundle's identifier, and the directory name of its support data.
-/// Matches `BUNDLE_IDENTIFIER` in `crates/lucidos-app/src/desktop.rs`.
+/// Must match `identifier` in `crates/lucidos-app/tauri.conf.json`.
 pub const BUNDLE_IDENTIFIER: &str = "com.lucidos.app";
 
 /// The bundle's on-disk name, under `/Applications` or `~/Applications`.

@@ -279,6 +279,7 @@ async fn write_artifact_data(
     profile_cache: &crate::engine::user_profile::UserProfileCache,
     artifact_path: &str,
     body: &[u8],
+    writer_thread_id: Option<uuid::Uuid>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // `write_and_commit` takes `impl AsRef<[u8]>`, so pass the raw bytes: a
     // binary upload (PNG, PDF, …) would otherwise be silently mangled by a
@@ -296,6 +297,7 @@ async fn write_artifact_data(
             &format!("Update {}", artifact_path),
             crate::core::WriteAnnouncement::Entity {
                 source: Some("data_api".to_string()),
+                writer_thread_id,
             },
         )
         .await?;
@@ -361,6 +363,7 @@ pub(super) async fn write_data(
             state.engine.user_profile_cache(),
             artifact_path,
             body.as_ref(),
+            actor.source_thread_id(),
         )
         .await
         {
@@ -618,6 +621,7 @@ pub(super) async fn edit_data(
                 old_string: op.find.as_deref(),
                 new_string: op.replace.as_deref(),
                 replace_all: false,
+                writer_thread_id: actor.source_thread_id(),
                 commit: None,
                 message: None,
             })
@@ -1084,6 +1088,7 @@ mod tests {
             &cache,
             "user_profile.md",
             b"# Profile\n\nDrinks tea.\n",
+            None,
         )
         .await
         .expect("write must land");
@@ -1104,7 +1109,7 @@ mod tests {
             "imported/user_profile.md",
             "old_user_profile.md",
         ] {
-            write_artifact_data(&am, &bus, &cache, path, b"theirs")
+            write_artifact_data(&am, &bus, &cache, path, b"theirs", None)
                 .await
                 .expect("write must land");
             assert_eq!(cache.snapshot().await, "mine", "{} touched the cache", path);
@@ -1156,9 +1161,10 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
 
-        let result = write_artifact_data(&am, &bus, &cache, "user_profile.md", b"never landed")
-            .await
-            .err();
+        let result =
+            write_artifact_data(&am, &bus, &cache, "user_profile.md", b"never landed", None)
+                .await
+                .err();
 
         assert!(result.is_some(), "the write must report failure");
         assert_eq!(cache.snapshot().await, "mine");

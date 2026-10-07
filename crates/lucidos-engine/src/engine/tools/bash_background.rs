@@ -298,6 +298,13 @@ impl BackgroundTask {
         self.finished_at.is_some()
     }
 
+    /// Still running, but somebody already took the stop signal: a stop,
+    /// `kill_for_thread`, or the teardown. Its completion is coming, and it is
+    /// no longer news to anyone who would arm a wait for it now.
+    fn stop_requested(&self) -> bool {
+        !self.is_finished() && self.kill_signal.is_none()
+    }
+
     /// True once the retention window has closed on a completed task. Always
     /// false while it is running: an unfinished task is live state, never a
     /// retention candidate, however long it has been going.
@@ -324,6 +331,35 @@ pub struct RunningTaskHandle {
     /// outlive this, so a wait armed to at least this instant cannot be
     /// outlived by the task either.
     pub watchdog_deadline: DateTime<Utc>,
+    /// A stop was already requested, so the engine must not arm a wait for it.
+    /// Without this, `stop X; run Y` inside the stop's grace re-armed a wait
+    /// on X, and X's own killed completion woke the thread that stopped it.
+    pub stop_requested: bool,
+}
+
+/// The right to stop one task, taken by [`BackgroundBashRegistry::begin_stop`]
+/// and not yet used.
+///
+/// Dropping it unsent still stops the task, at once rather than gracefully:
+/// the watchdog reads a closed channel as [`Stop::Immediate`].
+#[derive(Debug)]
+pub struct PendingStop {
+    owner: Option<Uuid>,
+    signal: tokio::sync::oneshot::Sender<Stop>,
+}
+
+impl PendingStop {
+    /// The thread that spawned the task. A completion's matchable payload
+    /// names it, so deciding which waits fire on the task needs it.
+    pub fn owner(&self) -> Option<Uuid> {
+        self.owner
+    }
+
+    /// Send the graceful stop: SIGTERM to the task's process group, then
+    /// SIGKILL after the grace (ADR 0263).
+    pub fn send(self) {
+        let _ = self.signal.send(Stop::Graceful);
+    }
 }
 
 /// One task the teardown is responsible for recording, as
@@ -535,7 +571,14 @@ impl BackgroundBashRegistry {
 
         let tasks = self.tasks.clone();
         let id = task_id.clone();
+        // Moved into the watchdog, which every exit path goes through: a
+        // natural exit, the timeout, a kill, and the runtime dropping it.
+        let awake = crate::core::keep_awake::hold(
+            crate::core::keep_awake::Work::BackgroundTask,
+            task_id.clone(),
+        );
         tokio::spawn(async move {
+            let _awake = awake;
             let timeout_fut = tokio::time::sleep(Duration::from_secs(timeout_secs));
             tokio::pin!(timeout_fut);
             let mut timed_out = false;
@@ -680,22 +723,39 @@ impl BackgroundBashRegistry {
         Some(drain_snapshot(task))
     }
 
-    /// Cancel a running task. Returns `false` if the task is unknown or
-    /// already finished, retained completions included: retention makes a
-    /// finished task readable, never killable.
-    pub async fn kill(&self, task_id: &str) -> bool {
+    /// Take the right to stop a running task, without stopping it yet. `None`
+    /// if the task is unknown, already finished, or already being stopped:
+    /// retention makes a finished task readable, never stoppable.
+    ///
+    /// Two steps, so a thread stopping its own task can stand down its waits
+    /// on it BEFORE the signal goes out. A child can exit on SIGTERM and emit
+    /// its completion within milliseconds. A stand-down after the signal
+    /// would race the very delivery it exists to prevent. From here on the
+    /// task is *stop requested*, so no engine wait arms for it
+    /// ([`RunningTaskHandle::stop_requested`]).
+    pub async fn begin_stop(&self, task_id: &str) -> Option<PendingStop> {
         let mut tasks = self.locked().await;
-        let Some(task) = tasks.get_mut(task_id) else {
-            return false;
-        };
+        let task = tasks.get_mut(task_id)?;
         if task.is_finished() {
-            return false;
+            return None;
         }
-        if let Some(tx) = task.kill_signal.take() {
-            let _ = tx.send(Stop::Graceful);
-            true
-        } else {
-            false
+        let signal = task.kill_signal.take()?;
+        Some(PendingStop {
+            owner: task.thread_id,
+            signal,
+        })
+    }
+
+    /// Test shorthand: begin a stop and send it at once. Production callers go
+    /// through [`Self::begin_stop`], so none can skip the stand-down between.
+    #[cfg(test)]
+    pub async fn kill(&self, task_id: &str) -> bool {
+        match self.begin_stop(task_id).await {
+            Some(stop) => {
+                stop.send();
+                true
+            }
+            None => false,
         }
     }
 
@@ -735,6 +795,7 @@ impl BackgroundBashRegistry {
                 description: t.description.clone(),
                 command: t.command.clone(),
                 watchdog_deadline: t.started_at + chrono::Duration::seconds(t.timeout_secs as i64),
+                stop_requested: t.stop_requested(),
             })
             .collect()
     }
@@ -1386,6 +1447,44 @@ mod tests {
         assert_eq!(snap.outcome, Some(TaskOutcome::Signaled(15)));
     }
 
+    /// Waits for the watchdog to drop its keep-awake hold, which happens just
+    /// after it signals the finish.
+    async fn hold_released(task_id: &str) -> bool {
+        for _ in 0..100 {
+            if !crate::core::keep_awake::is_held(task_id) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// A running task keeps the computer awake, and every way it can end
+    /// releases that: a clean exit, a failing exit and a kill.
+    #[tokio::test]
+    async fn a_task_keeps_the_computer_awake_until_it_ends() {
+        let reg = BackgroundBashRegistry::new();
+        let tmp = std::path::Path::new("/tmp");
+        for command in ["sleep 0.3", "sleep 0.3; exit 3"] {
+            let (task_id, finish_rx) = reg.spawn(command, 60, tmp, &[], None, None).await.unwrap();
+            assert!(crate::core::keep_awake::is_held(&task_id), "{command}");
+            finish_rx.await.unwrap();
+            assert!(hold_released(&task_id).await, "{command} leaked its hold");
+        }
+
+        let (task_id, finish_rx) = reg
+            .spawn("sleep 30", 60, tmp, &[], None, None)
+            .await
+            .unwrap();
+        assert!(crate::core::keep_awake::is_held(&task_id));
+        assert!(reg.kill(&task_id).await);
+        finish_rx.await.unwrap();
+        assert!(
+            hold_released(&task_id).await,
+            "a killed task leaked its hold"
+        );
+    }
+
     #[tokio::test]
     async fn kill_returns_false_for_unknown_task() {
         let reg = BackgroundBashRegistry::new();
@@ -1469,7 +1568,10 @@ mod tests {
     async fn timeout_ends_the_whole_process_group() {
         let dir = tempfile::tempdir().expect("tempdir");
         let reg = BackgroundBashRegistry::new();
-        let (task_id, grandchild) = spawn_with_grandchild(&reg, dir.path(), 1, None).await;
+        // The timeout must fire after the shell has written the pid. On a
+        // loaded host a shell can take over a second to start. A 1 s timeout
+        // then killed it first, and the pid never appeared.
+        let (task_id, grandchild) = spawn_with_grandchild(&reg, dir.path(), 5, None).await;
 
         assert!(reg.wait_for_finish(&task_id, Duration::from_secs(30)).await);
         assert!(
@@ -2508,6 +2610,49 @@ mod tests {
         assert!(reg.completion_record(&task_id).await.is_none());
         // Clean up so the spawned sleep doesn't outlive the test thread.
         reg.kill(&task_id).await;
+    }
+
+    /// A begun stop marks the task *stop requested* at once and signals
+    /// nothing until it is sent. The stopping thread stands its waits down in
+    /// between, so its completion cannot race that stand-down (ADR 0369).
+    #[tokio::test]
+    async fn a_begun_stop_marks_the_task_and_signals_only_when_sent() {
+        let reg = BackgroundBashRegistry::new();
+        let thread = Uuid::new_v4();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "sleep 30",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(thread),
+                None,
+            )
+            .await
+            .expect("spawn");
+
+        let stop = reg.begin_stop(&task_id).await.expect("running");
+        assert_eq!(stop.owner(), Some(thread));
+        let handles = reg.running_for_thread(thread).await;
+        assert!(handles[0].stop_requested, "{handles:?}");
+        assert!(
+            reg.begin_stop(&task_id).await.is_none(),
+            "a stop already on its way is not taken twice"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            reg.is_running(&task_id).await,
+            "nothing is signalled before send"
+        );
+
+        stop.send();
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(15)).await);
+        assert!(
+            reg.completion_record(&task_id)
+                .await
+                .expect("record")
+                .killed
+        );
     }
 
     /// `has_running_for_thread` answers per thread, never across threads: the

@@ -20,9 +20,15 @@
 //! **A turn that produced nothing is re-posted, never scored.** The model can
 //! end a turn with no text and no tool call. The engine is right to treat a
 //! clean stop as benign silence, and a task turn is not silence: the thread
-//! never started the work. [`EmptyCompletionPolicy`] re-posts the same prompt,
-//! and gives up after [`EMPTY_COMPLETION_RETRIES`]. The caller then voids the
-//! task in both arms, because a thread that never ran did not fail to deliver.
+//! never started the work. [`RepostPolicy`] re-posts the same prompt, and gives
+//! up after [`REPOSTS_PER_TURN`]. The caller then voids the task in both arms,
+//! because a thread that never ran did not fail to deliver.
+//!
+//! **A refused turn is re-posted too.** The provider's safety classifier can
+//! withhold a round's whole reply on benign work. The engine fails the turn,
+//! which is right for a user and says nothing about the memory module under
+//! test. The same policy and budget apply. A refusal that outlasts them keeps
+//! its `failed` status, as before.
 //!
 //! **A finished turn is not the end of its spend.** The title, the memory
 //! extractor and the summariser run in detached tasks, and each bills real
@@ -150,6 +156,11 @@ pub struct DrivenTask {
     pub empty_completions: u32,
     /// Prompts re-posted to recover one of those turns.
     pub empty_retries: u32,
+    /// Attempts at a turn the provider refused with no output, every one
+    /// counted, a recovered one included.
+    pub refusals: u32,
+    /// Prompts re-posted to recover one of those turns.
+    pub refusal_retries: u32,
     /// Sequence of the prompt that opened turn two, once one was driven.
     ///
     /// Recorded because a re-post writes its own `MessageReceived`. Counting
@@ -161,6 +172,26 @@ impl DrivenTask {
     /// Whether the task ran to the end, a wake included.
     pub fn completed(&self) -> bool {
         self.status.completed()
+    }
+
+    /// Count one attempt that carried this fault.
+    fn record_fault(&mut self, fault: TurnFault) {
+        match fault {
+            TurnFault::Empty => self.empty_completions += 1,
+            TurnFault::Refused => self.refusals += 1,
+        }
+    }
+
+    /// Count one prompt re-posted to recover from this fault.
+    ///
+    /// Accumulated, because the budget is per turn and the count is per task.
+    /// Assigning the policy's total would let turn two's first re-post erase
+    /// turn one's.
+    fn record_repost(&mut self, fault: TurnFault) {
+        match fault {
+            TurnFault::Empty => self.empty_retries += 1,
+            TurnFault::Refused => self.refusal_retries += 1,
+        }
     }
 
     /// What the results row records as this task's status.
@@ -299,13 +330,24 @@ impl DriveProgress {
     }
 }
 
-/// How many times a turn that produced nothing is re-posted before the driver
-/// gives up on it.
+/// How many times a faulted turn is re-posted before the driver gives up on it.
 ///
-/// Two. Every attempt is billed, and the failure this covers is a provider
-/// hiccup rather than a state the model argues itself out of. The budget is per
-/// turn, so a two-turn task can spend it twice.
-pub const EMPTY_COMPLETION_RETRIES: u32 = 2;
+/// Two. Every attempt is billed, and both faults are provider hiccups rather
+/// than states the model argues itself out of. The budget is per turn and
+/// shared by both faults, so a two-turn task can spend it twice.
+pub const REPOSTS_PER_TURN: u32 = 2;
+
+/// How the engine's failure for a refused round with no output begins.
+///
+/// `classify_empty_completion` in the engine's agentic loop writes it. A reply
+/// the classifier cut off partway carries text and a different message, so it
+/// never matches.
+const NO_OUTPUT_REFUSAL: &str = "Model returned no response (stop_reason: refusal,";
+
+/// Whether a `ResponseFailed` error is a provider refusal that returned nothing.
+pub fn is_no_output_refusal(error: &str) -> bool {
+    error.starts_with(NO_OUTPUT_REFUSAL)
+}
 
 /// What one turn of a thread put into the event store.
 ///
@@ -323,6 +365,11 @@ pub struct TurnOutput {
     /// A size, never a bill. Deriving what was billed means taking the cached
     /// counts out first, which is `InputSplit`'s job and not this probe's.
     pub input_total: i64,
+    /// Whether the turn failed on a provider refusal that returned nothing.
+    ///
+    /// Read apart from `produced_nothing`. Every refusal in the motivating run
+    /// came on the round after a tool result, so its turn had tool calls.
+    pub refused: bool,
 }
 
 impl TurnOutput {
@@ -341,41 +388,76 @@ impl TurnOutput {
     }
 }
 
+/// Why a turn that reached a terminal state is re-posted rather than kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnFault {
+    /// The turn finished with no text and no tool call.
+    Empty,
+    /// The turn failed on a provider refusal that returned nothing.
+    Refused,
+}
+
+impl TurnFault {
+    /// The fault a finished attempt carries, if any.
+    ///
+    /// A turn that timed out or parked produced no result either, and a
+    /// re-post would measure the same wall clock again. Those keep their own
+    /// status, which the caller already voids downstream. So does a turn that
+    /// failed for any reason but a refusal.
+    fn of(status: TaskStatus, output: &TurnOutput) -> Option<TurnFault> {
+        match status {
+            TaskStatus::Idle | TaskStatus::IdleAfterWake if output.produced_nothing() => {
+                Some(TurnFault::Empty)
+            }
+            TaskStatus::Settled if output.refused => Some(TurnFault::Refused),
+            _ => None,
+        }
+    }
+
+    /// The status a turn records once its re-posts ran out.
+    ///
+    /// An empty thread never ran, so it is voided. A refused one counts as
+    /// failed, which is what it counted as before re-posts existed.
+    pub fn given_up(self) -> TaskStatus {
+        match self {
+            TurnFault::Empty => TaskStatus::Empty,
+            TurnFault::Refused => TaskStatus::Settled,
+        }
+    }
+}
+
 /// What to do with a turn that has just reached a terminal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnStep {
     /// The turn produced something, or ended in a way a re-post cannot fix.
     Keep(TaskStatus),
-    /// The turn produced nothing. Re-post its prompt and drive it again.
-    Retry,
-    /// It produced nothing every time. The task is voided, not scored.
-    GiveUp,
+    /// The turn carries this fault. Re-post its prompt and drive it again.
+    Retry(TurnFault),
+    /// The budget is spent and the turn still carries this fault.
+    GiveUp(TurnFault),
 }
 
-/// The retry budget of one turn, and the rule that spends it.
+/// The re-post budget of one turn, and the rule that spends it.
 ///
 /// Its own state machine for the same reason [`DriveProgress`] is one: the
 /// decision is worth testing without a database, and both arms have to run
 /// exactly this rule (ADR 0087 I7). Nothing here reads an arm.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EmptyCompletionPolicy {
+pub struct RepostPolicy {
     retries_used: u32,
 }
 
-impl EmptyCompletionPolicy {
-    /// Fold in one finished attempt, and say what to do about it.
+impl RepostPolicy {
+    /// Fold in one attempt that reached a terminal state, and say what to do.
     pub fn observe(&mut self, status: TaskStatus, output: &TurnOutput) -> TurnStep {
-        // A turn that timed out, parked or settled produced no result either,
-        // and a re-post would measure the same wall clock again. Those keep
-        // their own status, which the caller already voids downstream.
-        if !status.completed() || !output.produced_nothing() {
+        let Some(fault) = TurnFault::of(status, output) else {
             return TurnStep::Keep(status);
-        }
-        if self.retries_used >= EMPTY_COMPLETION_RETRIES {
-            return TurnStep::GiveUp;
+        };
+        if self.retries_used >= REPOSTS_PER_TURN {
+            return TurnStep::GiveUp(fault);
         }
         self.retries_used += 1;
-        TurnStep::Retry
+        TurnStep::Retry(fault)
     }
 
     /// Re-posts spent so far, which the thread row records.
@@ -479,6 +561,58 @@ pub async fn wait_until_settled(pool: &PgPool, thread_id: Uuid) -> Fallible<bool
     }
 }
 
+/// How long a Tree arm's engine may take to report its trees ready.
+///
+/// The seeded workspace holds no events, so its backfill is empty and takes
+/// seconds. The bound only has to outlast a slow first boot.
+const TREE_READY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long the compactor may take to catch up after one task.
+///
+/// A long task writes hundreds of entries, and each line is a model call. The
+/// bound is generous because a short wait would score the next task on half
+/// built trees.
+const COMPACTION_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How often either wait polls.
+const TREE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Wait for a Tree arm's engine to take the Tree path, and say whether it did.
+///
+/// The engine runs Classic until its ready flag sets (ADR 0362 I7). A task
+/// started sooner would be scored as Classic under a Tree label. The answer is
+/// the engine's own `tree_ready`, so the harness restates none of it.
+pub async fn wait_until_tree_ready(pool: &PgPool) -> bool {
+    let deadline = Instant::now() + TREE_READY_TIMEOUT;
+    loop {
+        if lucidos_engine::engine::summary_tree::tree_ready(pool).await {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(TREE_POLL_INTERVAL).await;
+    }
+}
+
+/// Wait for the compactor to reflect every turn and artifact write so far.
+///
+/// A Classic arm's detached memory work lands inside the settle wait. A Tree
+/// arm's compactor can run past it, so this waits for the engine's own
+/// `caught_up`. `false` means the bound arrived first, which the caller records.
+pub async fn wait_until_compacted(pool: &PgPool) -> Fallible<bool> {
+    let deadline = Instant::now() + COMPACTION_TIMEOUT;
+    loop {
+        if lucidos_engine::engine::summary_tree::caught_up(pool).await? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(TREE_POLL_INTERVAL).await;
+    }
+}
+
 /// One arm's live endpoints, as the driver sees them.
 pub struct ArmEndpoint {
     pub base_url: String,
@@ -549,6 +683,8 @@ pub async fn drive_task(
         questions_answered: 0,
         empty_completions: 0,
         empty_retries: 0,
+        refusals: 0,
+        refusal_retries: 0,
         followup_sequence: None,
     };
     let mut turns = Turns {
@@ -598,17 +734,20 @@ struct Turns<'a> {
     answers: Option<&'a TaskAnswers>,
 }
 
-/// How one turn ended, and which prompt opened the attempt that ended that way.
+/// How one turn ended, and the sequence of the prompt that opened it.
+///
+/// The turn's first prompt, never a re-post's. A refused attempt can do real
+/// work before the refusal, and a probe counting from the boundary must see it.
 struct DrivenTurn {
     status: TaskStatus,
     opened_at: i64,
 }
 
-/// Drive one turn, re-posting its prompt while it comes back with nothing.
+/// Drive one turn, re-posting its prompt while it comes back empty or refused.
 ///
 /// The prompt is posted by the caller, so the first attempt only drives. Each
-/// re-post opens a fresh turn on the same thread, and the emptiness question is
-/// asked of that turn alone.
+/// re-post opens a fresh attempt on the same thread, and the fault question is
+/// asked of that attempt alone.
 async fn drive_one_turn(
     arm: &ArmEndpoint,
     driven: &mut DrivenTask,
@@ -616,51 +755,71 @@ async fn drive_one_turn(
     mut progress: DriveProgress,
     turns: &mut Turns<'_>,
 ) -> Fallible<DrivenTurn> {
-    let mut policy = EmptyCompletionPolicy::default();
+    let mut policy = RepostPolicy::default();
+    let opened_at = await_prompt(
+        &arm.pool,
+        driven.thread_id,
+        turns.prompts_posted,
+        &driven.task,
+    )
+    .await?;
+    let mut attempt_opened_at = opened_at;
     loop {
-        let opened_at = await_prompt(
+        let status = drive_turn(arm, driven, progress, turns).await?;
+        let output = turn_output(&arm.pool, driven.thread_id, attempt_opened_at).await?;
+        let step = policy.observe(status, &output);
+        let fault = match step {
+            TurnStep::Keep(status) => return Ok(DrivenTurn { status, opened_at }),
+            TurnStep::Retry(fault) | TurnStep::GiveUp(fault) => fault,
+        };
+        driven.record_fault(fault);
+        report_fault(&driven.task, &output, step, policy.retries_used());
+        if let TurnStep::GiveUp(fault) = step {
+            return Ok(DrivenTurn {
+                status: fault.given_up(),
+                opened_at,
+            });
+        }
+        // The re-post lands as a `MessageReceived`, which sets the thread
+        // running in the same write. `await_prompt` waits for it, so a refused
+        // turn's `failed` status is gone before the next poll.
+        post_message(arm, prompt, Some(driven.thread_id)).await?;
+        turns.prompts_posted += 1;
+        driven.record_repost(fault);
+        attempt_opened_at = await_prompt(
             &arm.pool,
             driven.thread_id,
             turns.prompts_posted,
             &driven.task,
         )
         .await?;
-        let status = drive_turn(arm, driven, progress, turns).await?;
-        let output = turn_output(&arm.pool, driven.thread_id, opened_at).await?;
-        let step = policy.observe(status, &output);
-        if let TurnStep::Keep(status) = step {
-            return Ok(DrivenTurn { status, opened_at });
-        }
-        driven.empty_completions += 1;
-        report_empty_completion(&driven.task, &output, step, policy.retries_used());
-        if step == TurnStep::GiveUp {
-            return Ok(DrivenTurn {
-                status: TaskStatus::Empty,
-                opened_at,
-            });
-        }
-        post_message(arm, prompt, Some(driven.thread_id)).await?;
-        turns.prompts_posted += 1;
-        // Accumulated, because the budget is per turn and the count is per
-        // task. Assigning the policy's total would let turn two's first re-post
-        // erase turn one's.
-        driven.empty_retries += 1;
         progress = DriveProgress::after_prompt();
     }
 }
 
-/// Say that a turn produced nothing, and what is being done about it.
+/// Say that a turn carried a fault, and what is being done about it.
 ///
 /// The input tokens go on the line because they are the corroborating tell.
 /// Zero means the provider never ran the request. A billed round that returned
 /// nothing is a different fault wearing the same symptom.
-fn report_empty_completion(task: &str, output: &TurnOutput, step: TurnStep, attempt: u32) {
+fn report_fault(task: &str, output: &TurnOutput, step: TurnStep, attempt: u32) {
     let next = match step {
-        TurnStep::GiveUp => "giving up, and the task is voided in both arms".to_string(),
-        _ => format!("re-posting the prompt, attempt {attempt} of {EMPTY_COMPLETION_RETRIES}"),
+        TurnStep::GiveUp(TurnFault::Empty) => {
+            "giving up, and the task is voided in both arms".to_string()
+        }
+        TurnStep::GiveUp(TurnFault::Refused) => {
+            "giving up, and the thread counts as failed".to_string()
+        }
+        _ => format!("re-posting the prompt, attempt {attempt} of {REPOSTS_PER_TURN}"),
+    };
+    let what = match step {
+        TurnStep::Retry(TurnFault::Refused) | TurnStep::GiveUp(TurnFault::Refused) => {
+            "on a provider refusal with no output"
+        }
+        _ => "with no text and no tool call",
     };
     println!(
-        "[eval]   {task} ended a turn with no text and no tool call ({} input tokens): {next}",
+        "[eval]   {task} ended a turn {what} ({} input tokens): {next}",
         output.input_total
     );
 }
@@ -786,16 +945,21 @@ async fn turn_output(pool: &PgPool, thread_id: Uuid, opened_at: i64) -> Fallible
                AND event_type = 'ToolCalled') AS tool_calls, \
            COALESCE((SELECT sum((payload->'usage'->>'input_tokens')::bigint) FROM events \
                       WHERE thread_id = $1 AND sequence > $2 \
-                        AND event_type = 'ContextCaptured'), 0)::bigint AS input_total",
+                        AND event_type = 'ContextCaptured'), 0)::bigint AS input_total, \
+           ARRAY(SELECT COALESCE(payload->>'error', '') FROM events \
+                  WHERE thread_id = $1 AND sequence > $2 \
+                    AND event_type = 'ResponseFailed') AS failures",
     )
     .bind(thread_id)
     .bind(opened_at)
     .fetch_one(pool)
     .await?;
+    let failures: Vec<String> = row.try_get("failures")?;
     Ok(TurnOutput {
         said_something: row.try_get("said_something")?,
         tool_calls: row.try_get("tool_calls")?,
         input_total: row.try_get("input_total")?,
+        refused: failures.iter().any(|error| is_no_output_refusal(error)),
     })
 }
 
@@ -805,16 +969,9 @@ async fn turn_output(pool: &PgPool, thread_id: Uuid, opened_at: i64) -> Fallible
 /// separate databases, but a task can also spawn a sub-thread, and the newest
 /// row is then the child.
 pub async fn resolve_thread_by_marker(pool: &PgPool, marker: &str) -> Fallible<Uuid> {
-    let pattern = format!("%{marker}%");
     let deadline = Instant::now() + RESOLVE_TIMEOUT;
     loop {
-        let row: Option<(Uuid,)> = sqlx::query_as(
-            "SELECT thread_id FROM thread_summaries WHERE first_message LIKE $1 LIMIT 1",
-        )
-        .bind(&pattern)
-        .fetch_optional(pool)
-        .await?;
-        if let Some((thread_id,)) = row {
+        if let Some(thread_id) = find_thread_by_marker(pool, marker).await? {
             return Ok(thread_id);
         }
         if Instant::now() >= deadline {
@@ -827,6 +984,27 @@ pub async fn resolve_thread_by_marker(pool: &PgPool, marker: &str) -> Fallible<U
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// The thread whose prompt carries this marker, if one exists yet.
+pub async fn find_thread_by_marker(pool: &PgPool, marker: &str) -> Fallible<Option<Uuid>> {
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT thread_id FROM thread_summaries WHERE first_message LIKE $1 LIMIT 1",
+    )
+    .bind(format!("%{marker}%"))
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(thread_id,)| thread_id))
+}
+
+/// Whether this arm's database still holds the thread.
+pub async fn thread_exists(pool: &PgPool, thread_id: Uuid) -> Fallible<bool> {
+    let row: Option<(Uuid,)> =
+        sqlx::query_as("SELECT thread_id FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
 }
 
 /// What the thread is doing, and whether anything will wake it.
@@ -1161,8 +1339,8 @@ mod tests {
 
     #[test]
     fn a_marker_is_unique_per_arm_repeat_and_task() {
-        let control = task_marker("abc", 1, crate::arm::Arm::Control, "T05");
-        let lean = task_marker("abc", 1, crate::arm::Arm::Lean, "T05");
+        let control = task_marker("abc", 1, crate::arm::Arm::CONTROL, "T05");
+        let lean = task_marker("abc", 1, crate::arm::Arm::LEAN, "T05");
         assert_ne!(control, lean);
         assert!(control.contains("T05"));
         assert!(control.starts_with("eval-abc-r1-"));
@@ -1178,6 +1356,8 @@ mod tests {
             questions_answered: 0,
             empty_completions: 0,
             empty_retries: 0,
+            refusals: 0,
+            refusal_retries: 0,
             followup_sequence: None,
         }
     }
@@ -1471,6 +1651,7 @@ mod tests {
             said_something: false,
             tool_calls: 0,
             input_total: 0,
+            refused: false,
         }
     }
 
@@ -1480,6 +1661,7 @@ mod tests {
             said_something: true,
             tool_calls: 0,
             input_total: 35_628,
+            refused: false,
         }
     }
 
@@ -1490,7 +1672,143 @@ mod tests {
             said_something: false,
             tool_calls: 9,
             input_total: 177_589,
+            refused: false,
         }
+    }
+
+    /// Run 4's Classic T09: tool work, then a round the classifier refused.
+    fn work_then_refusal() -> TurnOutput {
+        TurnOutput {
+            refused: true,
+            ..work_then_silence()
+        }
+    }
+
+    /// The engine's own text for run 4's Classic T09 refusal, verbatim.
+    const RUN_4_REFUSAL: &str = "Model returned no response (stop_reason: refusal, \
+         output_tokens: 0, thinking_chars: 0, model: claude-opus-5-5 \u{2014} the model declined \
+         to respond (provider safety classifier withheld the output). Rephrase the request or \
+         start a new thread; retrying the same prompt will be refused again).";
+
+    /// The failure the motivating run recorded is the one this matches.
+    #[test]
+    fn the_engine_failure_for_a_refusal_with_no_output_is_read_as_one() {
+        assert!(is_no_output_refusal(RUN_4_REFUSAL));
+    }
+
+    /// The match is built from the engine's own format strings. Rewording
+    /// either one there fails here, rather than turning re-posts off silently.
+    #[test]
+    fn the_refusal_prefix_is_the_text_the_engine_writes() {
+        let run = include_str!("../../lucidos-engine/src/engine/agentic_loop/run.rs");
+        let failure = r#""Model returned no response ({}).""#;
+        let diagnostic = r#""stop_reason: {}, output_tokens: {}"#;
+        for fragment in [failure, diagnostic] {
+            assert!(
+                run.contains(fragment),
+                "the engine no longer writes {fragment}"
+            );
+        }
+        let prefix = failure.trim_matches('"').replace("{}).", "")
+            + &diagnostic
+                .trim_start_matches('"')
+                .replace("{}, output_tokens: {}", "refusal,");
+        assert_eq!(NO_OUTPUT_REFUSAL, prefix);
+    }
+
+    /// A reply cut off partway still showed text, and a truncation or a
+    /// dropped stream is a different fault. None of them is re-posted.
+    #[test]
+    fn other_engine_failures_are_never_read_as_a_refusal() {
+        for error in [
+            "The model stopped partway: the provider's safety classifier withheld the rest of \
+             the response.",
+            "Model returned no response (stop_reason: max_tokens, output_tokens: 32000).",
+            "Model returned no response (stop_reason: end_turn, output_tokens: 40, \
+             thinking_chars: 0, model: claude-opus-5-5 \u{2014} model generated output the \
+             engine couldn't classify).",
+            "",
+        ] {
+            assert!(!is_no_output_refusal(error), "{error}");
+        }
+    }
+
+    /// The shape this change exists for. A refused turn is re-posted, the
+    /// re-post works, and the count still says it happened.
+    #[test]
+    fn a_refused_turn_that_answers_on_the_retry_is_kept() {
+        let mut policy = RepostPolicy::default();
+        assert_eq!(
+            policy.observe(TaskStatus::Settled, &work_then_refusal()),
+            TurnStep::Retry(TurnFault::Refused)
+        );
+        assert_eq!(
+            policy.observe(TaskStatus::Idle, &terse_answer()),
+            TurnStep::Keep(TaskStatus::Idle)
+        );
+        assert_eq!(policy.retries_used(), 1);
+    }
+
+    /// Two re-posts, and no more. A refusal that outlasts them counts as a
+    /// failed thread, exactly as it did before re-posts existed.
+    #[test]
+    fn a_turn_refused_every_time_gives_up_as_a_failure() {
+        let mut policy = RepostPolicy::default();
+        for _ in 0..REPOSTS_PER_TURN {
+            assert_eq!(
+                policy.observe(TaskStatus::Settled, &work_then_refusal()),
+                TurnStep::Retry(TurnFault::Refused)
+            );
+        }
+        assert_eq!(
+            policy.observe(TaskStatus::Settled, &work_then_refusal()),
+            TurnStep::GiveUp(TurnFault::Refused)
+        );
+        assert_eq!(TurnFault::Refused.given_up(), TaskStatus::Settled);
+        assert_eq!(driven(TaskStatus::Settled, "failed").row_status(), "failed");
+    }
+
+    /// One budget per turn, whichever fault spends it. An empty attempt and a
+    /// refused one leave a single re-post, not two each.
+    #[test]
+    fn empty_and_refused_attempts_share_one_budget() {
+        let mut policy = RepostPolicy::default();
+        assert_eq!(
+            policy.observe(TaskStatus::Idle, &nothing()),
+            TurnStep::Retry(TurnFault::Empty)
+        );
+        assert_eq!(
+            policy.observe(TaskStatus::Settled, &work_then_refusal()),
+            TurnStep::Retry(TurnFault::Refused)
+        );
+        assert_eq!(
+            policy.observe(TaskStatus::Idle, &nothing()),
+            TurnStep::GiveUp(TurnFault::Empty)
+        );
+    }
+
+    /// Only a failure the engine wrote as a refusal is re-posted. Any other
+    /// failed or paused turn keeps its status and spends nothing.
+    #[test]
+    fn a_failure_that_is_not_a_refusal_is_never_retried() {
+        let mut policy = RepostPolicy::default();
+        assert_eq!(
+            policy.observe(TaskStatus::Settled, &work_then_silence()),
+            TurnStep::Keep(TaskStatus::Settled)
+        );
+        assert_eq!(policy.retries_used(), 0);
+    }
+
+    /// A recovered refusal stays visible: the attempt and the re-post are both
+    /// counted, apart from the empty completions.
+    #[test]
+    fn a_refusal_and_its_repost_are_counted_apart_from_empty_completions() {
+        let mut task = driven(TaskStatus::Idle, "idle");
+        task.record_fault(TurnFault::Refused);
+        task.record_repost(TurnFault::Refused);
+        task.record_fault(TurnFault::Empty);
+        assert_eq!((task.refusals, task.refusal_retries), (1, 1));
+        assert_eq!((task.empty_completions, task.empty_retries), (1, 0));
     }
 
     /// The defect, as one reading. Nothing was said and nothing was done.
@@ -1528,10 +1846,10 @@ mod tests {
     /// re-post that works. The task scores, and the count says it happened.
     #[test]
     fn an_empty_first_turn_that_answers_on_the_retry_is_kept() {
-        let mut policy = EmptyCompletionPolicy::default();
+        let mut policy = RepostPolicy::default();
         assert_eq!(
             policy.observe(TaskStatus::Idle, &nothing()),
-            TurnStep::Retry
+            TurnStep::Retry(TurnFault::Empty)
         );
         assert_eq!(
             policy.observe(TaskStatus::Idle, &terse_answer()),
@@ -1544,45 +1862,53 @@ mod tests {
     /// caller voids the task rather than recording a delivery failure.
     #[test]
     fn a_turn_that_never_answers_gives_up_after_two_retries() {
-        let mut policy = EmptyCompletionPolicy::default();
+        let mut policy = RepostPolicy::default();
         assert_eq!(
             policy.observe(TaskStatus::Idle, &nothing()),
-            TurnStep::Retry
+            TurnStep::Retry(TurnFault::Empty)
         );
         assert_eq!(
             policy.observe(TaskStatus::Idle, &nothing()),
-            TurnStep::Retry
+            TurnStep::Retry(TurnFault::Empty)
         );
         assert_eq!(
             policy.observe(TaskStatus::Idle, &nothing()),
-            TurnStep::GiveUp
+            TurnStep::GiveUp(TurnFault::Empty)
         );
-        assert_eq!(policy.retries_used(), EMPTY_COMPLETION_RETRIES);
+        assert_eq!(policy.retries_used(), REPOSTS_PER_TURN);
         // And it stays given up, however many times it is asked.
         assert_eq!(
             policy.observe(TaskStatus::Idle, &nothing()),
-            TurnStep::GiveUp
+            TurnStep::GiveUp(TurnFault::Empty)
         );
     }
 
     /// A wake is a finish, so an empty woken turn is retried like any other.
-    /// A turn that did not finish keeps its own status: re-posting into a
-    /// timeout would just spend the deadline again.
+    /// A turn that timed out or parked keeps its own status, refused or not:
+    /// re-posting into a timeout would just spend the deadline again.
     #[test]
-    fn only_a_finished_turn_is_ever_retried() {
-        let mut policy = EmptyCompletionPolicy::default();
+    fn only_a_finished_or_refused_turn_is_ever_retried() {
+        let mut policy = RepostPolicy::default();
         assert_eq!(
             policy.observe(TaskStatus::IdleAfterWake, &nothing()),
-            TurnStep::Retry
+            TurnStep::Retry(TurnFault::Empty)
         );
         for status in [TaskStatus::Timeout, TaskStatus::Parked, TaskStatus::Settled] {
-            let mut policy = EmptyCompletionPolicy::default();
+            let mut policy = RepostPolicy::default();
             assert_eq!(
                 policy.observe(status, &nothing()),
                 TurnStep::Keep(status),
                 "{status:?}"
             );
             assert_eq!(policy.retries_used(), 0);
+        }
+        for status in [TaskStatus::Timeout, TaskStatus::Parked] {
+            let mut policy = RepostPolicy::default();
+            assert_eq!(
+                policy.observe(status, &work_then_refusal()),
+                TurnStep::Keep(status),
+                "{status:?}"
+            );
         }
     }
 
@@ -1699,8 +2025,8 @@ mod tests {
     /// policy reads an arm, and this is what keeps it that way.
     #[test]
     fn the_retry_rule_is_the_same_whichever_arm_hit_the_empty_completion() {
-        let mut control = EmptyCompletionPolicy::default();
-        let mut lean = EmptyCompletionPolicy::default();
+        let mut control = RepostPolicy::default();
+        let mut lean = RepostPolicy::default();
         for reading in [nothing(), nothing(), nothing()] {
             assert_eq!(
                 control.observe(TaskStatus::Idle, &reading),

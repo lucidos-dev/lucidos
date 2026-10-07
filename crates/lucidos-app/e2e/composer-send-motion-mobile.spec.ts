@@ -115,6 +115,12 @@ test.describe('A mobile follow-up send moves as one piece', () => {
 
   test('the title bar comes back under the header, never ahead of it', async ({ page }) => {
     await openThreadWithDraft(page, title);
+    // The focus sends the header away on a glide. A send before it has gone
+    // brings it straight back, so there is no glide in for this test to read.
+    await expect.poll(
+      () => page.locator('.app-header').evaluate((el) => el.getBoundingClientRect().bottom),
+      { message: 'the keyboard never sent the header away' },
+    ).toBeLessThanOrEqual(0.5);
 
     // Sample every frame of the keyboard close. Frames a slow host drops
     // cannot fail this: every frame it does draw must hold the rule.

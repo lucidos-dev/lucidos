@@ -45,7 +45,7 @@ describe('a call leaves the composer alone', () => {
    *  answer already lives. */
   it('gives the controls row the toggle and nothing else about a call', () => {
     const source = read('PromptRowControls.tsx');
-    expect(source).toContain('callToggleAction(codingAgent === null)');
+    expect(source).toContain('callToggleAction(callIsOffered(thread, codingAgent))');
     expect(source).not.toContain('voiceCall');
   });
 

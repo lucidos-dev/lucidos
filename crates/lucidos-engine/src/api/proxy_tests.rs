@@ -4,8 +4,9 @@ use axum::routing::any;
 use axum::Router;
 
 /// The default wait, which every test not about the timeout itself runs under.
-const TEST_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(crate::api::proxy_timeout::DEFAULT_SECS);
+fn test_timeout() -> std::time::Duration {
+    crate::api::proxy_timeout::default_wait()
+}
 
 fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
     let mut h = HeaderMap::new();
@@ -820,7 +821,7 @@ async fn run_method_test(method: Method, body: &str) {
         Vec::new(),
         Bytes::copy_from_slice(body.as_bytes()),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -873,7 +874,7 @@ async fn upstream_does_not_see_stripped_headers() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -915,15 +916,17 @@ async fn the_engines_own_trust_headers_never_reach_an_upstream() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
     for (name, value) in &recorded.headers {
+        let ours = name.to_ascii_lowercase().starts_with("x-lucidos-")
+            && !name.eq_ignore_ascii_case(PROXY_ORIGIN_HEADER);
         assert!(
             !name.eq_ignore_ascii_case("x-forwarded-prefix")
                 && !name.eq_ignore_ascii_case("x-forwarded-host")
-                && !name.to_ascii_lowercase().starts_with("x-lucidos-"),
+                && !ours,
             "the upstream saw {name}: {value}"
         );
     }
@@ -933,6 +936,96 @@ async fn the_engines_own_trust_headers_never_reach_an_upstream() {
         .headers
         .iter()
         .any(|(n, _)| n.eq_ignore_ascii_case("x-keep-me")));
+}
+
+#[tokio::test]
+async fn every_forward_carries_the_proxy_origin_marker() {
+    // An auth-less `apis.json` entry can aim at a local engine, and the strip
+    // above drops the app stamp. The marker is what lets that engine refuse.
+    let (base, slot) = spawn_recording_upstream(200, "ok").await;
+    let url = format!("{}/x", base);
+    let _ = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        HeaderMap::new(),
+        Vec::new(),
+        Bytes::new(),
+        Transport::Verified,
+        test_timeout(),
+    )
+    .await;
+    let recorded = slot.lock().unwrap().clone().unwrap();
+    assert!(
+        recorded
+            .headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(PROXY_ORIGIN_HEADER)),
+        "the forward went out unmarked: {:?}",
+        recorded.headers
+    );
+}
+
+/// A stand-in engine: one route behind the engine's refusal layer, counting
+/// how often the route ran. Returns `(base_url, hits)`.
+async fn spawn_guarded_engine() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits_in_route = hits.clone();
+    let app = Router::new()
+        .fallback(any(move || {
+            let hits = hits_in_route.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                "shell-only data"
+            }
+        }))
+        .layer(axum::middleware::from_fn(refuse_proxied_request));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{}", addr), hits)
+}
+
+#[tokio::test]
+async fn a_forward_aimed_at_an_engine_never_reaches_its_routes() {
+    let (base, hits) = spawn_guarded_engine().await;
+    let url = format!("{}/api/v1/oauth/google/access-token", base);
+    let resp = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        HeaderMap::new(),
+        Vec::new(),
+        Bytes::new(),
+        Transport::Verified,
+        test_timeout(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn the_engine_refuses_a_marked_request_and_serves_an_unmarked_one() {
+    let (base, hits) = spawn_guarded_engine().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let marked = client
+        .get(format!("{base}/api/v1/health"))
+        .header(PROXY_ORIGIN_HEADER, "anything")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(marked.status().as_u16(), 403);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let plain = client
+        .get(format!("{base}/api/v1/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(plain.status().as_u16(), 200);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -951,7 +1044,7 @@ async fn upstream_does_not_see_host_header_from_engine() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -992,7 +1085,7 @@ async fn forwards_arbitrary_auth_headers_to_upstream() {
         auth_vec,
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -1051,7 +1144,7 @@ async fn an_injected_header_replaces_the_callers_own() {
         auth_vec,
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -1084,7 +1177,7 @@ async fn a_stale_caller_content_length_does_not_frame_the_body() {
         Vec::new(),
         Bytes::copy_from_slice(signed.as_bytes()),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1147,7 +1240,7 @@ async fn a_produced_header_value_the_codec_refuses_is_refused_not_dropped() {
     let err = forward_with_redirects(
         "comfort",
         &scoped,
-        &CallBudget::start(TEST_TIMEOUT),
+        &CallBudget::start(test_timeout()),
         &Method::GET,
         "v1/items",
         None,
@@ -1182,7 +1275,7 @@ async fn forwards_query_param_auth_to_upstream() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -1206,7 +1299,7 @@ async fn forwards_query_param_auth_preserves_existing_query() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -1225,7 +1318,7 @@ async fn upstream_5xx_passes_through() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1287,7 +1380,7 @@ async fn forward_request_does_not_auto_follow_30x() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FOUND);
@@ -1342,7 +1435,7 @@ async fn proxied_with(headers: &'static [(&'static str, &'static str)]) -> Respo
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await
 }
@@ -1595,7 +1688,7 @@ async fn a_redirect_under_a_base_path_does_not_double_the_prefix() {
     let (resp, _) = forward_with_redirects(
         "backend",
         &scoped,
-        &CallBudget::start(TEST_TIMEOUT),
+        &CallBudget::start(test_timeout()),
         &Method::GET,
         "items",
         None,
@@ -1621,7 +1714,7 @@ async fn a_redirect_out_of_the_base_path_is_refused() {
     let err = forward_with_redirects(
         "backend",
         &scoped,
-        &CallBudget::start(TEST_TIMEOUT),
+        &CallBudget::start(test_timeout()),
         &Method::GET,
         "items",
         None,
@@ -1650,7 +1743,7 @@ async fn a_303_is_replayed_as_a_bodyless_get() {
     let (resp, _) = forward_with_redirects(
         "backend",
         &scoped,
-        &CallBudget::start(TEST_TIMEOUT),
+        &CallBudget::start(test_timeout()),
         &Method::POST,
         "jobs",
         None,
@@ -1683,7 +1776,7 @@ async fn upstream_unreachable_returns_502() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -1710,55 +1803,6 @@ async fn fetch_required_credential_resolves_an_oauth_client_by_name() {
         .await
         .expect("an explicitly named oauth client must resolve");
     assert_eq!(cred.auth_type, crate::core::AuthType::OauthClient);
-
-    pool.close().await;
-    teardown_test_db(&db).await;
-}
-
-/// The live-config regression. A `data/config/apis.json` written before
-/// 2026-08-05 spells the credential `oauth:<provider>`, and the prefix migration
-/// renames the row to `<provider>`. `data/config/` is user data no DB migration
-/// can rewrite, so without this tolerance every request through that API starts
-/// 502ing the moment the engine restarts. Temporary measure
-/// registered in `docs/temporary-measures.md` under "`oauth:` prefix stripped
-/// from a caller-supplied credential name".
-#[tokio::test]
-async fn fetch_required_credential_tolerates_a_legacy_oauth_prefixed_name() {
-    use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
-    let (pool, db) = setup_test_db().await;
-    seed_credential(
-        &pool,
-        "ghealth",
-        "https://healthcare.googleapis.test",
-        crate::core::AuthType::OauthClient,
-        "{\"client_id\":\"cid\"}",
-    )
-    .await;
-
-    let cred = fetch_required_credential(&pool, "oauth:ghealth")
-        .await
-        .expect("the pre-migration spelling must still resolve");
-    assert_eq!(cred.service_name, "ghealth");
-
-    pool.close().await;
-    teardown_test_db(&db).await;
-}
-
-/// The tolerance must not invent a credential. A name that matches nothing under
-/// either spelling still fails, and the error names what was asked for.
-#[tokio::test]
-async fn fetch_required_credential_still_reports_a_genuinely_missing_one() {
-    use crate::test_support::{setup_test_db, teardown_test_db};
-    let (pool, db) = setup_test_db().await;
-
-    let err = fetch_required_credential(&pool, "oauth:nothing-here")
-        .await
-        .expect_err("nothing to resolve");
-    assert!(
-        err.1.contains("oauth:nothing-here"),
-        "the error must name the credential the config asked for: {}",
-        err.1
-    );
 
     pool.close().await;
     teardown_test_db(&db).await;
@@ -1799,12 +1843,12 @@ fn an_explicitly_named_oauth_client_still_injects_its_env_vars() {
     );
 }
 
-/// The tolerance must not become a case-insensitive match on every miss. A
-/// config naming `Stripe` where no such credential exists must stay a miss, even
-/// when an unrelated `stripe` OAuth registration is present: resolving it would
-/// silently send a `{client_id, ...}` blob as the API's auth header.
+/// A miss is never a case-insensitive match. A config naming `Stripe` where no
+/// such credential exists must stay a miss, even when an unrelated `stripe` OAuth
+/// registration is present: resolving it would silently send a `{client_id, ...}`
+/// blob as the API's auth header. The error names what the config asked for.
 #[tokio::test]
-async fn fetch_required_credential_does_not_case_fold_a_non_prefixed_miss() {
+async fn fetch_required_credential_does_not_case_fold_a_miss() {
     use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
     let (pool, db) = setup_test_db().await;
     seed_credential(
@@ -1816,9 +1860,14 @@ async fn fetch_required_credential_does_not_case_fold_a_non_prefixed_miss() {
     )
     .await;
 
-    fetch_required_credential(&pool, "Stripe")
+    let err = fetch_required_credential(&pool, "Stripe")
         .await
         .expect_err("a differently-cased name is a different credential");
+    assert!(
+        err.1.contains("'Stripe'"),
+        "the error must name the credential the config asked for: {}",
+        err.1
+    );
 
     pool.close().await;
     teardown_test_db(&db).await;
@@ -3180,7 +3229,7 @@ async fn a_provider_without_the_opt_in_refuses_an_invalid_certificate() {
         Vec::new(),
         Bytes::new(),
         Transport::Verified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     assert_eq!(
@@ -3197,7 +3246,7 @@ async fn a_provider_without_the_opt_in_refuses_an_invalid_certificate() {
         Vec::new(),
         Bytes::new(),
         Transport::Unverified,
-        TEST_TIMEOUT,
+        test_timeout(),
     )
     .await;
     assert_eq!(

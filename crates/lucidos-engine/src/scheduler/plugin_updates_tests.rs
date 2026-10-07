@@ -25,6 +25,9 @@ fn candidate(id: &str, name: &str, version: &str) -> MarketplacePlugin {
         app_id: Some(id.to_string()),
         modified: false,
         modified_paths: vec![],
+        engine_requirement: None,
+        engine_compatible: true,
+        engine_incompatible_reason: None,
     }
 }
 

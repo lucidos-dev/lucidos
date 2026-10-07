@@ -684,6 +684,8 @@ mod settle_orphaned_running_sweep {
                 description: String::new(),
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 tool_use_id: format!("toolu-{thread_id}"),
+                parent_tool_use_id: None,
+                api_call_id: None,
             },
             meta: meta(EventChannel::ClaudeCode),
         })

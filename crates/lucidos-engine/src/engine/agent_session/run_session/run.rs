@@ -158,6 +158,8 @@ struct ReportedUsage {
     output_tokens: u32,
     cache_read_tokens: u32,
     cache_creation_tokens: u32,
+    parent_tool_use_id: Option<String>,
+    api_call_id: Option<String>,
 }
 
 /// How long a stopped session waits for Claude Code's driver to flush a
@@ -182,6 +184,8 @@ async fn usage_flushed_at_stop(
                 output_tokens,
                 cache_read_tokens,
                 cache_creation_tokens,
+                parent_tool_use_id,
+                api_call_id,
             })) => flushed.push((
                 model,
                 ReportedUsage {
@@ -189,6 +193,8 @@ async fn usage_flushed_at_stop(
                     output_tokens,
                     cache_read_tokens,
                     cache_creation_tokens,
+                    parent_tool_use_id,
+                    api_call_id,
                 },
             )),
             Ok(Some(AgentEvent::OutputEnded | AgentEvent::Exited { .. })) | Ok(None) => break,
@@ -266,6 +272,10 @@ impl LucidosEngine {
                         trim_passes: Vec::new(),
                         purpose: crate::engine::ContextPurpose::Turn,
                         reconstructed: false,
+                        parent_tool_use_id: reported.parent_tool_use_id,
+                        api_call_id: reported.api_call_id,
+                        reasoning_effort: None,
+                        duration_ms: None,
                     },
                     meta: meta.clone(),
                 },
@@ -532,6 +542,13 @@ impl LucidosEngine {
         // Held until this function returns. Entered before the debounce stamp,
         // so a caller the stamp refuses always sees this spawn as the owner.
         let _in_flight = self.spawns_in_flight.enter(thread_id);
+        // Keeps the computer awake until the session's process is gone. A
+        // session parked on a question still holds: its answer often comes
+        // from a phone, which an asleep Mac cannot receive.
+        let _awake = crate::core::keep_awake::hold(
+            crate::core::keep_awake::Work::AgentSession,
+            thread_id.to_string(),
+        );
 
         // Debounce: reject if a Claude Code session was spawned very recently for THIS thread
         // (prevents double-submit). Per-thread so concurrent starts on different threads
@@ -811,40 +828,23 @@ impl LucidosEngine {
         // orchestration has the pool, and validated inside the runtime's spawn.
         // An unresolvable path fails loud and names the setting, rather than
         // falling back to probing.
-        let binary_override_key = match coding_agent {
-            crate::runtime::CodingAgent::ClaudeCode => crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
-            crate::runtime::CodingAgent::Codex => crate::core::PREF_CODING_AGENT_CODEX_PATH,
+        let binary_override_pref = match coding_agent {
+            crate::runtime::CodingAgent::ClaudeCode => {
+                &crate::core::prefs::CODING_AGENT_CLAUDE_PATH
+            }
+            crate::runtime::CodingAgent::Codex => &crate::core::prefs::CODING_AGENT_CODEX_PATH,
         };
-        let binary_override = crate::core::PreferenceStore::get(self.pool(), binary_override_key)
-            .await
-            .unwrap_or_else(|e| {
-                log!(
-                    "[AgentSession] Failed to load {} preference: {}",
-                    binary_override_key,
-                    e
-                );
-                None
-            })
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        let binary_override = binary_override_pref.read(self.pool()).await;
         // Which of Claude Code's permission modes this session runs in. Read
         // only for Claude Code: Codex has no equivalent and ignores the field.
         // An unreadable preference means the default, so a DB hiccup costs the
         // user their opt-in for one spawn and never the spawn itself.
         let permission_mode = match coding_agent {
-            crate::runtime::CodingAgent::ClaudeCode => crate::core::PreferenceStore::get(
-                self.pool(),
-                crate::core::PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                log!(
-                    "[AgentSession] Failed to load {} preference: {}",
-                    crate::core::PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
-                    e
-                );
-                None
-            }),
+            crate::runtime::CodingAgent::ClaudeCode => {
+                crate::core::prefs::CODING_AGENT_CLAUDE_PERMISSION_MODE
+                    .stored(self.pool())
+                    .await
+            }
             crate::runtime::CodingAgent::Codex => None,
         };
         let repo_directory_grants = match coding_agent {
@@ -1603,6 +1603,24 @@ impl LucidosEngine {
                                 claude_text_buf.flush(&self.event_bus, thread_id, coding_agent, &meta, "[AgentSession] CodingAgentTextStreamed (Message flush)").await;
                             }
                         }
+                        AgentEvent::SubAgentMessage { .. } if turn_ended => {}
+                        // A sub-agent's prose is recorded whole, tagged with its
+                        // `Agent` call, and kept out of the session's text buffer:
+                        // that buffer is the session's own reply.
+                        AgentEvent::SubAgentMessage { text, parent_tool_use_id } => {
+                            let text = text.trim();
+                            if !text.is_empty() {
+                                self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
+                                    thread_id,
+                                    event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed {
+                                        text: text.to_string(),
+                                        coding_agent,
+                                        parent_tool_use_id: Some(parent_tool_use_id),
+                                    },
+                                    meta: meta.clone(),
+                                }, "[AgentSession] CodingAgentTextStreamed (sub-agent)").await;
+                            }
+                        }
                         // Reasoning stream, with the same straggler guard as
                         // Message and ToolUse. Its projection arm bumps
                         // `running`, so a thought arriving after the turn's
@@ -1643,7 +1661,7 @@ impl LucidosEngine {
                                 thread_id
                             );
                         }
-                        AgentEvent::ToolUse { name, input, id } => {
+                        AgentEvent::ToolUse { name, input, id, parent_tool_use_id, api_call_id } => {
                             if is_waiting {
                                 is_waiting = false;
                                 let mut sessions = self.agent_sessions.lock().await;
@@ -1705,6 +1723,8 @@ impl LucidosEngine {
                                         description,
                                         coding_agent,
                                         tool_use_id: id,
+                                        parent_tool_use_id,
+                                        api_call_id,
                                     },
                                     meta: meta.clone(),
                                 }, "[AgentSession] CodingAgentToolCalled").await;
@@ -1724,7 +1744,7 @@ impl LucidosEngine {
                                 thread_id
                             );
                         }
-                        AgentEvent::ToolResult { output, status: _, id } => {
+                        AgentEvent::ToolResult { output, status: _, id, parent_tool_use_id } => {
                             // Re-arm the watchdog if this was the last in-flight
                             // tool. Floored at 0 so an unpaired ToolResult cannot
                             // underflow (see `release_tool_slot`).
@@ -1736,6 +1756,7 @@ impl LucidosEngine {
                                     result: super::super::tool_output::stored_tool_output(&output),
                                     coding_agent,
                                     tool_use_id: id,
+                                    parent_tool_use_id,
                                 },
                                 meta: meta.clone(),
                             }, "[AgentSession] CodingAgentToolResult").await;
@@ -1746,6 +1767,8 @@ impl LucidosEngine {
                             output_tokens,
                             cache_read_tokens,
                             cache_creation_tokens,
+                            parent_tool_use_id,
+                            api_call_id,
                         } => {
                             // A usage frame reaches us only for a real API call
                             // (the parser drops all-zero ones), so this is the
@@ -1762,6 +1785,8 @@ impl LucidosEngine {
                                     output_tokens,
                                     cache_read_tokens,
                                     cache_creation_tokens,
+                                    parent_tool_use_id,
+                                    api_call_id,
                                 },
                             )
                             .await;
@@ -1808,7 +1833,7 @@ impl LucidosEngine {
                                             // Append the extra, so the frontend
                                             // sees the complete text before the
                                             // session goes to waiting. Mirrors
-                                            // `build_session_messages`.
+                                            // `build_session_messages_with`.
                                             let result_trimmed = text.trim();
                                             let extra = result_trimmed
                                                 .strip_prefix(claude_text_buf.as_str().trim())
@@ -1827,7 +1852,7 @@ impl LucidosEngine {
                                             // so emit its text for the frontend.
                                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                 thread_id,
-                                                event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: text.trim().to_string(), coding_agent },
+                                                event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: text.trim().to_string(), coding_agent, parent_tool_use_id: None },
                                                 meta: meta.clone(),
                                             }, "[AgentSession] CodingAgentTextStreamed (slash command result)").await;
                                         }
@@ -2213,11 +2238,14 @@ impl LucidosEngine {
                                         // Recorded on the `CodingAgentIdled` payload for
                                         // the event history. It gates nothing: a running
                                         // background task re-opens the thread through its
-                                        // event wait.
+                                        // event wait. A task the thread already stopped
+                                        // re-opens nothing, so it does not count.
                                         let bg_bash_running = self
                                             .bash_background
-                                            .has_running_for_thread(thread_id)
-                                            .await;
+                                            .running_for_thread(thread_id)
+                                            .await
+                                            .iter()
+                                            .any(|task| !task.stop_requested);
 
                                         // Shutdown: emitting idle would make recover_orphaned_worktrees
                                         // skip this session as "truly idle" and break recovery.
@@ -3255,6 +3283,8 @@ mod usage_flushed_at_stop_tests {
             output_tokens: 4,
             cache_read_tokens,
             cache_creation_tokens: 0,
+            parent_tool_use_id: None,
+            api_call_id: None,
         }
     }
 
@@ -3280,6 +3310,31 @@ mod usage_flushed_at_stop_tests {
         assert!(
             matches!(rx.try_recv(), Ok(AgentEvent::Usage { .. })),
             "the read stops at OutputEnded"
+        );
+    }
+
+    /// A sub-agent's flushed call keeps its parent, so its capture still binds
+    /// to that sub-agent's steps.
+    #[tokio::test]
+    async fn a_flushed_sub_agent_call_keeps_its_parent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(AgentEvent::Usage {
+            model: None,
+            input_tokens: 2,
+            output_tokens: 4,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            parent_tool_use_id: Some("toolu_agent".into()),
+            api_call_id: None,
+        })
+        .expect("send");
+        drop(tx);
+
+        let flushed = usage_flushed_at_stop(&mut rx, std::time::Duration::from_secs(5)).await;
+
+        assert_eq!(
+            flushed[0].1.parent_tool_use_id.as_deref(),
+            Some("toolu_agent")
         );
     }
 

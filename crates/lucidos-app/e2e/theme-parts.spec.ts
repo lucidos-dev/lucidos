@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test, expect, type Page } from './fixtures';
-import { apiRequest, gotoWithRetry } from './helpers';
+import { apiRequest, gotoWithRetry, shellDeviceId } from './helpers';
 import { appPath, createIframeAppFixture } from './db-helpers';
 
 // Theme parts in a real browser (ADR 0307), in Chromium and WebKit. Every test
@@ -51,14 +51,8 @@ const TRANSCRIPT = `
 </div></div>
 <span class="pane-header-title-text" id="lp-title">Title</span>`;
 
-async function deviceId(page: Page): Promise<string> {
-  const id = await page.evaluate(() => localStorage.getItem('lucidos-device-id'));
-  expect(id, 'the shell registered a device').toBeTruthy();
-  return id as string;
-}
-
 async function setPreference(page: Page, key: string, value: string): Promise<void> {
-  const device = await deviceId(page);
+  const device = await shellDeviceId(page);
   const res = await apiRequest(page).put(`/api/v1/preferences?key=${key}`, { data: { value, device_id: device } });
   expect(res.ok(), `${key}=${value}`).toBe(true);
   expect((await res.json()).success, `${key}=${value}`).toBe(true);
@@ -280,7 +274,7 @@ test.describe('theme parts in app frames', () => {
     expect(res.ok()).toBe(true);
     await setPreference(page, 'theme', EVERY_CAP);
     await setPreference(page, 'theme-effects', 'full');
-    const device = await deviceId(page);
+    const device = await shellDeviceId(page);
 
     try {
       await page.setContent(`<!DOCTYPE html><html><body>

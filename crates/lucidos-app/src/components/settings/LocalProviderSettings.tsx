@@ -7,32 +7,10 @@ import {
   DEFAULT_LOCAL_BASE_URL,
 } from '../../store/actions/preferences';
 import { useServerBackedField } from '../../hooks/useServerBackedField';
-import { findProviderCredential } from './providerCredential';
+import { findProviderCredential, providerKeyRescope } from './providerCredential';
 import { ProviderBlock } from './ProviderBlock';
-import type { CredentialInfo } from '../../store/types';
-import type { UpdateCredentialBody } from '../../api/client/settings';
 
 const LOCAL_SERVICE = 'local';
-
-/** The edit that moves a saved key to a new base URL, or `null` when it is
- *  already scoped there. The engine sends the key only inside its scope, so a
- *  URL saved without this would leave local chat keyless. A cleared field
- *  moves nothing: the engine then falls back to `LUCIDOS_LOCAL_BASE_URL`,
- *  which the page cannot see. */
-export function localKeyRescope(
-  existing: CredentialInfo | undefined,
-  url: string,
-): UpdateCredentialBody | null {
-  const target = url.trim();
-  if (!existing || !target || existing.base_urls.includes(target)) return null;
-  // An edit is a full replace, and an absent env var name resets to the default.
-  return {
-    base_urls: [target],
-    auth_type: existing.auth_type,
-    auth_header: existing.auth_header,
-    env_var_name: existing.env_var_name ?? undefined,
-  };
-}
 
 /** Configure the local OpenAI-compatible provider (Settings → Models →
  *  Providers): Ollama / LM Studio / vLLM / llama.cpp. The base URL is stored as
@@ -78,7 +56,7 @@ export function LocalProviderSettings() {
     setSavingUrl(true);
     try {
       await setLocalBaseUrl(url);
-      const rescope = localKeyRescope(existing, url);
+      const rescope = providerKeyRescope(existing, url);
       if (rescope && existing) await submitCredentialEdit(existing.id, rescope);
     } finally {
       setSavingUrl(false);

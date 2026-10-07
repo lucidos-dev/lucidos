@@ -213,10 +213,12 @@
  * e2e/mobile-threads-title-alignment.spec.ts. */
 .header-nav-cluster {
     position: absolute;
-    left: 50%;
+    /* Placed by `left` rather than `translateX(-50%)`: same spot, no
+       transform. At an odd width that translate is a half pixel, and WebKit
+       then snaps the mark's badge pill and its digit apart by a device pixel. */
+    left: calc(50% - var(--header-nav-cluster-width) / 2);
     top: 0;
     bottom: 0;
-    transform: translateX(-50%);
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -441,7 +443,6 @@
     /* Inside its host too, for the reason the rule above gives. */
     --header-control-veil: inherit;
     --badge-height: var(--header-mark-count-size);
-    border-radius: var(--radius-control);
     /* The tap belongs to the mark underneath, which opens the menu holding the
        matching rows. Same reason the state badge above is click-through: this
        is a positioned span over a SIBLING button, so its own taps would die. */
@@ -623,11 +624,10 @@
  * until it is answered takes a scrim, and a menu is not one.
  *
  * It is portaled to <body> (see BrandMenuButton), and that is structural rather
- * than tidy: the mark renders inside `.header-nav-cluster`, which is
- * `transform`ed, and a transformed ancestor becomes the containing block for
- * its `position: fixed` descendants. Left in place, every offset below would
- * resolve against that cluster instead of the viewport and the panel would
- * centre itself on the mark.
+ * than tidy: the mark renders inside the mobile `.pane-header`, which carries
+ * `will-change: translate`, and such an ancestor becomes the containing block
+ * for its `position: fixed` descendants. Left in place, every offset below
+ * would resolve against that header instead of the viewport.
  *
  * It sits above --z-toast, not at --z-modal, for the reason the switcher
  * documents in styles/panels/shell.css: a surface the user explicitly opened
@@ -1046,7 +1046,6 @@ div.brand-menu-ws-row {
     --badge-height: 1lh;
     min-width: 1.125rem;
     padding: 0 var(--space-xs);
-    border-radius: calc(var(--radius-control) * 1.125);
     background: var(--accent);
     color: var(--text-on-accent);
     font-size: var(--font-size-2xs);
@@ -1371,7 +1370,6 @@ div.brand-menu-ws-row {
     width: 0.4375rem;
     height: 0.4375rem;
     flex: 0 0 auto;
-    border-radius: var(--radius-round);
     background: var(--accent);
     pointer-events: none;
 }

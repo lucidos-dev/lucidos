@@ -6,7 +6,7 @@ import {
 import type { ModelRow } from '../../../store/modelSelection';
 
 const OPUS: ModelRow = {
-  value: 'claude-opus-5',
+  value: 'claude-opus-5[1m]',
   label: 'Opus 5 (1M)',
   tiers: [
     { value: 'high', label: 'High' },
@@ -18,7 +18,7 @@ const OPUS: ModelRow = {
 };
 
 const HAIKU: ModelRow = {
-  value: 'claude-haiku-4-5',
+  value: 'claude-haiku-4-5-20251001',
   label: 'Haiku 4.5',
   description: 'Fast',
   tiers: [{ value: 'low', label: 'Low' }],
@@ -32,7 +32,7 @@ const IMAGEN: ModelRow = {
   providers: [],
 };
 
-const IN_FORCE = { model: 'claude-opus-5', label: 'Opus 5 (1M) · X-High' };
+const IN_FORCE = { model: 'claude-opus-5[1m]', label: 'Opus 5 (1M) · X-High' };
 
 describe('modelStepOptions', () => {
   it('reads the whole pair on the model in force', () => {
@@ -47,7 +47,7 @@ describe('modelStepOptions', () => {
   });
 
   it('carries the model id, not an encoded pair: a model is not a selection', () => {
-    expect(modelStepOptions([HAIKU], IN_FORCE)[0].value).toBe('claude-haiku-4-5');
+    expect(modelStepOptions([HAIKU], IN_FORCE)[0].value).toBe('claude-haiku-4-5-20251001');
   });
 
   it('marks a model with tiers as opening another list', () => {
@@ -71,7 +71,7 @@ describe('modelStepOptions', () => {
 describe('tierStepOptions', () => {
   it('carries the encoded pair on every row, so one choice sets both halves', () => {
     expect(tierStepOptions(OPUS).map((o) => o.value))
-      .toEqual(['claude-opus-5|high', 'claude-opus-5|xhigh']);
+      .toEqual(['claude-opus-5[1m]|high', 'claude-opus-5[1m]|xhigh']);
   });
 
   it('labels a row with the tier alone: the step already names the model', () => {

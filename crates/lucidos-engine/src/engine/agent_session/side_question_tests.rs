@@ -217,3 +217,88 @@ async fn recovery_fails_only_the_asks_nothing_settled() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// Record one side-question event on a test thread.
+async fn record_event(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) {
+    record(bus, thread_id, event, EventMeta::NONE)
+        .await
+        .unwrap();
+}
+
+fn asked(side_question_id: Uuid) -> ThreadEvent {
+    ThreadEvent::SideQuestionAsked {
+        side_question_id,
+        question: "q".into(),
+        image_hashes: vec![],
+    }
+}
+
+fn failed(side_question_id: Uuid) -> ThreadEvent {
+    ThreadEvent::SideQuestionFailed {
+        side_question_id,
+        error: "busy".into(),
+    }
+}
+
+/// A retry re-asks under the card's own id, so an id may be asked again once
+/// every ask failed. One still running, or answered, may not.
+#[tokio::test]
+async fn an_id_may_be_asked_again_only_after_every_ask_failed() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    assert_eq!(may_ask(&pool, thread_id, id).await, Ok(true));
+
+    record_event(&bus, thread_id, asked(id)).await;
+    assert_eq!(may_ask(&pool, thread_id, id).await, Ok(false));
+
+    record_event(&bus, thread_id, failed(id)).await;
+    assert_eq!(may_ask(&pool, thread_id, id).await, Ok(true));
+    assert_eq!(may_ask(&pool, Uuid::new_v4(), id).await, Ok(true));
+
+    record_event(&bus, thread_id, asked(id)).await;
+    assert_eq!(may_ask(&pool, thread_id, id).await, Ok(false));
+
+    record_event(&bus, thread_id, failed(id)).await;
+    assert_eq!(may_ask(&pool, thread_id, id).await, Ok(true));
+
+    record_event(&bus, thread_id, asked(id)).await;
+    let answer = ThreadEvent::SideQuestionAnswered {
+        side_question_id: id,
+        answer: "a".into(),
+    };
+    record_event(&bus, thread_id, answer).await;
+    assert_eq!(may_ask(&pool, thread_id, id).await, Ok(false));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A restart during a retry leaves the re-ask unsettled, though an earlier
+/// ask under the same id already failed. Recovery fails the re-ask too.
+#[tokio::test]
+async fn recovery_fails_a_retry_a_restart_interrupted() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    record_event(&bus, thread_id, asked(id)).await;
+    record_event(&bus, thread_id, failed(id)).await;
+    record_event(&bus, thread_id, asked(id)).await;
+
+    assert_eq!(fail_unsettled_side_questions(&pool, &bus).await.unwrap(), 1);
+    assert_eq!(fail_unsettled_side_questions(&pool, &bus).await.unwrap(), 0);
+    assert_eq!(
+        recorded_types(&pool, thread_id).await,
+        [
+            "SideQuestionAsked",
+            "SideQuestionFailed",
+            "SideQuestionAsked",
+            "SideQuestionFailed"
+        ]
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

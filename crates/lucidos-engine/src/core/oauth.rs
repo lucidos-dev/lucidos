@@ -695,9 +695,9 @@ pub fn account_env_vars(accounts: Vec<OAuthAccount>) -> Vec<(String, String)> {
 
 /// Port the temporary callback listener binds. Fixed (not ephemeral) because
 /// the URI has to be registered with the provider ahead of time.
-const CALLBACK_PORT: u16 = 14981;
+pub(crate) const CALLBACK_PORT: u16 = 14981;
 /// Path the callback listener answers on.
-const CALLBACK_PATH: &str = "/oauth/callback";
+pub(crate) const CALLBACK_PATH: &str = "/oauth/callback";
 /// Host form advertised unless the credential overrides it. The loopback IP is
 /// the default because some providers reject the name `localhost` outright.
 const DEFAULT_CALLBACK_HOST: &str = "127.0.0.1";

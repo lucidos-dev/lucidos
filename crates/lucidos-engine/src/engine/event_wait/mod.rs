@@ -7,10 +7,11 @@
 //! nothing here holds state that cannot be reconstructed that way.
 //!
 //! **The watermark closes two gaps with one mechanism.** Each wait records the
-//! event `sequence` at registration, and both registration and boot run
-//! [`catch_up_from_watermark`] forward from it. That covers events that landed
-//! while the engine was down, and the live race between the emit and the cache
-//! insert.
+//! event store's *committed horizon* at registration, and both registration and
+//! boot run [`catch_up_from_watermark`] forward from it. That covers events that
+//! landed while the engine was down, and the live race between the emit and the
+//! cache insert. A horizon rather than `MAX(sequence)`, because no event at or
+//! below it can still commit afterwards (ADR 0364).
 //!
 //! **The third gap is REPORTED, not closed.** An event arriving between the
 //! model deciding to wait and the call landing sits BELOW the watermark.
@@ -24,6 +25,10 @@ mod dispatcher;
 mod register;
 
 pub(crate) use agent_surface::CancelEventWaitOutcome;
+pub(crate) use background_task::StoppedTask;
+/// Re-exported so the knowhow pins in `engine::value_pins_tests` can read it.
+#[cfg(test)]
+pub(crate) use register::MAX_LIVE_WAITS_PER_THREAD;
 /// Re-exported so the `await_event` schema's `maximum` is the cap the refusal
 /// uses.
 pub(crate) use register::MAX_TIMEOUT_SECS;

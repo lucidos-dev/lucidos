@@ -2,8 +2,8 @@ import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import type { ThreadStatus } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { AWAIT_EVENT_TOOL } from './event-waits';
-import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserImageHashes, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
-import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, computeExchanges, dividerStillAwaitsUser, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
+import { describeCCTool, describeEngineTool, exchangeHasCCContent, isAgentReplyText, isChangeLifecycleEvent, exchangeResponseText, exchangeUserImageHashes, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool, apiCallIdOf, parentToolUseIdOf } from './exchange';
+import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, computeExchanges, dividerStillAwaitsUser, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUnsentExchange, isUningestedMessage, isWaitingTypedMessage, opensAwaitingAnswer, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, RecalledMemory, ResponseEvent, Step, StepOutcome } from '../types';
@@ -301,7 +301,7 @@ export function synthesizeContextCapture(legacy: LegacyContextEvents): ContextCa
  *  snapshot rows the server stripped (`api/threads.rs ::
  *  strip_context_capture_sections`). Live SSE emissions carry full
  *  sections + tools, so `sections_stripped` is absent there. */
-function capturedEventToData(
+export function capturedEventToData(
   snap: Extract<ThreadEvent, { type: 'ContextCaptured' }>,
   eventId?: string,
 ): ContextCapture {
@@ -323,7 +323,13 @@ function capturedEventToData(
  *  after a `Thinking` step and binds there, so the inline
  *  `tokens / window (pct%)` chip renders next to the request. A coding agent
  *  manages its own loop and has no per-API-call Thinking step. Its snapshot
- *  binds to whichever step is on top of the stack.
+ *  binds to the last step of the agent that made the call: `parent` names a
+ *  sub-agent's `Agent` call, and is absent for the session's own calls.
+ *
+ *  A snapshot that names its API call (`apiCall`) binds by that id instead,
+ *  once the steps are in (`bindCapturesByApiCall`). Only a call that made no
+ *  step falls back here, such as a reply in text alone. It then takes a row
+ *  that no other call owns, so it never overwrites another call's figure.
  *
  *  A Thinking row already holding a main-LLM snapshot keeps it. A round the
  *  engine holds back (`prose_nudge_draft`) opens a row only to call a tool.
@@ -335,21 +341,48 @@ function capturedEventToData(
  *  field but live in different unions. */
 function bindSnapshotToStep<T>(
   data: ContextCapture,
+  parent: string | undefined,
   items: T[],
   isStep: (item: T) => boolean,
   isThinking: (item: T) => boolean,
+  parentOf: (item: T) => string | undefined,
   captureOf: (item: T) => ContextCapture | undefined,
   assign: (item: T, snap: ContextCapture) => void,
+  apiCall: string | undefined,
+  apiCallOf: (item: T) => string | undefined,
 ): void {
-  // Coding-agent captures anchor to tool steps; main-LLM captures to thinking.
+  if (apiCall && items.some(item => apiCallOf(item) === apiCall)) return;
+  const ownedByAnotherCall = (item: T) =>
+    apiCall !== undefined && (apiCallOf(item) !== undefined || captureOf(item) !== undefined);
+  // Coding-agent captures anchor to their own agent's tool steps; main-LLM
+  // captures to thinking.
   const mainLlm = data.producer === 'main_llm';
-  const acceptable = mainLlm ? isThinking : isStep;
+  const acceptable = mainLlm
+    ? isThinking
+    : (item: T) => isStep(item) && parentOf(item) === parent && !ownedByAnotherCall(item);
   for (let i = items.length - 1; i >= 0; i--) {
     if (acceptable(items[i])) {
       const held = captureOf(items[i]);
       if (!(mainLlm && held && !held.legacy)) assign(items[i], data);
       return;
     }
+  }
+}
+
+/** Give every step its own API call's snapshot, so each row of a parallel
+ *  batch shows the figure. Runs once the exchange's steps are all in: a
+ *  sub-agent's snapshot arrives after the first call of its batch, before the
+ *  rest. */
+function bindCapturesByApiCall<T>(
+  items: T[],
+  captures: ReadonlyMap<string, ContextCapture>,
+  apiCallOf: (item: T) => string | undefined,
+  assign: (item: T, snap: ContextCapture) => void,
+): void {
+  for (const item of items) {
+    const apiCall = apiCallOf(item);
+    const snap = apiCall ? captures.get(apiCall) : undefined;
+    if (snap) assign(item, snap);
   }
 }
 
@@ -367,6 +400,7 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
   let terminal: TerminalKind = null;
   let legacyAcc: LegacyContextEvents = {};
   let lastThinkingIdx = -1;
+  const callCaptures = new Map<string, ContextCapture>();
   const refreshLegacySnapshot = () => {
     if (lastThinkingIdx < 0) return;
     steps[lastThinkingIdx].contextCapture = synthesizeContextCapture(legacyAcc);
@@ -433,16 +467,23 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
         break;
       }
       case 'ContextCaptured': {
+        const snap = capturedEventToData(
+          event as Extract<ThreadEvent, { type: 'ContextCaptured' }>,
+          event._eventId,
+        );
+        const apiCall = apiCallIdOf(event);
+        if (apiCall) callCaptures.set(apiCall, snap);
         bindSnapshotToStep(
-          capturedEventToData(
-            event as Extract<ThreadEvent, { type: 'ContextCaptured' }>,
-            event._eventId,
-          ),
+          snap,
+          parentToolUseIdOf(event),
           steps,
           () => true,
           (s) => s.description === 'Thinking',
+          (s) => s.parent_tool_use_id,
           (s) => s.contextCapture,
           (s, snap) => { s.contextCapture = snap; },
+          apiCall,
+          (s) => s.api_call_id,
         );
         break;
       }
@@ -474,14 +515,19 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
         steps.push({ description: 'Thinking', outcome: 'pending' });
         break;
       case 'CodingAgentToolCalled': {
-        // Names the pending Thinking row, same as the chat arm above.
+        // Names the pending Thinking row, same as the chat arm above. A
+        // sub-agent's call never does: that row is the session's own.
         const e = event as { name: string; args: unknown; description?: string };
+        const parent = parentToolUseIdOf(event);
+        const apiCall = apiCallIdOf(event);
         const naming = {
           description: e.description || describeCCTool(e.name, e.args),
           tool_use_id: toolUseIdOf(event),
+          ...(parent ? { parent_tool_use_id: parent } : {}),
+          ...(apiCall ? { api_call_id: apiCall } : {}),
           outcome: callOutcome(exchange, seq),
         };
-        if (!nameThinkingRow(steps, naming)) steps.push({ ...naming });
+        if (parent || !nameThinkingRow(steps, naming)) steps.push({ ...naming });
         terminal = null; // CC resumed, not finished yet
         break;
       }
@@ -536,14 +582,15 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
       case 'CodingAgentTextStreamed':
         // Same visible-text gate as the chat arm above, and this is the arm it
         // was written for: a coding agent emits a blank chunk before EVERY
-        // tool call.
-        if (hasVisibleText((event as { text?: string }).text)) {
+        // tool call. A sub-agent's narration is not the session's output.
+        if (isAgentReplyText(event) && hasVisibleText((event as { text?: string }).text)) {
           resolveLastPendingStep(steps, isThinking);
         }
         terminal = null; // CC resumed, not finished yet
         break;
     }
   }
+  bindCapturesByApiCall(steps, callCaptures, s => s.api_call_id, (s, snap) => { s.contextCapture = snap; });
   // See `exchangeResponseEvents` for the outcome split and for why a handed-off
   // exchange finalizes only its Thinking markers. The last branch is the live
   // turn, the only one that can owe a row: see `needsLiveThinkingRow`.
@@ -673,6 +720,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
   // One ContextAssembled per exchange; attach to every step pushed after it.
   let currentContext: ContextAssembledData | undefined;
   let legacyAcc: LegacyContextEvents = {};
+  const callCaptures = new Map<string, ContextCapture>();
   const attachLegacyToLastThinking = () => {
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i];
@@ -763,16 +811,23 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         break;
       }
       case 'ContextCaptured': {
+        const snap = capturedEventToData(
+          event as Extract<ThreadEvent, { type: 'ContextCaptured' }>,
+          event._eventId,
+        );
+        const apiCall = apiCallIdOf(event);
+        if (apiCall) callCaptures.set(apiCall, snap);
         bindSnapshotToStep(
-          capturedEventToData(
-            event as Extract<ThreadEvent, { type: 'ContextCaptured' }>,
-            event._eventId,
-          ),
+          snap,
+          parentToolUseIdOf(event),
           events,
           (e) => e.type === 'step',
           (e) => e.type === 'step' && e.description === 'Thinking',
+          (e) => (e.type === 'step' ? e.parent_tool_use_id : undefined),
           (e) => (e.type === 'step' ? e.contextCapture : undefined),
           (e, snap) => { if (e.type === 'step') e.contextCapture = snap; },
+          apiCall,
+          (e) => (e.type === 'step' ? e.api_call_id : undefined),
         );
         break;
       }
@@ -855,10 +910,16 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         // and stamp `args_stripped` only when the engine dropped the args. The
         // snapshot and the live stream both drop them; an `include_context`
         // row keeps them, and computes `full` inline.
+        //
+        // A sub-agent's call opens its own row, as in `exchangeSteps`.
+        const parent = parentToolUseIdOf(event);
+        const apiCall = apiCallIdOf(event);
         const naming = {
           description: e.description || describeCCTool(e.name, e.args),
           tool_name: e.name,
           tool_use_id: toolUseIdOf(event),
+          ...(parent ? { parent_tool_use_id: parent } : {}),
+          ...(apiCall ? { api_call_id: apiCall } : {}),
           full: fullCommandForCCTool(e.name, e.args),
           outcome: callOutcome(exchange, seq),
           created,
@@ -867,7 +928,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           ...(event._eventId ? { call_event_id: event._eventId } : {}),
           ...(e.args_stripped ? { args_stripped: true, tool_channel: 'coding_agent' as const } : {}),
         };
-        if (!nameThinkingStep(events, naming)) pushStep({ type: 'step', ...naming });
+        if (parent || !nameThinkingStep(events, naming)) pushStep({ type: 'step', ...naming });
         terminal = null; // CC resumed, not finished yet
         break;
       }
@@ -923,10 +984,13 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         break;
       }
       case 'CodingAgentTextStreamed': {
+        terminal = null; // CC resumed, not finished yet
+        // A sub-agent's narration stays out of the reply. Its report returns
+        // as the `Agent` call's result.
+        if (!isAgentReplyText(event)) break;
         const text = (event as { text: string }).text;
         if (hasVisibleText(text)) resolveLastPendingResponseStep(events, isThinking);
         if (!isFailureEcho(text)) events.push({ type: 'text', md: text });
-        terminal = null; // CC resumed, not finished yet
         break;
       }
       case 'CodingAgentUserMessageSent':
@@ -1150,6 +1214,12 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
     // Every row this event pushed sits at its seq on the thread's clock.
     for (let i = pushedBefore; i < events.length; i++) events[i].seq ??= seq;
   }
+  bindCapturesByApiCall(
+    events,
+    callCaptures,
+    e => (e.type === 'step' ? e.api_call_id : undefined),
+    (e, snap) => { if (e.type === 'step') e.contextCapture = snap; },
+  );
   // Resolve pending spinners on finished exchanges: a missing ToolResult from
   // a killed session, parallel calls with lost results, or a non-last exchange
   // genuinely abandoned. Mid-flight chat injection means a non-last exchange
@@ -1204,7 +1274,28 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
     // See `needsLiveThinkingRow` and ADR 0066.
     pushStep({ type: 'step', description: 'Thinking', outcome: 'pending' });
   }
-  return mergeAdjacentTextEvents(events);
+  // Nest before merging: a parent's prose on either side of a moved child
+  // step is one document again.
+  return mergeAdjacentTextEvents(nestSubAgentSteps(events));
+}
+
+/** Move each sub-agent step under the `Agent` call that spawned it, as that
+ *  row's `children`, in clock order. The group then sits where the agent row
+ *  does, and the parent's own rows keep their places around it (ADR 0201).
+ *
+ *  A step whose `Agent` call is not in this turn stays where it is. That covers
+ *  a call in an earlier exchange, and rows written before the field existed. */
+function nestSubAgentSteps(events: ResponseEvent[]): ResponseEvent[] {
+  const agents = new Map<string, Extract<ResponseEvent, { type: 'step' }>>();
+  for (const e of events) {
+    if (e.type === 'step' && e.tool_use_id) agents.set(e.tool_use_id, e);
+  }
+  return events.filter(e => {
+    const agent = e.type === 'step' && e.parent_tool_use_id ? agents.get(e.parent_tool_use_id) : undefined;
+    if (!agent || agent === e || e.type !== 'step') return true;
+    (agent.children ??= []).push(e);
+    return false;
+  });
 }
 
 /** Will rendering these response events actually DRAW anything?
@@ -1895,10 +1986,10 @@ export interface QueuedFollowupRun {
  *
  *  Such a row owns no turn whether or not it carries words: no stream, no
  *  `last` role. Every fallback here means "whatever is at the bottom", and the
- *  rows are at the bottom by construction. */
+ *  rows are at the bottom by construction. An unsent message owns no turn either. */
 function lastTurnBearingIndex(exchanges: Exchange[]): number {
   for (let i = exchanges.length - 1; i >= 0; i--) {
-    if (!isLiveCallRow(exchanges[i].userEvent)) return i;
+    if (!isLiveCallRow(exchanges[i].userEvent) && !isUnsentExchange(exchanges[i])) return i;
   }
   return -1;
 }
@@ -1911,7 +2002,7 @@ function codingAgentQueue(exchanges: Exchange[]): QueuedFollowupRun {
   let activeIndex = -1;
   for (let i = 0; i < exchanges.length; i++) {
     if (exchanges[i].awaitingRead) queuedOrder.push(i);
-    else if (!isLiveCallRow(exchanges[i].userEvent)) activeIndex = i;
+    else if (!isLiveCallRow(exchanges[i].userEvent) && !isUnsentExchange(exchanges[i])) activeIndex = i;
   }
   if (activeIndex === -1) activeIndex = lastTurnBearingIndex(exchanges);
   return { activeIndex, queuedOrder, queuedIndices: new Set(queuedOrder) };
@@ -1955,7 +2046,7 @@ export function queuedFollowupRun(
     // delegated utterance awaiting its injection has not been taken. Read as
     // the active one, it steals the running turn's stream and badge.
     if (isUningestedMessage(exchanges[i])) continue;
-    if (exchangeHoldsNoTurn(exchanges[i])) continue;
+    if (exchangeHoldsNoTurn(exchanges[i]) || isUnsentExchange(exchanges[i])) continue;
     // Only the MOST RECENT settled or in-flight turn can own queued
     // follow-ups, so stop at the first non-uningested exchange. If it can be
     // queued behind, the follow-up queues behind it. If it is terminal, the
@@ -2028,20 +2119,6 @@ export function queuedMessagesFromExchanges(
   return out;
 }
 
-/** True for a divider that reads "Needs your answer" until its resolution
- *  lands: a question or a permission card. */
-export function opensAwaitingAnswer(exchange: Exchange): boolean {
-  switch (exchange.userEvent.type) {
-    case 'UserQuestionAsked':
-    case 'CodingAgentPermissionRequest':
-    case 'CommandPermissionRequested':
-    case 'McpPermissionRequested':
-      return true;
-    default:
-      return false;
-  }
-}
-
 declare const abortEvidenceBrand: unique symbol;
 
 /** The logged event an 'aborted' verdict rests on. `abortEvidenceOf` is its
@@ -2088,15 +2165,18 @@ function aborted(evidence: AbortEvidence): ExchangeVerdict {
  *         from a question or permission card. Its continuation and terminal
  *         are in flight, so the stale detector below must not settle it.
  *
+ *  @param behindOpenQuestion the exchange folds after the card awaiting an
+ *         answer, so nothing has read it yet.
+ *
  *  'aborted' needs an abort event in the log. Status flags are a lagging
  *  copy of the projection, so they never produce it on their own. */
-export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLast: boolean, hasPriorActive?: boolean, threadIsCC?: boolean, threadIdle = false, threadAwaitingAnswer = false): ExchangeStatus {
-  return exchangeVerdict(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer).status;
+export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLast: boolean, hasPriorActive?: boolean, threadIsCC?: boolean, threadIdle = false, threadAwaitingAnswer = false, behindOpenQuestion = false): ExchangeStatus {
+  return exchangeVerdict(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer, behindOpenQuestion).status;
 }
 
 /** `exchangeStatus` with its evidence. An aborted verdict names the abort
  *  event it rests on, so a verdict without one does not type-check. */
-export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isLast: boolean, hasPriorActive?: boolean, threadIsCC?: boolean, threadIdle = false, threadAwaitingAnswer = false): ExchangeVerdict {
+export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isLast: boolean, hasPriorActive?: boolean, threadIsCC?: boolean, threadIdle = false, threadAwaitingAnswer = false, behindOpenQuestion = false): ExchangeVerdict {
   // A row the client drew for the caller's own utterance, before the engine's
   // row for it exists. It carries no steps and can carry none. So no terminal
   // verdict below is about it, and every one of them would be a guess.
@@ -2433,7 +2513,10 @@ export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isL
   // running for it yet, and neither "Requesting" nor "Done" is true.
   // `threadIdle` is false once the user has answered, so the resume reads
   // "Requesting" before the engine's `running` reaches the client.
-  if (threadAwaitingAnswer && threadIdle && isLast && !hasSteps) return verdict('held');
+  // Every callback behind the card holds, not only the newest: none was read.
+  // A change record is no callback: the agent never reads it.
+  if (threadAwaitingAnswer && threadIdle && (isLast || behindOpenQuestion) && !hasSteps
+    && !isChangeLifecycleEvent(exchange.userEvent)) return verdict('held');
   // Non-last with steps but no terminator: the user moved past this exchange.
   // The chat fast path injects the follow-up via UPI under the parent's
   // request_event_id and redirects later events to the new exchange. A coding

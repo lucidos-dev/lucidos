@@ -27,7 +27,8 @@ export type BridgeOp =
   | 'sse.close'
   | 'storage.prime'
   | 'storage.set'
-  | 'storage.remove';
+  | 'storage.remove'
+  | 'storage.clear';
 
 export interface BridgeRequest {
   type: typeof BRIDGE_TYPE;

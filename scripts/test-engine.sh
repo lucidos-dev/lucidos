@@ -46,7 +46,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-PG_IMAGE="pgvector/pgvector:pg18"      # same image the workspaces use (has pgvector)
+# The workspaces' image and credentials: PG_IMAGE, PG_USER and PG_PASSWORD.
+# shellcheck source=scripts/lib/workspace_constants.sh
+source "$SCRIPT_DIR/lib/workspace_constants.sh"
 PG_CONTAINER="lucidos-pg-test"
 PG_PORT="${LUCIDOS_TEST_PG_PORT:-5510}"  # off the 5432+ workspace range on purpose
 
@@ -102,8 +104,8 @@ ensure_test_pg() {
         # test thread) never exhaust the server.
         docker run -d \
             --name "$PG_CONTAINER" \
-            -e POSTGRES_USER=lucidos \
-            -e POSTGRES_PASSWORD=lucidos \
+            -e POSTGRES_USER="$PG_USER" \
+            -e POSTGRES_PASSWORD="$PG_PASSWORD" \
             -e POSTGRES_DB=lucidos \
             -p "$PG_PORT:5432" \
             "$PG_IMAGE" \
@@ -112,7 +114,7 @@ ensure_test_pg() {
 
     echo -n "[test-db] waiting for Postgres"
     for _ in $(seq 1 30); do
-        if docker exec "$PG_CONTAINER" pg_isready -U lucidos >/dev/null 2>&1; then
+        if docker exec "$PG_CONTAINER" pg_isready -U "$PG_USER" >/dev/null 2>&1; then
             echo " ready"
             return 0
         fi
@@ -142,7 +144,7 @@ ensure_test_pg() {
 # connections. A DROP that races a fresh connection simply errors and is skipped.
 sweep_orphan_test_dbs() {
     local dbs
-    dbs="$(docker exec "$PG_CONTAINER" psql -U lucidos -d postgres -tAc \
+    dbs="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
         "SELECT d.datname FROM pg_database d
          WHERE d.datname LIKE 'lucidos_test_%'
            AND NOT EXISTS (
@@ -154,7 +156,7 @@ sweep_orphan_test_dbs() {
         [ -z "$db" ] && continue
         # DROP DATABASE cannot run inside a transaction block, so it gets its own
         # psql -c (a multi-statement -c string is wrapped in one implicit tx).
-        if docker exec "$PG_CONTAINER" psql -U lucidos -d postgres -tAc \
+        if docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
             "DROP DATABASE IF EXISTS \"$db\"" >/dev/null 2>&1; then
             count=$((count + 1))
         fi
@@ -171,8 +173,8 @@ ensure_test_pg
 # is guaranteed to exist when the trap fires.
 trap sweep_orphan_test_dbs EXIT
 
-export TEST_DATABASE_URL="postgres://lucidos:lucidos@localhost:$PG_PORT/postgres"
-echo "[test-db] TEST_DATABASE_URL=postgres://lucidos:lucidos@localhost:$PG_PORT/postgres"
+export TEST_DATABASE_URL="postgres://$PG_USER:$PG_PASSWORD@localhost:$PG_PORT/postgres"
+echo "[test-db] TEST_DATABASE_URL=$TEST_DATABASE_URL"
 
 cd "$PROJECT_DIR"
 

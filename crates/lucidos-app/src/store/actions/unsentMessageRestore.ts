@@ -1,8 +1,9 @@
 /** Bring back the unsent messages a previous page load left: sends whose
  *  outcome it never learned. A reload, often iOS unloading a backgrounded PWA,
  *  would otherwise lose them with no word. Each comes back as a Not sent card
- *  with Retry, where it was sent. One the engine has settles as accepted, and
- *  one whose thread is gone moves into a fresh draft.
+ *  with Retry, where it was sent. An answer typed to a question card comes
+ *  back on that card while it still waits. One the engine has settles as
+ *  accepted, and one whose thread is gone moves into a fresh draft.
  *
  *  Plan: `docs/plans/2026-10-03-unsent-messages-survive-a-reload.md`. */
 
@@ -108,7 +109,8 @@ async function restorePass(): Promise<UnsentRestoreOutcome> {
       outcome.movedToDraft += 1;
       continue;
     }
-    if (verdict === 'made-by-this-send' || engineRecordedMessage(threadId, eventId)) {
+    const answer = record.answersQuestion ? { toolUseId: record.answersQuestion, text: record.body.message } : false;
+    if (verdict === 'made-by-this-send' || engineRecordedMessage(threadId, eventId, answer)) {
       forgetUnsentMessageRecord(eventId);
       settleAcceptedSend(threadId, settlement);
       outcome.delivered += 1;

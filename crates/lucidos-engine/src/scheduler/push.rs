@@ -195,13 +195,13 @@ impl PushSubscriptionStore {
 pub async fn get_or_create_vapid_keys(
     pool: &PgPool,
 ) -> Result<VapidKeys, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::core::PreferenceStore;
+    use crate::core::{prefs, PreferenceStore};
     use base64::Engine;
     use p256::ecdsa::SigningKey;
     use p256::elliptic_curve::rand_core::OsRng;
     use p256::pkcs8::EncodePrivateKey;
 
-    if let Some(keys_json) = PreferenceStore::get(pool, "vapid_keys").await? {
+    if let Some(keys_json) = prefs::VAPID_KEYS.try_stored(pool).await? {
         let keys: VapidKeys = serde_json::from_str(&keys_json)?;
         return Ok(keys);
     }
@@ -223,7 +223,7 @@ pub async fn get_or_create_vapid_keys(
     };
 
     let keys_json = serde_json::to_string(&keys)?;
-    PreferenceStore::set_silent(pool, "vapid_keys", &keys_json).await?;
+    PreferenceStore::set_silent(pool, prefs::VAPID_KEYS.key(), &keys_json).await?;
 
     log!("[Push] Generated new VAPID key pair");
     Ok(keys)
@@ -809,7 +809,8 @@ pub(crate) async fn send_wake_push_to_device(
 
 /// Default notification tag — used when `notification_id` is absent so the
 /// browser still deduplicates repeat pushes for the same logical channel.
-/// Mirrors `DEFAULT_NOTIFICATION_TAG` in `sw.js`.
+/// `sw.js` carries a copy, pinned by a test because a service worker served raw
+/// cannot import it.
 const DEFAULT_NOTIFICATION_TAG: &str = "lucidos-notification";
 
 /// Top-level magic that opts the payload into Declarative Web Push parsing

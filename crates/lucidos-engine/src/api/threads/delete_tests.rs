@@ -625,6 +625,91 @@ fn a_missing_worktree_still_chases_the_branch() {
     );
 }
 
+/// A test repo with a linked worktree on `thread-branch`, plus a
+/// `user-feature` branch nothing has checked out.
+fn repo_with_thread_worktree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let worktree = tmp.path().join("wt");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "root"]);
+    git(&repo, &["branch", "user-feature"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "thread-branch",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    (tmp, repo, worktree)
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A coding agent can `git checkout` another branch inside its own tree. The
+/// delete takes the tree, but never the branch the tree happens to sit on: that
+/// one is the user's, and here it holds a commit nothing merged.
+#[tokio::test]
+async fn the_delete_never_takes_a_branch_the_agent_checked_out() {
+    use crate::engine::worktree_cleanup::remove_worktree_and_optionally_delete_branch;
+
+    let (_tmp, repo, worktree) = repo_with_thread_worktree();
+    git(&worktree, &["checkout", "-q", "user-feature"]);
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "user work"],
+    );
+
+    let on_recorded = detach_unless_on_recorded_branch(&worktree, Some("thread-branch"))
+        .await
+        .expect("a clean tree detaches");
+    assert!(!on_recorded, "the tree sits on someone else's branch");
+
+    let outcome =
+        remove_worktree_and_optionally_delete_branch(&worktree, Some(0), BranchDisposal::Always)
+            .await
+            .expect("the repo root resolves");
+    assert!(!worktree.exists(), "the tree still goes");
+    assert!(!outcome.branch_deleted, "a detached tree names no branch");
+    git(&repo, &["rev-parse", "--verify", "refs/heads/user-feature"]);
+}
+
+/// The tree on its own branch is left attached, so the removal takes that
+/// branch with it as decision 8 requires.
+#[tokio::test]
+async fn a_tree_on_its_recorded_branch_stays_attached() {
+    let (_tmp, _repo, worktree) = repo_with_thread_worktree();
+
+    let on_recorded = detach_unless_on_recorded_branch(&worktree, Some("thread-branch"))
+        .await
+        .expect("nothing to detach");
+    assert!(on_recorded);
+    assert_eq!(
+        crate::engine::git_ops::worktree_current_branch(&worktree)
+            .await
+            .as_deref(),
+        Some("thread-branch")
+    );
+}
+
 /// The parent keeps a disclosure chevron gated on `total_children_count`, and
 /// no rebuild reduces it: until delete existed nothing removed a child. A count
 /// of one with no child left draws a chevron that expands to nothing.
@@ -716,4 +801,74 @@ fn dropping_a_deleted_threads_waits_records_nothing() {
         body.contains("live_waits.take("),
         "it must still take the entries out of the live set"
     );
+}
+
+// ── I9 of the tree memory plan: summary trees ─────────────────────────
+
+/// The route's one transaction purges the family from every summary tree:
+/// its own tree, its workspace leaves, and each workspace merge after them.
+/// Another thread's tree and the leaves before the family stay.
+#[tokio::test]
+async fn the_delete_purges_the_family_from_every_summary_tree() {
+    use crate::engine::summary_tree::store::{insert_node, load_nodes, StoredNode};
+    use crate::engine::summary_tree::{NodeAddr, SummaryScope};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (kept, kept_event) = seed_thread(&bus, None).await;
+    let (doomed, doomed_event) = seed_thread(&bus, None).await;
+
+    let leaf = |text: &str, event: Uuid, thread: Option<Uuid>| StoredNode {
+        text: text.to_string(),
+        model: None,
+        source_event_id: Some(event),
+        source_thread_id: thread,
+    };
+    let merge = |text: &str| StoredNode {
+        text: text.to_string(),
+        model: Some("echo-model".to_string()),
+        source_event_id: None,
+        source_thread_id: None,
+    };
+    for (scope, event) in [(kept, kept_event), (doomed, doomed_event)] {
+        let node = leaf(&format!("user: {BODY_MARKER}"), event, None);
+        insert_node(&pool, SummaryScope::Thread(scope), NodeAddr::leaf(0), &node)
+            .await
+            .unwrap();
+    }
+    let workspace = SummaryScope::Workspace;
+    let kept_leaf = leaf("turn: kept", kept_event, Some(kept));
+    insert_node(&pool, workspace, NodeAddr::leaf(0), &kept_leaf)
+        .await
+        .unwrap();
+    let doomed_leaf = leaf(&format!("turn: {BODY_MARKER}"), doomed_event, Some(doomed));
+    insert_node(&pool, workspace, NodeAddr::leaf(1), &doomed_leaf)
+        .await
+        .unwrap();
+    let both = NodeAddr { start: 0, span: 2 };
+    insert_node(&pool, workspace, both, &merge(BODY_MARKER))
+        .await
+        .unwrap();
+
+    delete_family(&pool, &[doomed]).await;
+
+    assert!(load_nodes(&pool, SummaryScope::Thread(doomed))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        load_nodes(&pool, SummaryScope::Thread(kept))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let left: Vec<NodeAddr> = load_nodes(&pool, workspace)
+        .await
+        .unwrap()
+        .into_keys()
+        .collect();
+    assert_eq!(left, vec![NodeAddr::leaf(0)]);
+
+    teardown_test_db(&db_name).await;
 }

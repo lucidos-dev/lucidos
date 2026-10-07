@@ -15,18 +15,24 @@ use crate::api::error::ApiError;
 use crate::api::AppState;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
-use crate::engine::thread_triage::archive_all::{preflight, still_safe, ArchiveAllPreflight};
+use crate::engine::thread_triage::archive_all::{
+    preflight, refusal_kept_slug, still_safe, ArchiveAllPreflight, KeptThread,
+};
 use crate::engine::thread_triage::facts::{load, TriageScope};
 
 use super::archive::{rejection_text, PinnedMembers};
 
 /// The most ids one press may carry. A Current section past this is a
 /// workspace to triage in passes, not a request to accept unbounded.
-const MAX_IDS: usize = 2_000;
+pub(crate) const MAX_IDS: usize = 2_000;
 
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct ThreadIdsRequest {
     thread_ids: Vec<Uuid>,
+    /// Unarchive only: bring each thread's sub-threads back too, as the thread
+    /// menu's Move to Current does. Undo leaves it off and names every id.
+    #[serde(default)]
+    with_sub_threads: bool,
 }
 
 impl ThreadIdsRequest {
@@ -58,7 +64,7 @@ pub(in crate::api) async fn archive_all_preflight(
 
 /// POST /api/v1/threads/archive-all `{thread_ids}`: archive the confirmed
 /// threads that are still safe. Answers
-/// `{archived: [...], kept: [{thread_id, reason}]}`. `archived` lists every
+/// `{archived: [...], kept: [{thread_id, reason, slug}]}`. `archived` lists every
 /// member the cascades took, which is exactly what Undo hands back.
 pub(in crate::api) async fn archive_all(
     State(state): State<AppState>,
@@ -83,9 +89,10 @@ pub(in crate::api) async fn archive_all(
         .await
         {
             Ok(outcome) => archived.extend(outcome.archived),
-            Err(rejection) => kept.push(crate::engine::thread_triage::archive_all::KeptThread {
+            Err(rejection) => kept.push(KeptThread {
                 thread_id: id,
                 reason: rejection_text(&rejection),
+                slug: refusal_kept_slug(&rejection.1),
             }),
         }
     }
@@ -94,34 +101,59 @@ pub(in crate::api) async fn archive_all(
     ))
 }
 
-/// POST /api/v1/threads/unarchive `{thread_ids}`: move archived threads back
-/// to the inbox. Answers `{unarchived: [...]}`.
+/// POST /api/v1/threads/unarchive `{thread_ids, with_sub_threads?}`: move
+/// archived threads back to the inbox. Answers `{unarchived: [...]}`.
 pub(in crate::api) async fn unarchive(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<ThreadIdsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = crate::api::actor::require_owner_device(&headers, &state.pool).await?;
+    let scope = if request.with_sub_threads {
+        UnarchiveScope::WithSubThreads
+    } else {
+        UnarchiveScope::Exactly
+    };
     let ids = request.ids()?;
-    let unarchived = unarchive_threads(&state.engine.event_bus, &state.pool, &ids, actor)
+    let unarchived = unarchive_threads(&state.engine.event_bus, &state.pool, &ids, scope, actor)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(serde_json::json!({ "unarchived": unarchived })))
 }
 
-/// Emit `ThreadUnarchived` for each id that is archived now, and return those.
-/// An id in the inbox, discarded or unknown is left alone.
+/// Which threads an unarchive moves back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnarchiveScope {
+    /// Exactly the ids given: Undo names every member of its batch.
+    Exactly,
+    /// The ids and every sub-thread under them, mirroring Archive's cascade.
+    WithSubThreads,
+}
+
+/// Emit `ThreadUnarchived` for each thread in `scope` that is archived now,
+/// parents first, and return those. A thread in the inbox, discarded or
+/// unknown is left alone.
 pub(crate) async fn unarchive_threads(
     bus: &EventBus,
     pool: &sqlx::PgPool,
     ids: &[Uuid],
+    scope: UnarchiveScope,
     actor: MessageOrigin,
 ) -> Result<Vec<Uuid>, Box<dyn std::error::Error + Send + Sync>> {
     let archived: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT thread_id FROM thread_summaries \
-         WHERE thread_id = ANY($1) AND archive_state = 'archived' AND state <> 'discarded'",
+        "WITH RECURSIVE family AS ( \
+             SELECT thread_id FROM thread_summaries WHERE thread_id = ANY($1) \
+             UNION \
+             SELECT t.thread_id FROM thread_summaries t \
+             JOIN family f ON t.parent_thread_id = f.thread_id \
+             WHERE $2 \
+         ) \
+         SELECT t.thread_id FROM thread_summaries t JOIN family f USING (thread_id) \
+         WHERE t.archive_state = 'archived' AND t.state <> 'discarded' \
+         ORDER BY t.depth, t.thread_id",
     )
     .bind(ids)
+    .bind(scope == UnarchiveScope::WithSubThreads)
     .fetch_all(pool)
     .await?;
     for id in &archived {

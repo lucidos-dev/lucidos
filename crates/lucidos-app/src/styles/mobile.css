@@ -220,7 +220,6 @@
     color: var(--text-on-accent);
     font-size: var(--font-size-xs);
     font-weight: 600;
-    border-radius: calc(var(--radius-control) * 1.125);
     /* The design height, which styles/badges.css rounds to whole pixels. */
     --badge-height: 1.25rem;
     min-width: var(--badge-box, var(--badge-height));
@@ -1065,6 +1064,7 @@
        same way joins this list. */
     .mobile-swipe-pane .content-pane-body::before,
     .mobile-swipe-pane .thread-drawer-list::before,
+    .mobile-swipe-pane .thread-view-drawing-list::before,
     .mobile-swipe-pane .thread-filter-cover::before,
     .mobile-swipe-pane .thread-content::before {
         content: '';
@@ -1080,10 +1080,15 @@
        pane height it would overflow by the spacer, and even a short view would
        scroll its top up behind the header. The URL preview is positioned rather than
        in flow, so it starts where the spacer ends. The frame's selector must
-       not outrank the flowing repo preview's `height: auto` further down. */
-    .mobile-swipe-pane .content-pane-body > .content-view.active,
+       not outrank the flowing repo preview's `height: auto` further down.
+       A column view only starts at that height and grows with its content,
+       for the end space (panels/content.css). */
+    .mobile-swipe-pane .content-pane-body > .content-view-full-bleed.active,
     .mobile-swipe-pane .content-pane-body > .file-preview-frame {
         height: calc(100% - var(--app-header-bottom));
+    }
+    .mobile-swipe-pane .content-pane-body > .content-view.active {
+        min-height: calc(100% - var(--app-header-bottom));
     }
     .mobile-swipe-pane .content-pane-body > .url-preview-inline {
         top: var(--app-header-bottom);
@@ -1109,11 +1114,10 @@
        after the spacer, its box bottom landed a header-height BELOW the viewport
        and the Cancel/Save actions at the form's end were clipped off-screen and
        unreachable on mobile. Let the form flow in the pane's own scroller
-       instead, and pad the bottom for the home-indicator safe area. */
+       instead. The pane's end space clears the home indicator below it. */
     .mobile-swipe-pane .inline-form {
         height: auto;
         overflow-y: visible;
-        padding-bottom: calc(1rem + var(--safe-area-bottom));
     }
 
     /* The repo preview (a diff, the rendered diff, the whole file) flows in the
@@ -1151,6 +1155,15 @@
     }
     .mobile-swipe-pane .file-preview-frame:has(.file-preview-content .loading-fade-content :is(.markdown-content, .csv-table, .line-numbered)) .file-preview-fade {
         grid-template-rows: auto;
+    }
+
+    /* A flowing preview scrolls the pane like a column view, so it takes the
+       column's end space (panels/content.css) despite being full-bleed. */
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered)::after,
+    .mobile-swipe-pane .file-preview-frame:has(.file-preview-content .loading-fade-content :is(.markdown-content, .csv-table, .line-numbered))::after {
+        content: '';
+        flex-shrink: 0;
+        height: var(--pane-end-space);
     }
 
     /* The ::before spacer replaces padding-top, so zero out the base padding-top

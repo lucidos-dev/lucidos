@@ -28,6 +28,7 @@ use super::LiveWait;
 use crate::core::event_subscription::{
     validate_subscribable_event_type, EventSubscription, SubscriptionSurface,
 };
+use crate::engine::event_bus::committed_event_horizon;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::LucidosEngine;
 
@@ -209,10 +210,10 @@ impl LucidosEngine {
     /// cached yet, so a caller may still abandon it.
     ///
     /// The watermark is read BEFORE the emit in [`Self::commit_wait`], so the
-    /// catch-up scan (`sequence > watermark`) covers everything from this
-    /// instant on, including anything landing while the emit is in flight. It
-    /// re-reads `EventWaitStarted` itself, which is harmless: that name can
-    /// never be a subscribed type (the subscribability gate refuses it).
+    /// catch-up scan (`sequence > watermark`) covers everything that commits
+    /// from this instant on, including anything landing while the emit is in
+    /// flight. It re-reads `EventWaitStarted` itself, which is harmless: that
+    /// name can never be a subscribed type (the subscribability gate refuses it).
     pub(super) async fn build_wait(
         &self,
         thread_id: Uuid,
@@ -225,7 +226,9 @@ impl LucidosEngine {
         Ok(self.build_wait_at(thread_id, tool_use_id, on, reason, timeout_secs, watermark))
     }
 
-    /// The event store's high-water sequence, to be used as a wait's watermark.
+    /// A wait's watermark: the event store's *committed horizon*, so no event
+    /// at or below it can still commit after this read (ADR 0364). The read may
+    /// wait out appends already in flight, for milliseconds.
     ///
     /// Separate from [`Self::build_wait`] for the ONE caller that must read it
     /// earlier than the rest of its own inputs: see
@@ -234,9 +237,9 @@ impl LucidosEngine {
         &self,
         thread_id: Uuid,
     ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        self.latest_event_sequence().await.inspect_err(|e| {
+        Ok(committed_event_horizon(&self.pool).await.inspect_err(|e| {
             crate::log!("[EventWait] Watermark read failed for thread {thread_id}: {e}");
-        })
+        })?)
     }
 
     /// [`Self::build_wait`] with the watermark supplied rather than read here.
@@ -282,7 +285,8 @@ impl LucidosEngine {
     ///
     /// The scan is the same one the boot rebuild runs, and here it closes the
     /// live race: an event emitted between the watermark read and the insert
-    /// was offered to a cache that did not yet hold this wait. It can therefore
+    /// was offered to a cache that did not yet hold this wait. The watermark is
+    /// a committed horizon, so that event sits above it. The scan can therefore
     /// resolve the wait before this call returns, which is fine, and is why the
     /// caller's tool result is written in the future tense without promising
     /// the thread is still subscribed by the time the model reads it. The
@@ -291,36 +295,7 @@ impl LucidosEngine {
         &self,
         wait: &LiveWait,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.event_bus
-            .emit(crate::engine::event_bus::BusEvent::Thread {
-                thread_id: wait.thread_id,
-                event: ThreadEvent::EventWaitStarted {
-                    wait_id: wait.wait_id,
-                    tool_use_id: wait.tool_use_id.clone(),
-                    on: wait.on.clone(),
-                    reason: wait.reason.clone(),
-                    armed_at: wait.armed_at,
-                    expires_at: wait.expires_at,
-                    watermark: wait.watermark,
-                },
-                meta: EventMeta::NONE,
-            })
-            .await
-            .inspect_err(|e| {
-                crate::log!(
-                    "[EventWait] EventWaitStarted emit failed for thread {}: {e}",
-                    wait.thread_id
-                );
-            })?;
-
-        crate::log!(
-            "[EventWait] Thread {} subscribed to {:?} for {}s (wait {})",
-            wait.thread_id,
-            wait.on.iter().map(|s| &s.event_type).collect::<Vec<_>>(),
-            (wait.expires_at - wait.armed_at).num_seconds(),
-            wait.wait_id,
-        );
-        self.live_waits.insert(wait.clone()).await;
+        persist_wait(&self.event_bus, &self.live_waits, wait).await?;
         self.catch_up_event_wait(wait).await;
         Ok(())
     }
@@ -432,15 +407,6 @@ impl LucidosEngine {
         }
     }
 
-    /// The event store's current high-water sequence, used as a wait's
-    /// watermark.
-    async fn latest_event_sequence(&self) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM events")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(seq)
-    }
-
     /// Has this workspace ever emitted an event by this name? Drives the
     /// never-seen note on an unknown name (S3): accepted, because it may be a
     /// domain event nobody has emitted yet, but worth saying out loud so the
@@ -448,6 +414,46 @@ impl LucidosEngine {
     pub(crate) async fn event_type_seen_before(&self, event_type: &str) -> bool {
         crate::core::event_subscription::event_type_ever_emitted(&self.pool, event_type).await
     }
+}
+
+/// The first half of [`LucidosEngine::commit_wait`]: emit `EventWaitStarted`
+/// and insert the wait into the cache. The catch-up scan it still owes needs
+/// the engine, because a hit re-enters the thread.
+pub(super) async fn persist_wait(
+    bus: &crate::engine::event_bus::EventBus,
+    live_waits: &super::LiveWaits,
+    wait: &LiveWait,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    bus.emit(crate::engine::event_bus::BusEvent::Thread {
+        thread_id: wait.thread_id,
+        event: ThreadEvent::EventWaitStarted {
+            wait_id: wait.wait_id,
+            tool_use_id: wait.tool_use_id.clone(),
+            on: wait.on.clone(),
+            reason: wait.reason.clone(),
+            armed_at: wait.armed_at,
+            expires_at: wait.expires_at,
+            watermark: wait.watermark,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .inspect_err(|e| {
+        crate::log!(
+            "[EventWait] EventWaitStarted emit failed for thread {}: {e}",
+            wait.thread_id
+        );
+    })?;
+
+    crate::log!(
+        "[EventWait] Thread {} subscribed to {:?} for {}s (wait {})",
+        wait.thread_id,
+        wait.on.iter().map(|s| &s.event_type).collect::<Vec<_>>(),
+        (wait.expires_at - wait.armed_at).num_seconds(),
+        wait.wait_id,
+    );
+    live_waits.insert(wait.clone()).await;
+    Ok(())
 }
 
 /// The `ToolResult` text a successful registration returns.

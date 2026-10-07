@@ -624,6 +624,8 @@ async fn an_engine_reentry_supersedes_an_overtaken_question() {
             description: String::new(),
             coding_agent: CodingAgent::ClaudeCode,
             tool_use_id: "toolu-sibling".into(),
+            parent_tool_use_id: None,
+            api_call_id: None,
         },
         meta: cc_meta(),
     })

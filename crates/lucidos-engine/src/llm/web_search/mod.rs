@@ -40,6 +40,21 @@ pub use vertex::VertexGroundingSearch;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use crate::llm::metered::CallToken;
+use crate::llm::usage_wire::ProviderUsage;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// What one search answered, and what it cost.
+pub struct WebSearchResult {
+    /// The answer text, then a `Sources:` list.
+    pub text: String,
+    /// What the backend reported, when it reported tokens.
+    pub usage: Option<ProviderUsage>,
+    /// The model that answered, for the cost row.
+    pub model: String,
+}
+
 /// One web-search backend. Implementations wrap whatever search facility a
 /// configured LLM provider exposes.
 #[async_trait]
@@ -51,11 +66,15 @@ pub trait WebSearchProvider: Send + Sync {
     /// found" — [`WebSearchChain`] treats that as terminal. Reserve `Err` for
     /// availability failures (transport error, auth rejection, model/endpoint
     /// missing), which are what the chain falls through on.
+    ///
+    /// One billable call, recorded by the model call service that handed
+    /// over `call`.
     async fn search(
         &self,
         query: &str,
         max_results: usize,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
+        call: CallToken,
+    ) -> Result<WebSearchResult, BoxError>;
 
     /// Stable identifier for log lines and the exhausted-chain error. Never
     /// contains any part of a credential.
@@ -166,11 +185,12 @@ impl WebSearchProvider for WebSearchChain {
         &self,
         query: &str,
         max_results: usize,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        call: CallToken,
+    ) -> Result<WebSearchResult, BoxError> {
         let mut failures: Vec<String> = Vec::new();
 
         for backend in &self.backends {
-            match backend.search(query, max_results).await {
+            match backend.search(query, max_results, call).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     // Not silent: a backend dropping out is worth a log line
@@ -239,10 +259,15 @@ mod tests {
             &self,
             _query: &str,
             _max_results: usize,
-        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            _call: CallToken,
+        ) -> Result<WebSearchResult, BoxError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match &self.outcome {
-                Ok(body) => Ok(body.clone()),
+                Ok(body) => Ok(WebSearchResult {
+                    text: body.clone(),
+                    usage: None,
+                    model: self.id.to_string(),
+                }),
                 Err(msg) => Err(msg.clone().into()),
             }
         }
@@ -288,7 +313,14 @@ mod tests {
         let second = StubBackend::ok("anthropic-server-tool", "from anthropic");
         let chain = WebSearchChain::new(vec![first.clone(), second.clone()]);
 
-        assert_eq!(chain.search("q", 5).await.unwrap(), "from vertex");
+        assert_eq!(
+            chain
+                .search("q", 5, CallToken::for_test())
+                .await
+                .unwrap()
+                .text,
+            "from vertex"
+        );
         assert_eq!(
             second.calls(),
             0,
@@ -304,7 +336,14 @@ mod tests {
         let second = StubBackend::ok("anthropic-server-tool", "from anthropic");
         let chain = WebSearchChain::new(vec![first.clone(), second.clone()]);
 
-        assert_eq!(chain.search("q", 5).await.unwrap(), "from anthropic");
+        assert_eq!(
+            chain
+                .search("q", 5, CallToken::for_test())
+                .await
+                .unwrap()
+                .text,
+            "from anthropic"
+        );
         assert_eq!(second.calls(), 1);
     }
 
@@ -317,7 +356,11 @@ mod tests {
         let second = StubBackend::ok("anthropic-server-tool", "from anthropic");
         let chain = WebSearchChain::new(vec![first.clone(), second.clone()]);
 
-        let out = chain.search("xyzzy", 5).await.unwrap();
+        let out = chain
+            .search("xyzzy", 5, CallToken::for_test())
+            .await
+            .unwrap()
+            .text;
         assert!(out.contains("No search results found"), "{out}");
         assert_eq!(
             second.calls(),
@@ -331,9 +374,10 @@ mod tests {
     #[tokio::test]
     async fn empty_chain_explains_what_to_configure() {
         let err = WebSearchChain::empty()
-            .search("q", 5)
+            .search("q", 5, CallToken::for_test())
             .await
-            .expect_err("an empty chain must error");
+            .err()
+            .expect("an empty chain must error");
         let msg = err.to_string();
         for needle in [
             "Vertex AI",
@@ -353,7 +397,12 @@ mod tests {
             StubBackend::err("vertex-grounding", "404 Not Found"),
             StubBackend::err("anthropic-server-tool", "401 Unauthorized"),
         ]);
-        let msg = chain.search("q", 5).await.unwrap_err().to_string();
+        let msg = chain
+            .search("q", 5, CallToken::for_test())
+            .await
+            .err()
+            .expect("every backend failed")
+            .to_string();
         assert!(msg.contains("vertex-grounding: 404 Not Found"), "{msg}");
         assert!(
             msg.contains("anthropic-server-tool: 401 Unauthorized"),

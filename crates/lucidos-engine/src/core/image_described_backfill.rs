@@ -31,9 +31,11 @@ use uuid::Uuid;
 /// it keeps the derivation reproducible without inventing a private namespace.
 const BACKFILL_NAMESPACE: Uuid = Uuid::NAMESPACE_OID;
 
-/// Page size mirrors `image_migration::MIGRATION_BATCH_SIZE` — each row's
-/// payload is small (text + small string array), so memory pressure is tiny;
-/// the cap exists to avoid loading a multi-year events table at once.
+/// Page size for the scan. Each row's payload is small (text plus a short
+/// string array), so a page costs little memory. The cap only stops a
+/// multi-year events table loading at once. It is deliberately larger than
+/// `image_migration::MIGRATION_BATCH_SIZE`, which pages rows carrying inline
+/// base64 images.
 const BACKFILL_BATCH_SIZE: i64 = 200;
 
 /// Compute the deterministic event id for a backfilled `ImageDescribed`
@@ -185,8 +187,8 @@ async fn backfill_with_batch_size(
                         // No original wall-clock for the description: the
                         // legacy field was overwritten in place on the source
                         // MessageReceived's payload, so the description's
-                        // creation time wasn't recorded. Default to NOW() —
-                        // sequence ordering preserves causality regardless.
+                        // creation time wasn't recorded. Default to the insert
+                        // time: sequence ordering preserves causality regardless.
                         created: None,
                         broadcast: true,
                     })

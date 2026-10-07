@@ -26,8 +26,26 @@ mod question_card_tests {
             "RoundText::Reply(&round_text)",
             "Some(round),",
             "refusal.text()",
+            "agent_question::card_message(&tool_call.arguments),",
         ] {
             assert!(run.contains(needle), "run.rs must contain `{needle}`");
         }
+    }
+
+    /// The special-tool walk emits the card's `message`. A refused
+    /// card `continue`s before reaching it, so it shows no message, and its
+    /// re-sent retry shows the message only once.
+    #[test]
+    fn a_refused_card_never_reaches_the_walk_that_shows_its_message() {
+        let run = include_str!("../agentic_loop/run.rs");
+        let gate = run.find("let card_refusal =").unwrap();
+        let after_gate = &run[gate..];
+        let refused = after_gate
+            .find("if let Some(refusal) = card_refusal {")
+            .unwrap();
+        let walk = after_gate.find(".handle_special_tool(").unwrap();
+        assert!(refused < walk);
+        let refused_branch = &after_gate[refused..walk];
+        assert!(refused_branch.contains("continue;"));
     }
 }

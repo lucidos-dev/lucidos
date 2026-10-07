@@ -149,6 +149,7 @@ fn prepare_install_request_returns_sentinel_and_registers_pending() {
         archive.to_str().unwrap(),
         &Ok(Default::default()),
         &GitCredentials::none(),
+        &running(),
     );
 
     assert!(
@@ -180,6 +181,153 @@ fn prepare_install_request_returns_sentinel_and_registers_pending() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// Theme Studio's shape: a plugin declaring the first release it works on.
+fn stage_with_engine(
+    scratch: &Path,
+    pending: &std::sync::Arc<PendingInstallsMap>,
+    engine: &str,
+    running: &Result<semver::Version, String>,
+) -> String {
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let manifest = FIXTURE_MANIFEST
+        .replace("Fixture Plugin", "Theme Studio")
+        .replace("source =", &format!("engine = {engine}\nsource ="));
+    let archive = build_archive(
+        &archive_dir,
+        "theme-studio.lucidos-plugin",
+        &manifest,
+        &[("knowhow/fixture.md", b"body")],
+    );
+    prepare_install_request(
+        scratch,
+        pending,
+        archive.to_str().unwrap(),
+        &Ok(Default::default()),
+        &GitCredentials::none(),
+        running,
+    )
+}
+
+#[test]
+fn an_unmet_engine_requirement_refuses_staging_and_writes_nothing() {
+    let scratch = fresh_workspace();
+    let pending = fresh_pending_map();
+
+    let result = stage_with_engine(
+        &scratch,
+        &pending,
+        r#"">=0.46.1""#,
+        &Ok(semver::Version::new(0, 46, 0)),
+    );
+
+    assert_eq!(
+        result,
+        "Error: Theme Studio 0.1.0 needs Lucidos 0.46.1 or later. This is Lucidos 0.46.0. \
+         Update Lucidos first."
+    );
+    assert!(pending.lock().unwrap().is_empty(), "no confirm panel");
+    assert!(!scratch.join("data/knowhow").exists(), "nothing in data/");
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn an_invalid_engine_requirement_refuses_staging_with_the_value_quoted() {
+    let scratch = fresh_workspace();
+    let pending = fresh_pending_map();
+
+    let result = stage_with_engine(&scratch, &pending, r#""newest""#, &running());
+
+    assert!(result.starts_with("Error: Theme Studio 0.1.0 "), "{result}");
+    assert!(result.contains(r#"engine = "newest""#), "{result}");
+    assert!(pending.lock().unwrap().is_empty());
+    assert!(!scratch.join("data/knowhow").exists());
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn a_met_engine_requirement_stages_as_usual() {
+    let scratch = fresh_workspace();
+    let pending = fresh_pending_map();
+
+    let result = stage_with_engine(
+        &scratch,
+        &pending,
+        r#"">=0.46.1""#,
+        &Ok(semver::Version::new(0, 46, 1)),
+    );
+
+    assert!(
+        result.starts_with(PLUGIN_INSTALL_REQUEST_PREFIX),
+        "got: {result}"
+    );
+    assert_eq!(pending.lock().unwrap().len(), 1);
+    assert_eq!(
+        parse_sentinel_payload(&result)["engine_requirement"],
+        ">=0.46.1"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// No `engine` stages exactly as before. The payload says so with a null
+/// `engine_requirement`, which the confirmation panel shows as a quiet note.
+#[test]
+fn a_plugin_with_no_engine_stages_with_a_null_engine_requirement() {
+    let scratch = fresh_workspace();
+    let pending = fresh_pending_map();
+    let archive = build_fixture_archive(&scratch, "body");
+
+    let result = prepare_install_request(
+        &scratch,
+        &pending,
+        archive.to_str().unwrap(),
+        &Ok(Default::default()),
+        &GitCredentials::none(),
+        &Ok(semver::Version::new(0, 1, 0)),
+    );
+
+    assert!(
+        result.starts_with(PLUGIN_INSTALL_REQUEST_PREFIX),
+        "got: {result}"
+    );
+    assert_eq!(pending.lock().unwrap().len(), 1);
+    let payload = parse_sentinel_payload(&result);
+    assert!(payload["manifest"].get("engine").is_none());
+    assert!(payload["engine_requirement"].is_null(), "{payload}");
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn an_unreadable_release_refuses_only_a_plugin_that_declares_engine() {
+    let scratch = fresh_workspace();
+    let pending = fresh_pending_map();
+    let unreadable = Err("RELEASE is not semver".to_string());
+
+    let refused = stage_with_engine(&scratch, &pending, r#"">=0.46.1""#, &unreadable);
+    assert!(refused.contains("RELEASE is not semver"), "{refused}");
+    assert!(pending.lock().unwrap().is_empty());
+
+    let archive = build_fixture_archive(&scratch, "body");
+    let staged = prepare_install_request(
+        &scratch,
+        &pending,
+        archive.to_str().unwrap(),
+        &Ok(Default::default()),
+        &GitCredentials::none(),
+        &unreadable,
+    );
+    assert!(
+        staged.starts_with(PLUGIN_INSTALL_REQUEST_PREFIX),
+        "got: {staged}"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn prepare_install_request_lists_overwrites_when_files_already_exist() {
     let scratch = fresh_workspace();
@@ -196,6 +344,7 @@ fn prepare_install_request_lists_overwrites_when_files_already_exist() {
         archive.to_str().unwrap(),
         &Ok(Default::default()),
         &GitCredentials::none(),
+        &running(),
     );
     let payload = parse_sentinel_payload(&result);
     let overwrites: Vec<&str> = payload["overwrites"]
@@ -230,6 +379,7 @@ fn unreadable_baselines_refuse_a_staging_that_would_overwrite_files() {
         archive.to_str().unwrap(),
         &Err("connection refused".to_string()),
         &GitCredentials::none(),
+        &running(),
     );
 
     assert!(result.starts_with("Error:"), "got: {}", result);
@@ -260,6 +410,7 @@ fn unreadable_baselines_still_stage_a_fresh_install() {
         archive.to_str().unwrap(),
         &Err("connection refused".to_string()),
         &GitCredentials::none(),
+        &running(),
     );
 
     assert!(
@@ -283,6 +434,7 @@ fn prepare_install_request_returns_error_string_on_invalid_source() {
         "not-a-real-source",
         &Ok(Default::default()),
         &GitCredentials::none(),
+        &running(),
     );
 
     assert!(result.starts_with("Error:"), "got: {}", result);
@@ -313,6 +465,7 @@ async fn cancel_pending_install_emits_event_and_drops_staging() {
         archive.to_str().unwrap(),
         &Ok(Default::default()),
         &GitCredentials::none(),
+        &running(),
     );
     let payload = parse_sentinel_payload(&result);
     let install_id = payload["install_id"].as_str().unwrap().to_string();
@@ -1077,6 +1230,53 @@ async fn e2e_check_plugin_updates_returns_real_data_after_install() {
     assert_eq!(entry["latest_version"], "0.1.0");
     assert_eq!(entry["changed"], false);
     assert_eq!(entry["source"], source_url);
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    teardown_test_db(&db_name).await;
+}
+
+/// `engine_requirement` is null exactly when the manifest has no `engine`, on
+/// the installed summary (the installed version) and in `check_plugin_updates`
+/// (the remote version).
+#[tokio::test]
+async fn e2e_engine_requirement_follows_the_manifest_on_installed_and_check_updates() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let scratch = fresh_workspace();
+    let repos_dir = scratch.join("repos");
+    std::fs::create_dir_all(&repos_dir).unwrap();
+    let (bare, work) = make_local_git_plugin(&repos_dir, "floorless", "floorless", "0.1.0", "b");
+    let source_url = format!("file://{}", bare.display());
+    let id = Some("floorless".to_string());
+
+    install_from_source_with_bus(&scratch, &bus, &source_url, false)
+        .await
+        .expect("install");
+    let installed = installed_plugin_summaries(&pool, &scratch).await.unwrap();
+    assert_eq!(installed[0].engine_requirement, None);
+    let wire = serde_json::to_value(&installed[0]).unwrap();
+    assert!(wire.get("engine_requirement").is_none(), "{wire}");
+    let report = check_plugin_updates_impl(&scratch, &pool, id.clone()).await;
+    let report: Vec<serde_json::Value> = serde_json::from_str(&report).unwrap();
+    assert!(report[0]["engine_requirement"].is_null(), "{}", report[0]);
+    assert_eq!(report[0]["engine_compatible"], true);
+
+    // The author declares a floor upstream. The report reads the remote
+    // manifest, so it sees the floor before the installed version does.
+    let manifest = std::fs::read_to_string(work.join("manifest.toml")).unwrap();
+    let declared = manifest.replace("source =", "engine = \">=0.1.0\"\nsource =");
+    std::fs::write(work.join("manifest.toml"), declared).unwrap();
+    git(&work, &["commit", "-am", "declare engine"]);
+    git(&work, &["push", "origin", "main"]);
+    let report = check_plugin_updates_impl(&scratch, &pool, id).await;
+    let report: Vec<serde_json::Value> = serde_json::from_str(&report).unwrap();
+    assert_eq!(report[0]["engine_requirement"], ">=0.1.0");
+
+    install_from_source_with_bus(&scratch, &bus, &source_url, true)
+        .await
+        .expect("reinstall");
+    let installed = installed_plugin_summaries(&pool, &scratch).await.unwrap();
+    assert_eq!(installed[0].engine_requirement.as_deref(), Some(">=0.1.0"));
 
     let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;

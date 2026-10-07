@@ -94,12 +94,14 @@ impl JudgmentProvider for CostlyStub {
         &self,
         _state: Value,
         _questions: Vec<(String, Question)>,
+        _call: crate::llm::metered::CallToken,
     ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Judgment {
             answers: Answers::default(),
             usage: JudgmentUsage {
                 input_tokens: 1_204,
                 output_tokens: 16,
+                ..JudgmentUsage::default()
             },
             model: Some("jev-1.13.0".to_string()),
             request_chars: 890,
@@ -121,7 +123,7 @@ async fn the_judge_tool_records_what_the_judgment_cost() {
         json!({}),
         vec![],
         Duration::from_secs(60),
-        Some(&capture),
+        &capture,
     )
     .await
     .expect("the stub answers");
@@ -149,6 +151,7 @@ async fn a_failed_judgment_records_nothing_and_reports_the_error() {
             &self,
             _state: Value,
             _questions: Vec<(String, Question)>,
+            _call: crate::llm::metered::CallToken,
         ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
             Err("TypeSafe returned 429".into())
         }
@@ -164,7 +167,7 @@ async fn a_failed_judgment_records_nothing_and_reports_the_error() {
         json!({}),
         vec![],
         Duration::from_secs(60),
-        Some(&capture),
+        &capture,
     )
     .await
     .expect_err("the provider failed");

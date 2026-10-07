@@ -3,6 +3,7 @@
  * The thread ⋯ menu is the one place to rename, since the title is
  * display-only. It offers Rename… and Suggest name on a sent thread, and runs
  * each action. A draft is titled by its compose text, so it offers neither.
+ * The home thread offers Rename… alone, since only the user names it.
  */
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -54,6 +55,13 @@ describe('Rename items in the thread overflow menu', () => {
         expect(suggest).toBeTruthy();
         act(() => { suggest!.click(); });
         expect(suggestThreadName).toHaveBeenCalledWith('t');
+    });
+
+    it('offers Rename… but not Suggest name on the home thread', () => {
+        threadMap.value = new Map([['t', makeThreadState('t', { meta: { home: true } })]]);
+        const labels = openMenu().map(el => el.textContent);
+        expect(labels).toContain('Rename…');
+        expect(labels).not.toContain('Suggest name');
     });
 
     it('offers neither on a draft', () => {

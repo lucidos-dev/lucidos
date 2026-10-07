@@ -47,11 +47,22 @@ describe('mobile fixed-header spacer', () => {
   // overflows by one header height and scrolls its top up behind the header.
   it('a pane-filling view takes the pane height less the spacer', () => {
     const fill = cssRules(mobileCss).find(r =>
-      r.selector.includes('.content-pane-body > .content-view.active'),
+      r.selector.includes('.content-pane-body > .content-view-full-bleed.active'),
     );
     expect(fill, 'no rule sizes the pane-filling views').toBeDefined();
     expect(fill!.selector).toContain('.content-pane-body > .file-preview-frame');
     expect(fill!.props.get('height')).toBe('calc(100% - var(--app-header-bottom))');
+  });
+
+  // A column view starts at that height and grows, so its end space follows
+  // its last element rather than the pane's bottom edge.
+  it('a column view takes it as a floor, never a fixed height', () => {
+    const column = cssRules(mobileCss).find(r =>
+      r.selector.trim().endsWith('.content-pane-body > .content-view.active'),
+    );
+    expect(column, 'no rule floors the column views').toBeDefined();
+    expect(column!.props.get('min-height')).toBe('calc(100% - var(--app-header-bottom))');
+    expect(column!.props.has('height')).toBe(false);
   });
 
   /**

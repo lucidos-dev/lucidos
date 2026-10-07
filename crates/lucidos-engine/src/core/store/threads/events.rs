@@ -5,8 +5,8 @@ impl EventStore {
     /// with no events yet.
     ///
     /// The one caller is the chat turn resolving its clock
-    /// (`engine::chat::process::turn_clock`). Postgres stamps `created` with
-    /// `NOW()`, so this is the database's own reading, on the same clock as
+    /// (`engine::chat::process::turn_clock`). Postgres stamps `created`
+    /// itself, so this is the database's own reading, on the same clock as
     /// every row it will be compared against.
     ///
     /// `MAX(created)` rather than the newest row by `sequence`:
@@ -160,53 +160,6 @@ impl EventStore {
         Ok(Some((text, image_desc, image_count)))
     }
 
-    /// What was said out loud on this thread, oldest first, both voices.
-    ///
-    /// The titler's input. One utterance names a call badly, because a spoken
-    /// sentence leans on the one before it: "Yeah, please check" is the whole
-    /// request and none of the subject. The exchange carries the subject.
-    ///
-    /// **The talker's replies are in it.** They are half the conversation, and
-    /// often the half naming the thing. Dropping them costs more than the
-    /// tokens they spend.
-    ///
-    /// Oldest first and capped from the START, so a long call is titled by how
-    /// it opened rather than by where it drifted to.
-    pub async fn get_thread_spoken_exchange(
-        &self,
-        thread_id: uuid::Uuid,
-        limit: i64,
-    ) -> Result<Vec<SpokenTurn>, Box<dyn std::error::Error + Send + Sync>> {
-        let rows = sqlx::query_as::<_, (String, Option<String>)>(
-            r#"
-            SELECT event_type, payload->>'text'
-            FROM events
-            WHERE thread_id = $1
-              AND event_type IN ('SpokenMessageReceived', 'SpokenReplyGenerated')
-            ORDER BY created ASC, sequence ASC
-            LIMIT $2
-            "#,
-        )
-        .bind(thread_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .filter_map(|(event_type, text)| {
-                let text = text?;
-                if text.trim().is_empty() {
-                    return None;
-                }
-                Some(SpokenTurn {
-                    from_caller: event_type == "SpokenMessageReceived",
-                    text,
-                })
-            })
-            .collect())
-    }
-
     /// Returns recent `MessageReceived` / `ResponseGenerated` events from a thread,
     /// formatted as oldest-first labeled lines for use as Gemini extraction context.
     ///
@@ -267,7 +220,7 @@ impl EventStore {
         thread_id: &str,
     ) -> Result<Vec<SessionMessage>, Box<dyn std::error::Error + Send + Sync>> {
         let events = self.get_thread_events(thread_id).await?;
-        Ok(build_session_messages(&events))
+        Ok(self.build_messages_now(&events).await)
     }
 
     /// Get timeline events for a thread (session lifecycle + change actions).

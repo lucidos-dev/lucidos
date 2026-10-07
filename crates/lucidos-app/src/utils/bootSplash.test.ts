@@ -5,6 +5,7 @@ import {
 } from '../store/actions/notification-deeplink';
 import { THREAD_HASH_RE } from '../store/actions/cross-workspace';
 import { normalizeBasePath } from './basePath';
+import { STATUS_SWAP_MS } from './bootSplash';
 // @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error — same
@@ -49,9 +50,9 @@ function installFakeSplash(present: boolean, initialClasses: string[] = []) {
     if (!present) return null;
     if (sel === '.boot-splash') return splashEl;
     if (sel.includes('.boot-splash-status')) return statusEl;
-    // Compound state selectors (`.boot-splash.boot-splash-quiet`) resolve only
+    // Compound state selectors (`.boot-splash.boot-splash-formed`) resolve only
     // when the document actually carries that class, which is how the
-    // controller's state predicates read the inline script's decision.
+    // controller reads the handover script's decision.
     const state = /^\.boot-splash\.(boot-splash-[a-z-]+)$/.exec(sel);
     if (state) return classes.has(state[1]) ? splashEl : null;
     return null;
@@ -121,7 +122,7 @@ describe('bootSplash controller', () => {
     vi.useFakeTimers();
     try {
       c.setBootStatus('Waiting for the background service… (42s)');
-      vi.advanceTimersByTime(150);
+      vi.advanceTimersByTime(STATUS_SWAP_MS);
       expect(fake.statusIsReport()).toBe(false);
     } finally {
       vi.useRealTimers();
@@ -139,7 +140,7 @@ describe('bootSplash controller', () => {
       c.setBootStatus('Connecting…');
       expect(fake.statusSwapping()).toBe(true);
       expect(fake.statusEl.textContent).toBe('Opening your workspace…');
-      vi.advanceTimersByTime(149);
+      vi.advanceTimersByTime(STATUS_SWAP_MS - 1);
       expect(fake.statusEl.textContent).toBe('Opening your workspace…');
       vi.advanceTimersByTime(1);
       expect(fake.statusEl.textContent).toBe('Connecting…');
@@ -157,9 +158,9 @@ describe('bootSplash controller', () => {
       const c = await freshController();
       c.setBootStatus('Opening your workspace…');
       c.setBootStatus('Connecting…');
-      vi.advanceTimersByTime(100);
+      vi.advanceTimersByTime(STATUS_SWAP_MS - 50);
       c.setBootStatus('Loading…');
-      vi.advanceTimersByTime(150);
+      vi.advanceTimersByTime(STATUS_SWAP_MS);
       expect(fake.statusEl.textContent).toBe('Loading…');
       vi.runAllTimers();
       expect(fake.statusEl.textContent).toBe('Loading…');
@@ -317,14 +318,20 @@ describe('bootSplash controller', () => {
   // The one thing a quiet cover or a gateway handover changes for the controller:
   // there is no reveal to hold a floor for. This is the predicate the hook calls,
   // so both no-reveal documents and the launch case are pinned here against the
-  // real class names the inline scripts set.
+  // real names the inline scripts set: a class on the splash for the handover,
+  // and an attribute on <html> for the quiet cover.
   it('reports both no-reveal documents, and a plain launch as playing one', async () => {
-    for (const cls of ['boot-splash-quiet', 'boot-splash-formed']) {
-      fake?.restore();
-      fake = installFakeSplash(true, [cls]);
-      const c = await freshController();
-      expect(c.bootSplashPlaysNoReveal(), cls).toBe(true);
-    }
+    fake = installFakeSplash(true, ['boot-splash-formed']);
+    expect((await freshController()).bootSplashPlaysNoReveal(), 'formed').toBe(true);
+
+    fake.restore();
+    fake = installFakeSplash(true);
+    const root = (globalThis as any).document.documentElement;
+    const hasAttribute = root.hasAttribute;
+    root.hasAttribute = (name: string) => name === 'data-boot-splash-quiet';
+    onTestFinished(() => { root.hasAttribute = hasAttribute; });
+    expect((await freshController()).bootSplashPlaysNoReveal(), 'quiet').toBe(true);
+    root.hasAttribute = hasAttribute;
 
     fake.restore();
     fake = installFakeSplash(true);
@@ -483,7 +490,7 @@ describe('index.html inline boot splash', () => {
   });
 
   it('paints the brand gradient on both canvas layers so the iOS bottom safe-area strip is covered', () => {
-    // A fixed `inset:0` .boot-splash does not reach the iOS standalone bottom
+    // A fixed, viewport-sized .boot-splash does not reach the iOS standalone bottom
     // safe-area strip, so the boot script paints the brand gradient on <html>
     // behind it. The body carries the same paint: its light-theme inline
     // background otherwise owns the uncovered strip and shows white.
@@ -807,7 +814,9 @@ describe('index.html inline boot splash', () => {
     expect(foot).toContain('class="boot-splash-status');
     expect(foot).toContain('class="boot-splash-escape"');
     // With no mark to hang from, the quiet cover centres its status instead.
-    expect(html).toMatch(/\.boot-splash-quiet\s+\.boot-splash-foot\s*\{\s*position:\s*static/);
+    expect(html).toMatch(
+      /:root\[data-boot-splash-quiet\]\s+\.boot-splash-foot\s*\{\s*position:\s*static/,
+    );
     // A fixed box never scrolls, so anything that could hang past the bottom
     // edge re-centres the group: a failure report, a shown escape link (often
     // the only way out), and a short window.
@@ -824,9 +833,12 @@ describe('index.html inline boot splash', () => {
     const swap = /\.boot-splash-status\.boot-splash-status-swap\s*\{([^}]*)\}/.exec(html)?.[1];
     expect(swap).toBeTruthy();
     expect(swap).toMatch(/opacity:\s*0/);
-    // 0.15s at 1x is the delay both swappers wait out (STATUS_SWAP_MS here, the
-    // gateway poller's own literal), so the words never change while visible.
-    expect(swap).toMatch(/transition-duration:\s*calc\(0\.15s \* var\(--duration-scale, 1\)\)/);
+    // The fade at 1x is the delay both swappers wait out (STATUS_SWAP_MS here,
+    // the gateway poller's own literal), so the words never change while visible.
+    const swapSeconds = String(STATUS_SWAP_MS / 1000).replace('.', '\\.');
+    expect(swap).toMatch(
+      new RegExp(`transition-duration:\\s*calc\\(${swapSeconds}s \\* var\\(--duration-scale, 1\\)\\)`),
+    );
     // Declared after the shown rule it overrides at the same specificity.
     expect(html.indexOf('.boot-splash-status.boot-splash-status-swap')).toBeGreaterThan(
       html.indexOf('.boot-splash-status.boot-splash-status-shown'),
@@ -854,7 +866,9 @@ describe('index.html inline boot splash', () => {
     // splash is an isolated document at the browser default. So ANY rem length
     // here resolves differently across that seam, growing the mark and sliding
     // the status as the user crosses it.
-    expect(html).toMatch(/\.boot-splash\s*\{[^}]*--boot-mark-size:\s*min\(46vmin,\s*240px\)/);
+    expect(html).toMatch(
+      /\.boot-splash\s*\{[^}]*--boot-mark-size:\s*min\(46vmin,\s*240px\)/,
+    );
     expect(html).toMatch(/\.boot-splash\s*\{[^}]*--boot-splash-gap:\s*24px/);
     expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*width:\s*var\(--boot-mark-size\)/);
     expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*height:\s*var\(--boot-mark-size\)/);
@@ -965,6 +979,105 @@ describe('index.html inline boot splash', () => {
     expect(html).toContain("getAttribute('href') !== '/~/'");
   });
 
+  // An installed iOS app can open on a viewport short of the home-bar strip and
+  // gain the strip later. A splash sized by the viewport then grows, and the mark
+  // and status centred in it drop by half the strip on the last beat.
+  describe('height pin', () => {
+    function runPin() {
+      const source = html
+        .split('<script>')
+        .find((block: string) => block.split('</script>')[0].includes('--boot-splash-height'))
+        ?.split('</script>')[0];
+      if (!source) throw new Error('inline splash height pin not found');
+      const props = new Map<string, string>();
+      // The box measures the viewport while unpinned, and its pin once pinned.
+      const viewport = { width: 390, height: 810 };
+      const splash = {
+        isConnected: true,
+        style: {
+          setProperty: (name: string, value: string) => props.set(name, value),
+          removeProperty: (name: string) => props.delete(name),
+        },
+        getBoundingClientRect: () => ({
+          height: props.has('--boot-splash-height')
+            ? parseFloat(props.get('--boot-splash-height')!)
+            : viewport.height,
+        }),
+      };
+      const listeners = new Set<() => void>();
+      const win = {
+        get innerWidth() { return viewport.width; },
+        addEventListener: (_type: string, fn: () => void) => listeners.add(fn),
+        removeEventListener: (_type: string, fn: () => void) => listeners.delete(fn),
+      };
+      new Function('document', 'window', source)({ querySelector: () => splash }, win);
+      const resize = (width: number, height: number) => {
+        viewport.width = width;
+        viewport.height = height;
+        for (const fn of [...listeners]) fn();
+      };
+      return { props, resize, splash, listeners };
+    }
+
+    it('pins the box to its first-paint height', () => {
+      const { props } = runPin();
+      expect(props.get('--boot-splash-height')).toBe('810px');
+    });
+
+    it('holds the pin when only the height changes', () => {
+      const { props, resize } = runPin();
+      resize(390, 844);
+      expect(props.get('--boot-splash-height')).toBe('810px');
+    });
+
+    it('re-measures on a rotation, which changes the width', () => {
+      const { props, resize } = runPin();
+      resize(844, 390);
+      expect(props.get('--boot-splash-height')).toBe('390px');
+    });
+
+    // A rotation can report the new width before its final height.
+    it('follows the height while a rotation settles, then holds again', () => {
+      vi.useFakeTimers();
+      try {
+        const { props, resize } = runPin();
+        resize(844, 420);
+        resize(844, 390);
+        expect(props.get('--boot-splash-height')).toBe('390px');
+        vi.advanceTimersByTime(600);
+        resize(844, 430);
+        expect(props.get('--boot-splash-height')).toBe('390px');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('stops listening once the splash is gone', () => {
+      const { resize, splash, listeners } = runPin();
+      splash.isConnected = false;
+      resize(844, 390);
+      expect(listeners.size).toBe(0);
+    });
+
+    it('lays the box out against the pin, falling back to the viewport', () => {
+      expect(html).toMatch(/\.boot-splash\s*\{[^}]*inset:\s*0 0 auto;/);
+      expect(html).toMatch(/\.boot-splash\s*\{[^}]*height:\s*var\(--boot-splash-height,\s*100%\)/);
+      // A shrinking viewport still shrinks the box, so a stalled splash keeps
+      // its escape link on screen.
+      expect(html).toMatch(/\.boot-splash\s*\{[^}]*max-height:\s*100%;/);
+    });
+
+    // The pin holds the layout, never the cover. A pinned cover would leave the
+    // gained strip showing the app's own bottom edge under the splash.
+    it('covers the whole viewport whatever the pin holds', () => {
+      const cover = html.match(/\.boot-splash::before\s*\{([^}]*)\}/)?.[1] ?? '';
+      expect(cover).toMatch(/position:\s*fixed;/);
+      expect(cover).toMatch(/inset:\s*0;/);
+      expect(cover).toMatch(/background:\s*radial-gradient\(125% 125% at 30% 22%/);
+      expect(html).not.toMatch(/\.boot-splash\s*\{[^}]*background:/);
+    });
+  });
+
   describe('gateway handover (boot-splash-formed)', () => {
     // The gateway 503 splash and this document share one url, so the mark the
     // gateway already built is on screen when this document takes over. The
@@ -972,7 +1085,7 @@ describe('index.html inline boot splash', () => {
     function runHandover(flag: string | null) {
       const source = html
         .split('<script>')
-        .find((block: string) => block.includes('lucidos-splash-mark-formed'))
+        .find((block: string) => block.includes("removeItem('lucidos-splash-mark-formed')"))
         ?.split('</script>')[0];
       if (!source) throw new Error('inline splash handover script not found');
       const values = new Map<string, string>();
@@ -1022,18 +1135,25 @@ describe('index.html inline boot splash', () => {
     // `?notification=…` (WebKit offers no reload-free channel), so this splash is
     // on screen for every tap. It is a navigation inside a session the user was
     // already in, not a launch, so the document drops the launch ceremony.
-    const source = html
-      .split('<script>')
-      .find((block: string) => block.includes("classList.add('boot-splash-quiet')"))
-      ?.split('</script>')[0];
+    const blockWith = (needle: string) =>
+      html
+        .split('<script>')
+        .find((block: string) => block.includes(needle))
+        ?.split('</script>')[0];
+    // The decision, in <head>, and the step that applies it to the markup.
+    const source = blockWith("setAttribute('data-boot-splash-quiet'");
+    const applySource = blockWith("classList.add('boot-splash-quiet')");
 
-    /** Run the inline deep-link script against a URL, with a fake document whose
-     *  canvas layers start on the brand gradient (as the real ones do). */
+    /** Run the inline quiet scripts against a URL, in document order: the <head>
+     *  decision before the splash exists, then the body step. The fake canvas
+     *  layers start on the brand gradient, as the real ones do. */
     function runQuietBoot(
       url: string,
       opts: {
         bgVar?: string;
         theme?: string;
+        /** The gateway boot splash stood a mark on this url and left its
+         *  one-shot handover flag for this document. */
         formed?: boolean;
         refreshed?: boolean;
         /** `<base href>`: a `/<slug>/` workspace behind the gateway namespaces the
@@ -1041,12 +1161,11 @@ describe('index.html inline boot splash', () => {
         base?: string | null;
       } = {},
     ) {
-      if (!source) throw new Error('inline deep-link quiet script not found');
+      if (!source) throw new Error('inline quiet decision script not found');
+      if (!applySource) throw new Error('inline quiet apply script not found');
       const parsed = new URL(url);
       const GRADIENT = '#145eb9 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
-      // `formed` is the gateway handover script (which runs earlier in the body)
-      // having already tagged this document.
-      const classes = new Set<string>(opts.formed ? ['boot-splash-formed'] : []);
+      const classes = new Set<string>();
       const statusClasses = new Set<string>(['boot-splash-status-shown']);
       const status = {
         textContent: 'Opening your workspace…',
@@ -1059,13 +1178,16 @@ describe('index.html inline boot splash', () => {
         },
         querySelector: () => status,
       };
+      const attributes = new Map<string, string>([['data-theme-mode', opts.theme ?? 'dark']]);
       const documentElement = {
         style: {
           background: GRADIENT,
           getPropertyValue: (key: string) =>
             key === '--bg-primary' ? (opts.bgVar ?? '#07172e') : '',
         },
-        getAttribute: (key: string) => (key === 'data-theme-mode' ? (opts.theme ?? 'dark') : null),
+        getAttribute: (key: string) => attributes.get(key) ?? null,
+        setAttribute: (key: string, value: string) => attributes.set(key, value),
+        hasAttribute: (key: string) => attributes.has(key),
       };
       const body = { style: { background: GRADIENT } };
       // `refreshed` is the one-shot flag `refreshClient` stamps before reloading,
@@ -1077,24 +1199,31 @@ describe('index.html inline boot splash', () => {
       const basePath = opts.base == null ? '' : normalizeBasePath(opts.base);
       const slug = basePath === '' || basePath === '/~' ? null : basePath.slice(1);
       const flagKey = slug ? `ws:${slug}:lucidos-splash-quiet` : 'lucidos-splash-quiet';
+      const HANDOVER_KEY = 'lucidos-splash-mark-formed';
       const stored = new Map<string, string>();
       if (opts.refreshed) stored.set(flagKey, '1');
+      if (opts.formed) stored.set(HANDOVER_KEY, '1');
       const sessionStorage = {
         getItem: (key: string) => stored.get(key) ?? null,
         removeItem: (key: string) => stored.delete(key),
       };
       const base = opts.base == null ? null : { getAttribute: () => opts.base };
+      // <head>: the splash markup has not parsed yet, so only <base> resolves.
       new Function('document', 'location', 'sessionStorage', source)(
-        {
-          querySelector: (sel: string) => (sel === 'base' ? base : splash),
-          documentElement,
-          body,
-        },
+        { querySelector: (sel: string) => (sel === 'base' ? base : null), documentElement },
         { search: parsed.search, hash: parsed.hash },
         sessionStorage,
       );
+      // The handover script owns its flag. Spent here, it could not keep the
+      // gateway's mark standing.
+      const handoverFlagLeft = stored.has(HANDOVER_KEY);
+      new Function('document', applySource)({ querySelector: () => splash, documentElement, body });
+      const quiet = attributes.has('data-boot-splash-quiet');
+      // One decision: the body step follows the attribute, never decides itself.
+      expect(classes.has('boot-splash-quiet'), url).toBe(quiet);
       return {
-        quiet: classes.has('boot-splash-quiet'),
+        quiet,
+        handoverFlagLeft,
         status,
         statusShown: () => statusClasses.has('boot-splash-status-shown'),
         rootBackground: () => documentElement.style.background,
@@ -1102,10 +1231,29 @@ describe('index.html inline boot splash', () => {
         flagLeft: () => stored.has(flagKey),
         /** Anything left in storage, so a read of the WRONG key is visible as a
          *  flag that was never consumed rather than as a silent non-quiet. */
-        leftoverKeys: () => [...stored.keys()],
+        leftoverKeys: () => [...stored.keys()].filter((key) => key !== HANDOVER_KEY),
         gradient: GRADIENT,
       };
     }
+
+    // WebKit paints a frame the moment the bundle stylesheet lands, and every
+    // body script waits for that stylesheet. A body-side decision is one frame
+    // late, and that frame shows the blue launch splash. So the decision must
+    // live in <head>, ahead of the splash markup.
+    it('decides in <head>, before the splash markup can paint', () => {
+      const head = html.split('</head>')[0];
+      expect(source && head.includes(source)).toBe(true);
+      // The rules that must hold on the first frame key on the <html> attribute,
+      // never on a class a body script adds a frame later.
+      expect(html).toMatch(
+        /:root\[data-boot-splash-quiet\]\s+\.boot-splash::before\s*\{[^}]*background:\s*var\(--bg-primary/,
+      );
+      expect(html).toMatch(/:root\[data-boot-splash-quiet\]\s+\.boot-splash-mark\s*\{[^}]*display:\s*none/);
+      // The baked launch status stays hidden until the body step clears it.
+      expect(html).toMatch(
+        /:root\[data-boot-splash-quiet\]\s+\.boot-splash:not\(\.boot-splash-quiet\)\s+\.boot-splash-status\s*\{[^}]*visibility:\s*hidden/,
+      );
+    });
 
     it('quiets the splash and flattens both canvas layers on a tap', () => {
       const boot = runQuietBoot('https://host/myws/?notification=n1&thread=t1&tap=%7B%7D');
@@ -1113,7 +1261,7 @@ describe('index.html inline boot splash', () => {
       // "Opening your workspace…" is a launch message; this is a navigation.
       expect(boot.status.textContent).toBe('');
       expect(boot.statusShown()).toBe(false);
-      // A fixed inset:0 cover never reaches the iOS standalone bottom safe-area
+      // A fixed, viewport-sized cover never reaches the iOS standalone bottom safe-area
       // strip, so leaving the gradient on either canvas layer would show a blue
       // band under a flat cover.
       expect(boot.rootBackground()).toBe('#07172e');
@@ -1225,7 +1373,7 @@ describe('index.html inline boot splash', () => {
     // a tap on a stopped workspace, which the gateway lazy-starts while serving
     // its own boot splash on this exact url. By the time this document loads
     // the user has watched a fully built mark for seconds, and the handover
-    // script kept it standing. Quieting it there would `display: none` that
+    // script keeps it standing. Quieting it there would `display: none` that
     // mark and snap the gradient flat in one frame.
     it('stands down when the gateway handed over a mark that is already standing', () => {
       // Both triggers lose to the handover: a refresh during an engine restart
@@ -1243,6 +1391,8 @@ describe('index.html inline boot splash', () => {
         expect(boot.statusShown()).toBe(true);
         // The flag is still spent, so it cannot quiet a later load.
         expect(boot.flagLeft()).toBe(false);
+        // And the handover flag is left for the script that owns it.
+        expect(boot.handoverFlagLeft).toBe(true);
       }
     });
 
@@ -1278,11 +1428,9 @@ describe('index.html inline boot splash', () => {
       expect(source).not.toMatch(/location\.(replace|assign|reload)|location\.href\s*=|history\./);
     });
 
-    it('drops the mark and the gradient, and leaves faster than a launch splash', () => {
-      expect(html).toMatch(/\.boot-splash-quiet\s*\{[^}]*background:\s*var\(--bg-primary/);
-      expect(html).toMatch(/\.boot-splash-quiet\s+\.boot-splash-mark\s*\{[^}]*display:\s*none/);
+    it('leaves faster than a launch splash', () => {
       expect(html).toMatch(
-        /\.boot-splash-quiet\.boot-splash-leaving\s*\{[^}]*animation-duration:\s*calc\(0\.2s \* var\(--duration-scale, 1\)\)/,
+        /:root\[data-boot-splash-quiet\]\s+\.boot-splash-leaving\s*\{[^}]*animation-duration:\s*calc\(0\.2s \* var\(--duration-scale, 1\)\)/,
       );
     });
 
@@ -1294,10 +1442,10 @@ describe('index.html inline boot splash', () => {
     // moment boot has given up.
     it('keeps the status and the escape legible on a light-theme quiet cover', () => {
       expect(html).toMatch(
-        /\[data-theme-mode="light"\]\s+\.boot-splash-quiet\s+\.boot-splash-status\s*\{[^}]*color:/,
+        /:root\[data-theme-mode="light"\]\[data-boot-splash-quiet\]\s+\.boot-splash-status\s*\{[^}]*color:/,
       );
       expect(html).toMatch(
-        /\[data-theme-mode="light"\]\s+\.boot-splash-quiet\s+\.boot-splash-escape\s*\{[^}]*color:/,
+        /:root\[data-theme-mode="light"\]\[data-boot-splash-quiet\]\s+\.boot-splash-escape\s*\{[^}]*color:/,
       );
     });
 
@@ -1308,7 +1456,7 @@ describe('index.html inline boot splash', () => {
     // plain rule.
     it('does not let the quiet fade outrank reduced motion', () => {
       expect(reducedMotionRules()).toMatch(
-        /:root\[data-motion="reduce"\]\s+\.boot-splash-leaving,\s*:root\[data-motion="reduce"\]\s+\.boot-splash-quiet\.boot-splash-leaving\s*\{[^}]*animation-duration:\s*0\.15s/,
+        /:root\[data-motion="reduce"\]\s+\.boot-splash-leaving,\s*:root\[data-motion="reduce"\]\[data-boot-splash-quiet\]\s+\.boot-splash-leaving\s*\{[^}]*animation-duration:\s*0\.15s/,
       );
     });
   });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { previewDiskPath, previewFilePath, previewFileName, splitPreviewPath } from './previewPath';
+import { previewCopyPath, previewDiskPath, previewFilePath, previewFileName, splitPreviewPath } from './previewPath';
 
 describe('previewFilePath', () => {
   it('passes a workspace data path through unchanged', () => {
@@ -88,5 +88,37 @@ describe('previewDiskPath', () => {
   // is no such file under the workspace to open.
   it('has no answer for system-knowhow, which is not in the workspace', () => {
     expect(previewDiskPath('system-knowhow/glossary.md', WS, REPOS)).toBeNull();
+  });
+});
+
+// What "Copy path" puts on the clipboard: the thing a user pastes into
+// Obsidian, Finder or a terminal.
+describe('previewCopyPath', () => {
+  const WS = '/home/user/workspaces/dev';
+  const REPOS = [{ id: 'repo-1', path: '/home/user/code/example-repo' }];
+
+  it('prefers the absolute disk path, and says so', () => {
+    expect(previewCopyPath('artifacts/reports/pr.html', WS, REPOS))
+      .toEqual({ path: '/home/user/workspaces/dev/data/artifacts/reports/pr.html', absolute: true });
+  });
+
+  it('prefers the absolute path inside a repo checkout, and says so', () => {
+    expect(previewCopyPath('repo:repo-1:file:src/main.rs', WS, REPOS))
+      .toEqual({ path: '/home/user/code/example-repo/src/main.rs', absolute: true });
+  });
+
+  it('falls back to the repo-relative path when the clone is not loaded, and says so', () => {
+    expect(previewCopyPath('repo:repo-9:file:src/main.rs', WS, REPOS))
+      .toEqual({ path: 'src/main.rs', absolute: false });
+  });
+
+  it('falls back to the workspace-relative path when the root is missing, and says so', () => {
+    expect(previewCopyPath('artifacts/x.html', '', REPOS))
+      .toEqual({ path: 'artifacts/x.html', absolute: false });
+  });
+
+  it('falls back for system-knowhow, which has no file on disk', () => {
+    expect(previewCopyPath('system-knowhow/glossary.md', WS, REPOS))
+      .toEqual({ path: 'system-knowhow/glossary.md', absolute: false });
   });
 });

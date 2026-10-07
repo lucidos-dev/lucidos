@@ -36,7 +36,7 @@ fn write_blobs(workspace: &Path, n: u8) -> Vec<String> {
 #[test]
 fn no_images_returns_text_only() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let result = build_user_content_with_images("hello".into(), tmp.path(), &[], None);
+    let result = build_user_content_with_images("hello".into(), tmp.path(), &[], None, &[]);
     match result {
         MessageContent::Text(t) => assert_eq!(t, "hello"),
         _ => panic!("expected Text, got Blocks"),
@@ -47,7 +47,8 @@ fn no_images_returns_text_only() {
 fn current_image_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let imgs = vec![make_chat_img("AAAA", "image/jpeg")];
-    let result = build_user_content_with_images("check this".into(), tmp.path(), &[], Some(&imgs));
+    let result =
+        build_user_content_with_images("check this".into(), tmp.path(), &[], Some(&imgs), &[]);
     match result {
         MessageContent::Blocks(blocks) => {
             // Text with hint + 1 image = 2 blocks
@@ -69,8 +70,13 @@ fn history_images_labeled_as_earlier() {
     let tmp = tempfile::TempDir::new().unwrap();
     let hashes = write_blobs(tmp.path(), 1);
     let history = vec![hashes];
-    let result =
-        build_user_content_with_images("what was in the image?".into(), tmp.path(), &history, None);
+    let result = build_user_content_with_images(
+        "what was in the image?".into(),
+        tmp.path(),
+        &history,
+        None,
+        &[],
+    );
     match result {
         MessageContent::Blocks(blocks) => {
             assert_eq!(blocks.len(), 2);
@@ -99,6 +105,7 @@ fn mixed_history_and_current_images_separated() {
         tmp.path(),
         &history,
         Some(&current),
+        &[],
     );
     match result {
         MessageContent::Blocks(blocks) => {
@@ -145,6 +152,7 @@ fn current_vs_history_images_distinguished() {
         tmp.path(),
         &history,
         Some(&current),
+        &[],
     );
     match result {
         MessageContent::Blocks(blocks) => {
@@ -220,7 +228,8 @@ fn oversized_current_image_is_fitted_to_target() {
         img.base64.len()
     );
     let current = vec![img];
-    let result = build_user_content_with_images("look".into(), tmp.path(), &[], Some(&current));
+    let result =
+        build_user_content_with_images("look".into(), tmp.path(), &[], Some(&current), &[]);
     match result {
         MessageContent::Blocks(blocks) => {
             let (data, media_type) = blocks
@@ -259,7 +268,7 @@ fn oversized_history_image_is_fitted_to_target() {
         .unwrap();
     let hash = write_blob(tmp.path(), &raw).unwrap().hash;
     let history = vec![vec![hash]];
-    let result = build_user_content_with_images("recall".into(), tmp.path(), &history, None);
+    let result = build_user_content_with_images("recall".into(), tmp.path(), &history, None, &[]);
     match result {
         MessageContent::Blocks(blocks) => {
             let data = blocks
@@ -295,7 +304,7 @@ fn oversized_history_images_skipped() {
     let big_hash = write_blob(tmp.path(), &big_bytes).unwrap().hash;
     let small_hash = write_blob(tmp.path(), &png_with_marker(2)).unwrap().hash;
     let history = vec![vec![big_hash], vec![small_hash]];
-    let result = build_user_content_with_images("test".into(), tmp.path(), &history, None);
+    let result = build_user_content_with_images("test".into(), tmp.path(), &history, None, &[]);
     match result {
         MessageContent::Blocks(blocks) => {
             let img_count = blocks
@@ -315,7 +324,8 @@ fn history_images_include_staleness_warning() {
     let tmp = tempfile::TempDir::new().unwrap();
     let hashes = write_blobs(tmp.path(), 1);
     let history = vec![hashes];
-    let result = build_user_content_with_images("what changed?".into(), tmp.path(), &history, None);
+    let result =
+        build_user_content_with_images("what changed?".into(), tmp.path(), &history, None, &[]);
     match result {
         MessageContent::Blocks(blocks) => {
             let text = match &blocks[0] {
@@ -336,7 +346,8 @@ fn history_images_include_staleness_warning() {
 fn current_images_no_staleness_warning() {
     let tmp = tempfile::TempDir::new().unwrap();
     let imgs = vec![make_chat_img("NEW", "image/jpeg")];
-    let result = build_user_content_with_images("check this".into(), tmp.path(), &[], Some(&imgs));
+    let result =
+        build_user_content_with_images("check this".into(), tmp.path(), &[], Some(&imgs), &[]);
     match result {
         MessageContent::Blocks(blocks) => {
             let text = match &blocks[0] {
@@ -360,7 +371,7 @@ fn mixed_images_include_staleness_warning() {
     let history = vec![hashes];
     let current = vec![make_chat_img("NEW", "image/png")];
     let result =
-        build_user_content_with_images("compare".into(), tmp.path(), &history, Some(&current));
+        build_user_content_with_images("compare".into(), tmp.path(), &history, Some(&current), &[]);
     match result {
         MessageContent::Blocks(blocks) => {
             let text = match &blocks[0] {
@@ -377,6 +388,153 @@ fn mixed_images_include_staleness_warning() {
     }
 }
 
+// --- current-message image handles ---
+
+/// A PNG as the HTTP body hands it over: inline base64.
+fn png_chat_img(marker: u8) -> crate::api::ChatImage {
+    use base64::Engine as _;
+    make_chat_img(
+        &base64::engine::general_purpose::STANDARD.encode(png_with_marker(marker)),
+        "image/png",
+    )
+}
+
+/// Store `imgs` as the turn's `MessageReceived` does, then read their handles.
+fn stored_handles(workspace: &Path, imgs: &[crate::api::ChatImage]) -> Vec<Option<String>> {
+    crate::engine::chat::images_to_hashes(workspace, Some(imgs));
+    current_image_handles(workspace, imgs)
+}
+
+/// The reported bug: the model saw a new image with no address, guessed
+/// `thread:3` in a thread of two images, and `save_thread_image` failed.
+#[test]
+fn a_current_image_is_labeled_with_its_handle() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let imgs = vec![png_chat_img(7)];
+    let handles = stored_handles(tmp.path(), &imgs);
+    let handle = handles[0].clone().expect("a stored PNG has a handle");
+    let result = build_user_content_with_images(
+        "heres the process".into(),
+        tmp.path(),
+        &[],
+        Some(&imgs),
+        &handles,
+    );
+    let MessageContent::Blocks(blocks) = result else {
+        panic!("expected Blocks");
+    };
+    assert!(
+        matches!(&blocks[0], ContentBlock::Text { text } if text.contains(&handle)),
+        "the hint must name the image's handle, got: {:?}",
+        blocks[0]
+    );
+}
+
+#[test]
+fn the_current_message_separator_names_the_handles_too() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let history = vec![write_blobs(tmp.path(), 1)];
+    let imgs = vec![png_chat_img(8), png_chat_img(9)];
+    let handles = stored_handles(tmp.path(), &imgs);
+    let result = build_user_content_with_images(
+        "compare".into(),
+        tmp.path(),
+        &history,
+        Some(&imgs),
+        &handles,
+    );
+    let MessageContent::Blocks(blocks) = result else {
+        panic!("expected Blocks");
+    };
+    let separator = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } if text.starts_with("[Below:") => Some(text),
+            _ => None,
+        })
+        .next()
+        .expect("mixed content has a separator");
+    for handle in handles.iter().flatten() {
+        assert!(separator.contains(handle), "{separator}");
+    }
+}
+
+/// An image the budget leaves out is not shown, so its handle is not named
+/// either. Otherwise "1 image attached" would sit beside two handles.
+#[test]
+fn an_image_the_budget_skips_is_not_named() {
+    use base64::Engine as _;
+    let tmp = tempfile::TempDir::new().unwrap();
+    // A PNG header padded past the budget: not decodable, so it cannot shrink.
+    let mut big = png_with_marker(20);
+    big.extend(std::iter::repeat_n(0u8, MAX_TOTAL_IMAGE_BASE64));
+    let imgs = vec![
+        png_chat_img(21),
+        make_chat_img(
+            &base64::engine::general_purpose::STANDARD.encode(&big),
+            "image/png",
+        ),
+    ];
+    let handles = stored_handles(tmp.path(), &imgs);
+    let (kept, skipped) = (handles[0].clone().unwrap(), handles[1].clone().unwrap());
+    let result =
+        build_user_content_with_images("two".into(), tmp.path(), &[], Some(&imgs), &handles);
+    let MessageContent::Blocks(blocks) = result else {
+        panic!("expected Blocks");
+    };
+    let ContentBlock::Text { text } = &blocks[0] else {
+        panic!("expected the hint first");
+    };
+    assert!(text.contains("1 image attached"), "{text}");
+    assert!(text.contains(&kept), "{text}");
+    assert!(!text.contains(&skipped), "{text}");
+}
+
+/// The label is only worth printing if it resolves. The handle comes from the
+/// image bytes, the stored hash from `images_to_hashes`. If the two ever
+/// disagree, the model is handed an address the resolver rejects.
+#[test]
+fn a_current_images_handle_resolves_once_its_message_is_stored() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let older = write_blobs(tmp.path(), 1);
+    let imgs = vec![png_chat_img(11)];
+    let handles: Vec<String> = stored_handles(tmp.path(), &imgs)
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let stored = crate::engine::chat::images_to_hashes(tmp.path(), Some(&imgs));
+    let events: Vec<crate::core::events::EventRow> = [older, stored]
+        .into_iter()
+        .map(|hashes| {
+            crate::core::events::EventRow::new(
+                "MessageReceived",
+                serde_json::json!({ "text": "hi", "user_image_hashes": hashes }),
+            )
+        })
+        .collect();
+
+    let by_handle =
+        crate::engine::tools::image::resolve_thread_image_refs(tmp.path(), &events, &handles)
+            .expect("the printed handle must resolve");
+    let by_index = crate::engine::tools::image::resolve_thread_image_refs(
+        tmp.path(),
+        &events,
+        &["thread:2".to_string()],
+    )
+    .unwrap();
+    assert_eq!(by_handle[0].base64, by_index[0].base64);
+}
+
+/// An image whose blob never reached the disk never reached the thread, so it
+/// gets no handle: an address that names nothing is worse than none.
+#[test]
+fn an_image_with_no_stored_blob_gets_no_handle() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let imgs = vec![png_chat_img(30), make_chat_img("not base64!", "image/png")];
+    assert_eq!(current_image_handles(tmp.path(), &imgs), vec![None, None]);
+}
+
 // --- filter_recent_history_image_hashes tests ---
 
 fn make_user_msg(content: &str, hashes: Vec<String>) -> SessionMessage {
@@ -386,7 +544,7 @@ fn make_user_msg(content: &str, hashes: Vec<String>) -> SessionMessage {
         created_at: chrono::Utc::now(),
         channel: None,
         steps: vec![],
-        images: vec![],
+        image_handles: vec![],
         user_image_hashes: hashes,
         image_description: None,
         completed: None,
@@ -408,7 +566,7 @@ fn make_assistant_msg(content: &str) -> SessionMessage {
         created_at: chrono::Utc::now(),
         channel: None,
         steps: vec![],
-        images: vec![],
+        image_handles: vec![],
         user_image_hashes: vec![],
         image_description: None,
         completed: Some(true),
@@ -509,7 +667,7 @@ fn filter_images_counts_all_user_messages_for_recency() {
 #[test]
 fn filter_images_ignores_assistant_images() {
     let mut assistant = make_assistant_msg("here is a generated image");
-    assistant.images = vec!["generated.png".to_string()];
+    assistant.image_handles = vec!["img-0123456789abcdef".to_string()];
     assistant.user_image_hashes = vec!["SHOULD_NOT_APPEAR".to_string()];
     // Even if assistant message has user_image_hashes set (shouldn't happen), role filter blocks it
     let msgs = vec![

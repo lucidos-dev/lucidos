@@ -33,8 +33,8 @@ export async function loadChatModels(): Promise<void> {
     const data = await listModels();
     chatModels.value = { status: 'loaded', data: data.models || [] };
     // The registry is the authority on which tiers a model supports, and it
-    // lands AFTER `loadPreferences` has already clamped the effort with the
-    // id-shape heuristic. Re-clamp so the picker never keeps displaying a tier
+    // lands AFTER `loadPreferences` has already clamped the effort against the
+    // whole ladder. Re-clamp so the picker never keeps displaying a tier
     // the engine would silently snap on the way to the wire. Display only, like
     // `loadPreferences`: the stored preference is left alone, since the model
     // this clamps against may itself change again.
@@ -68,6 +68,12 @@ export function hasConfiguredRoute(model: ModelInfo): boolean {
   return model.routes.some((r) => isProviderConfigured(r.provider));
 }
 
+/** Whether `modelId` reads images, by its registry row's *vision flag*. A
+ *  model with no loaded row does not, matching the engine's `reads_images`. */
+export function readsImages(modelId: string): boolean {
+  return modelRow(modelId)?.vision ?? false;
+}
+
 /** The route that would serve `modelId`, or `undefined` when no row exists.
  *
  *  Mirrors the engine's `resolve_route`. The preferred provider wins when the
@@ -85,8 +91,8 @@ export function resolvedRoute(modelId: string): RouteInfo | undefined {
 }
 
 /** The reasoning efforts the engine says `modelId` supports on the route that
- *  would serve it, or `undefined` when the registry cannot answer. Callers fall
- *  back to the id-shape heuristic in `store/models.ts`. */
+ *  would serve it, or `undefined` when the registry cannot answer. Callers then
+ *  offer the whole ladder, and the engine snaps the request. */
 export function modelReasoningEfforts(modelId: string): string[] | undefined {
   return resolvedRoute(modelId)?.reasoning_efforts;
 }
@@ -104,7 +110,7 @@ export const LUCIDOS_TIER_VOCABULARY: readonly TierChoice[] = REASONING_LEVELS;
  *  model, and re-clamping the displayed effort once the registry lands. */
 export function clampEffortFor(effort: string, modelId: string): string {
   const offered = tierOptions(
-    lucidosTiers(modelId, modelReasoningEfforts(modelId)),
+    lucidosTiers(modelReasoningEfforts(modelId)),
     LUCIDOS_TIER_VOCABULARY,
   );
   return clampToOffered(effort, offered) ?? effort;
@@ -117,7 +123,7 @@ function providerChoices(modelId: string): ProviderChoice[] | undefined {
     value: r.provider,
     label: providerLabel(r.provider),
     configured: isProviderConfigured(r.provider),
-    reasoningEfforts: lucidosTiers(r.id, r.reasoning_efforts),
+    reasoningEfforts: lucidosTiers(r.reasoning_efforts),
   }));
 }
 
@@ -126,7 +132,7 @@ function lucidosModelChoice(value: string, label: string): ModelChoice {
   return {
     value,
     label,
-    reasoningEfforts: lucidosTiers(value, modelReasoningEfforts(value)),
+    reasoningEfforts: lucidosTiers(modelReasoningEfforts(value)),
     providers: providerChoices(value),
     defaultProvider: resolvedRoute(value)?.provider,
   };
@@ -211,7 +217,8 @@ export async function submitNewModel(
   id: string,
   label: string,
   provider: string,
-  contextWindow: string
+  contextWindow: string,
+  vision: boolean
 ): Promise<boolean> {
   if (!id.trim() || !label.trim()) {
     showToast('Model id and label are required', 'error');
@@ -229,6 +236,7 @@ export async function submitNewModel(
         label: label.trim(),
         provider,
         context_window: parsed.value,
+        vision,
       }),
     'Failed to add model'
   );
@@ -322,6 +330,12 @@ export async function saveModelRoutes(
 
 export function setModelEnabled(id: string, enabled: boolean): Promise<boolean> {
   return runModelMutation(() => updateModel(id, { enabled }), 'Failed to update model');
+}
+
+/** Set a model's *vision flag*. Builtins take it too, since a seed can be
+ *  wrong or unverified. */
+export function setModelVision(id: string, vision: boolean): Promise<boolean> {
+  return runModelMutation(() => updateModel(id, { vision }), 'Failed to update model');
 }
 
 export async function deleteModel(id: string): Promise<void> {

@@ -89,7 +89,7 @@ fn probe_is_off_unless_the_var_says_otherwise() {
     assert!(!probe_enabled_value(Some("0")));
     assert!(!probe_enabled_value(Some("false")));
     assert!(!probe_enabled_value(Some("off")));
-    for on in ["1", "true", "yes", "on", " 1 "] {
+    for &on in crate::core::prefs::FLAG_ON_VALUES {
         assert!(probe_enabled_value(Some(on)), "expected on for {on:?}");
     }
 }
@@ -350,4 +350,99 @@ fn host_of_survives_shapes_that_are_not_urls() {
     assert_eq!(host_of("https://host.example"), "host.example");
     assert_eq!(host_of("host.example/path"), "host.example");
     assert_eq!(host_of(""), "");
+}
+
+/// A Tree turn's first message, built by the real request builder: the view
+/// snapshot, two thread view pieces ending at marks, the view's rest, then the
+/// message.
+fn tree_request(rounds: usize, thread_view: &str) -> ClaudeRequest {
+    use crate::llm::provider::{ContentBlock, Message, MessageContent, ToolDefinition};
+    let mut messages = vec![Message {
+        role: "user".into(),
+        content: MessageContent::Blocks(vec![
+            ContentBlock::MemoryView {
+                text: "[WORKSPACE MEMORY VIEW]\n[w/0+4] the shared lines\n".into(),
+            },
+            ContentBlock::MemoryView {
+                text: format!("{thread_view}\n"),
+            },
+            ContentBlock::MemoryView {
+                text: "[8+4] the middle\n".into(),
+            },
+            ContentBlock::Text {
+                text: "[12+1] the newest\n[END THREAD MEMORY VIEW]".into(),
+            },
+            ContentBlock::Text {
+                text: "Request: hello".into(),
+            },
+        ]),
+    }];
+    for _ in 1..rounds {
+        messages.push(Message {
+            role: "assistant".into(),
+            content: MessageContent::Text("reading".into()),
+        });
+        messages.push(Message {
+            role: "user".into(),
+            content: MessageContent::Text("[tool result]".into()),
+        });
+    }
+    let tools = vec![ToolDefinition {
+        name: "read_file".into(),
+        description: "read a file".into(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+    crate::llm::anthropic_wire::build_claude_request(
+        messages,
+        tools,
+        "claude-opus-5",
+        Some("system body"),
+        None,
+        crate::llm::anthropic_wire::WireTarget::Vertex { url: URL },
+        "Vertex",
+    )
+    .0
+}
+
+/// I5: a Tree turn's first round marks the view snapshot, so other threads read
+/// the prefix through it, and both thread view marks, so the next turn reads
+/// the view's stable start. Tools and system give way to them.
+#[test]
+fn a_tree_first_round_marks_the_view_snapshot() {
+    let line = line(&tree_request(1, "[THREAD MEMORY VIEW]"));
+    assert_eq!(field(&line, "marker_count"), "4");
+    assert_eq!(
+        field(&line, "markers"),
+        "messages[0][0],messages[0][1],messages[0][2],messages[0][4]"
+    );
+}
+
+/// Past the first round the two message markers keep the turn's prefix, and
+/// the snapshot and the first thread view mark keep theirs.
+#[test]
+fn a_later_tree_round_keeps_the_snapshot_and_stays_at_four() {
+    let line = line(&tree_request(2, "[THREAD MEMORY VIEW]"));
+    assert_eq!(field(&line, "marker_count"), "4");
+    assert_eq!(
+        field(&line, "markers"),
+        "messages[0][0],messages[0][1],messages[1][0],messages[2][0]"
+    );
+}
+
+/// I5: two threads with different thread views share every byte through the
+/// snapshot block, the prefix the snapshot's marker caches.
+#[test]
+fn two_threads_share_the_prefix_through_the_snapshot() {
+    let prefix = |request: &ClaudeRequest| {
+        serde_json::to_string(&(
+            &request.tools,
+            &request.system,
+            &request.messages[0].content[0],
+        ))
+        .unwrap()
+    };
+    let one = tree_request(1, "[THREAD MEMORY VIEW]\n[0+1] user: plan the trip");
+    let two = tree_request(1, "[THREAD MEMORY VIEW]\n[0+1] user: fix the build");
+    assert_eq!(prefix(&one), prefix(&two));
+    assert_ne!(one.messages[0].content[1], two.messages[0].content[1]);
 }

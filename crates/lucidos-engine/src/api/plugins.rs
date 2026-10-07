@@ -24,10 +24,11 @@ use uuid::Uuid;
 use crate::api::AppState;
 use crate::core::plugin_catalog_cache;
 use crate::core::plugin_marketplaces::{
-    apply_installed_state_to_catalog, load_registry, InstalledPluginSummary, MarketplaceCatalog,
-    PluginMarketplace,
+    apply_engine_compatibility_to_catalog, apply_installed_state_to_catalog, load_registry,
+    InstalledPluginSummary, MarketplaceCatalog, PluginMarketplace,
 };
 use crate::core::plugins::PLUGIN_ARCHIVE_EXT;
+use crate::engine::release_notices;
 use crate::engine::thread_events::FormRequestOutcome;
 use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::tools::plugins::marketplaces::MarketplaceWriteError;
@@ -302,11 +303,13 @@ pub(super) async fn catalog(
     let scanning = due || plugin_catalog_cache::scan_is_running(cached.scan_started_at, now);
 
     let mut catalog = plugin_catalog_cache::merge_with_registry(&cached, &registry);
-    // Two overlays, both live state a minutes-old scan cannot have known.
+    // Three overlays, all live state a minutes-old scan cannot have known.
     // Without the first, a plugin installed since the last scan keeps offering
-    // its Install button until the next one lands.
+    // its Install button until the next one lands. The last one follows the
+    // running engine, which may have been upgraded since that scan.
     apply_installed_state_to_catalog(&mut catalog, &installed);
     mark_setup_complete(&state.pool, &mut catalog).await;
+    apply_engine_compatibility_to_catalog(&mut catalog, &release_notices::running_release());
     Ok(Json(CatalogResponse {
         catalog,
         scanned_at: cached.scanned_at.map(|t| t.to_rfc3339()),
@@ -929,6 +932,9 @@ mod tests {
             app_id: None,
             modified: false,
             modified_paths: vec![],
+            engine_requirement: None,
+            engine_compatible: true,
+            engine_incompatible_reason: None,
         }
     }
 

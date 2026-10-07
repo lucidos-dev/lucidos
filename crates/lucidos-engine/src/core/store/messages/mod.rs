@@ -7,8 +7,12 @@ mod build;
 mod resume;
 pub(crate) mod spoken_merge;
 
-pub use build::format_child_thread_completed_block;
-pub(crate) use build::{build_session_messages, newest_conversation_summary, CachedSummary};
+#[cfg(test)]
+pub(crate) use build::{build_session_messages, CHANGES_MOVED_ON_NOTE};
+pub(crate) use build::{
+    build_session_messages_with, newest_conversation_summary, reported_change_ids, CachedSummary,
+};
+pub use build::{format_child_thread_completed_block, ChangeStatuses};
 pub(crate) use resume::{
     build_resume_tool_blocks_with_skip_ids, collect_tool_pairs_chronological,
     find_orphan_tool_called_ids, parse_event_address, synthesize_tool_use_id,
@@ -16,6 +20,36 @@ pub(crate) use resume::{
 };
 
 impl EventStore {
+    /// Build session messages from `events`, with every change a child report
+    /// names read at its status now.
+    pub async fn build_messages_now(&self, events: &[EventRow]) -> Vec<SessionMessage> {
+        let statuses = self.reported_change_statuses(events).await;
+        build_session_messages_with(events, &statuses)
+    }
+
+    /// The status each change named by a child report in `events` has now.
+    /// An id with no row maps to `None`.
+    ///
+    /// An unreadable store yields an empty map, logged. Each report then reads
+    /// as the child left it.
+    pub async fn reported_change_statuses(&self, events: &[EventRow]) -> ChangeStatuses {
+        let ids = reported_change_ids(events);
+        match crate::core::changes::current_statuses(&self.pool, &ids).await {
+            Ok(found) => ids
+                .into_iter()
+                .map(|id| (id, found.get(&id).copied()))
+                .collect(),
+            Err(e) => {
+                crate::log!(
+                    "[EventStore] change statuses unreadable, child reports keep their \
+                     original change state: {}",
+                    e
+                );
+                ChangeStatuses::new()
+            }
+        }
+    }
+
     /// Get all messages for a specific request (for history time travel)
     /// Get session messages as raw text. HTML conversion happens at the API layer.
     /// Queries directly by request_id using the idx_events_request_id index.
@@ -35,7 +69,7 @@ impl EventStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(build_session_messages(&events))
+        Ok(self.build_messages_now(&events).await)
     }
 
     /// Get recent messages across all conversations, ordered chronologically (oldest first).
@@ -51,7 +85,7 @@ impl EventStore {
     /// The thread-selection CTE orders by recency; the outer query orders the
     /// returned events by `created ASC, sequence ASC` so events that share a
     /// timestamp (streaming bursts land in the same second) keep a stable,
-    /// insertion-order sequence within each thread for `build_session_messages`.
+    /// insertion-order sequence within each thread for `build_messages_now`.
     pub async fn get_recent_messages(
         &self,
         limit: i64,
@@ -106,7 +140,7 @@ impl EventStore {
             .await?
         };
 
-        Ok(build_session_messages(&events))
+        Ok(self.build_messages_now(&events).await)
     }
 }
 

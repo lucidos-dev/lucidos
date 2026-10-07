@@ -1121,7 +1121,7 @@ async fn a_continuation_request_that_never_ran_does_not_swallow_the_note() {
         &bus,
         thread_id,
         ThreadEvent::ContinuationRequested {
-            reason: "auto_resume_after_switch".into(),
+            reason: crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON.into(),
         },
     )
     .await;
@@ -1174,6 +1174,118 @@ async fn a_background_completion_an_event_wait_delivered_is_not_repeated() {
             .is_none(),
         "the delivery already told the agent, so the gap holds nothing to say"
     );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// 19b. **A task the thread itself stopped is not news on the next turn
+///      either** (ADR 0369). Its reap lands seconds after the stop, usually
+///      once the turn has ended. Without this, the next turn read "the wake
+///      never reached you" about work the agent stopped on purpose. A killed
+///      task whose watch nobody stood down still gets its line.
+#[tokio::test]
+async fn a_task_the_thread_stopped_itself_gets_no_line() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+    emit_message_received(&bus, thread_id, "lint it").await;
+    let watching = |task_id: &str| crate::core::event_subscription::EventSubscription {
+        event_type: "BackgroundBashCompleted".into(),
+        condition: Some(serde_json::json!({ "task_id": task_id })),
+    };
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::EventWaitCanceled {
+            wait_id: Uuid::new_v4(),
+            cause: crate::engine::thread_events::EventWaitCancelCause::AgentStandDown,
+            on: vec![watching("task-stopped")],
+            reason: "make lint to finish".into(),
+        },
+    )
+    .await;
+    for task_id in ["task-stopped", "task-killed-elsewhere"] {
+        let mut killed = completion(task_id, "make lint", None, false);
+        if let ThreadEvent::BackgroundBashCompleted {
+            killed: flag,
+            signal,
+            ..
+        } = &mut killed
+        {
+            *flag = true;
+            *signal = Some(15);
+        }
+        emit(&bus, thread_id, killed).await;
+    }
+    let current = emit_message_received(&bus, thread_id, "ready?").await;
+
+    let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
+        .await
+        .unwrap()
+        .note;
+    assert!(
+        !note.contains("task-stopped"),
+        "a self stop is not news: {note}"
+    );
+    assert!(
+        note.contains("task-killed-elsewhere"),
+        "a kill whose watch was never stood down still reports: {note}"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// 19c. A stand-down long before the kill is a watch the agent dropped, not
+///      its own stop. A later kill by somebody else still gets its line.
+#[tokio::test]
+async fn an_old_stand_down_does_not_hide_a_later_kill() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+    emit_message_received(&bus, thread_id, "lint it").await;
+    let canceled = emit(
+        &bus,
+        thread_id,
+        ThreadEvent::EventWaitCanceled {
+            wait_id: Uuid::new_v4(),
+            cause: crate::engine::thread_events::EventWaitCancelCause::AgentStandDown,
+            on: vec![crate::core::event_subscription::EventSubscription {
+                event_type: "BackgroundBashCompleted".into(),
+                condition: Some(serde_json::json!({ "task_id": "task-dropped" })),
+            }],
+            reason: "make lint to finish".into(),
+        },
+    )
+    .await;
+    sqlx::query("UPDATE events SET created = created - interval '2 hours' WHERE id = $1")
+        .bind(canceled)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut killed = completion("task-dropped", "make lint", None, false);
+    if let ThreadEvent::BackgroundBashCompleted {
+        killed: flag,
+        signal,
+        ..
+    } = &mut killed
+    {
+        *flag = true;
+        *signal = Some(15);
+    }
+    emit(&bus, thread_id, killed).await;
+    let current = emit_message_received(&bus, thread_id, "ready?").await;
+
+    let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
+        .await
+        .unwrap()
+        .note;
+    assert!(note.contains("task-dropped"), "{note}");
 
     pool.close().await;
     crate::test_support::teardown_test_db(&db_name).await;

@@ -30,6 +30,8 @@ export type ShortcutId =
   | 'toggleMenuDrawer'
   | 'historyBack'
   | 'historyForward'
+  | 'prevThreadInList'
+  | 'nextThreadInList'
   | 'prevTurnOrNotification'
   | 'nextTurnOrNotification'
   | 'toggleThreadDrawer'
@@ -43,6 +45,7 @@ export type ShortcutId =
   | 'resetPaneLayout'
   | 'refreshPanel'
   | 'toggleAppFullscreen'
+  | 'findInView'
   | 'toggleSourceView'
   | 'toggleLineWrap'
   | 'zoomIn'
@@ -105,11 +108,13 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'toggleMenuDrawer', label: 'Open or close the menu drawer', category: 'Navigation', defaultBinding: B(true, true, false, 'x') },
   { id: 'historyBack', label: 'Back (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowDown') },
   { id: 'historyForward', label: 'Forward (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowUp') },
+  { id: 'prevThreadInList', label: 'Previous thread in the open list or section (thread drawer)', category: 'Navigation', defaultBinding: B(false, false, true, 'ArrowUp'), mnemonic: 'Slack\'s previous channel chord' },
+  { id: 'nextThreadInList', label: 'Next thread in the open list or section (thread drawer)', category: 'Navigation', defaultBinding: B(false, false, true, 'ArrowDown'), mnemonic: 'Slack\'s next channel chord' },
   { id: 'prevTurnOrNotification', label: 'Previous turn (thread) or newer notification', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowUp') },
   { id: 'nextTurnOrNotification', label: 'Next turn (thread) or older notification', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowDown') },
   { id: 'focusComposer', label: 'Focus the composer', category: 'Thread', defaultBinding: B(false, true, false, 'Escape'), mnemonic: 'Focus input in ChatGPT' },
   { id: 'stopThread', label: 'Stop the running thread', category: 'Thread', defaultBinding: B(true, false, false, '.'), mnemonic: 'The classic Mac Cancel' },
-  { id: 'askSideQuestion', label: 'Ask the draft as a side question', category: 'Thread', defaultBinding: B(false, false, true, 'Enter'), mnemonic: 'Alt for an aside' },
+  { id: 'askSideQuestion', label: 'Side question mode (on or off)', category: 'Thread', defaultBinding: B(false, false, true, 'Enter'), mnemonic: 'Alt for an aside' },
   { id: 'copyLastResponse', label: 'Copy last response', category: 'Thread', defaultBinding: B(true, true, false, 'c'), mnemonic: 'C for Copy, as in ChatGPT' },
   { id: 'renameThread', label: 'Rename thread', category: 'Thread', defaultBinding: B(false, false, false, 'F2'), mnemonic: 'Rename in Windows Explorer and VS Code' },
   { id: 'followLiveEdge', label: 'Follow the live edge (arm or disarm)', category: 'Thread', defaultBinding: B(true, true, false, 'l'), mnemonic: 'L for Live' },
@@ -126,8 +131,9 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'narrowThreadDrawer', label: 'Narrow thread drawer', category: 'Panes', defaultBinding: B(true, true, true, 'ArrowLeft') },
   { id: 'widenThreadDrawer', label: 'Widen thread drawer', category: 'Panes', defaultBinding: B(true, true, true, 'ArrowRight') },
   { id: 'resetPaneLayout', label: 'Reset pane layout', category: 'Panes', defaultBinding: B(true, false, true, '0'), mnemonic: '0, as in Reset zoom' },
-  { id: 'refreshPanel', label: 'Refresh the content pane', category: 'View', defaultBinding: B(true, true, false, 'p'), mnemonic: 'P for Pull to refresh' },
+  { id: 'refreshPanel', label: 'Refresh the content pane', category: 'View', defaultBinding: B(true, false, false, 'r'), mnemonic: 'Reload in every browser' },
   { id: 'toggleAppFullscreen', label: 'Fullscreen the open app', category: 'View', defaultBinding: B(true, true, false, 'f'), mnemonic: 'F for Fullscreen' },
+  { id: 'findInView', label: 'Find in the focused pane (app, file or thread)', category: 'View', defaultBinding: B(true, false, false, 'f'), mnemonic: 'Find in every browser' },
   { id: 'toggleSourceView', label: 'Show source or rendered (file preview)', category: 'View', defaultBinding: B(true, true, false, 's'), mnemonic: 'S for Source' },
   { id: 'toggleLineWrap', label: 'Wrap long lines (source view)', category: 'View', defaultBinding: B(true, true, false, 'b'), mnemonic: 'B for line Break' },
   { id: 'zoomIn', label: 'Zoom in', category: 'View', defaultBinding: B(true, false, false, '='), mnemonic: 'Browser zoom' },

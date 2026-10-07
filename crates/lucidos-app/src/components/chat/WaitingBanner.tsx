@@ -1,12 +1,15 @@
 import type { ComponentChildren } from 'preact';
-import { threadMap, focusedThreadId, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn, standingApplyThreadIds, armingStandingApplyThreadIds, setAsideChangeForThread } from '../../store/store';
-import { bringBackSingleChange } from '../../store/actions/chat-changes';
+import { threadMap, focusedThreadId, getThreadDisplaySection, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn, threadUnsettled, standingApplyThreadIds, armingStandingApplyThreadIds, setAsideChangeForThread } from '../../store/store';
+import { bringBackSingleChange, discardSingleChange } from '../../store/actions/chat-changes';
 import { resolveThreadActions, threadHasIncompleteChange, type TaggedAction } from '../../store/actions/threadActions';
+import { handleArchiveThread, handleUnarchiveThread, showBlockedToast } from '../../store/actions/threads';
+import { BLOCKER_REASON, isDescendantBlocker, type BlockedRefusal } from '../../store/actions/blockerCopy';
+import { exitItems, threadBlocker } from '../../store/actions/threadBlockers';
 import { continueStoppedThread } from './continueStoppedThread';
 import type { ThreadState } from '../../store/thread-events';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
-import { ArchiveIcon, CheckIcon, ContinuedIcon, DiffIcon, MoveToTopIcon, SetAsideIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
+import { ArchiveIcon, CheckIcon, ContinuedIcon, DiffIcon, InboxIcon, MoveToTopIcon, SetAsideIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
 import type { HeaderActionSpec } from '../layout/headerActions';
 import type { OverflowMenuContext } from '../shared/OverflowMenu';
 import { useTouchActivated } from '../../hooks/useTouchActivated';
@@ -28,6 +31,8 @@ const BANNER_CLOSE_KINDS: ReadonlySet<string> = new Set(['discard', 'apply', 'se
 const BRING_BACK_TOOLTIP =
   "This thread's change is set aside. Bring it back to review and apply it.";
 
+const DISCARD_SET_ASIDE_TOOLTIP = "Throw away this thread's set-aside change.";
+
 type WaitingState =
   | { type: 'applying' }
   | { type: 'discarding' }
@@ -38,11 +43,17 @@ type WaitingState =
       threadId: string;
       isArchiving: boolean;
       showDiff: boolean;
-      /** The thread's set-aside change, which the banner offers to bring back. */
-      setAsideChangeId?: string;
+      /** The thread's set-aside change, which the banner offers to bring back,
+       *  and to discard unless the thread is unsettled. */
+      setAside?: { changeId: string; discardable: boolean };
       /** The pending change is incomplete, so Continue leads and Apply moves
        *  into the caret menu (ADR 0346). */
       incomplete?: boolean;
+      /** An archived thread offers Move to Current where Archive was. */
+      unarchive?: boolean;
+      /** A sub-thread holds Archive back. The thread's own blockers already
+       *  draw the control that resolves them: Cancel, Apply or Discard. */
+      blockedArchive?: BlockedRefusal;
     };
 
 /** Banner state passed to `getBannerActions`. The 'canceling' variant is owned
@@ -113,7 +124,20 @@ export function getWaitingState(): WaitingState | null {
   const actions = resolveThreadActions(focused).filter((a) => BANNER_CLOSE_KINDS.has(a.kind));
   // A set-aside change keeps a way back on its own thread, archived or not.
   const setAsideChangeId = setAsideChangeForThread(focused)?.id;
-  if (actions.length === 0 && !setAsideChangeId) return null;
+  const setAside = setAsideChangeId
+    ? { changeId: setAsideChangeId, discardable: !threadUnsettled(thread) }
+    : undefined;
+  // Placement is where the drawer shows the thread, not where it is stored
+  // (ADR 0378). One in the Archive section offers Move to Current.
+  const unarchive = actions.length === 0 && getThreadDisplaySection(thread) === 'archive';
+  const blockedArchive = actions.length === 0 && !unarchive ? subThreadBlocker(focused) : undefined;
+  // The thread menu's own answer, when the selector offers no Archive: a thread
+  // stored archived but kept in Current, or one whose blocking sub-thread is
+  // not loaded. Pressing it lets the engine decide, and recount if it drifted.
+  if (actions.length === 0 && !unarchive && !blockedArchive && exitItems(focused).archive === 'enabled') {
+    actions.push(archiveExitAction(focused));
+  }
+  if (actions.length === 0 && !setAside && !unarchive && !blockedArchive) return null;
 
   // The Diff button is shown only when the CC branch actually has a diff on
   // disk (`codingAgentHasDiff` — single git-truth signal maintained by the
@@ -128,9 +152,25 @@ export function getWaitingState(): WaitingState | null {
     threadId: focused,
     isArchiving: false,
     showDiff,
-    setAsideChangeId,
+    setAside,
     incomplete: threadHasIncompleteChange(focused),
+    unarchive,
+    blockedArchive,
   };
+}
+
+/** Archive the menu offers where the selector, reading stored facts, does not. */
+function archiveExitAction(threadId: string): TaggedAction {
+  return { kind: 'archive', category: 'close', label: 'Archive', invoke: async () => { await handleArchiveThread(threadId); } };
+}
+
+/** What holds Archive back when a sub-thread does, so the composer can say so
+ *  rather than drawing nothing (ADR 0378). */
+function subThreadBlocker(threadId: string): BlockedRefusal | undefined {
+  const { blocker, subThreads } = threadBlocker(threadId);
+  return blocker !== 'none' && isDescendantBlocker(blocker)
+    ? { blocker, subThreadId: subThreads[0]?.thread.meta.id ?? null }
+    : undefined;
 }
 
 /** ONE close-set action, as a ⋯ menu row. The composite split button folds into
@@ -177,7 +217,7 @@ export function getBannerActions(state: BannerState): HeaderActionSpec[] {
   // The historical change-row Diff buttons (ChatExchange, ChangesView) call
   // viewChangeDiff for one Change; this asks what the branch looks like now.
   if (state.showDiff) members.push(diffAction(state.threadId));
-  if (state.setAsideChangeId) members.push(bringBackAction(state.setAsideChangeId));
+  if (state.setAside) members.push(bringBackAction(state.setAside));
 
   // When the close set has a primary Apply, the remaining close-set buttons
   // collapse into a split button: a one-tap face plus a caret menu holding the
@@ -217,7 +257,62 @@ export function getBannerActions(state: BannerState): HeaderActionSpec[] {
   // change, so Archive plus a standalone Diff). Each button is its own member,
   // so the row can fold one without the other.
   for (const action of state.actions) members.push(closeSetAction(action));
+  if (state.unarchive) members.push(unarchiveAction(state.threadId));
+  if (state.blockedArchive) members.push(blockedArchiveAction(state.blockedArchive));
   return members;
+}
+
+const UNARCHIVE_TOOLTIP = 'Move this thread and its sub-threads back to Current.';
+
+/** Move an archived thread back to Current, where Archive was. */
+function unarchiveAction(threadId: string): HeaderActionSpec {
+  return {
+    key: 'unarchive',
+    label: 'Move to Current',
+    tooltip: UNARCHIVE_TOOLTIP,
+    icon: () => <InboxIcon />,
+    extraClass: PROTECTED_SURFACE,
+    render: (attrs) => (
+      <button
+        {...attrs}
+        data-thread-action=""
+        class={protectedButtonClass('')}
+        data-tooltip={UNARCHIVE_TOOLTIP}
+        onClick={() => void handleUnarchiveThread(threadId)}
+      >
+        Move to Current
+      </button>
+    ),
+    onClick: () => void handleUnarchiveThread(threadId),
+  };
+}
+
+/** Archive, held back by a sub-thread. It stays tappable: a tap says why, and
+ *  the toast opens the sub-thread to resolve. */
+function blockedArchiveAction(refusal: BlockedRefusal): HeaderActionSpec {
+  const reason = BLOCKER_REASON[refusal.blocker];
+  const explain = () => showBlockedToast("Can't archive yet", refusal);
+  return {
+    key: 'archive-blocked',
+    label: 'Archive thread',
+    tooltip: reason,
+    icon: () => <ArchiveIcon />,
+    extraClass: PROTECTED_SURFACE,
+    render: (attrs) => (
+      <button
+        {...attrs}
+        data-thread-action=""
+        class={protectedButtonClass('action-btn-blocked')}
+        aria-disabled="true"
+        aria-label={`Archive thread. ${reason}`}
+        data-tooltip={reason}
+        onClick={explain}
+      >
+        Archive
+      </button>
+    ),
+    onClick: explain,
+  };
 }
 
 /** The members the row carries when the banner is SUPPRESSED because the thread
@@ -319,26 +414,51 @@ export function applyFocusedThreadChange(): void {
   void resolveThreadActions(id).find((a) => a.kind === 'apply_when_settled')?.invoke();
 }
 
-/** Bring a set-aside change back to pending, from its own thread. */
-function bringBackAction(changeId: string): HeaderActionSpec {
-  return {
+/** Bring a set-aside change back to pending, from its own thread, with Discard
+ *  behind the caret, as the Changes panel's set-aside row offers. Discard is
+ *  withheld while the thread is unsettled, since the engine refuses it then. */
+function bringBackAction({ changeId, discardable }: { changeId: string; discardable: boolean }): HeaderActionSpec {
+  const bringBack: SplitFace = {
     key: 'bring-back',
     label: 'Bring back',
     tooltip: BRING_BACK_TOOLTIP,
+    className: 'action-btn',
     icon: () => <MoveToTopIcon />,
-    extraClass: PROTECTED_SURFACE,
+    invoke: () => bringBackSingleChange(changeId),
+  };
+  const discard: SplitFace = {
+    key: 'discard',
+    label: 'Discard',
+    tooltip: DISCARD_SET_ASIDE_TOOLTIP,
+    className: 'action-btn action-btn-danger',
+    icon: () => <TrashIcon />,
+    invoke: () => discardSingleChange(changeId),
+  };
+  const menuFaces = discardable ? [discard] : [];
+  return {
+    key: bringBack.key,
+    label: bringBack.label,
+    tooltip: bringBack.tooltip,
+    icon: bringBack.icon,
     render: (attrs) => (
-      <button
-        {...attrs}
-        data-thread-action=""
-        class={protectedButtonClass('')}
-        data-tooltip={BRING_BACK_TOOLTIP}
-        onClick={() => void bringBackSingleChange(changeId)}
-      >
-        Bring back
-      </button>
+      <SplitButton
+        primaryLabel={bringBack.label}
+        primaryClassName={bringBack.className}
+        primaryTooltip={bringBack.tooltip}
+        onPrimary={() => void bringBack.invoke()}
+        caretClassName={bringBack.className}
+        caretAriaLabel="More set-aside actions"
+        menuItems={menuFaces.map((face) => ({
+          key: face.key,
+          label: face.label,
+          className: face.className,
+          tooltip: face.tooltip,
+          onClick: () => void face.invoke(),
+        }))}
+        attrs={{ ...attrs, 'data-thread-action': '' }}
+      />
     ),
-    onClick: () => void bringBackSingleChange(changeId),
+    menuRows: (ctx) => [bringBack, ...menuFaces].map((face) => faceMenuRow(face, ctx)),
   };
 }
 

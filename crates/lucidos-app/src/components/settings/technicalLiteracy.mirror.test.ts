@@ -8,7 +8,6 @@ import { dirname, resolve } from 'node:path';
 import { preferences } from '../../store/store';
 import {
   currentTechnicalLiteracy,
-  TECHNICAL_LITERACY_LEVELS,
   TECHNICAL_LITERACY_NOT_SET,
 } from '../../store/actions/preferences';
 import { technicalLiteracyOptions } from './ResponseStylesSection';
@@ -38,16 +37,6 @@ function rustCopy(fnName: string): string[] {
 }
 
 describe('the technical literacy levels mirror the engine', () => {
-  it('agrees on every level, in order', () => {
-    expect(rustIds().length).toBeGreaterThan(0);
-    expect([...TECHNICAL_LITERACY_LEVELS]).toEqual(rustIds());
-  });
-
-  it('agrees on the value that clears the level', () => {
-    const match = RUST.match(/pub const NOT_SET_ID: &str = "([a-z-]+)";/);
-    expect(match?.[1]).toBe(TECHNICAL_LITERACY_NOT_SET);
-  });
-
   it('shows exactly the card copy the first-run setup shows', () => {
     const levels = technicalLiteracyOptions().slice(1);
     expect(levels.map((o) => o.label)).toEqual(rustCopy('card_label'));

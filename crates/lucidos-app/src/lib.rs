@@ -46,6 +46,24 @@ mod window_screen;
 mod window_session;
 mod window_target;
 
+/// The Lucidos release this app was built as (e.g. "0.46.0"), from the
+/// repo-root `RELEASE` file. `build-dmg.sh` stamps the same file into the
+/// bundle version. Mirrors `lucidos_engine::LUCIDOS_RELEASE` (duplicated, not
+/// shared, per ADR 0014).
+///
+/// Compare THIS against an engine's or a gateway's release, never
+/// `LUCIDOS_APP_VERSION`. That one is the client build id, a CalVer stamp that
+/// is never newer or older than a release in any meaningful sense.
+pub(crate) const LUCIDOS_RELEASE: &str = {
+    let raw = include_str!("../../../RELEASE").as_bytes();
+    let trimmed = raw.trim_ascii_end();
+    // SAFETY: input is ASCII (digits + '.' + whitespace); trim keeps valid UTF-8.
+    match std::str::from_utf8(trimmed) {
+        Ok(s) => s,
+        Err(_) => panic!("RELEASE file must be valid UTF-8"),
+    }
+};
+
 /// Headless launchd entry point — `Lucidos --service` (see `desktop::run_service`).
 /// Boots the bundled Postgres + engine and supervises them with no window. The
 /// caller (`main`) routes the process here before any Tauri init.
@@ -1180,7 +1198,8 @@ pub fn run() {
                 // One early eval, so the reclaimed-band CSS vars are set before
                 // the first paint.
                 let script = format!(
-                    "window.__LUCIDOS_APP_VERSION__ = '{version}';{}",
+                    "window.__LUCIDOS_APP_VERSION__ = '{version}';\
+                     window.__LUCIDOS_APP_RELEASE__ = '{LUCIDOS_RELEASE}';{}",
                     titlebar_inset_script()
                 );
                 if let Err(e) = webview.eval(script) {

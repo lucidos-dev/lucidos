@@ -8,12 +8,8 @@
 //! [`ProviderSelection`] onto a concrete provider. Factoring it out of `main.rs`
 //! means a runtime hot-swap produces a provider byte-identical to a fresh boot.
 
-use crate::core::{
-    AuthType, CredentialStore, PreferenceStore, DEFAULT_LOCAL_BASE_URL, PREF_LOCAL_BASE_URL,
-    PREF_OPENCODE_FREE_ENABLED, PREF_PROVIDER_ENABLED_ANTHROPIC, PREF_PROVIDER_ENABLED_LOCAL,
-    PREF_PROVIDER_ENABLED_OPENAI, PREF_PROVIDER_ENABLED_OPENROUTER, PREF_PROVIDER_ENABLED_VERTEX,
-    PREF_PROVIDER_ENABLED_XAI,
-};
+use crate::core::prefs::{self, parse_flag, Flag, Pref};
+use crate::core::{AuthType, CredentialStore};
 use crate::llm::web_search::{
     AnthropicServerToolSearch, OpenAiResponsesSearch, VertexGroundingSearch, WebSearchChain,
     WebSearchProvider,
@@ -39,16 +35,14 @@ pub const PROVIDER_CREDENTIAL_SERVICES: [&str; 5] =
 /// declares them.
 ///
 /// [`PROVIDER_PREFERENCE_KEYS`] is built from this list, so the config
-/// subscriber cannot end up watching a subset of it. The preference catalog
-/// spells the keys itself, and `no_switch_is_agent_settable` below is what
-/// holds those two together.
-pub(crate) const PROVIDER_ENABLED_KEYS: [&str; 6] = [
-    PREF_PROVIDER_ENABLED_VERTEX,
-    PREF_PROVIDER_ENABLED_ANTHROPIC,
-    PREF_PROVIDER_ENABLED_OPENAI,
-    PREF_PROVIDER_ENABLED_OPENROUTER,
-    PREF_PROVIDER_ENABLED_XAI,
-    PREF_PROVIDER_ENABLED_LOCAL,
+/// subscriber cannot end up watching a subset of it.
+pub(crate) const PROVIDER_ENABLED_SWITCHES: [&Pref<Flag>; 6] = [
+    &prefs::PROVIDER_ENABLED_VERTEX,
+    &prefs::PROVIDER_ENABLED_ANTHROPIC,
+    &prefs::PROVIDER_ENABLED_OPENAI,
+    &prefs::PROVIDER_ENABLED_OPENROUTER,
+    &prefs::PROVIDER_ENABLED_XAI,
+    &prefs::PROVIDER_ENABLED_LOCAL,
 ];
 
 /// Preference keys that, when changed, change which LLM provider is installed.
@@ -59,14 +53,14 @@ pub(crate) const PROVIDER_ENABLED_KEYS: [&str; 6] = [
 /// for the same reason: a switch that needed a restart is a switch the user
 /// reads as broken.
 pub const PROVIDER_PREFERENCE_KEYS: [&str; 8] = [
-    PREF_OPENCODE_FREE_ENABLED,
-    PREF_LOCAL_BASE_URL,
-    PROVIDER_ENABLED_KEYS[0],
-    PROVIDER_ENABLED_KEYS[1],
-    PROVIDER_ENABLED_KEYS[2],
-    PROVIDER_ENABLED_KEYS[3],
-    PROVIDER_ENABLED_KEYS[4],
-    PROVIDER_ENABLED_KEYS[5],
+    prefs::OPENCODE_FREE_ENABLED.key(),
+    prefs::LOCAL_BASE_URL.key(),
+    PROVIDER_ENABLED_SWITCHES[0].key(),
+    PROVIDER_ENABLED_SWITCHES[1].key(),
+    PROVIDER_ENABLED_SWITCHES[2].key(),
+    PROVIDER_ENABLED_SWITCHES[3].key(),
+    PROVIDER_ENABLED_SWITCHES[4].key(),
+    PROVIDER_ENABLED_SWITCHES[5].key(),
 ];
 
 /// Whether `LUCIDOS_BOOT_WITHOUT_PROVIDER` is truthy — a packaged build lets the
@@ -74,29 +68,7 @@ pub const PROVIDER_PREFERENCE_KEYS: [&str; 8] = [
 /// instead of the dev/docker fail-fast panic. Read in both `main.rs` (boot) and
 /// the subscriber (so a runtime swap-back to unconfigured mirrors boot).
 pub fn boot_without_provider_enabled() -> bool {
-    std::env::var("LUCIDOS_BOOT_WITHOUT_PROVIDER")
-        .map(|v| reads_as_true(&v))
-        .unwrap_or(false)
-}
-
-/// Whether a preference or env string reads as on. One spelling of truth for
-/// every boolean switch this module resolves.
-fn reads_as_true(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-/// Whether a preference string reads as an explicit off. The inverse of
-/// [`reads_as_true`] over the same vocabulary, and deliberately NOT its
-/// negation: an unrecognised value is neither, which is what lets the
-/// per-provider switches below default to on.
-fn reads_as_false(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    )
+    std::env::var("LUCIDOS_BOOT_WITHOUT_PROVIDER").is_ok_and(|v| parse_flag(&v) == Some(true))
 }
 
 /// The per-provider enable switches, resolved from the `provider_enabled_*`
@@ -106,9 +78,9 @@ fn reads_as_false(value: &str) -> bool {
 /// installs one, and it never touches the credential: turning a provider off is
 /// how a user parks a key they still want stored.
 ///
-/// Every field defaults to on, and only an explicit "false" turns one off. A
-/// workspace that never opened the page therefore resolves what it always did,
-/// and so does a boot that cannot read preferences at all.
+/// Every field defaults to its catalog default (on), and only an explicit off
+/// turns one off. A workspace that never opened the page therefore resolves
+/// what it always did, and so does a boot that cannot read preferences at all.
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderSwitches {
     pub vertex: bool,
@@ -122,45 +94,27 @@ pub struct ProviderSwitches {
 impl Default for ProviderSwitches {
     fn default() -> Self {
         Self {
-            vertex: true,
-            anthropic: true,
-            openai: true,
-            openrouter: true,
-            xai: true,
-            local: true,
+            vertex: prefs::PROVIDER_ENABLED_VERTEX.default_flag(),
+            anthropic: prefs::PROVIDER_ENABLED_ANTHROPIC.default_flag(),
+            openai: prefs::PROVIDER_ENABLED_OPENAI.default_flag(),
+            openrouter: prefs::PROVIDER_ENABLED_OPENROUTER.default_flag(),
+            xai: prefs::PROVIDER_ENABLED_XAI.default_flag(),
+            local: prefs::PROVIDER_ENABLED_LOCAL.default_flag(),
         }
     }
 }
 
-/// One switch's value: on unless the stored preference explicitly says off.
-///
-/// Shared with `llm::judgment::select`, whose TypeSafe master switch is not one
-/// of the six and still has to read the same vocabulary. Two spellings of "off"
-/// would make one Settings toggle behave unlike the rest of the page.
-pub(crate) fn switch_is_on(stored: Option<&str>) -> bool {
-    !stored.is_some_and(reads_as_false)
-}
-
-/// Read the six switches, defaulting any unreadable one to on. A failed read is
-/// logged and treated as absent. Losing a provider over a transient query error
-/// is worse than honouring the veto one build late.
+/// Read the six switches, defaulting any unreadable one to its default (on).
+/// The handle read logs a failed read. Losing a provider over a transient query
+/// error is worse than honouring the veto one build late.
 pub(crate) async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
-    async fn one(pool: &PgPool, key: &str) -> bool {
-        match PreferenceStore::get(pool, key).await {
-            Ok(v) => switch_is_on(v.as_deref()),
-            Err(e) => {
-                crate::log!("[Startup] Failed to read {} preference: {}", key, e);
-                true
-            }
-        }
-    }
     ProviderSwitches {
-        vertex: one(pool, PREF_PROVIDER_ENABLED_VERTEX).await,
-        anthropic: one(pool, PREF_PROVIDER_ENABLED_ANTHROPIC).await,
-        openai: one(pool, PREF_PROVIDER_ENABLED_OPENAI).await,
-        openrouter: one(pool, PREF_PROVIDER_ENABLED_OPENROUTER).await,
-        xai: one(pool, PREF_PROVIDER_ENABLED_XAI).await,
-        local: one(pool, PREF_PROVIDER_ENABLED_LOCAL).await,
+        vertex: prefs::PROVIDER_ENABLED_VERTEX.read(pool).await,
+        anthropic: prefs::PROVIDER_ENABLED_ANTHROPIC.read(pool).await,
+        openai: prefs::PROVIDER_ENABLED_OPENAI.read(pool).await,
+        openrouter: prefs::PROVIDER_ENABLED_OPENROUTER.read(pool).await,
+        xai: prefs::PROVIDER_ENABLED_XAI.read(pool).await,
+        local: prefs::PROVIDER_ENABLED_LOCAL.read(pool).await,
     }
 }
 
@@ -315,21 +269,12 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
     // OpenCode Free is a preference, not a credential. Nothing is read from the
     // credential store and nothing is sent as a bearer. An unreadable
     // preference costs the tier, never a key.
-    stored.opencode_free_pref = match PreferenceStore::get(pool, PREF_OPENCODE_FREE_ENABLED).await {
-        Ok(opt) => opt,
-        Err(e) => {
-            crate::log!(
-                "[Startup] Failed to read opencode_free_enabled preference: {}",
-                e
-            );
-            None
-        }
-    };
+    stored.opencode_free_pref = prefs::OPENCODE_FREE_ENABLED.stored(pool).await;
 
     // Local OpenAI-compatible: the `local_base_url` preference plus an optional
     // `local` credential. Either read failing drops the provider, because the
     // default base URL would send a stored key to another host.
-    match PreferenceStore::get(pool, PREF_LOCAL_BASE_URL).await {
+    match prefs::LOCAL_BASE_URL.try_stored(pool).await {
         Ok(opt) => stored.local_base = opt,
         Err(e) => {
             crate::log!(
@@ -945,14 +890,16 @@ fn build_opencode_free_provider(
     enabled_pref: Option<String>,
     default_model: &str,
 ) -> Option<OpenAiProvider> {
+    // A stored row wins even when it is neither on nor off, so the env switch
+    // only speaks while the preference is unset.
     let enabled = enabled_pref
-        .map(|v| reads_as_true(&v))
+        .map(|v| prefs::OPENCODE_FREE_ENABLED.resolve(Some(v.as_str())))
         .or_else(|| {
             std::env::var("LUCIDOS_OPENCODE_FREE")
                 .ok()
-                .map(|v| reads_as_true(&v))
+                .map(|v| parse_flag(&v) == Some(true))
         })
-        .unwrap_or(false);
+        .unwrap_or_else(|| prefs::OPENCODE_FREE_ENABLED.default_flag());
     if !enabled {
         return None;
     }
@@ -980,7 +927,7 @@ fn build_opencode_free_provider(
 /// (`stored_key`), or the `LUCIDOS_LOCAL_BASE_URL` / `LUCIDOS_LOCAL_API_KEY`
 /// env vars — otherwise `None`, so a default localhost backend isn't conjured
 /// for users who never asked for it (and the "no provider configured" guard
-/// stays honest). The base URL resolves pref → env → [`DEFAULT_LOCAL_BASE_URL`];
+/// stays honest). The base URL resolves pref → env → the catalog default;
 /// the key is optional (the `Authorization` header is omitted when empty), and
 /// is presented only inside its scope: see [`local_key_in_scope`].
 fn build_local_provider(
@@ -1015,10 +962,10 @@ fn build_local_provider(
     // preference. Same pairing as `api::proxy_builtin::resolve_local`.
     let env_key_host = base_env
         .clone()
-        .unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_string());
+        .unwrap_or_else(|| prefs::LOCAL_BASE_URL.default_text().to_string());
     let base = base_pref
         .or(base_env)
-        .unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_string());
+        .unwrap_or_else(|| prefs::LOCAL_BASE_URL.default_text().to_string());
     let key = local_key_in_scope(&base, stored_key, env_key.map(|k| (k, env_key_host)));
     match OpenAiProvider::new_with_base_url(
         key.unwrap_or_default(),
@@ -1094,7 +1041,7 @@ mod tests {
     /// bearing bit: it proves the rebuild can never reach `MockProvider`.
     fn unconfigured_ctx(boot_without_provider: bool) -> ProviderBuildContext {
         ProviderBuildContext {
-            default_model: crate::core::DEFAULT_CHAT_MODEL.to_string(),
+            default_model: prefs::CHAT_MODEL.default_text().to_string(),
             model_is_mock: false,
             vertex_project_id: String::new(),
             vertex_location: crate::llm::vertex::location_handle("europe-west1".to_string()),
@@ -1159,9 +1106,14 @@ mod tests {
     /// An env key follows the env base URL, never the preference.
     #[test]
     fn an_env_local_key_is_pinned_to_its_own_host() {
-        let env = || Some(("env-secret".to_string(), DEFAULT_LOCAL_BASE_URL.to_string()));
+        let env = || {
+            Some((
+                "env-secret".to_string(),
+                prefs::LOCAL_BASE_URL.default_text().to_string(),
+            ))
+        };
         assert_eq!(
-            local_key_in_scope(DEFAULT_LOCAL_BASE_URL, None, env()).as_deref(),
+            local_key_in_scope(prefs::LOCAL_BASE_URL.default_text(), None, env()).as_deref(),
             Some("env-secret")
         );
         assert_eq!(
@@ -1174,7 +1126,7 @@ mod tests {
     /// the model the agent talks to. A loopback one still builds.
     #[test]
     fn a_stored_public_local_base_url_builds_no_provider() {
-        let model = crate::core::DEFAULT_CHAT_MODEL;
+        let model = prefs::CHAT_MODEL.default_text();
         assert!(
             build_local_provider(Some("https://attacker.example/v1".into()), None, model).is_none()
         );
@@ -1313,7 +1265,7 @@ mod tests {
         let registry = crate::llm::model_registry::empty();
         let resolved = resolve_direct_providers(
             Some(&pool),
-            crate::core::DEFAULT_CHAT_MODEL,
+            prefs::CHAT_MODEL.default_text(),
             &registry,
             None,
             None,
@@ -1346,7 +1298,7 @@ mod tests {
 
         let without = resolve_direct_providers(
             None,
-            crate::core::DEFAULT_CHAT_MODEL,
+            prefs::CHAT_MODEL.default_text(),
             &registry,
             None,
             None,
@@ -1362,7 +1314,7 @@ mod tests {
 
         let with = resolve_direct_providers(
             None,
-            crate::core::DEFAULT_CHAT_MODEL,
+            prefs::CHAT_MODEL.default_text(),
             &registry,
             None,
             None,
@@ -1478,7 +1430,7 @@ mod tests {
             "the free tier must be off until the user turns it on"
         );
 
-        seed_preference(&pool, PREF_OPENCODE_FREE_ENABLED, "true")
+        seed_preference(&pool, prefs::OPENCODE_FREE_ENABLED.key(), "true")
             .await
             .unwrap();
         let (provider, selection) =
@@ -1730,7 +1682,7 @@ mod tests {
 
         let readable = resolve_direct_providers(
             Some(&pool),
-            crate::core::DEFAULT_CHAT_MODEL,
+            prefs::CHAT_MODEL.default_text(),
             &registry,
             None,
             None,
@@ -1751,7 +1703,7 @@ mod tests {
 
         let unreadable = resolve_direct_providers(
             Some(&pool),
-            crate::core::DEFAULT_CHAT_MODEL,
+            prefs::CHAT_MODEL.default_text(),
             &registry,
             None,
             None,
@@ -1839,7 +1791,7 @@ mod tests {
         seed_credential(
             &pool,
             "local",
-            DEFAULT_LOCAL_BASE_URL,
+            prefs::LOCAL_BASE_URL.default_text(),
             crate::core::AuthType::ApiKey,
             "local-key",
         )
@@ -1851,7 +1803,12 @@ mod tests {
             "a local-only workspace has no search-capable provider: {:?}",
             chain.backend_ids()
         );
-        let msg = chain.search("q", 5).await.unwrap_err().to_string();
+        let msg = chain
+            .search("q", 5, crate::llm::metered::CallToken::for_test())
+            .await
+            .err()
+            .expect("an empty chain errors")
+            .to_string();
         assert!(msg.contains("Settings → Models → Providers"), "{msg}");
         teardown_test_db(&db).await;
     }
@@ -1863,17 +1820,23 @@ mod tests {
     /// no rows at all, and must resolve every provider it always did.
     #[test]
     fn a_switch_is_on_unless_it_explicitly_says_off() {
-        assert!(switch_is_on(None), "absent must mean enabled");
-        for on in ["true", "TRUE", " on ", "1", "yes"] {
-            assert!(switch_is_on(Some(on)), "{on} must read as enabled");
+        for switch in PROVIDER_ENABLED_SWITCHES {
+            let key = switch.key();
+            assert!(switch.resolve(None), "{key}: absent must mean enabled");
+            for on in ["true", "TRUE", " on ", "1", "yes"] {
+                assert!(switch.resolve(Some(on)), "{key}: {on} must read as enabled");
+            }
+            for off in ["false", "FALSE", " off ", "0", "no"] {
+                assert!(
+                    !switch.resolve(Some(off)),
+                    "{key}: {off} must read as disabled"
+                );
+            }
+            // Neither vocabulary. Enabled, because a garbled value must not be
+            // the thing that quietly removes a working provider.
+            assert!(switch.resolve(Some("maybe")), "{key}");
+            assert!(switch.resolve(Some("")), "{key}");
         }
-        for off in ["false", "FALSE", " off ", "0", "no"] {
-            assert!(!switch_is_on(Some(off)), "{off} must read as disabled");
-        }
-        // Neither vocabulary. Enabled, because a garbled value must not be the
-        // thing that quietly removes a working provider.
-        assert!(switch_is_on(Some("maybe")));
-        assert!(switch_is_on(Some("")));
     }
 
     /// The default is every switch on, which is what a DB-down boot resolves.
@@ -1901,7 +1864,7 @@ mod tests {
 
         let on = resolve_direct_providers(
             Some(&pool),
-            crate::core::DEFAULT_CHAT_MODEL,
+            prefs::CHAT_MODEL.default_text(),
             &registry,
             None,
             None,
@@ -1917,7 +1880,7 @@ mod tests {
 
         let off = resolve_direct_providers(
             Some(&pool),
-            crate::core::DEFAULT_CHAT_MODEL,
+            prefs::CHAT_MODEL.default_text(),
             &registry,
             None,
             None,
@@ -1951,12 +1914,12 @@ mod tests {
     async fn a_switch_never_installs_an_unconfigured_provider() {
         let (pool, db) = setup_test_db().await;
         let registry = crate::llm::model_registry::empty();
-        seed_preference(&pool, PREF_PROVIDER_ENABLED_OPENROUTER, "true")
+        seed_preference(&pool, prefs::PROVIDER_ENABLED_OPENROUTER.key(), "true")
             .await
             .unwrap();
         let resolved = resolve_direct_providers(
             Some(&pool),
-            crate::core::DEFAULT_CHAT_MODEL,
+            prefs::CHAT_MODEL.default_text(),
             &registry,
             None,
             None,
@@ -1991,8 +1954,8 @@ mod tests {
             "a workspace with no rows must resolve every switch on"
         );
 
-        for key in PROVIDER_ENABLED_KEYS {
-            seed_preference(&pool, key, "false").await.unwrap();
+        for switch in PROVIDER_ENABLED_SWITCHES {
+            seed_preference(&pool, switch.key(), "false").await.unwrap();
         }
         let s = read_provider_switches(&pool).await;
         assert!(
@@ -2006,7 +1969,8 @@ mod tests {
     /// the config subscriber has to watch all six.
     #[test]
     fn every_switch_hot_swaps() {
-        for key in PROVIDER_ENABLED_KEYS {
+        for switch in PROVIDER_ENABLED_SWITCHES {
+            let key = switch.key();
             assert!(
                 PROVIDER_PREFERENCE_KEYS.contains(&key),
                 "{key} must be watched by the provider config subscriber"
@@ -2030,18 +1994,15 @@ mod tests {
         }
     }
 
-    /// The agent must not be able to switch a provider off. Asserted from this
-    /// side, over the same key list the build reads, so a renamed constant
-    /// cannot leave a settable key behind in the catalog.
+    /// The agent must not be able to switch a provider off: the provider it
+    /// switches off may be the one answering the turn.
     #[test]
     fn no_switch_is_agent_settable() {
-        for key in PROVIDER_ENABLED_KEYS {
+        for switch in PROVIDER_ENABLED_SWITCHES {
             assert!(
-                crate::core::preference_catalog::INTERNAL_KEYS
-                    .iter()
-                    .any(|(k, _)| *k == key),
-                "{key} must be an INTERNAL_KEY: the provider it switches off may \
-                 be the one answering the turn"
+                !matches!(switch.spec.access, prefs::PrefAccess::Agent),
+                "{} must not be agent-settable",
+                switch.key()
             );
         }
     }

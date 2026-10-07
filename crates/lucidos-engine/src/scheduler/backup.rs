@@ -3,14 +3,19 @@
 //! notification dedup helper.
 
 use crate::api::SharedEngine;
-use crate::scheduler::notifications::settings_tap;
+use crate::core::keep_awake::{self, AwakeHold, Work};
+use crate::scheduler::notifications::SettingsPage;
 
 use super::push;
 
 /// RAII guard for `engine.backup_in_progress`. Acquired atomically so two
 /// concurrent backup attempts can't both pass the check; cleared on drop so
-/// a panic mid-backup doesn't permanently strand the flag.
-pub(crate) struct BackupGuard(SharedEngine);
+/// a panic mid-backup doesn't permanently strand the flag. It keeps the
+/// computer awake for as long as it lives.
+pub(crate) struct BackupGuard {
+    engine: SharedEngine,
+    _awake: AwakeHold,
+}
 
 impl BackupGuard {
     /// Returns `Some` when the caller has exclusive ownership of the backup
@@ -25,13 +30,16 @@ impl BackupGuard {
                 std::sync::atomic::Ordering::SeqCst,
             )
             .ok()
-            .map(|_| Self(engine.clone()))
+            .map(|_| Self {
+                engine: engine.clone(),
+                _awake: keep_awake::hold(Work::Backup, "backup"),
+            })
     }
 }
 
 impl Drop for BackupGuard {
     fn drop(&mut self) {
-        self.0
+        self.engine
             .backup_in_progress
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -59,6 +67,7 @@ pub(crate) async fn run_backup(
     // run's duration (the durable backup history — see `BackupLastRun` /
     // `load_recent_runs`).
     let started_at = chrono::Utc::now();
+    let monotonic_start = std::time::Instant::now();
     let result = backup::create_backup(workspace, database_url, key, provider, progress).await;
     let finished_at = chrono::Utc::now();
 
@@ -105,12 +114,13 @@ pub(crate) async fn run_backup(
                 Err(e) => log!(
                     "[Backup] Could not read the retention count ({}); skipping pruning this run rather than defaulting to {}",
                     e,
-                    backup::DEFAULT_BACKUP_RETENTION
+                    crate::core::prefs::BACKUP_RETENTION.default_number()
                 ),
             }
         }
         Err(e) => {
-            let msg = e.to_string();
+            let slept = time_asleep(finished_at - started_at, monotonic_start.elapsed());
+            let msg = describe_backup_failure(&e.to_string(), slept);
             log!("[Backup] Failed: {}", msg);
             persist_last_run(pool, &backup::BackupLastRun::failure(&msg, started_at)).await;
             drop(guard);
@@ -127,6 +137,49 @@ pub(crate) async fn run_backup(
                 .await;
             notify_backup_failure(engine, provider.id(), &msg).await;
         }
+    }
+}
+
+/// Shortest sleep worth naming in a failure. Below it, the gap between the two
+/// clocks is scheduling noise, not a computer that slept.
+const SLEEP_NOTE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the computer slept during a run, when it slept long enough to name.
+///
+/// Wall-clock time keeps moving while the computer sleeps. `Instant` does not,
+/// on macOS or Linux. So the difference is the time spent asleep.
+fn time_asleep(
+    wall: chrono::Duration,
+    monotonic: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let wall = wall.to_std().ok()?;
+    wall.checked_sub(monotonic)
+        .filter(|gap| *gap >= SLEEP_NOTE_THRESHOLD)
+}
+
+/// The failure as the user reads it. A sleep is named first, because a
+/// connection that died while the computer slept explains the error under it.
+/// The note states only what the clocks measured.
+fn describe_backup_failure(error: &str, slept: Option<std::time::Duration>) -> String {
+    match slept {
+        Some(gap) => format!(
+            "The computer slept for {} during this backup. {error}",
+            spoken_duration(gap)
+        ),
+        None => error.to_string(),
+    }
+}
+
+/// `1 minute`, `13 minutes`, `2 hours`, `1 hour 5 minutes`. Rounded to the
+/// nearest minute, and never below one.
+fn spoken_duration(d: std::time::Duration) -> String {
+    let total = ((d.as_secs() + 30) / 60).max(1);
+    let unit = |n: u64, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    let (hours, minutes) = (total / 60, total % 60);
+    match (hours, minutes) {
+        (0, m) => unit(m, "minute"),
+        (h, 0) => unit(h, "hour"),
+        (h, m) => format!("{} {}", unit(h, "hour"), unit(m, "minute")),
     }
 }
 
@@ -250,62 +303,42 @@ async fn emit_backup_notification(
     push::send_push_to_all(engine, title, message, Some(notification_id));
 }
 
-/// Settings → System → Backup: the page carrying the health card with the last
-/// run and its error, the key, the schedule, and the *Grant access* button.
-fn backup_settings_tap() -> crate::scheduler::notifications::Tap {
-    settings_tap("backup")
-}
-
-/// The two pages a backup notification can send the user to, written the way the
-/// UI's own breadcrumbs read (`SETTINGS_SYSTEM_SUBPANEL_ITEMS` in the frontend
-/// store, and `system-knowhow/backups.md`).
+/// Where a failure notification sends the reader, which is NOT always the
+/// Backup page. The body links this page and the tap opens it, so the two
+/// cannot disagree.
 ///
-/// Each sits beside the tap that opens the same page, because the body has to
-/// name a route the user can actually walk when they read the notification
-/// somewhere the tap is not available. **Backup is a subpanel of System, not a
-/// top-level category**: these bodies said "Settings, then Backup" until
-/// 2026-08-07, which is a page with no Backup on it. The 2026-08-05 Settings
-/// restructure moved it and nothing here noticed.
-const BACKUP_PAGE_PATH: &str = "Settings → System → Backup";
-const ACCOUNTS_PAGE_PATH: &str = "Settings → Accounts";
-
-/// Where a failure notification should land, which is NOT always the Backup
-/// page.
-///
-/// The tap has to agree with the remedy the body just gave, or the notification
-/// argues with itself. For a provider with no account the remedy is *connect
-/// it*, and connecting happens only in Settings → Accounts: the Backup page has
-/// no account UI, and `system-knowhow/backups.md` is emphatic that sending a
-/// user there to connect is how this flow goes wrong. Every other cause is a
-/// backup-page matter.
-fn backup_failure_tap(
-    readiness: Option<&crate::core::backup::ProviderReadiness>,
-) -> crate::scheduler::notifications::Tap {
+/// For a provider with no account the remedy is *connect it*, and connecting
+/// happens only in Settings → Accounts: the Backup page has no account UI, and
+/// `system-knowhow/backups.md` is emphatic that sending a user there to connect
+/// is how this flow goes wrong. Every other cause is a Backup-page matter: it
+/// carries the health card, the error and the *Grant access* button.
+fn backup_failure_page(readiness: Option<&crate::core::backup::ProviderReadiness>) -> SettingsPage {
     match readiness {
-        Some(r) if !r.connected => settings_tap("accounts"),
-        _ => backup_settings_tap(),
+        Some(r) if !r.connected => SettingsPage::ACCOUNTS,
+        _ => SettingsPage::BACKUP,
     }
 }
 
-/// The key-generated body, hoisted to a const so a test can hold it to the same
-/// page path the failure bodies name (they all point at one page, and all three
-/// named the pre-restructure route until 2026-08-07).
-const BACKUP_KEY_GENERATED_MESSAGE: &str = concat!(
-    "Lucidos created a new encryption key for your backups. ",
-    "Store it somewhere safe: you need it to restore, and it cannot be recovered. ",
-    "Open Settings → System → Backup to view and copy it."
-);
+/// The key-generated body. It links the Backup page, where the key can be
+/// revealed and copied.
+fn backup_key_generated_message() -> String {
+    format!(
+        "Lucidos created a new encryption key for your backups. \
+         Store it somewhere safe: you need it to restore, and it cannot be recovered. \
+         Open {} to view and copy it.",
+        SettingsPage::BACKUP.link()
+    )
+}
 
 /// Notify the user that a backup path generated a fresh encryption key they
 /// never saw, so they must store it: it cannot be recovered and is required to
-/// restore. The tap deep-links to the Backup page, where the key can be
-/// revealed and copied.
+/// restore.
 async fn notify_backup_key_generated(engine: &SharedEngine) {
     emit_backup_notification(
         engine,
         BACKUP_KEY_GENERATED_TITLE,
-        BACKUP_KEY_GENERATED_MESSAGE,
-        backup_settings_tap(),
+        &backup_key_generated_message(),
+        SettingsPage::BACKUP.tap(),
     )
     .await;
 }
@@ -330,9 +363,7 @@ const BACKUP_FAILURE_DEDUP_MINUTES: i64 = 30;
 ///
 /// `readiness` is `None` when the verdict could not be resolved (an unknown
 /// provider id, or a DB error on the lookup). That falls back to the destination
-/// alone, which is right for every cause: the Backup page carries the health
-/// card, the error and the *Grant access* button, so it is where the user needs
-/// to be whatever went wrong.
+/// alone, which is right for every cause.
 fn backup_failure_body(
     provider_name: Option<&str>,
     readiness: Option<&crate::core::backup::ProviderReadiness>,
@@ -341,19 +372,16 @@ fn backup_failure_body(
     // A provider whose meta we could not resolve is named generically rather
     // than by its raw id, which is a wire value the user has never seen.
     let who = provider_name.unwrap_or("Your backup provider");
-    // Each branch names the page its own tap opens (see `backup_failure_tap`),
-    // so the text and the destination cannot disagree. Connecting is the one
-    // remedy that does NOT live on the Backup page.
+    let page = backup_failure_page(readiness).link();
     let remedy = match readiness {
-        Some(r) if !r.connected => format!(
-            "{who} has no connected account, so nothing can upload. \
-             Connect it in {ACCOUNTS_PAGE_PATH}."
-        ),
+        Some(r) if !r.connected => {
+            format!("{who} has no connected account, so nothing can upload. Connect it in {page}.")
+        }
         Some(r) if !r.ready() => format!(
             "{who} is connected but has not granted the permissions a backup needs. \
-             Open {BACKUP_PAGE_PATH} and press Grant access."
+             Open {page} and press Grant access."
         ),
-        _ => format!("Open {BACKUP_PAGE_PATH} to see the details and retry."),
+        _ => format!("Open {page} to see the details and retry."),
     };
     format!("{remedy}\n\n{error}")
 }
@@ -415,10 +443,9 @@ pub(crate) async fn notify_backup_failure(engine: &SharedEngine, provider_id: &s
         engine,
         BACKUP_FAILURE_TITLE,
         &body,
-        // Deep-linked for the same reason as the key-generated notification
-        // above: a Tap::Modal here opened a card repeating the error and
-        // offering nothing to do about it. Which page depends on the remedy.
-        backup_failure_tap(readiness.as_ref()),
+        // A Tap::Modal here opened a card repeating the error and offering
+        // nothing to do about it. Which page depends on the remedy.
+        backup_failure_page(readiness.as_ref()).tap(),
     )
     .await;
 }
@@ -426,11 +453,62 @@ pub(crate) async fn notify_backup_failure(engine: &SharedEngine, provider_id: &s
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_failure_body, backup_failure_tap, backup_settings_tap, BACKUP_FAILURE_TITLE,
-        BACKUP_KEY_GENERATED_MESSAGE,
+        backup_failure_body, backup_failure_page, backup_key_generated_message,
+        describe_backup_failure, spoken_duration, time_asleep, BACKUP_FAILURE_TITLE,
     };
+    use std::time::Duration;
+
+    /// The reported run: 24m49s on the wall clock, of which the process ran for
+    /// under 12 minutes.
+    #[test]
+    fn a_run_that_spanned_a_sleep_reports_the_gap() {
+        let wall = chrono::Duration::seconds(24 * 60 + 49);
+        let ran = Duration::from_secs(11 * 60 + 40);
+        assert_eq!(
+            time_asleep(wall, ran),
+            Some(Duration::from_secs(13 * 60 + 9))
+        );
+    }
+
+    /// Scheduling noise between the two clocks is not a sleep. Nor is a wall
+    /// clock that stepped backwards, which leaves no gap at all.
+    #[test]
+    fn a_run_that_never_slept_reports_nothing() {
+        let ran = Duration::from_secs(300);
+        assert_eq!(time_asleep(chrono::Duration::seconds(301), ran), None);
+        assert_eq!(time_asleep(chrono::Duration::seconds(359), ran), None);
+        assert_eq!(time_asleep(chrono::Duration::seconds(200), ran), None);
+        assert_eq!(time_asleep(chrono::Duration::seconds(-5), ran), None);
+    }
+
+    #[test]
+    fn the_sleep_note_leads_and_the_error_survives() {
+        const ERROR: &str = "Lost the connection to Google Drive while starting the upload.";
+        assert_eq!(describe_backup_failure(ERROR, None), ERROR);
+        let noted = describe_backup_failure(ERROR, Some(Duration::from_secs(13 * 60 + 9)));
+        assert_eq!(
+            noted,
+            format!("The computer slept for 13 minutes during this backup. {ERROR}")
+        );
+    }
+
+    #[test]
+    fn a_sleep_is_spoken_in_whole_minutes_and_hours() {
+        assert_eq!(spoken_duration(Duration::from_secs(60)), "1 minute");
+        assert_eq!(spoken_duration(Duration::from_secs(89)), "1 minute");
+        assert_eq!(spoken_duration(Duration::from_secs(90)), "2 minutes");
+        assert_eq!(spoken_duration(Duration::from_secs(2 * 3600)), "2 hours");
+        assert_eq!(
+            spoken_duration(Duration::from_secs(3600 + 5 * 60)),
+            "1 hour 5 minutes"
+        );
+    }
     use crate::core::backup::ProviderReadiness;
     use crate::scheduler::notifications::{NavigateTarget, Tap};
+
+    fn backup_failure_tap(readiness: Option<&ProviderReadiness>) -> Tap {
+        backup_failure_page(readiness).tap()
+    }
 
     /// The Settings sub-section a tap deep-links to, or `None` for a modal.
     fn tapped_view(tap: Tap) -> Option<String> {
@@ -496,16 +574,14 @@ mod tests {
         );
     }
 
-    /// Every remedy names the page its OWN tap opens. A body naming Accounts
-    /// while the tap lands on Backup makes the notification argue with itself,
-    /// which is the whole failure this change set out to end.
+    /// Every remedy LINKS the page its OWN tap opens. A body naming Accounts
+    /// while the tap lands on Backup makes the notification argue with itself.
     ///
-    /// The expected routes are spelled out here rather than read from
-    /// `BACKUP_PAGE_PATH` / `ACCOUNTS_PAGE_PATH`, so this pins the WORDING too:
-    /// sharing the const with the code under test would let a wrong path stay
-    /// green.
+    /// The expected links are spelled out here rather than read from
+    /// `SettingsPage`, so this pins the WORDING too: sharing the const with the
+    /// code under test would let a wrong path stay green.
     #[test]
-    fn every_remedy_names_the_page_its_tap_opens() {
+    fn every_remedy_links_the_page_its_tap_opens() {
         for readiness in [
             Some(&connected_not_ready()),
             Some(&ready()),
@@ -515,14 +591,14 @@ mod tests {
             let body = backup_failure_body(Some("Dropbox"), readiness, "e");
             let view = tapped_view(backup_failure_tap(readiness))
                 .unwrap_or_else(|| panic!("{readiness:?} must deep-link, not open a modal"));
-            let named = match view.as_str() {
-                "accounts" => "Settings → Accounts",
-                "backup" => "Settings → System → Backup",
+            let link = match view.as_str() {
+                "accounts" => "[Settings → Accounts](settings:accounts)",
+                "backup" => "[Settings → System → Backup](settings:backup)",
                 other => panic!("unexpected destination {other}"),
             };
             assert!(
-                body.contains(named),
-                "{readiness:?} taps through to {view} but the body does not say so: {body}"
+                body.contains(link),
+                "{readiness:?} taps through to {view} but the body does not link it: {body}"
             );
         }
     }
@@ -606,53 +682,20 @@ mod tests {
         assert!(body.starts_with("Your backup provider"), "{body}");
     }
 
-    /// The reported wording bug: Backup is a subpanel of Settings → System, so
-    /// a body that stops at "Settings, then Backup" (what all three of these
-    /// said until 2026-08-07) sends the reader to a page with no Backup on it.
-    /// Someone reading the notification where the tap is not to hand, an email
-    /// mirror, a lock-screen banner they dismiss, has only this route.
+    /// Backup is a subpanel of Settings → System. A body that stops at
+    /// "Settings, then Backup" sends the reader to a page with no Backup on it.
+    /// Someone reading the notification where the tap is not to hand, a
+    /// lock-screen banner they dismiss, has only this route.
     #[test]
-    fn every_backup_remedy_names_the_system_step() {
-        const PATH: &str = "Settings → System → Backup";
+    fn every_backup_remedy_links_the_system_step() {
+        const LINK: &str = "[Settings → System → Backup](settings:backup)";
         for readiness in [Some(&connected_not_ready()), Some(&ready()), None] {
             let body = backup_failure_body(Some("Dropbox"), readiness, "e");
-            assert!(body.contains(PATH), "{readiness:?}: {body}");
+            assert!(body.contains(LINK), "{readiness:?}: {body}");
         }
         // The sibling notification points at the same page and must agree.
-        assert!(
-            BACKUP_KEY_GENERATED_MESSAGE.contains(PATH),
-            "{BACKUP_KEY_GENERATED_MESSAGE}"
-        );
-    }
-
-    /// A backup notification deep-links to the page that carries its remedy.
-    /// A `Tap::Modal` is what made the failure notification a dead end.
-    #[test]
-    fn the_tap_deep_links_to_the_backup_settings_page() {
-        assert_eq!(
-            tapped_view(backup_settings_tap()).as_deref(),
-            Some("backup")
-        );
-    }
-
-    /// Every destination has to be one the frontend router renders. An id
-    /// outside `NAVIGABLE_SETTINGS_VIEWS` (`llm/tools/misc.rs`) toasts
-    /// "Unknown settings section" instead of navigating, turning the tap back
-    /// into the dead end it replaced.
-    #[test]
-    fn every_tap_destination_is_a_renderable_settings_view() {
-        let renderable = crate::llm::tools::NAVIGABLE_SETTINGS_VIEWS;
-        let taps = [
-            backup_settings_tap(),
-            backup_failure_tap(Some(&not_connected())),
-            backup_failure_tap(Some(&connected_not_ready())),
-            backup_failure_tap(Some(&ready())),
-            backup_failure_tap(None),
-        ];
-        for tap in taps {
-            let view = tapped_view(tap).expect("a deep link");
-            assert!(renderable.contains(&view.as_str()), "{view}");
-        }
+        let key_message = backup_key_generated_message();
+        assert!(key_message.contains(LINK), "{key_message}");
     }
 
     /// A key the user never saw makes every backup unrestorable once the

@@ -154,17 +154,20 @@ test.describe('Notification row: jump, or read the card', () => {
   });
 
   test('the chevron opens the card even though it sits over the row button', async ({ page }) => {
-    await navigateToApp(page);
-
     // A source event makes this a jumping row, which is the only kind that has
     // a chevron. Nothing here follows the jump.
     const source = seedThreadEvent();
+    // Posted before the page opens. An open page that answers the presence
+    // check gets the notification's toast. The toast stays while the row is
+    // unread, and on a phone it covers the chevron. Whether a page answers
+    // varies by browser, so no page is there to ask.
     await postNotification(page, {
       title: 'Chevron reaches the card',
       message: 'the row body jumps to the thread instead',
       thread_id: source.threadId,
       event_id: source.eventId,
     });
+    await navigateToApp(page);
 
     await ensureMobileView(page, 'content');
     await clickVisibleElement(page, '.notifications-bell');

@@ -158,6 +158,16 @@ fn ask_user_question_tool_is_in_default_set() {
         "`questions` must be required, got: {:?}",
         required_names
     );
+
+    // The chat card's own field, outside the shape CC shares: optional, and a
+    // string the engine shows verbatim above the first card.
+    let message = props.get("message").expect("schema must expose `message`");
+    assert_eq!(message.get("type").and_then(|v| v.as_str()), Some("string"));
+    assert!(!required_names.contains(&"message"));
+    // A mockup is what the field most often has to carry, and the one thing
+    // the summary of a pre-card reply always drops.
+    let description = message["description"].as_str().unwrap_or_default();
+    assert!(description.contains("pictures"), "{description}");
 }
 
 /// Regression guard for the reported card: a timezone question whose fourth
@@ -199,13 +209,12 @@ fn ask_user_question_description_bans_a_text_entry_escape_option() {
     );
 }
 
-/// Each question carries the CC-equivalent fields: `question` text, an
-/// `options` array of `{label, description?}`, and an optional
-/// `multiSelect` flag. `header` is the short chip CC uses to label the
-/// question in the UI; we accept it too for parity even though Lucidos
-/// doesn't currently render it.
+/// Each question carries `question` text, an `options` array of
+/// `{label, description?}`, and an optional `multiSelect` flag. CC's
+/// `header` chip is deliberately absent: Lucidos never renders it, and
+/// models filled it instead of the required `question`.
 #[test]
-fn ask_user_question_per_question_schema_matches_cc() {
+fn ask_user_question_per_question_schema() {
     let tools = get_default_tools(&ToolCapabilities::all_open());
     let tool = tools
         .iter()
@@ -220,13 +229,17 @@ fn ask_user_question_per_question_schema_matches_cc() {
     let item_props = item_schema
         .get("properties")
         .expect("each question item must have `properties`");
-    for field in ["question", "options", "multiSelect", "header"] {
+    for field in ["question", "options", "multiSelect"] {
         assert!(
             item_props.get(field).is_some(),
-            "per-question schema missing `{}` — must match CC's AskUserQuestion",
-            field
+            "per-question schema missing `{field}`"
         );
     }
+    assert!(
+        item_props.get("header").is_none(),
+        "`header` must stay out of the chat schema: the card never shows it, \
+         and models sent it in place of `question`"
+    );
 
     // Per-question required: at minimum `question` and `options`.
     let item_required = item_schema
@@ -483,7 +496,6 @@ fn ask_user_question_schema_parses_with_cc_parser() {
         "questions": [
             {
                 "question": "Which approach should I take?",
-                "header": "Approach",
                 "options": [
                     { "label": "Approach A", "description": "fast" },
                     { "label": "Approach B" }
@@ -806,6 +818,7 @@ fn thread_queue_grouped_tool_exposes_list_and_update_policy() {
         "max_queued_per_trigger",
         "reserved_background",
         "max_event_trigger_depth",
+        "max_concurrent_children_per_thread",
         "overflow",
     ] {
         assert!(
@@ -1298,6 +1311,7 @@ fn two_callers_in_one_workspace_get_a_byte_identical_array() {
             image_provider: true,
             judgment_provider: false,
             context_mode: false,
+            memory_tree: false,
         },
     ] {
         assert_eq!(
@@ -1452,6 +1466,38 @@ fn chat_wire_order(caps: &ToolCapabilities) -> Vec<String> {
         .chain(chat_tail_tools(caps))
         .map(|t| t.name)
         .collect()
+}
+
+/// A Tree turn never reads Classic's memory, so it is not offered the tool
+/// that edits it. The module swaps `memory` for `recall` in one slot, which
+/// moves no other grouped tool and so keeps the cached array's order.
+#[test]
+fn the_memory_module_swaps_memory_for_recall_in_one_slot() {
+    let names = |caps: &ToolCapabilities| -> Vec<String> {
+        crate::capability_manifest::llm_tools_for(caps)
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    };
+    let classic = names(&ToolCapabilities {
+        memory_tree: false,
+        ..ToolCapabilities::all_open()
+    });
+    let tree = names(&ToolCapabilities::all_open());
+
+    assert!(classic.iter().any(|n| n == tn::MEMORY));
+    assert!(!classic.iter().any(|n| n == tn::RECALL));
+    let swapped: Vec<String> = classic
+        .iter()
+        .map(|n| {
+            if n == tn::MEMORY {
+                tn::RECALL.to_string()
+            } else {
+                n.clone()
+            }
+        })
+        .collect();
+    assert_eq!(swapped, tree);
 }
 
 #[test]

@@ -1,15 +1,7 @@
 /**
- * Answering a question survives a stale connection.
- *
- * Reported from an iOS PWA: a question card was tapped twice and both taps
- * failed with "Failed to send answer: unknown error". No answer reached the
- * engine either time, and the third tap a minute later landed. That is the
- * half-closed HTTP/2 connection a backgrounded PWA wakes up holding, which
- * WebKit rejects as `TypeError("Load failed")` before the request goes out.
- *
- * The neighbouring mutations (`stopClaudeCode`, `cancelChat`, the compose PUT)
- * already retry through `mutatingFetchIdempotent`. The answer POST did not, and
- * it is the one tap the agent is blocked on.
+ * The answer POST is one attempt. The store action retries a stale
+ * connection, as every send does (`withQuietRetries`). A retry here too would
+ * multiply the attempts the user waits through.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { answerThreadQuestion } from './chat';
@@ -31,46 +23,34 @@ function withFetch(...impls: Array<() => Promise<Response>>): ReturnType<typeof 
 
 const answer = { kind: 'Selected', option_id: 'opt-0' } as const;
 
-describe('answerThreadQuestion over a stale connection', () => {
-  it('retries the POST once when the first attempt never leaves the device', async () => {
-    const mock = withFetch(
-      () => Promise.reject(new TypeError('Load failed')),
-      () => Promise.resolve(new Response('{"ok":true}', { status: 200 })),
-    );
+describe('answerThreadQuestion', () => {
+  it('posts the answer once', async () => {
+    const mock = withFetch(() => Promise.resolve(new Response('{"ok":true}', { status: 200 })));
 
     await expect(answerThreadQuestion('t1', 'tool-1', answer)).resolves.toBe(true);
-    expect(mock).toHaveBeenCalledTimes(2);
-    // The retry carries the same answer: a re-picked selection is exactly what
-    // the user should not have to do.
-    expect(mock.mock.calls[1][1]?.body).toBe(mock.mock.calls[0][1]?.body);
-    expect(String(mock.mock.calls[1][0])).toContain('/threads/t1/answer-question');
+    expect(mock).toHaveBeenCalledTimes(1);
+    expect(String(mock.mock.calls[0][0])).toContain('/threads/t1/answer-question');
   });
 
-  it('surfaces a second transport failure rather than looping', async () => {
-    const mock = withFetch(
-      () => Promise.reject(new TypeError('Load failed')),
-      () => Promise.reject(new TypeError('Load failed')),
-    );
+  it('gives up on a stalled attempt, so the store action can retry it', async () => {
+    const mock = withFetch(() => Promise.resolve(new Response('{"ok":true}', { status: 200 })));
+
+    await answerThreadQuestion('t1', 'tool-1', answer);
+    expect(mock.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('leaves a dropped connection to the store action to retry', async () => {
+    const mock = withFetch(() => Promise.reject(new TypeError('Load failed')));
 
     await expect(answerThreadQuestion('t1', 'tool-1', answer)).rejects.toThrow('Load failed');
-    expect(mock).toHaveBeenCalledTimes(2);
-  });
-
-  it('does not retry a rejection that says something about the request', async () => {
-    const mock = withFetch(() => Promise.reject(new TypeError('answer is not JSON')));
-
-    await expect(answerThreadQuestion('t1', 'tool-1', answer)).rejects.toThrow('not JSON');
     expect(mock).toHaveBeenCalledTimes(1);
   });
 
-  it('reports a 409 as false without a second attempt', async () => {
-    // The question is already answered or gone. Re-sending would 409 forever.
-    const mock = withFetch(() =>
-      Promise.resolve(new Response('{"error":"no pending question"}', { status: 409 })),
-    );
+  it('reports a 409 as false', async () => {
+    // The question is already answered or gone.
+    withFetch(() => Promise.resolve(new Response('{"error":"no pending question"}', { status: 409 })));
 
     await expect(answerThreadQuestion('t1', 'tool-1', answer)).resolves.toBe(false);
-    expect(mock).toHaveBeenCalledTimes(1);
   });
 
   it('raises an ApiError carrying the engine reason on a 500', async () => {

@@ -23,13 +23,11 @@ import { preferences } from '../../store/store';
 import { Explainer } from '../shared/Explainer';
 import { Dropdown } from '../shared/Dropdown';
 import {
-  DEFAULT_VOICE_TALKER_MODEL,
   DEFAULT_VOICE_TALKER_VOICE,
-  DEFAULT_VOICE_TRANSCRIBER_MODEL,
   VOICE_RESIDENT_SECTIONS,
-  storedVoiceTalkerModel,
-  storedVoiceTalkerVoice,
-  storedVoiceTranscriberModel,
+  currentVoiceTalkerModel,
+  currentVoiceTalkerVoice,
+  currentVoiceTranscriberModel,
   setVoiceEnabled,
   setVoiceSectionEnabled,
   setVoiceTalkerModel,
@@ -175,9 +173,9 @@ export function VoiceSection() {
   const on = voiceEnabled();
   // Resolved rather than raw. A picker has to show what the call will dial,
   // and it has no placeholder to carry an unset value with.
-  const talker = storedVoiceTalkerModel() || DEFAULT_VOICE_TALKER_MODEL;
-  const transcriber = storedVoiceTranscriberModel() || DEFAULT_VOICE_TRANSCRIBER_MODEL;
-  const talkerVoice = storedVoiceTalkerVoice() || DEFAULT_VOICE_TALKER_VOICE;
+  const talker = currentVoiceTalkerModel();
+  const transcriber = currentVoiceTranscriberModel();
+  const talkerVoice = currentVoiceTalkerVoice();
   return (
     <div class="settings-section">
       <div class="settings-section-title" data-search-anchor="models:voice">Voice</div>
@@ -186,9 +184,8 @@ export function VoiceSection() {
           Voice (experimental)
           <Explainer title="Voice (experimental)">
             <p>
-              Adds a call control to the composer. Press it and you talk to Lucidos out
-              loud, on the thread you are already in. Speech and typing interleave in
-              one transcript.
+              Adds a call control to your home thread's composer. Press it and you talk
+              to Lucidos out loud. Speech and typing interleave in one transcript.
             </p>
             <p>
               Two models share the thread. A rented speech-to-speech <strong>talker</strong>{' '}
@@ -197,8 +194,10 @@ export function VoiceSection() {
               turn, and a short call can cost several.
             </p>
             <p>
-              It needs the OpenAI provider configured. Experimental: the shape of a call
-              is still settling, and what it costs is not capped.
+              It needs the home thread, switched on under Appearance &amp; Behavior,
+              Experimental. It also needs the OpenAI provider configured.
+              Experimental: the shape of a call is still settling, and what it costs is
+              not capped.
             </p>
           </Explainer>
         </span>

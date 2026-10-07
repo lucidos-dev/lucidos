@@ -15,6 +15,7 @@ import {
   awayFromBottom,
   followAnsweredQuestion,
   followCanceledTurn,
+  followConfirmedCard,
   followContinuedThread,
   followResolvedPermission,
   followSentMessage,
@@ -250,8 +251,8 @@ function makeEl(opts: {
       questionCards.push(answered);
       return { body: answered, panel: card.panel };
     },
-    /** The agent draws a row into `turn`'s response body: its Thinking step,
-     *  its first text, a tool row. This is what ends the landing's hold, and
+    /** The agent draws a row into `turn`'s response body: its first text or
+     *  a tool row. This is what ends the landing's hold, and
      *  it is what arrived AFTER the glide in the report that produced it. */
     drawResponseRow(turn: any) {
       turn.drawn.push({ isConnected: true });
@@ -281,8 +282,8 @@ function makeEl(opts: {
       isConnected: true,
       statusLine: null,
       /** The rows the agent has DRAWN into this turn's response body: its
-       *  Thinking step, its text, its tool rows. The landing's hold ends on the
-       *  first one that was not there when the reader submitted. */
+       *  text and its tool rows, never a Thinking row. The landing's hold ends
+       *  on the first one that was not there when the reader submitted. */
       drawn: [] as any[],
       closest: (sel: string) => (sel === '.chat-exchange' ? turn : null),
       matches: (sel: string) => sel === '.chat-exchange',
@@ -414,6 +415,19 @@ function readerScrollsTo(el: { scrollTop: number }, top: number, onScroll: () =>
   readerGestureForTest(el as unknown as HTMLElement);
   el.scrollTop = top;
   onScroll();
+}
+
+/** The reader answers the card `toolUseId`, and the engine confirms it at once.
+ *  A card submit moves nobody until its confirm, which has its own block below. */
+function answerAndConfirm(toolUseId: string) {
+  followAnsweredQuestion(toolUseId);
+  followConfirmedCard(toolUseId);
+}
+
+/** The same for deciding the permission card `requestId`. */
+function decideAndConfirm(requestId: string) {
+  followResolvedPermission(requestId);
+  followConfirmedCard(requestId);
 }
 
 describe('the follow toggle arms a standing follow', () => {
@@ -1408,7 +1422,7 @@ describe('a reader who scrolls away ends the follow on a LIVE thread', () => {
     const { el } = armedThenScrolledUp();
     el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     vi.advanceTimersByTime(1500);
 
     expect(el.scrollTop).toBe(2500);
@@ -1423,7 +1437,7 @@ describe('a reader who scrolls away ends the follow on a LIVE thread', () => {
     atBottom(el);
     setFollowLiveEdge(true);
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     readerScrollsTo(el, 900, onScroll); // and they scroll away before the agent picks it up
 
     expect(followingLiveEdge.value).toBe(false);
@@ -1543,13 +1557,46 @@ describe('a scroll turns the follow off only while the thread is live', () => {
     const { el, onResize } = parkedAt800();
     el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     vi.advanceTimersByTime(1500);
     expect(el.scrollTop).toBe(2500);
 
     el.scrollHeight = 3400;
     onResize();
     expect(el.scrollTop).toBe(2900);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('rides on to the live edge when a cancel follows a flick, through its coast', () => {
+    // Reported on iOS: the reader flicks down toward the card and taps Cancel
+    // while the flick still coasts. The coast fires scroll events after the tap,
+    // inside the gesture window. Read as the reader's, they parked the ride
+    // again mid-glide, short of the edge with the toggle lit.
+    const { el, onScroll } = parkedAt800();
+    el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+    readerScrollsTo(el, 2300, onScroll); // the flick, still short of the edge
+    expect(followingLiveEdge.value).toBe(true);
+
+    followCanceledTurn('q1');
+    vi.advanceTimersByTime(30);
+    el.scrollTop = el.scrollTop + 5;     // the coast, a frame into the glide
+    onScroll();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2500);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('still parks on a NEW gesture made after the submit', () => {
+    const { el, onScroll } = parkedAt800();
+    el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+
+    followCanceledTurn('q1');
+    vi.advanceTimersByTime(30);
+    readerScrollsTo(el, 900, onScroll);  // the reader takes over mid-glide
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(900);
     expect(followingLiveEdge.value).toBe(true);
   });
 
@@ -2074,6 +2121,25 @@ describe('sending a message lands the reader on the live edge', () => {
     expect(el.scrollTop).toBeGreaterThan(parked);
   });
 
+  it('still lands after the platform moves the reader before their turn renders', () => {
+    // A phone send blurs the composer, and the keyboard closing moves the offset
+    // with no finger behind it. Only the reader's own scroll cancels a landing.
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const { onScroll, onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    atBottom(el);
+
+    followSentMessage();
+    el.scrollTop = 2440; // the platform, no gesture
+    onScroll();
+    el.addUserMessage({ top: 2900, height: 120 });
+    el.scrollHeight = 3400;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2900);
+  });
+
   it('writes nothing when the turn rendered without moving the live edge', () => {
     // A reader whose transcript did not grow has nowhere to go, and a submit
     // never scrolls BACKWARDS. Reached by measuring the target rather than
@@ -2272,7 +2338,7 @@ describe('sending a message lands the reader on the live edge', () => {
       // itself (`followSentMessage`) and the stale-landing case would go
       // untested.
       el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
-      followAnsweredQuestion('q1');
+      answerAndConfirm('q1');
       vi.advanceTimersByTime(1500);
 
       expect(el.scrollTop).toBe(2500); // 3000 - 500, the live edge
@@ -2632,7 +2698,7 @@ describe('the reader\'s own message glides into view, gently', () => {
     vi.advanceTimersByTime(1500);
     expect(el.scrollTop).toBe(2500);
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     el.scrollHeight = 3300;
     onResize();
     expect(el.scrollTop).toBe(2800);
@@ -2775,7 +2841,7 @@ describe('answering a question card lands the same way', () => {
     const parked = atBottom(el);
     el.writes = 0;
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
 
     expect(el.writes).toBe(0);
     expect(el.scrollTop).toBe(parked);
@@ -2790,7 +2856,7 @@ describe('answering a question card lands the same way', () => {
     const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
     const parked = atBottom(el);
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     el.drawResponseRow(card.panel.turn); // the agent resumes, ending the hold
     onResize();
     vi.advanceTimersByTime(1500);
@@ -2813,7 +2879,7 @@ describe('answering a question card lands the same way', () => {
     setActiveScrollElement(el);
     el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     expect(el.scrollTop).toBe(500); // a glide, not a jump
 
     vi.advanceTimersByTime(1500);
@@ -2831,7 +2897,7 @@ describe('answering a question card lands the same way', () => {
     setActiveScrollElement(el);
     const live = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     vi.advanceTimersByTime(60);
     const midGlide = el.scrollTop;
     expect(midGlide).toBeGreaterThan(500);
@@ -2851,7 +2917,7 @@ describe('answering a question card lands the same way', () => {
     setActiveScrollElement(el);
     const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     vi.advanceTimersByTime(1500);
     expect(el.scrollTop).toBe(2500);
 
@@ -2873,7 +2939,7 @@ describe('answering a question card lands the same way', () => {
     setActiveScrollElement(el);
     el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     vi.advanceTimersByTime(60);
     expect(el.scrollTop).toBeGreaterThan(500);
 
@@ -2914,25 +2980,78 @@ describe('answering a question card lands the same way', () => {
     expect(el.scrollTop).toBe(2500); // 3000 - 500, the live edge
   });
 
-  it('holds that card while the answer and the reply render into it', () => {
-    // The typed-answer block lands inside the card a moment after the submit,
-    // and the agent's first row after that. Both are what the reader submitted
-    // to see, so the hold carries them exactly as a clicked option's does.
+  /** A typed answer does NOT wait for the confirm, unlike a picked option. Its
+   *  spinner sits on the "Your answer" label under the options, which is often
+   *  below the fold. Waiting left the reader looking at the options while their
+   *  answer spun out of sight. Reported. */
+  it('lands at once on the typed answer and its spinner, before any confirm', () => {
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
     const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
 
     followSentMessage();
-    vi.advanceTimersByTime(1500);
-    expect(el.scrollTop).toBe(2500);
-
+    followSentMessage();
     el.answerQuestionCard(card); // the typed-answer block grows the card
     el.scrollHeight = 3200;
     onResize();
     vi.advanceTimersByTime(1500);
 
-    expect(el.scrollTop).toBe(2700); // 3200 - 500, the live edge again
+    expect(el.scrollTop).toBe(2700); // 3200 - 500, the live edge
+  });
+
+  it('then holds through a slow confirm, and shows the agent line when it comes', () => {
+    // The confirm took longer than the eight-second round-trip budget. The old
+    // landing waited for it and lapsed, so neither scroll happened. Reported.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+
+    followSentMessage();
+    followSentMessage();
+    el.answerQuestionCard(card);
+    el.scrollHeight = 3200;
+    onResize();
+    vi.advanceTimersByTime(12_000);
+
+    followConfirmedCard('q1'); // late, and a no-op: the landing is in hand
+    el.scrollHeight = 3300; // the agent line under the card
+    onResize();
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(2800); // 3300 - 500
+
+    el.drawResponseRow(card.panel.turn); // the agent's first row ends the hold
+    el.scrollHeight = 3400;
+    onResize();
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(2900); // rests on that row
+
+    el.writes = 0;
+    el.scrollHeight = 5000; // the reply grows on below
+    onResize();
+    vi.advanceTimersByTime(1500);
+    expect(el.writes).toBe(0);
+  });
+
+  it('stops for the reader who scrolls away while the typed answer sends', () => {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    const { onScroll, onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+
+    followSentMessage();
+    followSentMessage();
+    vi.advanceTimersByTime(1500);
+    readerScrollsTo(el, 1200, onScroll);
+
+    el.answerQuestionCard(card);
+    el.scrollHeight = 3400;
+    onResize();
+    followConfirmedCard('q1');
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(1200);
   });
 
   /** A card nobody can answer leaves the send a send. Anchoring on a dead card
@@ -2985,7 +3104,7 @@ describe('answering a question card lands the same way', () => {
     el.addQuestionCard({ toolUseId: 'another-question', top: 2400, height: 300 });
     el.writes = 0;
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     vi.advanceTimersByTime(100); // well inside the landing deadline
     expect(el.writes).toBe(0);
     expect(el.scrollTop).toBe(500);
@@ -2996,6 +3115,258 @@ describe('answering a question card lands the same way', () => {
     vi.advanceTimersByTime(1500);
 
     expect(el.scrollTop).toBe(3500); // 4000 - 500, the live edge
+  });
+});
+
+/** A CARD SUBMIT MOVES THE READER ONCE THE ENGINE HAS IT. The picked button
+ *  spins until the answer or decision is confirmed, and the reader asked for
+ *  the scroll to wait for that: a glide under a spinning pick reads as the app
+ *  moving on before it knows the submit arrived. Reported. */
+describe('an answer lands once the engine confirms it', () => {
+  beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  it('moves nobody while the answer is sending, then glides to the live edge', () => {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+    el.writes = 0;
+
+    followAnsweredQuestion('q1');
+    el.answerQuestionCard(card); // the optimistic pick, spinning
+    el.scrollHeight = 3100;
+    onResize();
+    vi.advanceTimersByTime(1500);
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(500);
+
+    followConfirmedCard('q1');
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2600); // 3100 - 500, the live edge
+  });
+
+  it('waits the same way for a permission decision', () => {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.addPermissionCard({ requestId: 'p1', top: 2400, height: 300 });
+    el.writes = 0;
+
+    followResolvedPermission('p1');
+    vi.advanceTimersByTime(1500);
+    expect(el.writes).toBe(0);
+
+    followConfirmedCard('p1');
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2500);
+  });
+
+  it('keeps a rider where they parked until the answer is confirmed', () => {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const { onScroll, onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+    atBottom(el);
+    setFollowLiveEdge(true);
+    setTranscriptLive(false);
+    readerScrollsTo(el, 1500, onScroll); // a waiting thread parks the ride
+    el.writes = 0;
+
+    followAnsweredQuestion('q1');
+    el.scrollHeight = 3100; // the answered body swaps in
+    onResize();
+    vi.advanceTimersByTime(1500);
+    expect(el.writes).toBe(0);
+
+    followConfirmedCard('q1');
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2600);
+  });
+
+  it('keeps the reader where they scrolled while the answer was sending', () => {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    const { onScroll } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+
+    followAnsweredQuestion('q1');
+    readerScrollsTo(el, 300, onScroll);
+    followConfirmedCard('q1');
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(300);
+  });
+
+  it('still lands after a scroll the reader did not make while the answer was sending', () => {
+    // A phone answer closes the keyboard and shrinks the composer, and WebKit
+    // moves the offset with no finger behind it. That move is not the reader's,
+    // so the landing still runs when the engine confirms.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    const { onScroll } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+
+    followAnsweredQuestion('q1');
+    el.answerQuestionCard(card);
+    el.scrollTop = 460; // the platform, no gesture
+    onScroll();
+    followConfirmedCard('q1');
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2500);
+  });
+
+  it('still lands when WebKit moves the offset just after the keyboard compensation', () => {
+    // The compensation is an anchor write that carries the landing's stamp. A
+    // move inside its event window is the keyboard's offset, not a placement.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    const { onScroll } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+
+    followAnsweredQuestion('q1');
+    holdAcrossRelayout(el, 544);
+    el.scrollTop = 520; // WebKit, a frame later
+    onScroll();
+    followConfirmedCard('q1');
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2500);
+  });
+
+  it('moves nobody for an answer the engine never confirms', () => {
+    // A failed answer rolls the pick back and leaves the card live. A confirm
+    // arriving after the budget is no longer news the reader is waiting on.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+    el.writes = 0;
+
+    followAnsweredQuestion('q1');
+    vi.advanceTimersByTime(9000);
+    followConfirmedCard('q1');
+    vi.advanceTimersByTime(1500);
+
+    expect(el.writes).toBe(0);
+  });
+
+  it('moves nobody for a confirm the reader did not just submit', () => {
+    // Every answered card confirms on mount, history included.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+    el.writes = 0;
+
+    followConfirmedCard('q1');
+    followAnsweredQuestion('q2');
+    followConfirmedCard('q1');
+    vi.advanceTimersByTime(1500);
+
+    expect(el.writes).toBe(0);
+  });
+
+  /** A coding agent asks several questions as ONE tool call, and Lucidos shows
+   *  them one card at a time. An answer can resume the agent with a row in the
+   *  answered card's turn. The next card follows a few milliseconds later, in a
+   *  turn of its own. The row ended the hold, so the next card rendered under a
+   *  reader who had already come to rest. Reported. */
+  function answerTheFirstOfTwo() {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    const { onScroll, onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    const first = el.addQuestionCard({ toolUseId: 'q0', top: 2400, height: 300 });
+    followAnsweredQuestion('q0');
+    el.answerQuestionCard(first);
+    followConfirmedCard('q0');
+    return { el, first, onScroll, onResize };
+  }
+
+  it('brings the next question into view when it follows a drawn row', () => {
+    const { el, first, onResize } = answerTheFirstOfTwo();
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(2500);
+
+    el.drawResponseRow(first.panel.turn); // a row, which ends the hold
+    onResize();
+    el.addQuestionCard({ toolUseId: 'q1', top: 3000, height: 300 });
+    el.scrollHeight = 3400;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2900); // 3400 - 500, the next card in view
+  });
+
+  it('brings it into view when it lands mid-glide too', () => {
+    const { el, first, onResize } = answerTheFirstOfTwo();
+    vi.advanceTimersByTime(60);
+
+    el.drawResponseRow(first.panel.turn);
+    onResize();
+    el.addQuestionCard({ toolUseId: 'q1', top: 3000, height: 300 });
+    el.scrollHeight = 3400;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2900);
+  });
+
+  it('ends the hold on the next question, so nothing after it carries the reader', () => {
+    const { el, onResize } = answerTheFirstOfTwo();
+    vi.advanceTimersByTime(1500);
+
+    el.addQuestionCard({ toolUseId: 'q1', top: 3000, height: 300 });
+    el.scrollHeight = 3400;
+    onResize();
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(2900);
+    el.writes = 0;
+
+    el.scrollHeight = 5000;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.writes).toBe(0);
+  });
+
+  it('leaves a question that arrives later where it lands', () => {
+    // The agent asking again after working a while is the card ARRIVING, which
+    // moves nobody (ADR 0064).
+    const { el, first, onResize } = answerTheFirstOfTwo();
+    vi.advanceTimersByTime(1500);
+    el.drawResponseRow(first.panel.turn);
+    onResize();
+    vi.advanceTimersByTime(5000);
+    el.writes = 0;
+
+    el.addQuestionCard({ toolUseId: 'q1', top: 3000, height: 300 });
+    el.scrollHeight = 3400;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.writes).toBe(0);
+  });
+
+  it('leaves the next question alone once the reader has scrolled away', () => {
+    const { el, first, onScroll, onResize } = answerTheFirstOfTwo();
+    vi.advanceTimersByTime(1500);
+    el.drawResponseRow(first.panel.turn);
+    onResize();
+    readerScrollsTo(el, 1200, onScroll);
+    el.writes = 0;
+
+    el.addQuestionCard({ toolUseId: 'q1', top: 3000, height: 300 });
+    el.scrollHeight = 3400;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(1200);
   });
 });
 
@@ -3023,7 +3394,7 @@ describe('a submit holds the bottom until the agent draws', () => {
     const parked = atBottom(el);
     el.writes = 0;
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     expect(el.scrollTop).toBe(parked); // nothing to do yet, and nothing done
 
     el.drawResponseRow(card.panel.turn); // the agent picks the answer up
@@ -3049,7 +3420,7 @@ describe('a submit holds the bottom until the agent draws', () => {
       const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
       atBottom(el);
 
-      followAnsweredQuestion('q1');
+      answerAndConfirm('q1');
 
       clock += 1500;    // the engine is slow, and something reflows meanwhile
       el.scrollHeight = 3100;
@@ -3063,6 +3434,40 @@ describe('a submit holds the bottom until the agent draws', () => {
       vi.advanceTimersByTime(1500);
 
       expect(el.scrollTop).toBe(2900); // 3400 - 500, the live edge
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('keeps holding for a coding agent that takes many seconds to write', () => {
+    // Reported from a phone: a coding agent resuming on a cold cache wrote its
+    // first reply 7 to 14 seconds after each answer. The hold had lapsed by
+    // then, so the reply landed under the composer. The Thinking row drawn
+    // meanwhile is not a reply (`a-thinking-row-is-not-a-reply.test.tsx`), so
+    // here it is only the growth it causes.
+    const nowSpy = vi.spyOn(performance, 'now');
+    let clock = 1_000_000;
+    nowSpy.mockImplementation(() => clock);
+    try {
+      const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+      const { onResize } = makeScrollObservers(el);
+      setActiveScrollElement(el);
+      const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
+      atBottom(el);
+
+      answerAndConfirm('q1');
+      el.scrollHeight = 3060; // the agent line and its Thinking row
+      onResize();
+      vi.advanceTimersByTime(1500);
+      expect(el.scrollTop).toBe(2560);
+
+      clock += 14_000;
+      el.drawResponseRow(card.panel.turn); // the reply, at last
+      el.scrollHeight = 3200;
+      onResize();
+      vi.advanceTimersByTime(1500);
+
+      expect(el.scrollTop).toBe(2700); // 3200 - 500, the live edge
     } finally {
       nowSpy.mockRestore();
     }
@@ -3083,7 +3488,7 @@ describe('a submit holds the bottom until the agent draws', () => {
     vi.advanceTimersByTime(1500);
     expect(el.scrollTop).toBe(2580); // landed on the edge as it then stood
 
-    el.drawResponseRow(sent.turn);   // the Thinking step, a beat later
+    el.drawResponseRow(sent.turn);   // the first step, a beat later
     el.scrollHeight = 3200;
     onResize();
     vi.advanceTimersByTime(1500);
@@ -3197,7 +3602,7 @@ describe('a submit holds the bottom until the agent draws', () => {
     const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
     atBottom(el);
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     readerScrollsTo(el, 1200, onScroll); // they go back to read something
     el.writes = 0;
 
@@ -3232,7 +3637,7 @@ describe('a submit holds the bottom until the agent draws', () => {
       // Seeded AFTER the send, so the send's landing is a SEND landing. See the
       // same note in "a lapsed landing does not block the NEXT submit".
       el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
-      followAnsweredQuestion('q1');
+      answerAndConfirm('q1');
       vi.advanceTimersByTime(1500);
 
       expect(el.scrollTop).toBe(2500); // 3000 - 500, the live edge
@@ -3375,7 +3780,7 @@ describe('a submit holds the bottom until the agent draws', () => {
     const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300, status: true, rows: 3 });
     atBottom(el);
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     el.scrollHeight = 3200;
     onResize();                    // a round with no new row: still holding
     vi.advanceTimersByTime(1500);
@@ -3496,7 +3901,7 @@ describe('a submit holds the bottom until the agent draws', () => {
       vi.advanceTimersByTime(1500);
       expect(el.scrollTop).toBe(2580);
 
-      clock += 20_000; // past the backstop, with the turn still empty
+      clock += 61_000; // past the backstop, with the turn still empty
       el.scrollHeight = 9000;
       onResize();
       el.writes = 0;
@@ -3622,7 +4027,7 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
     ridingButParked(el);
 
-    followAnsweredQuestion('q1');
+    answerAndConfirm('q1');
     vi.advanceTimersByTime(1500);
 
     expect(el.scrollTop).toBe(5500); // 6000 - 500
@@ -3637,7 +4042,7 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     el.addPermissionCard({ requestId: 'p1', top: 2400, height: 300 });
     ridingButParked(el);
 
-    followResolvedPermission('p1');
+    decideAndConfirm('p1');
     vi.advanceTimersByTime(1500);
 
     expect(el.scrollTop).toBe(5500);
@@ -3739,7 +4144,7 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     // instead and the two submits would be the same shape.
     el.addQuestionCard({ toolUseId: 'q1', top: 3400, height: 300 });
     el.scrollHeight = 3800;
-    followAnsweredQuestion('q1');  // and the reader answers the card mid-glide
+    answerAndConfirm('q1');  // and the reader answers the card mid-glide
     vi.advanceTimersByTime(1500);
 
     expect(el.scrollTop).toBe(3300); // 3800 - 500, the bottom as it then stood
@@ -3809,7 +4214,7 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     setFollowLiveEdge(true);
     el.writes = 0;
 
-    followResolvedPermission('p1');
+    decideAndConfirm('p1');
     vi.advanceTimersByTime(1500);
 
     expect(el.writes).toBe(0);
@@ -3825,7 +4230,7 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     setActiveScrollElement(el);
     el.addPermissionCard({ requestId: 'p1', top: 2400, height: 300 });
 
-    followResolvedPermission('p1');
+    decideAndConfirm('p1');
     expect(el.scrollTop).toBe(500); // a glide, not a jump
     vi.advanceTimersByTime(1500);
     expect(el.scrollTop).toBe(2500); // 3000 - 500, the live edge
@@ -3848,7 +4253,7 @@ describe('a submit made while already riding the live edge goes to the bottom', 
     el.addPermissionCard({ requestId: 'p2', top: 4400, height: 300 });
     el.writes = 0;
 
-    followResolvedPermission('p1');
+    decideAndConfirm('p1');
     vi.advanceTimersByTime(100);
     expect(el.writes).toBe(0);                  // p2 is not p1
 
@@ -3931,7 +4336,7 @@ describe('Cancel is a submit too, in both the acts it covers', () => {
     el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300 });
 
     followCanceledTurn();          // pending: no boundary yet
-    followAnsweredQuestion('q1');  // and the reader answers a card meanwhile
+    answerAndConfirm('q1');  // and the reader answers a card meanwhile
     el.scrollHeight = 3200;
     onResize();
     vi.advanceTimersByTime(1500);
@@ -4097,12 +4502,12 @@ const SUBMIT_SURFACES: Array<{
   {
     name: 'an answered question card',
     arrange: (el, top = 2400) => el.addQuestionCard({ toolUseId: 'q1', top, height: 300 }),
-    submit: () => followAnsweredQuestion('q1'),
+    submit: () => answerAndConfirm('q1'),
   },
   {
     name: 'a decided permission card',
     arrange: (el, top = 2400) => el.addPermissionCard({ requestId: 'p1', top, height: 300 }),
-    submit: () => followResolvedPermission('p1'),
+    submit: () => decideAndConfirm('p1'),
   },
   {
     name: 'Continue after an abort',
@@ -4401,7 +4806,8 @@ describe('nothing but the chevron, a send and an answer arms it', () => {
     const ACTIONS_DIR = resolve(here, '../../../store/actions');
     /** The sanctioned callers, per module. `chat.ts` owns the send's own call
      *  and `threads.ts` retires the follow when the reader opens another
-     *  thread. Every other submit has NO sanctioned store-action caller, for
+     *  thread. `transcript-find.ts` retires it when the reader steps the find
+     *  bar to a match, so a streaming turn cannot pull them off it. Every other submit has NO sanctioned store-action caller, for
      *  the same reason every time: the store action is the TRANSPORT, carrying
      *  decisions nobody watched happen, while the reader's own tap lives in the
      *  component. So each is called from its card, never from its transport:
@@ -4413,6 +4819,7 @@ describe('nothing but the chevron, a send and an answer arms it', () => {
     const ALLOWED: Record<string, string[]> = {
       'chat.ts': ['followSentMessage'],
       'threads.ts': ['stopFollowingBottom'],
+      'transcript-find.ts': ['stopFollowingBottom'],
     };
     const CALLS = ['followSentMessage', 'followAnsweredQuestion', 'followResolvedPermission', 'followContinuedThread', 'followCanceledTurn', 'scrollToBottom', 'scrollToBottomAnimated', 'stopFollowingBottom'];
 

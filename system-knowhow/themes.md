@@ -7,8 +7,8 @@ description: Switch, make or ship themes: colours, headers, focus cues. "Nord th
 
 A *theme* is a named set of design-token values: colours, header chrome, focus
 cues, radii and shadows. It can also suggest fonts. Light, dark and system are
-the *theme mode*, set by the `theme-mode` preference, and a theme styles one mode
-or both.
+the *theme mode*, set by the `theme-mode` preference. A theme styles one mode or
+both.
 
 A theme carries **tokens and theme parts**, never CSS. It can recolour Lucidos
 and add capped effects, such as a glow on chat text. It cannot move a control,
@@ -17,16 +17,15 @@ hide a card, write a selector, or load anything from a third-party origin.
 ## Switch themes
 
 Set the device-scoped `theme` preference to a theme's id with `set_preference`.
-The user finds the same choice under **Settings → Appearance → Theme**, a
-carousel of every theme grouped by family.
+The user finds it under **Settings → Appearance → Theme**, a carousel grouped by
+family.
 
 A theme with a map for one mode only is *light only* or *dark only*. Picked in
 the carousel from the other mode, it asks first, then switches the device's
-`theme-mode` to the theme's mode. `set_preference` does not ask: set `theme-mode` too when
-the user wants to see the theme now.
+`theme-mode`. `set_preference` does not ask: set `theme-mode` too when the user
+wants to see the theme now.
 
-A workspace theme's card carries a "Custom" badge, so it reads apart from a
-built-in one.
+A workspace theme's card carries a "Custom" badge.
 
 Built-in themes: `lucidos` (the default), `minimal`, `mono` (pure black or
 white), `amethyst`, `nord`, `catppuccin`, `rose-pine`, `gruvbox`, `solarized`,
@@ -42,10 +41,9 @@ The picker groups themes by *family*, one section each, in this order:
 | `warm` | Warm | Gruvbox, Everforest, Paper, Ember |
 | `neutral` | Neutral | Minimal, Mono, Real computer |
 
-The `blue` section reads "Cool" because only Lucidos has a blue background.
-The others share a blue accent on slate, teal or indigo.
-
-A theme that names no family shows last, under "Other".
+The `blue` section reads "Cool": only Lucidos has a blue background, and the
+others put a blue accent on slate, teal or indigo. A theme that names no family
+shows last, under "Other".
 
 ## Make a theme
 
@@ -84,8 +82,7 @@ Then set `theme` to the id.
 - `name` is required. `description`, `author` and `credit` are optional.
   Credit the palette when it comes from someone else.
 - `family` is optional: `blue`, `violet`, `warm` or `neutral`. Pick the one the
-  theme reads as at a glance, which is not always its accent. Any other value is
-  refused.
+  theme reads as at a glance, not always its accent. Any other value is refused.
 
 **Rules every theme must follow.** Every key is a token from § The theme token
 catalog, and nothing else: not the spacing or type scale, not `--z-*`, and not
@@ -94,7 +91,7 @@ catalog, and nothing else: not the spacing or type scale, not `--z-*`, and not
 `var()`, `color-mix()`, `rgba()`, `calc()` and gradients are fine. A theme never
 sets `--font-ui`, `--font-family`, `--font` or the two `--font-features-*`
 tokens: it suggests a UI font with `fonts.ui` instead. These rules keep a theme
-from reading as hostile. See § Protected surfaces for why:
+from reading as hostile (see § Protected surfaces):
 
 - `--text-primary` on `--bg-primary` reaches at least 3:1, in both modes.
 - `--accent-green` never reads as red, and `--accent-red` never reads as green.
@@ -107,52 +104,50 @@ from reading as hostile. See § Protected surfaces for why:
 - No token map sets a `--part-*` token. Set parts with `parts`.
 
 A write through `write_file`, `copy_file` or `lucidos data write` that breaks a
-rule is refused with the reason, and nothing reaches disk. A theme file written
-any other way (`run_python`, say) that breaks a rule never shows: the picker
-skips it, and setting it paints the default. If the active theme stops passing,
-the default theme shows and a warning names the rule it broke.
+rule is refused with the reason, and nothing reaches disk. A broken theme
+written any other way (`run_python`, say) never shows: the picker skips it, and
+setting it paints the default. If the active theme stops passing, the default
+shows and a warning names the broken rule.
 
 A theme is always written whole: `edit_file` and the partial-edit route refuse
-`themes/`. Read the theme, then write it back whole. Rewriting the active theme's
-file through `write_file` or `lucidos data write` repaints every device at once.
+`themes/`. Read the theme, then write it back whole. Rewriting the active theme
+through `write_file` or `lucidos data write` repaints every device at once.
 After any other kind of write, set `theme` again.
 
 ## Three seeds are enough
 
 `--bg-primary`, `--text-primary` and `--accent` are *seeds*. Set one, and the
-engine fills in every token that derives from it and that the theme left unset:
-the surface ladder, the text greys, the action colour, the header, its badge and
-the focus cues. The table below names each token's seeds. Set a token yourself
-to override its derivation.
+engine fills in every unset token that derives from it: the surface ladder, the
+text greys, the action colour, the header, its badge and the focus cues. The
+catalog names each token's seeds. Set a token yourself to override it.
 
 Write seeds as hex literals where you can. A hex `--bg-primary` also paints the
 page before any stylesheet loads, so a cold start shows the theme at once.
 
 **The way out.** If a theme makes the UI unreadable, open Lucidos with
-`?style-reset` on the URL. It resets the theme to the default, and clears the
-style overrides, before the first pixel is painted.
+`?style-reset` on the URL. Before first paint, it resets the theme to the
+default and clears the style overrides.
 
 ## Fonts
 
 A theme suggests fonts by font id, in its `fonts` field:
 
 - `ui` is the UI font. It paints only on a device whose `font-family`
-  preference is `theme` ("Follow the theme" in Settings), which is the default.
-  A font the user picked always wins. A theme with no `ui` font leaves the
-  default, Fira Code. Of the built-in themes, Paper suggests Source Serif 4,
-  Minimal suggests Geist and Mono suggests Geist Mono.
+  preference is `theme` ("Follow the theme" in Settings), the default. A font
+  the user picked always wins. With no `ui` font, the default is Fira Code.
+  Paper suggests Source Serif 4, Minimal suggests Geist and Mono suggests Geist
+  Mono.
 - `mono` is the code font. It sets `--font-mono` in both modes, so it paints on
   every device. Set it with `fonts.mono` or a free-form `--font-mono` token,
   not both. A `mono` font must be monospaced (kind `both` or `mono`).
 
-The font ids and what each is fit for come from `GET /api/v1/fonts`. Every font
-is one Lucidos serves itself (`vendored`), one the device already has
-(`device`), or one installed in the workspace (`workspace`, id `ws-<slug>`).
-None makes a request to the internet, so a theme may name any of them. A write
-that names an unknown id, a workspace font that is not installed, or a
-proportional code font, is refused with the reason. A workspace font removed
-later drops out of the theme, which then paints as if it named nothing. See
-`system-knowhow/workspace-fonts.md`.
+`GET /api/v1/fonts` lists the font ids and what each is fit for. Each font is
+served by Lucidos (`vendored`), already on the device (`device`), or installed
+in the workspace (`workspace`, id `ws-<slug>`). None makes an internet request,
+so a theme may name any of them. A write is refused, with the reason, if it
+names an unknown id, an uninstalled workspace font, or a proportional code font.
+A workspace font removed later drops out of the theme, which then paints as if
+it named nothing. See `system-knowhow/workspace-fonts.md`.
 
 The fonts, by group:
 
@@ -168,11 +163,11 @@ font they apply them on code surfaces only.
 VT323 is a DEC terminal face with a small x-height and one weight. Lucidos
 scales it to Fira Code's x-height and centres its line box on the glyphs. It
 reads at the size of the other fonts, and the caret sits level with the text.
-It has no bold face, so bold text keeps its crisp regular strokes. Where the UI
-font has no bold, bold text takes `--text-strong` instead, a step brighter than
-the text, the way a terminal showed bold. A theme that sets its page or text
-colour gets a step away from its own page, in either theme: toward white on a
-dark page, toward black on a light one.
+
+Where the UI font has no bold face (VT323, say), bold text keeps its regular
+strokes and takes `--text-strong`: a step brighter, the way a terminal showed
+bold. In a theme that sets its page or text colour, the step moves away from
+its own page: toward white on a dark page, toward black on a light one.
 
 ## Headers and focus
 
@@ -184,33 +179,21 @@ The header bar is fully tunable:
   `--header-fg-muted` and the control veils follow it.
 - **Lines between pane headers:** set `--header-divider` to a colour.
 - **A patterned bar:** set `--header-gradient` to a pattern, such as a
-  `repeating-linear-gradient`. On macOS the pattern carries on up through the
-  title-bar band, lined up with the header, because setting `--header-gradient`
-  sets `--titlebar-strip-continues` to 1. `--titlebar-strip-bg` stays the solid
-  colour under it and the window colour.
+  `repeating-linear-gradient`. Setting it sets `--titlebar-strip-continues` to
+  1, so on macOS the pattern runs on up through the title-bar band, lined up.
+  `--titlebar-strip-bg` stays the solid colour under it and the window colour.
 
-Focus shows in four places, and a theme tunes each one:
-
-- the wash over the focused pane's header, `--focus-header-tint`;
-- the underline under it, `--focus-header-underline` and
-  `--focus-header-underline-width`, off by default;
-- the active pane dot on a phone, `--focus-pill-bg` and `--focus-pill-glow`;
-- the spotlight on the item you navigated to, `--nav-focus-glow`.
-
+Focus shows in four places, each with its own tokens in § Focus: the focused
+header's wash and underline, the phone's pane dot, and the navigation spotlight.
 To swap the wash for an underline, set `--focus-header-tint` to `transparent`
 and `--focus-header-underline` to your accent.
 
 ## Actor icons
 
-The chat marks each actor with its brand icon, and a theme can recolour all
-three:
-
-- **The Lucidos tile:** `--lucidos-mark-bg-top` and `--lucidos-mark-bg-bottom`
-  for its gradient, `--lucidos-mark-fg` for the glyph. Set both stops to one
-  colour for a flat tile.
-- **The Claude logo:** `--claude-mark`. A theme that sets only
-  `--initiator-coding-agent` recolours it too; `--claude-mark` wins over it.
-- **The Codex logo:** `--codex-mark`. It follows `--accent-light` until set.
+A theme can recolour the three brand icons that mark actors in the chat, with
+the § Brand marks tokens. For a flat Lucidos tile, set `--lucidos-mark-bg-top`
+and `--lucidos-mark-bg-bottom` to one colour. Until set, `--claude-mark`
+follows `--initiator-coding-agent` and `--codex-mark` follows `--accent-light`.
 
 These never derive from the seeds. A green-on-black theme that wants green
 marks sets them, for example `"--claude-mark": "var(--accent)"`.
@@ -218,9 +201,9 @@ marks sets them, for example `"--claude-mark": "var(--accent)"`.
 ## Theme parts
 
 A *theme part* is a named region of the UI that a theme may style with capped
-paint-only properties: a glow on chat text, a tinted glow on the actor icons,
-wider letter-spacing on header titles. The theme names the part and the
-property. It never writes a selector: Lucidos owns every selector.
+paint-only properties, such as a glow on chat text or wider letter-spacing on
+header titles. The theme names the part and the property. It never writes a
+selector: Lucidos owns every selector.
 
 ```json
 {
@@ -241,16 +224,15 @@ property. It never writes a selector: Lucidos owns every selector.
 ```
 
 - **`parts` applies in both modes.** A mode map's own `parts` wins per part and
-  property, the way mode tokens win over `tokens`. Above, dark keeps the chat
-  glow and adds an icon glow, and light turns the chat glow off.
+  property, the way mode tokens win over `tokens`.
 - **`none` switches a shared effect off in one mode.** `text-shadow`,
   `box-shadow` and `filter` accept it. A part colour meant for one mode goes in
   that mode's `parts`.
 - **A mode map that holds only `parts` does not make a theme dark only or light
   only.** A glow in one mode never makes the user switch modes.
-- **Take colours from tokens.** A part colour may name a colour token,
-  `var(--accent)`, with no fallback. A mode switch or a seed change then
-  repaints the effect for free.
+- **Take colours from tokens.** A part colour may name a colour token, such as
+  `var(--accent)`, with no fallback. A mode switch or seed change then repaints
+  the effect.
 
 The engine checks each value against its property's grammar and emits one
 *part token* per part property, such as `--part-chat-text-text-shadow`. A
@@ -303,9 +285,8 @@ A part colour takes one of these forms:
 - `var(--<colour token>)`, a named colour, or `currentColor`.
 
 `transparent` alone may be a shadow colour, a `color-mix()` input or a
-scanline stop.
-`calc()`, `attr()`, `url()` and anything else the grammar does not name is
-refused. A part text colour must reach 3:1 against the background it sits on,
+scanline stop. `calc()`, `attr()`, `url()` and anything else the grammar does
+not name is refused. A part text colour must reach 3:1 against its background,
 the same floor page text has.
 
 No part reaches a protected surface. Each protected surface resets every part
@@ -317,17 +298,16 @@ token and the inherited part properties, and paints above its neighbours.
 `text-shadow` of `chat-text`, `actor-label`, `header-title` and
 `composer-text`, so it follows every part rule: the caps, colour typing,
 protected surfaces and theme effects. An explicit part value wins over it. A
-glow sized in `rem` or `px` compiles as `em`. For a new theme, set
-the parts instead.
+glow sized in `rem` or `px` compiles as `em`. A new theme sets the parts instead.
 
 ### Theme effects
 
 The device-scoped `theme-effects` preference decides whether part shadows,
 filters and scanlines show. `reduce` drops every part `text-shadow`,
 `box-shadow` and `filter` and the screen's scanlines. It keeps part colours,
-letter-spacing, the caret shape and borders. `system`, the default,
-drops them when the OS asks for more contrast or less transparency. `full`
-always shows them.
+letter-spacing, the caret shape and borders. `system`, the default, drops them
+when the OS asks for more contrast or less transparency. `full` always shows
+them.
 
 The user finds it under **Settings → Appearance → Theme → Effects**. Offer
 `reduce` to a user who finds a glow hard to read, or wants to save battery.
@@ -353,20 +333,20 @@ double-line boxes.
 ```
 
 **The block caret.** `composer-text` takes `caret-shape: block` or
-`underscore`. `caret-shape` is native in Chromium and drawn by Lucidos
-elsewhere: Safari, the iPhone, the macOS app and Firefox get the same shape. It
-paints in the part's `caret-color`, else the composer text colour, and a block
-shows the character under it.
+`underscore`. Lucidos draws the shape where the browser cannot, so Safari, the
+iPhone, the macOS app and Firefox match Chromium. It paints in the part's
+`caret-color`, else the composer text colour, and a block shows the character
+under it.
 
 The shape hides while you select text, and the thin caret returns while an
 input method composes text. Under reduced motion the caret stops blinking.
 Protected inputs, such as the credential form, keep the normal caret.
 
 **Scanlines.** `screen` takes a `repeating-linear-gradient()` of faint stops.
-Lucidos paints it on the base fill behind every pane, so it shows through
-wherever a pane has no fill of its own. It never paints over text, a card, the
-composer or a protected surface. The header draws its own lines through
-`--header-gradient`. The rules:
+Lucidos paints it on the base fill behind every pane, so it shows wherever a
+pane has no fill of its own. It never paints over text, a card, the composer or
+a protected surface. The header draws its own lines through `--header-gradient`.
+The rules:
 
 - 2 to 4 stops, each a hex, `rgb()`, `rgba()`, `hsl()` or `hsla()` colour, or
   `transparent`. No `var()`, no named colour, no `color-mix()`.
@@ -378,8 +358,9 @@ composer or a protected surface. The header draws its own lines through
   under every stop.
 
 Protected text keeps 4.5:1 on every band: the engine clamps the protected
-palette against the scanlines. So only a theme sets them: `style_overrides`
-refuses the screen token. `theme-effects: reduce` turns the scanlines off.
+palette against the scanlines. So only a theme sets scanlines:
+`style_overrides` refuses the screen token. `theme-effects: reduce` turns them
+off.
 
 **Double-line boxes.** `surface` and `card` take `border-style: double` and a
 `border-width` from 1px to 4px. A double line needs at least 3px. The parts
@@ -388,7 +369,7 @@ frame.
 
 ## Protected surfaces
 
-Some surfaces ask the user to decide. They are:
+These surfaces ask the user to decide:
 
 - permission and question cards;
 - the credential and email forms;
@@ -405,14 +386,11 @@ The engine derives a `--protected-*` palette from each theme and clamps it:
 - confirm stays green and deny stays red, whatever the theme's accents;
 - a neutral action never turns red, and a blocking dialog's scrim always dims.
 
-These surfaces read that palette and nothing else for text, fills and
-confirm or deny colours, so the theme's own values never reach them. Most themes
-see no change. A faint or clashing palette shows its repaired version there.
-A theme cannot set a `--protected-*` token, and neither can a style override.
-Protected surfaces also keep a catalog code font for the command being
-approved.
-
-`?style-reset` still clears the theme and every override before first paint.
+For text, fills and confirm or deny colours, these surfaces read that palette
+alone, so the theme's own values never reach them. Most themes see no change. A
+faint or clashing palette shows its repaired version there. Neither a theme nor
+a style override can set a `--protected-*` token. Protected surfaces also keep a
+catalog code font for the command being approved.
 
 ## Themes in a plugin
 
@@ -425,8 +403,8 @@ broken theme never installs. See `plugins.md`.
 App frames follow the active theme too, for the tokens they define. An app that
 loads the SDK stylesheet also paints the `app-*` parts, unless it sets
 `data-theme-parts="off"` on its `<html>`. An app without the SDK gets no part.
-See `js-sdk.md`. An app that builds themes (a theme editor, say) reaches these
-routes through `lucidos.request`:
+See `js-sdk.md`. A theme-building app reaches these routes through
+`lucidos.request`:
 
 | Route | Returns |
 |---|---|
@@ -439,13 +417,13 @@ routes through `lucidos.request`:
 
 It saves with `lucidos.data.write('themes/<id>.json', …)` and deletes with
 `lucidos.data.delete`, which run the same validation. It switches themes with
-`lucidos.preferences.set('theme', id)`. For a live preview while the user tunes,
-write `style_overrides` and clear it on save. A preview of parts writes the
-draft's resolved part tokens there. Part tokens in `style_overrides` pass the
-same grammar, so a bad one is refused at the write. Leave out
-`--part-screen-background-image`: `style_overrides` refuses it, so preview
-scanlines by saving the theme. Keep every field you do not
-edit when you save, `parts`, `dark.parts` and `light.parts` included.
+`lucidos.preferences.set('theme', id)`. On save, keep every field you did not
+edit, `parts`, `dark.parts` and `light.parts` included.
+
+For a live preview while the user tunes, write `style_overrides` and clear it on
+save. A parts preview writes the draft's resolved part tokens there. They pass
+the same grammar, so a bad one is refused at the write. `style_overrides` refuses
+`--part-screen-background-image`, so preview scanlines by saving the theme.
 
 ## The theme token catalog
 
@@ -564,12 +542,12 @@ Corner radii of controls, surfaces, and circles and pills.
 |---|---|---|
 | `--radius-control` | Corner radius of buttons, inputs and rows. |  |
 | `--radius-surface` | Corner radius of toasts, menus, popovers and dialogs. |  |
-| `--radius-round` | Corner radius of circles and pills: round buttons, dots, badges and chips. Set it to 0 to square them. |  |
+| `--radius-round` | Corner radius of circles and pills: round buttons, dots and chips. Set it to 0 to square them. Badges on icons stay round in every theme. |  |
 
 Every corner in Lucidos follows one of the three. A smaller or larger corner,
 like a chip or the composer box, is a multiple of the control or surface
-radius. So it scales with them. For a fully square look, set all three to `0`.
-Spinners stay round.
+radius, so it scales with them. For a fully square look, set all three to `0`.
+Spinners and the badges on icons stay round.
 
 ### Shadows
 

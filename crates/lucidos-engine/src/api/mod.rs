@@ -3,6 +3,7 @@ pub(crate) mod app_reach;
 mod app_ui;
 mod apps;
 mod artifacts;
+mod background_models;
 pub(crate) mod backup;
 pub(crate) mod base_path;
 mod blobs;
@@ -27,6 +28,7 @@ pub(crate) mod frontend_snapshot;
 pub(crate) mod handshake_scripts;
 pub(crate) mod hex;
 mod history;
+pub(crate) use history::ROUTE_FRAMES;
 mod images;
 pub(crate) mod internal;
 mod knowhow;
@@ -36,6 +38,7 @@ mod mcp_permission;
 mod memory;
 pub(crate) mod mutating_gate;
 mod notifications;
+mod recall;
 #[cfg(test)]
 pub(crate) mod route_scan;
 mod side_questions;
@@ -53,6 +56,7 @@ pub mod presence_pong;
 pub(crate) mod proxy;
 pub(crate) mod proxy_auth_layer;
 pub(crate) mod proxy_builtin;
+pub(crate) mod proxy_cost;
 pub(crate) mod proxy_hmac_layer;
 pub mod proxy_migration;
 pub(crate) mod proxy_pipeline;
@@ -268,6 +272,98 @@ pub(crate) fn resolve_thread_id_in_nav_payload(
     Ok(())
 }
 
+/// Settle the repository a `NavigationRequested` file locator names.
+///
+/// A `file_path` of `repo:<repo>:<mode>:<path>` opens a file in a registered
+/// repository clone (codec: `store/repoPath.ts`). The page reads `<repo>` as a
+/// uuid. Every other repo-scoped tool takes a name or an id, so an agent writes
+/// the name. The page then fails on a bare uuid parse error, after the caller
+/// was told the navigate went out.
+///
+/// So the segment resolves here, by id or name, and the payload carries the
+/// uuid. A repository nobody registered is refused before anything is
+/// emitted. Both emitters come through here, as with
+/// [`resolve_thread_id_in_nav_payload`].
+///
+/// A malformed locator passes untouched. The page reads it as an artifact
+/// path, which `system-knowhow/js-sdk.md` promises apps, and shows a load
+/// error for it.
+pub(crate) async fn resolve_repo_in_nav_payload(
+    pool: &PgPool,
+    payload: &mut serde_json::Value,
+) -> Result<(), String> {
+    if payload.get("target").and_then(|v| v.as_str()) != Some("file") {
+        return Ok(());
+    }
+    let Some(file_path) = payload.get("file_path").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let Some((repo, mode, path)) = split_repo_locator(file_path) else {
+        return Ok(());
+    };
+    let repos = crate::core::repositories::RepositoryStore::list(pool)
+        .await
+        .map_err(|e| format!("could not list repositories for '{file_path}': {e}"))?;
+    let id = match_repository(&repos, repo).map_err(|reason| {
+        format!(
+            "{reason} (in file_path '{file_path}'). manage_repositories 'list' shows each \
+             one's name and id."
+        )
+    })?;
+    payload["file_path"] = serde_json::Value::String(format!("repo:{id}:{mode}:{path}"));
+    Ok(())
+}
+
+/// The id of the one repository `reference` names: by id, then by exact name,
+/// then by name in any case. The first tier with a hit decides, and two hits in
+/// one tier are refused, since names are not unique. The same tiers as
+/// `matchRepository` in `store/actions/repoFileLink.ts`, so a link and a
+/// navigate land on the same repository or both refuse.
+fn match_repository(
+    repos: &[crate::core::repositories::Repository],
+    reference: &str,
+) -> Result<Uuid, String> {
+    let id = Uuid::parse_str(reference).ok();
+    let tiers: [&dyn Fn(&crate::core::repositories::Repository) -> bool; 3] =
+        [&|r| Some(r.id) == id, &|r| r.name == reference, &|r| {
+            r.name.to_lowercase() == reference.to_lowercase()
+        }];
+    for in_tier in tiers {
+        let hits: Vec<_> = repos.iter().filter(|r| in_tier(r)).collect();
+        match hits.as_slice() {
+            [] => continue,
+            [one] => return Ok(one.id),
+            many => {
+                return Err(format!(
+                    "{} registered repositories share the name '{reference}', so name it by id",
+                    many.len()
+                ))
+            }
+        }
+    }
+    Err(format!(
+        "no registered repository has the name or id '{reference}'"
+    ))
+}
+
+/// A well-formed `repo:` locator's repository, mode and path segments, or
+/// `None`. The same rules as `parseRepoPath` in `store/repoPath.ts`: every
+/// segment non-empty, mode `file` or `diff`, and a `#` qualifier non-empty.
+/// Everything after the second colon is the path, since a ref cannot hold a
+/// colon and a path can.
+fn split_repo_locator(file_path: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = file_path.strip_prefix("repo:")?.splitn(3, ':');
+    let (repo, mode, path) = (parts.next()?, parts.next()?, parts.next()?);
+    let (mode_name, qualifier) = mode
+        .split_once('#')
+        .map_or((mode, None), |(name, q)| (name, Some(q)));
+    let well_formed = !repo.is_empty()
+        && !path.is_empty()
+        && qualifier != Some("")
+        && matches!(mode_name, "file" | "diff");
+    well_formed.then_some((repo, mode, path))
+}
+
 /// Reject refs/commits that git would parse as a flag, traverse with `..`, or contain
 /// shell metacharacters. The git invocations themselves use argv (no shell), so these
 /// checks defend against ref-as-flag injection and against passing the value through
@@ -359,10 +455,13 @@ pub struct UrlContext {
     pub content: String,
 }
 
-/// An image pasted by the user, sent inline as base64.
+/// An image as base64 bytes plus their mime type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatImage {
     pub base64: String,
+    /// Optional on the wire. `chat_submit` ignores a client's value and uses
+    /// the format the blob store sniffs.
+    #[serde(default)]
     pub mime_type: String,
 }
 
@@ -528,13 +627,15 @@ pub struct ChatRequest {
     /// lets the model's own preferred provider decide.
     #[serde(default)]
     pub provider: Option<String>,
+    /// Images sent inline, for a caller that cannot upload first. A
+    /// cross-workspace spawn is one, since the mutating gate refuses it the
+    /// upload route. Each is stored exactly as an upload is, and a refused one
+    /// fails the request with the upload's 415. Ignored when `image_hashes` is
+    /// set.
     #[serde(default)]
     pub images: Option<Vec<ChatImage>>,
-    /// Forward-compat: when set, the handler resolves each hash against the
-    /// workspace blob store and uses those bytes for the LLM call. Frontends
-    /// that have already uploaded their images via `POST /threads/:id/blobs`
-    /// can send hash refs only — keeping this body small even on cellular.
-    /// Mutually exclusive with `images`.
+    /// Hashes of images already uploaded through `POST /threads/:id/blobs`,
+    /// the app's path. It keeps this body small even on cellular.
     #[serde(default)]
     pub image_hashes: Option<Vec<String>>,
     #[serde(default)]
@@ -818,6 +919,7 @@ pub struct ModelInfo {
     pub label: String,
     pub routes: Vec<RouteInfo>,
     pub preferred_provider: Option<String>,
+    pub vision: bool,
     pub sort_order: i32,
     pub source: String,
     pub enabled: bool,
@@ -867,6 +969,10 @@ pub struct CreateModelRequest {
     /// Vertex and the direct Anthropic API.
     #[serde(default)]
     pub routes: Option<Vec<Route>>,
+    /// The *vision flag*: whether the model reads images. Omitted means it
+    /// does not, so image description neither offers nor calls it.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 /// PUT body for a model, and the `manage_models` update args. A builtin row
@@ -903,6 +1009,11 @@ pub struct UpdateModelRequest {
     /// Refusing it there would leave every seeded model stuck on one backend.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub preferred_provider: Option<Option<String>>,
+    /// The *vision flag*. Absent keeps the stored value. Accepted on a builtin
+    /// too, like `routes`: whether a model reads images is a fact a seed can
+    /// get wrong, not identity.
+    #[serde(default)]
+    pub vision: Option<bool>,
 }
 
 /// The engine's read-back on a trigger's cron after a create or update: the fire
@@ -1409,6 +1520,7 @@ pub fn create_router(
         .merge(notifications::router())
         .merge(artifacts::router())
         .merge(settings::router())
+        .merge(background_models::router())
         .merge(credential_reveal::router())
         .merge(triggers::router())
         .merge(trigger_groups::router())
@@ -1417,6 +1529,7 @@ pub fn create_router(
         .merge(presence::router())
         .merge(presence_pong::router())
         .merge(memory::router())
+        .merge(recall::router())
         .merge(apps::router())
         .merge(command_permission::router())
         .merge(command_checkpoint::router())
@@ -1570,6 +1683,10 @@ pub fn create_router(
             Arc::new(local_auth::EngineAuth::resolve(bind_choice)),
             local_auth::enforce,
         ))
+        // A request the credentialed proxy forwarded is never the shell, so
+        // it is refused before any credential is read. See
+        // `proxy::refuse_proxied_request`.
+        .layer(axum::middleware::from_fn(proxy::refuse_proxied_request))
         .layer(axum::middleware::from_fn(request_logger));
 
     if permissive_cors_enabled() {
@@ -1607,7 +1724,7 @@ fn permissive_cors_enabled() -> bool {
 }
 
 fn permissive_cors_enabled_value(value: Option<&str>) -> bool {
-    matches!(value.map(str::trim), Some("1" | "true" | "yes" | "on"))
+    value.is_some_and(crate::core::prefs::env_switch_is_on)
 }
 
 #[cfg(test)]
@@ -1732,8 +1849,11 @@ mod tests {
         for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
             assert!(!permissive_cors_enabled_value(value), "value: {value:?}");
         }
-        for value in [Some("1"), Some("true"), Some("yes"), Some("on")] {
-            assert!(permissive_cors_enabled_value(value), "value: {value:?}");
+        for &value in crate::core::prefs::FLAG_ON_VALUES {
+            assert!(
+                permissive_cors_enabled_value(Some(value)),
+                "value: {value:?}"
+            );
         }
     }
 
@@ -2164,6 +2284,79 @@ mod tests {
             let err = super::resolve_thread_id_in_nav_payload(&mut payload, Some(Uuid::new_v4()))
                 .expect_err("a non-string must be refused");
             assert!(err.contains("must be a string"), "{bad} gave: {err}");
+        }
+    }
+
+    // ---- split_repo_locator ----
+
+    #[test]
+    fn a_repo_locator_splits_at_the_first_two_colons() {
+        assert_eq!(
+            super::split_repo_locator("repo:example-repo:file#feature/x:docs/a:b.md"),
+            Some(("example-repo", "file#feature/x", "docs/a:b.md"))
+        );
+        assert_eq!(
+            super::split_repo_locator("repo:r:diff#change-1:src/main.rs"),
+            Some(("r", "diff#change-1", "src/main.rs"))
+        );
+    }
+
+    fn repo(name: &str) -> crate::core::repositories::Repository {
+        crate::core::repositories::Repository {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            path: format!("/home/user/src/{name}"),
+            description: None,
+            root_commit_sha: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_repository_matches_by_id_then_exact_name_then_any_case() {
+        let (exact, folded) = (repo("Example-Repo"), repo("example-repo-two"));
+        let repos = [exact.clone(), folded.clone()];
+        assert_eq!(
+            super::match_repository(&repos, &exact.id.to_string()),
+            Ok(exact.id)
+        );
+        assert_eq!(
+            super::match_repository(&repos, "Example-Repo"),
+            Ok(exact.id)
+        );
+        assert_eq!(
+            super::match_repository(&repos, "EXAMPLE-REPO-TWO"),
+            Ok(folded.id)
+        );
+    }
+
+    /// Names are not unique. A navigate that picked one of two would open the
+    /// wrong clone without a word; a link click refuses the same name.
+    #[test]
+    fn a_name_two_repositories_share_is_refused_but_an_exact_match_wins() {
+        let (upper, lower) = (repo("App"), repo("app"));
+        let repos = [upper.clone(), lower.clone()];
+        assert_eq!(super::match_repository(&repos, "app"), Ok(lower.id));
+        let err = super::match_repository(&repos, "APP").expect_err("ambiguous");
+        assert!(err.contains("2 registered repositories"), "{err}");
+        let err = super::match_repository(&repos, "unregistered-repo").expect_err("missing");
+        assert!(err.contains("no registered repository"), "{err}");
+    }
+
+    /// A malformed locator is the page's artifact path, as the SDK docs promise
+    /// apps, so the resolver leaves it alone rather than refusing it.
+    #[test]
+    fn a_malformed_repo_locator_is_not_one() {
+        for not_one in [
+            "artifacts/notes.md",
+            "repo:example-repo",
+            "repo::file:x.md",
+            "repo:example-repo:file:",
+            "repo:example-repo:file#:x.md",
+            "repo:example-repo:docs/x.md",
+            "repo:example-repo:blob:x.md",
+        ] {
+            assert_eq!(super::split_repo_locator(not_one), None, "{not_one}");
         }
     }
 

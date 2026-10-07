@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::color::{function_call, split_top_level};
 
 /// How deep `color-mix()` may nest inside a part colour.
-const MAX_MIX_DEPTH: usize = 2;
+pub(super) const MAX_MIX_DEPTH: usize = 2;
 
 /// The unit a part length takes. A bare `0` is always accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

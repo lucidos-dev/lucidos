@@ -55,6 +55,9 @@ const TITLEBAR_LIGHTS_RESERVE_PX = 80;
  *  it: the drawer toggle's box. Mirrors `.thread-toggle-slot` in
  *  styles/panels/shell.css (`--header-icon-box`). */
 const THREAD_ROW_SIDE_REM = 2.25;
+/** What Home adds to that end while it is shown: its box and one gap. Mirrors
+ *  the `:has(> .home-thread-btn)` reserve on `.pane-header-brand`. */
+const THREAD_ROW_HOME_REM = 2.25 + 0.25;
 /** The row's own leading padding, in rem. `--header-lead-inset`'s web value, and
  *  the floor UNDER the floor: whatever lead the row is sized around, an end is
  *  never narrower than the padding every build has. */
@@ -138,16 +141,19 @@ export function minDrawerWidth(): number {
  *  narrower one on both builds, because the actions fold into the ⋯ menu long
  *  before this width (`useHeaderActionCollapse`). So the symmetric lead is what
  *  governs. */
-export function computeMinThreadPaneWidth(remPx: number, leadPx: number): number {
-  const sidePx = Math.max(leadPx, THREAD_ROW_PAD_REM * remPx) + THREAD_ROW_SIDE_REM * remPx;
+export function computeMinThreadPaneWidth(remPx: number, leadPx: number, homeShown: boolean): number {
+  const sideRem = THREAD_ROW_SIDE_REM + (homeShown ? THREAD_ROW_HOME_REM : 0);
+  const sidePx = Math.max(leadPx, THREAD_ROW_PAD_REM * remPx) + sideRem * remPx;
   return Math.ceil(2 * sidePx + THREAD_ROW_CLUSTER_REM * remPx);
 }
 
 /** Floor for the Conversation pane, at the CURRENT root font size. Reads the
  *  same lead the drawer's floor does, and by the same rule: the reserve decides
- *  how the row is LAID OUT, not how narrow the pane may get. */
+ *  how the row is LAID OUT, not how narrow the pane may get. Home leads the row
+ *  only while the experimental switch is on, so its box counts only then. */
 export function minThreadPanePx(): number {
-  return computeMinThreadPaneWidth(getRemPx(), titlebarLightsReservePx());
+  const homeShown = document.querySelector('.desktop-header .pane-header-brand > .home-thread-btn') !== null;
+  return computeMinThreadPaneWidth(getRemPx(), titlebarLightsReservePx(), homeShown);
 }
 
 /** Floor for the Canvas pane. */

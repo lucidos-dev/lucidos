@@ -17,6 +17,7 @@ import {
   sortToolsByCost,
 } from '../mcpCost';
 import type {
+  McpBudget,
   McpCostTotals,
   McpServerStatus,
   McpServersResponse,
@@ -97,12 +98,28 @@ function totals(over: Partial<McpCostTotals> = {}): McpCostTotals {
   };
 }
 
+/** The engine's figures for a 200k window: 288k request chars, a quarter of
+ *  it for MCP. */
+function budget(over: Partial<McpBudget> = {}): McpBudget {
+  return {
+    request_chars: 288000,
+    mcp_ceiling_chars: 72000,
+    sent_tools: 1,
+    sent_chars: 500,
+    sent_tokens: 200,
+    dropped: [],
+    warning: null,
+    ...over,
+  };
+}
+
 function response(over: Partial<McpServersResponse> = {}): McpServersResponse {
   return {
     servers: [server()],
     totals: totals(),
-    model: 'claude-opus-5',
+    model: 'claude-sonnet-5',
     context_window: 200000,
+    budget: budget(),
     ...over,
   };
 }
@@ -190,49 +207,87 @@ describe('the skeleton row is the real row', () => {
 });
 
 describe('header cost figures', () => {
-  it('reports servers on, tools, tokens and the share of the window', () => {
-    const summary = mcpHeaderSummary(totals({ running_servers: 2, tools: 23, tokens: 4100 }), 200000, 'claude-opus-5');
-    expect(summary.live).toBe('2 servers on, 23 tools, ~4k tokens per request');
-    expect(summary.share).toBe("2% of claude-opus-5's 200k context window");
+  it('reports servers on, tools, tokens and the share of the request budget', () => {
+    const summary = mcpHeaderSummary(
+      totals({ running_servers: 2 }),
+      200000,
+      'claude-sonnet-5',
+      budget({ sent_tools: 23, sent_chars: 72000, sent_tokens: 28800 }),
+    );
+    expect(summary.live).toBe('2 servers on, 23 tools, ~29k tokens per request');
+    // Chars over the request's char budget: a quarter of it is 25%, where
+    // tokens over the raw window would have said 14%.
+    expect(summary.share).toBe('25% of what a request to claude-sonnet-5 can carry (200k context window)');
   });
 
-  it('never reports a real cost as 0% of the window', () => {
-    const summary = mcpHeaderSummary(totals({ tokens: 300 }), 200000, 'claude-opus-5');
-    expect(summary.share).toBe("Under 1% of claude-opus-5's 200k context window");
+  it('never reports a real cost as 0% of the budget', () => {
+    const summary = mcpHeaderSummary(totals(), 200000, 'claude-sonnet-5', budget({ sent_chars: 300 }));
+    expect(summary.share).toBe('Under 1% of what a request to claude-sonnet-5 can carry (200k context window)');
   });
 
   it('states a 1M window as 1M, matching the marker the id carries', () => {
-    const summary = mcpHeaderSummary(totals({ tokens: 0 }), 1_000_000, 'claude-opus-5[1m]');
-    expect(summary.share).toBe("0% of claude-opus-5[1m]'s 1M context window");
+    const summary = mcpHeaderSummary(
+      totals(),
+      1_000_000,
+      'claude-opus-5[1m]',
+      budget({ request_chars: 1_488_000, sent_chars: 0 }),
+    );
+    expect(summary.share).toBe('0% of what a request to claude-opus-5[1m] can carry (1M context window)');
   });
 
-  it('omits the share when the engine reports no window', () => {
-    expect(mcpHeaderSummary(totals(), 0, 'mystery-model').share).toBeNull();
+  it('omits the share when the engine reports no budget', () => {
+    expect(mcpHeaderSummary(totals(), 0, 'mystery-model', budget({ request_chars: 0 })).share).toBeNull();
+  });
+
+  it("shows the engine's warning as it was written, and nothing when there is none", () => {
+    const warning = '3 tools are left out of every request.';
+    expect(mcpHeaderSummary(totals(), 200000, 'm', budget({ warning })).warning).toBe(warning);
+    expect(mcpHeaderSummary(totals(), 200000, 'm', budget()).warning).toBeNull();
+  });
+
+  it('renders the warning line in the header once the engine sends one', () => {
+    const warning = '3 tools are left out of every request.';
+    const text = body({ status: 'loaded', data: response({ budget: budget({ warning }) }) });
+    expect(text).toContain('mcp-cost-warning');
+    expect(text).toContain(warning);
+    expect(body({ status: 'loaded', data: response() })).not.toContain('mcp-cost-warning');
   });
 
   it('counts the off servers separately from the per-request total', () => {
     const summary = mcpHeaderSummary(
-      totals({ running_servers: 1, tools: 3, tokens: 900, stopped_tools: 40, stopped_tokens: 12000 }),
+      totals({ running_servers: 1, stopped_tools: 40, stopped_tokens: 12000 }),
       200000,
-      'claude-opus-5',
+      'claude-sonnet-5',
+      budget({ sent_tools: 3, sent_tokens: 900 }),
     );
     expect(summary.live).toBe('1 server on, 3 tools, ~900 tokens per request');
     expect(summary.stopped).toBe('40 more tools available, ~12k tokens if switched on');
   });
 
   it('states the disabled subtotal so the per-tool switch visibly pays', () => {
-    const summary = mcpHeaderSummary(totals({ disabled_tools: 3, disabled_tokens: 800 }), 200000, 'm');
+    const summary = mcpHeaderSummary(totals({ disabled_tools: 3, disabled_tokens: 800 }), 200000, 'm', budget());
     expect(summary.disabled).toBe('3 tools switched off, keeping ~800 tokens out of every request');
   });
 
   it('has nothing to say about off servers or off tools when there are none', () => {
-    const summary = mcpHeaderSummary(totals(), 200000, 'm');
+    const summary = mcpHeaderSummary(totals(), 200000, 'm', budget());
     expect(summary.stopped).toBeNull();
     expect(summary.disabled).toBeNull();
   });
 
+  it('states what a request sends, not the offered total, once tools are dropped', () => {
+    const summary = mcpHeaderSummary(
+      totals({ running_servers: 2, tools: 500, chars: 750000, tokens: 300000 }),
+      200000,
+      'claude-sonnet-5',
+      budget({ sent_tools: 48, sent_chars: 71000, sent_tokens: 28400 }),
+    );
+    expect(summary.live).toBe('2 servers on, 48 tools, ~28k tokens per request');
+    expect(summary.share).toBe('25% of what a request to claude-sonnet-5 can carry (200k context window)');
+  });
+
   it('does not claim a cost when no server is on', () => {
-    const summary = mcpHeaderSummary(totals({ running_servers: 0, tools: 0, tokens: 0 }), 200000, 'm');
+    const summary = mcpHeaderSummary(totals({ running_servers: 0, tools: 0, tokens: 0 }), 200000, 'm', budget());
     expect(summary.live).toBe('No servers on, so MCP adds nothing to a request');
   });
 });

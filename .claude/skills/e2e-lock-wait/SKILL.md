@@ -179,7 +179,7 @@ Both are domain events, emitted best effort by `scripts/lib/e2e_lock.sh`.
 
 | Event | When | Payload |
 |---|---|---|
-| `E2ELockAcquired` | a run takes the lock | `script`, `thread_id`, `worktree`, `reclaimed` |
+| `E2ELockAcquired` | a run takes the lock | `script`, `thread_id`, `worktree`, `reclaimed`, and `projects` (comma-separated Playwright projects) when the entry script declared them |
 | `E2ELockReleased` | a hold ends | `script`, `thread_id`, `worktree`, `held_secs` (absent on an old lock file), `outcome`: `released` or `reclaimed` |
 
 Subscribe to `E2ELockReleased` with no `--condition`: any release frees the lock,

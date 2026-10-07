@@ -90,6 +90,9 @@
 # A reclaim is one step under a flock (`_e2e_reclaim_stale_lock`), so of two
 # runs reclaiming the same stale lock, one wins and the other refuses.
 
+# The refusal line. scripts/e2e-github.sh matches it to retry a lost race.
+E2E_LOCK_HELD_MESSAGE="another e2e run is in progress on the e2e-test workspace."
+
 E2E_LOCK_OWNED=""
 
 # Fields of the lock file, as filled in by `_e2e_read_lock_file`. Globals rather
@@ -775,15 +778,24 @@ _e2e_stand_down_lock_waits() {
 
 # A hold has started. `$2` is true when this run took the lock over from a dead
 # owner rather than finding it free.
+#
+# $E2E_LOCK_PROJECTS, when the entry script set it, names the Playwright
+# projects the hold will run, comma-separated. It goes in the summary as well as
+# the payload, because a memory snapshot log keyed on these events prints the
+# summary: it is how a WebKit hold reads apart from a Chromium one.
 _e2e_announce_lock_acquired() {
-    local script="$1" reclaimed="$2"
-    local summary="e2e lock acquired by $script"
+    local script="$1" reclaimed="$2" projects="${E2E_LOCK_PROJECTS:-}"
+    local summary="e2e lock acquired by $script" extra=",\"reclaimed\":$reclaimed"
+    if [ -n "$projects" ]; then
+        summary="$summary (projects: $projects)"
+        extra="$extra,\"projects\":\"$(_e2e_json_escape "$projects")\""
+    fi
     if [ "$reclaimed" = true ]; then
         summary="$summary (reclaimed from a dead owner)"
     fi
     _e2e_emit_lock_event E2ELockAcquired "$summary" \
         "$(_e2e_lock_event_payload "$script" "${LUCIDOS_THREAD_ID:-unknown}" \
-            "$PWD" ",\"reclaimed\":$reclaimed")"
+            "$PWD" "$extra")"
 }
 
 # A hold has ended, and this is the event a blocked run waits on.
@@ -997,7 +1009,7 @@ EOF
     fi
 
     echo ""
-    echo "ERROR: another e2e run is in progress on the e2e-test workspace."
+    echo "ERROR: $E2E_LOCK_HELD_MESSAGE"
     echo "  Owner:    PID ${existing_pid:-unknown} (script: ${existing_script:-unknown})"
     echo "  Thread:   ${existing_thread:-unknown}"
     echo "  Worktree: ${existing_wt:-unknown}"

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test, expect, type Page } from './fixtures';
-import { apiRequest, gotoWithRetry, waitForVisibleInput } from './helpers';
+import { apiRequest, gotoWithRetry, shellDeviceId, waitForVisibleInput } from './helpers';
 
 /**
  * A patterned header fill carries on up through the macOS title-bar band.
@@ -41,17 +41,8 @@ const RULES_BEFORE = `
   .app-header { background: var(--header-gradient) !important; }
 `;
 
-async function deviceId(page: Page): Promise<string> {
-  let id: string | null = null;
-  await expect.poll(async () => {
-    id = await page.evaluate(() => localStorage.getItem('lucidos-device-id')).catch(() => null);
-    return id;
-  }, { message: 'the shell registered a device' }).toBeTruthy();
-  return id as unknown as string;
-}
-
 async function setTheme(page: Page, theme: string): Promise<void> {
-  const device = await deviceId(page);
+  const device = await shellDeviceId(page);
   const res = await apiRequest(page).put('/api/v1/preferences?key=theme', { data: { value: theme, device_id: device } });
   expect(res.ok(), `theme=${theme}`).toBe(true);
 }

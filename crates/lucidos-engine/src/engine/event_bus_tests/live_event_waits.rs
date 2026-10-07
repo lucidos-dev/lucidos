@@ -415,7 +415,7 @@ async fn an_arm_racing_a_resolution_does_not_resurrect_the_resolved_wait() {
         let (arm_bus, _arm_rx) = EventBus::new(arm_pool.clone());
         emit_wait_started(&arm_bus, thread_id, armed).await;
     });
-    wait_until_blocked_on_a_lock(&pool).await;
+    wait_until_blocked_on_locks(&pool, 1).await;
 
     sweeper.commit().await.unwrap();
     arm.await.unwrap();
@@ -433,30 +433,6 @@ async fn an_arm_racing_a_resolution_does_not_resurrect_the_resolved_wait() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
-}
-
-/// Block until this database has a backend waiting on a lock. That is the
-/// signal that the racing statement reached its `UPDATE`, rather than merely
-/// having been spawned. Scoped to `current_database()`, so a concurrent test's
-/// disposable database cannot satisfy it.
-///
-/// Panics rather than returning on timeout: a race that never materialised
-/// means the test proved nothing, and passing quietly is how it would rot.
-async fn wait_until_blocked_on_a_lock(pool: &PgPool) {
-    for _ in 0..200 {
-        let blocked: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock'",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        if blocked > 0 {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    panic!("no backend ever blocked on the row lock, so the race never happened");
 }
 
 /// Both columns have to reach the client on BOTH paths, or the panel is right

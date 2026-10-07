@@ -2,6 +2,49 @@
    Do not edit: run `npm run build` in packages/lucidos-sdk. */
 "use strict";
 (() => {
+  // src/generated/preference-catalog.ts
+  var PREF_THEME_MODE = {
+    key: "theme-mode",
+    scope: "device",
+    type: "enum",
+    values: ["light", "dark", "system"],
+    fallback: "system"
+  };
+  var PREF_FONT_FAMILY = {
+    key: "font-family",
+    scope: "device",
+    type: "text",
+    fallback: "theme"
+  };
+  var PREF_UI_SCALE = {
+    key: "ui-scale",
+    scope: "device",
+    type: "number",
+    min: 75,
+    max: 200,
+    fallback: "100"
+  };
+  var PREF_MOTION = {
+    key: "motion",
+    scope: "device",
+    type: "enum",
+    values: ["system", "reduce", "full"],
+    fallback: "system"
+  };
+  var PREF_THEME_EFFECTS = {
+    key: "theme-effects",
+    scope: "device",
+    type: "enum",
+    values: ["system", "reduce", "full"],
+    fallback: "system"
+  };
+  var PREF_THEME = {
+    key: "theme",
+    scope: "device",
+    type: "text",
+    fallback: "lucidos"
+  };
+
   // src/generated/font-catalog.ts
   var FOLLOW_THEME = "theme";
   var FALLBACK_FONT = "fira-code";
@@ -500,11 +543,15 @@
     "yellow",
     "yellowgreen"
   ];
+  var MAX_MIX_DEPTH = 2;
+  var MAX_VALUE_LENGTH = 120;
+  var MAX_RESOLVED_TOKENS = 200;
+  var MAX_SHADOW_PX = 32;
+  var PX_PER_REM = 16;
+  var SHADOW_COLOUR_FUNCTIONS = ["rgb", "rgba", "hsl", "hsla", "hwb", "lab", "lch", "oklab", "oklch", "color", "color-mix"];
 
   // src/themeParts.ts
   var PART_TOKEN_PREFIX = "--part-";
-  var MAX_MIX_DEPTH = 2;
-  var MAX_VALUE_LENGTH = 120;
   var VALUE_BANNED_RE = /[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i;
   var COLOUR_TOKEN_SET = new Set(COLOUR_TOKENS);
   var FRAME_COLOUR_TOKEN_SET = new Set(FRAME_COLOUR_TOKENS);
@@ -871,11 +918,11 @@
   }
 
   // src/appearance.ts
-  var THEME_MODES = ["light", "dark", "system"];
-  var THEME_MODE_KEY = "theme-mode";
+  var THEME_MODES = PREF_THEME_MODE.values;
+  var THEME_MODE_KEY = PREF_THEME_MODE.key;
   var THEME_MODE_STORAGE_KEY = "lucidos-theme-mode";
   var THEME_MODE_ATTRIBUTE = "data-theme-mode";
-  var DEFAULT_THEME_MODE = "system";
+  var DEFAULT_THEME_MODE = PREF_THEME_MODE.fallback;
   var THEME_MODE_BG = {
     light: "#ffffff",
     dark: "#07172e"
@@ -917,8 +964,8 @@
     text: '"liga" 0, "calt" 0',
     code: '"liga" 1, "calt" 1'
   };
-  var UI_SCALE_MIN = 75;
-  var UI_SCALE_MAX = 200;
+  var UI_SCALE_MIN = PREF_UI_SCALE.min;
+  var UI_SCALE_MAX = PREF_UI_SCALE.max;
   var UI_SCALE_STEP = 12.5;
   var LEGACY_UI_SCALES = {
     small: 100,
@@ -929,8 +976,8 @@
     if (mode === "system") return prefersLight ? "light" : "dark";
     return mode;
   }
-  var MOTION_PREFS = ["system", "reduce", "full"];
-  var DEFAULT_MOTION = "system";
+  var MOTION_PREFS = PREF_MOTION.values;
+  var DEFAULT_MOTION = PREF_MOTION.fallback;
   var MOTION_STORAGE_KEY = "lucidos-motion";
   var REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
   function parseMotion(raw) {
@@ -943,8 +990,8 @@
   function motionAttribute(reduced) {
     return reduced ? "reduce" : "full";
   }
-  var THEME_EFFECTS_PREFS = ["system", "reduce", "full"];
-  var DEFAULT_THEME_EFFECTS = "system";
+  var THEME_EFFECTS_PREFS = PREF_THEME_EFFECTS.values;
+  var DEFAULT_THEME_EFFECTS = PREF_THEME_EFFECTS.fallback;
   var THEME_EFFECTS_STORAGE_KEY = "lucidos-theme-effects";
   var REDUCED_TRANSPARENCY_QUERY = "(prefers-reduced-transparency: reduce)";
   var MORE_CONTRAST_QUERY = "(prefers-contrast: more)";
@@ -1012,8 +1059,8 @@
   }
   var STYLE_OVERRIDES_STORAGE_KEY = "lucidos-style-overrides";
   var STYLE_RESET_PARAM = "style-reset";
-  var MAX_STYLE_OVERRIDES = 200;
-  var MAX_STYLE_VALUE_LENGTH = 120;
+  var MAX_STYLE_OVERRIDES = MAX_RESOLVED_TOKENS;
+  var MAX_STYLE_VALUE_LENGTH = MAX_VALUE_LENGTH;
   var NAME_RE = /^--[a-z][a-z0-9-]*$/;
   var VALUE_BANNED_RE2 = /[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i;
   function isValidOverrideName(name) {
@@ -1032,21 +1079,7 @@
     "--shadow-lg",
     "--shadow-up"
   ];
-  var MAX_SHADOW_PX = 32;
-  var PX_PER_REM = 16;
-  var SHADOW_COLOUR_FUNCTIONS = /* @__PURE__ */ new Set([
-    "rgb",
-    "rgba",
-    "hsl",
-    "hsla",
-    "hwb",
-    "lab",
-    "lch",
-    "oklab",
-    "oklch",
-    "color",
-    "color-mix"
-  ]);
+  var SHADOW_COLOUR_FUNCTION_SET = new Set(SHADOW_COLOUR_FUNCTIONS);
   function splitTopLevel2(value, isSep) {
     const parts = [];
     let depth = 0;
@@ -1092,7 +1125,7 @@
         const word = raw.toLowerCase();
         if (word.includes("(")) {
           const name = wholeCallName(word);
-          if (name === null || !SHADOW_COLOUR_FUNCTIONS.has(name)) return false;
+          if (name === null || !SHADOW_COLOUR_FUNCTION_SET.has(name)) return false;
           continue;
         }
         const px = shadowLengthPx(word);
@@ -1156,6 +1189,7 @@
   function styleResetRequested(search) {
     return new RegExp(`[?&]${STYLE_RESET_PARAM}(?:[=&]|$)`).test(search);
   }
+  var THEME_KEY = PREF_THEME.key;
   var THEME_STORAGE_KEY = "lucidos-theme-resolved";
   var THEME_SEED_KEY = "theme_resolved";
   var EMPTY_THEME = { dark: {}, light: {}, fonts: {}, workspace_fonts: [] };
@@ -1260,6 +1294,18 @@
   function parseWorkspaceFont(raw) {
     return sanitizeWorkspaceFont(parseJson(raw));
   }
+  var FONT_FAMILY_STORAGE_KEY = "lucidos-font-family";
+  var UI_SCALE_STORAGE_KEY = "lucidos-ui-scale";
+  var APPEARANCE_PUSH_SOURCES = [
+    [THEME_MODE_KEY, THEME_MODE_STORAGE_KEY],
+    [THEME_SEED_KEY, THEME_STORAGE_KEY],
+    [PREF_FONT_FAMILY.key, FONT_FAMILY_STORAGE_KEY],
+    [WORKSPACE_FONT_SEED_KEY, WORKSPACE_FONT_STORAGE_KEY],
+    [PREF_UI_SCALE.key, UI_SCALE_STORAGE_KEY],
+    ["style_overrides", STYLE_OVERRIDES_STORAGE_KEY],
+    [PREF_MOTION.key, MOTION_STORAGE_KEY],
+    [PREF_THEME_EFFECTS.key, THEME_EFFECTS_STORAGE_KEY]
+  ];
 
   // src/_bridge.ts
   var BRIDGE_TYPE = "lucidos:bridge";
@@ -1281,6 +1327,11 @@
     window.parent.postMessage(message, hostOrigin());
   }
 
+  // src/appStorage.ts
+  var APP_STORAGE_QUOTA = 512 * 1024;
+  var APP_STORAGE_VALUE_MAX = 256 * 1024;
+  var SDK_STORAGE_QUOTA = 8 * 1024;
+
   // src/_storage.ts
   function workspaceSlug() {
     const base = getBaseUrl();
@@ -1292,20 +1343,30 @@
     const slug = workspaceSlug();
     return slug ? `ws:${slug}:${key}` : key;
   }
-  var mirror = /* @__PURE__ */ new Map();
-  function mirrorKey(key, session) {
-    return `${session ? "session" : "local"}:${key}`;
+  function emptyMirror() {
+    return {
+      sdk: { local: /* @__PURE__ */ new Map(), session: /* @__PURE__ */ new Map() },
+      app: { local: /* @__PURE__ */ new Map(), session: /* @__PURE__ */ new Map() }
+    };
   }
-  function bridgedGet(key, session) {
+  var mirror = emptyMirror();
+  var primeSettled = false;
+  var writtenBeforePrime = /* @__PURE__ */ new Set();
+  function noteWrite(space, area, key) {
+    if (primeSettled) return;
+    writtenBeforePrime.add(key === null ? `${space}:${area}` : `${space}:${area}:${key}`);
+  }
+  function sdkGet(key, area) {
     var _a;
-    return (_a = mirror.get(mirrorKey(key, session))) != null ? _a : null;
+    return (_a = mirror.sdk[area].get(key)) != null ? _a : null;
   }
-  function bridgedRemove(key, session) {
-    mirror.delete(mirrorKey(key, session));
-    tellHost("storage.remove", { key, session });
+  function sdkRemove(key, area) {
+    noteWrite("sdk", area, key);
+    mirror.sdk[area].delete(key);
+    tellHost("storage.remove", { space: "sdk", area, key });
   }
   function wsLocalGet(key) {
-    if (isBridged()) return bridgedGet(nsKey(key), false);
+    if (isBridged()) return sdkGet(key, "local");
     try {
       return localStorage.getItem(nsKey(key));
     } catch (e) {
@@ -1313,7 +1374,7 @@
     }
   }
   function wsLocalRemove(key) {
-    if (isBridged()) return bridgedRemove(nsKey(key), false);
+    if (isBridged()) return sdkRemove(key, "local");
     try {
       localStorage.removeItem(nsKey(key));
     } catch (e) {
@@ -1433,18 +1494,18 @@ ${face.path}`;
       seeded(served, WORKSPACE_FONT_SEED_KEY, WORKSPACE_FONT_STORAGE_KEY)
     );
     const known = picked ? [picked, ...theme.workspace_fonts] : theme.workspace_fonts;
-    const font = resolveFont(seeded(served, "font-family", "lucidos-font-family"), theme.fonts, known);
+    const font = resolveFont(seeded(served, PREF_FONT_FAMILY.key, "lucidos-font-family"), theme.fonts, known);
     d.style.setProperty("--font-ui", font.stack);
     d.style.setProperty("--font-features-text", font.features.text);
     d.style.setProperty("--font-features-code", font.features.code);
     d.setAttribute(FONT_BOLD_ATTRIBUTE, fontBoldMark(font));
     registerFontsInUse(font, known, theme.fonts.mono, dataMountUrl);
     const scale = parseUiScale(
-      (served == null ? void 0 : served["ui-scale"]) || (served == null ? void 0 : served["text-size"]) || (served == null ? void 0 : served["font-size"]) || wsLocalGet("lucidos-ui-scale")
+      (served == null ? void 0 : served[PREF_UI_SCALE.key]) || (served == null ? void 0 : served["text-size"]) || (served == null ? void 0 : served["font-size"]) || wsLocalGet("lucidos-ui-scale")
     );
     if (scale !== null) d.style.setProperty("--user-ui-scale", `${scale}%`);
     const reducedMotion = resolveReducedMotion(
-      parseMotion(seeded(served, "motion", MOTION_STORAGE_KEY)),
+      parseMotion(seeded(served, PREF_MOTION.key, MOTION_STORAGE_KEY)),
       matchMedia(REDUCED_MOTION_QUERY).matches
     );
     d.setAttribute("data-motion", motionAttribute(reducedMotion));
@@ -1453,7 +1514,7 @@ ${face.path}`;
       d.style.setProperty("--duration-scale", String(durationScaleFor(position, reducedMotion)));
     }
     const reducedThemeEffects = resolveReducedThemeEffects(
-      parseThemeEffects(seeded(served, "theme-effects", THEME_EFFECTS_STORAGE_KEY)),
+      parseThemeEffects(seeded(served, PREF_THEME_EFFECTS.key, THEME_EFFECTS_STORAGE_KEY)),
       matchMedia(REDUCED_TRANSPARENCY_QUERY).matches,
       matchMedia(MORE_CONTRAST_QUERY).matches
     );

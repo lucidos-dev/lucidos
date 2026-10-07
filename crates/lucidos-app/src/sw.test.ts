@@ -755,9 +755,8 @@ describe('Service Worker push handler — normal show-notification path', () => 
 
   it('normal payload triggers showNotification with title/body/tag', async () => {
     const event = makePushEvent({
-      title: 'Hi',
-      body: 'There',
-      notification_id: 'notif-show',
+      web_push: 8030,
+      notification: { title: 'Hi', body: 'There', tag: 'notif-show' },
     });
     handlers.push(event);
     await Promise.all(event.waiting);
@@ -840,7 +839,7 @@ describe('Service Worker push handler — userVisibleOnly contract', () => {
   it('calls registration.showNotification on push (no clients connected)', async () => {
     const { handlers, mockRegistration, matchAll } = loadSw();
     matchAll.mockResolvedValue([]);
-    const ev = pushEvent({ title: 'Hi', body: 'There', notification_id: 'nid-1' });
+    const ev = pushEvent({ web_push: 8030, notification: { title: 'Hi', body: 'There', tag: 'nid-1' } });
     handlers.push(ev);
     await Promise.all(ev._waited);
     expect(mockRegistration.showNotification).toHaveBeenCalledTimes(1);
@@ -859,15 +858,15 @@ describe('Service Worker push handler — userVisibleOnly contract', () => {
     matchAll.mockResolvedValue([
       { frameType: 'top-level', visibilityState: 'visible', postMessage: vi.fn() },
     ]);
-    const ev = pushEvent({ title: 'Hi', body: 'There', notification_id: 'nid-2' });
+    const ev = pushEvent({ web_push: 8030, notification: { title: 'Hi', body: 'There', tag: 'nid-2' } });
     handlers.push(ev);
     await Promise.all(ev._waited);
     expect(mockRegistration.showNotification).toHaveBeenCalledTimes(1);
   });
 
-  it('falls back to the default tag when notification_id is missing', async () => {
+  it('falls back to the default tag when the notification has none', async () => {
     const { handlers, mockRegistration } = loadSw();
-    const ev = pushEvent({ title: 'Hi', body: 'There' });
+    const ev = pushEvent({ web_push: 8030, notification: { title: 'Hi', body: 'There' } });
     handlers.push(ev);
     await Promise.all(ev._waited);
     expect(mockRegistration.showNotification).toHaveBeenCalledWith('Hi', expect.objectContaining({
@@ -999,8 +998,8 @@ describe('Service Worker push handler — declarative envelope', () => {
   });
 
   it('declarative push: missing navigate falls back to bare origin', async () => {
-    // Defensive: the engine always emits navigate today, but legacy payloads
-    // or future engine bugs shouldn't crash the SW.
+    // Defensive: the engine always emits navigate today, but an engine bug
+    // shouldn't crash the SW.
     const { handlers, mockRegistration } = loadSw();
     const ev = pushEvent(declarativeEnvelope({
       title: 'Bare',
@@ -1014,32 +1013,17 @@ describe('Service Worker push handler — declarative envelope', () => {
     expect(opts.navigate).toBe('https://example.com/');
   });
 
-  it('legacy flat-shape push (deploy-window compat): still calls showNotification with title/body', async () => {
-    // Defensive legacy branch, kept for one deploy cycle so an in-flight push
-    // from an old engine does not break a freshly-updated SW.
+  it('a payload that is not declarative shows the generic notification', async () => {
     const { handlers, mockRegistration } = loadSw();
-    const ev = pushEvent({
-      title: 'Legacy',
-      body: 'Old shape',
-      notification_id: 'nid-legacy',
-      thread_id: 'tid-1',
-      tap: { kind: 'navigate', to: { target: 'thread', id: 'tid-1' } },
-    });
+    const ev = pushEvent({ title: 'Flat', body: 'Old shape', notification_id: 'nid-flat' });
     handlers.push(ev);
     await Promise.all(ev._waited);
     const [title, opts] = mockRegistration.showNotification.mock.calls[0];
-    expect(title).toBe('Legacy');
-    expect(opts.body).toBe('Old shape');
-    expect(opts.tag).toBe('nid-legacy');
-    // The legacy shape has no engine-built navigate URL, so the SW falls back
-    // to the origin root rather than rebuilding the params.
+    expect(title).toBe('Lucidos');
+    expect(opts.body).toBe('New notification');
+    expect(opts.tag).toBe('lucidos-notification');
     expect(opts.navigate).toBe('https://example.com/');
-    expect(opts.data).toEqual({
-      notification_id: 'nid-legacy',
-      thread_id: 'tid-1',
-      event_id: undefined,
-      tap: { kind: 'navigate', to: { target: 'thread', id: 'tid-1' } },
-    });
+    expect(opts.data).toEqual({});
   });
 
   it('non-JSON payload: defaults to Lucidos title + text body', async () => {
@@ -1081,11 +1065,13 @@ describe('Service Worker push handler — wake variant (layer 3)', () => {
   it('wake:true push still calls showNotification (Chrome silent-push budget)', async () => {
     const { handlers, mockRegistration } = loadSw();
     const ev = pushEvent({
-      title: 'Claude is asking',
-      body: 'Pick one',
-      notification_id: 'nid-stuck',
-      thread_id: 'tid-stuck',
-      tap: { kind: 'navigate', to: { target: 'thread', id: 'tid-stuck' } },
+      web_push: 8030,
+      notification: {
+        title: 'Claude is asking',
+        body: 'Pick one',
+        tag: 'nid-stuck',
+        data: { notification_id: 'nid-stuck', tap: { kind: 'navigate', to: { target: 'thread', id: 'tid-stuck' } } },
+      },
       wake: true,
     });
     handlers.push(ev);
@@ -1096,7 +1082,7 @@ describe('Service Worker push handler — wake variant (layer 3)', () => {
   it('wake:true push sets renotify:false and silent:true (no re-pop, no sound)', async () => {
     const { handlers, mockRegistration } = loadSw();
     const ev = pushEvent({
-      title: 'T', body: 'B', notification_id: 'nid-stuck', wake: true,
+      web_push: 8030, notification: { title: 'T', body: 'B', tag: 'nid-stuck' }, wake: true,
     });
     handlers.push(ev);
     await Promise.all(ev._waited);
@@ -1109,7 +1095,7 @@ describe('Service Worker push handler — wake variant (layer 3)', () => {
 
   it('non-wake push keeps renotify:true and silent:false (original behavior)', async () => {
     const { handlers, mockRegistration } = loadSw();
-    const ev = pushEvent({ title: 'T', body: 'B', notification_id: 'nid-real' });
+    const ev = pushEvent({ web_push: 8030, notification: { title: 'T', body: 'B', tag: 'nid-real' } });
     handlers.push(ev);
     await Promise.all(ev._waited);
     const [, opts] = mockRegistration.showNotification.mock.calls[0];

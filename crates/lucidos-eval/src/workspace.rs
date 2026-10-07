@@ -76,11 +76,16 @@ fn refusal(path: &Path, why: &str) -> Box<dyn std::error::Error + Send + Sync> {
 /// Longest a run label may be, in bytes.
 ///
 /// A Postgres identifier holds 63 bytes. The longest name built here spends 32
-/// of them on `lucidos_`, `eval-`, the separators, `control` and a ten-digit
-/// repeat. That leaves 31. The guard is
+/// of them on `lucidos_`, `eval-`, the separators, `control-tree` and a
+/// five-digit repeat. That leaves 31. The guard is
 /// `the_longest_possible_name_fits_a_postgres_identifier`, which computes the
 /// fixed part rather than trusting this line.
 const MAX_LABEL_BYTES: usize = 31;
+
+/// The highest repeat a run may name.
+///
+/// Five digits, so the longest arm name fits beside the longest label.
+pub const MAX_REPEAT: u32 = 99_999;
 
 /// Hex digits of the digest every derived label ends in.
 const LABEL_DIGEST_HEX: usize = 6;
@@ -90,8 +95,8 @@ const MAX_LABEL_STEM_BYTES: usize = MAX_LABEL_BYTES - LABEL_DIGEST_HEX - 1;
 
 /// What separates one run's arm workspaces from another's.
 ///
-/// An **arm** is a context-mode configuration and stays one. The model is a
-/// separate axis. Without it in the name, two runs against different providers
+/// An **arm** is a context mode and a memory module. The model is a separate
+/// axis. Without it in the name, two runs against different providers
 /// both want `eval-lean-1` and both try to create `lucidos_eval-lean-1`. The
 /// second corrupts or fails against the first.
 ///
@@ -268,9 +273,9 @@ pub fn digest_rows(rows: &[SeedRow]) -> String {
 
 /// Read the three seeded tables, excluding the permitted differences.
 ///
-/// The excluded keys are the rows an arm may differ on, and there are three:
-/// the mode's own flag and the two numbers beside it. They are filtered in SQL,
-/// not by a text scan of a dump.
+/// The excluded keys are the rows an arm may differ on, and there are four:
+/// the mode's own flag, the two numbers beside it, and the memory module. They
+/// are filtered in SQL, not by a text scan of a dump.
 pub async fn read_seed_rows(pool: &PgPool) -> Fallible<Vec<SeedRow>> {
     let mut rows = Vec::new();
 
@@ -651,6 +656,7 @@ fn arm_engine_env(
             FORCE_QUERY_CLASSIFICATION_ENV,
             OsString::from(FORCE_QUERY_CLASSIFICATION_VALUE),
         ),
+        (BIND_LOOPBACK_ENV, OsString::from("1")),
     ];
     env.extend(
         tls.engine_env()
@@ -675,6 +681,16 @@ fn arm_engine_env(
 /// pin below no longer is: the e2e harness sets that one too
 /// (`scripts/lib/e2e.sh`). See ADR 0110 decision 12.
 pub const FULL_CAPTURE_ENV: &str = "LUCIDOS_EVAL_FULL_CAPTURE";
+
+/// Pins the arm's engine to loopback, whatever the machine's bind settings say.
+///
+/// An arm otherwise inherits the gateway bind from `network.toml`, such as a
+/// tailnet address. An engine facing a network refuses every caller without a
+/// credential, and the harness registers its device with none. So the first
+/// request of the run fails with a 401. The harness only ever calls
+/// 127.0.0.1, and a gateway proxies to loopback, so nothing needs the wider
+/// bind. The engine reads the same name in `resolve_bind_choice`.
+const BIND_LOOPBACK_ENV: &str = "LUCIDOS_BIND_LOOPBACK";
 
 /// Pins what the engine's query classifier answers, instead of asking an LLM.
 ///
@@ -810,6 +826,8 @@ pub struct SeedPins<'a> {
     pub model_label: &'a str,
     pub model_provider: &'a str,
     pub reasoning_effort: &'a str,
+    /// The model the seed pins the memory tasks to.
+    pub background_model: &'a str,
     /// The context window to declare on the seeded model row, or `None` to let
     /// the engine infer it from the model id.
     ///
@@ -842,6 +860,8 @@ pub fn apply_seed_sql(database_url: &str, seed_sql: &Path, pins: &SeedPins) -> F
             &format!("model_provider={}", pins.model_provider),
             "-v",
             &format!("reasoning_effort={}", pins.reasoning_effort),
+            "-v",
+            &format!("background_model={}", pins.background_model),
             "-v",
             &format!("context_window={window}"),
             "-f",
@@ -968,15 +988,15 @@ mod tests {
         let root = Path::new("/tmp/eval-root");
         let label = opus();
         assert_eq!(
-            arm_workspace_path(root, &label, Arm::Lean, 3),
+            arm_workspace_path(root, &label, Arm::LEAN, 3),
             root.join(format!("eval-{label}-lean-3"))
         );
         assert_eq!(
-            arm_database_name(&label, Arm::Control, 2),
+            arm_database_name(&label, Arm::CONTROL, 2),
             format!("lucidos_eval-{label}-control-2")
         );
         assert_eq!(
-            arm_database_url("postgres://u:p@localhost:5438/", &label, Arm::Lean, 1),
+            arm_database_url("postgres://u:p@localhost:5438/", &label, Arm::LEAN, 1),
             format!("postgres://u:p@localhost:5438/lucidos_eval-{label}-lean-1")
         );
     }
@@ -988,12 +1008,12 @@ mod tests {
         let anthropic = RunLabel::derive("claude-opus-5@default");
         let openai = RunLabel::derive("gpt-5.6-sol");
         assert_ne!(
-            arm_workspace_name(&anthropic, Arm::Lean, 1),
-            arm_workspace_name(&openai, Arm::Lean, 1)
+            arm_workspace_name(&anthropic, Arm::LEAN, 1),
+            arm_workspace_name(&openai, Arm::LEAN, 1)
         );
         assert_ne!(
-            arm_database_name(&anthropic, Arm::Lean, 1),
-            arm_database_name(&openai, Arm::Lean, 1)
+            arm_database_name(&anthropic, Arm::LEAN, 1),
+            arm_database_name(&openai, Arm::LEAN, 1)
         );
     }
 
@@ -1041,8 +1061,8 @@ mod tests {
             assert_eq!(sanitise(left), sanitise(right), "the premise of the pair");
             assert_ne!(first, second, "{left} collided with {right}");
             assert_ne!(
-                arm_database_name(&first, Arm::Lean, 1),
-                arm_database_name(&second, Arm::Lean, 1)
+                arm_database_name(&first, Arm::LEAN, 1),
+                arm_database_name(&second, Arm::LEAN, 1)
             );
         }
     }
@@ -1051,7 +1071,7 @@ mod tests {
     /// gates dropping a database and clearing a data tree.
     #[test]
     fn a_labelled_workspace_still_carries_the_eval_prefix() {
-        let name = arm_workspace_name(&opus(), Arm::Control, 7);
+        let name = arm_workspace_name(&opus(), Arm::CONTROL, 7);
         assert!(name.starts_with(EVAL_WORKSPACE_PREFIX), "{name}");
         assert!(name.ends_with("-control-7"), "{name}");
     }
@@ -1061,15 +1081,19 @@ mod tests {
     /// so `MAX_LABEL_BYTES` cannot drift away from the real ceiling.
     #[test]
     fn the_longest_possible_name_fits_a_postgres_identifier() {
+        let longest_arm = Arm::ALL
+            .into_iter()
+            .max_by_key(|arm| arm.as_str().len())
+            .expect("there are arms");
         let longest_label = RunLabel("z".repeat(MAX_LABEL_BYTES));
-        let name = arm_database_name(&longest_label, Arm::Control, u32::MAX);
+        let name = arm_database_name(&longest_label, longest_arm, MAX_REPEAT);
         assert!(name.len() <= 63, "{} bytes: {name}", name.len());
 
         // And the label really is the largest piece that can grow, so one more
         // byte would have spent the last of the headroom.
         let over = RunLabel("z".repeat(MAX_LABEL_BYTES + 1));
         assert_eq!(
-            arm_database_name(&over, Arm::Control, u32::MAX).len(),
+            arm_database_name(&over, longest_arm, MAX_REPEAT).len(),
             64,
             "the ceiling is exactly one byte above the longest legal label"
         );
@@ -1087,8 +1111,8 @@ mod tests {
         assert!(first.as_str().len() <= MAX_LABEL_BYTES, "{first}");
         assert!(second.as_str().len() <= MAX_LABEL_BYTES, "{second}");
         assert_ne!(
-            arm_database_name(&first, Arm::Lean, 1),
-            arm_database_name(&second, Arm::Lean, 1)
+            arm_database_name(&first, Arm::LEAN, 1),
+            arm_database_name(&second, Arm::LEAN, 1)
         );
     }
 
@@ -1123,11 +1147,11 @@ mod tests {
         let recorded = RunLabel::recorded("gpt-5-6-sol");
         let ambient = RunLabel::derive("claude-opus-5@default");
         assert_ne!(
-            arm_database_name(&recorded, Arm::Lean, 1),
-            arm_database_name(&ambient, Arm::Lean, 1)
+            arm_database_name(&recorded, Arm::LEAN, 1),
+            arm_database_name(&ambient, Arm::LEAN, 1)
         );
         assert_eq!(
-            arm_database_name(&recorded, Arm::Lean, 1),
+            arm_database_name(&recorded, Arm::LEAN, 1),
             "lucidos_eval-gpt-5-6-sol-lean-1"
         );
     }
@@ -1137,14 +1161,14 @@ mod tests {
     #[test]
     fn an_unlabelled_run_keeps_the_name_it_was_created_with() {
         let none = RunLabel::recorded("");
-        assert_eq!(arm_workspace_name(&none, Arm::Lean, 1), "eval-lean-1");
+        assert_eq!(arm_workspace_name(&none, Arm::LEAN, 1), "eval-lean-1");
         assert_eq!(
-            arm_database_name(&none, Arm::Lean, 1),
+            arm_database_name(&none, Arm::LEAN, 1),
             "lucidos_eval-lean-1"
         );
         // And it still satisfies I5, which is what allows the harness to touch
         // the directory at all.
-        assert!(arm_workspace_name(&none, Arm::Control, 2).starts_with(EVAL_WORKSPACE_PREFIX));
+        assert!(arm_workspace_name(&none, Arm::CONTROL, 2).starts_with(EVAL_WORKSPACE_PREFIX));
     }
 
     /// An id with nothing alphanumeric in it still has to name a database.
@@ -1152,7 +1176,7 @@ mod tests {
     fn an_id_that_sanitises_to_nothing_still_yields_a_label() {
         let label = RunLabel::derive("///");
         assert!(!label.as_str().is_empty());
-        assert!(arm_database_name(&label, Arm::Lean, 1).len() <= 63);
+        assert!(arm_database_name(&label, Arm::LEAN, 1).len() <= 63);
     }
 
     /// The contract with the gateway, spelled out because it cannot be called.
@@ -1170,20 +1194,20 @@ mod tests {
         // A recorded label, so the literals below stay readable. A derived one
         // ends in a digest, which this test is not about.
         let label = RunLabel::recorded("m");
-        assert_eq!(arm_workspace_name(&label, Arm::Lean, 1), "eval-m-lean-1");
+        assert_eq!(arm_workspace_name(&label, Arm::LEAN, 1), "eval-m-lean-1");
         assert_eq!(
-            arm_database_name(&label, Arm::Lean, 1),
+            arm_database_name(&label, Arm::LEAN, 1),
             "lucidos_eval-m-lean-1"
         );
         // Underscores were the old shape, and the gateway can never produce
         // one: a slug is `[a-z0-9-]`. Only the `lucidos_` prefix carries one.
-        assert!(!arm_workspace_name(&label, Arm::Lean, 1).contains('_'));
+        assert!(!arm_workspace_name(&label, Arm::LEAN, 1).contains('_'));
     }
 
     /// The hyphens the gateway's shape forces have to survive into SQL.
     #[test]
     fn the_hyphenated_database_name_is_quoted_in_every_statement() {
-        let name = arm_database_name(&RunLabel::recorded("m"), Arm::Lean, 1);
+        let name = arm_database_name(&RunLabel::recorded("m"), Arm::LEAN, 1);
         let (drop, create) = recreate_statements(&name);
         assert_eq!(
             drop,
@@ -1274,6 +1298,17 @@ mod tests {
                 "the pin is missing from an arm's environment"
             );
         }
+    }
+
+    /// A machine whose gateway binds a tailnet address must not hand that bind
+    /// to an arm, or the arm refuses the harness's first request.
+    #[test]
+    fn every_arm_boots_pinned_to_loopback() {
+        let env = arm_env(&tls(None, None).unwrap());
+        assert_eq!(
+            value_of(&env, BIND_LOOPBACK_ENV),
+            Some(&OsString::from("1"))
+        );
     }
 
     /// `none` would drop the memory section the curated mode is measured on.

@@ -14,6 +14,7 @@
 
 import { serveHost } from './_bridge';
 import { capture } from './capture';
+import { serveFind } from './find';
 
 export function installHostOps(): void {
   serveHost('capture', () => capture());
@@ -35,4 +36,7 @@ export function installHostOps(): void {
     location.replace(target.href);
     return true;
   });
+
+  // Find in app: the host's find bar reads no frame text, so the frame runs it.
+  serveHost('find', serveFind);
 }

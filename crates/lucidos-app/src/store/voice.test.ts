@@ -397,45 +397,37 @@ describe('whether a call reaches the focused thread', () => {
     focusedThreadId.value = id;
   }
 
-  /** The fresh compose view has no draft, so the answer rides `inputMode`. */
-  it('follows the destination picked before any draft exists', () => {
-    expect(callReachesTheFocusedThread.value).toBe(true);
-    inputMode.value = { type: 'coding_agent' };
-    expect(callReachesTheFocusedThread.value).toBe(false);
-  });
+  function started(id: string, channel: string, home: boolean): void {
+    threadMap.value = new Map(threadMap.value).set(id, {
+      meta: { id, state: 'active', channel, ...(home ? { home: true } : {}) },
+    } as unknown as ThreadState);
+    focusedThreadId.value = id;
+  }
 
-  /** The case the user reported: Claude Code picked, then the call pressed. */
-  it('follows a composing draft own mode', () => {
-    draft('d-1', 'claude_code');
-    expect(callReachesTheFocusedThread.value).toBe(false);
-    setDraft('d-1', { text: '', image_hashes: [], mode: 'lucidos' });
+  /** Voice sessions live in the home thread alone (ADR 0362). */
+  it('reaches the home thread', () => {
+    started('home', 'chat', true);
     expect(callReachesTheFocusedThread.value).toBe(true);
   });
 
-  /** Per-draft, so one draft's pick cannot answer for another's. */
-  it('answers for the focused draft alone', () => {
-    draft('d-1', 'claude_code');
-    draft('d-2', 'lucidos');
-    expect(callReachesTheFocusedThread.value).toBe(true);
-    focusedThreadId.value = 'd-1';
+  /** Any other thread is refused, a trigger's and a chat thread's alike. */
+  it('reaches no other started thread', () => {
+    started('t-1', 'chat', false);
+    expect(callReachesTheFocusedThread.value).toBe(false);
+    started('t-2', 'trigger', false);
     expect(callReachesTheFocusedThread.value).toBe(false);
   });
 
-  /** A started thread is locked to its channel, and that is what decides. */
+  /** The compose view and a draft have no home thread, whatever their mode. */
+  it('reaches neither the compose view nor a draft', () => {
+    expect(callReachesTheFocusedThread.value).toBe(false);
+    draft('d-1', 'lucidos');
+    expect(callReachesTheFocusedThread.value).toBe(false);
+  });
+
+  /** A call reaches the Lucidos Agent only (ADR 0165), on home too. */
   it('reads a started thread channel', () => {
-    threadMap.value = new Map().set('t-1', {
-      meta: { id: 't-1', state: 'active', channel: 'claude_code' },
-    } as unknown as ThreadState);
-    focusedThreadId.value = 't-1';
+    started('t-3', 'claude_code', true);
     expect(callReachesTheFocusedThread.value).toBe(false);
-  });
-
-  /** A trigger thread's turns run the Lucidos Agent, so a call reaches it. */
-  it('reaches a thread a trigger started', () => {
-    threadMap.value = new Map().set('t-2', {
-      meta: { id: 't-2', state: 'active', channel: 'trigger' },
-    } as unknown as ThreadState);
-    focusedThreadId.value = 't-2';
-    expect(callReachesTheFocusedThread.value).toBe(true);
   });
 });

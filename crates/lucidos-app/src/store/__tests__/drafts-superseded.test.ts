@@ -225,7 +225,7 @@ describe('superseded drafts are dropped; unsent work is not', () => {
     typeDraftHere(T, DRAFT, WATERMARK);
     // The projection wiped compose_selection along with the text, so the draft's
     // dropdown picks must not survive locally either.
-    seedComposeSelection(T, { model: 'claude-opus-5' });
+    seedComposeSelection(T, { model: 'claude-sonnet-5' });
     // loadAllThreads ran first and its snapshot came back empty — it just had no
     // evidence yet, because the missed messages arrive only with this replay.
     serverReportedNoDraft(T);

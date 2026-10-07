@@ -165,8 +165,8 @@ fn write_from_worktree_targets_the_parent_workspace_engine() {
         "stderr must not name the worktree, got: {stderr}"
     );
     assert!(
-        !stderr.contains("cannot see"),
-        "only a picture carries the not-shown reminder, got: {stderr}"
+        stderr.contains("The user cannot see this file yet"),
+        "a saved artifact must say its link is not shown yet, got: {stderr}"
     );
 }
 
@@ -288,9 +288,10 @@ fn write_normalizes_and_encodes_the_request_path() {
         .recv()
         .expect("engine must have received the write");
     assert_eq!(req.path, "artifacts/quarterly report.md");
+    // Markdown ends a bare target at the space, so the link is bracketed.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "[quarterly report.md](artifacts/quarterly report.md)"
+        "[quarterly report.md](<artifacts/quarterly report.md>)"
     );
 }
 

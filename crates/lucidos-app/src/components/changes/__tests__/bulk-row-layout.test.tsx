@@ -32,6 +32,7 @@ import {
   changes,
   appliedChanges,
   setAsideChanges,
+  threadMap,
   applyingChangeIds,
   applyingNowThreadIds,
   applyAllInProgress,
@@ -85,6 +86,7 @@ beforeEach(() => {
   };
   appliedChanges.value = { status: 'loaded', data: [] };
   setAsideChanges.value = { status: 'loaded', data: [] };
+  threadMap.value = new Map();
   applyingChangeIds.value = new Set();
   applyingNowThreadIds.value = new Map();
   applyAllInProgress.value = false;
@@ -185,6 +187,21 @@ describe('the set-aside row', () => {
     render(<ChangesView />, host);
     expect(setAsideRowButtons()).toEqual(['Diff', 'Bring back', 'More set-aside actions']);
     expect(host.querySelector('.split-button-primary')?.className).not.toContain('action-btn-confirm');
+  });
+
+  // A thread watching an event wakes and commits on its branch, so the engine
+  // refuses the discard until it settles.
+  it('withholds Discard while its thread watches an event', () => {
+    setAsideChanges.value = {
+      status: 'loaded',
+      data: [makeChange({ id: 'aside', thread_id: 'thread-watching', status: 'set_aside' as Change['status'] })],
+    };
+    threadMap.value = new Map([['thread-watching', {
+      meta: { id: 'thread-watching', status: 'idle', liveEventWaitCount: 1 },
+      pendingUserMessages: [],
+    } as never]]);
+    render(<ChangesView />, host);
+    expect(setAsideRowButtons()).toEqual(['Diff', 'Bring back']);
   });
 });
 

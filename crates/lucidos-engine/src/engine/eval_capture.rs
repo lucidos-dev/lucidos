@@ -31,9 +31,9 @@ pub(crate) fn full_bodies() -> bool {
     *ENABLED.get_or_init(|| enabled_value(std::env::var(FULL_CAPTURE_ENV).ok().as_deref()))
 }
 
-/// The same truthy set the cache probe uses, so one habit covers both.
+/// The exact env switch rule (`prefs::env_switch_is_on`).
 fn enabled_value(value: Option<&str>) -> bool {
-    matches!(value.map(str::trim), Some("1" | "true" | "yes" | "on"))
+    value.is_some_and(crate::core::prefs::env_switch_is_on)
 }
 
 /// The cap a capture applies to one section body, or `None` for no cap.
@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn only_a_truthy_value_lifts_the_caps() {
-        for on in ["1", "true", "yes", "on", " on "] {
+        for &on in crate::core::prefs::FLAG_ON_VALUES {
             assert!(enabled_value(Some(on)), "{on} should enable it");
         }
         for off in [None, Some(""), Some("0"), Some("false"), Some("maybe")] {

@@ -43,7 +43,7 @@ describe('contextLabel', () => {
 describe('InlineStep context suffix', () => {
   const capture: ContextCapture = {
     producer: 'main_llm',
-    model: 'claude-opus-5',
+    model: 'claude-opus-5[1m]',
     context_window: 1_000_000,
     sections: [],
     tools: [],
@@ -76,7 +76,7 @@ describe('InlineStep context suffix', () => {
 describe('InlineStep context counter as a click target', () => {
   const capture: ContextCapture = {
     producer: 'main_llm',
-    model: 'claude-opus-5',
+    model: 'claude-opus-5[1m]',
     context_window: 1_000_000,
     sections: [],
     tools: [],
@@ -86,8 +86,10 @@ describe('InlineStep context counter as a click target', () => {
 
   function counterOf(event: Extract<ResponseEvent, { type: 'step' }>) {
     const vnode = InlineStep({ event }) as VNode<{ children?: unknown }>;
-    const children = vnode.props.children as VNode<Record<string, unknown>>[];
-    return children[1];
+    const children = vnode.props.children as (VNode<Record<string, unknown>> | false | undefined)[];
+    return children.find(
+      (c): c is VNode<Record<string, unknown>> => !!c && String(c.props.class ?? '').startsWith('step-context'),
+    )!;
   }
 
   afterEach(() => { contextViewer.value = null; });

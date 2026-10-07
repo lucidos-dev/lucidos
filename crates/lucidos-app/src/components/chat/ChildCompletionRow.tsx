@@ -17,6 +17,8 @@ interface Props {
   /** Changes pending anywhere below the child, kept apart from its own. An
    *  orchestrator's children hold the work while it holds none. */
   subThreadPendingChanges?: SubThreadPendingChange[];
+  /** Set while the report waits behind an open question (`EventRowProps`). */
+  heldNote?: string;
 }
 
 /** How each completion reads on the row. This is the one event row that
@@ -71,6 +73,7 @@ export function ChildCompletionRow(props: Props) {
     subject: eventNameChip({ kind: 'chip', name: 'ChildThreadCompleted', sentenceStart: true }),
     stateLabel: label,
     tone,
+    heldNote: props.heldNote,
     facts: [
       { kind: 'node' as const, node: threadLink(props.childThreadId, props.childThreadTitle) },
       pending > 0

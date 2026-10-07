@@ -1,32 +1,35 @@
-//! Which arm a workspace is, and the one preference row that makes it so.
+//! Which arm a workspace is, and the preference rows that make it so.
 //!
-//! This module is the whole seam between the harness and ADR 0085's context
-//! mode. Everything else asks it two questions: what preference row does this
-//! arm seed, and does the engine under test know that key. Nothing else in the
-//! crate names the preference.
+//! An arm has two dimensions: ADR 0085's context mode and ADR 0362's memory
+//! module. This module is the whole seam between the harness and both.
+//! Everything else asks it two questions: what preference rows does this arm
+//! seed, and does the engine under test know those keys. Nothing else in the
+//! crate names the preferences.
 //!
-//! **The engine may not carry the flag.** [`FlagAvailability`] makes that gap a
+//! **The engine may not carry a flag.** [`FlagAvailability`] makes that gap a
 //! refusal with the key's name in it, rather than a null result that reads as a
 //! pass. See `manipulation::preflight`.
 
 use std::fmt;
 
-use lucidos_engine::core::preference_catalog::{self, PrefValue};
+use lucidos_engine::core::prefs::{self, PrefValue};
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// The workspace preference that turns the self-curated context mode on.
 ///
-/// The seeding digest excludes this key and the two beside it, and nothing
-/// else. The two arms can then be proved byte-identical everywhere they are
-/// not (I1).
-pub const CONTEXT_MODE_PREFERENCE_KEY: &str = "self_curated_context_mode";
+/// The seeding digest excludes the [`ARM_PREFERENCE_KEYS`] and nothing else.
+/// The arms can then be proved byte-identical everywhere they are not (I1).
+pub const CONTEXT_MODE_PREFERENCE_KEY: &str = prefs::SELF_CURATED_CONTEXT_MODE.key();
+
+/// The workspace preference that picks the memory module (ADR 0362).
+pub const MEMORY_MODULE_PREFERENCE_KEY: &str = prefs::MEMORY_MODULE.key();
 
 /// How old a result gets before a sweep may take it.
-pub const EXPIRE_AFTER_ROUNDS_KEY: &str = "self_curated_context_expire_after_rounds";
+pub const EXPIRE_AFTER_ROUNDS_KEY: &str = prefs::SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS.key();
 
 /// How often the sweep runs.
-pub const SWEEP_EVERY_ROUNDS_KEY: &str = "self_curated_context_sweep_every_rounds";
+pub const SWEEP_EVERY_ROUNDS_KEY: &str = prefs::SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS.key();
 
 /// The variable that pins how old a result may get before a sweep takes it.
 pub const EXPIRE_AFTER_ROUNDS_VAR: &str = "LUCIDOS_EVAL_EXPIRE_AFTER_ROUNDS";
@@ -39,10 +42,11 @@ pub const SWEEP_EVERY_ROUNDS_VAR: &str = "LUCIDOS_EVAL_SWEEP_EVERY_ROUNDS";
 /// The seeding digest excludes exactly these. Excluding fewer than an arm
 /// writes fails I1 before the first prompt, naming a mismatch the harness
 /// itself created.
-pub const ARM_PREFERENCE_KEYS: [&str; 3] = [
+pub const ARM_PREFERENCE_KEYS: [&str; 4] = [
     CONTEXT_MODE_PREFERENCE_KEY,
     EXPIRE_AFTER_ROUNDS_KEY,
     SWEEP_EVERY_ROUNDS_KEY,
+    MEMORY_MODULE_PREFERENCE_KEY,
 ];
 
 /// The schedule a lean arm runs at.
@@ -57,12 +61,14 @@ pub struct SweepPins {
 }
 
 impl Default for SweepPins {
-    /// The engine's own defaults, read from the engine. A pair copied here
-    /// would keep reporting the shipped default long after it moved.
+    /// The engine's own defaults, read from its preference catalog. A pair
+    /// copied here would keep reporting the shipped default long after it moved.
     fn default() -> Self {
         Self {
-            expire_after_rounds: lucidos_engine::engine::DEFAULT_EXPIRE_AFTER_ROUNDS,
-            sweep_every_rounds: lucidos_engine::engine::DEFAULT_SWEEP_EVERY_ROUNDS,
+            expire_after_rounds: prefs::SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS.default_number()
+                as usize,
+            sweep_every_rounds: prefs::SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS.default_number()
+                as usize,
         }
     }
 }
@@ -123,7 +129,7 @@ fn checked(
 /// Read rather than restated, so a widened bound reaches the harness with the
 /// engine that widened it.
 fn catalog_range(catalog_key: &str) -> Option<(usize, usize)> {
-    match preference_catalog::lookup(catalog_key)?.value {
+    match prefs::lookup(catalog_key)?.value {
         PrefValue::Number { min, max } if min >= 0.0 && max >= min => {
             Some((min.ceil() as usize, max.floor() as usize))
         }
@@ -159,11 +165,9 @@ fn written(env_var: &str) -> Option<String> {
         .filter(|raw| !raw.is_empty())
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum Arm {
+/// ADR 0085's context mode, one dimension of an arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContextMode {
     /// Post-ADR-0086 behaviour with nothing removed.
     Control,
     /// Context mode on: memory recall and the conversation history go from
@@ -171,38 +175,80 @@ pub enum Arm {
     Lean,
 }
 
+/// ADR 0362's memory module, the other dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MemoryModule {
+    /// The history summariser, memory recall and memory search. The engine's
+    /// default, so a Classic arm seeds no row for it.
+    Classic,
+    /// Summary trees and memory views in place of history and recall.
+    Tree,
+}
+
+impl MemoryModule {
+    /// The `memory_module` value the engine reads.
+    pub fn as_pref(self) -> &'static str {
+        match self {
+            MemoryModule::Classic => "classic",
+            MemoryModule::Tree => "tree",
+        }
+    }
+}
+
+/// One arm: a context mode and a memory module.
+///
+/// Its name is its identity in every result row, workspace and database. A
+/// Classic arm keeps the name it had before the memory module became a
+/// dimension. Its rows, its database and its seeded preferences therefore stay
+/// byte-identical (ADR 0362 I2). A Tree arm adds `-tree`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(into = "String", try_from = "String")]
+pub struct Arm {
+    pub context: ContextMode,
+    pub memory: MemoryModule,
+}
+
 impl Arm {
-    pub const BOTH: [Arm; 2] = [Arm::Control, Arm::Lean];
+    pub const CONTROL: Arm = Arm::of(ContextMode::Control, MemoryModule::Classic);
+    pub const LEAN: Arm = Arm::of(ContextMode::Lean, MemoryModule::Classic);
+    pub const CONTROL_TREE: Arm = Arm::of(ContextMode::Control, MemoryModule::Tree);
+    pub const LEAN_TREE: Arm = Arm::of(ContextMode::Lean, MemoryModule::Tree);
+    pub const ALL: [Arm; 4] = [Arm::CONTROL, Arm::LEAN, Arm::CONTROL_TREE, Arm::LEAN_TREE];
+
+    const fn of(context: ContextMode, memory: MemoryModule) -> Arm {
+        Arm { context, memory }
+    }
 
     pub fn as_str(self) -> &'static str {
-        match self {
-            Arm::Control => "control",
-            Arm::Lean => "lean",
+        match (self.context, self.memory) {
+            (ContextMode::Control, MemoryModule::Classic) => "control",
+            (ContextMode::Lean, MemoryModule::Classic) => "lean",
+            (ContextMode::Control, MemoryModule::Tree) => "control-tree",
+            (ContextMode::Lean, MemoryModule::Tree) => "lean-tree",
         }
     }
 
     pub fn parse(s: &str) -> Option<Arm> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "control" => Some(Arm::Control),
-            "lean" => Some(Arm::Lean),
-            _ => None,
-        }
+        let wanted = s.trim().to_ascii_lowercase();
+        Arm::ALL.into_iter().find(|arm| arm.as_str() == wanted)
     }
 
     /// The preference rows this arm seeds, in order.
     ///
-    /// The control arm writes nothing at all rather than writing `false`. An
-    /// absent key and a false one mean the same thing to the engine, and an
-    /// absent one keeps the digest exclusion honest: the rows of difference
-    /// between the arms exist in one arm only.
+    /// A control arm writes no mode row rather than writing `false`, and a
+    /// Classic arm writes no module row. An absent key and the default mean
+    /// the same thing to the engine. An absent one keeps the digest exclusion
+    /// honest: each row of difference between two arms exists in one arm only.
     ///
     /// Plural, because the schedule rides beside the mode. An arm that carries
     /// the flag and not the two numbers would run at the engine's defaults
     /// while the run believed it was sweeping.
     pub fn preference_rows(self, sweep: SweepPins) -> Vec<(&'static str, String)> {
-        match self {
-            Arm::Control => Vec::new(),
-            Arm::Lean => vec![
+        let mut rows = match self.context {
+            ContextMode::Control => Vec::new(),
+            ContextMode::Lean => vec![
                 (CONTEXT_MODE_PREFERENCE_KEY, "true".to_string()),
                 (
                     EXPIRE_AFTER_ROUNDS_KEY,
@@ -210,7 +256,14 @@ impl Arm {
                 ),
                 (SWEEP_EVERY_ROUNDS_KEY, sweep.sweep_every_rounds.to_string()),
             ],
+        };
+        if self.memory == MemoryModule::Tree {
+            rows.push((
+                MEMORY_MODULE_PREFERENCE_KEY,
+                MemoryModule::Tree.as_pref().to_string(),
+            ));
         }
+        rows
     }
 
     /// Whether every round must carry a context panel.
@@ -221,10 +274,27 @@ impl Arm {
     /// because it always states the budget. So there is no round the flag can
     /// be silently inert on.
     pub fn expects_a_context_panel(self) -> bool {
-        match self {
-            Arm::Control => false,
-            Arm::Lean => true,
-        }
+        self.context == ContextMode::Lean
+    }
+
+    /// Whether every turn must take the Tree path. The engine runs Classic
+    /// until its ready flag sets, so a Tree arm checks readiness itself.
+    pub fn expects_tree_memory(self) -> bool {
+        self.memory == MemoryModule::Tree
+    }
+}
+
+impl From<Arm> for String {
+    fn from(arm: Arm) -> String {
+        arm.as_str().to_string()
+    }
+}
+
+impl TryFrom<String> for Arm {
+    type Error = String;
+
+    fn try_from(name: String) -> Result<Arm, String> {
+        Arm::parse(&name).ok_or_else(|| format!("{name} is not an arm"))
     }
 }
 
@@ -240,10 +310,10 @@ impl fmt::Display for Arm {
 /// comes from the build being measured rather than from this crate's opinion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlagAvailability {
-    /// The catalog carries every key. The lean arm can be exercised.
+    /// The catalog carries every key. Every arm can be exercised.
     Present,
-    /// A key is missing, so a lean run would measure something other than what
-    /// it reports. See [`missing_flag_message`].
+    /// A key is missing, so an arm seeding it would measure something other
+    /// than what it reports. See [`missing_flag_message`].
     Missing,
 }
 
@@ -277,12 +347,12 @@ impl FlagAvailability {
 /// the key is never spelled by hand a second time.
 pub fn missing_flag_message() -> String {
     format!(
-        "context_mode_flag_missing: the engine's preference catalog is missing \
-         at least one of `{}`. So ADR 0085's context mode is not implemented in \
-         this build, or not at the schedule this run pins. The lean arm would \
-         run identically to the control arm, or at the engine's own defaults, \
-         and the result would be a null that reads as a pass. Land ADR 0085 \
-         before running either arm.",
+        "arm_flag_missing: the engine's preference catalog is missing at least \
+         one of `{}`. So this build lacks ADR 0085's context mode, its schedule, \
+         or ADR 0362's memory module. The engine ignores a key it does not know. \
+         A lean arm would then run as control, or a tree arm as classic, and the \
+         result would be a null that reads as a pass. Land the missing key \
+         before running any arm.",
         ARM_PREFERENCE_KEYS.join("`, `")
     )
 }
@@ -291,36 +361,98 @@ pub fn missing_flag_message() -> String {
 mod tests {
     use super::*;
 
+    fn lean_rows() -> Vec<(&'static str, String)> {
+        let defaults = SweepPins::default();
+        vec![
+            (CONTEXT_MODE_PREFERENCE_KEY, "true".to_string()),
+            (
+                EXPIRE_AFTER_ROUNDS_KEY,
+                defaults.expire_after_rounds.to_string(),
+            ),
+            (
+                SWEEP_EVERY_ROUNDS_KEY,
+                defaults.sweep_every_rounds.to_string(),
+            ),
+        ]
+    }
+
+    /// I2: the Classic arms seed exactly what they seeded before the memory
+    /// module was a dimension.
     #[test]
     fn only_the_lean_arm_seeds_preference_rows() {
-        assert!(Arm::Control
+        assert!(Arm::CONTROL
             .preference_rows(SweepPins::default())
             .is_empty());
+        assert_eq!(Arm::LEAN.preference_rows(SweepPins::default()), lean_rows());
+    }
+
+    /// A Tree arm is its Classic twin plus one row, so the two differ by the
+    /// module and nothing else.
+    #[test]
+    fn a_tree_arm_adds_the_module_row_to_its_classic_twin() {
+        let module = (MEMORY_MODULE_PREFERENCE_KEY, "tree".to_string());
         assert_eq!(
-            Arm::Lean.preference_rows(SweepPins::default()),
-            vec![
-                (CONTEXT_MODE_PREFERENCE_KEY, "true".to_string()),
-                (EXPIRE_AFTER_ROUNDS_KEY, "5".to_string()),
-                (SWEEP_EVERY_ROUNDS_KEY, "10".to_string()),
-            ]
+            Arm::CONTROL_TREE.preference_rows(SweepPins::default()),
+            vec![module.clone()]
         );
+        let mut lean_tree = lean_rows();
+        lean_tree.push(module);
+        assert_eq!(
+            Arm::LEAN_TREE.preference_rows(SweepPins::default()),
+            lean_tree
+        );
+    }
+
+    /// The value the Tree arm seeds is one the engine's catalog accepts, read
+    /// from the catalog rather than restated.
+    #[test]
+    fn both_module_values_are_ones_the_catalog_accepts() {
+        let spec = prefs::lookup(MEMORY_MODULE_PREFERENCE_KEY)
+            .expect("the catalog declares the memory module");
+        let PrefValue::Enum(options) = spec.value else {
+            panic!("the memory module is no longer an enum preference");
+        };
+        for module in [MemoryModule::Classic, MemoryModule::Tree] {
+            assert!(
+                options.contains(&module.as_pref()),
+                "{} is not a memory module the engine accepts",
+                module.as_pref()
+            );
+        }
     }
 
     /// Every key an arm writes must be excluded from the digest, or the run
     /// dies on a difference the harness put there itself.
     #[test]
     fn every_seeded_key_is_one_the_digest_excludes() {
-        for (key, _) in Arm::Lean.preference_rows(SweepPins::default()) {
-            assert!(
-                ARM_PREFERENCE_KEYS.contains(&key),
-                "{key} is seeded but not excluded from the seed digest"
-            );
+        for arm in Arm::ALL {
+            for (key, _) in arm.preference_rows(SweepPins::default()) {
+                assert!(
+                    ARM_PREFERENCE_KEYS.contains(&key),
+                    "{key} is seeded by the {arm} arm but not excluded from the seed digest"
+                );
+            }
         }
+    }
+
+    /// I2: a Classic arm's name is its name from before, in every row and
+    /// database that carries it.
+    #[test]
+    fn the_classic_arms_keep_their_wire_names() {
+        assert_eq!(serde_json::to_string(&Arm::CONTROL).unwrap(), "\"control\"");
+        assert_eq!(serde_json::to_string(&Arm::LEAN).unwrap(), "\"lean\"");
+        assert_eq!(
+            serde_json::to_string(&Arm::LEAN_TREE).unwrap(),
+            "\"lean-tree\""
+        );
+        let read: Arm = serde_json::from_str("\"control-tree\"").unwrap();
+        assert_eq!(read, Arm::CONTROL_TREE);
+        assert!(serde_json::from_str::<Arm>("\"tree\"").is_err());
     }
 
     #[test]
     fn a_swept_arm_seeds_the_values_it_was_given() {
-        let rows = Arm::Lean.preference_rows(SweepPins {
+        let rows = Arm::LEAN.preference_rows(SweepPins {
             expire_after_rounds: 3,
             sweep_every_rounds: 7,
         });
@@ -330,7 +462,11 @@ mod tests {
 
     #[test]
     fn a_catalog_without_the_key_reports_missing() {
-        let catalog = ["timezone", "language", "chat_model"];
+        let catalog = [
+            prefs::TIMEZONE.key(),
+            prefs::LANGUAGE.key(),
+            prefs::CHAT_MODEL.key(),
+        ];
         assert_eq!(
             FlagAvailability::from_catalog_keys(&catalog),
             FlagAvailability::Missing
@@ -339,7 +475,7 @@ mod tests {
 
     #[test]
     fn a_catalog_with_every_key_reports_present() {
-        let mut catalog = vec!["timezone"];
+        let mut catalog = vec![prefs::TIMEZONE.key()];
         catalog.extend(ARM_PREFERENCE_KEYS);
         assert_eq!(
             FlagAvailability::from_catalog_keys(&catalog),
@@ -352,14 +488,18 @@ mod tests {
     /// report the numbers it seeded.
     #[test]
     fn the_mode_key_alone_reports_missing() {
-        let catalog = ["timezone", CONTEXT_MODE_PREFERENCE_KEY];
+        let catalog = [prefs::TIMEZONE.key(), CONTEXT_MODE_PREFERENCE_KEY];
         assert_eq!(
             FlagAvailability::from_catalog_keys(&catalog),
             FlagAvailability::Missing
         );
         assert_eq!(
             FlagAvailability::missing_keys(&catalog),
-            vec![EXPIRE_AFTER_ROUNDS_KEY, SWEEP_EVERY_ROUNDS_KEY]
+            vec![
+                EXPIRE_AFTER_ROUNDS_KEY,
+                SWEEP_EVERY_ROUNDS_KEY,
+                MEMORY_MODULE_PREFERENCE_KEY
+            ]
         );
     }
 
@@ -385,8 +525,14 @@ mod tests {
 
     #[test]
     fn an_unset_pin_is_the_engines_own_default() {
-        let resolved = checked(EXPIRE_AFTER_ROUNDS_VAR, EXPIRE_AFTER_ROUNDS_KEY, None, 5);
-        assert_eq!(resolved.unwrap(), 5);
+        let default = SweepPins::default().expire_after_rounds;
+        let resolved = checked(
+            EXPIRE_AFTER_ROUNDS_VAR,
+            EXPIRE_AFTER_ROUNDS_KEY,
+            None,
+            default,
+        );
+        assert_eq!(resolved.unwrap(), default);
     }
 
     #[test]
@@ -438,9 +584,21 @@ mod tests {
 
     #[test]
     fn arm_round_trips_through_its_wire_name() {
-        for arm in Arm::BOTH {
+        for arm in Arm::ALL {
             assert_eq!(Arm::parse(arm.as_str()), Some(arm));
         }
         assert_eq!(Arm::parse("nolean"), None);
+    }
+
+    /// The panel follows the context mode alone, and Tree the module alone.
+    #[test]
+    fn each_gate_reads_its_own_dimension() {
+        for arm in Arm::ALL {
+            assert_eq!(
+                arm.expects_a_context_panel(),
+                arm.context == ContextMode::Lean
+            );
+            assert_eq!(arm.expects_tree_memory(), arm.memory == MemoryModule::Tree);
+        }
     }
 }

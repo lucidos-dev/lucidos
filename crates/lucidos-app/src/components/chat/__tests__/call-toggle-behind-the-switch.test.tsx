@@ -25,7 +25,7 @@ function toggle(available = true): HTMLElement | null {
 
 /** Voice on, so the tests below are about the destination and nothing else. */
 function voiceIsOn(): void {
-  preferences.value = { status: 'loaded', data: { voice_enabled: 'true' } };
+  preferences.value = { status: 'loaded', data: { voice_enabled: 'true', home_thread_enabled: 'true' } };
 }
 
 beforeEach(() => {
@@ -54,8 +54,14 @@ describe('the call toggle behind the voice switch', () => {
   });
 
   it('renders the control once voice is on', () => {
-    preferences.value = { status: 'loaded', data: { voice_enabled: 'true' } };
+    preferences.value = { status: 'loaded', data: { voice_enabled: 'true', home_thread_enabled: 'true' } };
     expect(toggle()).not.toBeNull();
+  });
+
+  /** A call runs on the home thread alone, so voice on is not enough. */
+  it('renders nothing while the home thread is off, even with voice on', () => {
+    preferences.value = { status: 'loaded', data: { voice_enabled: 'true' } };
+    expect(toggle()).toBeNull();
   });
 
   /** A switch flipped mid-call must not take away the only way to ring off.

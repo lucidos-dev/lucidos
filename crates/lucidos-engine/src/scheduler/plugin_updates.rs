@@ -5,7 +5,9 @@
 //! updates — the user asked to be told and to decide. When the scan finds
 //! installed plugins with a newer version available, this emits a single,
 //! deduplicated notification pointing the user at the Apps section, where each
-//! plugin's "Update" button stages the change for the user to confirm.
+//! plugin's "Update" button stages the change for the user to confirm. It never
+//! announces a version whose `engine` requirement this release misses. The
+//! Plugins panel shows that one with a disabled Update button and the reason.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -21,6 +23,7 @@ use crate::core::plugin_marketplaces::{
     MarketplacePlugin, MarketplaceScanError,
 };
 use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::engine::release_notices::running_release;
 use crate::engine::tools::plugins::installed_plugin_summaries;
 use crate::scheduler::notifications::{NavigateTarget, NavigateUi, Tap};
 
@@ -341,7 +344,7 @@ async fn check_marketplaces_for_updates(
         report.errors.push(format_scan_error(error));
     }
 
-    let candidates = update_candidates(&catalog);
+    let candidates = update_candidates(&catalog, &running_release());
     report.candidates = candidates.len();
 
     let current: BTreeSet<String> = candidates

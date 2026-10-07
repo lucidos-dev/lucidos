@@ -418,9 +418,9 @@ pub const TABLES: &[TableRule] = &[
             exempt: &[ExemptWriter {
                 function: "set_silent",
                 why: "The guarded silent door for engine-internal keys \
-                      (SILENT_PREF_KEYS). It rejects any key not on that list, \
-                      so it cannot be used to write a user-visible preference \
-                      quietly.",
+                      (a PrefAccess::Engine catalog spec). It rejects any \
+                      other key, so it cannot be used to write a \
+                      user-visible preference quietly.",
             }],
         },
     },
@@ -460,6 +460,31 @@ pub const TABLES: &[TableRule] = &[
         announcement: Announcement::Announced {
             events: &["RepositoryAdded", "RepositoryRemoved"],
             exempt: &[],
+        },
+    },
+    TableRule {
+        table: "summary_tree_nodes",
+        owners: &["engine/summary_tree/store.rs"],
+        announcement: Announcement::Silent {
+            reason: "Summary tree nodes, a derived index like memory_entries: \
+                     every node is rebuilt from events that were themselves \
+                     announced, and the memory views, recall tools and the \
+                     summary tree browser only read them. A thread delete \
+                     purges the family's nodes inside its own transaction, \
+                     and ThreadsDeleted is the record of that.",
+        },
+    },
+    TableRule {
+        table: "summary_tree_scopes",
+        owners: &["engine/summary_tree/store.rs"],
+        announcement: Announcement::Silent {
+            reason: "The compactor's durable progress: the newest event each \
+                     summary tree reflects, and the workspace's ready flag. \
+                     The progress is bookkeeping derived from the events. The \
+                     flag's two writers announce from their callers, which \
+                     hold the bus: the compactor emits TreeBackfillCompleted \
+                     after setting it, and the consumer emits \
+                     TreeBackfillReset after clearing a set one.",
         },
     },
     TableRule {

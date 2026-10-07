@@ -8,6 +8,7 @@ import {
   type WireRequest,
   type WireResponse,
 } from './_bridge';
+import { PROXY_CLIENT_WAIT_SECS } from './generated/engine-constants';
 
 /**
  * Generic API proxy. Configure backends in `data/config/apis.json`:
@@ -46,10 +47,10 @@ export interface ProxyClient {
 /** How long the host will wait on a proxied upstream before giving up.
  *
  *  The engine owns the real limit: `proxy_timeout_secs`, or an entry's
- *  `timeout_secs`, with one proxied call capped at 600 s. This sits a minute
- *  above that cap, so it never cuts first. It exists so a hung backend cannot
- *  leave a pending entry for the life of the frame. An engine test pins it. */
-const PROXY_TIMEOUT_MS = 660000;
+ *  `timeout_secs`, under a cap on the whole call. This wait sits above that
+ *  cap, so it never cuts first. It exists so a hung backend cannot leave a
+ *  pending entry for the life of the frame. */
+const PROXY_TIMEOUT_MS = PROXY_CLIENT_WAIT_SECS * 1000;
 
 export function proxy(name: string): ProxyClient {
   const safeName = encodeURIComponent(name);

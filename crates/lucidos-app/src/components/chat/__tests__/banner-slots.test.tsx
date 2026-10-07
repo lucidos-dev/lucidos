@@ -510,15 +510,114 @@ describe('a thread holding a set-aside change', () => {
       data: [{ id: 'c-aside', thread_id: 't-aside', status: 'set_aside' } as never],
     };
     const state = getWaitingState();
-    expect(state).toMatchObject({ type: 'actions', setAsideChangeId: 'c-aside' });
+    expect(state).toMatchObject({ type: 'actions', setAside: { changeId: 'c-aside', discardable: true } });
     const keys = getBannerActions(state as Parameters<typeof getBannerActions>[0]).map((m) => m.key);
     expect(keys).toContain('bring-back');
+  });
+
+  /** The Bring back member for a set-aside change, with its caret's items and
+   *  the rows it folds into. */
+  function bringBackMember(discardable: boolean) {
+    const members = getBannerActions({
+      type: 'actions',
+      actions: [],
+      threadId: 't-aside',
+      isArchiving: false,
+      showDiff: false,
+      setAside: { changeId: 'c-aside', discardable },
+    });
+    const bringBack = members.find((m) => m.key === 'bring-back')!;
+    const split = bringBack.render!({}) as VNode<{ primaryLabel: string; menuItems: { label: string; className: string }[] }>;
+    const ctx = { run: (fn: () => void) => () => fn(), anchor: null };
+    return { split: split.props, folded: buttonLabels(bringBack.menuRows!(ctx)) };
+  }
+
+  // The same control the Changes panel's set-aside row wears.
+  it('draws Bring back as a split button with Discard behind the caret', () => {
+    const { split, folded } = bringBackMember(true);
+    expect(split.primaryLabel).toBe('Bring back');
+    expect(split.menuItems.map((i) => [i.label, i.className])).toEqual([
+      ['Discard', 'action-btn action-btn-danger'],
+    ]);
+    expect(folded).toEqual(['Bring back', 'Discard']);
+  });
+
+  it('withholds Discard while the thread is unsettled', () => {
+    const { split, folded } = bringBackMember(false);
+    expect(split.menuItems).toEqual([]);
+    expect(folded).toEqual(['Bring back']);
+  });
+
+  // A thread watching an event is idle, so the banner shows, but the engine
+  // refuses the discard until the thread settles.
+  it('reads a thread watching an event as unsettled', () => {
+    const thread = makeCCThread('t-watch', { status: 'idle', liveEventWaitCount: 1 });
+    threadMap.value = new Map([['t-watch', thread]]);
+    focusedThreadId.value = 't-watch';
+    setAsideChanges.value = {
+      status: 'loaded',
+      data: [{ id: 'c-watch', thread_id: 't-watch', status: 'set_aside' } as never],
+    };
+    expect(getWaitingState()).toMatchObject({ setAside: { changeId: 'c-watch', discardable: false } });
   });
 
   it('offers nothing to bring back when the thread has no set-aside change', () => {
     const thread = makeCCThread('t-none', { status: 'idle', section: 'archived' });
     threadMap.value = new Map([['t-none', thread]]);
     focusedThreadId.value = 't-none';
-    expect(getWaitingState()).toBeNull();
+    const state = getWaitingState();
+    const keys = getBannerActions(state as Parameters<typeof getBannerActions>[0]).map((m) => m.key);
+    expect(keys).not.toContain('bring-back');
+  });
+});
+
+// A blocked or finished Archive never leaves the composer row silent (ADR 0378).
+describe('the composer row when Archive is not on offer', () => {
+  it('offers Move to Current on an archived thread', () => {
+    threadMap.value = new Map([['t-arch', makeCCThread('t-arch', { status: 'idle', section: 'archived' })]]);
+    focusedThreadId.value = 't-arch';
+    const state = getWaitingState();
+    expect(state).toMatchObject({ type: 'actions', unarchive: true });
+    const members = getBannerActions(state as Parameters<typeof getBannerActions>[0]);
+    expect(members.map((m) => m.key)).toEqual(['unarchive']);
+    expect(buttonLabels(rows(members))).toEqual(['Move to Current']);
+  });
+
+  it('shows Archive held back, with its reason, when a sub-thread blocks it', () => {
+    threadMap.value = new Map([
+      ['t-parent', makeCCThread('t-parent', { status: 'idle', blockingDescendantCount: 1 })],
+      ['t-child', makeCCThread('t-child', { status: 'waiting_for_user_answer', parentThreadId: 't-parent' })],
+    ]);
+    focusedThreadId.value = 't-parent';
+    const state = getWaitingState();
+    expect(state).toMatchObject({
+      type: 'actions',
+      blockedArchive: { blocker: 'descendant_question', subThreadId: 't-child' },
+    });
+    const members = getBannerActions(state as Parameters<typeof getBannerActions>[0]);
+    expect(members.map((m) => m.key)).toEqual(['archive-blocked']);
+    const [button] = buttonNodes(rowOf(members[0])) as VNode<Record<string, unknown>>[];
+    expect(button.props['aria-disabled']).toBe('true');
+    expect(button.props['data-tooltip']).toBe('A sub-thread is waiting for your answer.');
+  });
+
+  it('offers Archive on a stored-archived thread a stale count keeps in Current', () => {
+    // Shown in Current, so Move to Current would be a lie. Archive makes the
+    // engine recount the family, which lets it go to Archive.
+    threadMap.value = new Map([
+      ['t-coord', makeCCThread('t-coord', { status: 'idle', section: 'archived', activeChildrenCount: 12 })],
+    ]);
+    focusedThreadId.value = 't-coord';
+    const state = getWaitingState();
+    expect(state).toMatchObject({ type: 'actions', unarchive: false });
+    const members = getBannerActions(state as Parameters<typeof getBannerActions>[0]);
+    expect(members.map((m) => m.key)).toEqual(['archive']);
+  });
+
+  it('draws nothing extra when the thread itself holds Archive back', () => {
+    // Its own blocker already draws the control that resolves it.
+    threadMap.value = new Map([['t-run', makeCCThread('t-run', { status: 'running' })]]);
+    focusedThreadId.value = 't-run';
+    expect(getWaitingState()).toMatchObject({ type: 'canceling' });
   });
 });

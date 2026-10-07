@@ -318,7 +318,7 @@ export function stripReleaseHeading(
  * notes for the release already running, under a heading naming another.
  *
  * **The version comes from the notes' own heading, not from `version`.** That
- * argument is derived from `latestTauriAppVersion`, which the health poll
+ * argument can come from `latestTauriAppVersion`, which the health poll
  * overwrites every few seconds with the engine's `latest_tauri_app_version`. On
  * a dev workspace that field is a CalVer app build id, not a release. So the row
  * headed itself with a build id, or vanished while the offer toast beside it

@@ -2,10 +2,12 @@
  *  entry, from waiting on the draft's thread to a confirmed hash in the draft.
  *  State lives in `store/pendingUploads.ts`; the composer only draws it. Each
  *  entry's bytes are also kept on the device (`store/pendingUploadRecords.ts`),
- *  so a page reload can resume it.
+ *  so a page reload can resume it. An entry lands on its upload's answer or
+ *  on the engine's `ImageUploaded` event, whichever comes first.
  *
  *  Plans: `docs/plans/2026-10-02-image-upload-progress-and-resilience.md`,
- *  `docs/plans/2026-10-02-pending-uploads-survive-a-reload.md`. */
+ *  `docs/plans/2026-10-02-pending-uploads-survive-a-reload.md`,
+ *  `docs/plans/2026-10-04-image-upload-lands-on-its-event.md`. */
 
 import { batch, effect } from '@preact/signals';
 
@@ -18,8 +20,11 @@ import {
   uploadThreadBlob,
 } from '../../api/client';
 import { addAttachedImageHash, rememberSessionBlobUrl } from '../../components/chat/pastedImages';
+import { errorDetail } from '../../utils/errorDetail';
+import { sha256Hex } from '../../utils/sha256Hex';
 import { generateUuid } from '../../utils/uuid';
 import { composeDrafts, getDraft } from '../composeDrafts';
+import { landedImages } from '../landedImages';
 import {
   addPendingUpload,
   detachPendingUpload,
@@ -27,6 +32,7 @@ import {
   hasPendingUpload,
   pendingUploads,
   removePendingUpload,
+  setPendingUploadContentHash,
   setPendingUploadState,
   type PendingUpload,
   type PendingUploadState,
@@ -64,6 +70,7 @@ export function attachPendingUpload(args: { threadId: string; file: File; bytes:
   const localId = generateUuid();
   addPendingUpload(newPendingUpload(threadId, localId, file));
   persistPendingUpload({ localId, threadId, name: file.name, mime: file.type, bytes });
+  nameByContent(threadId, localId, Promise.resolve(bytes));
   return runPendingUpload(threadId, localId);
 }
 
@@ -71,7 +78,21 @@ export function attachPendingUpload(args: { threadId: string; file: File; bytes:
  *  exists and is this page's now. */
 export function resumePendingUpload(threadId: string, localId: string, file: File): Promise<void> {
   addPendingUpload(newPendingUpload(threadId, localId, file));
+  nameByContent(threadId, localId, file.arrayBuffer());
   return runPendingUpload(threadId, localId);
+}
+
+/** Give the entry the hash its `ImageUploaded` will carry, alongside the
+ *  upload. An event that beats the hash still lands it (`landedImages`). */
+function nameByContent(threadId: string, localId: string, bytes: Promise<ArrayBuffer>): void {
+  bytes
+    .then(sha256Hex)
+    .then((hash) => {
+      if (hash) setPendingUploadContentHash(threadId, localId, hash);
+    })
+    // Best-effort: without a hash the entry still lands on its upload's own
+    // answer, as every entry did before, so the user loses nothing here.
+    .catch((err) => console.warn(`[uploads] could not hash a pending image: ${errorDetail(err)}`));
 }
 
 /** The blob URL is handed off twice: first to the pending entry, for the chip,
@@ -260,6 +281,20 @@ effect(() => {
   const connected = isConnected.value;
   if (connected && !wasConnected) resumeOfflineUploads();
   wasConnected = connected;
+});
+
+// The engine reported these bytes stored on this draft, so the entry has
+// landed. Its upload's own answer can be lost on the way back, which stalled
+// the chip until the watchdog re-uploaded. Whichever signal comes first lands
+// it. Detaching aborts the run, so the other finds no entry and does nothing.
+effect(() => {
+  const landed = landedImages.value;
+  for (const list of pendingUploads.value.values()) {
+    for (const entry of list) {
+      const hash = entry.contentHash;
+      if (hash && landed.get(entry.threadId)?.has(hash)) promote(entry, hash);
+    }
+  }
 });
 
 /** Whether this page still needs a record's bytes to survive a reload:

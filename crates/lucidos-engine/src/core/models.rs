@@ -77,6 +77,9 @@ pub struct Model {
     /// Honoured when its route is configured, and refused rather than
     /// substituted when it is not.
     pub preferred_provider: Option<String>,
+    /// The *vision flag*: whether this model reads images. Image description
+    /// refuses a model without it, and its picker hides one.
+    pub vision: bool,
     pub sort_order: i32,
     /// [`SOURCE_BUILTIN`] or [`SOURCE_USER`].
     pub source: String,
@@ -107,6 +110,7 @@ pub struct ModelFields {
     pub label: String,
     pub routes: Vec<Route>,
     pub preferred_provider: Option<String>,
+    pub vision: bool,
     pub sort_order: i32,
 }
 
@@ -146,13 +150,14 @@ pub fn validate_routes(routes: &[Route]) -> Result<(), String> {
     Ok(())
 }
 
-/// Raw DB row: (id, label, routes, preferred_provider, sort_order, source,
-/// enabled, created_at).
+/// Raw DB row: (id, label, routes, preferred_provider, vision, sort_order,
+/// source, enabled, created_at).
 type ModelRow = (
     String,
     String,
     sqlx::types::Json<Vec<Route>>,
     Option<String>,
+    bool,
     i32,
     String,
     bool,
@@ -160,15 +165,17 @@ type ModelRow = (
 );
 
 const SELECT_COLS: &str =
-    "id, label, routes, preferred_provider, sort_order, source, enabled, created_at";
+    "id, label, routes, preferred_provider, vision, sort_order, source, enabled, created_at";
 
 fn row_to_model(row: ModelRow) -> Model {
-    let (id, label, routes, preferred_provider, sort_order, source, enabled, created_at) = row;
+    let (id, label, routes, preferred_provider, vision, sort_order, source, enabled, created_at) =
+        row;
     Model {
         id,
         label,
         routes: routes.0,
         preferred_provider,
+        vision,
         sort_order,
         source,
         enabled,
@@ -221,14 +228,15 @@ impl ModelStore {
     ) -> Result<Model, sqlx::Error> {
         let row: ModelRow = sqlx::query_as(&format!(
             "INSERT INTO models \
-               (id, label, routes, preferred_provider, sort_order, source, enabled) \
-             VALUES ($1, $2, $3, $4, $5, '{SOURCE_USER}', TRUE) \
+               (id, label, routes, preferred_provider, vision, sort_order, source, enabled) \
+             VALUES ($1, $2, $3, $4, $5, $6, '{SOURCE_USER}', TRUE) \
              RETURNING {SELECT_COLS}"
         ))
         .bind(id)
         .bind(&fields.label)
         .bind(sqlx::types::Json(&fields.routes))
         .bind(&fields.preferred_provider)
+        .bind(fields.vision)
         .bind(fields.sort_order)
         .fetch_one(pool)
         .await?;
@@ -248,12 +256,13 @@ impl ModelStore {
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "UPDATE models SET label = $2, routes = $3, preferred_provider = $4, \
-             sort_order = $5, enabled = $6, updated_at = NOW() WHERE id = $1",
+             vision = $5, sort_order = $6, enabled = $7, updated_at = NOW() WHERE id = $1",
         )
         .bind(id)
         .bind(&fields.label)
         .bind(sqlx::types::Json(&fields.routes))
         .bind(&fields.preferred_provider)
+        .bind(fields.vision)
         .bind(fields.sort_order)
         .bind(enabled)
         .execute(pool)
@@ -402,6 +411,7 @@ impl ModelStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::prefs;
     use crate::test_support::{setup_test_db, teardown_test_db};
 
     /// Whether `provider` can serve this model.
@@ -434,6 +444,7 @@ mod tests {
                 context_window: window,
             }],
             preferred_provider: None,
+            vision: false,
             sort_order,
         }
     }
@@ -683,8 +694,8 @@ mod tests {
         }
 
         // The current lineup, which the prune must not reach. Opus 5 in
-        // particular is `DEFAULT_CHAT_MODEL`: switch it off and a fresh install
-        // resolves to a model its own picker will not show.
+        // particular is the `prefs::CHAT_MODEL` default: switch it off and a
+        // fresh install resolves to a model its own picker will not show.
         for id in [
             "claude-fable-5-1",
             "claude-fable-5",
@@ -901,6 +912,135 @@ mod tests {
         let cleared = ModelStore::get(&pool, "ctx-model").await.unwrap().unwrap();
         assert_eq!(declared_window(&cleared), None);
 
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The builtins the vision seed leaves `false` because nobody has checked
+    /// that they read images. A builtin seeded later lands here or declares
+    /// `vision = TRUE`, so its seed has to decide.
+    const BUILTINS_NOT_KNOWN_TO_READ_IMAGES: &[&str] = &[
+        "gpt-5.3-codex-spark",
+        "z-ai/glm-5.2",
+        "grok-4.6",
+        "grok-4.5",
+        "grok-4.20",
+        "grok-4.3",
+        "laguna-s-2.1-free",
+        "nemotron-3.5-lightning-free",
+        "x-preview-f-free",
+        "nemotron-3-ultra-free",
+        "muse-spark-1.2-contributor-free",
+        "hy3-free",
+    ];
+
+    /// The families published as image-reading, which are the only ones the
+    /// seed may mark. Over-declaring sends images to a model that rejects them.
+    fn in_an_image_reading_family(id: &str) -> bool {
+        (id.starts_with("claude-") || id.starts_with("gemini-") || id.starts_with("gpt-"))
+            && !BUILTINS_NOT_KNOWN_TO_READ_IMAGES.contains(&id)
+    }
+
+    /// Every builtin is decided: it reads images, or it is listed as not known
+    /// to. And the flag sits only on the families that publish it.
+    #[tokio::test]
+    async fn every_builtin_declares_whether_it_reads_images() {
+        let (pool, db_name) = setup_test_db().await;
+        let builtins: Vec<Model> = ModelStore::list(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(Model::is_builtin)
+            .collect();
+        assert!(!builtins.is_empty());
+        for m in &builtins {
+            assert_eq!(
+                m.vision,
+                in_an_image_reading_family(&m.id),
+                "builtin '{}' has vision = {}; seed it, or list it in \
+                 BUILTINS_NOT_KNOWN_TO_READ_IMAGES",
+                m.id,
+                m.vision
+            );
+        }
+        for id in BUILTINS_NOT_KNOWN_TO_READ_IMAGES {
+            assert!(
+                builtins.iter().any(|m| m.id == *id),
+                "'{id}' is listed but is no builtin row"
+            );
+        }
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The seed is a no-op on re-run, and never marks a user's own row, even
+    /// one whose id looks like an image-reading family.
+    #[tokio::test]
+    async fn the_vision_seed_reruns_cleanly_and_leaves_user_rows_alone() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        ModelStore::create(
+            &pool,
+            &bus,
+            "claude-my-own",
+            &fields("Mine", "anthropic", 1000, None),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261006204014_add_vision_flag_to_models.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mine = ModelStore::get(&pool, "claude-my-own")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!mine.vision, "a user row is never seeded");
+        let haiku = ModelStore::get(&pool, "claude-haiku-4-5")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(haiku.vision);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The flag round-trips through create and update, and reaches the
+    /// in-memory registry the engine routes with.
+    #[tokio::test]
+    async fn the_vision_flag_round_trips_into_the_registry() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        let looking = ModelFields {
+            vision: true,
+            ..fields("Looker", "local", 1000, None)
+        };
+        let created = ModelStore::create(&pool, &bus, "local/looker", &looking, None)
+            .await
+            .unwrap();
+        assert!(created.vision);
+        let registry = crate::llm::model_registry::load_from_db(&pool).await;
+        assert!(registry["local/looker"].vision);
+
+        let blind = ModelFields {
+            vision: false,
+            ..looking
+        };
+        assert!(
+            ModelStore::update(&pool, &bus, "local/looker", &blind, true, None)
+                .await
+                .unwrap()
+        );
+        let reread = ModelStore::get(&pool, "local/looker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!reread.vision);
+        let registry = crate::llm::model_registry::load_from_db(&pool).await;
+        assert!(!registry["local/looker"].vision);
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1217,6 +1357,7 @@ mod tests {
             label: "Empty".to_string(),
             routes: Vec::new(),
             preferred_provider: None,
+            vision: false,
             sort_order: 1,
         };
         assert!(
@@ -1263,6 +1404,11 @@ mod tests {
             include_str!("../../migrations/20260922222019_respell_default_alias_model_ids.sql");
         let (pool, db_name) = setup_test_db().await;
         let thread = uuid::Uuid::new_v4();
+        let (chat, memory, title) = (
+            prefs::CHAT_MODEL.key(),
+            prefs::MODEL_MEMORY.key(),
+            prefs::MODEL_TITLE.key(),
+        );
         let seed = [
             // Opus 4.8 renames cleanly. Opus 5 collides with the bare row the
             // first run produced, so its references must stay where they are.
@@ -1273,13 +1419,13 @@ mod tests {
              ('claude-opus-5@default', 'Opus 5 (legacy)', '[{\"provider\": \"vertex\"}]', 1, \
               'user', true)"
                 .to_string(),
-            "DELETE FROM preferences WHERE key IN ('chat_model', 'model_memory', 'model_title')"
-                .to_string(),
-            "INSERT INTO preferences (key, value) VALUES \
-             ('chat_model', 'claude-opus-4-8@default'), \
-             ('model_memory', 'claude-opus-4-8@default'), \
-             ('model_title', 'claude-opus-5@default')"
-                .to_string(),
+            format!("DELETE FROM preferences WHERE key IN ('{chat}', '{memory}', '{title}')"),
+            format!(
+                "INSERT INTO preferences (key, value) VALUES \
+                 ('{chat}', 'claude-opus-4-8@default'), \
+                 ('{memory}', 'claude-opus-4-8@default'), \
+                 ('{title}', 'claude-opus-5@default')"
+            ),
             format!(
                 "INSERT INTO thread_summaries (thread_id, compose_selection) VALUES \
                  ('{thread}', '{{\"model\": \"claude-opus-4-8@default\"}}')"
@@ -1322,7 +1468,7 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        for key in ["chat_model", "model_memory"] {
+        for key in [chat, memory] {
             assert_eq!(
                 text(format!("SELECT value FROM preferences WHERE key = '{key}'")).await,
                 "claude-opus-4-8"
@@ -1362,7 +1508,10 @@ mod tests {
             .expect("the legacy row stays");
         assert_eq!(legacy.routes, vec![Route::bare("vertex")]);
         assert_eq!(
-            text("SELECT value FROM preferences WHERE key = 'model_title'".to_string()).await,
+            text(format!(
+                "SELECT value FROM preferences WHERE key = '{title}'"
+            ))
+            .await,
             "claude-opus-5@default"
         );
 
@@ -1446,6 +1595,7 @@ mod tests {
             label: existing.label.clone(),
             routes: existing.routes.clone(),
             preferred_provider: Some("anthropic".to_string()),
+            vision: existing.vision,
             sort_order: existing.sort_order,
         };
         assert!(

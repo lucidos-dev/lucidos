@@ -226,6 +226,27 @@ pub enum ThreadEvent {
         /// by `core::aux_context_backfill` and by nothing else.
         #[serde(default, skip_serializing_if = "is_false")]
         reconstructed: bool,
+        /// The `Agent` call whose sub-agent made this call, so the capture
+        /// binds to that sub-agent's steps. Absent for every other capture.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+        /// The coding agent's id for this API call. Every
+        /// `CodingAgentToolCalled` the call produced carries the same id, so
+        /// the capture binds to each of them. Absent for every other capture.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_call_id: Option<String>,
+        /// The reasoning tier this call ran at, where the caller has one to
+        /// report. Absent for every purpose but the compactor today, and for
+        /// every row written before the field existed. Lets a cost estimate
+        /// split measured usage by tier instead of treating all history as
+        /// one baseline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        /// How long the call took, wall clock, where the caller timed it.
+        /// Absent for every purpose but the compactor today. The Tree
+        /// backfill estimate reads it as a model's seconds per call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     /// The engine's automatic pre-turn recall: `retrieve_context` vector-searched
     /// long-term memory with classifier-derived `queries` and injected the hits
@@ -461,6 +482,10 @@ pub enum ThreadEvent {
         text: String,
         #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
         coding_agent: CodingAgent,
+        /// The `Agent` call whose sub-agent wrote this text. Such text is the
+        /// sub-agent's narration, never the session's reply. Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
     },
     /// Streamed reasoning from a coding agent, the coding-agent mirror
     /// of the chat agent's `ThoughtStreamed`. Carries plaintext reasoning the
@@ -488,6 +513,14 @@ pub enum ThreadEvent {
         /// splits them across exchanges. Empty for legacy DB rows.
         #[serde(default, skip_serializing_if = "is_empty_str")]
         tool_use_id: String,
+        /// The `Agent` call whose sub-agent made this call. Absent for the
+        /// session's own calls and on rows written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+        /// The API call that made this tool call, matching that call's
+        /// `ContextCaptured`. Absent from Codex and on older rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_call_id: Option<String>,
     },
     #[serde(alias = "ClaudeCodeToolResult")]
     CodingAgentToolResult {
@@ -503,6 +536,11 @@ pub enum ThreadEvent {
         /// Empty for legacy DB rows.
         #[serde(default, skip_serializing_if = "is_empty_str")]
         tool_use_id: String,
+        /// The `Agent` call whose sub-agent made the call this answers. Absent
+        /// for the session's own calls and on rows written before the field
+        /// existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
     },
     #[serde(alias = "ClaudeCodeUserMessageSent")]
     CodingAgentUserMessageSent {
@@ -671,6 +709,11 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// The workspace's *home thread* was created (ADR 0362): an active chat
+    /// thread titled "Home", with no message yet. `ensure_home_thread`
+    /// emits it once per workspace, at boot. The projection's unique marker
+    /// refuses a second one, which rolls the event back with it.
+    HomeThreadCreated,
     /// A user attached an image to this thread's compose draft. Emitted by
     /// POST /api/v1/threads/:id/blobs after the bytes are content-addressed
     /// to disk under `data/blobs/<hh>/<hash>.<ext>`. The `hash` is the sole

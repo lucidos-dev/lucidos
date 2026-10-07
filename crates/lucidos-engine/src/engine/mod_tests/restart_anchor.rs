@@ -238,7 +238,7 @@ async fn continuation_started_turn_keeps_its_own_anchor() {
         ThreadEvent::ContinuationStarted {
             branch: String::new(),
             origin: None,
-            reason: Some("user_clicked_continue".into()),
+            reason: Some(crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON.into()),
         },
         Uuid::new_v4(),
     )
@@ -318,7 +318,7 @@ async fn continuation_requested_turn_keeps_its_own_anchor() {
         &bus,
         thread_id,
         ThreadEvent::ContinuationRequested {
-            reason: "user_clicked_continue".into(),
+            reason: crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON.into(),
         },
         Uuid::new_v4(),
     )

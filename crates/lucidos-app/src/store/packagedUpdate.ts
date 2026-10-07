@@ -7,7 +7,7 @@
  * surface that only wants to know whether an update exists must not drag that
  * in. The *System attention badge* asks exactly that, from the menu-drawer button.
  */
-import { latestTauriAppVersion, releaseCheck } from './store';
+import { clientOfferedRelease, latestTauriAppVersion, releaseCheck } from './store';
 import { isNewerVersion } from '../utils/version';
 
 /**
@@ -19,14 +19,17 @@ import { isNewerVersion } from '../utils/version';
  * caller.
  *
  * The gateway's answer wins where there is one, because it covers every install
- * shape. The fallback covers two cases. A dev client reads
- * `latestTauriAppVersion` from the engine's `/health`, and a client on an older
- * gateway reads its own Tauri check.
+ * shape. Two fallbacks follow, each compared against a version of its own kind:
+ * a client on an older gateway reads its own updater's release, and a dev client
+ * reads its checkout's build id from the engine's `/health`.
  */
 export function packagedUpdateVersion(): string | null {
   const announced = releaseCheck.value?.latest;
   if (announced) return announced.version;
-  const latest = latestTauriAppVersion.value;
-  const current = window.__LUCIDOS_APP_VERSION__;
+  return newerThan(clientOfferedRelease.value, window.__LUCIDOS_APP_RELEASE__)
+    ?? newerThan(latestTauriAppVersion.value, window.__LUCIDOS_APP_VERSION__);
+}
+
+function newerThan(latest: string | null, current: string | undefined): string | null {
   return latest && current && isNewerVersion(latest, current) ? latest : null;
 }

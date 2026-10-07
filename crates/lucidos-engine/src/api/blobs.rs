@@ -24,9 +24,10 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::api::actor::user_actor;
-use crate::api::{ApiError, AppState};
+use crate::api::{ApiError, AppState, ChatImage};
 use crate::core::blobs::{
-    get_or_create_preview, resolve_blob, write_blob, BlobError, PREVIEW_MAX_EDGE,
+    get_or_create_preview, resolve_blob, write_blob, write_blob_from_base64, BlobError,
+    ResolvedBlob, PREVIEW_MAX_EDGE,
 };
 use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
@@ -86,30 +87,8 @@ pub(super) async fn post_blob(
         .await
         .map_err(|e| ApiError::bad_request(format!("read body: {e}")))?;
 
-    // write_blob sniffs the mime against the allowlist; on rejection
-    // it returns BlobError::UnsupportedMime → 415 with no disk write.
-    // The error carries what the bytes turned out to be, so the 415 names
-    // this upload's format rather than reciting the allowlist.
-    //
-    // Hashing and the disk write are blocking work, so they run off the async
-    // runtime: a large photo must not stall a worker other requests need.
     let workspace = state.workspace_path.clone();
-    let written = tokio::task::spawn_blocking(move || write_blob(&workspace, &bytes))
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    let resolved = match written {
-        Ok(r) => r,
-        Err(e @ BlobError::UnsupportedMime(_)) => {
-            return Err(ApiError::new(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                e.to_string(),
-            ));
-        }
-        Err(BlobError::Io(e)) => return Err(ApiError::internal(e.to_string())),
-        // write_blob never returns BadEncoding (it takes raw bytes); the
-        // variant only fires through write_blob_from_base64.
-        Err(BlobError::BadEncoding(_)) => unreachable!(),
-    };
+    let resolved = store_off_runtime(move || write_blob(&workspace, &bytes)).await?;
 
     let actor = user_actor(&headers, None);
     let event = BusEvent::Thread {
@@ -153,6 +132,54 @@ pub(super) async fn post_blob(
             byte_size: resolved.byte_size,
         }),
     ))
+}
+
+/// The response a refused blob earns, wherever its bytes came from.
+///
+/// The 415 carries what the bytes turned out to be, so it names the caller's
+/// format rather than reciting the allowlist.
+fn refusal(e: BlobError) -> ApiError {
+    match e {
+        BlobError::UnsupportedMime(_) => {
+            ApiError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, e.to_string())
+        }
+        BlobError::BadEncoding(_) => ApiError::bad_request(e.to_string()),
+        BlobError::Io(e) => ApiError::internal(e.to_string()),
+    }
+}
+
+/// Run a blob write off the async runtime, refusing as [`refusal`] says.
+///
+/// Hashing and the disk write block, and a large photo must not stall a worker
+/// other requests need.
+async fn store_off_runtime(
+    write: impl FnOnce() -> Result<ResolvedBlob, BlobError> + Send + 'static,
+) -> Result<ResolvedBlob, ApiError> {
+    tokio::task::spawn_blocking(write)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(refusal)
+}
+
+/// Store inline chat images exactly as [`post_blob`] stores an upload, and
+/// return their hashes in order.
+///
+/// A caller that cannot upload first sends images inline: a cross-workspace
+/// spawn is refused the upload route by the mutating gate. The client's
+/// `mime_type` is ignored, because the blob store sniffs the bytes. One image
+/// the store refuses refuses them all, before anything else reads them.
+pub(super) async fn store_inline_images(
+    workspace: &std::path::Path,
+    images: Vec<ChatImage>,
+) -> Result<Vec<String>, ApiError> {
+    let mut hashes = Vec::with_capacity(images.len());
+    for image in images {
+        let workspace = workspace.to_path_buf();
+        let stored =
+            store_off_runtime(move || write_blob_from_base64(&workspace, &image.base64)).await?;
+        hashes.push(stored.hash);
+    }
+    Ok(hashes)
 }
 
 /// Stream `path` with the given `mime` and the immutable cache header
@@ -219,4 +246,81 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/blobs/:hash", get(get_blob))
         .route("/blobs/:hash/preview", get(get_blob_preview))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    fn inline(bytes: &[u8], claimed_mime: &str) -> ChatImage {
+        ChatImage {
+            base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime_type: claimed_mime.to_string(),
+        }
+    }
+
+    /// The smallest PNG the blob sniff accepts: signature plus IHDR.
+    fn png() -> Vec<u8> {
+        vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00,
+        ]
+    }
+
+    #[tokio::test]
+    async fn an_inline_image_lands_in_the_blob_store_under_its_sniffed_format() {
+        let dir = tempfile::tempdir().unwrap();
+        // The claim is a lie the store must ignore, as the upload route does.
+        let hashes = store_inline_images(dir.path(), vec![inline(&png(), "image/jpeg")])
+            .await
+            .expect("a PNG is accepted");
+
+        assert_eq!(hashes, vec![crate::core::blobs::compute_hash(&png())]);
+        let stored = resolve_blob(dir.path(), &hashes[0]).expect("the blob is on disk");
+        assert_eq!(stored.mime, "image/png", "the store sniffs, never trusts");
+    }
+
+    #[tokio::test]
+    async fn an_inline_tiff_is_refused_as_the_upload_route_refuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tiff = vec![0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+        tiff.resize(64, 0);
+        let err = store_inline_images(dir.path(), vec![inline(&png(), ""), inline(&tiff, "")])
+            .await
+            .expect_err("a TIFF is outside the allowlist");
+
+        assert_eq!(err.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(
+            err.message.contains("TIFF"),
+            "names the format: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_inline_image_is_called_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = store_inline_images(dir.path(), vec![inline(&[], "image/png")])
+            .await
+            .expect_err("zero bytes are not an image");
+
+        assert_eq!(err.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(err.message.contains("empty"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn inline_bytes_that_are_not_base64_are_a_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = ChatImage {
+            base64: "not base64 !!".to_string(),
+            mime_type: String::new(),
+        };
+        let err = store_inline_images(dir.path(), vec![bad])
+            .await
+            .expect_err("undecodable input is refused");
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
 }

@@ -1,4 +1,4 @@
-import type { RefObject } from 'preact';
+import { Fragment, type RefObject } from 'preact';
 import { keepFocusOnPress } from '../../utils/dom';
 import { SearchField } from './SearchField';
 
@@ -10,6 +10,17 @@ export interface ControlOption {
   /** Picking this row opens another list rather than committing. Draws the
    *  disclosure glyph, so a model row does not read as a finished choice. */
   drilldown?: boolean;
+  /** The heading this row sits under. A list whose rows carry sections shows
+   *  each heading where its run begins, in place of the list's own label. */
+  section?: string;
+}
+
+/** The heading to draw above `options[index]`, or `null` when the row
+ *  continues the run above it. */
+export function sectionHeadingAt(options: readonly ControlOption[], index: number): string | null {
+  const section = options[index]?.section;
+  if (!section) return null;
+  return index > 0 && options[index - 1].section === section ? null : section;
 }
 
 /** Move a highlight index by one step within `[0, count)`, wrapping at both
@@ -100,7 +111,7 @@ export function ControlOptionList({
   onHighlight: (index: number) => void;
 }) {
   return (
-    <div class="control-list" tabIndex={0} ref={listRef} onKeyDown={onKeyDown}>
+    <div class="control-list" tabIndex={0} ref={listRef} onKeyDown={onKeyDown} data-surface-step={label}>
       {filter && <ControlFilter {...filter} />}
       {back && (
         <button class="control-item control-back" onMouseDown={keepFocusOnPress} onClick={back.onBack}>
@@ -108,13 +119,15 @@ export function ControlOptionList({
           {back.label}
         </button>
       )}
-      <div class="control-section-label">{label}</div>
+      {!options.some((opt) => opt.section) && <div class="control-section-label">{label}</div>}
       {options.length === 0 && <div class="control-empty">No matches</div>}
       {options.map((opt, index) => {
         const isCurrent = opt.value === currentValue;
+        const heading = sectionHeadingAt(options, index);
         return (
+          <Fragment key={opt.value}>
+          {heading && <div class="control-section-label">{heading}</div>}
           <button
-            key={opt.value}
             // A tier row is labelled with its tier alone, so its text does not
             // say which model it belongs to. The value does, and a test that
             // has to pick one exact pair needs it.
@@ -136,6 +149,7 @@ export function ControlOptionList({
               <span class="control-option-more" aria-hidden="true">&#8250;</span>
             )}
           </button>
+          </Fragment>
         );
       })}
     </div>

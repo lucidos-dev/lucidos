@@ -1,7 +1,7 @@
 import type { ComponentChildren } from 'preact';
 import { useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
-import { batch, signal, useSignalEffect } from '@preact/signals';
+import { batch, effect, signal, useSignal } from '@preact/signals';
 import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, setDrawerView, repositories, focusedPane, scaledDurationMs, showToast, ALL_CHANNELS, clearThreadFilter } from '../../store/store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../../store/appliedThreadFilter';
 import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
@@ -9,12 +9,14 @@ import { composeDraftContextName } from '../../store/composeDestination';
 import { threadPassesChannelFilter } from '../../store/threadFilter';
 import { threadFilterPanelOpen, setThreadFilterPaneVisible, closeThreadFilterPanel } from '../../store/threadFilterPanel';
 import { ThreadFilterCover } from './ThreadFilterCover';
+import { LeavingViewSnapshot, type LeavingDrawing } from './LeavingViewDrawing';
 import { focusPane, showThreadList } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
 import { handleArchiveAll } from '../../store/actions/archive-all';
 import { openAttentionThread } from '../../store/actions/event-navigation';
 import { loadOlderThreads, reloadAfterFilterChange, filterChangedSinceLoad, ensureThreadInMap, loadThreadEvents } from '../../store/actions/thread-loading';
-import { ThreadStatusIcon, visualStatusFor, type VisualStatus } from '../shared/ThreadStatusIcon';
+import { ThreadStatusIcon } from '../shared/ThreadStatusIcon';
+import { visualStatusFor, type VisualStatus } from '../shared/threadVisualStatus';
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { DraftOverflowMenu } from '../shared/DraftOverflowMenu';
@@ -36,9 +38,10 @@ import { readSavedScroll, useScrollMemory } from '../../hooks/useScrollMemory';
 import { forgetSavedScroll } from '../../store/savedScroll';
 import { useRowActionsGesture } from './useRowActionsGesture';
 import { getRemPx } from '../../utils/dom';
+import { isMobile } from '../../utils/viewport';
 import { scrollBehavior } from '../../utils/motion';
 import type { ThreadSearchResult } from '../../api/threads';
-import { PinIcon, InboxIcon, ArchiveIcon, DraftsIcon, AttentionIcon, RunningIcon, ChevronRightIcon } from '../shared/icons';
+import { PinIcon, InboxIcon, ArchiveIcon, DraftsIcon, AttentionIcon, InFlightIcon, ChevronRightIcon, HomeIcon } from '../shared/icons';
 import type { ComponentType } from 'preact';
 
 // `threadPassesChannelFilter` lives in `store/threadFilter.ts` (shared with the
@@ -114,9 +117,9 @@ export type DrawerNavNode =
            *  this row's archived-reveal toggle, since it has no Tab stop of
            *  its own. 0/undefined in the flat alternate views. */
           hiddenArchivedCount?: number;
-          /** The lifecycle section this row lives in, or null in the flat
-           *  alternate views (drafts/attention/review/running/search), which have
-           *  no collapsible sections — ←/→ are inert there. */
+          /** The lifecycle section this row lives in, or null in the alternate
+           *  views (drafts/attention/review/in-flight/search). They have no
+           *  collapsible sections or family toggles, so ←/→ are inert there. */
           sectionKey: DisplaySection | null;
       };
 
@@ -157,6 +160,15 @@ const highlightedKey = signal<string | null>(null);
  *  threads) or the flat alternate views (threads only). */
 const navNodes = signal<DrawerNavNode[]>([]);
 
+/** Publish a mounted list's rows as `navNodes`, re-publishing when `key`
+ *  changes. Unmounting clears them, so nothing walks a list off screen. */
+function usePublishedNavNodes(build: () => DrawerNavNode[], key: string): void {
+    useEffect(() => {
+        navNodes.value = build();
+        return () => { navNodes.value = []; };
+    }, [key]);
+}
+
 export function selectHighlighted() {
     const key = highlightedKey.value;
     if (!key) return;
@@ -165,7 +177,13 @@ export function selectHighlighted() {
         toggleSectionCollapse(key.slice(SECTION_KEY_PREFIX.length));
         return;
     }
-    const id = key;
+    openListedThread(key);
+}
+
+/** Open a thread row of the drawer's current view the way a click on it does:
+ *  a search hit is loaded into the map first, and a Needs attention row opens
+ *  on what needs the user. */
+function openListedThread(id: string): void {
     const searchResult = threadSearchResults.value;
     const searching = threadSearchQuery.value.trim().length > 0;
     if (searching && searchResult.status === 'loaded') {
@@ -174,6 +192,42 @@ export function selectHighlighted() {
     }
     if (!searching && drawerView.value === 'attention') openAttentionThread(id);
     else focusThread(id);
+}
+
+/** Pure: the thread row `delta` steps from `currentId` in the drawer's list, or
+ *  null at either end. A row in a lifecycle section steps only within that
+ *  section, so Running steps through running threads and Pinned through pinned
+ *  ones. A thread the list does not show starts from the first row (next) or
+ *  the last (previous). Rows hidden by a collapse are skipped. */
+export function stepThreadInList(
+    nodes: readonly DrawerNavNode[],
+    currentId: string | null,
+    delta: 1 | -1,
+): string | null {
+    const threads = nodes.filter((n): n is Extract<DrawerNavNode, { kind: 'thread' }> => n.kind === 'thread');
+    const current = threads.find((n) => n.id === currentId);
+    if (!current) {
+        const edge = delta > 0 ? threads[0] : threads[threads.length - 1];
+        return edge?.id ?? null;
+    }
+    const peers = threads.filter((n) => n.sectionKey === current.sectionKey);
+    return peers[peers.indexOf(current) + delta]?.id ?? null;
+}
+
+/** Open the next (`1`) or previous (`-1`) thread in the drawer's open list,
+ *  from the focused thread, and move the drawer highlight with it. Works from
+ *  any pane, though a Mac text field keeps its own Option+Arrow (see
+ *  `isMacTextEditingKey`). A hidden desktop drawer opens first, so the list being stepped
+ *  through is on screen. Driven by the `nextThreadInList` / `prevThreadInList`
+ *  shortcuts. */
+export function stepFocusedThreadInList(delta: 1 | -1): void {
+    if (navNodes.value.length === 0 && !isMobile()) showThreadList();
+    whenNavNodesPublished(() => {
+        const id = stepThreadInList(navNodes.value, focusedThreadId.value, delta);
+        if (!id) return;
+        setHighlight(id);
+        openListedThread(id);
+    });
 }
 
 /** Open the highlighted thread row's overflow (⋯) menu: the keyboard route to
@@ -400,19 +454,25 @@ export function pickInitialHighlight(openThreadId: string | null, navKeys: strin
     return navKeys[0] ?? null;
 }
 
-/** Seed the keyboard highlight when the drawer is focused via ⌘⇧1, so Enter has
- *  an immediate target. `navNodes` is set in a post-render effect, so on a fresh
- *  open it can be empty for the first frames. Retrying a few frames is what
- *  lands the seed on a real node. A genuinely empty list seeds null after the
- *  retries, which is harmless. */
-export function seedDrawerHighlight(): void {
+/** Run `then` once a list has published its rows. `navNodes` is set in a
+ *  post-render effect, so on a fresh open it can be empty for the first frames.
+ *  Retrying a few frames is what lands on real rows. A genuinely empty list
+ *  runs `then` after the retries, against no rows. */
+function whenNavNodesPublished(then: () => void): void {
     let tries = 0;
-    const seed = () => {
-        const keys = navNodes.value.map(nodeKey);
-        if (keys.length === 0 && tries++ < 3) { requestAnimationFrame(seed); return; }
-        highlightedKey.value = pickInitialHighlight(focusedThreadId.value, keys);
+    const attempt = () => {
+        if (navNodes.value.length === 0 && tries++ < 3) { requestAnimationFrame(attempt); return; }
+        then();
     };
-    requestAnimationFrame(seed);
+    attempt();
+}
+
+/** Seed the keyboard highlight when the drawer is focused via ⌘⇧1, so Enter has
+ *  an immediate target. */
+export function seedDrawerHighlight(): void {
+    requestAnimationFrame(() => whenNavNodesPublished(() => {
+        highlightedKey.value = pickInitialHighlight(focusedThreadId.value, navNodes.value.map(nodeKey));
+    }));
 }
 
 /** What it takes to show a thread in the full thread list. */
@@ -651,6 +711,8 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
 
     const drawerRef = useRef<HTMLDivElement>(null);
     const listRef = useRef<HTMLDivElement>(null);
+    // A signal, so only the drawing re-renders when one is taken, not the list.
+    const leavingDrawing = useSignal<LeavingDrawing | null>(null);
     // Don't restore while in an alternate view — saved offset is for the full list.
     // Declared before the hook, so the reset runs before each attach.
     const restorePaused = activeView !== 'all';
@@ -675,14 +737,16 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     // per-row render budget: reading `highlightedKey` in the component body
     // would re-run ThreadList on every ↑/↓, the storm DrawerSectionTitle and
     // ThreadRow were split out to avoid. Rows and section headers carry
-    // matching `navKeyDomId` ids.
-    useSignalEffect(() => {
+    // matching `navKeyDomId` ids. A plain `effect`, never `useSignalEffect`:
+    // that one re-runs on the next animation frame, so the attribute trailed
+    // the highlighted row by a frame.
+    useEffect(() => effect(() => {
         const id = navKeyDomId(highlightedKey.value);
         const el = drawerRef.current;
         if (!el) return;
         if (id) el.setAttribute('aria-activedescendant', id);
         else el.removeAttribute('aria-activedescendant');
-    });
+    }), []);
 
     useEffect(() => {
         highlightedKey.value = null;
@@ -714,14 +778,16 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
                 unlabelled div. The container above keeps the arrows, which move
                 the highlight and scroll its row into view. */}
             <div class="thread-drawer-list" ref={listRef} tabIndex={-1}>
-                {renderContent && (
-                    activeView === 'search' ? <SearchResults />
-                    : activeView === 'drafts' ? <DraftsList />
-                    : activeView === 'attention' ? <AttentionList />
-                    : activeView === 'review' ? <ReviewList />
-                    : activeView === 'running' ? <RunningList />
-                    : <ThreadList />
-                )}
+                <LeavingViewSnapshot view={view} list={listRef} drawing={leavingDrawing}>
+                    {renderContent && (
+                        activeView === 'search' ? <SearchResults />
+                        : activeView === 'drafts' ? <DraftsList />
+                        : activeView === 'attention' ? <AttentionList />
+                        : activeView === 'review' ? <ReviewList />
+                        : activeView === 'in-flight' ? <InFlightList />
+                        : <ThreadList />
+                    )}
+                </LeavingViewSnapshot>
             </div>
             {/* The filter panel is a view inside THIS pane, covering the list
                 rather than replacing it, so the list stays mounted underneath.
@@ -734,13 +800,13 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
                 loaded window was actually fetched against, so an unmounted list
                 reloads on its next mount. Which is what makes the four STATUS
                 views safe, since those really do replace this list. */}
-            <ThreadFilterCover paneVisible={visible} />
+            <ThreadFilterCover paneVisible={visible} leaving={leavingDrawing} />
         </div>
     );
 }
 
 
-import { attentionThreads, reviewThreads, runningThreads, composingThreads, collapsedAncestorIds, computeDrawerCategorization, depthStyle, draftThreads, filterHiddenArchived, nestByParent, renderedFamilyRows, threadHasUnsentDraft, visibleChildrenCount } from './family-graph';
+import { attentionThreads, reviewThreads, inFlightThreads, inFlightHasRunning, composingThreads, collapsedAncestorIds, computeDrawerCategorization, depthStyle, draftThreads, filterHiddenArchived, nestByParent, renderedFamilyRows, threadHasUnsentDraft, visibleChildrenCount } from './family-graph';
 import type { DrawerCategorization, FamilyGraph, NestedThread } from './family-graph';
 export * from './family-graph';
 function ThreadList() {
@@ -878,7 +944,7 @@ function ThreadList() {
             ? sectionNavKey(n.sectionKey)
             : `${n.id}:${n.depth}:${n.parentId ?? ''}:${n.hasChildren ? 1 : 0}:${n.hiddenArchivedCount ?? 0}`)
         .join(',');
-    useEffect(() => { navNodes.value = navList; }, [navKey]);
+    usePublishedNavNodes(() => navList, navKey);
 
     // Reset key: the whole applied selection, not just its channel set. A filter
     // change re-populates the list wholesale, which is not threads moving
@@ -1447,6 +1513,10 @@ interface ThreadRowContentProps {
     /** Pinned (saved) state — drives the pin button's filled/outline glyph.
      *  In the memo equality check so a pin toggle repaints just this row. */
     isSaved: boolean;
+    /** The home thread's row, which only the filtered views draw: a house
+     *  before the title, and no pin, since a pin would move it nowhere
+     *  (ADR 0362). */
+    isHome?: boolean;
     isFocused: boolean;
     isHighlighted: boolean;
     /** Set when this row is the root of a lifted family — its own natural
@@ -1577,6 +1647,7 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
                     <span class="thread-row-title-row">
                         <span class="thread-row-title-text">
                             <ThreadStatusIcon status={sk ? null : (props.visualStatus ?? null)} />
+                            {props.isHome && <span class="thread-row-home-icon"><HomeIcon size="0.875rem" /></span>}
                             <SkText class="thread-row-title" w="11rem">{props.title}</SkText>
                             {props.hasDraft && <span class="draft-indicator" data-tooltip="Has unsent draft">Draft</span>}
                         </span>
@@ -1585,7 +1656,7 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
                                 {/* Mouse-only (tabIndex=-1): the drawer is a single tab
                                     stop. The keyboard reaches every row action through
                                     the ⋯ menu via the "Open thread actions" shortcut. */}
-                                <PinThreadButton threadId={props.id} saved={props.isSaved ?? false} stopPropagation extraClass="thread-row-action" tabIndex={-1} />
+                                {!props.isHome && <PinThreadButton threadId={props.id} saved={props.isSaved ?? false} stopPropagation extraClass="thread-row-action" tabIndex={-1} />}
                                 <ThreadOverflowMenu threadId={props.id} title={props.title ?? ''} stopPropagation extraClass="thread-row-action" tabIndex={-1} hostOpener={gesture.hostOpener} />
                             </RowActions>
                         )}
@@ -1675,6 +1746,7 @@ const ThreadRowContent = memo(ThreadRowContentImpl, (prev, next) =>
     && prev.needsReview === next.needsReview
     && prev.hasDraft === next.hasDraft
     && prev.isSaved === next.isSaved
+    && prev.isHome === next.isHome
     && prev.isFocused === next.isFocused
     && prev.isHighlighted === next.isHighlighted
     && prev.isLiftedParent === next.isLiftedParent
@@ -1745,6 +1817,7 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
             needsReview={meta.section === 'inbox' && status !== 'running'}
             hasDraft={hasDraft}
             isSaved={meta.saved}
+            isHome={meta.home === true}
             isFocused={isFocused}
             isHighlighted={isHighlighted}
             isLiftedParent={isLiftedParent}
@@ -1762,7 +1835,7 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
 }
 
 /** One-tap shortcut back to the unfiltered "All statuses" view, offered by every
- *  status-filter view (Drafts / Needs attention / Review / Running) in both
+ *  status-filter view (Drafts / Needs attention / Review / In flight) in both
  *  states: under the "nothing here" message when the filter is empty, and under
  *  the last row when it is not. Either way the user has reached the end of this
  *  status. So the way out sits where they are already looking, rather than back
@@ -1812,7 +1885,7 @@ function DraftsList() {
 
     const ids = drafts.map(t => t.meta.id);
     const idsKey = ids.join(',');
-    useEffect(() => { navNodes.value = flatThreadNodes(ids); }, [idsKey]);
+    usePublishedNavNodes(() => flatThreadNodes(ids), idsKey);
 
     if (!hydrated) return null;
     if (drafts.length === 0) {
@@ -1844,7 +1917,7 @@ function AttentionList() {
 
     const ids = threads.map(t => t.meta.id);
     const idsKey = ids.join(',');
-    useEffect(() => { navNodes.value = flatThreadNodes(ids); }, [idsKey]);
+    usePublishedNavNodes(() => flatThreadNodes(ids), idsKey);
 
     if (!hydrated) return null;
     if (threads.length === 0) {
@@ -1872,7 +1945,7 @@ function ReviewList() {
 
     const ids = threads.map(t => t.meta.id);
     const idsKey = ids.join(',');
-    useEffect(() => { navNodes.value = flatThreadNodes(ids); }, [idsKey]);
+    usePublishedNavNodes(() => flatThreadNodes(ids), idsKey);
 
     if (!hydrated) return null;
     if (threads.length === 0) {
@@ -1889,34 +1962,30 @@ function ReviewList() {
     );
 }
 
-/** Single-section view of every Current/Saved thread actively working on a
- *  response (see `threadIsRunning`). Mirrors `AttentionList`/`ReviewList`:
- *  bypasses the channel/trigger/repo filters and the three lifecycle sections so
- *  the user sees everything in flight in one place, flat and most-recent-first.
- *  Same pagination caveat — running threads ride at the top of the loaded
- *  window. */
-function RunningList() {
+/** Single-section view of every in-flight thread (see `threadIsInFlight`):
+ *  running, or waiting on its own event wait or on sub-threads. Mirrors
+ *  `AttentionList`/`ReviewList`: bypasses the channel/trigger/repo filters and
+ *  the three lifecycle sections. Unlike them it nests each sub-thread under its
+ *  parent, so a family reads as one block. Same pagination caveat: these
+ *  threads sit in Current, at the top of the loaded window. */
+function InFlightList() {
     const hydrated = threadsLoaded.value;
-    const threads = hydrated ? runningThreads(threadMap.value) : [];
+    const rows = hydrated ? inFlightThreads(threadMap.value) : [];
 
-    const ids = threads.map(t => t.meta.id);
+    const ids = rows.map(n => n.thread.meta.id);
     const idsKey = ids.join(',');
-    useEffect(() => { navNodes.value = flatThreadNodes(ids); }, [idsKey]);
+    usePublishedNavNodes(() => flatThreadNodes(ids), idsKey);
 
     if (!hydrated) return null;
-    if (threads.length === 0) {
-        return <EmptyFilteredView message="Nothing running" />;
+    if (rows.length === 0) {
+        return <EmptyFilteredView message="Nothing in flight" />;
     }
     return (
         <div>
             <div class="list-section-title">
-                {/* Every thread in this view is running (the empty case already
-                    returned), so the header always shimmers — the same "live"
-                    affordance the lifecycle sections show while they hold a
-                    running thread. */}
-                <SectionHeaderContent Icon={RunningIcon} title="Running" count={threads.length} running />
+                <SectionHeaderContent Icon={InFlightIcon} title="In flight" count={rows.length} running={inFlightHasRunning(rows)} />
             </div>
-            {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
+            {rows.map(n => <ThreadRow key={n.thread.meta.id} threadId={n.thread.meta.id} status={effectiveThreadStatus(n.thread)} depth={n.depth} />)}
             <FilteredViewFooter />
         </div>
     );
@@ -1928,7 +1997,7 @@ function SearchResults() {
 
     const resultIds = loadable.status === 'loaded' ? loadable.data.map((r: ThreadSearchResult) => r.thread_id) : [];
     const resultKey = resultIds.join(',');
-    useEffect(() => { navNodes.value = flatThreadNodes(resultIds); }, [resultKey]);
+    usePublishedNavNodes(() => flatThreadNodes(resultIds), resultKey);
 
     if (loadable.status === 'failed') {
         // The reason, not a bare "Search failed": this is the only report the

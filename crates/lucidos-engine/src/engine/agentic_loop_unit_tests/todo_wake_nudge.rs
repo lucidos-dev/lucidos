@@ -69,7 +69,7 @@ mod todo_wake_nudge_tests {
         // Same sanity the re-ask guard pins, and for the same reason: what must
         // not drift is the unconfigured relationship to the outer backstop.
         const { assert!(MAX_TODO_WAKE_NUDGE >= 1) };
-        const { assert!(MAX_TODO_WAKE_NUDGE < crate::core::DEFAULT_MAX_TOOL_CALLS) };
+        assert!((MAX_TODO_WAKE_NUDGE as f64) < crate::core::prefs::MAX_TOOL_CALLS.default_number());
     }
 
     #[test]

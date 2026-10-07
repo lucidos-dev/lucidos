@@ -57,6 +57,12 @@ describe('locateReadingTarget', () => {
     expect(locateReadingTarget(exchanges, { kind: 'row', id: 'evt-5' })).toEqual({ index: 1, row: 0 });
   });
 
+  it('finds a sub-agent row at its agent row, which is where it is drawn', () => {
+    const child = { ...toolCall(3), parent_tool_use_id: 'tool-2' } as StoredEvent;
+    const exchanges = exchangesOf([userMessage(0), toolCall(1), toolCall(2), child], false);
+    expect(locateReadingTarget(exchanges, { kind: 'row', id: 'evt-3' })).toEqual({ index: 0, row: 1 });
+  });
+
   it('finds a row inside a continuation fragment, which has no turn id', () => {
     // The page starts mid-turn: the fragment holds evt-1..evt-3 and no opening
     // message. A turn anchor could not name it. Its rows are still found.

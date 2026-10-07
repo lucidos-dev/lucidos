@@ -59,8 +59,8 @@ export function countsAsReaderScroll(opts: {
  *  write takes the reader somewhere. An anchor write keeps them on their line,
  *  and the follow's carry rides a reply, so neither moves the bars (ADR 0337).
  *
- *  A write that moved nothing took nobody anywhere. Focus landing on a control
- *  already on screen marks one (`markRevealScroll`), on every tap. */
+ *  A write that moved nothing took nobody anywhere. An arrow-key step to a
+ *  choice already on screen marks one (`markRevealScroll`). */
 export function revealsBars(opts: { kind: NavScrollKind; moved: boolean }): boolean {
   return opts.moved && (opts.kind === 'placement' || opts.kind === 'held');
 }

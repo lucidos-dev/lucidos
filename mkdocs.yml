@@ -50,6 +50,7 @@ nav:
   - Concepts: concepts.md
   - Architecture: architecture.md
   - Philosophy: philosophy.md
+  - Privacy: privacy.md
   - Develop Lucidos: develop.md
   - Tutorials:
       - Build an app: tutorials/build-an-app.md

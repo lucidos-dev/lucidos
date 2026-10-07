@@ -1,6 +1,5 @@
 mod failure_breaker_tests {
     use super::super::{generic_breaker_action, next_failure_streak, BreakerAction};
-    use crate::core::DEFAULT_MAX_TOOL_CALLS;
 
     /// Simulate a run of single-tool-call iterations on the SAME (tool, key),
     /// returning the breaker action observed on each iteration BEFORE the
@@ -123,6 +122,6 @@ mod failure_breaker_tests {
         // DEFAULT cap: the configured one is a user setting with no ceiling and
         // a floor of 1, and a cap set below 5 deliberately trades the breaker
         // message for the engine-limit one.
-        const { assert!(5 < DEFAULT_MAX_TOOL_CALLS) };
+        assert!(5.0 < crate::core::prefs::MAX_TOOL_CALLS.default_number());
     }
 }

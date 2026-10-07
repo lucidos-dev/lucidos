@@ -297,6 +297,7 @@ impl AppServerTracker {
                 output: "(abandoned — turn ended before the tool finished)".to_string(),
                 status: "error".to_string(),
                 id,
+                parent_tool_use_id: None,
             })
             .collect()
     }
@@ -378,6 +379,8 @@ impl AppServerTracker {
             name: tool.name,
             input: tool.input,
             id: tool.id,
+            parent_tool_use_id: None,
+            api_call_id: None,
         }]
     }
 
@@ -480,6 +483,8 @@ impl AppServerTracker {
                     output_tokens: output,
                     cache_read_tokens: cached,
                     cache_creation_tokens: 0,
+                    parent_tool_use_id: None,
+                    api_call_id: None,
                 }]
             }
             "error" => {
@@ -567,11 +572,14 @@ impl AppServerTracker {
                         name: "todo_list".to_string(),
                         input: serde_json::json!({ "items": items }),
                         id: id.clone(),
+                        parent_tool_use_id: None,
+                        api_call_id: None,
                     },
                     AgentEvent::ToolResult {
                         output: String::new(),
                         status: "success".to_string(),
                         id,
+                        parent_tool_use_id: None,
                     },
                 ]
             }
@@ -635,6 +643,7 @@ impl AppServerTracker {
                         output,
                         status: tool_status(&str_field(item, "status")).to_string(),
                         id,
+                        parent_tool_use_id: None,
                     }]
                 } else {
                     self.maybe_emit_tool_use(DeferredToolUse {
@@ -674,6 +683,7 @@ impl AppServerTracker {
                         output: status.clone(),
                         status: tool_status(&status).to_string(),
                         id,
+                        parent_tool_use_id: None,
                     }]
                 } else {
                     // Remembered for the approval request codex raises next
@@ -711,6 +721,7 @@ impl AppServerTracker {
                         output,
                         status: tool_status(&str_field(item, "status")).to_string(),
                         id,
+                        parent_tool_use_id: None,
                     }]
                 } else {
                     self.open_tool_ids.push(id.clone());
@@ -721,6 +732,8 @@ impl AppServerTracker {
                             .cloned()
                             .unwrap_or(serde_json::Value::Null),
                         id,
+                        parent_tool_use_id: None,
+                        api_call_id: None,
                     }]
                 }
             }
@@ -734,11 +747,14 @@ impl AppServerTracker {
                         name: "web_search".to_string(),
                         input: serde_json::json!({ "query": str_field(item, "query") }),
                         id: id.clone(),
+                        parent_tool_use_id: None,
+                        api_call_id: None,
                     },
                     AgentEvent::ToolResult {
                         output: String::new(),
                         status: "success".to_string(),
                         id,
+                        parent_tool_use_id: None,
                     },
                 ]
             }

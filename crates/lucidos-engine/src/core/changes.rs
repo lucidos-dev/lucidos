@@ -609,6 +609,22 @@ pub async fn sub_thread_pending_changes(
         .collect())
 }
 
+/// The status each of `ids` has now. An id with no row is absent. One query.
+pub async fn current_statuses(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, ChangeStatus>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(Uuid, ChangeStatus)> =
+        sqlx::query_as("SELECT id, status FROM changes WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
 /// Return the subset of `changes` whose thread has settled: the ones Apply All
 /// and Discard All may act on. Acting on the rest in bulk would merge, or delete
 /// the worktree of, a branch the coding agent is still working on. The

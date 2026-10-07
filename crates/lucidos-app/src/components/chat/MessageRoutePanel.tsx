@@ -1,8 +1,8 @@
 import { useRef } from 'preact/hooks';
+import { UNTITLED_THREAD } from '../../utils/threadTitle';
 import type { ComponentChildren } from 'preact';
-import type { CodingAgent } from '../../api/types';
 import { AppsIcon } from '../shared/icons';
-import { messageRoutePanel, closeMessageRoutePanel, triggers, threadMap, repositories, appsList, workspaceName } from '../../store/store';
+import { messageRoutePanel, closeMessageRoutePanel, contextViewer, triggers, threadMap, repositories, appsList, workspaceName } from '../../store/store';
 import { loadApps } from '../../store/actions/apps';
 import { turnDeviceName } from '../../store/actions/devices';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
@@ -15,11 +15,11 @@ import { navigateToTrigger } from '../../store/actions/triggers';
 import { loadRepositories } from '../../store/actions/chat';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { formatMessageTimestamp } from '../../utils/formatTime';
-import { formatThreadChannelLabel } from '../../utils/formatChannel';
 import { Overlay } from '../shared/Overlay';
 import { EventRowFoldView } from './EventRow';
 import { loadedOr } from '../../store/types';
 import {
+  capturedEventToData,
   ENGINE_LABEL,
   LUCIDOS_AGENT_LABEL,
   exchangeResponseModel,
@@ -30,6 +30,7 @@ import {
   findMcpPermissionResolution,
   findPermissionResolution,
   findQuestionAnswer,
+  questionDividerResolution,
   isChangeLifecycleEvent,
   legacyOrigin,
   modeToInitiator,
@@ -38,12 +39,17 @@ import {
   sortEventsChronologically,
   starterEngineReason,
   SYSTEM_LABEL,
+  type AnsweredQuestion,
+  type ResolvedCommandPermission,
+  type ResolvedMcpPermission,
+  type ResolvedPermission,
   type Exchange,
   type EngineReason,
   type MessageOrigin,
   type StoredEvent,
   type ThreadMeta,
 } from '../../store/thread-events';
+import type { ContextCapture } from '../../store/types';
 import {
   describeAbortCause,
   describeCancelCause,
@@ -72,27 +78,10 @@ export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
   const userEvent = exchange.userEvent;
   if (userEvent.type === 'MessageReceived') return legacyOrigin(userEvent);
   if (isChangeLifecycleEvent(userEvent)) return userEvent.actor;
-  // Divider-starter ActionRequired events: the Origin is the device that
-  // *answered* the question / *resolved* the permission — pulled from the
-  // matching resolution step in this exchange. No answer yet → undefined and
-  // the popover degrades to the initiator row only.
-  if (userEvent.type === 'UserQuestionAsked') {
-    return findQuestionAnswer(exchange, userEvent.tool_use_id)?.actor;
-  }
-  if (userEvent.type === 'CodingAgentPermissionRequest') {
-    return findPermissionResolution(exchange, userEvent.request_id)?.actor;
-  }
-  if (userEvent.type === 'CommandPermissionRequested') {
-    return findCommandPermissionResolution(exchange, userEvent.request_id)?.actor;
-  }
-  if (userEvent.type === 'McpPermissionRequested') {
-    return findMcpPermissionResolution(exchange, userEvent.request_id)?.actor;
-  }
-  // McpConsentRequested has no user-side answer event today. The initiator row
-  // carries the disclosure on its own.
-  if (userEvent.type === 'McpConsentRequested') {
-    return undefined;
-  }
+  // A question or permission card: the chip names the agent that asked, so the
+  // Origin is whoever answered it.
+  const settlement = dividerSettlement(exchange);
+  if (settlement !== null) return settlement?.actor;
   // Engine-emitted events (ContinuationStarted, CodingAgentPromptSent, TriggerStarted, ChangeProposed)
   // carry origin directly — surface it so the popover can render the Engine variant.
   if ('origin' in userEvent && userEvent.origin) {
@@ -110,6 +99,41 @@ export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
     ?? (userEvent.type === 'ContinuationStarted' ? CONTINUATION_ENGINE_REASON : undefined);
   if (implied) return { kind: 'engine', reason: implied };
   return undefined;
+}
+
+type DividerSettlement =
+  | AnsweredQuestion
+  | ResolvedPermission
+  | ResolvedCommandPermission
+  | ResolvedMcpPermission;
+
+/** The step that settled a question or permission card: the user's answer or
+ *  verdict. `undefined` while the card waits, and `null` for any other turn.
+ *  A canceled or superseded question was never answered, so it stays waiting,
+ *  as on the card's own status. An MCP consent records no answer at all. */
+function dividerSettlement(exchange: Exchange): DividerSettlement | undefined | null {
+  const userEvent = exchange.userEvent;
+  switch (userEvent.type) {
+    case 'UserQuestionAsked':
+      return questionDividerResolution(exchange) ? undefined : findQuestionAnswer(exchange, userEvent.tool_use_id);
+    case 'CodingAgentPermissionRequest':
+      return findPermissionResolution(exchange, userEvent.request_id);
+    case 'CommandPermissionRequested':
+      return findCommandPermissionResolution(exchange, userEvent.request_id);
+    case 'McpPermissionRequested':
+      return findMcpPermissionResolution(exchange, userEvent.request_id);
+    case 'McpConsentRequested':
+      return undefined;
+    default:
+      return null;
+  }
+}
+
+/** Whether the Origin popover says anything the chip does not. A question or
+ *  permission card's chip already names the asker, so its popover waits until
+ *  someone answered. */
+export function originPopoverHasContent(exchange: Exchange): boolean {
+  return dividerSettlement(exchange) === null || resolveOrigin(exchange) !== undefined;
 }
 
 /** Live lookup wins over `cachedLinkedTitle` because SSE handlers
@@ -130,7 +154,6 @@ export function resolveThreadLinkTitle(
 }
 
 /** A linked thread whose title never loaded. Its id is in Technical details. */
-const UNTITLED_THREAD = 'Untitled thread';
 
 /** Branch comes from `SessionStarted` (or `ContinuationStarted`), which fire once per CC
  *  process spawn — not per user message. A follow-up exchange within an existing Claude Code
@@ -144,7 +167,9 @@ const UNTITLED_THREAD = 'Untitled thread';
  *  the session id from those, falling back to a non-empty `SessionStarted.session_id` only
  *  for legacy rows. Like branch, it's session-scoped, so it rides the same full-thread walk.
  *
- *  Context info is per-exchange and stays scoped to `exchange.steps`. */
+ *  Context info is per-exchange and stays scoped to `exchange.steps`. The turn's
+ *  last capture rides along as `contextCapture`, so the Context row can open
+ *  the context viewer on it. A legacy row carries a count with no snapshot. */
 export function executorExtras(
   exchange: Exchange,
   threadEvents: Map<number, StoredEvent>,
@@ -153,6 +178,7 @@ export function executorExtras(
   ccSessionId?: string;
   contextTokens?: number;
   contextTrimmed?: boolean;
+  contextCapture?: ContextCapture;
   repoId?: string;
 } {
   // The cutoff is the last seq in this exchange — SessionStarted typically lives in
@@ -188,12 +214,17 @@ export function executorExtras(
 
   let contextTokens: number | undefined;
   let contextTrimmed: boolean | undefined;
+  let contextCapture: ContextCapture | undefined;
   for (const { event } of exchange.steps) {
     if (event.type === 'ThoughtStreamed') {
       // Legacy DB rows — ContextCaptured below overrides when present.
-      if (typeof event.context_tokens === 'number') contextTokens = event.context_tokens;
+      if (typeof event.context_tokens === 'number') {
+        contextTokens = event.context_tokens;
+        contextCapture = undefined;
+      }
       if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;
     } else if (event.type === 'ContextCaptured') {
+      contextCapture = capturedEventToData(event, event._eventId);
       // Prefer real input_tokens; fall back to the engine's chars*2/5
       // estimate (see `estimate_tokens_from_chars` in the engine, which is
       // measured at 2.5 chars/token, NOT the trim budget's conservative 1.5).
@@ -202,7 +233,7 @@ export function executorExtras(
       if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;
     }
   }
-  return { branch, ccSessionId, contextTokens, contextTrimmed, repoId };
+  return { branch, ccSessionId, contextTokens, contextTrimmed, contextCapture, repoId };
 }
 
 export function MessageRoutePanel() {
@@ -230,7 +261,7 @@ export function MessageRoutePanel() {
       panelRef={ref}
     >
       {section === 'origin'
-        ? renderOriginSection(exchange, thread.meta.parentThreadTitle, getLiveThreadTitle, pausedBy, thread.meta.codingAgent, readAt)
+        ? renderOriginSection(exchange, thread.meta.parentThreadTitle, getLiveThreadTitle, pausedBy, readAt)
         : renderExecutorSection(exchange, thread.events, thread.meta, priorModel, priorEffort)}
     </Overlay>
   );
@@ -249,7 +280,6 @@ export function renderOriginSection(
   parentTitle: string | undefined,
   getLiveTitle: (threadId: string) => string | undefined,
   pausedBy?: StoredEvent,
-  codingAgent: CodingAgent = 'claude-code',
   readAt?: string,
 ) {
   const userEvent = exchange.userEvent;
@@ -264,8 +294,8 @@ export function renderOriginSection(
     );
   }
 
-  const initiatorRow = renderInitiatorRow(userEvent, codingAgent);
   const origin = resolveOrigin(exchange);
+  const settledAt = renderSettledAt(userEvent, dividerSettlement(exchange));
   const technical = renderTechnicalDetails(userEvent, origin);
   const channel = origin
     ? renderChannelSection(origin, parentTitle, getLiveTitle, deviceRowLabel(userEvent))
@@ -327,7 +357,7 @@ export function renderOriginSection(
     );
   }
 
-  if (!initiatorRow && !issuer && !channel && !explainer && !paused) {
+  if (!issuer && !channel && !explainer && !paused) {
     return (
       <section class="route-section">
         <h4>Origin</h4>
@@ -345,7 +375,7 @@ export function renderOriginSection(
   return (
     <section class="route-section">
       <h4>Origin</h4>
-      {initiatorRow}
+      {settledAt}
       {issuer}
       {engineRows}
       {channel}
@@ -365,14 +395,23 @@ const ENGINE_WHY_HEADING = 'Why Lucidos acted';
 const NOT_RECORDED_EXPLAINER =
   'Lucidos did not record who started this turn. Older turns often lack it.';
 
-/** What the device row is called, by what the device did. A question's device
- *  answered it, so a bare "Device" under "Asked by" would read as the asker. */
-function deviceRowLabel(userEvent: StoredEvent): string {
+/** What the user did to settle a question or permission card. */
+function settledVerb(userEvent: StoredEvent): 'Answered' | 'Decided' | null {
   switch (userEvent.type) {
-    case 'UserQuestionAsked':            return 'Answered on';
+    case 'UserQuestionAsked':            return 'Answered';
     case 'CodingAgentPermissionRequest':
     case 'CommandPermissionRequested':
-    case 'McpPermissionRequested':       return 'Decided on';
+    case 'McpPermissionRequested':       return 'Decided';
+    default:                             return null;
+  }
+}
+
+/** What the device row is called, by what the device did. A question's device
+ *  answered it, so a bare "Device" would read as the asker. */
+function deviceRowLabel(userEvent: StoredEvent): string {
+  const verb = settledVerb(userEvent);
+  if (verb) return `${verb} on`;
+  switch (userEvent.type) {
     case 'MessageReceived':
     case 'UserPromptInjected':           return 'Sent from';
     case 'ResponseAborted':
@@ -536,34 +575,21 @@ function renderExplainer(heading: string, body: string | null): preact.JSX.Eleme
   );
 }
 
-/** Initiator row for divider-starter ActionRequired events. The chip reads the
- *  asking agent; this row mirrors who *asked*. A coding-agent question or
- *  permission gate names the thread's backend (Claude Code or Codex), a chat
- *  question the Lucidos Agent, and an MCP-consent request Lucidos. Returns
- *  null for non-divider events (their initiator is implied by channel/audit). */
-export function renderInitiatorRow(
+/** When the user answered a question or decided a permission. The header
+ *  shows when the agent asked, so this is where the answer time is visible. */
+function renderSettledAt(
   userEvent: StoredEvent,
-  codingAgent: CodingAgent = 'claude-code',
+  settlement: DividerSettlement | undefined | null,
 ): preact.JSX.Element | null {
-  const text = initiatorRowText(userEvent, formatThreadChannelLabel('claude_code', codingAgent));
-  if (!text) return null;
+  const verb = settledVerb(userEvent);
+  const at = settlement && (settlement.created || settlement._displayCreated);
+  if (!verb || !at) return null;
   return (
     <div class="route-row">
-      <strong>Asked by</strong>
-      <span>{text}</span>
+      <strong>{verb}</strong>
+      <span>{formatMessageTimestamp(at)}</span>
     </div>
   );
-}
-
-function initiatorRowText(userEvent: StoredEvent, backend: string): string | null {
-  switch (userEvent.type) {
-    case 'UserQuestionAsked':            return userEvent.cc_session_id ? backend : 'Lucidos Agent';
-    case 'CodingAgentPermissionRequest': return `${backend}, asking your permission`;
-    case 'CommandPermissionRequested':   return 'Lucidos Agent, asking to run a command';
-    case 'McpPermissionRequested':       return 'Lucidos Agent, asking to use a tool';
-    case 'McpConsentRequested':          return 'Lucidos, asking before a tool is first used';
-    default:                             return null;
-  }
 }
 
 /** Channel: who, on what surface: a device, an outside app, a workspace, a
@@ -632,7 +658,11 @@ export function renderChannelSection(
         getLiveTitle ?? (() => undefined),
       );
       const linkedId = origin.thread_id;
-      const heading = origin.direction === 'child' ? 'Child thread' : 'Parent thread';
+      // The home thread follows up threads it never spawned (ADR 0362), so a
+      // message from it is not necessarily from a parent.
+      const heading = origin.direction === 'child' ? 'Child thread'
+        : threadMap.value.get(linkedId)?.meta.home ? 'Home thread'
+        : 'Parent thread';
       return (
         <div class="route-row">
           <strong>{heading}</strong>
@@ -752,7 +782,7 @@ export function renderExecutorSection(
         <div class="route-row">
           <strong>Context</strong>
           <span>
-            {extras.contextTokens.toLocaleString()} tokens
+            {contextLink(extras.contextTokens, extras.contextCapture)}
             {extras.contextTrimmed && <span class="pill"> older parts left out</span>}
           </span>
         </div>
@@ -792,6 +822,26 @@ export function renderExecutorSection(
         </div>
       )}
     </section>
+  );
+}
+
+/** The Context row's figure. With a snapshot behind it, it opens the context
+ *  viewer on the turn's last call, as a step row's counter does for its own. */
+function contextLink(tokens: number, snapshot: ContextCapture | undefined): preact.JSX.Element | string {
+  const label = `${tokens.toLocaleString()} tokens`;
+  if (!snapshot) return label;
+  return (
+    <button
+      type="button"
+      class="accent-link"
+      aria-label="Show the context sent for the last call of this turn"
+      onClick={() => {
+        closeMessageRoutePanel();
+        contextViewer.value = { snapshot, description: 'Last call of this turn' };
+      }}
+    >
+      {label}
+    </button>
   );
 }
 

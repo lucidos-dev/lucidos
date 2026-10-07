@@ -10,7 +10,7 @@ paths:
 
 ## Before adding a method
 
-1. **Check it doesn't already exist.** Each top-level namespace has a sibling source file (`data.ts`, `events.ts`, `proxy.ts`, `preferences.ts`, `notifications.ts`, `apps.ts`, `threads.ts`, `triggers.ts`, `ui.ts`, `sse.ts`, `utils.ts`, `capture.ts`, `request.ts`).
+1. **Check it doesn't already exist.** Each top-level namespace has a sibling source file (`data.ts`, `events.ts`, `proxy.ts`, `preferences.ts`, `notifications.ts`, `apps.ts`, `threads.ts`, `triggers.ts`, `ui.ts`, `sse.ts`, `utils.ts`, `capture.ts`, `request.ts`, `oauth.ts`, `storage.ts`).
 
    `Grep pattern: 'lucidos\\.<methodname>'` over the repo (or just look for the matching `## lucidos.<namespace>` heading in `system-knowhow/js-sdk.md`). The existing helper may be lower-level than the new spec wants: say so explicitly to the user instead of silently shipping a duplicate.
 

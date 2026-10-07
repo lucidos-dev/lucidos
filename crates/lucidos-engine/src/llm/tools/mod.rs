@@ -114,12 +114,19 @@ pub struct ToolCapabilities {
     /// the working understanding. A schema billed on every request that
     /// nothing calls is the cost bug the mode exists to fix.
     pub context_mode: bool,
+    /// The workspace is on the Tree *memory module*, with its summary trees
+    /// ready. A turn then reads memory views and may open them (ADR 0362).
+    /// It opens [`Gate::MemoryTree`] and shuts [`Gate::MemoryClassic`].
+    pub memory_tree: bool,
 }
 
 impl ToolCapabilities {
-    /// Every [`Gate`] open, which is the whole engine-authored surface rather
-    /// than one workspace's array. For tests asking whether a schema is
+    /// Every [`Gate`] open but one, which is the whole engine-authored surface
+    /// rather than one workspace's array. For tests asking whether a schema is
     /// registered at all, which no gate should be able to answer for them.
+    ///
+    /// The one is [`Gate::MemoryClassic`]: the two memory gates are one fact
+    /// read two ways, so no workspace opens both. This opens the Tree side.
     ///
     /// `context_mode` is not a gate and is off here. It shapes rather than
     /// gates, and what it does is CLOSE a family, so the widest array is the
@@ -131,6 +138,7 @@ impl ToolCapabilities {
             image_provider: true,
             judgment_provider: true,
             context_mode: false,
+            memory_tree: true,
         }
     }
 }
@@ -152,16 +160,23 @@ pub enum Gate {
     ImageProvider,
     /// A configured judgment provider, switched on.
     JudgmentProvider,
+    /// The Tree memory module, with its summary trees ready.
+    MemoryTree,
+    /// Every turn that is not on Tree. A Tree turn never reads Classic's
+    /// memory, so a tool acting on it would report work that changed nothing.
+    MemoryClassic,
 }
 
 impl Gate {
-    fn is_open(self, caps: &ToolCapabilities) -> bool {
+    pub(crate) fn is_open(self, caps: &ToolCapabilities) -> bool {
         match self {
             Gate::Ungated => true,
             Gate::EmailAccount => caps.email_account,
             Gate::Intent => caps.intent,
             Gate::ImageProvider => caps.image_provider,
             Gate::JudgmentProvider => caps.judgment_provider,
+            Gate::MemoryTree => caps.memory_tree,
+            Gate::MemoryClassic => !caps.memory_tree,
         }
     }
 }

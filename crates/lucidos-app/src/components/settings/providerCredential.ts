@@ -1,4 +1,5 @@
 import type { CredentialInfo, Loadable } from '../../store/types';
+import type { UpdateCredentialBody } from '../../api/client/settings';
 
 /**
  * The provider credential stored under `service`, ignoring any OAuth client
@@ -25,4 +26,25 @@ export function findProviderCredential(
   return credLoadable.data.find(
     (c) => c.service_name === service && c.auth_type !== 'oauth_client'
   );
+}
+
+/** The edit that moves a saved key to a new endpoint URL, or `null` when it is
+ *  already scoped there. The engine sends the key only inside its scope, so a
+ *  URL saved without this would leave the provider keyless. Used by the Local
+ *  provider and the custom System One endpoint. A cleared field moves nothing:
+ *  the Local engine then falls back to `LUCIDOS_LOCAL_BASE_URL`, which the page
+ *  cannot see. */
+export function providerKeyRescope(
+  existing: CredentialInfo | undefined,
+  url: string,
+): UpdateCredentialBody | null {
+  const target = url.trim();
+  if (!existing || !target || existing.base_urls.includes(target)) return null;
+  // An edit is a full replace, and an absent env var name resets to the default.
+  return {
+    base_urls: [target],
+    auth_type: existing.auth_type,
+    auth_header: existing.auth_header,
+    env_var_name: existing.env_var_name ?? undefined,
+  };
 }

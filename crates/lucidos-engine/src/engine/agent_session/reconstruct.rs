@@ -302,6 +302,7 @@ mod tests {
         ThreadEvent::CodingAgentTextStreamed {
             text: text.into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            parent_tool_use_id: None,
         }
     }
 
@@ -312,6 +313,8 @@ mod tests {
             description: description.into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             tool_use_id: String::new(),
+            parent_tool_use_id: None,
+            api_call_id: None,
         }
     }
 
@@ -321,6 +324,7 @@ mod tests {
             result: result.into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             tool_use_id: String::new(),
+            parent_tool_use_id: None,
         }
     }
 

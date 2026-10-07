@@ -471,6 +471,15 @@
     border-color: var(--text-secondary);
 }
 
+/* Settings → Models: a row's vision flag, accent while the model reads images. */
+.model-vision-toggle {
+    color: var(--text-muted);
+}
+
+.model-vision-toggle[aria-pressed='true'] {
+    color: var(--accent);
+}
+
 /* Settings → Models: one model's route editor, opened under its row. */
 .model-routes-editor {
     display: flex;

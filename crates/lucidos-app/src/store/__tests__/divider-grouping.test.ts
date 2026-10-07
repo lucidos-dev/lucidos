@@ -72,6 +72,23 @@ describe('groupIntoExchanges — ActionRequired events as exchange boundaries', 
     expect(divider.questionOvertaken).toBe(false);
   });
 
+  it("a card's message, emitted after the ToolCalled, renders above a live card", () => {
+    // The engine shows the card's `message` once the gate passes the call, so
+    // it lands between ToolCalled and the first UserQuestionAsked.
+    const MESSAGE = '1. Open https://example.com/settings\n2. Press **Save**.';
+    const events = new Map<number, StoredEvent>([
+      [1, { type: 'MessageReceived', text: 'just tell me what to do with links', _eventId: 'msg-1', created: '2026-06-16T12:00:01Z' } as StoredEvent],
+      [2, { type: 'ToolCalled', name: 'ask_user_question', args: { message: MESSAGE }, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-06-16T12:00:02Z' } as StoredEvent],
+      [3, { type: 'TextStreamed', text: MESSAGE, request_event_id: 'msg-1', created: '2026-06-16T12:00:03Z' } as StoredEvent],
+      [4, { type: 'UserQuestionAsked', tool_use_id: 'tu-outer#q0', cc_session_id: '', question: 'Tap when it is saved.', options: [{ id: 'a', label: 'Done, verify it' }, { id: 'b', label: 'Cannot find it' }], created: '2026-06-16T12:00:04Z' } as StoredEvent],
+    ]);
+    const [mrEx, divider] = groupIntoExchanges(events);
+    expect(divider.userEvent.type).toBe('UserQuestionAsked');
+    expect(exchangeResponseEvents(mrEx).find(e => e.type === 'text' && e.md === MESSAGE)).toBeDefined();
+    expect(divider.steps.map(s => s.event.type)).not.toContain('TextStreamed');
+    expect(divider.questionOvertaken).toBe(false);
+  });
+
   it('chat agent post-answer text/response routes to the question exchange (rendered below the answer)', () => {
     // The agent's reply text must land in the question divider so it renders
     // BELOW the question card, not back in the MR exchange (which would put

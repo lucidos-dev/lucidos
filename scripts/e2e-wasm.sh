@@ -3,6 +3,7 @@
 #
 # Usage:
 #   ./scripts/e2e-wasm.sh [-- cargo test args]
+#   ./scripts/e2e-wasm.sh --github            # on GitHub's runners, ADR 0382
 #
 # Builds every signer in `signers/` to `wasm32-unknown-unknown` release mode
 # (via `./signers/build-all.sh`) so the tests in
@@ -15,6 +16,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/e2e_github.sh
+source "$SCRIPT_DIR/lib/e2e_github.sh"
+e2e_github_handoff wasm "$@"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 CARGO_ARGS=()

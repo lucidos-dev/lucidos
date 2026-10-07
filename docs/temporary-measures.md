@@ -59,6 +59,26 @@ entry's removal condition should name them).
 
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
+### Left-packed button rows awaiting the sweep
+
+- **Added:** 2026-10-03
+- **Lives in:** `LEFT_PACKED_PENDING_SWEEP` in
+  `crates/lucidos-app/src/styles/__tests__/button-rows-pack-right.test.ts`.
+- **Impermanent because:** the rule that a row of action buttons packs right,
+  primary last, arrived after these rows were built. The list lets the guard
+  bind every new row now, while a sweep thread renders each old one before
+  changing it.
+- **Removal / resolution condition:** the list is empty. Each row is either
+  right-aligned or, where its parent already places it, made explicit with its
+  own `justify-content` and a comment saying why. Verify with that test file
+  passing with an empty set, then delete the constant.
+- **Status:** `removed` 2026-10-03. All 17 rows were rendered and now state
+  their packing: 13 by naming the parent that places them, two by packing
+  right, and two by a comment on why they stay where they are. The constant is
+  gone, and the guard fails on any left-packed row. Per-row outcomes:
+  `docs/plans/2026-10-03-sweep-left-packed-button-rows.md`.
+- **Investigation:** none.
+
 ### Toast placement picker
 
 - **Added:** 2026-08-13
@@ -1216,7 +1236,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   §4.5 seventh iteration; this row registers it and its new page-side cover)
 - **Lives in:** `crates/lucidos-engine/src/scheduler/push.rs` (`navigate_url_ios`,
   the query-string URL put on `notification.navigate`) and, page-side, the
-  **deep-link branch** of the `boot-splash-quiet` script in
+  **deep-link branch** of the quiet script in the `<head>` of
   `crates/lucidos-app/index.html` (the `?notification=` detection, NOT the cover
   it turns on).
 - **Scope note (2026-07-31, same day):** the *quiet boot cover* itself is
@@ -1225,7 +1245,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `lucidos-splash-quiet`), which is a continuation of the session for exactly the
   same reason a tap is. So this row tracks only the notification-tap TRIGGER and
   the engine-side URL that forces it. The cover, its stylesheet rules, and the
-  `boot-splash-quiet` arm of `bootSplashPlaysNoReveal()` all outlive it.
+  `data-boot-splash-quiet` arm of `bootSplashPlaysNoReveal()` all outlive it.
 - **Impermanent because:** A push tap should hand the deep link to the PWA window
   that is already open. Instead the engine deliberately emits a **cross-document**
   query URL, so every tap tears the running document down and boots a new one.
@@ -1827,6 +1847,21 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   check in `e2e/theme-parts-retro.spec.ts` then holds on every engine.
 - **Status:** active
 
+### Gemini 3.8 Flash's introductory compactor price
+
+- **Added:** 2026-10-06
+- **Lives in:** `crates/lucidos-engine/src/engine/summary_tree/compactor_models.rs`,
+  the `gemini-3.8-flash` row's `price`.
+- **Impermanent because:** It records Google's introductory list price,
+  $0.75 / $3.75 per million tokens. Google doubles it to $1.50 / $7.50 on
+  1 January 2027. After that date the Tree backfill estimate prices this
+  model at half its real cost.
+- **Removal / resolution condition:** On or after 2027-01-01, set the row's
+  `price` to `(1.5, 7.5)` and drop the comment that points here. Confirm the
+  new rate on Google's Vertex AI pricing page first. Then set this entry to
+  `resolved`.
+- **Status:** open
+
 ---
 
 ## 2. Model-tolerance measures
@@ -2298,7 +2333,17 @@ condition; fix the condition rather than acting on it.
   2026-09-25 to a card after a saved picture the user cannot see. Plan:
   `docs/plans/2026-09-25-a-card-after-a-picture-nobody-saw.md`. Widened the
   same day to a typed reply answered only by a progress note. Plan:
-  `docs/plans/2026-09-25-a-typed-reply-answered-by-a-note.md`.
+  `docs/plans/2026-09-25-a-typed-reply-answered-by-a-note.md`. Changed on
+  2026-10-06: a card question that carries the report covers tool work, and
+  a retry that drops a picture gets one more refusal. Also on 2026-10-06 the
+  chat card gained `message`, the primary path. The gate stays as the
+  backstop for a model that skips it. Plan:
+  `docs/plans/2026-10-06-chat-card-message-field.md`. Later that day the
+  chat prompt began routing pictures into `message`. Plan:
+  `docs/plans/2026-10-06-chat-pictures-go-in-the-card-message.md`. Widened
+  on 2026-10-07 from pictures to every saved artifact: any other file needs
+  its link in the words or on the card. No plan: the incident is under
+  "after a saved page" below.
 - **Lives in:** `crates/lucidos-engine/src/engine/question_card_gate.rs`
   (rule, query, refusal text, tests in the sibling `_tests.rs`). The chat
   loop calls it in `agentic_loop/run.rs`. Coding agents reach it through
@@ -2321,31 +2366,67 @@ condition; fix the condition rather than acting on it.
   - **Claude Code on Opus 5.5, after a saved picture.** Twice, an agent saved
     a mockup and pasted its `![...]` line into the reply just before the
     card. That reply arrived as a one-line summary without the picture.
+  - **Claude Code on Opus 5.5, after a saved page.** Asked for an HTML
+    explainer, the agent saved it and wrote its link just before a glossary
+    card. The user got "I've put together a one-page overview" and no link.
+    The gate stayed silent: it counted only pictures.
   - **Chat on Opus 5.5, a typed reply answered by a note.** Asked for a
     refund message, the agent said "here it is now" four times. The message
     stayed in its reasoning, and each card followed a note under 400
     characters. The agent reads its own reasoning back, so it believed it
     had sent it.
+  - **Chat on Opus 5.5, after a picture it looked at.** Twice, the agent
+    rendered tee mockups with `run_python`, opened them with `read_file`, and
+    asked which layout. Each card followed a one-line summary with no
+    picture. The chat prompt said "draw it in your reply", which is the
+    summarized text. The gate stayed silent: a chat tool's save carries no
+    thread, so its picture rule never sees it.
 
   `ASK_USER_QUESTION_RULE` already said "answer first", and
   `REASONING_NOT_VISIBLE_RULE` said the reasoning is not shown, so guidance
-  alone failed. The gate refuses such a card once per user input. A card that
-  says "above" counts when every word since the input is note-sized, under
-  600 characters. A picture counts when this thread saved it through the data
-  API since the input. It must then appear as a markdown target in the words
-  or on the card. `SHOWING_AN_IMAGE_RULE` and the `lucidos data write`
-  reminder now name the card first, so the gate is the backstop.
+  alone failed. The gate refuses such a card once per user input, plus once
+  more for an unseen artifact. A card that says "above" counts when every word
+  since the input is note-sized, under 600 characters. An artifact counts when
+  this thread saved it under `artifacts/` through the data API since the
+  input. It must then appear as a markdown target in the words or on the
+  card: the image form for a picture, a link for any other file. An option
+  renders a link as plain text, so only the question or the words can carry
+  one. `SHOWING_AN_IMAGE_RULE` and the `lucidos data write` reminder now name
+  the card first, so the gate is the backstop.
+
+  The chat card's `message` is the root fix for the shapes above that carry
+  prose. A tool input is never summarized, so the engine shows it in full as
+  the agent's text just above the card. The gate counts it as a reply, so a
+  card carrying one passes every rule but the artifact rule. The trigger was
+  a chat thread where steps with links, written before a card, reached the
+  user twice as a one-line note.
 
   In chat, a typed reply counts as unanswered when the round wrote only
   progress notes (`LlmResponse::content_is_progress_notes`) and every word
-  since is note-sized. An unseen picture outranks every other reason. A third
+  since is note-sized. An unseen artifact outranks every other reason. A third
   session spent the one refusal on unreported work, the render that made the
   picture, and its retry passed without the picture.
+
+  The gate itself caused the next loss. A Claude Code agent put its findings
+  and both pictures in a card question 1,300 characters long. The gate refused
+  it for unreported work, since it read only prose. The agent wrote a note and
+  re-sent the card without the pictures, and that retry passed.
+
+  So a card question of at least 600 characters now reports the tool work
+  before it. It answers no typed reply, since a re-sent card reads the same.
+  Option text never counts, since the first chat case hid its answer there.
+  The artifact check also runs after a refusal of any other kind, at most once
+  per input. So one input can draw two refusals, and never more.
 
   A refusal that owes words quotes the input it means, and says nothing new
   has arrived. On 2026-09-27 a chat agent read "The user typed you a reply" as
   a new message. It then asked the user to resend a reply it had already
   acted on.
+
+  The notes-only refusal once said to end the turn with no card. Users often
+  type a new request into a card instead of answering it, and the agent then
+  dropped its questions about that request. It now moves the reply onto the
+  card and sends the card again.
 
   Before 2026-09-23 a refusal could also mean the agent did answer, invisibly.
   See § "Text before a tool call arrives as hidden reasoning", now removed.
@@ -2353,7 +2434,7 @@ condition; fix the condition rather than acting on it.
 - **Removal / resolution condition:** in a per-workspace audit, count question
   cards raised after a typed reply or after tool work since the last input.
   Add cards that say "above" after note-sized words, and cards after a saved
-  picture. That is the denominator. A chat card after a typed reply with only
+  artifact. That is the denominator. A chat card after a typed reply with only
   notes since is already among the first group.
   Count refusals among them: tool-result rows
   (`ToolResult` or `CodingAgentToolResult`) with "Question card not shown." in
@@ -2496,13 +2577,52 @@ event that retires it.
   sets the variable, and the nightly knowhow never names it. The function, its
   call, its test and the doc mentions are gone.
 
+### `LUCIDOS_SUMMARY_TREES` opt-in for the compactor (ADR 0362)
+
+- **Added:** 2026-10-04
+- **Lives in:** `crates/lucidos-engine/src/engine/summary_tree/consumer.rs`
+  (`ENABLE_ENV`, `spawn_if_enabled`), called from `main.rs` beside the other
+  bus consumers.
+- **Impermanent because:** Phase 2 of
+  `docs/plans/2026-10-04-tree-memory-module-and-the-home-thread.md` ships the
+  compactor before anything reads its trees. Running it everywhere would spend
+  a backfill of model calls on output nobody uses. The owner chose a dormant
+  compactor that a developer can switch on to measure it.
+- **Removal / resolution condition:** Phase 3 lands the `memory_module`
+  preference, and the compactor starts for exactly the workspaces set to
+  `tree`. Then delete `ENABLE_ENV` and the env check, and start the compactor
+  from that preference instead. Verify with the Phase 3 test that a Classic
+  workspace makes no compactor call.
+- **Status:** removed 2026-10-04. `summary_tree::spawn` starts the compactor
+  while `memory_module` is `tree` and stops it on a switch back
+  (`the_compactor_runs_only_while_the_module_is_tree`). `ENABLE_ENV` and the
+  env check are gone.
+
+### `home_thread_enabled` experimental switch (ADR 0362)
+
+- **Added:** 2026-10-04
+- **Lives in:**
+  - `crates/lucidos-engine/src/core/preference_catalog.rs`: the
+    `HOME_THREAD_ENABLED` handle and `PrefSideEffect::HomeThread`.
+  - `engine/home_thread.rs`: the gate.
+  - `core/store/threads/mod.rs`: `home_visible_sql`.
+  - `api/voice.rs`: the refusal.
+  - `SettingsView.tsx`: the Experimental section.
+- **Impermanent because:** the owner shipped the home thread off while it
+  proves itself. Plan:
+  `docs/plans/2026-10-04-home-thread-behind-an-experimental-toggle.md`.
+- **Removal / resolution condition:** an ADR graduates the home thread and
+  flips the default to on. One release after that, delete the key, the gate
+  and the filter, so every workspace has its home thread again. Verify from
+  the tree: no `home_thread_enabled` outside this row and the ADRs.
+- **Status:** open
+
 ### `self_curated_context_mode` flag (ADR 0085)
 
 - **Added:** 2026-08-19
-- **Lives in:** `crates/lucidos-engine/src/core/preferences.rs` (the key, the
-  two schedule keys and their readers), `core/preference_catalog.rs` (the three
-  settable rows), and `engine/chat/process/context_mode.rs`, which owns the
-  whole mode. Also the `todo_write` gate in `llm/tools/misc.rs`.
+- **Lives in:** `crates/lucidos-engine/src/core/preference_catalog.rs` (the
+  three handles), `core/preferences.rs` (`self_curated_context_schedule`), and
+  `engine/chat/process/context_mode.rs`, which owns the whole mode. Also the `todo_write` gate in `llm/tools/misc.rs`.
 
   The rest is spread thin on purpose. `context_panel.rs` renders the panel,
   `working_understanding.rs` parses and renders the document and holds
@@ -2635,19 +2755,11 @@ event that retires it.
 
 - **Added:** 2026-08-05
 - **Lives in:** `crates/lucidos-engine/src/core/oauth.rs`
-  (`client_provider_name`, the `strip_prefix("oauth:")`), reached from three
+  (`client_provider_name`, the `strip_prefix("oauth:")`), reached from two
   sites: the `request_credential` LLM tool
-  (`engine/tools/credentials.rs::requested_service_name`),
-  `POST /api/v1/credentials` (`api/settings.rs::create_credential`), and the
-  proxy's `api/proxy.rs::fetch_required_credential`, whose fallback covers a
-  `data/config/apis.json` entry that still names a credential
-  `oauth:<provider>`. That third site is the load-bearing one: `data/config/` is
-  user data no DB migration can rewrite, so a live config would otherwise 502 on
-  every request the moment the prefix migration runs (a live workspace
-  had two such entries when this shipped). Pinned by
-  `client_provider_name_strips_a_legacy_prefix`,
-  `fetch_required_credential_tolerates_a_legacy_oauth_prefixed_name`, and
-  `fetch_required_credential_still_reports_a_genuinely_missing_one`.
+  (`engine/tools/credentials.rs::requested_service_name`) and
+  `POST /api/v1/credentials` (`api/settings.rs::create_credential`). Pinned by
+  `client_provider_name_strips_a_legacy_prefix`.
 - **Impermanent because:** an `oauth_client` credential is named for the provider
   alone now. The strip exists only because `oauth:<provider>` is still in
   circulation as the spelling agents and workspace knowhow learned: the chat system
@@ -2670,7 +2782,12 @@ event that retires it.
   (see § 2's sampling rule), drop the `strip_prefix` and the
   `client_provider_name_strips_a_legacy_prefix` test, keeping the lowercase/trim
   normalization, which is a real rule rather than a tolerance.
-- **Status:** active
+- **Status:** active, for the write-path strip only. The proxy half was removed
+  2026-10-05: no `data/config/apis.json` on the maintainer's machine names a
+  credential `oauth:<provider>`. `fetch_required_credential` no longer rewrites
+  an `oauth:` name before its typed `oauth_client` lookup, which stays, and
+  `fetch_required_credential_tolerates_a_legacy_oauth_prefixed_name` and
+  `fetch_required_credential_still_reports_a_genuinely_missing_one` are gone.
 
 ### `script_handshake` workspace-root script fallback
 
@@ -2957,7 +3074,10 @@ event that retires it.
   `commit_data_paths_moved`, the startup call and five tests) was removed
   2026-10-01. Its condition was three releases since the rename: v0.41.0
   carried it, and v0.41.1 to v0.44.1 followed.
-- **Status:** active, for `current_data_path` only.
+- **Status:** removed 2026-10-05. The workspace audit found no
+  `PluginInstalled` record with a `looks/` path in any workspace database on the
+  maintainer's machine. `current_data_path`, its call and its test are gone. The
+  plugin hint stays.
 
 ### Defensive double-write of tables into `init_schema`
 
@@ -3366,7 +3486,14 @@ measure now eligible for removal** — search this file for the id to find them 
   stops there, which is the honest answer rather than a remedy that cannot run.
   The endpoint half is already verifiable that way: § `lucidos.request` and the
   audit's remediation both name it.
-- **Status:** open (storage half)
+
+  **The storage half is now decided and shipped.** [ADR 0372](adr/0372-app-storage-lives-in-the-shell.md)
+  adds `lucidos.storage.local` and `.session`, kept in the shell's browser
+  storage and scoped per app by the host. It rejects the `localStorage` shim.
+  IndexedDB, `caches` and cookies get no replacement, by decision: large or
+  shared state goes in `lucidos.data`. Verifiable as the condition asks:
+  § `lucidos.storage` in `js-sdk.md`, and the audit's remediation table names it.
+- **Status:** resolved 2026-10-06
 - **Measures referencing this investigation:** none yet.
 - **Related, and now closed:** the same opaque origin took a third thing, behind
   a gateway. An app frame could not load its own files as subresources, because

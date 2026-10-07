@@ -4,6 +4,7 @@ import { shortcutDef } from '../../utils/shortcuts';
 import { attentionThreadCount, mobileView, threadDrawerOpen, type MobileView } from '../../store/store';
 import { viewportIsMobile } from '../../utils/viewport';
 import { SidebarIcon, ThreadListIcon } from './icons';
+import { GlyphBadge } from './GlyphBadge';
 
 interface Props {
   class?: string;
@@ -59,7 +60,7 @@ export function ThreadToggleButton({ class: cls }: Props) {
       data-tooltip={tooltipWithShortcut(label, 'toggleThreadDrawer')}
     >
       <Glyph />
-      {badgeCount > 0 && <span class="badge">{badgeCount}</span>}
+      {badgeCount > 0 && <GlyphBadge class="badge">{badgeCount}</GlyphBadge>}
     </button>
   );
 }

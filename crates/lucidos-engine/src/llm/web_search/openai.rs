@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::time::Duration;
 
-use super::{format_search_result, WebSearchProvider, SEARCH_SYSTEM_PROMPT};
+use super::{format_search_result, WebSearchProvider, WebSearchResult, SEARCH_SYSTEM_PROMPT};
+use crate::llm::metered::CallToken;
 
 /// Output ceiling for the summary written over the search results. Bounds the
 /// token half of the bill; the per-call search fee is bounded by this backend
@@ -149,7 +150,8 @@ impl WebSearchProvider for OpenAiResponsesSearch {
         &self,
         query: &str,
         max_results: usize,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        _call: CallToken,
+    ) -> Result<WebSearchResult, Box<dyn std::error::Error + Send + Sync>> {
         let response = self
             .client
             .post(&self.responses_url)
@@ -167,7 +169,11 @@ impl WebSearchProvider for OpenAiResponsesSearch {
 
         let parsed: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("Failed to parse OpenAI search response: {e}"))?;
-        parse_response(&parsed, max_results)
+        Ok(WebSearchResult {
+            text: parse_response(&parsed, max_results)?,
+            usage: crate::llm::usage_wire::from_json(&parsed),
+            model: self.model.clone(),
+        })
     }
 
     fn id(&self) -> &'static str {

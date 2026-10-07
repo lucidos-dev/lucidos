@@ -202,7 +202,7 @@ describe('offeredRelease', () => {
   });
 
   it('names the release its own notes name, not the argument', () => {
-    // The argument comes from `latestTauriAppVersion`, which the health poll
+    // The argument can come from `latestTauriAppVersion`, which the health poll
     // overwrites with the engine's `latest_tauri_app_version`. On a dev
     // workspace that is a CalVer app build id, and the row wore it.
     const offered = offeredRelease('2026.08.13.1', `## v9.9.9 ${EM_DASH} 2026-09-01\n\n- a thing`);

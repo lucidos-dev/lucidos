@@ -198,6 +198,14 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
     })
 }
 
+/// The frame the SSE route writes when a subscriber falls behind.
+pub(crate) const LAGGED_FRAME: &str = "Lagged";
+
+/// Every frame type the SSE route writes itself rather than relays. A domain
+/// event may not take one of these names, or any app could make every client
+/// act on a frame it forged.
+pub(crate) const ROUTE_FRAMES: &[&str] = &[LAGGED_FRAME];
+
 /// Wire frame the frontend sees when its broadcast subscriber falls behind the
 /// 4096-event buffer. Without this, lagged events vanish silently and the UI
 /// keeps a "Thinking" spinner forever waiting for a `ResponseGenerated` that
@@ -205,7 +213,7 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
 /// thread state from `/api/v1/threads/<id>/events`.
 fn lagged_event_json(count: u64) -> String {
     serde_json::json!({
-        "type": "Lagged",
+        "type": LAGGED_FRAME,
         "data": { "count": count },
     })
     .to_string()

@@ -15,9 +15,11 @@ export function searchResultDestinationPane(category: string): FocusedPane {
  *  A menu result is a DESTINATION rather than a kind of thing, so it wears the
  *  mark of the page it opens: the Apps row gets the apps glyph, not a glyph for
  *  "menu". Every `MenuItem` id is also a `CategoryIcon` key, the same fact
- *  `navEntryCategory` leans on. Everything else is marked by its category. */
+ *  `navEntryCategory` leans on. A Text line wears the file it is in. Everything
+ *  else is marked by its category. */
 export function searchResultIconCategory(item: { category: string; id: string }): string {
-  return item.category === 'menu' ? item.id : item.category;
+  if (item.category === 'menu') return item.id;
+  return item.category === 'text' ? 'files' : item.category;
 }
 
 /** Open the keyboard before the SearchEverywhere modal mounts its input. Call

@@ -1,6 +1,7 @@
-import { useRef, useCallback, useLayoutEffect } from 'preact/hooks';
+import { useRef, useCallback, useEffect, useLayoutEffect } from 'preact/hooks';
 import { splitRatio, threadDrawerOpen, threadDrawerWidth, focusedPane, SPLIT_RATIO_KEY } from '../../store/store';
 import { focusPane, toggleSplitFromDivider } from '../../store/actions/pane';
+import { homeThreadId } from '../../store/actions/homeThread';
 import { setSplitRatio, clampSplitRatio, migratedSplitRatio, beginPaneResize, endPaneResize } from './splitHelpers';
 import { splitBounds } from '../../store/paneMinimums';
 import { startDividerDrag } from './dividerDrag';
@@ -39,6 +40,22 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
     observer.observe(container);
     return () => observer.disconnect();
   }, []);
+
+  // Home leading the header raises the Conversation floor (paneMinimums), and
+  // the home thread usually loads after the migration above ran. So its arrival
+  // migrates again, a frame later, once the header has drawn the button the
+  // floor reads.
+  const homeShown = homeThreadId.value !== null;
+  useEffect(() => {
+    if (!homeShown) return;
+    const frame = requestAnimationFrame(() => {
+      const container = containerRef.current;
+      if (!container) return;
+      const next = migratedSplitRatio(splitRatio.value, container.getBoundingClientRect().width, splitBounds());
+      if (next !== null) setSplitRatio(next);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [homeShown]);
 
   const onDividerDown = useCallback((e: PointerEvent) => {
     dividerDblGate.record();

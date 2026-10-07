@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.46.1"
+LUCIDOS_DEFAULT_VERSION="0.47.0"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -107,7 +107,7 @@ LUCIDOS_INSTANCE_EXPLICIT="${LUCIDOS_INSTANCE:+1}"         # non-empty if the us
 LUCIDOS_INSTANCE="${LUCIDOS_INSTANCE:-default}"             # instance slug (--name); its data lives at $LUCIDOS_PREFIX/<slug>/
 LUCIDOS_GATEWAY_DATA="${LUCIDOS_GATEWAY_DATA:-}"            # override the instance data dir (registry + embedded PG + fastembed + logs); empty = $LUCIDOS_PREFIX/<slug>
 LUCIDOS_PORT_EXPLICIT="${LUCIDOS_PORT:+1}"                  # non-empty if the user PINNED a port via env LUCIDOS_PORT (or --port, set in parse_args)
-LUCIDOS_PORT="${LUCIDOS_PORT:-5252}"                         # gateway port — a mutable PROPERTY of the instance (5252 = the packaged gateway's default)
+LUCIDOS_PORT="${LUCIDOS_PORT:-5252}"                         # gateway port — a mutable PROPERTY of the instance; the default is the packaged gateway's, pinned by crates/lucidos-gateway/src/value_pins_tests.rs
 LUCIDOS_FORCE="${LUCIDOS_FORCE:-}"                            # set to 1 to re-download/re-extract even if the runtime is already present
 LUCIDOS_NO_LAUNCH="${LUCIDOS_NO_LAUNCH:-}"                    # set to 1 to install without launching (start it later)
 LUCIDOS_NO_SERVICE="${LUCIDOS_NO_SERVICE:-}"                 # set to 1 (or --no-service) to launch in the FOREGROUND instead of registering a user service

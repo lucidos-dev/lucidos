@@ -123,6 +123,8 @@ fn cc_tool_called_description_serialization() {
         description: "Read main.rs".into(),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         tool_use_id: String::new(),
+        parent_tool_use_id: None,
+        api_call_id: None,
     };
     let serialized = serde_json::to_value(&event).unwrap();
     assert_eq!(serialized["description"], "Read main.rs");
@@ -134,6 +136,8 @@ fn cc_tool_called_description_serialization() {
         description: String::new(),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         tool_use_id: String::new(),
+        parent_tool_use_id: None,
+        api_call_id: None,
     };
     let serialized2 = serde_json::to_value(&event2).unwrap();
     assert!(serialized2.get("description").is_none());
@@ -147,6 +151,8 @@ fn cc_tool_called_result_tool_use_id_round_trip() {
         description: "ls".into(),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         tool_use_id: "toolu_42".into(),
+        parent_tool_use_id: None,
+        api_call_id: None,
     };
     let serialized = serde_json::to_value(&call).unwrap();
     assert_eq!(serialized["tool_use_id"], "toolu_42");
@@ -158,6 +164,8 @@ fn cc_tool_called_result_tool_use_id_round_trip() {
         description: String::new(),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         tool_use_id: String::new(),
+        parent_tool_use_id: None,
+        api_call_id: None,
     };
     assert!(serde_json::to_value(&call_no_id)
         .unwrap()
@@ -174,6 +182,115 @@ fn cc_tool_called_result_tool_use_id_round_trip() {
         }
         _ => panic!("wrong variant"),
     }
+}
+
+/// A sub-agent's call names its parent on the wire. The session's own call
+/// omits the field, so its payload is unchanged by the field's existence.
+#[test]
+fn cc_tool_called_parent_tool_use_id_round_trip() {
+    let sub_call = ThreadEvent::CodingAgentToolCalled {
+        name: "Bash".into(),
+        args: json!({}),
+        description: String::new(),
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        tool_use_id: "toolu_1".into(),
+        parent_tool_use_id: Some("toolu_agent".into()),
+        api_call_id: None,
+    };
+    let serialized = serde_json::to_value(&sub_call).unwrap();
+    assert_eq!(serialized["parent_tool_use_id"], "toolu_agent");
+    let read_back: ThreadEvent = serde_json::from_value(serialized).unwrap();
+    assert!(matches!(
+        read_back,
+        ThreadEvent::CodingAgentToolCalled { parent_tool_use_id: Some(ref p), .. } if p == "toolu_agent"
+    ));
+
+    let own_call = ThreadEvent::CodingAgentToolCalled {
+        name: "Bash".into(),
+        args: json!({}),
+        description: String::new(),
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        tool_use_id: "toolu_1".into(),
+        parent_tool_use_id: None,
+        api_call_id: None,
+    };
+    assert!(serde_json::to_value(&own_call)
+        .unwrap()
+        .get("parent_tool_use_id")
+        .is_none());
+}
+
+/// A call's `api_call_id` survives the wire, an absent one is omitted, and a
+/// row written before the field existed reads as having none.
+#[test]
+fn cc_tool_called_api_call_id_round_trip() {
+    let call = ThreadEvent::CodingAgentToolCalled {
+        name: "Bash".into(),
+        args: json!({}),
+        description: String::new(),
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        tool_use_id: "toolu_1".into(),
+        parent_tool_use_id: None,
+        api_call_id: Some("msg_1".into()),
+    };
+    let serialized = serde_json::to_value(&call).unwrap();
+    assert_eq!(serialized["api_call_id"], "msg_1");
+    let read_back: ThreadEvent = serde_json::from_value(serialized).unwrap();
+    assert!(matches!(
+        read_back,
+        ThreadEvent::CodingAgentToolCalled { api_call_id: Some(ref id), .. } if id == "msg_1"
+    ));
+
+    let legacy: ThreadEvent = serde_json::from_str(
+        r#"{"type":"CodingAgentToolCalled","name":"Bash","args":{},"tool_use_id":"t"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        legacy,
+        ThreadEvent::CodingAgentToolCalled {
+            api_call_id: None,
+            ..
+        }
+    ));
+    assert!(serde_json::to_value(&legacy)
+        .unwrap()
+        .get("api_call_id")
+        .is_none());
+}
+
+/// Rows written before the field existed read as the session's own work.
+#[test]
+fn legacy_rows_without_parent_tool_use_id_read_as_top_level() {
+    let result: ThreadEvent = serde_json::from_str(
+        r#"{"type":"CodingAgentToolResult","name":"Bash","result":"ok","tool_use_id":"t"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        result,
+        ThreadEvent::CodingAgentToolResult {
+            parent_tool_use_id: None,
+            ..
+        }
+    ));
+    let call: ThreadEvent =
+        serde_json::from_str(r#"{"type":"CodingAgentToolCalled","name":"Read","args":{}}"#)
+            .unwrap();
+    assert!(matches!(
+        call,
+        ThreadEvent::CodingAgentToolCalled {
+            parent_tool_use_id: None,
+            ..
+        }
+    ));
+    let text: ThreadEvent =
+        serde_json::from_str(r#"{"type":"CodingAgentTextStreamed","text":"hi"}"#).unwrap();
+    assert!(matches!(
+        text,
+        ThreadEvent::CodingAgentTextStreamed {
+            parent_tool_use_id: None,
+            ..
+        }
+    ));
 }
 
 #[test]

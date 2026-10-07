@@ -3,8 +3,8 @@
 //!
 //! This module owns the SEND schema only. Reading / clearing the inbox is the
 //! grouped `notifications` manifest tool, and enabling push is
-//! `set_preference(key="push_notifications", …)`. See the trailing comments
-//! below for both.
+//! `set_preference` on [`crate::core::prefs::PUSH_NOTIFICATIONS`]. See the
+//! trailing comments below for both.
 
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
@@ -56,6 +56,6 @@ pub fn get_notification_tool() -> ToolDefinition {
 // (see `Domain::llm_aliases`). Only the *send* tool remains hand-written here,
 // because its rich structured `tap` schema is a poor fit for the grouped union.
 
-// Push notifications are no longer a standalone tool — enabling/declining them is
-// `set_preference(key="push_notifications", value="enabled"|"declined")`, which
-// keeps the [PUSH_NOTIFICATION_REQUEST] handshake. See core/preference_catalog.rs.
+// Push notifications are no longer a standalone tool. Enabling or declining them
+// is `set_preference` on `prefs::PUSH_NOTIFICATIONS` with `enabled` or
+// `declined`, which keeps the [PUSH_NOTIFICATION_REQUEST] handshake.

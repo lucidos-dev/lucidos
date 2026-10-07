@@ -744,10 +744,56 @@ fn selected_answer_resolves_to_label() {
 }
 
 #[test]
-fn free_text_passes_through() {
+fn free_text_passes_through_with_the_typed_reply_note() {
     let answer = serde_json::json!({"kind": "FreeText", "text": "purple"});
     let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
-    assert_eq!(out, serde_json::json!({"Fav color?": "purple"}));
+    assert_eq!(
+        out,
+        serde_json::json!({"Fav color?": format!("purple\n\n[{TYPED_REPLY_NOTE}]")})
+    );
+}
+
+/// Users often type a new request into a card instead of answering it. An
+/// agent that reads that as the answer never asks its question again.
+#[test]
+fn a_typed_reply_that_picks_no_option_tells_the_agent_to_re_ask() {
+    assert!(TYPED_REPLY_NOTE.contains("ask the question again"));
+    let typed = [
+        serde_json::json!({"kind": "FreeText", "text": "can it also do X?"}),
+        serde_json::json!({"kind": "MultiSelected", "option_ids": [], "text": "can it also do X?"}),
+    ];
+    for answer in typed {
+        let out = build_hook_answers(
+            std::slice::from_ref(&answer),
+            &questions(),
+            AnswerImages::AttachedBlocks,
+        );
+        let value = out["Fav color?"].as_str().unwrap();
+        assert!(
+            value.starts_with("can it also do X?"),
+            "{answer}: {value:?}"
+        );
+        assert!(value.contains(TYPED_REPLY_NOTE), "{answer}: {value:?}");
+    }
+}
+
+/// A picked option answers the question, and so does text typed beside one.
+#[test]
+fn a_reply_that_picks_an_option_carries_no_typed_reply_note() {
+    let answers = [
+        serde_json::json!({"kind": "Selected", "option_id": "opt-0"}),
+        serde_json::json!({"kind": "MultiSelected", "option_ids": ["opt-0"], "text": "and X"}),
+        serde_json::json!({"kind": "FreeText", "text": "", "image_hashes": ["a".repeat(64)]}),
+    ];
+    for answer in answers {
+        let out = build_hook_answers(
+            std::slice::from_ref(&answer),
+            &questions(),
+            AnswerImages::AttachedBlocks,
+        );
+        let value = out["Fav color?"].as_str().unwrap();
+        assert!(!value.contains(TYPED_REPLY_NOTE), "{answer}: {value:?}");
+    }
 }
 
 /// A coding agent opens an answer's image itself, so the relayed text names
@@ -939,14 +985,17 @@ fn multi_selected_with_text_appends_after_labels() {
 }
 
 #[test]
-fn multi_selected_with_only_text_yields_just_text() {
+fn multi_selected_with_only_text_yields_the_text_and_the_typed_reply_note() {
     let answer = serde_json::json!({
     "kind": "MultiSelected",
     "option_ids": [],
     "text": "freeform answer",
     });
     let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
-    assert_eq!(out, serde_json::json!({"Fav color?": "freeform answer"}));
+    assert_eq!(
+        out,
+        serde_json::json!({"Fav color?": format!("freeform answer\n\n[{TYPED_REPLY_NOTE}]")})
+    );
 }
 
 #[test]
@@ -1136,6 +1185,7 @@ async fn coding_agent_text_streamed_orphans_only_active_lookup() {
                 event: ThreadEvent::CodingAgentTextStreamed {
                     text: "carrying on with parallel work\n".into(),
                     coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                    parent_tool_use_id: None,
                 },
                 meta: cc_meta(),
             })
@@ -1160,6 +1210,8 @@ async fn coding_agent_tool_called_orphans_only_active_lookup() {
                     description: String::new(),
                     coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                     tool_use_id: "toolu-sibling".into(),
+                    parent_tool_use_id: None,
+                    api_call_id: None,
                 },
                 meta: cc_meta(),
             })
@@ -1468,6 +1520,12 @@ fn answer_kind_note_separates_a_typed_reply_from_a_picked_option() {
     );
     assert_ne!(typed, picked, "the two must never render identically");
 
+    // Text submitted with no toggle on is a typed reply too.
+    let typed_multi = answer_kind_note(&serde_json::json!({
+        "kind": "MultiSelected", "option_ids": [], "text": "hmm"
+    }));
+    assert_eq!(typed_multi, typed);
+
     // MultiSelected splits on whether freetext rode along with the toggles.
     let multi = answer_kind_note(&serde_json::json!({
         "kind": "MultiSelected", "option_ids": ["opt-0"], "text": "and this"
@@ -1634,4 +1692,63 @@ async fn recap_is_none_when_nothing_has_been_answered() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+// ---------------------------------------------------------------------------
+// A card that carries its own answer in `message`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn card_message_reads_only_a_non_blank_string() {
+    let args = |message: serde_json::Value| serde_json::json!({ "message": message });
+    assert_eq!(
+        card_message(&args("1. Open it.\n2. Save.".into())),
+        Some("1. Open it.\n2. Save.")
+    );
+    assert_eq!(card_message(&args(" \n".into())), None);
+    assert_eq!(card_message(&args(serde_json::json!(3))), None);
+    assert_eq!(card_message(&serde_json::json!({ "questions": [] })), None);
+}
+
+#[tokio::test]
+async fn a_card_message_lands_as_agent_text_in_the_asking_turn() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let request = seed_chat_thread(&bus, thread_id, "just tell me what to do with links").await;
+    let meta = EventMeta {
+        request_event_id: Some(request),
+        channel: Some(EventChannel::Chat),
+        ..EventMeta::NONE
+    };
+    let text = "1. Open https://example.com/settings\n2. Press **Save**.";
+
+    emit_card_message(&bus, thread_id, &CardMessage { text, meta: &meta })
+        .await
+        .expect("message persisted");
+
+    let row: (String, Option<String>) = sqlx::query_as(
+        "SELECT payload->>'text', payload->>'request_event_id' FROM events \
+         WHERE thread_id = $1 AND event_type = 'TextStreamed'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .expect("one TextStreamed");
+    assert_eq!(row.0, text, "verbatim, never summarized");
+    assert_eq!(row.1, Some(request.to_string()), "in the asking turn");
+    teardown_test_db(&db).await;
+}
+
+/// The walk has no engine-free harness, so pin its order in the source: the
+/// message goes out once, for the first card, only when that card is first
+/// asked, and before it. A `TextStreamed` after the card would overtake it.
+#[test]
+fn the_walk_shows_the_message_just_before_the_first_card() {
+    let src = include_str!("../agent_question.rs");
+    let walk = &src[src.find("pub(crate) async fn walk_question_batch").unwrap()..];
+    let asked = walk.find("if !already_asked {").unwrap();
+    let message = walk.find("message.as_ref().filter(|_| i == 0)").unwrap();
+    let card = walk.find("ThreadEvent::UserQuestionAsked {").unwrap();
+    assert!(asked < message && message < card);
 }

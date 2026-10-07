@@ -45,7 +45,7 @@ function msSinceLoad(): number {
  *      already built the mark on this url. Holding the floor there would park a
  *      fully built mark on screen for another second at the end of a cold boot
  *      that was already slow, the opposite of what the floor is for.
- *    • a quiet cover (`boot-splash-quiet`), which carries no mark at all. Its
+ *    • a quiet cover (`data-boot-splash-quiet`), which carries no mark at all. Its
  *      document is continuing a session the user never left (a refresh they
  *      asked for, or a notification tap), and holding a launch floor across that
  *      is what made every such reload read as a relaunch. */

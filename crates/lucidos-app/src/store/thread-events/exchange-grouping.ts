@@ -1,13 +1,13 @@
 import { EVENT_CLASSIFICATION } from '../../generated/thread-lifecycle';
 import { instantMicros } from '../../utils/isoInstant';
 import { eventWaitProjection } from './event-waits';
-import { findQuestionAnswer, modeToInitiator } from './exchange';
+import { findQuestionAnswer, isAgentReplyText, modeToInitiator } from './exchange';
 import { isOneUtterance, joinSpoken } from './spokenMerge';
 import { SIDE_QUESTION_TYPES, isFormRequest, isSideQuestionEvent, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
-import type { Exchange } from './exchange';
+import type { Exchange, TypedAnswer } from './exchange';
 import type { MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent, TransientEvent } from './thread-event-types';
-import type { ThreadAggregate, ThreadState } from './thread-meta';
+import type { PendingUserMessage, ThreadAggregate, ThreadState } from './thread-meta';
 
 // ---------------------------------------------------------------------------
 // Exchange grouping
@@ -202,7 +202,7 @@ function runStartBefore(
 /** A step the renderer folds into the prose beside it, so two of them in a row
  *  are one document rather than two. */
 function isStreamedText(event: { type: string }): boolean {
-  return event.type === 'TextStreamed' || event.type === 'CodingAgentTextStreamed';
+  return isAgentReplyText(event);
 }
 
 /** Put one step at the end, keeping a run of streamed text whole.
@@ -335,9 +335,97 @@ function foldedExchanges(thread: ThreadState): Exchange[] {
   // starting mid-turn and a corrupt thread look identical to the fold, and
   // only this tells them apart. See `Exchange.continuationFragment`.
   const paged = thread.hasOlderEvents === true;
-  if (thread.pendingUserMessages.length === 0) {
-    return filterRemovedQueuedExchanges(groupIntoExchangesCached(thread.events, paged), thread.events);
+  const base = groupIntoExchangesCached(thread.events, paged);
+  const { answers, rows } = splitTypedAnswers(base, thread.pendingUserMessages);
+  const folded = foldPendingRows(thread, base, rows, paged);
+  // An unsent answer goes back on its card only while the thread waits on it.
+  const waitingOn = (thread.unsentMessageSeqs?.size ?? 0) > 0 && thread.meta.status === 'waiting_for_user_answer'
+    ? awaitedQuestionCard(folded)
+    : undefined;
+  return placeTypedAnswers(folded, answers, waitingOn);
+}
+
+/** True for a divider that reads "Needs your answer" until its resolution
+ *  lands: a question or a permission card. */
+export function opensAwaitingAnswer(exchange: Exchange): boolean {
+  switch (exchange.userEvent.type) {
+    case 'UserQuestionAsked':
+    case 'CodingAgentPermissionRequest':
+    case 'CommandPermissionRequested':
+    case 'McpPermissionRequested':
+      return true;
+    default:
+      return false;
   }
+}
+
+/** The question card the thread is waiting on, by tool-use id: the newest
+ *  card that awaits an answer, when it is a question nobody has answered. A
+ *  newer permission card means no question is what waits. */
+export function awaitedQuestionCard(exchanges: Exchange[]): string | undefined {
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const ex = exchanges[i];
+    if (!opensAwaitingAnswer(ex)) continue;
+    const ue = ex.userEvent;
+    return ue.type === 'UserQuestionAsked' && !findQuestionAnswer(ex, ue.tool_use_id) ? ue.tool_use_id : undefined;
+  }
+  return undefined;
+}
+
+/** Split pending messages into typed answers, keyed by the question card they
+ *  answer, and the rest, which draw as rows. An answer stays a row when its
+ *  card is gone or already answered, so the user's text never vanishes. So
+ *  does one the safety refetch gave up on: it is no longer on its way, and the
+ *  card goes live again. */
+function splitTypedAnswers(
+  base: Exchange[],
+  pending: PendingUserMessage[],
+): { answers: Map<string, TypedAnswer>; rows: PendingUserMessage[] } {
+  const answers = new Map<string, TypedAnswer>();
+  if (!pending.some(p => p.answersQuestion)) return { answers, rows: pending };
+  const cards = new Set<string>();
+  for (const ex of base) {
+    const ue = ex.userEvent;
+    if (ue.type === 'UserQuestionAsked' && !findQuestionAnswer(ex, ue.tool_use_id)) cards.add(ue.tool_use_id);
+  }
+  const rows: PendingUserMessage[] = [];
+  for (const p of pending) {
+    const card = p.answersQuestion;
+    if (card && !p.unconfirmed && cards.has(card) && !answers.has(card)) {
+      answers.set(card, { state: 'sending', text: p.text, image_hashes: p.image_hashes ?? [] });
+    } else {
+      rows.push(p);
+    }
+  }
+  return { answers, rows };
+}
+
+/** Put each typed answer on its question card, as a clone: the cached fold's
+ *  exchange objects are shared and must not carry it.
+ *
+ *  An unsent typed answer leaves its row only for `waitingOn`, the card the
+ *  thread waits on, and only when no newer answer is sending there. Every
+ *  other unsent answer keeps its row, Discard included. */
+function placeTypedAnswers(exchanges: Exchange[], sending: Map<string, TypedAnswer>, waitingOn: string | undefined): Exchange[] {
+  if (sending.size === 0 && !waitingOn) return exchanges;
+  const typed = new Map(sending);
+  let moved: Exchange | undefined;
+  if (waitingOn && !typed.has(waitingOn)) {
+    moved = exchanges.find((ex) => ex.userEvent.type === 'MessageReceived' && ex.userEvent._answersQuestion === waitingOn && !!ex.userEvent._eventId);
+    const ue = moved?.userEvent;
+    if (ue?.type === 'MessageReceived' && ue._eventId) {
+      typed.set(waitingOn, { state: 'unsent', text: ue.text ?? '', image_hashes: ue.user_image_hashes ?? [], unsentEventId: ue._eventId });
+    }
+  }
+  if (typed.size === 0) return exchanges;
+  return exchanges.filter((ex) => ex !== moved).map((ex) => {
+    const answer = ex.userEvent.type === 'UserQuestionAsked' ? typed.get(ex.userEvent.tool_use_id) : undefined;
+    return answer ? { ...ex, typedAnswer: answer } : ex;
+  });
+}
+
+function foldPendingRows(thread: ThreadState, base: Exchange[], rows: PendingUserMessage[], paged: boolean): Exchange[] {
+  if (rows.length === 0) return filterRemovedQueuedExchanges(base, thread.events);
   // Merge pending messages as synthetic MessageReceived events so they act as
   // proper exchange boundaries. MAX_SAFE_INTEGER seqs sort them after all real events.
   //
@@ -349,10 +437,10 @@ function foldedExchanges(thread: ThreadState): Exchange[] {
   // after the follow-up ARE responses to it. Timestamp-based sorting correctly
   // splits events between old and new exchanges.
   const isCC = thread.meta.channel === 'claude_code';
-  const pendingCount = thread.pendingUserMessages.length;
+  const pendingCount = rows.length;
   const synthetic: SequencedEvent[] = [];
   for (let i = 0; i < pendingCount; i++) {
-    const pending = thread.pendingUserMessages[i];
+    const pending = rows[i];
     const seq = syntheticSeqBase(thread) - pendingCount + i;
     synthetic.push({
       seq,
@@ -372,7 +460,6 @@ function foldedExchanges(thread: ThreadState): Exchange[] {
   // pending message. So append, rather than re-fold the whole history on every
   // send and every streamed token. Checking only the earliest pending suffices:
   // later ones have strictly larger seqs and same-or-later timestamps.
-  const base = groupIntoExchangesCached(thread.events, paged);
   const cache = incrementalCache.get(thread.events);
   const first = synthetic[0];
   const canAppendTrailing =
@@ -786,6 +873,13 @@ function requestEventIdOf(event: { type: string }): string | undefined {
   return (event as { request_event_id?: string }).request_event_id;
 }
 
+/** The id the legacy rerun-in-place rule pairs an abort and a terminal on.
+ *  Undefined on CC: one session id spans every follow-up, so an earlier turn's
+ *  terminal would bury a later crash abort, and its Continue with it. */
+function rerunReqIdOf(event: StoredEvent): string | undefined {
+  return shouldRouteByRequestId(event) ? requestEventIdOf(event) : undefined;
+}
+
 /** The caller speaking, in either of the two events one utterance can be.
  *
  *  Every caller utterance is a `SpokenMessageReceived` today, whatever the
@@ -1037,6 +1131,20 @@ function chatTurnQueuedBehind(state: GroupFoldState, current: Exchange | null, e
   if (!current || !isUningestedMessage(current)) return null;
   const turn = chatTurnOwner(state, null);
   return turn && turn !== current && stillRunning(turn) ? turn : null;
+}
+
+/** The exchange a terminal with no request id ends: the running turn, never a
+ *  chat follow-up queued behind it. Before the turn writes a routed row,
+ *  `chatTurnQueuedBehind` cannot name it. The loop is then running the oldest
+ *  message still waiting, as `queuedFollowupRun` reads the queue. */
+function turnEndedBy(state: GroupFoldState, current: Exchange | null, event: StoredEvent): Exchange | null {
+  const routed = chatTurnQueuedBehind(state, current, event);
+  if (routed || !current) return routed ?? current;
+  const waitingChat = (ex: Exchange) => isUningestedMessage(ex) && !onCodingAgentChannel(ex.userEvent);
+  if (!waitingChat(current)) return current;
+  let oldest = state.exchanges.indexOf(current);
+  while (oldest > 0 && waitingChat(state.exchanges[oldest - 1])) oldest--;
+  return state.exchanges[oldest] ?? current;
 }
 
 /** Hand the turn to a message leaving the queue.
@@ -1443,9 +1551,16 @@ function liveReplyTargetIndex(exchanges: Exchange[]): number {
     const exchange = exchanges[i];
     if (isWaitingTypedMessage(exchange)) continue;
     if (isTurnlessBoundary(exchange.userEvent)) continue;
+    if (isUnsentExchange(exchange)) continue;
     return i;
   }
   return -1;
+}
+
+/** An *unsent message*'s exchange. It never reached the engine, so it holds no
+ *  turn: every search for the live turn steps over it. */
+export function isUnsentExchange(exchange: Exchange): boolean {
+  return exchange.userEvent._unsent === true;
 }
 
 /** Fold an event set into turns.
@@ -1582,7 +1697,7 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>, paged: boole
       // messages already folded should have queued (`readsReported`).
       return rebuildIncrementalCache(events, paged);
     }
-    const reqId = requestEventIdOf(event);
+    const reqId = rerunReqIdOf(event);
     if (event.type === 'ResponseAborted' && reqId) {
       batchAbortReqIds.add(reqId);
     }
@@ -1601,7 +1716,7 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>, paged: boole
 
   const touched = new Set<Exchange>();
   for (const { seq, event } of appended) {
-    const reqId = requestEventIdOf(event);
+    const reqId = rerunReqIdOf(event);
     const superseded =
       event.type === 'ResponseAborted' && !!reqId && cache.fold.resolvedReqIds.has(reqId);
     foldEvent(cache.fold, seq, event, superseded, touched);
@@ -1623,7 +1738,7 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>, paged: boole
  *  question-divider marking. Both `groupIntoExchanges` and the cache rebuild
  *  go through here. */
 function foldSorted(sorted: SequencedEvent[], paged: boolean): GroupFoldState {
-  // Legacy rerun-in-place. When a ResponseAborted shares request_event_id with
+  // Legacy rerun-in-place. When a chat ResponseAborted shares request_event_id with
   // a later ResponseGenerated or ResponseFailed, the rerun re-used the original
   // exchange. Do not split at those aborts: supersededAbortIndices in
   // exchangeStatus deflates the verdict to the later success.
@@ -1634,13 +1749,13 @@ function foldSorted(sorted: SequencedEvent[], paged: boolean): GroupFoldState {
   const resolvedReqIds = new Set<string>();
   for (const { event } of sorted) {
     if (event.type !== 'ResponseGenerated' && event.type !== 'ResponseFailed') continue;
-    const reqId = requestEventIdOf(event);
+    const reqId = rerunReqIdOf(event);
     if (reqId) resolvedReqIds.add(reqId);
   }
   const legacySupersededAbortSeqs = new Set<number>();
   for (const { seq, event } of sorted) {
     if (event.type !== 'ResponseAborted') continue;
-    const reqId = requestEventIdOf(event);
+    const reqId = rerunReqIdOf(event);
     if (reqId && resolvedReqIds.has(reqId)) legacySupersededAbortSeqs.add(seq);
   }
 
@@ -1853,7 +1968,7 @@ function foldEvent(
   const { exchanges, toolCallOwners, chatToolCallOwners, questionDividerOwners, permissionDividerOwners, reqIdRedirect } = state;
   let current = state.current;
   {
-    const reqId = requestEventIdOf(event);
+    const reqId = rerunReqIdOf(event);
     if ((event.type === 'ResponseGenerated' || event.type === 'ResponseFailed') && reqId) {
       state.resolvedReqIds.add(reqId);
     }
@@ -1890,6 +2005,15 @@ function foldEvent(
     if (event.type === 'QueuedMessageRemoved') {
       const at = state.unreadMessages.findIndex(ex => ex.userEvent._eventId === event.removed_message_id);
       if (at !== -1) state.unreadMessages.splice(at, 1);
+      return;
+    }
+    // An unsent message's failure card goes to its own message, one seq below.
+    if (event._unsent && event.type === 'ResponseFailed') {
+      const unsent = exchanges.find((ex) => ex.userSeq === seq - 1);
+      if (unsent) {
+        appendStep(unsent, seq, event);
+        touched?.add(unsent);
+      }
       return;
     }
     if (NON_EXCHANGE_METADATA_EVENTS.has(event.type)) return;
@@ -1945,6 +2069,12 @@ function foldEvent(
     const owner = reqId
       ? (reqIdRedirect.get(reqId) ?? findExchangeByAnchorId(exchanges, reqId))
       : null;
+    // The exchange an abort or a cancel ends. One with no request id, such as
+    // a stale settle, must not land on a queued follow-up: a step there would
+    // bring a retracted message back.
+    const terminalTarget = event.type === 'ResponseAborted' || event.type === 'ResponseCanceled'
+      ? owner ?? turnEndedBy(state, current, event)
+      : null;
 
     // ResponseAborted is dual-purpose. It terminates the originating exchange,
     // so the partial-response panel reads 'Aborted'. It also opens a boundary
@@ -1952,10 +2082,9 @@ function foldEvent(
     // The boundary always sits chronologically last, so the panel appears below
     // any newer MessageReceived in the timeline.
     if (event.type === 'ResponseAborted' && !isLegacySupersededAbort) {
-      const target = owner ?? current;
-      if (target && target.userEvent.type !== 'ResponseAborted') {
-        target.steps.push({ seq, event });
-        touched?.add(target);
+      if (terminalTarget && terminalTarget.userEvent.type !== 'ResponseAborted') {
+        terminalTarget.steps.push({ seq, event });
+        touched?.add(terminalTarget);
         current = { userEvent: event, userSeq: seq, steps: [] };
         exchanges.push(current);
         touched?.add(current);
@@ -1976,18 +2105,17 @@ function foldEvent(
     // resolution and model extraction still see a terminator, but open NO
     // boundary: there must be no standalone 'Response canceled' panel.
     if (event.type === 'ResponseCanceled') {
-      const target = owner ?? current;
-      if (target && target.userEvent.type !== 'ResponseCanceled') {
+      if (terminalTarget && terminalTarget.userEvent.type !== 'ResponseCanceled') {
         if (event.cause === 'superseded_by_followup') {
-          target.steps.push({ seq, event });
-          touched?.add(target);
+          terminalTarget.steps.push({ seq, event });
+          touched?.add(terminalTarget);
           return;
         }
-        target.steps.push({ seq, event });
-        touched?.add(target);
+        terminalTarget.steps.push({ seq, event });
+        touched?.add(terminalTarget);
         // The divider that interrupted this turn, which may no longer be where
         // the turn is showing: a caller speaking moves the continuation on.
-        const teller = (reqId ? state.turnDividers.get(reqId) : undefined) ?? target;
+        const teller = (reqId ? state.turnDividers.get(reqId) : undefined) ?? terminalTarget;
         if (teller.userEvent.type === 'UserQuestionAsked') {
           // A question dismissed, or replaced by a follow-up, already says so
           // on its own card. A standalone "Response canceled" panel under it
@@ -2193,7 +2321,9 @@ function foldEvent(
       // A `ChildThreadStopped` or `ChildThreadDetached` is handled the same
       // way: it wakes nothing, so a turn the parent is running keeps writing
       // where it was.
-      if (isTurnlessBoundary(event)) {
+      // An unsent message never reached the engine, so no agent reads it and it
+      // takes no turn either.
+      if (isTurnlessBoundary(event) || event._unsent) {
         current = previousCurrent;
         return;
       }

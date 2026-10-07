@@ -39,6 +39,15 @@ function buildNotice(img: HTMLImageElement): HTMLElement {
   return notice;
 }
 
+/** Show the notice for an image the renderer refused to fetch, and drop its
+ *  `src`. The same markup a failed load gets, without the request: the image
+ *  is already wrapped, so the notice lands inside the wrapper beside it. */
+export function markImageUnavailable(img: HTMLImageElement): void {
+  img.after(buildNotice(img));
+  img.setAttribute(FAILED_ATTR, '');
+  img.removeAttribute('src');
+}
+
 function onImageError(event: Event): void {
   const img = event.target;
   if (!(img instanceof HTMLImageElement)) return;

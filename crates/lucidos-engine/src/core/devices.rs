@@ -793,6 +793,7 @@ fn parse_os(ua: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::prefs;
 
     #[test]
     fn parse_user_agent_renders_desktop_token_as_lucidos_desktop_app() {
@@ -1172,13 +1173,12 @@ mod tests {
         PinnedAppStore::pin(pool, bus, "habit-tracker", "main", id, None)
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO preferences (key, value, device_id) VALUES ('ui_scale', '1.25', $1)",
-        )
-        .bind(id)
-        .execute(pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO preferences (key, value, device_id) VALUES ($1, '125', $2)")
+            .bind(prefs::UI_SCALE.key())
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO push_subscriptions (endpoint, p256dh, auth, device_id)
              VALUES ('https://push.example/sub', 'k', 'a', $1)",
@@ -1332,27 +1332,24 @@ mod tests {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
         seed_device_state(&pool, &bus, "old").await;
-        sqlx::query(
-            "INSERT INTO preferences (key, value, device_id) VALUES ('ui_scale', '0.75', 'new')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO preferences (key, value, device_id) VALUES ($1, '75', 'new')")
+            .bind(prefs::UI_SCALE.key())
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let outcome = DeviceStore::hand_over(&pool, &bus, "old", "new", None)
             .await
             .unwrap();
         assert_eq!(outcome, HandOver::Moved);
         let value: String = sqlx::query_scalar(
-            "SELECT value FROM preferences WHERE key = 'ui_scale' AND device_id = 'new'",
+            "SELECT value FROM preferences WHERE key = $1 AND device_id = 'new'",
         )
+        .bind(prefs::UI_SCALE.key())
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(
-            value, "1.25",
-            "the real device's value wins over the orphan"
-        );
+        assert_eq!(value, "125", "the real device's value wins over the orphan");
 
         crate::test_support::teardown_test_db(&db_name).await;
     }
@@ -1539,8 +1536,9 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO preferences (key, value, device_id) VALUES ('ui_scale', '1.25', 'one-off')",
+            "INSERT INTO preferences (key, value, device_id) VALUES ($1, '125', 'one-off')",
         )
+        .bind(prefs::UI_SCALE.key())
         .execute(&pool)
         .await
         .unwrap();

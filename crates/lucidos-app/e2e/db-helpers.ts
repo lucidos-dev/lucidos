@@ -24,6 +24,9 @@ export function git(args: string[]): string {
 let cachedDbPort: string | null = null;
 export function getDbPort(): string {
   if (cachedDbPort) return cachedDbPort;
+  // `shared_pg_psql` in scripts/lib/workspace.sh reads the same variable.
+  const external = process.env.LUCIDOS_EXTERNAL_PG_PORT;
+  if (external) return (cachedDbPort = external);
   const container = process.env.LUCIDOS_SHARED_PG_CONTAINER ?? 'lucidos-pg-shared';
   const portLine = execSync(`docker port ${container} 5432`, { encoding: 'utf-8' }).trim();
   cachedDbPort = portLine.split(':').pop()!;
@@ -49,6 +52,24 @@ export function clearAllThreads(): void {
     "TRUNCATE TABLE thread_summaries CASCADE",
     "TRUNCATE TABLE notifications CASCADE",
   ].join(';\n'));
+}
+
+/** Turn the experimental home thread switch on and return its id (ADR 0362).
+ *  The switch ships off, and `clearAllThreads` truncates the row, so this puts
+ *  both back. The drawer and the composer read only the switch and the row,
+ *  so no event is needed. */
+export function ensureHomeThread(): string {
+  psql(
+    "INSERT INTO preferences (key, value) VALUES ('home_thread_enabled', 'true') " +
+    "ON CONFLICT (key, COALESCE(device_id, '')) DO UPDATE SET value = 'true'",
+  );
+  const existing = psql('SELECT thread_id FROM thread_summaries WHERE is_home');
+  if (existing) return existing;
+  return psql(
+    "INSERT INTO thread_summaries (thread_id, title, initiator, source, created_at, last_activity, " +
+    "message_count, state, status, is_home) VALUES (gen_random_uuid(), 'Home', 'user', 'chat', " +
+    "NOW(), NOW(), 0, 'active', 'idle', TRUE) RETURNING thread_id",
+  ).split('\n')[0].trim();
 }
 
 /** Wipe the notification projection AND the source events. Used by specs that

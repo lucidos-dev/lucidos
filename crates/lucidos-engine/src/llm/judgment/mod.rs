@@ -8,15 +8,13 @@
 //! is the reason this layer exists: it lets a caller put its tie-break in Rust
 //! instead of in prompt text.
 //!
-//! The question types come from TypeSafe's System One API, which [`jev`]
-//! speaks. Nothing here is Jev-specific, so a second backend needs no change
-//! to these types. Its third primitive, **Score**, is deliberately absent: no
-//! call site asks one, and ADR 0220 records it as the next candidate.
+//! The question types come from TypeSafe's System One API, which
+//! [`system_one`] speaks for every endpoint that shares it. [`chat`] answers
+//! the same types on a chat model. Its third primitive, **Score**, is
+//! deliberately absent: no call site asks one.
 //!
-//! **Adding a judgment call site does not mean adding a judgment provider.**
-//! Both current callers keep their existing prompt-and-parse path as the
-//! default, and reach for this layer only when the user opts in. See
-//! `docs/plans/2026-09-19-jev-judgment-provider-for-classification.md`.
+//! **Every site speaks this trait alone** (ADR 0363). Which backend answers is
+//! the user's pick in the site's model control, read by [`select`].
 
 use std::collections::HashMap;
 use std::fmt;
@@ -27,14 +25,17 @@ use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub mod jev;
+pub mod chat;
+pub mod endpoint;
+mod fallback;
 pub mod select;
+pub mod system_one;
 
-pub use jev::{JevProvider, JEV_DEFAULT_MODEL, TYPESAFE_API_BASE_URL};
-pub use select::{
-    jev_for, jev_for_agent, judgment_available, JudgmentSite, TYPESAFE_API_KEY_ENV,
-    TYPESAFE_CREDENTIAL_SERVICE,
-};
+pub use chat::ChatJudgmentProvider;
+pub use endpoint::{SystemOneEndpoint, TYPESAFE_API_KEY_ENV, TYPESAFE_CREDENTIAL_SERVICE};
+pub use fallback::for_site;
+pub use select::{jev_for_agent, judgment_available, system_one_for, JudgmentSite};
+pub use system_one::{SystemOneProvider, JEV_DEFAULT_MODEL, TYPESAFE_API_BASE_URL};
 
 /// One question, in the shape the wire wants.
 ///
@@ -209,10 +210,15 @@ impl Answers {
 }
 
 /// What one judgment call cost, for the caller that records it.
+///
+/// The cache counters stay zero on a System One endpoint, which has no prompt
+/// cache. A chat model may report both, and the cost rollup needs them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JudgmentUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_creation_tokens: u32,
 }
 
 /// The answers to one request, with everything a caller needs to record it.
@@ -240,10 +246,13 @@ pub struct Judgment {
 /// for the state twice.
 #[async_trait]
 pub trait JudgmentProvider: Send + Sync {
+    /// One billable call, recorded by the model call service that handed
+    /// over `call`.
     async fn ask(
         &self,
         state: serde_json::Value,
         questions: Vec<(String, Question)>,
+        call: crate::llm::metered::CallToken,
     ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>>;
 }
 

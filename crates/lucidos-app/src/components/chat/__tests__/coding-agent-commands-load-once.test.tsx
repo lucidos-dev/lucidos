@@ -26,6 +26,7 @@ vi.mock('../../../api/client', async (importOriginal) => ({
 
 const { CodingAgentControlMenu } = await import('../CodingAgentControlMenu');
 const { codingAgentSessionVersion } = await import('../../../store/store');
+const { composeSelections } = await import('../../../store/composeSelections');
 
 let host: HTMLDivElement;
 
@@ -66,5 +67,45 @@ describe('the coding-agent commands read', () => {
 
     await settle();
     expect(fetchCodingAgentCommands.mock.calls.length).toBe(afterMount);
+  });
+});
+
+/** The menu stays mounted across a draft switch and across the move from an
+ *  active thread into compose, so those prop changes alone must refetch. A
+ *  signal effect saw neither and kept the previous context's commands. */
+describe('the compose commands follow the focused context', () => {
+  afterEach(() => {
+    composeSelections.value = new Map();
+  });
+
+  /** The repo and backend of the newest commands read. */
+  function lastRequest(): { repoId: unknown; codingAgent: unknown } {
+    const calls = fetchCodingAgentCommands.mock.calls as unknown as unknown[][];
+    const [, repoId, codingAgent] = calls[calls.length - 1];
+    return { repoId, codingAgent };
+  }
+
+  it('refetches for the newly focused draft’s repo and backend', async () => {
+    composeSelections.value = new Map([
+      ['draft-a', { scope: { kind: 'external', repoId: 'repo-a' }, codingAgent: 'claude-code' }],
+      ['draft-b', { scope: { kind: 'external', repoId: 'repo-b' }, codingAgent: 'codex' }],
+    ]);
+    render(<CodingAgentControlMenu composeThreadId="draft-a" />, host);
+    await settle();
+    expect(lastRequest()).toEqual({ repoId: 'repo-a', codingAgent: 'claude-code' });
+
+    render(<CodingAgentControlMenu composeThreadId="draft-b" />, host);
+    await settle();
+    expect(lastRequest()).toEqual({ repoId: 'repo-b', codingAgent: 'codex' });
+  });
+
+  it('refetches for compose when an active thread hands over to a new thread', async () => {
+    render(<CodingAgentControlMenu threadId="t1" codingAgent="claude-code" />, host);
+    await settle();
+    expect(lastRequest().repoId).toBeUndefined();
+
+    render(<CodingAgentControlMenu codingAgent="claude-code" />, host);
+    await settle();
+    expect(lastRequest().repoId).toBe('');
   });
 });

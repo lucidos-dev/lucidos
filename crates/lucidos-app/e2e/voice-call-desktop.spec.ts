@@ -21,7 +21,8 @@
  * the two mobile projects, one of which is WebKit.
  */
 import { test, expect } from '@playwright/test';
-import { apiRequest, gotoWithRetry, setVoiceEnabled, waitForVisibleInput } from './helpers';
+import { apiRequest, gotoWithRetry, newThread, setVoiceEnabled, waitForVisibleInput } from './helpers';
+import { ensureHomeThread } from './db-helpers';
 
 // A fake capture device, so `getUserMedia` resolves with no hardware and no
 // consent prompt. Both flags are needed: one supplies the device, the other
@@ -73,7 +74,7 @@ test.describe('a call the engine cannot take', () => {
   });
 
   test('says why in plain English, and leaves no call behind', async ({ page }) => {
-    await gotoWithRetry(page);
+    await gotoWithRetry(page, `/#thread=${ensureHomeThread()}`);
     await waitForVisibleInput(page);
 
     const toggle = page.locator(CALL_TOGGLE).first();
@@ -99,11 +100,16 @@ test.describe('a call the engine cannot take', () => {
     await expect(page.locator('[data-role="call-state"]').first()).toBeEmpty();
   });
 
-  test('the toggle is offered on the compose view, like every prompt input', async ({ page }) => {
-    await gotoWithRetry(page);
+  /** Voice sessions live in the home thread alone (ADR 0362). */
+  test('the toggle is offered on the home thread, and not in the compose view', async ({ page }) => {
+    await gotoWithRetry(page, `/#thread=${ensureHomeThread()}`);
     await waitForVisibleInput(page);
     const toggle = page.locator(CALL_TOGGLE).first();
     await expect(toggle).toBeVisible();
     await expect(toggle).toHaveAccessibleName('Start a call');
+
+    await newThread(page);
+    await waitForVisibleInput(page);
+    await expect(page.locator(`${CALL_TOGGLE}:visible`)).toHaveCount(0);
   });
 });

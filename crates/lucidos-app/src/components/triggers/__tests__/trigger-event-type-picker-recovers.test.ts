@@ -14,7 +14,7 @@
  *
  * See docs/plans/2026-08-24-trigger-event-type-picker-recovers-from-a-transport-failure.md
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import type { TriggerInfo } from '../../../store/types';
 
 const { fetchEventTypes } = vi.hoisted(() => ({
@@ -98,6 +98,13 @@ async function openOptionLabels(host: HTMLElement): Promise<string[]> {
 describe('the trigger event-type picker recovers from a transport failure', () => {
   let host: HTMLElement;
   let unmount: (() => void) | null;
+
+  // Pays the cold transform of the form's module graph under the hook
+  // timeout. `vi.resetModules()` re-evaluates modules but keeps their
+  // transforms, so no case's own timeout pays it on a loaded host.
+  beforeAll(async () => {
+    await import('../TriggerDetails');
+  });
 
   beforeEach(() => {
     vi.resetModules();

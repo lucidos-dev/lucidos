@@ -24,6 +24,8 @@ paths:
   - "rust-toolchain.toml"
   - ".github/workflows/release-tarballs.yml"
   - ".github/workflows/install-smoke.yml"
+  - ".github/workflows/e2e.yml"
+  - "scripts/check-e2e-workflow.sh"
 ---
 
 # Build, Packaging & Installer
@@ -68,13 +70,15 @@ cd crates/lucidos-app && cargo tauri build # Desktop app
 
 Dev: native engine + Docker PostgreSQL. Production: the `.app` and the headless tarball above, each with bundled PostgreSQL.
 
-### GitHub Actions is release-only — there is no dev-loop CI
+### GitHub Actions never gates a change: release checks plus on-demand e2e
 
-Every workflow in `.github/workflows/` exists to verify a **release or delivery
-artifact**, and that is the complete list of what belongs there:
+Every workflow in `.github/workflows/` verifies a **release or delivery
+artifact**, or runs the e2e suites **when someone asks** (ADR 0382). That is the
+complete list of what belongs there:
 
 | workflow | fires on | verifies |
 |---|---|---|
+| `e2e.yml` | push to `e2e/**` by `./scripts/e2e*.sh --github`, plus a push to mirror `main` that only seeds the dependency cache | the selected e2e suites, sharded: Linux for API, WASM, embedder, `chromium` and `mobile`; macOS arm64 for `mobile-webkit`. No secrets, `contents: read`, and `e2e/*` branches never save a cache |
 | `install-smoke.yml` | push to `rc/**`, a `dmg_tag` dispatch (the RC draft gate, ADR 0036), `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, the RC front door's payloads, **route parity between the two front doors**, and that both front doors still parse under macOS `/bin/sh` |
 | `release-tarballs.yml` | `rc/**` push, `v*` tag push, manual | the per-triple headless tarball build, and attaching it to that tag's release (still a DRAFT at the time) |
 
@@ -106,8 +110,12 @@ the branch into `main` directly — so a `pull_request` trigger never fires and 
 `push` trigger only reports *after* the change is already on main. A new
 per-change check goes into `/harden` Phase 4.5's test-selection table
 (`.claude/commands/harden.md`). This is the CLAUDE.md rule "We build locally:
-GitHub Actions is RELEASE-ONLY"; the section here is its rationale and the
+GitHub Actions never gates a change". The section here is its rationale and the
 inventory it is measured against.
+
+`e2e.yml` fits that rule because the agent asks for the run, before Apply, and
+waits for it. It never fires on its own. `./scripts/check-e2e-workflow.sh`
+enforces its limits in `/harden`.
 
 `install-smoke.yml`'s two crons are the only non-release *triggers*, and both are
 deliberate — each verifies something **external** to the tree, which is why no

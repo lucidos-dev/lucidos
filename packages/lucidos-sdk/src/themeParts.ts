@@ -13,6 +13,8 @@
 import {
   COLOUR_TOKENS,
   FRAME_COLOUR_TOKENS,
+  MAX_MIX_DEPTH,
+  MAX_VALUE_LENGTH,
   NAMED_COLOURS,
   PART_PROPERTIES,
   PART_TOKENS,
@@ -22,8 +24,6 @@ import {
 
 export const PART_TOKEN_PREFIX = '--part-';
 
-const MAX_MIX_DEPTH = 2;
-const MAX_VALUE_LENGTH = 120;
 const VALUE_BANNED_RE = /[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i;
 
 const COLOUR_TOKEN_SET = new Set<string>(COLOUR_TOKENS);

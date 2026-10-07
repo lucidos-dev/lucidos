@@ -140,12 +140,13 @@ export async function deleteThread(id: string): Promise<void> {
 }
 
 // --- Search Everywhere ---
-export type SearchCategory = 'all' | 'threads' | 'files' | 'apps' | 'triggers' | 'settings' | 'changes' | 'menu';
+export type SearchCategory = 'all' | 'threads' | 'files' | 'apps' | 'triggers' | 'settings' | 'changes' | 'text' | 'menu';
 
-/** The categories the engine answers on. `settings` and `menu` are resolved in
- *  the frontend (`components/search/searchIndex.ts` and `menuIndex.ts`). The
- *  engine 400s on a category it does not know, so neither may be sent. */
-export type ServerSearchCategory = Exclude<SearchCategory, 'settings' | 'menu'>;
+/** The categories `/search` answers on. `settings` and `menu` are resolved in
+ *  the frontend (`components/search/searchIndex.ts` and `menuIndex.ts`), and
+ *  `text` has its own route (`searchText`). The engine 400s on a category it
+ *  does not know, so none of the three may be sent. */
+export type ServerSearchCategory = Exclude<SearchCategory, 'settings' | 'menu' | 'text'>;
 
 export interface SearchResultItem {
   id: string;
@@ -170,4 +171,40 @@ export async function searchEverywhere(
   if (query) params.set('q', query);
   if (limit !== undefined) params.set('limit', String(limit));
   return json<SearchResults>(`${API}/search?${params}`, { signal });
+}
+
+/** `preview` answers the All tab with a few of the best lines; `all` answers
+ *  the Text tab with every line, up to the engine's cap. */
+export type TextSearchMode = 'preview' | 'all';
+
+/** One matching line. `before`, `matched` and `after` concatenate to the
+ *  snippet, already cut, so the match needs no offsets to highlight. */
+export interface TextSearchHit {
+  path: string;
+  /** 1-based. */
+  line: number;
+  before: string;
+  matched: string;
+  after: string;
+}
+
+export type TextSearchResponse =
+  | { status: 'query-too-short'; min_query_chars: number }
+  | {
+    status: 'ok';
+    hits: TextSearchHit[];
+    /** The engine found or skipped lines it did not return. */
+    truncated: boolean;
+    /** Text files too large to search. */
+    skipped_large_files: number;
+  };
+
+/** Text search: a literal phrase inside workspace files (ADR 0383). */
+export async function searchText(
+  query: string,
+  mode: TextSearchMode,
+  { signal }: { signal?: AbortSignal } = {},
+): Promise<TextSearchResponse> {
+  const params = new URLSearchParams({ q: query, mode });
+  return json<TextSearchResponse>(`${API}/search/text?${params}`, { signal });
 }

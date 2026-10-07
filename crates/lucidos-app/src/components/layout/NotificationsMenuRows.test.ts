@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { VNode } from 'preact';
 import type { WorkspaceStatus } from '../../api/client/control';
 import { vnodeToText } from '../chat/__tests__/vnodeToText';
+vi.mock('../shared/GlyphBadge', () => import('../shared/__tests__/glyphBadgeStub'));
 
 const platform = vi.hoisted(() => ({ isTauri: false, isStandalone: false, isMac: true }));
 vi.mock('../../utils/platform', () => ({

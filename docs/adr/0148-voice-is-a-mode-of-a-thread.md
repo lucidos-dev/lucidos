@@ -1,6 +1,6 @@
 # 0148: Voice is a mode of an ordinary chat thread, never a kind of thread
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by [ADR 0362](0362-tree-memory-module-and-the-home-thread.md): voice now lives only in the home thread
 - **Date**: 2026-08-28
 
 ## Context

@@ -7,7 +7,6 @@ mod apply_all_batches;
 pub(crate) mod apply_all_driver;
 pub(crate) mod apply_estimate;
 mod archive_request;
-pub(crate) mod aux_capture;
 pub(crate) mod aux_purpose;
 pub mod cc_permission;
 pub mod cc_question_wait;
@@ -21,10 +20,10 @@ pub(crate) mod command_guard;
 pub(crate) mod command_judge;
 pub(crate) mod command_judge_questions;
 pub mod command_permission;
-/// `pub(crate)` for the two cost helpers: `tool_definitions_chars` and
-/// `estimate_tokens_from_chars` are what the MCP settings surface reports, and
-/// it lives outside `engine`. One definition of "what does this cost" is the
-/// whole point, since a second ratio is what once showed a 205k prompt as 361k.
+/// `pub(crate)` for the cost helpers: `tool_definitions_chars`,
+/// `estimate_tokens_from_chars` and `agent_context_char_budget` are what the
+/// MCP surface is capped and reported by, and it lives outside `engine`. The
+/// cap, the report and the request packer must share one definition of cost.
 pub(crate) mod context;
 pub mod db_health;
 pub mod engine_version;
@@ -37,6 +36,7 @@ pub mod form_requests;
 pub mod frontend_preview;
 mod frontend_refresh;
 pub(crate) mod git_ops;
+pub mod home_thread;
 pub mod http;
 pub(crate) mod image_size_hint;
 pub(crate) mod inline_question_repair;
@@ -50,6 +50,7 @@ pub mod mcp_permission;
 /// have to reconcile, and nothing would tell it which to trust.
 pub(crate) mod memory;
 pub mod memory_consumer;
+pub mod model_call;
 mod pending_apply_actors;
 pub(crate) mod preferences;
 pub(crate) mod question_card_gate;
@@ -58,7 +59,9 @@ pub(crate) mod repo_directory_grants;
 mod session_seed;
 pub mod standing_apply;
 pub mod startup_lease;
+pub mod summary_tree;
 pub mod supervisor_respawn_sidecar;
+pub(crate) mod text_search;
 pub mod thread_events;
 pub mod thread_lifecycle;
 pub mod thread_queue;
@@ -79,10 +82,10 @@ pub(crate) use agentic_loop::{
     coalesced_images_for_reprocess, coalesced_user_text_for_reprocess,
     emit_user_prompt_injected_event, filter_removed_queued_prompts, strip_app_capture_marker,
 };
-pub(crate) use aux_capture::AuxCapture;
 #[cfg(test)]
 pub(crate) use change_ops::bind_in_place_conflict_resolution;
 pub(crate) use change_ops::now_epoch_millis;
+pub(crate) use model_call::AuxCapture;
 // Re-exported for `api::claude_code`, which classifies an `apply_now` refusal
 // into an HTTP status by identity against this const (a 404 there means "no
 // live session" to the frontend, so misclassifying it runs the wrong fallback).
@@ -97,22 +100,17 @@ pub(crate) use chat::accepted_messages::chat_event_id_is_recorded;
 pub(crate) use chat::agent_archive::{AgentArchiveAck, AgentArchiveError};
 pub(crate) use chat::child_detach::{ChildDetachError, DetachAck, DetachCaller};
 pub(crate) use chat::child_follow_up::{
-    ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpUrgency,
+    ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpReach, FollowUpUrgency,
 };
 pub(crate) use chat::follow_up_order::{FollowUpOrder, FollowUpTurn};
 pub(crate) use chat::PreEmittedOrigin;
 pub(crate) use chat::{generate_thread_title, title_call, IMAGE_DESCRIPTION_PROMPT};
 #[cfg(test)]
 pub(crate) use context::format_history_steps;
-// The two provisional numbers, so `PreferenceStore` states its fallbacks in the
-// same place the sweep reads them.
-// `SweepSchedule` rides with them because `core` resolves the two numbers and
-// `chat` is not reachable from there. One type crossing beats two bare `usize`
-// a caller can transpose in silence.
+// `core` resolves the schedule's two numbers, and `chat` is not reachable from
+// there. One type crossing beats two bare `usize` a caller can transpose in
+// silence.
 pub(crate) use chat::process::context_mode::SweepSchedule;
-// Public for the same reason the prompt below is: the eval pins a schedule, and
-// a default it hardcodes would silently stop being the shipped one.
-pub use chat::process::context_mode::{DEFAULT_EXPIRE_AFTER_ROUNDS, DEFAULT_SWEEP_EVERY_ROUNDS};
 // Public because the eval's `guidance_hash` has to cover the text a model
 // actually saw, and two arms swept at different values must hash differently.
 pub use chat::process::context_mode::rendered_context_mode_prompt;
@@ -125,9 +123,9 @@ pub mod spawn_dispatcher {
     pub use super::agent_session::spawn_dispatcher::{SpawnDispatcher, SpawnRequest};
 }
 
-use crate::core::{AppManager, ArtifactManager, CredentialStore, EventStore, PreferenceStore};
+use crate::core::{AppManager, ArtifactManager, CredentialStore, EventStore};
 use crate::llm::LlmProvider;
-use crate::memory::{EmbedderSlot, MemoryExtractor, PgVectorIndex};
+use crate::memory::{EmbedderSlot, PgVectorIndex};
 use crate::runtime::{
     AgentRuntime, BrowserRuntime, ClaudeCodeRuntime, CodexRuntime, CodingAgent, PythonRuntime,
 };
@@ -407,7 +405,6 @@ pub struct LucidosEngine {
     /// `memory::EmbedderSlot`.
     embedder: Arc<EmbedderSlot>,
     memory_index: Option<PgVectorIndex>,
-    extractor: Option<MemoryExtractor>,
     /// Vertex project ID — used to build image providers on demand.
     vertex_project_id: String,
     /// Shared region handle, updated in place when `vertex_region` changes.
@@ -545,6 +542,9 @@ pub struct LucidosEngine {
     /// engines each get their own latch. See
     /// `engine::frontend_refresh::warn_once_if_frontend_worktree_pinned`.
     frontend_worktree_pin_warned: std::sync::atomic::AtomicBool,
+    /// The Tree memory module's compactor, once the workspace first chose
+    /// Tree. Runtime only: the backfill's durable state is in the database.
+    summary_tree: crate::engine::summary_tree::Runtime,
     /// Dev-only: the one supervised Vite dev server showing a coding-agent
     /// worktree's frontend before Apply. One slot per workspace by design (see
     /// `engine::frontend_preview`). Ephemeral by the statelessness rule: it is a
@@ -683,6 +683,11 @@ pub struct LucidosEngine {
     /// consumed when assembling the user message + stubbing resume tool blocks.
     /// Reconstructable from `ToolResult` events on engine restart (task 2.3).
     pub(crate) loaded_knowhow: Arc<crate::engine::loaded_knowhow::LoadedKnowhowStore>,
+    /// The live workspace *view snapshots* of the Tree memory module, one per
+    /// view budget. A cache: a restart folds them afresh.
+    pub(crate) view_snapshots: crate::engine::summary_tree::view::ViewSnapshots,
+    /// Cached verdicts of the recall tool's `find`, by query and line.
+    pub(crate) find_cache: crate::engine::tools::recall::FindCache,
     /// Registered coding-agent backends (Claude Code, Codex, …).
     /// Engine code spawns agents via this registry instead of naming a concrete runtime.
     pub(crate) agent_runtimes: HashMap<CodingAgent, Arc<dyn AgentRuntime>>,
@@ -801,8 +806,8 @@ pub struct LucidosEngine {
     ///
     /// A thread is named once, and `thread_has_title` alone cannot hold that:
     /// naming takes a model call, so two askers a second apart both read "no
-    /// name yet" and both write one. A call has two askers exactly that far
-    /// apart, the caller's utterance and the turn it delegates.
+    /// name yet" and both write one. Two follow-up messages sent a second
+    /// apart are exactly that.
     ///
     /// Transient, like every other guard here. A process that dies mid-name
     /// simply leaves the thread nameable again, which is the safe direction.
@@ -890,6 +895,8 @@ pub struct ThreadGuard {
     /// active_threads entry if the generation still matches — prevents a
     /// force-evicted guard from removing a newer registration.
     generation: u64,
+    /// Keeps the computer awake for the turn, released on every exit path.
+    _awake: crate::core::keep_awake::AwakeHold,
 }
 
 impl ThreadGuard {
@@ -977,7 +984,7 @@ fn spawn_vertex_region_subscriber(
             else {
                 continue;
             };
-            if key != crate::core::PREF_VERTEX_REGION {
+            if key != crate::core::prefs::VERTEX_REGION.key() {
                 continue;
             }
             let Some(new_region) = value else { continue };
@@ -1036,17 +1043,7 @@ fn spawn_models_registry_subscriber(
             ) {
                 continue;
             }
-            let fresh = crate::llm::model_registry::load_from_db(&pool).await;
-            match registry.write() {
-                Ok(mut guard) => {
-                    *guard = fresh;
-                    log!(
-                        "[ModelRegistry] reloaded model→provider map ({} entries)",
-                        guard.len()
-                    );
-                }
-                Err(e) => log!("[ModelRegistry] reload skipped (lock poisoned): {}", e),
-            }
+            crate::llm::model_registry::reload(&registry, &pool).await;
         }
     });
 }
@@ -1277,6 +1274,10 @@ fn install_thread_handle(
         thread_id,
         completion_notify: completion_notify.clone(),
         generation,
+        _awake: crate::core::keep_awake::hold(
+            crate::core::keep_awake::Work::ThreadTurn,
+            thread_id.to_string(),
+        ),
     };
     (token, injection_rx, guard)
 }
@@ -1627,3 +1628,6 @@ mod injection_tests;
 #[cfg(test)]
 #[path = "mod_tests/restart_anchor.rs"]
 mod restart_anchor_tests;
+
+#[cfg(test)]
+mod value_pins_tests;

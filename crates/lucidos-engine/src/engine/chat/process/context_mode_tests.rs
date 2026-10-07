@@ -89,6 +89,12 @@ fn seen(pairs: &[(&str, usize)]) -> std::collections::HashMap<String, usize> {
         .collect()
 }
 
+/// The default schedule's sweep round, so no test restates the catalog's
+/// interval.
+fn sweep_round() -> usize {
+    SweepSchedule::default().sweep_every_rounds
+}
+
 /// The bytes a message puts on the wire. `Message` carries no `PartialEq`, and
 /// comparing the serialized form is the stricter check for a cache prefix.
 fn wire(messages: &[Message]) -> String {
@@ -162,32 +168,35 @@ fn off_adds_no_system_prompt_section() {
 
 // ---- the schedule ----
 
-/// Invariant 4. On the defaults an item lives 6 to 15 rounds, averaging the ten
-/// decision 1 asks for.
+/// Invariant 4. On the defaults an item lives one round past expiry at the
+/// least, and a whole interval past it at the most.
 #[test]
-fn an_item_lives_six_to_fifteen_rounds_on_the_defaults() {
+fn an_item_lives_from_one_round_past_expiry_to_one_interval_past_it() {
     let schedule = SweepSchedule::default();
+    let (expire, every) = (schedule.expire_after_rounds, schedule.sweep_every_rounds);
     let mut lives: Vec<usize> = Vec::new();
-    for arrived in 1..=schedule.sweep_every_rounds {
+    for arrived in 1..=every {
         let at = schedule.leaves_at(arrived, arrived);
         lives.push(at - arrived);
     }
-    assert_eq!(*lives.iter().min().unwrap(), 6);
-    assert_eq!(*lives.iter().max().unwrap(), 15);
+    assert_eq!(*lives.iter().min().unwrap(), expire + 1);
+    assert_eq!(*lives.iter().max().unwrap(), expire + every);
     let mean = lives.iter().sum::<usize>() as f64 / lives.len() as f64;
-    assert!((mean - 10.5).abs() < 0.01, "mean life was {mean}");
+    let expected = expire as f64 + (every + 1) as f64 / 2.0;
+    assert!((mean - expected).abs() < 0.01, "mean life was {mean}");
 }
 
 #[test]
-fn the_pass_runs_on_every_tenth_round() {
+fn the_pass_runs_on_every_interval_round() {
     let schedule = SweepSchedule::default();
+    let every = schedule.sweep_every_rounds;
     assert!(!schedule.is_sweep_round(1));
-    assert!(!schedule.is_sweep_round(9));
-    assert!(schedule.is_sweep_round(10));
-    assert!(!schedule.is_sweep_round(11));
-    assert!(schedule.is_sweep_round(20));
-    assert_eq!(schedule.rounds_to_next_sweep(9), 1);
-    assert_eq!(schedule.rounds_to_next_sweep(10), 10);
+    assert!(!schedule.is_sweep_round(every - 1));
+    assert!(schedule.is_sweep_round(every));
+    assert!(!schedule.is_sweep_round(every + 1));
+    assert!(schedule.is_sweep_round(2 * every));
+    assert_eq!(schedule.rounds_to_next_sweep(every - 1), 1);
+    assert_eq!(schedule.rounds_to_next_sweep(every), every);
 }
 
 /// A zero interval would divide by zero on every round, so it is clamped rather
@@ -219,7 +228,7 @@ fn a_pair_leaves_whole_or_not_at_all() {
     let sweep = sweep_expired_pairs(
         &mut messages,
         &seen(&[(ADDRESS_A, 1)]),
-        10,
+        sweep_round(),
         SweepSchedule::default(),
     );
 
@@ -253,8 +262,8 @@ fn the_current_rounds_pair_always_stays() {
     messages.extend(pair("call-a", ADDRESS_A, "just arrived", false));
     let sweep = sweep_expired_pairs(
         &mut messages,
-        &seen(&[(ADDRESS_A, 10)]),
-        10,
+        &seen(&[(ADDRESS_A, sweep_round())]),
+        sweep_round(),
         SweepSchedule::default(),
     );
     assert!(sweep.removed.is_empty());
@@ -273,7 +282,7 @@ fn a_swept_result_takes_its_image_with_it() {
     let sweep = sweep_expired_pairs(
         &mut messages,
         &seen(&[(ADDRESS_A, 1)]),
-        10,
+        sweep_round(),
         SweepSchedule::default(),
     );
 
@@ -301,8 +310,8 @@ fn an_image_beside_a_surviving_result_stays() {
 
     let sweep = sweep_expired_pairs(
         &mut messages,
-        &seen(&[(ADDRESS_A, 1), (ADDRESS_B, 10)]),
-        10,
+        &seen(&[(ADDRESS_A, 1), (ADDRESS_B, sweep_round())]),
+        sweep_round(),
         SweepSchedule::default(),
     );
 
@@ -318,14 +327,11 @@ fn nothing_leaves_on_a_round_that_is_not_a_sweep() {
     messages.extend(pair("call-a", ADDRESS_A, "ancient", true));
     let before = wire(&messages);
 
-    for round in [1, 2, 5, 9, 11, 19] {
+    let schedule = SweepSchedule::default();
+    let between_sweeps = (1..2 * sweep_round()).filter(|r| r % sweep_round() != 0);
+    for round in between_sweeps {
         let mut probe = messages.clone();
-        let sweep = sweep_expired_pairs(
-            &mut probe,
-            &seen(&[(ADDRESS_A, 1)]),
-            round,
-            SweepSchedule::default(),
-        );
+        let sweep = sweep_expired_pairs(&mut probe, &seen(&[(ADDRESS_A, 1)]), round, schedule);
         assert!(sweep.removed.is_empty(), "round {round} removed something");
         assert_eq!(wire(&probe), before, "round {round} rewrote the array");
     }
@@ -336,16 +342,24 @@ fn nothing_leaves_on_a_round_that_is_not_a_sweep() {
 #[test]
 fn an_item_leaves_at_the_first_sweep_past_expiry() {
     let schedule = SweepSchedule::default();
-    // Arrived on round 5, so at round 10 its age is 5, which is not PAST five.
-    let mut at_ten = vec![request()];
-    at_ten.extend(pair("call-a", ADDRESS_A, "body", true));
-    let sweep = sweep_expired_pairs(&mut at_ten, &seen(&[(ADDRESS_A, 5)]), 10, schedule);
-    assert!(sweep.removed.is_empty(), "age five is not past five");
+    let (round, expire) = (schedule.sweep_every_rounds, schedule.expire_after_rounds);
+    // At the sweep round its age is exactly the expiry age, which is not PAST it.
+    let mut at_expiry = vec![request()];
+    at_expiry.extend(pair("call-a", ADDRESS_A, "body", true));
+    let arrived = round - expire;
+    let sweep = sweep_expired_pairs(
+        &mut at_expiry,
+        &seen(&[(ADDRESS_A, arrived)]),
+        round,
+        schedule,
+    );
+    assert!(sweep.removed.is_empty(), "the expiry age is not past it");
 
-    // Arrived on round 4, so at round 10 its age is 6.
+    // One round older, so past expiry at the sweep round.
     let mut older = vec![request()];
     older.extend(pair("call-a", ADDRESS_A, "body", true));
-    let sweep = sweep_expired_pairs(&mut older, &seen(&[(ADDRESS_A, 4)]), 10, schedule);
+    let arrived = round - expire - 1;
+    let sweep = sweep_expired_pairs(&mut older, &seen(&[(ADDRESS_A, arrived)]), round, schedule);
     assert_eq!(sweep.removed, vec![ADDRESS_A.to_string()]);
 }
 
@@ -380,7 +394,7 @@ fn a_sweep_never_leaves_an_empty_message() {
     let sweep = sweep_expired_pairs(
         &mut messages,
         &seen(&[(ADDRESS_A, 1)]),
-        10,
+        sweep_round(),
         SweepSchedule::default(),
     );
 
@@ -411,7 +425,7 @@ fn a_sweep_takes_the_instruction_the_results_leave_behind() {
     let sweep = sweep_expired_pairs(
         &mut messages,
         &seen(&[(ADDRESS_A, 1)]),
-        10,
+        sweep_round(),
         SweepSchedule::default(),
     );
 
@@ -448,7 +462,7 @@ fn a_sweep_keeps_the_prose_beside_the_call() {
     sweep_expired_pairs(
         &mut messages,
         &seen(&[(ADDRESS_A, 1)]),
-        10,
+        sweep_round(),
         SweepSchedule::default(),
     );
     assert_eq!(messages.len(), 2, "the hollowed results message went");
@@ -471,8 +485,8 @@ fn message_index_pins_survive_a_mid_array_removal() {
 
     let sweep = sweep_expired_pairs(
         &mut messages,
-        &seen(&[(ADDRESS_A, 1), (ADDRESS_B, 9)]),
-        10,
+        &seen(&[(ADDRESS_A, 1), (ADDRESS_B, sweep_round() - 1)]),
+        sweep_round(),
         SweepSchedule::default(),
     );
 
@@ -494,10 +508,15 @@ fn prompt() -> String {
 /// say ten while the pass drops at four.
 #[test]
 fn the_prompt_quotes_the_values_in_force() {
-    let swept = rendered_context_mode_prompt(3, 7);
-    assert!(swept.contains("Every 7 rounds"), "{swept}");
+    let interval = sweep_round() + 1;
+    let swept = rendered_context_mode_prompt(3, interval);
+    assert!(
+        swept.contains(&format!("Every {interval} rounds")),
+        "{swept}"
+    );
     assert!(swept.contains("more than 3 rounds old"), "{swept}");
-    assert!(!swept.contains("Every 10 rounds"));
+    let default_interval = format!("Every {} rounds", sweep_round());
+    assert!(!swept.contains(&default_interval));
 }
 
 /// Invariant 43's mechanism. Two arms at different values render different

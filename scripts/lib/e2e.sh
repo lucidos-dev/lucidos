@@ -53,20 +53,17 @@ fi
 # Use mock LLM provider by default for e2e tests (override with LUCIDOS_MODEL=... before calling)
 export LUCIDOS_MODEL="${LUCIDOS_MODEL:-mock}"
 
-# Pin the query classifier, because LUCIDOS_MODEL=mock does not reach it.
+# Pin the query classifier, so an e2e turn skips one model round trip.
 #
-# That variable swaps the TURN provider only. Every auxiliary call still
-# resolves through `MemoryExtractor::provider_for_model`, whose default is real
-# Gemini Flash on Vertex. The others run detached, but query classification runs
-# INLINE, ahead of the turn's first event, under a 30s deadline
-# (`engine::aux_purpose`). So a slow provider misses the deadlines the tests
-# themselves give a turn, on a healthy host over a working network.
+# Under LUCIDOS_MODEL=mock every auxiliary call runs on the mock too
+# (`engine::aux_purpose`). Query classification runs INLINE, ahead of the turn's
+# first event, and the mock streams its reply word by word. That reply is no
+# judgment, so the call would land on its fallback after the delay anyway.
 #
 # `all` is the value that changes the least. It is what the call already falls
-# back to on error and on timeout. A host with no Vertex project gets it too,
-# since that host builds no extractor at all. It also keeps the memory,
-# file-list and credentials sections assembling on every e2e turn, which `none`
-# would stop exercising.
+# back to on error and on timeout. It also keeps the memory, file-list and
+# credentials sections assembling on every e2e turn, which `none` would stop
+# exercising.
 #
 # `-` and not `:-`, so an explicitly EMPTY value means what the engine reads it
 # as: no pin, classify live. That is the only way to measure the unpinned suite,
@@ -193,9 +190,9 @@ build_e2e_engine_once() {
     fi
     # Apps loaded in iframes fetch /api/v1/sdk.js — without dist/sdk.js the
     # engine serves a stub that lacks lucidos.ui/data, breaking SDK e2e tests.
-    build_sdk
+    build_sdk || return 1
     BUILD="1"
-    build_or_find_engine
+    build_or_find_engine || return 1
     export LUCIDOS_E2E_ENGINE_BUILT=1
 }
 
@@ -387,7 +384,7 @@ ensure_workspace_running() {
 # leftover dirs the engine's startup recovery iterates over them and exceeds
 # its 30s API readiness budget.
 prune_orphan_worktree_dirs() {
-    local wt_root="$E2E_WORKSPACE/.lucidos/worktrees"
+    local wt_root="$E2E_WORKSPACE/$WORKTREES_SUBPATH"
     [ -d "$wt_root" ] || return 0
 
     local removed=0
@@ -574,6 +571,122 @@ project_runs_spec() {
         chromium:*-mobile.spec.ts) return 1 ;;
         mobile:*-desktop.spec.ts | mobile-webkit:*-desktop.spec.ts) return 1 ;;
     esac
+    return 0
+}
+
+# ── e2e_spec_needs_claude_code ───────────────────────────────────────
+# Succeed when a spec spawns a real Claude Code session. The compose
+# destination picker is the entry point for spawning one, so a new spec
+# classifies itself. GitHub mode runs these on this host, where Claude Code is
+# logged in.
+e2e_spec_needs_claude_code() {
+    grep -q "pickComposeDestination" "$1" 2>/dev/null
+}
+
+# ── e2e_browser_projects ─────────────────────────────────────────────
+# The browser projects a full run exercises, one per line, in run order.
+# mobile-webkit goes last, and `--no-webkit` drops it. The loop in
+# scripts/e2e-browser.sh says why it is last.
+e2e_browser_projects() {
+    printf '%s\n' chromium mobile
+    [ "${1:-}" = --no-webkit ] || printf '%s\n' mobile-webkit
+}
+
+# ── e2e_browser_lock_projects ────────────────────────────────────────
+# The comma-separated projects an e2e-browser.sh run declares in its
+# E2ELockAcquired event ($E2E_LOCK_PROJECTS, read by e2e_lock.sh).
+#
+#   e2e_browser_lock_projects <use-webkit> <skip-webkit> <test-file> [playwright args…]
+#
+# A `--project` passed through to Playwright, and `--webkit`, name the projects
+# outright. Otherwise it is the full list, less mobile-webkit under
+# `--no-webkit`, less any project whose testIgnore drops the test file.
+# Playwright's split `--project` is variadic: it takes every value up to the
+# next flag, so this does too.
+e2e_browser_lock_projects() {
+    local use_webkit="$1" skip_webkit="$2" test_file="$3"
+    shift 3
+    local named="" arg project in_project=""
+    for arg in "$@"; do
+        case "$arg" in
+            --project=*) named="${named:+$named,}${arg#--project=}"; in_project="" ;;
+            --project) in_project=1 ;;
+            -*) in_project="" ;;
+            *) [ -z "$in_project" ] || named="${named:+$named,}$arg" ;;
+        esac
+    done
+    [ -z "$use_webkit" ] || named="${named:+$named,}mobile-webkit"
+    if [ -n "$named" ]; then
+        printf '%s' "$named"
+        return 0
+    fi
+    local runs=""
+    while IFS= read -r project; do
+        if [ -z "$test_file" ] || project_runs_spec "$project" "$test_file"; then
+            runs="${runs:+$runs,}$project"
+        fi
+    done <<EOF
+$(e2e_browser_projects ${skip_webkit:+--no-webkit})
+EOF
+    printf '%s' "$runs"
+}
+
+# ── Per-spec compressor samples ──────────────────────────────────────
+# crates/lucidos-app/e2e/memSampleReporter.ts appends one line per test to
+# $LUCIDOS_E2E_MEM_LOG, under the run's own output root, and to its mirror
+# $LUCIDOS_E2E_MEM_MIRROR. The mirror is named for this hold's run id and lives
+# under $HOME, so it outlives worktree cleanup. The reporter counts WebKit GPU
+# processes by $LUCIDOS_E2E_WEBKIT_PATH_TOKEN, the reaper's own token.
+#
+#   export_e2e_mem_sample_env <absolute output root>
+export_e2e_mem_sample_env() {
+    export LUCIDOS_E2E_MEM_LOG="$1/mem-samples.log"
+    LUCIDOS_E2E_WEBKIT_PATH_TOKEN="$(_reaper_match)"
+    export LUCIDOS_E2E_WEBKIT_PATH_TOKEN
+    if [ -n "${LUCIDOS_E2E_RUN_ID:-}" ]; then
+        export LUCIDOS_E2E_MEM_MIRROR="$HOME/.lucidos/e2e-mem/$LUCIDOS_E2E_RUN_ID.log"
+    else
+        unset LUCIDOS_E2E_MEM_MIRROR
+    fi
+}
+
+# The ten largest compressor-page deltas in a sample log, summed by project and
+# spec, then where the log is. Silent when there is no log, which is every run
+# off macOS. Always returns 0: it is a report at the end of a run.
+#
+#   report_e2e_mem_top_deltas [log]     # default $LUCIDOS_E2E_MEM_LOG
+report_e2e_mem_top_deltas() {
+    local log="${1:-${LUCIDOS_E2E_MEM_LOG:-}}"
+    [ -n "$log" ] && [ -s "$log" ] || return 0
+    echo ""
+    echo "[e2e-mem] largest compressor-page deltas, by project and spec:"
+    printf '  %12s  %7s  %5s  %-14s %s\n' pages '%limit' tests project spec
+    {
+        awk -F'\t' '
+            {
+                split("", f)
+                for (i = 2; i <= NF; i++) {
+                    eq = index($i, "=")
+                    if (eq) f[substr($i, 1, eq - 1)] = substr($i, eq + 1)
+                }
+                if (f["delta"] !~ /^-?[0-9]+$/) next
+                key = f["project"] "\t" f["spec"]
+                sum[key] += f["delta"]
+                tests[key]++
+                if (f["limit"] > 0) limit = f["limit"]
+            }
+            END {
+                for (k in sum) {
+                    pct = limit > 0 ? 100 * sum[k] / limit : 0
+                    printf "%d\t%.1f\t%d\t%s\n", sum[k], pct, tests[k], k
+                }
+            }' "$log" |
+            sort -t "$(printf '\t')" -k1,1nr |
+            head -10 |
+            awk -F'\t' '{ printf "  %12d  %6s%%  %5d  %-14s %s\n", $1, $2, $3, $4, $5 }'
+    } || :
+    echo "[e2e-mem] per-test log: $log"
+    [ -z "${LUCIDOS_E2E_MEM_MIRROR:-}" ] || echo "[e2e-mem] mirror: $LUCIDOS_E2E_MEM_MIRROR"
     return 0
 }
 
@@ -1017,7 +1130,7 @@ reset_e2e_database() {
     # database in place and quietly restore the very bug this replaces. Assert
     # the outcome instead of trusting the exit code.
     local leftover
-    leftover=$(docker exec "$(shared_pg_container)" psql -U lucidos -d "$db" -At -c \
+    leftover=$(shared_pg_psql "$db" -At -c \
         "SELECT to_regclass('_sqlx_migrations') IS NOT NULL;")
     if [ "$leftover" != "f" ]; then
         echo "ERROR: $db was not recreated — _sqlx_migrations is still present." >&2

@@ -21,14 +21,14 @@ import { onPerfEnabledChange, perfRecordingOn, recordPerfSample } from './perfQu
 /** How often the tick is due. Short enough to catch a stall inside one
  *  navigation, long enough that the timer itself is not the cost: two clock
  *  reads and a compare, four times a second. */
-const TICK_MS = 250;
+export const TICK_MS = 250;
 
 /** Report at or above this overshoot.
  *
  *  Comfortably past the scheduling jitter a healthy browser shows, and past the
  *  50ms that defines a long task. A reported line therefore always means a
  *  stall the user could feel. */
-const STALL_MS = 150;
+export const STALL_MS = 150;
 
 /** How late did this tick run, and is that worth reporting?
  *

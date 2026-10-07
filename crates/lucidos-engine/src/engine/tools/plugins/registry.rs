@@ -10,6 +10,7 @@ use crate::core::git_auth::GitCredentials;
 use crate::core::plugin_marketplaces::InstalledPluginSummary;
 use crate::core::plugins::{self, compare_versions, PluginManifest, UpdateDecision};
 use crate::core::DATA_DIR;
+use crate::engine::release_notices::running_release;
 use crate::triggers::definition::TriggerDefinition;
 
 use super::source::{credentials_for_source, detect_source, fetch_source};
@@ -107,6 +108,7 @@ pub(crate) async fn installed_plugin_summaries(
                 files,
                 modified: status.modified,
                 modified_paths: status.modified_paths,
+                engine_requirement: rec.manifest().and_then(plugins::engine_requirement_of),
             }
         })
         .collect())
@@ -190,11 +192,10 @@ impl InstalledRecord {
             .pointer("/data/manifest/manifest/name")
             .and_then(|v| v.as_str())
     }
-    /// The files this install owns, at the paths they live at now. A plugin
-    /// installed before the theme rename recorded `looks/<id>.json`, and that
-    /// file now lives in `themes/` (docs/temporary-measures.md § Legacy
-    /// `data/looks/` folder). Every reader goes through here, so uninstall and
-    /// update find the file where it is.
+    pub(crate) fn manifest(&self) -> Option<&serde_json::Value> {
+        self.payload.pointer("/data/manifest/manifest")
+    }
+    /// The files this install owns, as the install recorded them.
     pub(crate) fn files(&self) -> Vec<String> {
         self.payload
             .pointer("/data/files")
@@ -202,7 +203,7 @@ impl InstalledRecord {
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
-                    .map(current_data_path)
+                    .map(String::from)
                     .collect()
             })
             .unwrap_or_default()
@@ -736,11 +737,18 @@ async fn check_one(
         Ok(remote) => {
             let changed =
                 compare_versions(&installed_version, &remote.version) == UpdateDecision::Update;
+            // `update_plugin` refuses a version this release cannot install,
+            // so the report says so up front rather than offering it.
+            let mismatch = plugins::check_engine_requirement(&remote.raw, &running_release()).err();
             serde_json::json!({
                 "id": id,
                 "installed_version": installed_version,
                 "latest_version": remote.version,
                 "changed": changed,
+                "engine_requirement": plugins::engine_requirement_of(&remote.raw),
+                "engine_compatible": mismatch.is_none(),
+                "engine_incompatible_reason": mismatch
+                    .map(|m| m.refusal(&remote.name, &remote.version)),
                 "source": source,
                 "remote_manifest": remote.raw,
             })
@@ -795,37 +803,11 @@ fn fetch_remote_manifest_blocking(
     plugins::parse_manifest(&text).map_err(|e| e.to_string())
 }
 
-/// Where a recorded data path lives now that `looks/` became `themes/`.
-fn current_data_path(recorded: &str) -> String {
-    let legacy = format!("{}/", crate::core::themes::LEGACY_THEMES_DIR);
-    match recorded.strip_prefix(&legacy) {
-        Some(rest) => format!("{}/{rest}", crate::core::themes::THEMES_DIR),
-        None => recorded.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::installed_plugin_summaries;
     use crate::test_support::{setup_test_db, teardown_test_db};
     use uuid::Uuid;
-
-    #[test]
-    fn a_file_recorded_under_looks_reads_back_under_themes() {
-        let record = super::InstalledRecord {
-            payload: serde_json::json!({
-                "data": { "files": ["looks/harbour.json", "knowhow/looks/notes.md", "apps/a/index.html"] }
-            }),
-        };
-        assert_eq!(
-            record.files(),
-            [
-                "themes/harbour.json",
-                "knowhow/looks/notes.md",
-                "apps/a/index.html"
-            ]
-        );
-    }
 
     /// A `PluginInstalled` projection must carry the plugin's `files` and the
     /// derived `content` kinds so the Plugins → Installed row can list what was

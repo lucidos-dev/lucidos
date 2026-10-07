@@ -37,7 +37,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   live.value = false;
   seed.value = false;
-  preferences.value = { status: 'loaded', data: { voice_enabled: 'true' } };
+  preferences.value = { status: 'loaded', data: { voice_enabled: 'true', home_thread_enabled: 'true' } };
 });
 
 describe('the follow shortcut', () => {
@@ -72,21 +72,28 @@ describe('the follow shortcut', () => {
 });
 
 describe('the call shortcut', () => {
-  it('presses the call toggle on a Lucidos Agent thread', () => {
-    focus(makeThreadState('t1'));
+  it('presses the call toggle on the home thread', () => {
+    focus(makeThreadState('t1', { meta: { home: true } }));
     pressCallToggleIfShown();
     expect(pressCallToggle).toHaveBeenCalledTimes(1);
   });
 
+  /** Voice sessions live in the home thread alone (ADR 0362). */
+  it('does nothing on any other Lucidos Agent thread', () => {
+    focus(makeThreadState('t1'));
+    pressCallToggleIfShown();
+    expect(pressCallToggle).not.toHaveBeenCalled();
+  });
+
   it('does nothing on a coding-agent thread, where the toggle is not drawn', () => {
-    focus(makeThreadState('t1', { meta: { channel: 'claude_code' } }));
+    focus(makeThreadState('t1', { meta: { channel: 'claude_code', home: true } }));
     pressCallToggleIfShown();
     expect(pressCallToggle).not.toHaveBeenCalled();
   });
 
   it('does nothing while voice is off', () => {
     preferences.value = { status: 'loaded', data: {} };
-    focus(makeThreadState('t1'));
+    focus(makeThreadState('t1', { meta: { home: true } }));
     pressCallToggleIfShown();
     expect(pressCallToggle).not.toHaveBeenCalled();
   });

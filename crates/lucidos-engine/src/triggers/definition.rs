@@ -22,8 +22,9 @@ use crate::engine::command_guard::SideEffectCategory;
 use crate::triggers::config::{TriggerConfig, TriggerRun};
 use crate::triggers::EventSubscription;
 
-fn default_timezone() -> String {
-    "UTC".to_string()
+/// The zone a trigger runs in while neither it nor the workspace names one.
+pub(crate) fn default_timezone() -> String {
+    chrono_tz::UTC.name().to_string()
 }
 
 fn is_false(b: &bool) -> bool {

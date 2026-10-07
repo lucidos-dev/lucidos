@@ -9,8 +9,11 @@ import {
   focusedThreadId,
   TOAST_AUTO_DISMISS_MS,
 } from '../store';
-import { loadedOr } from '../types';
-import { applyNow, applyChange, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError, isTransportError } from '../../api/client';
+import { refreshChangesState } from './chat-changes';
+import { applyNow, applyChange, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
+import { pendingAnswers, unsentPicks } from '../pendingDecisions';
+import { sendFailureOf, withQuietRetries } from './sendRetry';
+import { inSendChain } from './sendChain';
 import type { AnswerKind } from '../thread-events';
 import { markThreadRerenderStart, clearThreadRerenderStart } from '../../utils/threadOpenMarks';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
@@ -92,10 +95,22 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
       return;
     }
     if (e instanceof ApiError && e.httpCode === 404) {
-      // No live Claude Code session — fall back to applying pending changes directly.
-      // `loadedOr([])` treats not-loaded / loading / failed as "no rows to act
-      // on"; the follow-up SSE refresh will re-render with the right state.
-      const pending = loadedOr(changes.value, []).filter(
+      // No live session, so apply the thread's pending changes one by one. The
+      // cached list can lag a proposal, or hold a failed load. So re-read it
+      // before naming what is pending, and never call a change absent unread.
+      // A landed read always writes a new `loaded` value, so the same object
+      // means the read did not land.
+      const cached = changes.value;
+      await refreshChangesState();
+      const fresh = changes.value;
+      if (fresh === cached || fresh.status !== 'loaded') {
+        clearApplyingNow(threadId);
+        showToast(changeToastMessage('Not applied', threadId, 'the pending changes could not be read. Try again'), 'error', {
+          key: `applying-${threadId}`,
+        });
+        return;
+      }
+      const pending = fresh.data.filter(
         c => c.thread_id === threadId && c.status === 'pending',
       );
       if (pending.length > 0) {
@@ -158,7 +173,7 @@ export async function handleDiscardCCChanges(threadId: string): Promise<void> {
   }
 }
 
-/** Why an answer did not land, said once and naming the cause.
+/** Why the engine refused an answer, said once and naming the cause.
  *
  *  The two submit sites roll their optimistic state back and stay quiet, so
  *  this string is the whole account the user gets. One failed tap used to raise
@@ -166,10 +181,9 @@ export async function handleDiscardCCChanges(threadId: string): Promise<void> {
  *  try again." over "Failed to send answer: unknown error". Between them they
  *  named neither the cause nor a way out.
  *
- *  A transport rejection is the iOS PWA's stale connection, which the client
- *  already retried once (`answerThreadQuestion` in api/client/chat.ts). A
- *  conflict is a question nobody is waiting on any more, so it says that
- *  rather than asking for a retry that would 409 forever. */
+ *  A conflict is a question nobody is waiting on any more, so it says that
+ *  rather than asking for a retry that would 409 forever. An answer that got
+ *  no reply at all never reaches here: its card says Not sent instead. */
 export function answerFailureMessage(
   failure: { kind: 'conflict' } | { kind: 'error'; err: unknown },
 ): string {
@@ -177,18 +191,21 @@ export function answerFailureMessage(
     return 'Could not send answer: that question is no longer waiting for one.';
   }
   const { err } = failure;
-  if (isTransportError(err)) {
-    return 'Could not send answer: the connection dropped. Try again.';
-  }
   if (err instanceof ApiError) return `Could not send answer: ${err.reason}`;
   return `Could not send answer: ${errorDetail(err)}`;
 }
 
-/** Answer a pending question card on a thread. Returns true on success, false
- *  on 409 (stale or duplicate) and false on any other error. Callers branch on
- *  the boolean, none rely on a throw.
+/** What became of an answer to a question card.
+ *   - 'sent': the engine took it.
+ *   - 'unsent': no attempt got a reply. The card shows the pick as Not sent
+ *     (`unsentPicks`), with a Retry.
+ *   - 'refused': the engine said no, and a toast says why. */
+export type AnswerOutcome = 'sent' | 'unsent' | 'refused';
+
+/** Answer a pending question card on a thread, with the quiet retries every
+ *  send gets. Never throws.
  *
- *  This owns the failure message for BOTH outcomes (see
+ *  This owns the failure surface for every outcome (see
  *  `answerFailureMessage`). A caller adding its own is how one failure came to
  *  say two things.
  *
@@ -199,7 +216,7 @@ export async function answerThreadQuestion(
   threadId: string,
   toolUseId: string,
   answer: AnswerKind,
-): Promise<boolean> {
+): Promise<AnswerOutcome> {
   // Perf: stamp the re-render span for the `thread-rerender` mark — answering a
   // question on the focused thread flips `answeringThreadIds`, busting every
   // exchange memo → full re-render. ThreadView fires once on the next render.
@@ -211,23 +228,37 @@ export async function answerThreadQuestion(
   // Optimistically mark the thread as resuming so the answered question-divider
   // doesn't settle as "Done" while the client's status still reads
   // `waiting_for_user_answer` (see `isRenderedThreadIdle`). Cleared by the
-  // PromptInput effect once the real status leaves that state, or below on a
-  // 409 / failure (no resume is coming).
+  // PromptInput effect once the real status leaves that state, or below when
+  // no resume is coming. Held through every quiet retry.
   markThreadAnswering(threadId);
-  try {
-    const ok = await apiAnswerThreadQuestion(threadId, toolUseId, answer);
-    if (!ok) {
-      clearThreadAnswering(threadId); // 409 — stale/duplicate, no resume
-      clearThreadRerenderStart(threadId); // no render coming → don't mis-fire later
-      showToast(answerFailureMessage({ kind: 'conflict' }), 'error');
-    }
-    return ok;
-  } catch (err) {
-    clearThreadAnswering(threadId);
-    clearThreadRerenderStart(threadId);
-    showToast(answerFailureMessage({ kind: 'error', err }), 'error');
-    return false;
+  // A new answer replaces a pick that was not sent.
+  unsentPicks.clear(toolUseId);
+  // In the thread's send chain, so a message typed after the tap cannot reach
+  // the engine first and be taken as the card's answer.
+  const result = await inSendChain(threadId, () =>
+    withQuietRetries(() => apiAnswerThreadQuestion(threadId, toolUseId, answer), { path: 'answer' }));
+  // A 409 after a dropped attempt almost always means that attempt arrived:
+  // the engine 409s a repeated answer. SSE shows what was recorded.
+  if (result.kind === 'done' && (result.value || result.attempts > 1)) return 'sent';
+  clearThreadAnswering(threadId);
+  clearThreadRerenderStart(threadId); // no render coming → don't mis-fire later
+  if (result.kind === 'gave-up') {
+    unsentPicks.set(toolUseId, { threadId, answer, failure: sendFailureOf(result) });
+    return 'unsent';
   }
+  showToast(answerFailureMessage(result.kind === 'refused' ? { kind: 'error', err: result.error } : { kind: 'conflict' }), 'error');
+  return 'refused';
+}
+
+/** Send an unsent pick again, sending on its card meanwhile. Resolves null
+ *  when there is nothing to retry, e.g. a second press. */
+export async function retryUnsentPick(toolUseId: string): Promise<AnswerOutcome | null> {
+  const pick = unsentPicks.map.value.get(toolUseId);
+  if (!pick) return null;
+  pendingAnswers.set(toolUseId, pick.answer);
+  const outcome = await answerThreadQuestion(pick.threadId, toolUseId, pick.answer);
+  if (outcome !== 'sent') pendingAnswers.clear(toolUseId);
+  return outcome;
 }
 
 /** Send a control request to a running Claude Code session.

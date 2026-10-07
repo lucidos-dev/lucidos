@@ -114,10 +114,10 @@ waitForLucidos();
     // Two sources in order: the engine's seed, then storage. The storage keys
     // are workspace-scoped through the SDK's _storage helper (mirrors
     // workspaceStorage.ts); the guard in sdk_prefs.rs forbids raw access.
-    expect(js).toContain('THEME_MODE_KEY = "theme-mode"');
+    expect(js).toContain('THEME_MODE_KEY = PREF_THEME_MODE.key');
     expect(js).toContain('THEME_MODE_STORAGE_KEY = "lucidos-theme-mode"');
     expect(js).toContain('seeded(served, THEME_MODE_KEY, THEME_MODE_STORAGE_KEY)');
-    expect(js).toContain('seeded(served, "font-family", "lucidos-font-family")');
+    expect(js).toContain('seeded(served, PREF_FONT_FAMILY.key, "lucidos-font-family")');
     expect(js).toContain('wsLocalGet("lucidos-ui-scale")');
     expect(js).toContain('globalThis.__lucidosPrefs');
     expect(js).not.toContain('localStorage.getItem("lucidos-theme-mode")');

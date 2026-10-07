@@ -283,6 +283,7 @@ describe('a marketplace mutation shows its own result', () => {
       content: [],
       categories: [],
       files_count: 1,
+      engine_compatible: true,
       status: 'available' as const,
     };
   }

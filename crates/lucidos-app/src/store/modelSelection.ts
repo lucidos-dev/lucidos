@@ -36,6 +36,9 @@ export interface ModelChoice {
   /** Every backend that can serve the model, in route order. Absent on a
    *  surface with no provider dimension, which then never shows the step. */
   providers?: readonly ProviderChoice[];
+  /** The heading the picker lists this model under. Absent on a list with no
+   *  sections. */
+  section?: string;
   /** The backend the model resolves to when nothing here picks one. */
   defaultProvider?: string;
 }
@@ -93,6 +96,8 @@ export interface ModelRow {
   providerLabel: string | null;
   /** The PROVIDER step's rows, or empty when the row has no real choice. */
   providers: ProviderRow[];
+  /** The heading this row sits under, from its {@link ModelChoice}. */
+  section?: string;
 }
 
 /** The separator between the two halves of an encoded pair.
@@ -177,6 +182,7 @@ export function modelRows(
             tiers: tierOptions(p.reasoningEfforts, vocabulary),
           }))
         : [],
+      section: model.section,
     };
   });
 }
@@ -265,12 +271,12 @@ export function clampToOffered(
  *
  *  `registryEfforts` is the engine's own answer from `GET /api/v1/models`, and
  *  `undefined` means it could not answer: the registry has not loaded, the id
- *  has no row, or the engine predates the field. Only then does the id-shape
- *  heuristic in `store/models.ts` stand in. Callers get the registry answer
+ *  has no row, or the engine predates the field. The whole ladder is offered
+ *  then, and the engine snaps the request. Callers get the registry answer
  *  from `modelReasoningEfforts` in `store/actions/models.ts`, which is where
  *  the loaded registry lives. */
-export function lucidosTiers(modelId: string, registryEfforts?: readonly string[]): string[] {
-  return availableReasoningLevels(modelId, registryEfforts).map((l) => l.value);
+export function lucidosTiers(registryEfforts?: readonly string[]): string[] {
+  return availableReasoningLevels(registryEfforts).map((l) => l.value);
 }
 
 /** The tiers one offered model accepts. The single lookup both surfaces use,

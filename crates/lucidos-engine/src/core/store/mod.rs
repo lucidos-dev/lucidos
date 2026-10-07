@@ -6,20 +6,20 @@ pub mod types;
 use crate::core::EventRow;
 use crate::engine::thread_events::ThreadEvent;
 use chrono::{DateTime, Utc};
-pub use messages::format_child_thread_completed_block;
 pub(crate) use messages::{
-    build_resume_tool_blocks_with_skip_ids, build_session_messages,
-    collect_tool_pairs_chronological, find_orphan_tool_called_ids, newest_conversation_summary,
-    parse_event_address, synthesize_tool_use_id, tool_called_event_id_of, with_event_address,
-    CachedSummary, RESUME_VERBATIM_TOOL_TAIL,
+    build_resume_tool_blocks_with_skip_ids, collect_tool_pairs_chronological,
+    find_orphan_tool_called_ids, newest_conversation_summary, parse_event_address,
+    synthesize_tool_use_id, tool_called_event_id_of, with_event_address, CachedSummary,
+    RESUME_VERBATIM_TOOL_TAIL,
 };
+pub use messages::{format_child_thread_completed_block, ChangeStatuses};
 use sqlx::PgPool;
 pub(crate) use threads::format_display_title;
 pub use threads::{
     active_thread_statuses, attach_reader_fields, char_length, fetch_thread_aggregate, has_draft,
     parse_status_filter_csv, parse_status_filter_values, status_value_list, text_preview,
     thread_link, DraftSummary, EventWaitSummary, FilterFacet, FilterFacets, LegacyInitiator,
-    SpokenTurn, StatusFilter, ThreadAggregate, ThreadSearchResult, ThreadSummary,
+    MessageMatch, StatusFilter, ThreadAggregate, ThreadSearchResult, ThreadSummary,
     ThreadSummaryFilters, HAS_DRAFT_SQL, PREVIEW_CHARS, UNTITLED_THREAD,
 };
 pub use types::*;
@@ -61,8 +61,8 @@ pub fn escape_like(s: &str) -> String {
 ///
 /// Includes `)` so that markdown link output like `[label](screenshots/foo.png)`
 /// truncates at the closing paren. Screenshot filenames never contain any of
-/// these characters, so widening the set is safe across the two call sites
-/// (conversation time-travel, messages projection).
+/// these characters, so widening the set is safe for the conversation
+/// time-travel view that reads it.
 const SCREENSHOT_PATH_DELIMS: &[char] = &['"', '\n', ' ', ')'];
 
 /// Extract the screenshot path from a `browser_screenshot` tool result.

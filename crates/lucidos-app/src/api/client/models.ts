@@ -38,6 +38,7 @@ export function createModel(body: {
   sort_order?: number;
   context_window?: number;
   routes?: RouteInput[];
+  vision?: boolean;
 }): Promise<ApiResult> {
   return json(`${API}/models`, {
     method: 'POST',
@@ -60,6 +61,7 @@ export function updateModel(
     context_window?: number | null;
     routes?: RouteInput[];
     preferred_provider?: string | null;
+    vision?: boolean;
   }
 ): Promise<ApiResult> {
   return json(`${API}/models?id=${encodeURIComponent(id)}`, {

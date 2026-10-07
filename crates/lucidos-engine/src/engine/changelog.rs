@@ -106,17 +106,32 @@ pub async fn changelog_releases() -> Vec<ChangelogRelease> {
 /// an old branch's changelog, a truncated download, and a page of HTML from
 /// whatever answered instead of the file. `baked` needs no check, since a binary
 /// always contains the release it reports.
+///
+/// A release the chosen copy left undated takes its date from any other copy.
+/// The published copy is frozen at its release, so a heading dated on `main`
+/// afterwards would otherwise stay blank until the next one. Only a blank is
+/// filled, so no copy can overwrite the chosen one's date.
 fn select_releases(
     published: Option<Vec<ChangelogRelease>>,
     checkout: Option<Vec<ChangelogRelease>>,
     baked: Vec<ChangelogRelease>,
     running: &str,
 ) -> Vec<ChangelogRelease> {
-    [published, checkout]
-        .into_iter()
-        .flatten()
-        .find(|candidate| candidate.iter().any(|r| r.version == running))
-        .unwrap_or(baked)
+    let mut candidates: Vec<Vec<ChangelogRelease>> =
+        [published, checkout].into_iter().flatten().collect();
+    let trusted = candidates
+        .iter()
+        .position(|candidate| candidate.iter().any(|r| r.version == running));
+    candidates.push(baked);
+    let mut chosen = candidates.remove(trusted.unwrap_or(candidates.len() - 1));
+    for release in chosen.iter_mut().filter(|r| r.date.is_none()) {
+        release.date = candidates
+            .iter()
+            .flatten()
+            .filter(|other| other.version == release.version)
+            .find_map(|other| other.date.clone());
+    }
+    chosen
 }
 
 /// The checkout's `CHANGELOG.md`, or `None` on an install without one.
@@ -375,6 +390,39 @@ mod tests {
             "1.0.0",
         );
         assert_eq!(versions(&chosen), ["1.0.0", "0.9.0"]);
+    }
+
+    fn dated(version: &str, date: &str) -> ChangelogRelease {
+        ChangelogRelease {
+            date: Some(date.to_string()),
+            ..release(version)
+        }
+    }
+
+    /// The published copy is frozen at its release, so a heading dated on
+    /// `main` afterwards would stay blank in the panel until the next release.
+    #[test]
+    fn a_date_the_chosen_copy_lacks_is_filled_from_another_copy() {
+        let chosen = select_releases(
+            Some(vec![dated("2.0.0", "2026-02-01"), release("1.0.0")]),
+            Some(vec![release("1.0.0")]),
+            vec![dated("1.0.0", "2026-01-01")],
+            "1.0.0",
+        );
+        assert_eq!(chosen[0].date.as_deref(), Some("2026-02-01"));
+        assert_eq!(chosen[1].date.as_deref(), Some("2026-01-01"));
+    }
+
+    /// Only a blank is filled. The chosen copy's own date stands.
+    #[test]
+    fn a_date_the_chosen_copy_has_is_never_overwritten() {
+        let chosen = select_releases(
+            Some(vec![dated("1.0.0", "2026-01-02")]),
+            Some(vec![dated("1.0.0", "2026-01-01")]),
+            vec![release("1.0.0")],
+            "1.0.0",
+        );
+        assert_eq!(chosen[0].date.as_deref(), Some("2026-01-02"));
     }
 
     /// What a captive portal or a soft-404 answers with. It parses to no

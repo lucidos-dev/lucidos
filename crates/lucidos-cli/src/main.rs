@@ -398,14 +398,21 @@ enum Command {
         #[command(subcommand)]
         action: generated::ThreadQueueCmd,
     },
-    /// Read long-term memory — `stats` (index counts), `entries` (paginated
-    /// long-term-memory entries), or `source` (the originating event/artifact for
-    /// one memory). Generated from the capability parity manifest; routed through
-    /// the gateway-safe HTTP client. (Correcting memory is the chat agent's
-    /// grouped `memory` tool; reading is the agent's injected context.)
+    /// Read long-term memory: `stats` (index counts), `entries` (paginated
+    /// long-term-memory entries), `search`, or `source` (the originating
+    /// event/artifact for one memory). Generated from the capability parity
+    /// manifest; routed through the gateway-safe HTTP client.
     Memory {
         #[command(subcommand)]
         action: generated::MemoryCmd,
+    },
+    /// The Tree memory module's recall tools. `zoom` opens a memory view line
+    /// and `find` walks the workspace tree for a query. `search` finds exact
+    /// words, and `date` says when a line's entries happened. Generated from
+    /// the capability parity manifest.
+    Recall {
+        #[command(subcommand)]
+        action: generated::RecallCmd,
     },
     /// Manage non-secret environment variables injected into every subprocess
     /// Lucidos spawns — `list`, `set --name N --value V`, or `delete --name N`.
@@ -654,9 +661,9 @@ enum ThreadsCmd {
     /// Move a child thread to top level, so its parent stops waiting for it.
     ///
     /// The child keeps running and finishes on its own. It is not stopped,
-    /// and no work is lost. Its former parent gets no result from it, cannot
-    /// follow up on it, and does not get the child slot back. The move cannot
-    /// be undone.
+    /// and no work is lost. Its former parent gets no result from it and
+    /// cannot follow up on it. It holds the parent's child slot until it
+    /// finishes. The move cannot be undone.
     ///
     /// From inside a Lucidos thread you can only move your own DIRECT
     /// children: the engine reads the calling thread from the origin token
@@ -722,7 +729,8 @@ enum BackgroundTaskCmd {
         /// The id `run` printed.
         task_id: String,
     },
-    /// Stop a running task. Its completion is still recorded, as killed.
+    /// Stop a running task. Its completion is still recorded, as killed, but
+    /// it does not re-open this thread.
     Stop {
         /// The id `run` printed.
         task_id: String,
@@ -994,6 +1002,11 @@ pub(crate) struct SpawnThreadArgs {
     /// Task prompt for the new thread. Must be self-contained.
     #[arg(long)]
     pub(crate) message: String,
+    /// Image file to attach to the message. Repeat for several. The target
+    /// engine checks each one's format and fits its size exactly as it does
+    /// for an image attached in the app.
+    #[arg(long = "image", value_name = "PATH")]
+    pub(crate) images: Vec<PathBuf>,
     /// Optional thread title (shown in the target workspace's UI).
     #[arg(long)]
     pub(crate) title: Option<String>,
@@ -1066,7 +1079,9 @@ pub(crate) struct SpawnThreadArgs {
 enum HardenedCmd {
     /// Mark the current branch (in $PWD) as hardened at its current HEAD.
     /// Resolves repo_root, branch, and HEAD SHA from git, then POSTs to the
-    /// parent engine's `/api/v1/internal/mark-hardened`.
+    /// parent engine's `/api/v1/internal/mark-hardened`. From a coding-agent
+    /// session it also stops the thread's leftover background tasks, and
+    /// prints them and every wait still live.
     Mark,
     /// Print the hardening state of the current branch (in $PWD): `FRESH`,
     /// `STALE`, or `MISSING`. GETs `/api/v1/internal/hardened-state`. Used by
@@ -1675,6 +1690,21 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::Memory { action } => {
             let ws = resolve_from_env()?;
             generated::dispatch_memory(&ws, action)?;
+            Ok(0)
+        }
+        Command::Recall { mut action } => {
+            let ws = resolve_from_env()?;
+            // A coding agent names its own thread, so a bare id resolves there
+            // and a find files its cost there.
+            if let generated::RecallCmd::Zoom { thread, .. }
+            | generated::RecallCmd::Find { thread, .. }
+            | generated::RecallCmd::Date { thread, .. } = &mut action
+            {
+                if thread.is_none() {
+                    *thread = std::env::var("LUCIDOS_THREAD_ID").ok();
+                }
+            }
+            generated::dispatch_recall(&ws, action)?;
             Ok(0)
         }
         Command::EnvVars { action } => {

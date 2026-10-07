@@ -7,6 +7,7 @@ export * from './client/chat';
 export * from './client/changes';
 export * from './client/apps';
 export * from './client/data';
+export * from './client/fileUrls';
 export * from './client/fonts';
 export * from './client/frontendPreview';
 export * from './client/triggers';

@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use lucidos_engine::core::preference_catalog;
+use lucidos_engine::core::prefs::{self, Pref, Text};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -303,13 +303,13 @@ pub struct PricesFile {
     pub model: Vec<ModelPrice>,
 }
 
-/// Preference keys naming a model the eval's own workload runs on.
+/// Preferences naming a model the eval's own workload runs on.
 ///
-/// The seed writes `chat_model` and deletes every other preference row, so each
-/// of these falls back to the catalog's default. Two are deliberately absent:
-/// `model_conversation_summary` inherits `model_memory` rather than naming a
-/// model, and `model_image_description` fires on an upload no task makes.
-const AUXILIARY_MODEL_KEYS: [&str; 2] = ["model_title", "model_memory"];
+/// The seed writes `chat_model`, pins the memory tasks to
+/// `prefs::BACKGROUND_MODEL`, and deletes every other preference row. So each
+/// of these falls back to the catalog's default. `model_image_description` is
+/// deliberately absent: it fires on an upload no task makes.
+const AUXILIARY_MODELS: [&Pref<Text>; 1] = [&prefs::MODEL_TITLE];
 
 /// Per-million-token prices for one model, pinned so a result is reproducible.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -407,15 +407,10 @@ impl Fixture {
     /// changed it.
     pub fn check_models_priced(&self, under_test: &str) -> Fallible<()> {
         let mut wanted = BTreeSet::from([under_test.to_string()]);
-        for key in AUXILIARY_MODEL_KEYS {
-            let spec = preference_catalog::lookup(key).ok_or_else(|| {
-                format!(
-                    "the engine's preference catalog no longer states {key:?}, so the harness \
-                     cannot tell which model the auxiliary calls will bill"
-                )
-            })?;
-            wanted.insert(spec.default.to_string());
+        for pref in AUXILIARY_MODELS {
+            wanted.insert(pref.default_text().to_string());
         }
+        wanted.insert(prefs::BACKGROUND_MODEL.to_string());
         let missing: Vec<&str> = wanted
             .iter()
             .map(String::as_str)
@@ -549,10 +544,11 @@ fn rendered_assertion(label: &str, assertion: Option<&Assertion>) -> Option<(Str
 
 /// Words no criterion may contain (ADR 0110 decision 5).
 ///
-/// Every one names an internal of the context mode: a verb, a surface it
-/// renders, or a route the retired outcome vocabulary attributed a pass to. A
-/// criterion that says any of them is scoring the mechanism rather than the
-/// work, and it stops meaning anything the day the mechanism changes.
+/// Every one names an internal of the context mode or the Tree memory module:
+/// a verb, a surface it renders, or a route the retired outcome vocabulary
+/// attributed a pass to. A criterion that says any of them is scoring the
+/// mechanism rather than the work. It stops meaning anything the day the
+/// mechanism changes.
 ///
 /// Matched case-insensitively, and deliberately as PHRASES where the bare word
 /// is ordinary English. The seeded corpus lives in `artifacts/ledger-migration`
@@ -561,7 +557,7 @@ fn rendered_assertion(label: &str, assertion: Option<&Assertion>) -> Option<(Str
 /// A RETIRED internal stays on the list. A criterion naming one scores a
 /// mechanism that is gone, so it reads 0 for every arm. The run then reports
 /// a difference nobody made.
-pub const BANNED_MECHANISM_TOKENS: [&str; 14] = [
+pub const BANNED_MECHANISM_TOKENS: [&str; 18] = [
     "keep open",
     "keep_open",
     "working understanding",
@@ -576,6 +572,10 @@ pub const BANNED_MECHANISM_TOKENS: [&str; 14] = [
     "scratchpad",
     "keep_in_context",
     "dismiss_from_context",
+    "summary tree",
+    "memory view",
+    "view snapshot",
+    "compactor",
 ];
 
 impl Fixture {
@@ -1138,18 +1138,39 @@ mod tests {
         assert!(error.contains("prices.toml has no row"), "{error}");
     }
 
-    /// The keys are read off the engine's catalog, so one that was renamed has
-    /// to fail here rather than quietly price nothing.
+    /// Each auxiliary default names a model of its own. One that came to
+    /// inherit another key would price that key's model under this one's name.
     #[test]
     fn every_auxiliary_model_key_still_names_a_model() {
-        for key in AUXILIARY_MODEL_KEYS {
-            let spec = preference_catalog::lookup(key)
-                .unwrap_or_else(|| panic!("the catalog no longer states {key:?}"));
+        for pref in AUXILIARY_MODELS {
             assert!(
-                !spec.default.starts_with('('),
-                "{key} now inherits another key rather than naming a model: {}",
-                spec.default
+                matches!(pref.spec.default, prefs::PrefDefault::Value(_)),
+                "{} now inherits another key rather than naming a model: {}",
+                pref.key(),
+                pref.spec.default_label()
             );
+        }
+    }
+
+    /// The memory tasks resolve their default from the host's providers, so the
+    /// seed pins each one, by key, to the priced background model. SQL cannot
+    /// import the catalog, so this pins the spelling: a renamed key unpins it.
+    #[test]
+    fn the_seed_pins_every_memory_task_to_the_background_model() {
+        let seed = std::fs::read_to_string(fixture_root().join("fixtures/seed.sql"))
+            .expect("the checked-in seed");
+        for pref in [
+            &prefs::MODEL_MEMORY,
+            &prefs::MODEL_QUERY_CLASSIFICATION,
+            &prefs::MODEL_CONVERSATION_SUMMARY,
+            &prefs::MODEL_MEMORY_FIND,
+        ] {
+            let row = format!("('{}',", pref.key());
+            let line = seed
+                .lines()
+                .find(|line| line.trim_start().starts_with(&row))
+                .unwrap_or_else(|| panic!("seed.sql does not pin {}", pref.key()));
+            assert!(line.contains(":'background_model'"), "{line}");
         }
     }
 

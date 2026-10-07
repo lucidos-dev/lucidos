@@ -239,8 +239,8 @@ async fn a_required_user_actor_reaches_the_persisted_system_event() {
 // project-cascades-into-parent, capture-aggregate-must-stay-in-tx, broadcast-
 // fires-only-after-commit. The two tests below pin both halves of the contract:
 //
-//   1. `emit_pipeline_has_five_named_phases_in_order` — a source-level check
-//      that the five `// === Phase: <Name> ===` banners exist inside
+//   1. `emit_pipeline_has_six_named_phases_in_order` — a source-level check
+//      that the six `// === Phase: <Name> ===` banners exist inside
 //      `event_bus/mod.rs` in the documented order. Catches the case where someone
 //      adds a chunk of code outside a declared phase, or reorders the phases.
 //
@@ -251,16 +251,17 @@ async fn a_required_user_actor_reaches_the_persisted_system_event() {
 //      someone moves the broadcast send before `tx.commit()`, or captures the
 //      aggregate from a pre-projection read.
 // ---------------------------------------------------------------------------
-/// Parse `event_bus/mod.rs` at compile time and assert the five phase banners
+/// Parse `event_bus/mod.rs` at compile time and assert the six phase banners
 /// inside `EventBus::emit` appear in the documented order. Drift triggers
 /// here before the behavioural test or production code can mask it.
 ///
 /// Adding a new phase: update both the source banners and `EXPECTED` here,
 /// and document the phase in the `EventBus` struct doc-comment.
 #[test]
-fn emit_pipeline_has_five_named_phases_in_order() {
+fn emit_pipeline_has_six_named_phases_in_order() {
     const SOURCE: &str = include_str!("../event_bus/mod.rs");
     const EXPECTED: &[&str] = &[
+        "Serialize",
         "Validate",
         "Persist",
         "Project",

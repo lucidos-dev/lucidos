@@ -390,9 +390,12 @@ pub fn detect_agent_binary(agent: CodingAgent, override_path: Option<&str>) -> A
         let (label, pref_key) = match agent {
             CodingAgent::ClaudeCode => (
                 "Claude Code (`claude`)",
-                crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
+                crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
             ),
-            CodingAgent::Codex => ("Codex (`codex`)", crate::core::PREF_CODING_AGENT_CODEX_PATH),
+            CodingAgent::Codex => (
+                "Codex (`codex`)",
+                crate::core::prefs::CODING_AGENT_CODEX_PATH.key(),
+            ),
         };
         return match spawn_env::resolve_binary_override(raw, label, pref_key) {
             Ok(p) => AgentBinaryStatus {
@@ -931,7 +934,7 @@ mod tests {
             status
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("coding_agent_claude_path")),
+                .is_some_and(|e| e.contains(crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key())),
             "the spawn-failure message naming the preference must survive"
         );
         assert_eq!(status.version, None);

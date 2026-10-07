@@ -13,6 +13,7 @@
 mod analyse;
 mod arm;
 mod assertions;
+mod calls;
 mod config;
 mod driver;
 #[cfg(feature = "fixture-gen")]
@@ -93,9 +94,14 @@ enum Command {
         /// it from the model id, which is that model's real window.
         #[arg(long)]
         window: Option<i64>,
-        /// Resume into an existing results file rather than starting one.
+        /// Resume into an existing results file rather than starting one. A
+        /// repeat cut at a task boundary continues in the workspaces it left.
         #[arg(long)]
         run_id: Option<String>,
+        /// End this invocation after this task. The same command with a later
+        /// task, or none, continues the repeat without reseeding.
+        #[arg(long)]
+        stop_after: Option<String>,
     },
     /// Resolve every probe for a finished run and append the probe rows.
     Score {
@@ -210,7 +216,7 @@ async fn dispatch() -> Fallible<()> {
             let arms = selected_arms(&arms)?;
             seed_repeat(
                 &paths,
-                repeat,
+                checked_repeat(repeat)?,
                 &arms,
                 checked_window(window)?,
                 SweepPins::from_env()?,
@@ -226,6 +232,7 @@ async fn dispatch() -> Fallible<()> {
             arms,
             window,
             run_id,
+            stop_after,
         } => {
             let paths = Paths::resolve()?;
             let fixture = Fixture::load(&paths.fixture_root)?;
@@ -237,13 +244,14 @@ async fn dispatch() -> Fallible<()> {
                 &fixture,
                 RunShape {
                     config,
-                    repeats,
+                    repeats: checked_repeat(repeats)?,
                     arms: selected_arms(&arms)?,
                     window: checked_window(window)?,
                     sweep: SweepPins::from_env()?,
                 },
                 tasks,
                 run_id,
+                stop_after,
             )
             .await
         }
@@ -282,8 +290,13 @@ async fn dispatch() -> Fallible<()> {
         }
         Command::Report { run_id } => {
             let paths = Paths::resolve()?;
+            let fixture = Fixture::load(&paths.fixture_root)?;
             let analysis = analyse::analyse(&read_runs(&paths, &run_id)?)?;
-            print_report(&analysis, &trims_by_pass(&paths, &run_id).await?);
+            print_report(
+                &analysis,
+                &trims_by_pass(&paths, &run_id).await?,
+                &calls_by_arm(&paths, &run_id, &fixture).await?,
+            );
             Ok(())
         }
     }
@@ -307,7 +320,7 @@ struct RunShape {
 fn selected_arms(names: &[String]) -> Fallible<Vec<Arm>> {
     let mut arms: Vec<Arm> = Vec::new();
     for name in names {
-        let known = Arm::BOTH
+        let known = Arm::ALL
             .iter()
             .map(|arm| arm.as_str())
             .collect::<Vec<_>>()
@@ -323,6 +336,19 @@ fn selected_arms(names: &[String]) -> Fallible<Vec<Arm>> {
         return Err("name at least one arm".into());
     }
     Ok(arms)
+}
+
+/// Refuse a repeat whose arm names would not fit a Postgres identifier.
+fn checked_repeat(repeat: u32) -> Fallible<u32> {
+    match repeat <= workspace::MAX_REPEAT {
+        true => Ok(repeat),
+        false => Err(format!(
+            "repeat {repeat} is above {}, and an arm's database name would no longer fit \
+             a Postgres identifier",
+            workspace::MAX_REPEAT
+        )
+        .into()),
+    }
 }
 
 /// Refuse a window whose message budget collapses (ADR 0110 decision 11).
@@ -379,6 +405,7 @@ fn seed_pins(window: Option<i64>) -> workspace::SeedPins<'static> {
         model_label: leak_env("LUCIDOS_EVAL_MODEL_LABEL", "Model under test"),
         model_provider: leak_env("LUCIDOS_EVAL_MODEL_PROVIDER", "vertex"),
         reasoning_effort: leak_env("LUCIDOS_EVAL_REASONING_EFFORT", "default"),
+        background_model: lucidos_engine::core::prefs::BACKGROUND_MODEL,
         context_window: window,
     }
 }
@@ -575,6 +602,7 @@ async fn run_command(
     shape: RunShape,
     tasks: Option<Vec<String>>,
     run_id: Option<String>,
+    stop_after: Option<String>,
 ) -> Fallible<()> {
     let run_id = run_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     let file = ResultsFile::open(&paths.results_dir, &run_id)?;
@@ -592,6 +620,17 @@ async fn run_command(
             })
             .collect::<Fallible<Vec<_>>>()?,
         None => fixture.tasks.iter().collect(),
+    };
+    // One past the last task this invocation drives in its repeat.
+    let end = match &stop_after {
+        Some(id) => {
+            selected
+                .iter()
+                .position(|task| &task.id == id)
+                .ok_or_else(|| format!("--stop-after {id} is not one of this run's tasks"))?
+                + 1
+        }
+        None => selected.len(),
     };
     let pins = seed_pins(shape.window);
     let under_test = models_under_test(pins.model);
@@ -627,7 +666,7 @@ async fn run_command(
         _ => None,
     }) {
         Some(recorded) => results::check_resume_matches(recorded, &this_run)?,
-        None => file.append(&ResultRow::Run(this_run))?,
+        None => file.append(&ResultRow::Run(this_run.clone()))?,
     }
 
     for repeat in 1..=shape.repeats {
@@ -635,23 +674,68 @@ async fn run_command(
             println!("[eval] repeat {repeat} is already complete, skipping");
             continue;
         }
-        run_repeat(paths, fixture, &file, &run_id, repeat, &selected, &shape).await?;
+        let progress = results::repeat_progress(&existing, &this_run, repeat)?;
+        if progress.reached >= end {
+            return Err(format!(
+                "repeat {repeat} already ran past {}, so this invocation has nothing to drive. \
+                 Name a later --stop-after.",
+                selected[end - 1].id
+            )
+            .into());
+        }
+        let stretch = Stretch {
+            repeat,
+            tasks: &selected[..end],
+            progress,
+        };
+        run_repeat(paths, fixture, &file, &run_id, stretch, &shape).await?;
+        // A stop ends the invocation, the last task included: the next repeat
+        // is the next invocation's work.
+        if let Some(last) = &stop_after {
+            println!(
+                "[eval] stopped after {last} in repeat {repeat}. The same command continues \
+                 from there, with a later --stop-after or none"
+            );
+            break;
+        }
     }
     println!("[eval] results at {}", file.path().display());
     Ok(())
 }
 
-/// One repeat: every named arm, every task, interleaved.
+/// The part of one repeat this invocation drives.
+struct Stretch<'a> {
+    repeat: u32,
+    /// The run's tasks, up to the `--stop-after` one.
+    tasks: &'a [&'a Task],
+    /// Where earlier invocations left this repeat.
+    progress: results::RepeatProgress,
+}
+
+/// One repeat: every named arm, every task from where earlier invocations
+/// left off, interleaved.
 async fn run_repeat(
     paths: &Paths,
     fixture: &Fixture,
     file: &ResultsFile,
     run_id: &str,
-    repeat: u32,
-    tasks: &[&Task],
+    stretch: Stretch<'_>,
     shape: &RunShape,
 ) -> Fallible<()> {
-    seed_repeat(paths, repeat, &shape.arms, shape.window, shape.sweep).await?;
+    let Stretch {
+        repeat,
+        tasks,
+        progress,
+    } = stretch;
+    // Never empty: the caller refuses a stretch that already ran to its end.
+    let remaining = &tasks[progress.reached..];
+    match progress.reached {
+        0 => seed_repeat(paths, repeat, &shape.arms, shape.window, shape.sweep).await?,
+        _ => println!(
+            "[eval] repeat {repeat} continues at {} in the workspaces an earlier invocation left",
+            remaining[0].id
+        ),
+    }
     let mut engines = Vec::new();
     let mut endpoints = Vec::new();
     let booted = boot_arms(paths, repeat, &shape.arms, &mut engines, &mut endpoints).await;
@@ -661,7 +745,24 @@ async fn run_repeat(
     // engine keeps writing to a workspace the next seed clears, and holds a
     // database that seed force-drops.
     let outcome = match booted {
-        Ok(()) => drive_repeat(fixture, file, run_id, repeat, tasks, &endpoints).await,
+        Ok(()) => {
+            async {
+                let next = &remaining[0].id;
+                check_workspaces_resumable(&endpoints, &progress, run_id, repeat, next).await?;
+                await_tree_backfill(&endpoints).await?;
+                drive_repeat(
+                    fixture,
+                    file,
+                    run_id,
+                    repeat,
+                    remaining,
+                    progress.failed,
+                    &endpoints,
+                )
+                .await
+            }
+            .await
+        }
         Err(error) => Err(error),
     };
     let stop_failures: Vec<String> = engines
@@ -710,6 +811,67 @@ async fn boot_arms(
     Ok(())
 }
 
+/// Wait until every Tree arm's engine reports its trees ready.
+///
+/// Before the first task, and never inside it, so no Tree arm is scored while
+/// the engine still serves it Classic (ADR 0362 I7).
+async fn await_tree_backfill(endpoints: &[(Arm, PathBuf, ArmEndpoint)]) -> Fallible<()> {
+    for (arm, _, endpoint) in endpoints {
+        if !arm.expects_tree_memory() {
+            continue;
+        }
+        let waited = std::time::Instant::now();
+        if !driver::wait_until_tree_ready(&endpoint.pool).await {
+            return Err(format!(
+                "tree_not_ready: the {arm} arm's engine never reported its summary trees ready, \
+                 so every turn would run Classic under a Tree label. Read its engine log."
+            )
+            .into());
+        }
+        println!(
+            "[eval] {arm} arm: summary trees ready after {}s",
+            waited.elapsed().as_secs()
+        );
+    }
+    Ok(())
+}
+
+/// Refuse to drive `next` in a workspace that is not as the results file says.
+///
+/// Two ways it can differ. Workspaces are named after the run label, not the
+/// run, so another run under the same label reseeds them. And an invocation
+/// killed while driving `next` leaves its thread behind with no row written.
+async fn check_workspaces_resumable(
+    endpoints: &[(Arm, PathBuf, ArmEndpoint)],
+    progress: &results::RepeatProgress,
+    run_id: &str,
+    repeat: u32,
+    next: &str,
+) -> Fallible<()> {
+    for (arm, _, endpoint) in endpoints {
+        if let Some(thread_id) = progress.last_threads.get(arm) {
+            if !driver::thread_exists(&endpoint.pool, *thread_id).await? {
+                return Err(format!(
+                    "workspace_reseeded: the {arm} arm no longer holds thread {thread_id}, the \
+                     last one this run drove there. Another run under the same label reseeded \
+                     it. Start a new run instead."
+                )
+                .into());
+            }
+        }
+        let marker = driver::task_marker(run_id, repeat, *arm, next);
+        if let Some(thread_id) = driver::find_thread_by_marker(&endpoint.pool, &marker).await? {
+            return Err(format!(
+                "cut_off: the {arm} arm already holds thread {thread_id} for {next}, with no \
+                 row for it, so an earlier invocation stopped inside {next}. Start a new run \
+                 instead."
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Take the port this arm's engine binds, and clear whatever sat on it.
 ///
 /// The registry holds a port once the seed registered the arm. Binding THAT one
@@ -741,24 +903,22 @@ async fn claim_arm_port(arm: Arm, repeat: u32) -> Fallible<u16> {
 /// waiting on.
 const ARM_PORT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Every task of one repeat, in both arms, interleaved per task.
+/// The given tasks of one repeat, in every arm, interleaved per task.
+///
+/// `failed` is a set per arm, because two arms are two worlds. Voiding T05 in
+/// the lean arm because T02 failed in the control arm would throw away a
+/// measurement the lean arm could still make. It arrives holding whatever
+/// earlier invocations of this repeat failed, and has a set for every arm.
 async fn drive_repeat(
     fixture: &Fixture,
     file: &ResultsFile,
     run_id: &str,
     repeat: u32,
     tasks: &[&Task],
+    mut failed: BTreeMap<Arm, BTreeSet<String>>,
     endpoints: &[(Arm, PathBuf, ArmEndpoint)],
 ) -> Fallible<()> {
     let graph = TaskGraph::new(&fixture.tasks);
-    // A failure set per arm, because two arms are two worlds. Voiding T05 in
-    // the lean arm because T02 failed in the control arm would throw away a
-    // measurement the lean arm could still make. Keyed on the arms that ran,
-    // so a single-configuration run carries exactly one set.
-    let mut failed: BTreeMap<Arm, BTreeSet<String>> = endpoints
-        .iter()
-        .map(|(arm, _, _)| (*arm, BTreeSet::new()))
-        .collect();
     for task in tasks {
         // Look the completion probe up once. Neither the scorer nor the row
         // writer should have to cope with a task the loader already guaranteed
@@ -799,6 +959,10 @@ async fn drive_repeat(
                 delivered.insert(*arm, CompletionOutcome::Void);
                 continue;
             }
+            manipulation::check_tree_path(
+                *arm,
+                lucidos_engine::engine::summary_tree::tree_ready(&endpoint.pool).await,
+            )?;
             let marker = driver::task_marker(run_id, repeat, *arm, &task.id);
             let driven = driver::drive_task(
                 endpoint,
@@ -826,12 +990,20 @@ async fn drive_repeat(
                     task.id
                 );
             }
+            let settled = Settled {
+                event_log: event_log_settled,
+                compaction: match arm.expects_tree_memory() {
+                    true => Some(compaction_caught_up(&endpoint.pool, &task.id).await?),
+                    false => None,
+                },
+            };
             // The whole table, not one row. A thread bills the agent on the
             // model under test. Its title and memory work bill the auxiliary
             // default, and each is priced at its own rate.
             let metrics =
                 metrics::collect(&endpoint.pool, driven.thread_id, &fixture.prices).await?;
             gate_manipulation(*arm, &endpoint.pool, driven.thread_id).await?;
+            manipulation::check_no_recall_on_tree(*arm, metrics.memory_recalled)?;
             let handover_lines = handover_line_count(task, workspace_dir);
             retrieved.insert(*arm, metrics.memory_recalled);
             let ended_empty = driven.status == driver::TaskStatus::Empty;
@@ -857,7 +1029,7 @@ async fn drive_repeat(
                 &driven,
                 &metrics,
                 handover_lines,
-                event_log_settled,
+                settled,
             )))?;
         }
         write_pair_verdict(
@@ -981,7 +1153,7 @@ fn write_pair_verdict(
     }
     if !reasons.is_empty() {
         println!("[eval]   voided: {}", reasons.join("; and "));
-        // The arms this run measured, and never `Arm::BOTH`. Every arm that
+        // The arms this run measured, and never `Arm::ALL`. Every arm that
         // reached this point has a delivery entry, blocked ones included. A
         // fixed pair would write void probe rows for an arm nobody ran.
         for arm in outcomes.delivered.keys().copied() {
@@ -1088,6 +1260,27 @@ fn task_answers<'a>(fixture: &'a Fixture, task: &str) -> Option<&'a config::Task
     fixture.answers.iter().find(|entry| entry.task == task)
 }
 
+/// What the harness waited for before it snapshotted a thread.
+#[derive(Debug, Clone, Copy)]
+struct Settled {
+    /// The thread's event log went still.
+    event_log: bool,
+    /// A Tree arm's compactor caught up. `None` on a Classic arm.
+    compaction: Option<bool>,
+}
+
+/// Wait for a Tree arm's compactor, and say so when it ran out of time.
+async fn compaction_caught_up(pool: &PgPool, task: &str) -> Fallible<bool> {
+    let caught_up = driver::wait_until_compacted(pool).await?;
+    if !caught_up {
+        println!(
+            "[eval]   the compactor had not caught up with {task} when its bound arrived, so \
+             the next task reads part-built trees"
+        );
+    }
+    Ok(caught_up)
+}
+
 fn thread_row(
     run_id: &str,
     repeat: u32,
@@ -1095,7 +1288,7 @@ fn thread_row(
     driven: &DrivenTask,
     metrics: &metrics::ThreadMetrics,
     handover_lines: Option<i64>,
-    event_log_settled: bool,
+    settled: Settled,
 ) -> ThreadRow {
     let combined = metrics.tokens.combined();
     ThreadRow {
@@ -1110,7 +1303,7 @@ fn thread_row(
         input_total: combined.input_total,
         output_tokens: combined.output_tokens,
         auxiliary_tokens: metrics.tokens.auxiliary(),
-        event_log_settled: Some(event_log_settled),
+        event_log_settled: Some(settled.event_log),
         todo_writes: metrics.todo_writes,
         document_writes: metrics.document.writes,
         writes_with_a_tool_call: metrics.document.writes_with_a_tool_call,
@@ -1131,7 +1324,10 @@ fn thread_row(
         memory_recalled: metrics.memory_recalled,
         empty_completions: driven.empty_completions as i64,
         empty_retries: driven.empty_retries as i64,
+        refusals: driven.refusals as i64,
+        refusal_retries: driven.refusal_retries as i64,
         followup_sequence: driven.followup_sequence,
+        compaction_caught_up: settled.compaction,
     }
 }
 
@@ -1553,7 +1749,7 @@ fn trigger_intent(payload: &str) -> Option<String> {
 /// A reader should be able to answer "what did this run do" from the first
 /// block, without holding a second configuration in their head. ADR 0110
 /// decision 2.
-fn print_report(analysis: &analyse::Analysis, trims: &Trims) {
+fn print_report(analysis: &analyse::Analysis, trims: &Trims, calls: &[ArmCalls]) {
     println!(
         "Context-handling benchmark, {} run",
         analysis.config.as_str()
@@ -1568,6 +1764,7 @@ fn print_report(analysis: &analyse::Analysis, trims: &Trims) {
     }
     print_pairs(&analysis.pairs);
     print_empty_completions(&analysis.empty_completions);
+    print_refusals(&analysis.refusals);
 
     for result in &analysis.configurations {
         print_configuration(result);
@@ -1576,6 +1773,7 @@ fn print_report(analysis: &analyse::Analysis, trims: &Trims) {
         print_sweep(sweep);
     }
     print_trims(trims);
+    print_calls(calls);
     for comparison in &analysis.comparisons {
         print_comparison(comparison);
     }
@@ -1584,6 +1782,98 @@ fn print_report(analysis: &analyse::Analysis, trims: &Trims) {
             "\nOne configuration, so nothing is compared. Run a second window for a sweep, or \
              a second arm for a side by side."
         );
+    }
+}
+
+/// One arm database's model calls, as the report prints them.
+struct ArmCalls {
+    arm: Arm,
+    repeat: u32,
+    /// `None` once a later run has re-seeded the database.
+    by_purpose: Option<Vec<calls::PurposeCalls>>,
+    /// A Tree arm's nodes. `None` on a Classic arm.
+    tree: Option<calls::TreeNodes>,
+}
+
+/// Every model call each arm database of the named runs made.
+///
+/// A database still holding none of its run's threads was re-seeded by a later
+/// run. Its calls belong to that run, so it is reported unreadable rather than
+/// counted here.
+async fn calls_by_arm(
+    paths: &Paths,
+    run_ids: &[String],
+    fixture: &Fixture,
+) -> Fallible<Vec<ArmCalls>> {
+    let labels = RunLabels::read(paths, run_ids)?;
+    let mut one_thread: BTreeMap<(String, Arm, u32), uuid::Uuid> = BTreeMap::new();
+    for thread in threads_of(paths, run_ids)? {
+        one_thread
+            .entry((thread.run_id, thread.arm, thread.repeat))
+            .or_insert(thread.thread_id);
+    }
+    let mut arms = Vec::new();
+    for ((run_id, arm, repeat), thread_id) in one_thread {
+        let mut found = ArmCalls {
+            arm,
+            repeat,
+            by_purpose: None,
+            tree: None,
+        };
+        if let Ok(pool) = arm_pool(paths, labels.of(&run_id), arm, repeat).await {
+            if metrics::highest_sequence(&pool, thread_id).await? > 0 {
+                found.by_purpose = Some(calls::by_purpose(&pool, &fixture.prices).await?);
+                if arm.expects_tree_memory() {
+                    found.tree = Some(calls::tree_nodes(&pool).await?);
+                }
+            }
+        }
+        arms.push(found);
+    }
+    Ok(arms)
+}
+
+/// Every model call per arm, compactor included, by purpose and model.
+fn print_calls(arms: &[ArmCalls]) {
+    println!("\n== model calls, whole workspace ==");
+    for arm in arms {
+        println!("  {} arm, repeat {}", arm.arm, arm.repeat);
+        let Some(groups) = &arm.by_purpose else {
+            println!("    unreadable: a later run re-seeded this database");
+            continue;
+        };
+        println!(
+            "    {:<22} {:<24} {:>6} {:>10} {:>8} {:>11} {:>11} {:>8}",
+            "purpose", "model", "calls", "fresh in", "out", "cache read", "cache write", "usd"
+        );
+        for group in groups {
+            let input = group.counts.input_split();
+            println!(
+                "    {:<22} {:<24} {:>6} {:>10} {:>8} {:>11} {:>11} {:>8.2}",
+                group.purpose,
+                group.model,
+                group.calls,
+                input.fresh(),
+                group.counts.output_tokens,
+                input.cache_read(),
+                input.cache_creation(),
+                group.usd
+            );
+        }
+        let auxiliary: Vec<&calls::PurposeCalls> = calls::auxiliary(groups).collect();
+        println!(
+            "    {} call(s), {} of them auxiliary at ${:.2}, ${:.2} in all",
+            groups.iter().map(|g| g.calls).sum::<i64>(),
+            auxiliary.iter().map(|g| g.calls).sum::<i64>(),
+            auxiliary.iter().map(|g| g.usd).sum::<f64>(),
+            groups.iter().map(|g| g.usd).sum::<f64>()
+        );
+        if let Some(tree) = arm.tree {
+            println!(
+                "    summary tree nodes   {} written by a model, {} stored verbatim",
+                tree.written, tree.free
+            );
+        }
     }
 }
 
@@ -1865,7 +2155,7 @@ fn print_pairs(pairs: &analyse::PairCensus) {
 ///
 /// Always printed, so a zero is a measurement rather than a missing line. The
 /// warning is what stops an unrecovered one reading as a clean run.
-fn print_empty_completions(empty: &analyse::EmptyCompletions) {
+fn print_empty_completions(empty: &analyse::RepostTally) {
     println!(
         "  empty completions  {} attempt(s) with no text and no tool call, {} re-posted",
         empty.turns, empty.retries
@@ -1880,6 +2170,36 @@ fn print_empty_completions(empty: &analyse::EmptyCompletions) {
              figure below covers the tasks that ran.",
             empty.unrecovered_threads
         );
+    }
+}
+
+/// Turns the provider refused with no output, per arm and then per task.
+///
+/// Every arm gets a line, so a zero is a measurement. A refusal a re-post
+/// recovered leaves no other trace in the report, which is why it is here.
+fn print_refusals(refusals: &[analyse::ArmRefusals]) {
+    println!("  refusals           turns refused with no output, every attempt counted");
+    for arm in refusals {
+        let total = &arm.total;
+        println!(
+            "    {:<17}{} refused, {} re-posted, {} thread(s) recovered, {} never did",
+            arm.arm.to_string(),
+            total.turns,
+            total.retries,
+            total.recovered_threads,
+            total.unrecovered_threads
+        );
+        for task in &arm.by_task {
+            let tally = &task.tally;
+            println!(
+                "      {:<15}{} refused, {} re-posted, {} thread(s) recovered, {} never did",
+                task.task,
+                tally.turns,
+                tally.retries,
+                tally.recovered_threads,
+                tally.unrecovered_threads
+            );
+        }
     }
 }
 

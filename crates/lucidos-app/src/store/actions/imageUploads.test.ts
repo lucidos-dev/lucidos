@@ -22,6 +22,7 @@ import {
   attachPendingUpload,
   cancelPendingUpload,
   recordStillNeeded,
+  resumePendingUpload,
   retryPendingUpload,
   runPendingUpload,
   stateAfterFailure,
@@ -47,6 +48,7 @@ import {
 const pendingUploadsMap = () => pendingUploads.value;
 import { connectionStatus, threadMap, toasts } from '../store';
 import { getDraft, patchDraft, _resetComposeDraftsForTesting } from '../composeDrafts';
+import { noteImageLanded, _resetLandedImagesForTesting } from '../landedImages';
 import { _resetSessionBlobUrlsForTesting } from '../../components/chat/pastedImages';
 import { makeOptimisticThreadState, type ThreadState } from '../thread-events';
 
@@ -54,7 +56,7 @@ const THREAD = 't-1';
 const transportDrop = () => new TypeError('Failed to fetch');
 const refusal = (code: number, reason: string) => new ApiError(code, reason);
 
-function addEntry(localId = 'u-1'): void {
+function addEntry(localId = 'u-1', contentHash?: string): void {
   addPendingUpload({
     localId,
     threadId: THREAD,
@@ -62,8 +64,12 @@ function addEntry(localId = 'u-1'): void {
     mime: 'image/png',
     state: { kind: 'uploading', sentBytes: 0, totalBytes: 3 },
     file: new File([new Uint8Array([1, 2, 3])], 'a.png', { type: 'image/png' }),
+    contentHash,
   });
 }
+
+/** SHA-256 of the bytes [1, 2, 3], as the engine's `compute_hash` names them. */
+const HASH_123 = '039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81';
 
 function stateOf(localId = 'u-1'): PendingUploadState | undefined {
   return getPendingUpload(THREAD, localId)?.state;
@@ -256,6 +262,159 @@ describe('runPendingUpload', () => {
   });
 });
 
+describe('landing on the ImageUploaded event', () => {
+  const originalFetch = globalThis.fetch;
+
+  /** An upload the engine took but whose answer never reaches the page. It
+   *  rejects on abort, as `postWithUploadProgress` does. `answer` lands the
+   *  late answer anyway, for the race where it loses to the event. */
+  function lostAnswer(): { answer: (hash: string) => void; signal: () => AbortSignal | undefined } {
+    let answer!: (v: { hash: string; mime: string; byte_size: number }) => void;
+    let signal: AbortSignal | undefined;
+    vi.mocked(uploadThreadBlob).mockImplementation((_t, _f, observer?: UploadObserver) => {
+      signal = observer?.signal;
+      return new Promise((resolve, reject) => {
+        answer = resolve;
+        signal?.addEventListener('abort', () => reject(new DOMException('Upload cancelled', 'AbortError')));
+      });
+    });
+    return { answer: (hash) => answer({ hash, mime: 'image/png', byte_size: 3 }), signal: () => signal };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    globalThis.fetch = vi.fn(async () => new Response(null, { status: 204 })) as unknown as typeof fetch;
+    connectionStatus.value = 'connected';
+    seedThread();
+    toasts.value = [];
+    _resetPendingUploadRecordsForTesting();
+    vi.mocked(uploadThreadBlob).mockReset();
+    vi.mocked(awaitThreadStarted).mockReset().mockImplementation(async () => {});
+    vi.mocked(isThreadStartPending).mockReset().mockReturnValue(false);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    _resetLandedImagesForTesting();
+    globalThis.fetch = originalFetch;
+    _resetImageUploadRunsForTesting();
+    _resetPendingUploadsForTesting();
+    _resetComposeDraftsForTesting();
+    _resetSessionBlobUrlsForTesting();
+    threadMap.value = new Map();
+    connectionStatus.value = 'disconnected';
+  });
+
+  it('lands an upload whose answer never comes, and uploads nothing again', async () => {
+    const upload = lostAnswer();
+    addEntry('u-1', 'h1');
+    const run = runPendingUpload(THREAD, 'u-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    noteImageLanded(THREAD, 'h1');
+    expect(getDraft(THREAD).image_hashes).toEqual(['h1']);
+    expect(stateOf()).toBeUndefined();
+    expect(upload.signal()?.aborted).toBe(true);
+
+    await run;
+    await vi.runAllTimersAsync();
+    expect(uploadThreadBlob).toHaveBeenCalledTimes(1);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('a late answer after the event changes nothing', async () => {
+    const upload = lostAnswer();
+    addEntry('u-1', 'h1');
+    const run = runPendingUpload(THREAD, 'u-1');
+    await vi.advanceTimersByTimeAsync(0);
+    noteImageLanded(THREAD, 'h1');
+    upload.answer('h1');
+    await run;
+
+    expect(getDraft(THREAD).image_hashes).toEqual(['h1']);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('the event after the answer changes nothing', async () => {
+    vi.mocked(uploadThreadBlob).mockResolvedValue({ hash: 'h1', mime: 'image/png', byte_size: 3 });
+    addEntry('u-1', 'h1');
+    await runPendingUpload(THREAD, 'u-1');
+    noteImageLanded(THREAD, 'h1');
+
+    expect(getDraft(THREAD).image_hashes).toEqual(['h1']);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('lands nothing for another image, or for the same image on another draft', async () => {
+    const upload = lostAnswer();
+    addEntry('u-1', 'h1');
+    void runPendingUpload(THREAD, 'u-1');
+    await vi.advanceTimersByTimeAsync(0);
+
+    noteImageLanded(THREAD, 'h2');
+    noteImageLanded('t-other', 'h1');
+    expect(stateOf()?.kind).toBe('uploading');
+    expect(getDraft(THREAD).image_hashes).toEqual([]);
+    expect(upload.signal()?.aborted).toBe(false);
+  });
+
+  it('a cancelled image is not brought back by its event', async () => {
+    lostAnswer();
+    addEntry('u-1', 'h1');
+    const run = runPendingUpload(THREAD, 'u-1');
+    await vi.advanceTimersByTimeAsync(0);
+    cancelPendingUpload(THREAD, 'u-1');
+    noteImageLanded(THREAD, 'h1');
+    await run;
+
+    expect(getDraft(THREAD).image_hashes).toEqual([]);
+  });
+
+  it('an attached image is named by the hash the engine will give it', async () => {
+    lostAnswer();
+    const bytes = new Uint8Array([1, 2, 3]).buffer;
+    void attachPendingUpload({ threadId: THREAD, file: new File([bytes], 'a.png', { type: 'image/png' }), bytes });
+    await vi.waitFor(() => expect(pendingUploadsMap().get(THREAD)?.[0]?.contentHash).toBe(HASH_123));
+
+    noteImageLanded(THREAD, HASH_123);
+    expect(getDraft(THREAD).image_hashes).toEqual([HASH_123]);
+  });
+
+  it('an event that beats the hash still lands the image once it is hashed', async () => {
+    const upload = lostAnswer();
+    noteImageLanded(THREAD, HASH_123);
+    const bytes = new Uint8Array([1, 2, 3]).buffer;
+    const run = attachPendingUpload({ threadId: THREAD, file: new File([bytes], 'a.png', { type: 'image/png' }), bytes });
+
+    await vi.waitFor(() => expect(getDraft(THREAD).image_hashes).toEqual([HASH_123]));
+    await run;
+    expect(pendingUploadsMap().get(THREAD)).toBeUndefined();
+    expect(upload.signal()?.aborted ?? true).toBe(true);
+  });
+
+  it('a resumed image lands on its event too', async () => {
+    const upload = lostAnswer();
+    const run = resumePendingUpload(THREAD, 'u-9', new File([new Uint8Array([1, 2, 3])], 'a.png', { type: 'image/png' }));
+    await vi.waitFor(() => expect(upload.signal()).toBeDefined());
+
+    noteImageLanded(THREAD, HASH_123);
+    await run;
+    expect(getDraft(THREAD).image_hashes).toEqual([HASH_123]);
+    expect(uploadThreadBlob).toHaveBeenCalledTimes(1);
+  });
+
+  it('without Web Crypto an image carries no hash and still lands on its answer', async () => {
+    // What an insecure context keeps: no `subtle`, no `randomUUID`.
+    const real = globalThis.crypto;
+    vi.stubGlobal('crypto', { getRandomValues: real.getRandomValues.bind(real) });
+    vi.mocked(uploadThreadBlob).mockResolvedValue({ hash: 'h1', mime: 'image/png', byte_size: 3 });
+    const bytes = new Uint8Array([1, 2, 3]).buffer;
+    await attachPendingUpload({ threadId: THREAD, file: new File([bytes], 'a.png', { type: 'image/png' }), bytes });
+
+    expect(getDraft(THREAD).image_hashes).toEqual(['h1']);
+  });
+});
+
 describe('recordStillNeeded', () => {
   const record = (landedHash?: string) => ({ localId: 'u-1', threadId: THREAD, size: 3, landedHash });
 
@@ -287,6 +446,8 @@ describe('pending upload records', () => {
   };
   const storedIds = async () => (await readPendingUploadStore()).uploads.map((r) => r.localId);
   const onlyEntryId = () => ownedPendingUploadRecords()[0]?.localId;
+  /** The upload leaves once the image is hashed, which is real async work. */
+  const uploadStarted = () => vi.waitFor(() => expect(uploadThreadBlob).toHaveBeenCalled());
 
   /** An upload that waits until the test answers it. */
   function heldUpload(): { answer: (hash: string) => void; signal: () => AbortSignal | undefined } {
@@ -333,7 +494,7 @@ describe('pending upload records', () => {
   it('the X deletes the record and aborts the request', async () => {
     const upload = heldUpload();
     void attach();
-    await Promise.resolve();
+    await uploadStarted();
     const localId = onlyEntryId();
     cancelPendingUpload(THREAD, localId);
     expect(upload.signal()?.aborted).toBe(true);
@@ -345,7 +506,7 @@ describe('pending upload records', () => {
     globalThis.fetch = vi.fn(() => new Promise<Response>(() => {})) as unknown as typeof fetch;
     const upload = heldUpload();
     const run = attach();
-    await Promise.resolve();
+    await uploadStarted();
     const localId = onlyEntryId();
     upload.answer('h1');
     await run;
@@ -360,7 +521,7 @@ describe('pending upload records', () => {
   it('a landed image the user removes from the draft is released', async () => {
     const upload = heldUpload();
     const run = attach();
-    await Promise.resolve();
+    await uploadStarted();
     upload.answer('h1');
     await run;
     patchDraft(THREAD, { image_hashes: [] });
@@ -370,7 +531,7 @@ describe('pending upload records', () => {
   it('a discarded draft cancels its uploads and deletes their records', async () => {
     const upload = heldUpload();
     void attach();
-    await Promise.resolve();
+    await uploadStarted();
     const thread = threadMap.value.get(THREAD)!;
     threadMap.value = new Map([[THREAD, { ...thread, meta: { ...thread.meta, state: 'discarded' } }]]);
     expect(upload.signal()?.aborted).toBe(true);
@@ -381,7 +542,7 @@ describe('pending upload records', () => {
   it('a thread row that goes away takes its uploads with it', async () => {
     heldUpload();
     void attach();
-    await Promise.resolve();
+    await uploadStarted();
     threadMap.value = new Map();
     expect(getPendingUploadIds()).toEqual([]);
     expect(await storedIds()).toEqual([]);

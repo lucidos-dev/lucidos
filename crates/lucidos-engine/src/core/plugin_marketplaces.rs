@@ -64,6 +64,10 @@ pub struct InstalledPluginSummary {
     /// "propose upstream" flow). Empty when `modified` is false.
     #[serde(default)]
     pub modified_paths: Vec<String>,
+    /// The installed version's `engine` requirement as authored. `None` means
+    /// its manifest declares none, which the Plugins panel shows as a chip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_requirement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +129,18 @@ pub struct MarketplacePlugin {
     /// (the badge tooltip). Empty unless `modified`.
     #[serde(default)]
     pub modified_paths: Vec<String>,
+    /// The manifest's `engine` requirement as the author wrote it. `None` means
+    /// the manifest declares none, which the Plugins panel shows as a chip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_requirement: Option<String>,
+    /// False when this Lucidos cannot install this version. Drives the disabled
+    /// Install or Update button; never blocks a plugin already installed.
+    #[serde(default)]
+    pub engine_compatible: bool,
+    /// Why not, in the user's words ("Needs Lucidos 0.46.1 or later"). Set
+    /// only when `engine_compatible` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_incompatible_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,14 +335,44 @@ pub fn apply_installed_state_to_catalog(
     }
 }
 
-pub fn update_candidates(catalog: &MarketplaceCatalog) -> Vec<MarketplacePlugin> {
+/// Stamp one catalog row with whether the running release can install it.
+///
+/// Set on serve rather than stored by the scan: the *plugin catalog cache*
+/// can outlive an engine upgrade, and a stored verdict would go stale.
+/// `running` is `release_notices::running_release()`.
+pub fn apply_engine_compatibility(
+    plugin: &mut MarketplacePlugin,
+    running: &Result<semver::Version, String>,
+) {
+    let mismatch = plugins::check_engine_requirement(&plugin.manifest, running).err();
+    plugin.engine_requirement = plugins::engine_requirement_of(&plugin.manifest);
+    plugin.engine_compatible = mismatch.is_none();
+    plugin.engine_incompatible_reason = mismatch.map(|m| m.short_reason());
+}
+
+/// [`apply_engine_compatibility`] over a whole catalog.
+pub fn apply_engine_compatibility_to_catalog(
+    catalog: &mut MarketplaceCatalog,
+    running: &Result<semver::Version, String>,
+) {
+    for plugin in &mut catalog.plugins {
+        apply_engine_compatibility(plugin, running);
+    }
+}
+
+/// The newest installable update per installed plugin. A version the running
+/// release cannot install is left out, so nobody is told to take an update
+/// they cannot take. It counts as new again once Lucidos meets its requirement.
+pub fn update_candidates(
+    catalog: &MarketplaceCatalog,
+    running: &Result<semver::Version, String>,
+) -> Vec<MarketplacePlugin> {
     let mut by_plugin_id: BTreeMap<String, MarketplacePlugin> = BTreeMap::new();
 
-    for plugin in catalog
-        .plugins
-        .iter()
-        .filter(|p| p.status == MarketplacePluginStatus::UpdateAvailable)
-    {
+    for plugin in catalog.plugins.iter().filter(|p| {
+        p.status == MarketplacePluginStatus::UpdateAvailable
+            && plugins::check_engine_requirement(&p.manifest, running).is_ok()
+    }) {
         match by_plugin_id.get(&plugin.id) {
             Some(existing)
                 if compare_versions(&existing.version, &plugin.version)
@@ -434,6 +480,10 @@ fn scan_one_marketplace(
             app_id: None,
             modified: false,
             modified_paths: Vec::new(),
+            // Filled on serve by `apply_engine_compatibility`, never stored.
+            engine_requirement: None,
+            engine_compatible: false,
+            engine_incompatible_reason: None,
         };
         let installed = installed_by_id.get(&plugin.id).cloned();
         apply_installed_state(&mut plugin, installed.as_ref());

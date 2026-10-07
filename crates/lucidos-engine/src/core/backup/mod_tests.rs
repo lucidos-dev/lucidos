@@ -1139,19 +1139,19 @@ async fn backups_are_configured_needs_a_destination_and_an_active_schedule() {
 
     assert!(!backups_are_configured(&pool).await.unwrap(), "nothing set");
 
-    write(PREF_BACKUP_PROVIDER, "google_drive").await;
+    write(prefs::BACKUP_PROVIDER.key(), "google_drive").await;
     assert!(
         !backups_are_configured(&pool).await.unwrap(),
         "a destination alone backs nothing up",
     );
 
-    write(PREF_BACKUP_SCHEDULE, "off").await;
+    write(prefs::BACKUP_SCHEDULE.key(), "off").await;
     assert!(!backups_are_configured(&pool).await.unwrap(), "cron off");
 
-    write(PREF_BACKUP_SCHEDULE, "0 0 3 * * *").await;
+    write(prefs::BACKUP_SCHEDULE.key(), "0 0 3 * * *").await;
     assert!(backups_are_configured(&pool).await.unwrap(), "both set");
 
-    write(PREF_BACKUP_PROVIDER, "").await;
+    write(prefs::BACKUP_PROVIDER.key(), "").await;
     assert!(
         !backups_are_configured(&pool).await.unwrap(),
         "an empty destination is no destination",
@@ -1393,7 +1393,8 @@ async fn last_run_persists_documented_json_shape() {
         .await
         .unwrap();
 
-    let raw = crate::core::PreferenceStore::get(&pool, PREF_BACKUP_LAST_RUN)
+    let raw = prefs::BACKUP_LAST_RUN
+        .try_stored(&pool)
         .await
         .unwrap()
         .expect("a stored value");
@@ -1705,7 +1706,7 @@ fn workspace_archive_name_uses_final_component() {
 async fn get_retention_count_reads_preference() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
 
-    crate::test_support::seed_preference(&pool, PREF_BACKUP_RETENTION, "10")
+    crate::test_support::seed_preference(&pool, prefs::BACKUP_RETENTION.key(), "10")
         .await
         .unwrap();
     assert_eq!(get_retention_count(&pool).await.unwrap(), 10);
@@ -1713,27 +1714,22 @@ async fn get_retention_count_reads_preference() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// With no preference (or an unparseable one), retention falls back to
-/// DEFAULT_BACKUP_RETENTION — never silently 0, which would mean "delete
-/// everything".
+/// With no preference (or an unparseable one), retention falls back to the
+/// catalog default, never silently 0, which would mean "delete everything".
 #[tokio::test]
 async fn get_retention_count_falls_back_to_default() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
 
+    let default = prefs::BACKUP_RETENTION.default_number() as usize;
+
     // Absent → default.
-    assert_eq!(
-        get_retention_count(&pool).await.unwrap(),
-        DEFAULT_BACKUP_RETENTION
-    );
+    assert_eq!(get_retention_count(&pool).await.unwrap(), default);
 
     // Unparseable → default, not 0.
-    crate::test_support::seed_preference(&pool, PREF_BACKUP_RETENTION, "not-a-number")
+    crate::test_support::seed_preference(&pool, prefs::BACKUP_RETENTION.key(), "not-a-number")
         .await
         .unwrap();
-    assert_eq!(
-        get_retention_count(&pool).await.unwrap(),
-        DEFAULT_BACKUP_RETENTION
-    );
+    assert_eq!(get_retention_count(&pool).await.unwrap(), default);
 
     crate::test_support::teardown_test_db(&db_name).await;
 }

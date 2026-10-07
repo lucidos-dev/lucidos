@@ -75,8 +75,9 @@ export function clampSplitRatio(pointerPx: number, totalPx: number, bounds: Spli
  *  INTO whatever layout they last left, floors or not. That is how a header
  *  overlap survives the change that fixed it.
  *
- *  A MIGRATION, not a resize policy. It runs once, when the split first has a
- *  width, and it corrects only a ratio the clamp would already have refused.
+ *  A MIGRATION, not a resize policy. It runs when the split first has a width,
+ *  and again when Home raises the floor (SplitLayout). It corrects only a ratio
+ *  the clamp would already have refused.
  *  Re-clamping on every container resize is a different decision, and a larger
  *  one: it would hold the Conversation floor by squeezing the Canvas pane under
  *  its own, on every window the two no longer fit.

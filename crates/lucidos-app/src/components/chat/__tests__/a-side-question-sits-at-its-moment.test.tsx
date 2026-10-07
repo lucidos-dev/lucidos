@@ -14,7 +14,7 @@ import type { Exchange, StoredEvent } from '../../../store/thread-events';
 import type { ResponseEvent } from '../../../store/types';
 
 const card = (id: string, afterSeq: number | null): SideQuestion =>
-  ({ id, threadId: 't1', question: id, imageHashes: [], afterSeq, dismissed: false, status: 'pending' });
+  ({ id, threadId: 't1', question: id, imageHashes: [], afterSeq, dismissed: false, asks: 1, status: 'pending' });
 
 describe('placeInBody', () => {
   const step = (index: number, seq?: number) => ({

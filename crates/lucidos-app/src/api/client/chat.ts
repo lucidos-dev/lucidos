@@ -5,6 +5,7 @@ import type { DiffFile } from '../../store/store';
 import type { AnswerKind, AllowScope } from '../../store/thread-events';
 import type { Loadable } from '../../store/types';
 import type { ChatRequestBody, CodingAgent } from '../types';
+import { SIDE_QUESTION_TIMEOUT_MS } from '@lucidos/engine-constants';
 
 // --- Health ---
 export interface HealthInfo {
@@ -78,11 +79,19 @@ export async function getWorkspaceLabel(): Promise<string | null> {
 }
 
 // --- Chat ---
+/** How long one attempt of a send may take: a message, or an answer to a
+ *  question card. The engine acks in milliseconds. On a half-open mobile
+ *  connection a POST can hang for minutes before Safari gives up, and the
+ *  deadline turns that into a quiet retry. A timed-out POST that did land is
+ *  harmless, because the engine acks a repeat once. */
+export const SUBMIT_CHAT_TIMEOUT_MS = 20_000;
+
 export async function submitChat(body: ChatRequestBody): Promise<{ event_id: string }> {
   const res = await mutatingFetch(`${API}/chat/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(SUBMIT_CHAT_TIMEOUT_MS),
   });
   await throwIfNotOk(res);
   return res.json();
@@ -154,9 +163,10 @@ export async function sendControlRequest(threadId: string, request: Record<strin
   });
 }
 
-/** How long the side-question POST may take. The engine's own limit is 120
- *  seconds, so this outlasts it and the engine's error is what the user reads. */
-export const SIDE_QUESTION_TIMEOUT_MS = 130_000;
+/** How much longer than the engine's own limit the side-question POST waits,
+ *  so the engine's error is what the user reads. */
+const SIDE_QUESTION_CLIENT_MARGIN_MS = 10_000;
+const SIDE_QUESTION_CLIENT_WAIT_MS = SIDE_QUESTION_TIMEOUT_MS + SIDE_QUESTION_CLIENT_MARGIN_MS;
 
 /** Ask a side question, with any images already uploaded to the thread. The
  *  engine answers beside any running turn and records the ask and its outcome
@@ -174,7 +184,7 @@ export async function askSideQuestion(
     body: JSON.stringify({
       thread_id: threadId, side_question_id: sideQuestionId, question, image_hashes: imageHashes,
     }),
-  }, SIDE_QUESTION_TIMEOUT_MS);
+  }, SIDE_QUESTION_CLIENT_WAIT_MS);
   return body.answer;
 }
 
@@ -311,27 +321,20 @@ export async function discardCCChanges(threadId: string): Promise<void> {
  *  the same turn. Returns true on success; false for 409 (stale/duplicate)
  *  so the UI can re-sync from events.
  *
- *  Idempotent + iOS PWA retry, for the same reason `stopClaudeCode` takes one.
- *  A PWA waking from the background writes its first POST into a half-closed
- *  HTTP/2 connection. WebKit rejects that as `TypeError("Load failed")` before
- *  the request leaves the device. This is the one tap the agent is blocked on.
- *  A retry that lands twice writes one answer and 409s the second, pinned by
- *  `answer_question_idempotent_409_on_duplicate`.
- *
- *  A response lost AFTER the request landed makes that 409 the retry's own, so
- *  an answer that worked reports `false`. Accepted rather than engineered
- *  away: SSE renders the truth a moment later, and telling the two apart needs
- *  a submission id the engine would have to store and compare. See
- *  `docs/code-review-priors.md`. */
+ *  One attempt. The store action retries it with every other send
+ *  (`withQuietRetries`). An answer that lands twice writes once and 409s the
+ *  second (`answer_question_idempotent_409_on_duplicate`). So the action reads
+ *  a 409 on a retry as the earlier attempt having landed. */
 export async function answerThreadQuestion(
   threadId: string,
   toolUseId: string,
   answer: AnswerKind,
 ): Promise<boolean> {
-  const res = await mutatingFetchIdempotent(`${API}/threads/${encodeURIComponent(threadId)}/answer-question`, {
+  const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/answer-question`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tool_use_id: toolUseId, answer }),
+    signal: AbortSignal.timeout(SUBMIT_CHAT_TIMEOUT_MS),
   });
   if (res.ok) return true;
   if (res.status === 409) return false; // already answered or no pending question

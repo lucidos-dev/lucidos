@@ -34,6 +34,10 @@ export interface PendingUpload {
   state: PendingUploadState;
   /** Held so a retry can re-upload without re-prompting. */
   file: File;
+  /** The SHA-256 the engine names these bytes by, once computed. Its
+   *  `ImageUploaded` event lands the entry even if the upload's own answer is
+   *  lost. Absent without Web Crypto. */
+  contentHash?: string;
 }
 
 export const pendingUploads = signal<Map<string, PendingUpload[]>>(new Map());
@@ -61,12 +65,24 @@ export function setPendingUploadState(
   localId: string,
   state: PendingUploadState,
 ): void {
+  patchPendingUpload(threadId, localId, { state });
+}
+
+export function setPendingUploadContentHash(threadId: string, localId: string, contentHash: string): void {
+  patchPendingUpload(threadId, localId, { contentHash });
+}
+
+function patchPendingUpload(
+  threadId: string,
+  localId: string,
+  patch: Partial<Pick<PendingUpload, 'state' | 'contentHash'>>,
+): void {
   const list = pendingUploads.value.get(threadId);
   if (!list) return;
   const idx = list.findIndex((u) => u.localId === localId);
   if (idx === -1) return;
   const next = [...list];
-  next[idx] = { ...next[idx], state };
+  next[idx] = { ...next[idx], ...patch };
   const map = new Map(pendingUploads.value);
   map.set(threadId, next);
   pendingUploads.value = map;

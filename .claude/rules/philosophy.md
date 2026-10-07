@@ -51,7 +51,11 @@ DMG). Do not cite this page against a ramp.
 3. **Open standards, or no dependency.** Clients are one HTML/CSS/JS build (a
    PWA, and the same build in the OS webview); apps are plain HTML/CSS/JS
    against the SDK, no build step. No Swift/Kotlin/C#, and no private wire
-   protocol where a standard exists. Client-side native code only as a shim.
+   protocol where a standard exists. Client-side native code only as a shim: a
+   thin device shell (for example reliable push, background audio) around the
+   same build is allowed, a second client is not.
+   It is also the better product: one build gives every device every feature on
+   the same day, and a user who knows one device knows all of them.
 
 ## Already settled
 

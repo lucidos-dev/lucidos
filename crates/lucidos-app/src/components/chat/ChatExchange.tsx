@@ -5,19 +5,21 @@ import { useMemo, useState } from 'preact/hooks';
 import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
-import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, ResolvedPermission } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, ResolvedPermission, TypedAnswer } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, isUserBubbleEvent, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, isUnsentExchange, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { discardUnsentMessage, editQueuedMessage, removeQueuedMessage, retryUnsentMessage } from '../../store/actions/chat';
 import { unsentMessages } from '../../store/unsentMessages';
 import { withScrollAnchor } from './CreateThreadView';
-import { QuestionBody, pendingAnswers } from './QuestionCard';
+import { QuestionBody } from './QuestionCard';
+import { originPopoverHasContent } from './MessageRoutePanel';
+import { pendingAnswers, unsentPicks } from '../../store/pendingDecisions';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody, engineResolutionNote, pendingVerdicts } from './PermissionCard';
 import { ChildCompletionRow, ChildMovedOutRow, ChildStoppedRow } from './ChildCompletionRow';
 import { drawsResponseRow, liveStepInBody, responseBody, type BodyRow } from '../../store/event-rendering';
 import { Disclosure } from '../shared/Disclosure';
-import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
+import { HELD_CALLBACK_NOTE, statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
 import type { ExchangeStatus } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
@@ -26,7 +28,7 @@ import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { FormRequestRow } from './FormRequestRow';
 import { NO_SIDE_QUESTIONS, SideQuestionGroup, placeInBody } from './SideQuestionCard';
 import type { SideQuestion } from '../../store/sideQuestions';
-import { ChangeEventRow, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeCard, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, boundaryCard, turnControls } from './chat-exchange-parts';
+import { ChangeEventRow, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, SubAgentStepGroup, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeCard, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, boundaryCard, turnControls } from './chat-exchange-parts';
 import type { BoundaryTurn } from './chat-exchange-parts';
 import { EditIcon, TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
@@ -98,6 +100,9 @@ interface Props {
    *  card, so a just-answered divider keeps reading "Working" during the
    *  answer-to-resume gap. */
   threadAwaitingAnswer: boolean;
+  /** Folds after the card awaiting an answer, so the agent has not read it
+   *  (`exchangeStatus`). */
+  behindOpenQuestion?: boolean;
   /** Lifted from `cancelingThreadIds.value.has(threadId)`. */
   threadCanceling: boolean;
   /** How many of this turn's leading rows the render window leaves out.
@@ -185,23 +190,12 @@ function isResumeTurn(exchange: Exchange): boolean {
   return exchange.userEvent.type === 'ContinuationStarted';
 }
 
-/** Which boundaries the reader owns, and so draw the right-aligned bubble.
- *
- *  Two events, one act. A caller's utterance is a `SpokenMessageReceived` when
- *  the talker answered it alone and a `MessageReceived` when it delegated. The
- *  reader said the same thing either way, so both read the same way.
- *
- *  Exported for the test that pins that, since the bubble decision itself lives
- *  inside a component with no jsdom to mount it in. */
-export function isUserBubbleEvent(userEvent: { type: string }): boolean {
-  return userEvent.type === 'MessageReceived' || userEvent.type === 'SpokenMessageReceived';
-}
 
 /** The event id to retry when this exchange is an unsent message, else
- *  undefined. Only an unsent message starts on a negative seq, and a Retry
- *  already under way has taken its record, so the card offers nothing twice. */
+ *  undefined. A Retry already under way has taken its record, so the card
+ *  offers nothing twice. */
 function unsentMessageOf(exchange: Exchange): string | undefined {
-  if (exchange.userSeq >= 0) return undefined;
+  if (!isUnsentExchange(exchange)) return undefined;
   const eventId = exchangeStarterId(exchange);
   return eventId && unsentMessages.value.has(eventId) ? eventId : undefined;
 }
@@ -219,7 +213,7 @@ function heldOnThePress(fn: () => void): (e: MouseEvent) => void {
   return (e) => withScrollAnchor(e.currentTarget as HTMLElement | null, fn);
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMarker, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, rowsHidden = 0, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson, pausedBy, sideQuestions = NO_SIDE_QUESTIONS }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMarker, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, behindOpenQuestion, threadCanceling, rowsHidden = 0, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson, pausedBy, sideQuestions = NO_SIDE_QUESTIONS }: Props) {
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
   const artifactPaths = loadedOr(artifacts.value, NO_ARTIFACTS);
@@ -234,9 +228,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const responseTextRaw = exchangeResponseText(exchange);
   const steps = exchangeSteps(exchange, isLast, threadIdle);
   const events = exchangeResponseEvents(exchange, isLast, threadIdle);
-  const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer);
+  const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer, behindOpenQuestion);
   const error = exchangeError(exchange);
   const unsentEventId = unsentMessageOf(exchange);
+  // A live turn's output can land between the bubble and this card, so the
+  // card names the message Retry would send.
+  const unsentText = unsentEventId ? unsentMessages.value.get(unsentEventId)?.body.message.trim() : undefined;
 
   // Cap detection reads `ResponseGenerated.text` directly via
   // `exchangeEngineLimitDetail`. The cap is emitted with no preceding
@@ -317,7 +314,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
     : getStatusLabel(status, hasSteps);
   const statusLabelText = sl.label;
   const statusClass = sl.className;
-  const showStatus = exchangeActive || hasResponse || hasEvents || status === 'queued' || status === 'held' || status === 'interrupted' || status === 'canceled' || status === 'error' || status === 'aborted';
+  const showStatus = exchangeActive || hasResponse || hasEvents || status === 'queued' || status === 'interrupted' || status === 'canceled' || status === 'error' || status === 'aborted';
 
   const responseTimestamp = exchangeResponseTimestamp(exchange);
 
@@ -440,16 +437,17 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // Where this turn stands, for a card that asked for work, and the Continue an
   // interrupted response's card offers.
   const boundaryTurn = boundaryTurnOf(status);
+  const heldNote = status === 'held' ? HELD_CALLBACK_NOTE : undefined;
   const initiator = useMemo(
     () => withoutActorHeader(
-      describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, { description: proposedChangeDesc, fileCount: proposedChangeFileCount, summary: proposedChangeSummary }, { eventType: matchedEventType, eventId: matchedEventId, payloadJson: matchedPayloadJson }),
+      describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, { description: proposedChangeDesc, fileCount: proposedChangeFileCount, summary: proposedChangeSummary }, { eventType: matchedEventType, eventId: matchedEventId, payloadJson: matchedPayloadJson }, heldNote),
       exchange.userEvent,
       {
         turn: boundaryTurn,
         actions: exchange.userEvent.type === 'ResponseAborted' && isContinuableAbort ? <ContinueButton threadId={threadId} /> : undefined,
       },
     ),
-    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson, boundaryTurn, isContinuableAbort],
+    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson, heldNote, boundaryTurn, isContinuableAbort],
   );
   const isChangePanel = isChangeLifecycleEvent(exchange.userEvent);
   // Card-less treatment. A human chat message renders as a right-aligned
@@ -477,6 +475,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // would misattribute it: the message is the user's, and a stack of them
   // should each read as waiting.
   const isQueuedUserMessage = !!isQueued && isUserMessageBubble;
+  // What waits behind an open question dims. A queued message carries no note:
+  // its own "Queued" says it. A callback does, unless its card drew it already.
+  const panelHeld = isQueuedUserMessage && threadAwaitingAnswer ? {}
+    : heldNote && !initiator.heldNoteInCard ? { note: heldNote } : undefined;
   // Claude Code can take back a message it has not read; Codex cannot.
   const canTakeBack = !threadIsCC || threadCodingAgent === 'claude-code';
   const queuedMessageId = isQueuedUserMessage && canTakeBack ? exchange.userEvent._eventId : undefined;
@@ -569,7 +571,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // only thing a status badge sits on. So with no reply yet, the panel would be
   // an empty box under the caller's bubble.
   const speechOnlyHasWords = !isSpeechOnly || canCollapse;
-  const showResponsePanel = isResume || (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isTurnlessPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveRow && speechOnlyHasWords && (hasResponse || hasEvents || showStatus);
+  const showResponsePanel = status !== 'held' && (isResume || (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isTurnlessPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveRow && speechOnlyHasWords && (hasResponse || hasEvents || showStatus));
   // The panel draws its body only when it has one and is unfolded, which is
   // exactly when `bodyPieces` carries the cards.
   const bodyTakesCards = showResponsePanel && canCollapse && !bodyFolded;
@@ -586,7 +588,11 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         // `.response-chunk` in chat/response.css.
         return (
           <Disclosure key={`t${row.key}`} open={row.open}>
-            <div class="response-chunk" dangerouslySetInnerHTML={{ __html: chunkHtmls.get(row.event) ?? '' }} />
+            <div
+              class="response-chunk"
+              data-text-seq={row.event.seq}
+              dangerouslySetInnerHTML={{ __html: chunkHtmls.get(row.event) ?? '' }}
+            />
           </Disclosure>
         );
       case 'steps':
@@ -603,9 +609,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         return (
           <Fragment key={`s${row.key}`}>
             <Disclosure open={row.open}>
-              {row.steps.map(({ event, index }) => (
-                <InlineStep key={index} event={event} rowRef={index === liveRowIndex ? setLiveStepRow : undefined} />
-              ))}
+              {row.steps.map(({ event, index }) => {
+                const rowRef = index === liveRowIndex ? setLiveStepRow : undefined;
+                return event.children?.length
+                  ? <SubAgentStepGroup key={index} event={event} rowRef={rowRef} />
+                  : <InlineStep key={index} event={event} rowRef={rowRef} />;
+              })}
             </Disclosure>
             <Disclosure open={row.elided}>
               <div class="response-elision" aria-hidden="true" />
@@ -668,7 +677,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
           ? { ...initiator, status: initiatorStatus }
           : initiator}
         timestamp={formatMessageTimestamp(readAt ?? timestamp)}
-        onActorClick={initiator.actorClickable === false
+        onActorClick={initiator.actorClickable === false || !originPopoverHasContent(exchange)
           ? undefined
           : (e) => openInfoPanel('origin', e)}
         // The same router the response body gets. This panel renders markdown
@@ -680,6 +689,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         collapsible={canCollapseInitiator}
         collapsed={isInitiatorCollapsed}
         onToggle={canCollapseInitiator ? toggleInitiator : undefined}
+        held={panelHeld}
       />
       )}
 
@@ -760,15 +770,16 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         // steps" toggle can hide them and an id there resolves only sometimes.
         <div class="exchange-error" data-event-id={error.eventId || undefined}>
           <strong>{unsentEventId ? 'Not sent' : 'The reply failed'}</strong>
+          {unsentText && <blockquote class="exchange-error-quote">{unsentText}</blockquote>}
           <p>{error.message}</p>
           {unsentEventId
             ? (
               <div class="exchange-error-actions">
-                <button type="button" class="action-btn exchange-error-retry" onClick={() => void retryUnsentMessage(unsentEventId)}>
-                  Retry
-                </button>
                 <button type="button" class="action-btn action-btn-secondary exchange-error-discard" onClick={() => discardUnsentMessage(unsentEventId)}>
                   Discard
+                </button>
+                <button type="button" class="action-btn exchange-error-retry" onClick={() => void retryUnsentMessage(unsentEventId)}>
+                  Retry
                 </button>
               </div>
             )
@@ -821,6 +832,11 @@ function userBubbleText(exchange: Exchange): string | undefined {
   return ev.type === 'SpokenReplyGenerated' ? ev.text : undefined;
 }
 
+/** The unsent message a question card's typed answer would retry, if any. */
+function unsentEventIdOf(exchange: Exchange): string | undefined {
+  return exchange.typedAnswer?.state === 'unsent' ? exchange.typedAnswer.unsentEventId : undefined;
+}
+
 /** Custom prop equality for the `memo`-wrapped `ChatExchange` below.
  *
  *  Default `memo` shallow-compares props, and a from-scratch `computeExchanges`
@@ -841,6 +857,8 @@ function userBubbleText(exchange: Exchange): string | undefined {
  *     finalizes this one's pending Thinking marker.
  *   - `releasedFromHold`, which a rebuild can settle differently once a late
  *     release arrives. It changes the header text.
+ *   - `typedAnswer`, the composer's answer drawn on a question card until the
+ *     engine confirms it, sending or not sent.
  *   - `blockedStepSeqs` / `deniedStepSeqs`, a permission decision on a call
  *     this exchange owns, and `deliveredHeldIds`. These marks are written from
  *     OUTSIDE, by a later exchange, so nothing else here moves with them.
@@ -861,6 +879,7 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.threadCodingAgent !== next.threadCodingAgent) return false;
   if (prev.threadIdle !== next.threadIdle) return false;
   if (prev.threadAwaitingAnswer !== next.threadAwaitingAnswer) return false;
+  if (prev.behindOpenQuestion !== next.behindOpenQuestion) return false;
   if (prev.threadCanceling !== next.threadCanceling) return false;
   // Without this the memo swallows every scroll-up round into the floor turn:
   // the window grows, nothing else about the turn changes, and the head the
@@ -895,6 +914,10 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (a.questionOvertaken !== b.questionOvertaken) return false;
   if (a.continuationMoved !== b.continuationMoved) return false;
   if (a.releasedFromHold !== b.releasedFromHold) return false;
+  // A typed answer comes, changes state and goes on a clone with the same steps.
+  if (a.typedAnswer?.text !== b.typedAnswer?.text) return false;
+  if (a.typedAnswer?.state !== b.typedAnswer?.state) return false;
+  if (unsentEventIdOf(a) !== unsentEventIdOf(b)) return false;
   if (a.steps.length !== b.steps.length) return false;
   const aLast = a.steps[a.steps.length - 1]?.seq;
   const bLast = b.steps[b.steps.length - 1]?.seq;
@@ -985,6 +1008,9 @@ export interface InitiatorDescriptor {
   /** Drop the actor chip, as a user bubble and a change card do. Set by
    *  `withoutActorHeader` on every turn the agent did not write. */
   chromeless?: boolean;
+  /** The body's event card draws the held note itself, so the panel adds no
+   *  note and no dim of its own. */
+  heldNoteInCard?: boolean;
 }
 
 /** Action label shared by the panel header and the route popover's Origin row. */
@@ -1126,10 +1152,10 @@ function boundaryTurnOf(status: ExchangeStatus): BoundaryTurn {
 }
 
 /** Build a descriptor in the "Response canceled" style: no icon, the action
- *  text AS the label, and no separate summary line. The label chip stays
- *  clickable (it opens the origin popover, which discloses who/what — "You",
- *  the device, "Lucidos credential request", …). Shared by every user-driven
- *  control turn (Restart, Continue, auto-prompt, credential/consent) so they
+ *  text AS the label, and no separate summary line. The label chip opens the
+ *  origin popover whenever it has something to add (`originPopoverHasContent`).
+ *  Shared by every user-driven control turn (Restart, Continue, auto-prompt,
+ *  credential/consent) so they
  *  read as clean boundaries, matching the ResponseCanceled turn. `details`
  *  carries any richer body (resume note, injected prompt). */
 function actionInitiator(label: string, details?: ComponentChildren): InitiatorDescriptor {
@@ -1176,15 +1202,25 @@ function dividerStatus(
   return <AwaitingStatus {...pick} />;
 }
 
-/** Where a divider's card keeps its optimistic pick, and the card's id there. */
-type PendingPick = { picks: ReadonlySignal<ReadonlyMap<string, unknown>>; id: string };
+/** Where a divider's card keeps its optimistic pick, and the card's id there.
+ *  `typed` is the state of a question card's typed answer, which the exchange
+ *  carries rather than the picks. `unsent` holds a question card's picks that
+ *  were not sent. */
+type PendingPick = {
+  picks: ReadonlySignal<ReadonlyMap<string, unknown>>;
+  id: string;
+  typed?: TypedAnswer['state'];
+  unsent?: ReadonlySignal<ReadonlyMap<string, unknown>>;
+};
 
 /** A component, not a plain span, so it reads the pick itself. The descriptor
  *  that holds it is memoized, so a signal read there would not re-render. */
-export function AwaitingStatus({ picks, id }: PendingPick) {
-  return picks.value.has(id)
-    ? <span class="exchange-status-label exchange-status-sending">{'Sending'}</span>
-    : <span class="exchange-status-label exchange-status-awaiting">{'Needs your answer'}</span>;
+export function AwaitingStatus({ picks, id, typed, unsent }: PendingPick) {
+  if (picks.value.has(id) || typed === 'sending') {
+    return <span class="exchange-status-label exchange-status-sending">{'Sending'}</span>;
+  }
+  if (typed === 'unsent' || unsent?.value.has(id)) return <span class="exchange-status-label exchange-status-not-sent">{'Not sent'}</span>;
+  return <span class="exchange-status-label exchange-status-awaiting">{'Needs your answer'}</span>;
 }
 
 /** A permission step's verdict, in the one shape every permission card reads. */
@@ -1231,6 +1267,9 @@ export function describeInitiator(
    *  argument. The fields are still flat primitives, never the payload object,
    *  so `chatExchangePropsEqual` compares them without a deep walk. */
   matched?: { eventType?: string; eventId?: string; payloadJson?: string },
+  /** Set while this turn waits behind an open question. An arm whose card can
+   *  carry it passes it in and sets `heldNoteInCard`. */
+  heldNote?: string,
 ): InitiatorDescriptor {
   const ev = exchange.userEvent;
   // Ahead of the switch, because the row wears a `MessageReceived` and would
@@ -1358,8 +1397,9 @@ export function describeInitiator(
         // Same as the trigger and the child callback, whose rows own their
         // prefixes too.
         summary: matched?.eventType ? undefined : summary,
+        heldNoteInCard: !!heldNote && !!matched?.eventType,
         details: matched?.eventType
-          ? <EventDeliveryBody eventType={matched.eventType} eventId={matched.eventId} payloadJson={matched.payloadJson} />
+          ? <EventDeliveryBody eventType={matched.eventType} eventId={matched.eventId} payloadJson={matched.payloadJson} heldNote={heldNote} />
           : <MarkdownBlock html={userMessageHtml} />,
       };
     case 'MessageReceived': {
@@ -1422,6 +1462,7 @@ export function describeInitiator(
         icon: <LucidosGlyph />,
         label: ENGINE_LABEL,
         actorClickable: false,
+        heldNoteInCard: !!heldNote,
         details: (
           <ChildCompletionRow
             childThreadId={ev.child_thread_id}
@@ -1430,6 +1471,7 @@ export function describeInitiator(
             summary={ev.summary}
             pendingChangeIds={ev.pending_change_ids}
             subThreadPendingChanges={ev.sub_thread_pending_changes}
+            heldNote={heldNote}
           />
         ),
       };
@@ -1484,7 +1526,7 @@ export function describeInitiator(
           'Answered',
           'Unanswered',
           unanswered ?? (responseTerminated ? 'dropped' : null),
-          { picks: pendingAnswers.map, id: ev.tool_use_id },
+          { picks: pendingAnswers.map, id: ev.tool_use_id, typed: exchange.typedAnswer?.state, unsent: unsentPicks.map },
         ),
         details: (
           <QuestionBody
@@ -1494,6 +1536,7 @@ export function describeInitiator(
             options={ev.options ?? []}
             multiSelect={ev.multi_select}
             resolved={answered?.answer}
+            typedAnswer={exchange.typedAnswer}
             terminated={responseTerminated}
           />
         ),
@@ -1575,8 +1618,9 @@ export function describeInitiator(
       };
     }
     case 'McpConsentRequested':
-      // Iconless action label (ResponseCanceled style); the asker is disclosed
-      // in the timestamp popover. No body component: nothing emits it today.
+      // Iconless action label (ResponseCanceled style). No answer is ever
+      // recorded, so its chip opens no popover. No body component: nothing
+      // emits it today.
       return actionInitiator(summary);
     default:
       // Unreachable in production (groupIntoExchanges only assigns starter

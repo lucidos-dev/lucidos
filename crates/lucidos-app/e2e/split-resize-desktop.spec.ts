@@ -185,6 +185,10 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
     // removed a capability rather than moving it.
     await page.locator('.split-divider').dblclick();
     await expect(page.locator('.pane-thread')).toHaveClass(/pane-collapsed/, { timeout: 5_000 });
+    // The class flips at once, but the divider slides to the wall. A press
+    // mid-slide kills the transition, so the divider snaps away and the
+    // second click lands on the Canvas pane. A user double-clicks it at rest.
+    await expect.poll(() => threadPaneWidth(page), { timeout: 5_000 }).toBeLessThanOrEqual(1);
     await page.locator('.split-divider').dblclick();
     await expect(page.locator('.pane-thread')).not.toHaveClass(/pane-collapsed/, { timeout: 5_000 });
   });

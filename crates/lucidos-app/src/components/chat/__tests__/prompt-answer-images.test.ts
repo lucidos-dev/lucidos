@@ -65,72 +65,53 @@ describe('PromptInput sends images with an answer', () => {
   });
 });
 
-describe('a hold on Send asks the draft as a side question', () => {
-  it('marks the hold so its release does not also send', () => {
+/** The source of the waiting card's lone Cancel. */
+const cancelButtonSource = (): string =>
+  promptSource.match(/answerMode === 'cancel' \? \([\s\S]*?<\/button>/)?.[0] ?? '';
+
+describe('every hold turns on side-question mode', () => {
+  it('marks the hold so its release does not also act', () => {
     expect(promptSource).toMatch(
       /function releaseEndsHold\(\): boolean \{\s*if \(!heldSendRef\.current\) return false;\s*heldSendRef\.current = false;/,
     );
-    expect(promptSource).toMatch(/const morphActivate = useTouchActivated\(\s*\(\) => \{\s*if \(releaseEndsHold\(\)\) return;/);
     // Every new press clears the mark, so it belongs to one gesture only.
     expect(promptSource).toMatch(/onPointerDown: \(e: PointerEvent\) => \{\s*heldSendRef\.current = false;/);
   });
 
-  it('offers the menu only where a side question can be asked', () => {
-    expect(promptSource).toMatch(/if \(!canAskFromHold\) return;\s*heldSendRef\.current = true;/);
-    expect(promptSource).toMatch(/const canAskFromHold = sideQuestionBlocker === null;/);
-    expect(promptSource).toMatch(/\} else void submit\(true\);/);
+  it('holds only where a side question can be asked', () => {
+    expect(promptSource).toMatch(/if \(sideQuestionRefusal !== null\) return;\s*heldSendRef\.current = true;/);
   });
 
-  it('a closed menu clears the mark, so a later Send is never swallowed', () => {
-    expect(promptSource).toMatch(/onClosed=\{\(opener\) => \{\s*heldSendRef\.current = false;/);
-  });
-});
-
-describe('a hold on Stop starts a side question', () => {
-  it('offers it on the morph Stop and on a waiting card\'s lone Cancel', () => {
-    expect(promptSource).toMatch(
-      /stopOrCancelShown: \(morphMode === 'cancel' && !isAnsweringQuestion\) \|\| answerMode === 'cancel',/,
-    );
-  });
-
-  // The lone Cancel carries the same hold, and its release never also cancels.
-  it('gives the waiting card\'s Cancel the hold, spent before it cancels', () => {
-    const cancel = promptSource.match(/answerMode === 'cancel' \? \([\s\S]*?<\/button>/)?.[0] ?? '';
-    expect(cancel).toContain('{...holdHandlers}');
-    expect(promptSource).toMatch(
-      /const answerCancelActivate = useTouchActivated\(\s*\(\) => \{\s*if \(releaseEndsHold\(\)\) return;[^]*?cancelExchangeForTarget\(\);/,
-    );
-  });
-
-  it('turns on side-question mode over the empty composer instead of asking', () => {
-    expect(promptSource).toMatch(
-      /if \(holdSideQuestion\.kind === 'start-mode'\) \{\s*startedSideQuestionModeRef\.current = true;\s*setSideQuestionMode\(true\);/,
-    );
+  it('only turns the mode on, and never asks or sends from the hold', () => {
+    expect(promptSource).toMatch(/morphGate\.spend\(\);\s*setSideQuestionMode\(true\);\s*\}, \(\) => \{\}\);/);
+    expect(promptSource).not.toContain('submit(true)');
     expect(promptSource).toMatch(/function setSideQuestionMode\(on: boolean\): void \{[^]*?updateComposeSelection\(threadId, \{ sideQuestionMode: on \}\);/);
   });
 
-  it('shows a pill whose × leaves the mode and keeps the text', () => {
-    expect(promptSource).toMatch(/<Disclosure key="side-question-mode" open=\{sideQuestionMode\}>/);
-    expect(promptSource).toMatch(/onClick=\{\(\) => setSideQuestionMode\(false\)\}/);
+  it('rides on every button that can end the row', () => {
+    expect(sendButtonSource()).toContain('{...holdHandlers}');
+    expect(submitButtonSource()).toContain('{...holdHandlers}');
+    expect(cancelButtonSource()).toContain('{...holdHandlers}');
+    expect(promptSource).toContain('primaryPressHandlers={ungatedHoldHandlers}');
   });
 
-  it('skips the pill for a mouse hold, so the box takes typing at once', () => {
+  it('keeps the ungated multi-select Submit out of the tap gate', () => {
+    const ungated = promptSource.match(/const ungatedHoldHandlers = \{[\s\S]*?\n {2}\};/)?.[0] ?? '';
+    expect(ungated, 'ungatedHoldHandlers not found').not.toBe('');
+    expect(ungated).not.toContain('morphGate');
+  });
+
+  it('spends the mark on every release before it acts', () => {
+    expect(promptSource).toMatch(/const morphActivate = useTouchActivated\(\s*\(\) => \{\s*if \(releaseEndsHold\(\)\) return;/);
+    expect(promptSource).toMatch(/const answerSubmitActivate = useTouchActivated\(\(\) => \{\s*if \(releaseEndsHold\(\)\) return;\s*void submit\(\);/);
     expect(promptSource).toMatch(
-      /if \(holdSideQuestion\.kind === 'start-mode' && pressPointerTypeRef\.current === 'mouse'\) \{\s*setSideQuestionMode\(true\);\s*holdRefocusesComposerRef\.current = true;\s*return;\s*\}\s*sendHoldMenuOpener\.value = 'hold';/,
+      /const answerCancelActivate = useTouchActivated\(\s*\(\) => \{\s*if \(releaseEndsHold\(\)\) return;\s*cancelExchangeForTarget\(\);/,
     );
-    expect(promptSource).toMatch(/pressPointerTypeRef\.current = e\.pointerType;/);
+    expect(promptSource).toMatch(/onPrimary=\{\(\) => \{\s*if \(releaseEndsHold\(\)\) return;\s*void submitMultiAnswer\(\);/);
   });
 
-  it('marks the hold so its release does not also stop the turn', () => {
-    // The same mark as Send's, checked before the morph picks send or cancel.
-    const activate = promptSource.match(/const morphActivate = useTouchActivated\([\s\S]*?\n {2}\);/)?.[0] ?? '';
-    expect(activate.indexOf('if (releaseEndsHold())')).toBeGreaterThan(-1);
-    expect(activate.indexOf('if (releaseEndsHold())')).toBeLessThan(activate.indexOf('cancelExchangeForTarget()'));
-  });
-
-  it('spends the tap gate, so a finger drifting under the pill is not a refused swipe', () => {
-    // Before the branch, so a hold that turns on the mode spends it too.
-    expect(promptSource).toMatch(/heldSendRef\.current = true;[^]*?morphGate\.spend\(\);[^]*?if \(holdSideQuestion\.kind === 'start-mode' &&[^]*?sendHoldMenuOpener\.value = 'hold';/);
+  it('spends the tap gate, so a finger drifting during the hold is not a refused swipe', () => {
+    expect(promptSource).toMatch(/heldSendRef\.current = true;[^]*?morphGate\.spend\(\);[^]*?setSideQuestionMode\(true\);/);
     // What the spend buys: Stop's destructive lift reaches the hold mark.
     const gate = createTapGate();
     let served = 0;
@@ -145,140 +126,53 @@ describe('a hold on Stop starts a side question', () => {
     expect(served).toBe(1);
   });
 
-  it('shuts the pill when Stop stops', () => {
-    expect(promptSource).toMatch(
-      /else if \(morphMode === 'cancel'\) \{\s*sendHoldMenuOpener\.value = null;\s*cancelExchangeForTarget\(\);/,
-    );
-  });
-
-  it('says so in Stop\'s tooltip', () => {
-    expect(promptSource).toContain("morphMode === 'cancel' && offersHoldHint ? tooltipWithShortcut('Stop. Hold to ask a side question', 'stopThread')");
-  });
-
-  it('hands focus back to the composer when a mouse hold began mid-typing', () => {
-    expect(promptSource).toMatch(
-      /holdRefocusesComposerRef\.current = e\.pointerType === 'mouse' && document\.activeElement === inputRef\.current;/,
-    );
-    expect(promptSource).toMatch(/sendHoldMenuOpener\.value = 'hold';\s*if \(holdRefocusesComposerRef\.current\) focusIfNeeded\(inputRef\.current\);/);
-    // Again after the release's click, which the `.action-btn` blur listener hears.
+  it('hands focus back to the composer after a mouse hold, for the side question to be typed', () => {
+    expect(promptSource).toMatch(/holdRefocusesComposerRef\.current = e\.pointerType === 'mouse';/);
+    // After the release's click, which the `.action-btn` blur listener hears.
     expect(promptSource).toMatch(
       /if \(holdRefocusesComposerRef\.current\) requestAnimationFrame\(\(\) => focusIfNeeded\(inputRef\.current\)\);\s*return true;/,
     );
   });
 
-  it('lets Enter in the composer press the Side question half while the pill is open', () => {
-    expect(promptSource).toMatch(
-      /else if \(sendHoldMenuOpener\.value !== null\) \{\s*sendHoldMenuOpener\.value = null;\s*askFromSideQuestionPill\(\);\s*\} else void submit\(\);/,
-    );
-    expect(promptSource).toContain('onAskSideQuestion={askFromSideQuestionPill}');
-  });
-
-  it('drops the hold hint from both tooltips while the pill is open', () => {
-    expect(promptSource).toMatch(/const offersHoldHint = canAskFromHold && sendHoldMenuOpener\.value === null;/);
-    expect(promptSource).toContain("morphMode === 'send' && offersHoldHint ? tooltipWithShortcut('Send. Hold to ask a side question', 'askSideQuestion')");
-    expect(promptSource).not.toMatch(/canAskFromHold \? tooltipWithShortcut/);
-  });
-});
-
-describe('Send is the split pill\'s other half', () => {
-  it('anchors the pill, so a tap on Send sends instead of only dismissing', () => {
-    expect(promptSource).toMatch(/<SendHoldMenu\s+anchor=\{splitPillButtonEl\}/);
-    expect(sendButtonSource()).toMatch(/ref=\{setSplitPillButtonEl\}\s*\{\.\.\.holdHandlers\}/);
-  });
-
-  it('wraps the half and the end button alone, so the half measures that button', () => {
-    expect(promptSource).toMatch(
-      /<span class="split-pill">\s*<SendHoldMenu[\s\S]*?\/>\s*\{isAnsweringQuestion \? answerControl : sendButton\}\s*<\/span>/,
-    );
-  });
-
-  it('shuts the pill when Send sends', () => {
-    expect(promptSource).toMatch(
-      /if \(morphMode === 'send'\) \{\s*sendHoldMenuOpener\.value = null;\s*void submit\(\);\s*\}/,
-    );
-  });
-
-  it('comes after the Side question half, so Tab moves from that half to Send', () => {
-    const half = promptSource.indexOf('<SendHoldMenu');
-    const send = promptSource.indexOf('{isAnsweringQuestion ? answerControl : sendButton}');
-    expect(half).toBeGreaterThan(-1);
-    expect(half).toBeLessThan(send);
-  });
-
-  it('lets a key press send even after a right-click left the hold mark', () => {
+  it('lets a key press act even after a right-click left the hold mark', () => {
     expect(promptSource).toMatch(/onKeyDown: \(e: KeyboardEvent\) => \{\s*if \(e\.key === 'Enter' \|\| e\.key === ' '\) heldSendRef\.current = false;/);
   });
 
-  it('shuts the pill once the button under it offers no side question', () => {
-    expect(promptSource).toMatch(/if \(sideQuestionBlocker !== null\) sendHoldMenuOpener\.value = null;/);
+  it('shows a pill whose × leaves the mode and keeps the text', () => {
+    expect(promptSource).toMatch(/<Disclosure key="side-question-mode" open=\{sideQuestionMode\}>/);
+    expect(promptSource).toMatch(/onClick=\{\(\) => setSideQuestionMode\(false\)\}/);
   });
 
-  it('squares off while the pill is open, and until its half has slid back', () => {
-    expect(promptSource).toMatch(/sendHoldMenuShown \? ' split-open' : ''/);
-    expect(promptSource).toMatch(/leaving=\{sendHoldMenuShown && sendHoldMenuOpener\.value === null\}/);
+  it('says so in each tooltip', () => {
+    expect(sendButtonSource()).toContain("morphMode === 'cancel' && holdOffersSideQuestion ? tooltipWithShortcut('Stop. Hold for a side question', 'stopThread')");
+    expect(sendButtonSource()).toContain("morphMode === 'send' && holdOffersSideQuestion ? tooltipWithShortcut('Send. Hold for a side question', 'askSideQuestion')");
+    expect(submitButtonSource()).toContain("holdOffersSideQuestion ? tooltipWithShortcut('Send answer. Hold for a side question', 'askSideQuestion')");
   });
 });
 
-describe('Submit is the split pill\'s other half while a question card waits', () => {
-  it('anchors the pill and takes the same hold as Send', () => {
-    const submit = submitButtonSource();
-    expect(submit, 'the lone Submit not found').not.toBe('');
-    expect(submit).toMatch(/ref=\{setSplitPillButtonEl\}\s*\{\.\.\.holdHandlers\}/);
+describe('in side-question mode the round button asks, in every thread state', () => {
+  it('takes over from a waiting card\'s Submit once the box holds text', () => {
+    expect(promptSource).toMatch(/const answersCard = isAnsweringQuestion && !\(sideQuestionMode && morphHasContent\);/);
+    expect(promptSource).toContain('{answersCard ? answerControl : sendButton}');
   });
 
-  it('marks the hold so its release does not also answer', () => {
-    expect(promptSource).toMatch(
-      /const answerSubmitActivate = useTouchActivated\(\(\) => \{\s*if \(releaseEndsHold\(\)\) return;\s*sendHoldMenuOpener\.value = null;\s*void submit\(\);/,
-    );
+  it('leaves Submit no "Ask" face of its own', () => {
+    expect(submitButtonSource()).not.toMatch(/sideQuestionMode/);
   });
 
-  it('squares off while the pill is open', () => {
-    expect(submitButtonSource()).toMatch(/class=\{'action-btn action-btn-confirm' \+ \(sendHoldMenuShown \? ' split-open' : ''\)\}/);
-  });
-
-  it('says so in its tooltip', () => {
-    expect(submitButtonSource()).toContain(
-      "offersHoldHint ? tooltipWithShortcut('Send answer. Hold to ask a side question', 'askSideQuestion')",
-    );
-  });
-
-  it('keeps the anchor on the lone node whichever face it wears', () => {
-    // Submit, Cancel and Canceling share one node. Preact clears a ref only
-    // when the vnode carries one. A face without it leaves the anchor on a node
-    // that later unmounts.
-    const faces = promptSource.match(/<button\s+key="answer-lone"[\s\S]*?>/g) ?? [];
-    expect(faces).toHaveLength(3);
-    for (const face of faces) expect(face).toContain('ref={setSplitPillButtonEl}');
+  it('asks whenever the mode is on', () => {
+    expect(promptSource).toMatch(/\}, sideQuestionMode\);/);
   });
 });
 
 describe('the Side question shortcut', () => {
-  it('opens the menu only where a hold could, and says why elsewhere', () => {
-    expect(promptSource).toMatch(
-      /else if \(sideQuestionBlocker === null\) sendHoldMenuOpener\.value = 'shortcut';\s*else showToast\(sideQuestionBlocker, 'info'\);/,
-    );
+  it('says why where a side question cannot be asked', () => {
+    expect(promptSource).toMatch(/if \(sideQuestionRefusal !== null\) \{\s*showToast\(sideQuestionRefusal, 'info'\);\s*return;/);
   });
 
-  it('turns on side-question mode over an empty box, so the user types straight on', () => {
+  it('toggles the mode, and turning it on puts focus in the box', () => {
     expect(promptSource).toMatch(
-      /else if \(holdSideQuestion\.kind === 'start-mode'\) setSideQuestionMode\(true\);\s*else if \(sideQuestionBlocker === null\) sendHoldMenuOpener\.value = 'shortcut';/,
-    );
-  });
-
-  it('shuts the open pill on a second press, as Escape does', () => {
-    expect(promptSource).toMatch(
-      /promptSideQuestionRequested\.value = false;[^]*?if \(sendHoldMenuOpener\.peek\(\) !== null\) sendHoldMenuOpener\.value = null;\s*else if \(holdSideQuestion\.kind === 'start-mode'\)/,
-    );
-  });
-
-  it('works during a running turn, since a typed draft turns Stop back into Send', () => {
-    expect(promptSource).toMatch(/hasContent: morphMode === 'send',/);
-  });
-
-  it('hands focus back to the draft when the menu it opened shuts, as a started side question does', () => {
-    // A frame late, after the document-level `.action-btn` click blur.
-    expect(promptSource).toMatch(
-      /if \(opener === 'shortcut' \|\| startedMode\) requestAnimationFrame\(\(\) => inputRef\.current\?\.focus\(\)\);/,
+      /setSideQuestionMode\(!sideQuestionMode\);\s*if \(!sideQuestionMode\) requestAnimationFrame\(\(\) => focusIfNeeded\(inputRef\.current\)\);/,
     );
   });
 

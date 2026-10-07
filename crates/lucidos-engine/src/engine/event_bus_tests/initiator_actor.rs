@@ -469,7 +469,7 @@ fn persisted_system_events_round_trip_through_json() {
             actor: None,
         },
         SystemEvent::PreferencesChanged {
-            key: "timezone".into(),
+            key: crate::core::prefs::TIMEZONE.key().into(),
             value: Some("Europe/Oslo".into()),
             actor: None,
         },

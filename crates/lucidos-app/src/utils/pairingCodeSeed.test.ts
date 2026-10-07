@@ -4,20 +4,20 @@ import {
   takePairingCodeFromUrl,
   takeUnspentPairingCodeFromUrl,
   resetPairingCodeSeedForTest,
-  PAIR_CODE_PARAM,
+  PAIR_PARAM,
 } from './pairingCodeSeed';
 
 const CODE = '01234567';
 
 describe('pairingCodeToAdopt', () => {
   it('adopts the eight digits a scanned QR carried', () => {
-    expect(pairingCodeToAdopt(`?${PAIR_CODE_PARAM}=${CODE}`)).toBe(CODE);
+    expect(pairingCodeToAdopt(`?${PAIR_PARAM}=${CODE}`)).toBe(CODE);
     // Order and neighbours do not matter.
-    expect(pairingCodeToAdopt(`?a=1&${PAIR_CODE_PARAM}=${CODE}&b=2`)).toBe(CODE);
+    expect(pairingCodeToAdopt(`?a=1&${PAIR_PARAM}=${CODE}&b=2`)).toBe(CODE);
     // A code that picked up padding on the way here is still that code.
-    expect(pairingCodeToAdopt(`?${PAIR_CODE_PARAM}=%20${CODE}%20`)).toBe(CODE);
+    expect(pairingCodeToAdopt(`?${PAIR_PARAM}=%20${CODE}%20`)).toBe(CODE);
     // Leading zeros are part of the code, never trimmed off as a number.
-    expect(pairingCodeToAdopt(`?${PAIR_CODE_PARAM}=00000001`)).toBe('00000001');
+    expect(pairingCodeToAdopt(`?${PAIR_PARAM}=00000001`)).toBe('00000001');
   });
 
   it('drops anything that is not eight digits rather than posting it', () => {
@@ -33,7 +33,7 @@ describe('pairingCodeToAdopt', () => {
       '<script>',
     ]) {
       expect(
-        pairingCodeToAdopt(`?${PAIR_CODE_PARAM}=${encodeURIComponent(bad)}`),
+        pairingCodeToAdopt(`?${PAIR_PARAM}=${encodeURIComponent(bad)}`),
         `should have rejected ${JSON.stringify(bad)}`,
       ).toBeNull();
     }
@@ -78,7 +78,7 @@ describe('takePairingCodeFromUrl', () => {
   }
 
   it('hands back the code and strips the parameter', () => {
-    const { code, after } = takeAt(`?${PAIR_CODE_PARAM}=${CODE}`);
+    const { code, after } = takeAt(`?${PAIR_PARAM}=${CODE}`);
     expect(code).toBe(CODE);
     // The code works once and expires, so a URL still carrying it is a URL
     // that will stop working. A reload, a bookmark and an installed PWA's
@@ -87,19 +87,19 @@ describe('takePairingCodeFromUrl', () => {
   });
 
   it('leaves the other parameters where they were', () => {
-    const { code, after } = takeAt(`?pick=&${PAIR_CODE_PARAM}=${CODE}`);
+    const { code, after } = takeAt(`?pick=&${PAIR_PARAM}=${CODE}`);
     expect(code).toBe(CODE);
     expect(after).toBe('?pick=');
   });
 
   it('strips an invalid code too, rather than leaving a dead one on screen', () => {
-    const { code, after } = takeAt(`?${PAIR_CODE_PARAM}=nope`);
+    const { code, after } = takeAt(`?${PAIR_PARAM}=nope`);
     expect(code).toBeNull();
     expect(after).toBe('');
   });
 
   it('reads once, so a remount cannot re-read a URL already cleaned', () => {
-    expect(takeAt(`?${PAIR_CODE_PARAM}=${CODE}`).code).toBe(CODE);
+    expect(takeAt(`?${PAIR_PARAM}=${CODE}`).code).toBe(CODE);
     // The same answer, not null. `main.tsx` calls this for the strip and
     // `PairingGate` for the value, and neither may depend on running first.
     expect(takePairingCodeFromUrl()).toBe(CODE);
@@ -132,7 +132,7 @@ describe('takeUnspentPairingCodeFromUrl', () => {
   /** Land on a launch URL carrying `code` and ask for it, as a cold start does. */
   function launchWith(code: string): string | null {
     resetPairingCodeSeedForTest();
-    currentUrl.value = `https://mac.tail1234.ts.net/~/?${PAIR_CODE_PARAM}=${code}`;
+    currentUrl.value = `https://mac.tail1234.ts.net/~/?${PAIR_PARAM}=${code}`;
     return takeUnspentPairingCodeFromUrl();
   }
 

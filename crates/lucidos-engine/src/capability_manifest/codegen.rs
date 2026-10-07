@@ -254,32 +254,33 @@ fn generate_cli_rs_unformatted() -> String {
                     fmt_args.join(", ")
                 ));
             }
-            // Query params — only declare the vec when there are query args.
+            // Query params — only declare the vec when there are query args. It
+            // is named `params` so an arg called `query` cannot shadow it.
             let query_args: Vec<&Arg> = op.args.iter().filter(|a| a.loc == ArgIn::Query).collect();
             let query_clause = if query_args.is_empty() {
                 String::new()
             } else {
-                out.push_str("            let mut query: Vec<(&str, String)> = Vec::new();\n");
+                out.push_str("            let mut params: Vec<(&str, String)> = Vec::new();\n");
                 for a in &query_args {
                     match (a.ty, a.required) {
                         // Required bool = bare flag (`bool` field).
                         (ArgType::Bool, true) => out.push_str(&format!(
-                            "            if {0} {{ query.push((\"{0}\", \"true\".to_string())); }}\n",
+                            "            if {0} {{ params.push((\"{0}\", \"true\".to_string())); }}\n",
                             a.name
                         )),
                         (_, true) => out.push_str(&format!(
-                            "            query.push((\"{0}\", {0}.to_string()));\n",
+                            "            params.push((\"{0}\", {0}.to_string()));\n",
                             a.name
                         )),
                         // Every optional arg is an `Option<T>`, bool included,
                         // so one arm covers them all.
                         (_, false) => out.push_str(&format!(
-                            "            if let Some(v) = {0} {{ query.push((\"{0}\", v.to_string())); }}\n",
+                            "            if let Some(v) = {0} {{ params.push((\"{0}\", v.to_string())); }}\n",
                             a.name
                         )),
                     }
                 }
-                ".query(&query)".to_string()
+                ".query(&params)".to_string()
             };
             // Body — only when there are body args; empty body for non-GET goes
             // through json!({}) so the engine sees a JSON content type.

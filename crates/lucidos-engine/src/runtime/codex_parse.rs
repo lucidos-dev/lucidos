@@ -279,6 +279,7 @@ impl TurnTracker {
                 output: "(abandoned — turn ended before the tool finished)".to_string(),
                 status: "error".to_string(),
                 id,
+                parent_tool_use_id: None,
             })
             .collect()
     }
@@ -330,6 +331,8 @@ impl TurnTracker {
                         output_tokens: clamp(output_tokens),
                         cache_read_tokens: cached,
                         cache_creation_tokens: 0,
+                        parent_tool_use_id: None,
+                        api_call_id: None,
                     });
                 }
                 events.push(AgentEvent::Result {
@@ -396,6 +399,8 @@ impl TurnTracker {
                         name: "command_execution".to_string(),
                         input: serde_json::json!({ "command": command }),
                         id,
+                        parent_tool_use_id: None,
+                        api_call_id: None,
                     }]
                 }
                 ItemPhase::Updated => Vec::new(),
@@ -415,6 +420,7 @@ impl TurnTracker {
                         },
                         status: tool_status(&status).to_string(),
                         id,
+                        parent_tool_use_id: None,
                     }]
                 }
             },
@@ -429,11 +435,14 @@ impl TurnTracker {
                         name: "file_change".to_string(),
                         input: serde_json::json!({ "changes": changes }),
                         id: id.clone(),
+                        parent_tool_use_id: None,
+                        api_call_id: None,
                     },
                     AgentEvent::ToolResult {
                         output: status.clone(),
                         status: tool_status(&status).to_string(),
                         id,
+                        parent_tool_use_id: None,
                     },
                 ]
             }
@@ -454,6 +463,8 @@ impl TurnTracker {
                             name,
                             input: arguments,
                             id,
+                            parent_tool_use_id: None,
+                            api_call_id: None,
                         }]
                     }
                     ItemPhase::Updated => Vec::new(),
@@ -463,6 +474,7 @@ impl TurnTracker {
                             output: error.unwrap_or_else(|| result.to_string()),
                             status: tool_status(&status).to_string(),
                             id,
+                            parent_tool_use_id: None,
                         }]
                     }
                 }
@@ -476,11 +488,14 @@ impl TurnTracker {
                         name: "web_search".to_string(),
                         input: serde_json::json!({ "query": query }),
                         id: id.clone(),
+                        parent_tool_use_id: None,
+                        api_call_id: None,
                     },
                     AgentEvent::ToolResult {
                         output: String::new(),
                         status: "success".to_string(),
                         id,
+                        parent_tool_use_id: None,
                     },
                 ]
             }
@@ -497,11 +512,14 @@ impl TurnTracker {
                         name: "todo_list".to_string(),
                         input: serde_json::json!({ "items": items }),
                         id: id.clone(),
+                        parent_tool_use_id: None,
+                        api_call_id: None,
                     },
                     AgentEvent::ToolResult {
                         output: String::new(),
                         status: "success".to_string(),
                         id,
+                        parent_tool_use_id: None,
                     },
                 ]
             }

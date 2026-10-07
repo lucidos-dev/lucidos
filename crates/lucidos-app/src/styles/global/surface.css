@@ -118,6 +118,8 @@
 .surface-actions {
     flex: none;
     display: flex;
+    /* The growing title already places these at the head's right end. */
+    justify-content: flex-end;
     align-items: center;
     gap: var(--space-sm);
 }

@@ -63,6 +63,11 @@ frontend, and the engine keeps only its length.
   thread in silence the same way. The signal there is a missing usage block
   rather than a missing stop reason, because that stream reported
   `finish_reason: stop`.
+- **Extended to a `tool_use` stop with no tool call.** Vertex once sent only
+  the interrupted-work sentinel, then `stop_reason: tool_use`, with no
+  `tool_use` block. The stop reason is present, so the guard above passed, and
+  the turn failed as an empty completion. The same rule applies: with nothing
+  rendered and no tool run, the parser raises a retryable truncation.
 
 ## Alternatives considered
 

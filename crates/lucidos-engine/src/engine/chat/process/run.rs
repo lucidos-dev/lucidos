@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::super::events::{describe_images, emit_routing_failure, make_message_received};
-use super::super::images::build_user_content_with_images;
+use super::super::images::{build_user_content_with_images, current_image_handles};
 use super::super::process_helpers::{
     build_trigger_started_event, classify_or_fallback, pinned_classification, TriggerContext,
 };
@@ -125,30 +125,30 @@ pub(super) async fn resolve_route_overrides(
 }
 
 impl LucidosEngine {
-    /// The tools a chat turn offers. A side question sends the same array, so
-    /// the two share one prompt-cache prefix.
+    /// The tools a chat turn offers, with the MCP slice fitted to a model of
+    /// `context_window`. A side question sends the same array, so the two
+    /// share one prompt-cache prefix.
     pub(super) async fn chat_turn_tools(
         &self,
         gates: &crate::llm::ToolCapabilities,
+        context_window: usize,
     ) -> crate::engine::agentic_loop::TurnTools {
         let mut tools = get_default_tools(gates);
         tools.push(get_notification_tool());
         // Grouped notification-inbox tool (list / mark_read / mark_all_read) +
         // any other manifest-declared LLM tools, from one source of truth.
-        tools.extend(crate::capability_manifest::llm_tools());
+        tools.extend(crate::capability_manifest::llm_tools_for(gates));
         // navigate_ui, save_thread_image, view_image and generate_image, each
         // with its gate declared beside it in `llm::tools::CHAT_TAIL`.
         tools.extend(chat_tail_tools(gates));
         // MCP server management is the grouped `mcp` manifest tool (spliced via
         // llm_tools() above). Tools discovered from running servers join here.
-        let mcp_surface = self.mcp_manager.tool_surface().await;
         // The stamp rides with the tools so the loop can tell whether what it
         // holds is still current. It is the only part of the array that can
         // move mid-turn; see `TurnTools`.
-        crate::engine::agentic_loop::TurnTools::new(
-            tools.into_iter().chain(mcp_surface.tools).collect(),
-            mcp_surface.generation,
-        )
+        let mcp_char_ceiling = crate::mcp::mcp_tool_char_ceiling(context_window);
+        let mcp_surface = self.mcp_manager.tool_surface(mcp_char_ceiling).await;
+        crate::engine::agentic_loop::TurnTools::new(tools, mcp_surface, mcp_char_ceiling)
     }
 }
 
@@ -435,69 +435,47 @@ impl LucidosEngine {
         // the turn. It sits after the answer path above, which reads none.
         // It returns `(description, model)`, and the agentic loop emits
         // `ImageDescribed { model, .. }` naming the model that described it.
-        // That is the `model_image_description` preference, or the
-        // extractor's default when the preference is empty or "default".
         // A coding agent reads the images itself and its lane never consumes
         // this handle, so spawning for it would pay for a discarded call.
-        let mut description_handle = if let (Some(imgs), Some(ref extractor)) =
-            (user_images, &self.extractor)
-        {
-            if !imgs.is_empty() && use_coding_agent != Some(true) {
+        let mut description_handle = match user_images {
+            Some(imgs) if !imgs.is_empty() && use_coding_agent != Some(true) => 'describe: {
                 let purpose = crate::engine::ContextPurpose::ImageDescribe;
-                let call = crate::engine::aux_purpose::AuxCall::resolve(&self.pool, purpose).await;
-                match extractor.provider_for_model(call.model(), call.attempt_timeout()) {
-                    Ok(provider) => {
-                        // Resolve the model name the event records. The pref
-                        // string wins when set. Otherwise it is the provider's
-                        // default, the model `provider_for_model`'s "" /
-                        // "default" branch actually calls.
-                        let recorded_model =
-                            if crate::engine::aux_purpose::is_extractor_default(call.model()) {
-                                provider.default_model().to_string()
-                            } else {
-                                call.model().to_string()
-                            };
-                        let effort = call.reasoning().map(str::to_string);
-                        let deadline = call.deadline();
-                        let imgs: Vec<crate::api::ChatImage> = imgs.to_vec();
-                        let capture =
-                            crate::engine::AuxCapture::new(&self.event_bus, thread_id, purpose);
-                        Some(tokio::spawn(async move {
-                            // Under the purpose's whole-call deadline. The task
-                            // is detached, so nothing else would ever stop it.
-                            let described = tokio::time::timeout(
-                                deadline,
-                                describe_images(
-                                    provider.as_ref(),
-                                    &imgs,
-                                    effort.as_deref(),
-                                    Some(&capture),
-                                ),
-                            )
-                            .await;
-                            match described {
-                                Ok(Ok(desc)) => Some((desc, recorded_model)),
-                                Ok(Err(e)) => {
-                                    log!("[Chat] Image description failed: {}", e);
-                                    None
-                                }
-                                Err(_) => {
-                                    log!("[Chat] Image description timed out ({:?})", deadline);
-                                    None
-                                }
-                            }
-                        }))
-                    }
-                    Err(e) => {
-                        log!("[Chat] Failed to build image-description provider: {}", e);
-                        None
-                    }
+                let call = self.aux_call(purpose).await;
+                // A model that cannot read images would fail on every image,
+                // so it is refused before anything is spent. Settings shows
+                // the same refusal on the row (`GET /api/v1/models/background`).
+                if let Some(refusal) = call.selection().refusal() {
+                    log!("[Chat] Image description refused: {}", refusal);
+                    break 'describe None;
                 }
-            } else {
-                None
+                let provider = call.provider();
+                let recorded_model = call.model().to_string();
+                let effort = call.reasoning().map(str::to_string);
+                let deadline = call.deadline();
+                let imgs: Vec<crate::api::ChatImage> = imgs.to_vec();
+                let capture = crate::engine::AuxCapture::new(&self.event_bus, thread_id, purpose);
+                Some(tokio::spawn(async move {
+                    // Under the purpose's whole-call deadline. The task is
+                    // detached, so nothing else would ever stop it.
+                    let described = tokio::time::timeout(
+                        deadline,
+                        describe_images(provider.as_ref(), &imgs, effort.as_deref(), &capture),
+                    )
+                    .await;
+                    match described {
+                        Ok(Ok(desc)) => Some((desc, recorded_model)),
+                        Ok(Err(e)) => {
+                            log!("[Chat] Image description failed: {}", e);
+                            None
+                        }
+                        Err(_) => {
+                            log!("[Chat] Image description timed out ({:?})", deadline);
+                            None
+                        }
+                    }
+                }))
             }
-        } else {
-            None
+            _ => None,
         };
 
         // Held messages (ADR 0256). An agent-sent message waits while a human
@@ -1308,11 +1286,9 @@ impl LucidosEngine {
         // The classification *model selection*, read once for the call below.
         // Fact extraction and history summarisation each resolve their own, one
         // purpose per preference, which is why neither travels from here.
-        let classification_call = crate::engine::aux_purpose::AuxCall::resolve(
-            &self.pool,
-            crate::engine::ContextPurpose::QueryClassification,
-        )
-        .await;
+        let classification_call = self
+            .aux_call(crate::engine::ContextPurpose::QueryClassification)
+            .await;
 
         // This turn's clock. Every reading the model sees derives from it,
         // never from `Utc::now()`. The message array is rebuilt from events on
@@ -1339,6 +1315,10 @@ impl LucidosEngine {
         // array, the system prompt and this turn's payload then answer from one
         // snapshot. `super::context_mode` owns everything it changes.
         let context_mode = super::context_mode::ContextMode::from_capabilities(&capabilities.gates);
+        // ADR 0362: on the Tree memory module, with its trees ready, the memory
+        // views replace the history, its summariser and memory recall. Off,
+        // every line below runs exactly as before (I2).
+        let memory_tree = capabilities.gates.memory_tree;
 
         // Resume tool blocks + conversation history + per-thread loaded
         // knowhow, all derived from a single events fetch (see
@@ -1351,7 +1331,7 @@ impl LucidosEngine {
                 thread_id,
                 user_message,
                 turn_started_at,
-                context_mode,
+                &capabilities.gates,
             ),
         )
         .await
@@ -1376,13 +1356,12 @@ impl LucidosEngine {
         // Memory indexing is handled by the EventBus memory consumer —
         // it reacts to persisted MessageReceived/ResponseGenerated events.
 
-        // A pinned classification answers before the extractor is consulted,
-        // so the LLM call never happens. Off unless
-        // `LUCIDOS_FORCE_QUERY_CLASSIFICATION` is set, which leaves every
-        // ordinary turn on the path below.
+        // A pinned classification answers before the model is asked, so the
+        // LLM call never happens. Off unless `LUCIDOS_FORCE_QUERY_CLASSIFICATION`
+        // is set, which leaves every ordinary turn on the path below.
         let classification = if let Some(pinned) = pinned_classification() {
             pinned
-        } else if let Some(ref extractor) = self.extractor {
+        } else {
             let ctx = if conversation_summary.is_empty() {
                 None
             } else {
@@ -1398,12 +1377,15 @@ impl LucidosEngine {
             let Some(classification) = until_canceled(
                 &cancel_token,
                 classify_or_fallback(
-                    extractor.classify_query(
+                    crate::memory::classify_query(
                         &self.pool,
                         user_message,
                         ctx,
                         &classification_call,
-                        Some(&capture),
+                        // A Tree turn retrieves no recall, so its queries
+                        // would go unread.
+                        !memory_tree,
+                        &capture,
                     ),
                     classification_call.deadline(),
                 ),
@@ -1415,17 +1397,19 @@ impl LucidosEngine {
                     .await);
             };
             classification
-        } else {
-            crate::memory::QueryClassification::default()
         };
 
         // Retrieve relevant context from memory (skipped if classification says not needed)
         let response_meta = cancel_exit.meta.clone();
-        let Some((mut memory_context, recalled_memories)) = until_canceled(
-            &cancel_token,
-            self.retrieve_context(user_message, &classification),
-        )
-        .await
+        let recall = async {
+            if memory_tree {
+                (String::new(), Vec::new())
+            } else {
+                self.retrieve_context(user_message, &classification).await
+            }
+        };
+        let Some((mut memory_context, recalled_memories)) =
+            until_canceled(&cancel_token, recall).await
         else {
             return Ok(self
                 .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
@@ -1435,7 +1419,7 @@ impl LucidosEngine {
         // Emit MemoryRecalled so the frontend can show the step. ADR 0109 ends
         // the assembled body region, so nothing reads the id back any more: the
         // recall rides in the message on both arms.
-        if classification.needs_memory {
+        if classification.needs_memory && !memory_tree {
             self.event_bus
                 .emit_or_log(
                     crate::engine::event_bus::BusEvent::Thread {
@@ -1592,6 +1576,14 @@ impl LucidosEngine {
             thread_depth_context,
         } = context_sections;
 
+        // The window the resolved model really has. It sizes the message budget
+        // below and the MCP slice of the tool array. It comes from the model's
+        // registry row when the row declares one. The id-shape fallback has no
+        // rule for OpenRouter / xAI / Gemini / local ids, and gives them 200k.
+        let provider = self.current_provider();
+        let resolved_model = model_override.unwrap_or_else(|| provider.default_model());
+        let context_window = self.context_window_for(resolved_model, chosen_provider);
+
         // The one setup await that is checkpointed rather than raced: it can be
         // mid-RPC to a running MCP server, and dropping it there is not the pure
         // read the other phases are. So the checkpoint goes AFTER it, where it
@@ -1600,7 +1592,9 @@ impl LucidosEngine {
         // have exited. The two remaining awaits (stopped-server summaries, the
         // capture preference) are in-memory / single-row and are followed
         // immediately by the loop's own pre-iteration check.
-        let tools = self.chat_turn_tools(&capabilities.gates).await;
+        let tools = self
+            .chat_turn_tools(&capabilities.gates, context_window)
+            .await;
         if cancel_token.is_cancelled() {
             return Ok(self
                 .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
@@ -1611,15 +1605,33 @@ impl LucidosEngine {
         // definitions overhead. The budget scales with the resolved model's context
         // window (e.g. ~1.49M chars for a 1M model vs ~288k chars for default
         // 200k-token Claude), so a big-window turn isn't trimmed back to the
-        // smaller model's limit. The window comes from the model's registry row
-        // when it declares one — the id-shape fallback has no rule for
-        // OpenRouter / xAI / Gemini / local ids and would hand them all 200k.
-        let provider = self.current_provider();
-        let resolved_model = model_override.unwrap_or_else(|| provider.default_model());
-        let total_budget =
-            agent_context_char_budget(self.context_window_for(resolved_model, chosen_provider));
+        // smaller model's limit.
+        let total_budget = agent_context_char_budget(context_window);
         let prompt_overhead: usize = system_prompt.len() + tools.defs_chars();
         let message_budget = total_budget.saturating_sub(prompt_overhead);
+
+        let memory_views = if memory_tree {
+            let surface = self.chat_surface(thread_id, is_trigger).await;
+            let Some(views) = until_canceled(
+                &cancel_token,
+                self.turn_memory_views(
+                    thread_id,
+                    surface,
+                    resolved_model,
+                    user_message,
+                    message_budget / 2,
+                ),
+            )
+            .await
+            else {
+                return Ok(self
+                    .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                    .await);
+            };
+            views
+        } else {
+            super::memory_views::TurnMemoryViews::default()
+        };
 
         // `loaded_knowhow_docs` was already populated up in the follow-up
         // branch (or left empty for triggers / new threads). Build the block
@@ -1674,7 +1686,9 @@ impl LucidosEngine {
             + engine_build_block.len()
             + client_url_block.len()
             + current_time_block.len()
+            + tools.mcp_dropped_notice().map_or(0, str::len)
             + user_message.len()
+            + memory_views.bytes()
             + 500; // 500 for formatting
         let expendable_budget = message_budget.saturating_sub(fixed_size);
         let expendable_size = memory_context.len() + history_context.len();
@@ -1710,8 +1724,13 @@ impl LucidosEngine {
         // sends them. What the mode curates is the live tool results, which are
         // 33.1% of the bill against the region's 16.3%.
 
-        // Build user message from contextual sections
+        // Build user message from contextual sections. A Tree turn opens with
+        // the recent workspace entries, right behind the view snapshot and the
+        // thread memory view (`TurnMemoryViews::lead`).
         let mut user_message_parts: Vec<&str> = Vec::new();
+        if !memory_views.recent.is_empty() {
+            user_message_parts.push(&memory_views.recent);
+        }
         if !profile_context.is_empty() {
             user_message_parts.push(&profile_context);
         }
@@ -1788,6 +1807,9 @@ impl LucidosEngine {
         if !mcp_stopped_context.is_empty() {
             user_message_parts.push(&mcp_stopped_context);
         }
+        if let Some(notice) = tools.mcp_dropped_notice() {
+            user_message_parts.push(notice);
+        }
         let setup_reminder = if !missing_pref_keys.is_empty() {
             let missing_list = missing_pref_keys.join(", ");
             format!("CRITICAL: The following preferences are not set: {}. Do NOT proceed with the user's request. Ask the user to configure these first.", missing_list)
@@ -1816,9 +1838,8 @@ impl LucidosEngine {
         // chasing a path it can't reach ("the bot can't see my attached image").
         let user_message_text = user_message_parts.join(super::context_mode::PART_SEPARATOR);
 
-        // Section *shape* (name + the two sizes) is always built so the
-        // modal can render the breakdown; only the body is gated by
-        // `capture_context`. Body cap (8 KB) prevents a 100 KB system
+        // Built with bodies. The loop drops them per round when
+        // `capture_context` is off. Body cap (8 KB) prevents a 100 KB system
         // prompt from bloating every events row. The actual assembly —
         // tagging each section with role + inner-tier group, plus the
         // per-loaded-knowhow and per-resume-tool-pair rows — lives in
@@ -1827,13 +1848,13 @@ impl LucidosEngine {
         // A section that became a body reports through the region's own rows
         // instead, so it is passed as empty here. Two rows for one body would
         // double its size in the viewer's budget bar and in the eval's read.
-        let capture_body = match PreferenceStore::capture_context(&self.pool).await {
-            Ok(body) => body,
-            Err(e) => {
-                return Err(self
-                    .fail_turn(thread_id, origin_id, response_channel, e.into())
-                    .await)
-            }
+        // A Tree turn reports its views where Classic reports recall and the
+        // history, so the context view shows what this turn carried.
+        let workspace_view = memory_views.workspace();
+        let (capture_memory, capture_history) = if memory_tree {
+            (workspace_view.as_str(), memory_views.thread.text.as_str())
+        } else {
+            (memory_context.as_str(), history_context.as_str())
         };
         let capture_sections = build_capture_sections(
             &system_prompt,
@@ -1843,12 +1864,13 @@ impl LucidosEngine {
             &credentials_context,
             &email_accounts_context,
             &oauth_context,
-            &memory_context,
-            &history_context,
+            capture_memory,
+            capture_history,
             &app_context_section,
             &file_context_section,
             &url_context_section,
             &mcp_stopped_context,
+            tools.mcp_dropped_notice().unwrap_or_default(),
             &setup_reminder,
             &thread_depth_context,
             &todo_list_block,
@@ -1860,16 +1882,18 @@ impl LucidosEngine {
             },
             &loaded_knowhow_docs,
             &resume_tool_blocks,
-            capture_body,
         );
         let capture_model = resolved_model.to_string();
 
-        let user_content = build_user_content_with_images(
+        let user_content = memory_views.lead(build_user_content_with_images(
             user_message_text,
             &self.workspace_path,
             &history_image_hashes,
             user_images,
-        );
+            &user_images
+                .map(|imgs| current_image_handles(&self.workspace_path, imgs))
+                .unwrap_or_default(),
+        ));
 
         // Prepend reconstructed (ToolUse, ToolResult) Message pairs for the
         // most recent N tool calls (Phase 3). This keeps tool result bodies —
@@ -1920,7 +1944,6 @@ impl LucidosEngine {
                 crate::engine::agentic_loop::ContextCaptureSeed {
                     sections: &capture_sections,
                     model: &capture_model,
-                    capture_body,
                 },
                 &trigger_side_effect_grant,
                 max_tool_calls,

@@ -18,11 +18,13 @@ vi.mock('./store', async (importOriginal) => {
 
 import { ApiError } from '../api/client';
 import {
+  QUICK_FAILURE_MS,
   SIDE_QUESTION_CODEX,
   SIDE_QUESTION_EMPTY,
   SIDE_QUESTION_NOT_STARTED,
   askSideQuestion,
   dismissSideQuestion,
+  retrySideQuestion,
   latestEventSeq,
   routeSideQuestion,
   localSideQuestions,
@@ -34,6 +36,7 @@ import {
 } from './sideQuestions';
 import { composeSelections } from './composeSelections';
 import { threadMap } from './store';
+import { SEND_RETRY_BACKOFF_MS } from './actions/sendRetry';
 import type { StoredEvent } from './thread-events/thread-event-types';
 import type { ThreadState } from './thread-events/thread-meta';
 
@@ -75,6 +78,15 @@ describe('routeSideQuestion', () => {
       .toEqual({ kind: 'refuse', toast: SIDE_QUESTION_CODEX });
   });
 });
+
+beforeEach(() => { vi.useFakeTimers(); });
+afterEach(() => { vi.useRealTimers(); });
+
+/** Run every pending timer, the automatic retries' waits included, then the ask. */
+async function finish(asking: Promise<void>): Promise<void> {
+  await vi.runAllTimersAsync();
+  await asking;
+}
 
 function resetSideQuestions() {
   localSideQuestions.value = new Map();
@@ -163,11 +175,11 @@ describe('recorded side questions', () => {
     ]);
     expect(sideQuestionsFor('t1')).toEqual([
       {
-        id: 'a', threadId: 't1', question: 'first', imageHashes: ['h1'], afterSeq: 4, dismissed: false,
+        id: 'a', threadId: 't1', question: 'first', imageHashes: ['h1'], afterSeq: 4, dismissed: false, asks: 1,
         status: 'answered', answer: 'one',
       },
       {
-        id: 'b', threadId: 't1', question: 'second', imageHashes: [], afterSeq: 6, dismissed: false,
+        id: 'b', threadId: 't1', question: 'second', imageHashes: [], afterSeq: 6, dismissed: false, asks: 1,
         status: 'failed', error: 'Interrupted by a restart. Ask again.',
       },
     ]);
@@ -211,6 +223,173 @@ describe('recorded side questions', () => {
     const before = sideQuestionsFor('t1')[0];
     threadMap.value.get('t1')!.events.set(2, { type: 'MessageReceived' } as unknown as StoredEvent);
     expect(sideQuestionsFor('t1')[0]).toBe(before);
+  });
+});
+
+describe('a dropped request', () => {
+  beforeEach(resetSideQuestions);
+  afterEach(resetSideQuestions);
+
+  it('never hides an ask the engine is still answering, and lets its answer land', async () => {
+    let fail!: (err: Error) => void;
+    post.mockReturnValueOnce(new Promise((_, reject) => { fail = reject; }))
+      .mockRejectedValue(new ApiError(409, 'A side question with this id is still running or was answered.'));
+    const asking = askSideQuestion('t1', 'q');
+    const id = sideQuestionsFor('t1')[0].id;
+    holdEvents('t1', [[10, asked(id, 'q')]]);
+    fail(new TypeError('Load failed'));
+    await finish(asking);
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id, afterSeq: 10, status: 'pending' }]);
+    threadMap.value.get('t1')!.events.set(11, { type: 'SideQuestionAnswered', side_question_id: id, answer: 'done' } as unknown as StoredEvent);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id, status: 'answered', answer: 'done' }]);
+  });
+
+  it('shows an engine error even when the engine never recorded how the ask ended', async () => {
+    let fail!: (err: Error) => void;
+    post.mockReturnValueOnce(new Promise((_, reject) => { fail = reject; }))
+      .mockRejectedValue(new ApiError(500, 'The side question stopped'));
+    const asking = askSideQuestion('t1', 'q');
+    const id = sideQuestionsFor('t1')[0].id;
+    holdEvents('t1', [[10, asked(id, 'q')]]);
+    fail(new ApiError(500, 'The side question stopped'));
+    await finish(asking);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id, afterSeq: 10, status: 'failed', error: 'The side question stopped' }]);
+  });
+
+  it('shows the failure when the engine never recorded the ask', async () => {
+    post.mockRejectedValue(new TypeError('Load failed'));
+    await finish(askSideQuestion('t1', 'q'));
+    expect(sideQuestionsFor('t1')).toMatchObject([{ status: 'failed', error: 'Load failed' }]);
+  });
+});
+
+describe('automatic retry', () => {
+  beforeEach(resetSideQuestions);
+  afterEach(resetSideQuestions);
+
+  it('retries a dropped request on the shared schedule under the same id, pending throughout, then shows the failure', async () => {
+    post.mockRejectedValue(new TypeError('Load failed'));
+    const asking = askSideQuestion('t1', 'q');
+    const id = sideQuestionsFor('t1')[0].id;
+    for (const [i, delay] of SEND_RETRY_BACKOFF_MS.entries()) {
+      await vi.advanceTimersByTimeAsync(delay);
+      expect(post).toHaveBeenCalledTimes(i + 2);
+      if (i < SEND_RETRY_BACKOFF_MS.length - 1) expect(sideQuestionsFor('t1')).toMatchObject([{ id, status: 'pending' }]);
+    }
+    await asking;
+    const attempts = SEND_RETRY_BACKOFF_MS.length + 1;
+    expect(post.mock.calls.map((call) => call[1])).toEqual(Array(attempts).fill(id));
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id, status: 'failed', error: 'Load failed' }]);
+  });
+
+  it('stops once an attempt is answered', async () => {
+    post.mockRejectedValueOnce(new TypeError('Load failed')).mockResolvedValue('here');
+    await finish(askSideQuestion('t1', 'q'));
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ status: 'answered', answer: 'here' }]);
+  });
+
+  it('retries a quick engine failure, keeping the card pending while its events land', async () => {
+    post.mockRejectedValueOnce(new ApiError(502, 'Claude Code sent an empty side answer')).mockResolvedValue('ok');
+    const asking = askSideQuestion('t1', 'q');
+    const id = sideQuestionsFor('t1')[0].id;
+    holdEvents('t1', [[10, asked(id, 'q')]]);
+    await vi.advanceTimersByTimeAsync(0);
+    threadMap.value.get('t1')!.events.set(11, { type: 'SideQuestionFailed', side_question_id: id, error: 'empty' } as unknown as StoredEvent);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id, status: 'pending' }]);
+    await finish(asking);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id, afterSeq: 10, status: 'answered', answer: 'ok' }]);
+  });
+
+  it('stays pending when the engine\'s failure events land after its reply', async () => {
+    post.mockRejectedValueOnce(new ApiError(502, 'Claude Code sent an empty side answer')).mockReturnValue(new Promise(() => {}));
+    void askSideQuestion('t1', 'q');
+    const id = sideQuestionsFor('t1')[0].id;
+    await vi.advanceTimersByTimeAsync(0);
+    holdEvents('t1', [[10, asked(id, 'q')], [11, { type: 'SideQuestionFailed', side_question_id: id, error: 'empty' }]]);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id, status: 'pending' }]);
+  });
+
+  it('never retries a refusal', async () => {
+    post.mockRejectedValue(new ApiError(400, 'Type the side question first.'));
+    await finish(askSideQuestion('t1', 'q'));
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  it('never retries a failure that took its time', async () => {
+    post.mockImplementation(() => new Promise((_, reject) => {
+      setTimeout(() => reject(new ApiError(502, 'Claude Code did not answer within 120 seconds')), QUICK_FAILURE_MS);
+    }));
+    await finish(askSideQuestion('t1', 'q'));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ status: 'failed' }]);
+  });
+});
+
+describe('retrySideQuestion', () => {
+  beforeEach(resetSideQuestions);
+  afterEach(resetSideQuestions);
+
+  const failed = (id: string) => ({ type: 'SideQuestionFailed', side_question_id: id, error: 'busy' });
+
+  it('re-asks a recorded failure under its own id, in place, pending at once', async () => {
+    holdEvents('t1', [[4, { ...asked('a', 'what is X?'), image_hashes: ['h1'] }], [5, failed('a')]]);
+    let resolve!: (answer: string) => void;
+    post.mockReturnValue(new Promise((r) => { resolve = r; }));
+    const retrying = retrySideQuestion(sideQuestionsFor('t1')[0]);
+    expect(post).toHaveBeenCalledWith('t1', 'a', 'what is X?', ['h1']);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id: 'a', afterSeq: 4, status: 'pending' }]);
+    resolve('A letter.');
+    await retrying;
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id: 'a', afterSeq: 4, status: 'answered', answer: 'A letter.' }]);
+  });
+
+  it('draws the recorded re-ask in place, then its settlement', () => {
+    holdEvents('t1', [[4, asked('a', 'q')], [5, failed('a')], [9, asked('a', 'q')]]);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id: 'a', afterSeq: 4, status: 'pending', asks: 2 }]);
+    threadMap.value.get('t1')!.events.set(10, { type: 'SideQuestionAnswered', side_question_id: 'a', answer: 'yes' } as unknown as StoredEvent);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id: 'a', afterSeq: 4, status: 'answered', answer: 'yes' }]);
+  });
+
+  it('lets the recorded outcome rule once the re-ask is recorded', async () => {
+    holdEvents('t1', [[4, asked('a', 'q')], [5, failed('a')]]);
+    post.mockReturnValue(new Promise(() => {}));
+    void retrySideQuestion(sideQuestionsFor('t1')[0]);
+    const events = threadMap.value.get('t1')!.events;
+    events.set(9, asked('a', 'q') as unknown as StoredEvent);
+    events.set(10, { type: 'SideQuestionFailed', side_question_id: 'a', error: 'again' } as unknown as StoredEvent);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id: 'a', status: 'failed', error: 'again' }]);
+  });
+
+  it('shows the retry\'s own failure when the engine never recorded it', async () => {
+    holdEvents('t1', [[4, asked('a', 'q')], [5, failed('a')]]);
+    post.mockRejectedValue(new TypeError('Load failed'));
+    await finish(retrySideQuestion(sideQuestionsFor('t1')[0]));
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id: 'a', afterSeq: 4, status: 'failed', error: 'Load failed' }]);
+    threadMap.value.get('t1')!.events.set(9, asked('a', 'q') as unknown as StoredEvent);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id: 'a', status: 'pending' }]);
+  });
+
+  it('re-asks a failure the engine never recorded under the same id', async () => {
+    post.mockRejectedValue(new TypeError('Load failed'));
+    await finish(askSideQuestion('t1', 'q'));
+    const [card] = sideQuestionsFor('t1');
+    post.mockResolvedValue('here');
+    await retrySideQuestion(card);
+    expect(post).toHaveBeenLastCalledWith('t1', card.id, 'q', []);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id: card.id, status: 'answered', answer: 'here' }]);
+  });
+
+  it('waits for the engine when it already holds the ask', async () => {
+    post.mockRejectedValue(new TypeError('Load failed'));
+    await finish(askSideQuestion('t1', 'q'));
+    const [card] = sideQuestionsFor('t1');
+    post.mockRejectedValue(new ApiError(409, 'A side question with this id is still running or was answered.'));
+    await retrySideQuestion(card);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id: card.id, status: 'pending' }]);
+    holdEvents('t1', [[3, asked(card.id, 'q')], [4, { type: 'SideQuestionAnswered', side_question_id: card.id, answer: 'done' }]]);
+    expect(sideQuestionsFor('t1')).toMatchObject([{ id: card.id, status: 'answered', answer: 'done' }]);
   });
 });
 

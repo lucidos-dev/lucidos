@@ -84,7 +84,7 @@
 //!   one "Low disk space on your machine" `NotificationCreated`. Its body is
 //!   framed around the volume and branches on Lucidos's footprint vs.
 //!   [`LARGE_FOOTPRINT_BYTES`]. Every disk notification taps through to
-//!   [`DISK_USAGE_PAGE_PATH`], and names it.
+//!   [`SettingsPage::DISK_USAGE`], and links it.
 //!
 //! ## What we *do not* touch
 //!
@@ -115,7 +115,7 @@ use crate::engine::git_ops::{git_cmd, has_branch_commits, worktrees_dir, SHORT_T
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::tools::bash_background::BackgroundBashRegistry;
 use crate::engine::types::AgentSession;
-use crate::scheduler::notifications::settings_tap;
+use crate::scheduler::notifications::SettingsPage;
 
 /// Is something working in this thread's worktree right now? Event age cannot
 /// say, because three kinds of work emit nothing while they use the tree:
@@ -247,17 +247,6 @@ const TEMP_WORKTREE_PREFIXES: &[&str] = &["harden-", "apply-", "merge-"];
 
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-/// The `settings_view` every disk notification's tap deep-links to. Must be a
-/// renderable subview: see [`settings_tap`].
-const DISK_USAGE_SETTINGS_VIEW: &str = "disk-usage";
-
-/// The same page written the way the UI's own breadcrumbs read
-/// (`SETTINGS_SYSTEM_SUBPANEL_ITEMS` in the frontend store). Every disk
-/// notification names it, so a reader without the tap to hand can still walk
-/// there. **Disk Usage is a subpanel of System, not a top-level category**: the
-/// bodies said "Settings → Disk Usage", a page with no Disk Usage on it.
-const DISK_USAGE_PAGE_PATH: &str = "Settings → System → Disk Usage";
-
 /// Body for the hard-threshold auto-cleanup report.
 ///
 /// The title attributes the action to Lucidos. The body names the volume as
@@ -267,10 +256,11 @@ const DISK_USAGE_PAGE_PATH: &str = "Settings → System → Disk Usage";
 fn auto_cleanup_body(free_bytes: u64, freed_bytes: u64) -> String {
     let free_gb = free_bytes as f64 / BYTES_PER_GB;
     let freed_gb = freed_bytes as f64 / BYTES_PER_GB;
+    let page = SettingsPage::DISK_USAGE.link();
     format!(
         "Your machine ran critically low on disk, so Lucidos reclaimed {freed_gb:.1} GB \
          from idle coding-agent worktrees. {free_gb:.1} GB is free now. Close saved threads \
-         or remove unused worktrees from {DISK_USAGE_PAGE_PATH} to reclaim more."
+         or remove unused worktrees from {page} to reclaim more."
     )
 }
 
@@ -1017,7 +1007,7 @@ fn disk_notification(title: &str, message: String) -> BusEvent {
         app_id: None,
         thread_id: None,
         event_id: None,
-        tap: settings_tap(DISK_USAGE_SETTINGS_VIEW),
+        tap: SettingsPage::DISK_USAGE.tap(),
         actor: None,
     })
 }

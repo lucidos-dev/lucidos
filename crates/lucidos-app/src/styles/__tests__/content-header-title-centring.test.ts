@@ -180,9 +180,9 @@ describe('the reserve is derived from the controls, never guessed', () => {
   };
 
   it('is three icon boxes and four gaps', () => {
-    // Three: two context icons riding the row plus the bell, which is the
-    // widest the cluster gets (a set of three or more folds whole, see
-    // alwaysCollapseFrom, so past two icons it gets NARROWER). Four gaps: the
+    // Three: two context icons riding the row plus the bell. That is the
+    // widest the cluster gets on the clamp's middle arm, since a third icon
+    // there makes the measurement fold two into ⋯. Four gaps: the
     // two between those boxes, and the two the collapse measurement charges the
     // centred box, one at each of its sides. Pinned as arithmetic on the icon
     // box rather than as a length, because the lights reserve's own note

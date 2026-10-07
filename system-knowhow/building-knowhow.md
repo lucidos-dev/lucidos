@@ -5,27 +5,27 @@ description: Use when writing or updating a knowhow file (API quirks, payload sh
 
 # Building Knowhow
 
-How to write a knowhow file the engine LLM will actually find and use. The intent/knowhow/script taxonomy and frontmatter shape are in `docs/taxonomy.md` and the engine system prompt: don't restate them. The standalone-vs-app-scoped placement rule is in CLAUDE.md and `system-knowhow/best-practices.md`: apply, don't restate. The doc-vs-reference rule below is this file's own, because it changes how you write the file and not only where it sits.
+How to write a knowhow file the engine LLM will find and use. The intent/knowhow/script taxonomy and frontmatter shape live in `docs/taxonomy.md` and the engine system prompt. The standalone-vs-app-scoped placement rule lives in CLAUDE.md and `system-knowhow/best-practices.md`. Apply those, don't restate them. The doc-vs-reference rule below is this file's own, because it changes how you write the file.
 
 ## When knowhow is the right artifact
 
-Knowhow captures *technical detail you'd otherwise re-derive*: API quirks, payload shapes, working examples, known failure modes. Things that don't change every day but would be wrong to forget.
+Knowhow captures *technical detail you'd otherwise re-derive*: API quirks, payload shapes, working examples, known failure modes. They don't change every day, but they would be wrong to forget.
 
 | You're writing… | Right place |
 |---|---|
 | "Here's how the Oura sleep API responds" | Knowhow |
 | "The user wants daily sleep summaries" | Intent |
 | "Lucidos engine architecture overview" | `docs/`, not knowhow |
-| "Today I noticed X" | The chat — not knowhow |
+| "Today I noticed X" | The chat, not knowhow |
 | "Workaround for the Panasonic API rate limit" | Knowhow |
 
-If a fact is stable across users and would be the same in every workspace, it might belong in `docs/` or `system-knowhow/` instead. If it's specific to *this* workspace's setup, it's knowhow.
+A fact that is the same in every workspace may belong in `docs/` or `system-knowhow/` instead. A fact specific to *this* workspace's setup is knowhow.
 
 ## Where the file goes: a doc, or one doc's reference
 
 A knowhow **doc** is a file the engine lists for routing. A file below the
 listing depth is a **reference**: it belongs to the doc above it, and only that
-doc reaches it. Placement is what decides which one you wrote.
+doc reaches it. Placement decides which one you wrote.
 
 | Root | Listed as docs | Anything deeper |
 |---|---|---|
@@ -38,9 +38,9 @@ under an app or a trigger sits at that root. The app or the trigger is already
 the group.
 
 **Split the supporting material out when a doc has a lot of it.** A long
-endpoint table, a field-by-field payload dump, a matrix of error codes: each is
-worth keeping, and none is worth a row in every thread's routing list. Put them
-in a folder named after the doc:
+endpoint table, a payload dump, a matrix of error codes: each is worth keeping,
+and none is worth a row in every thread's routing list. Put them in a folder
+named after the doc:
 
 ```
 data/knowhow/
@@ -59,29 +59,29 @@ The phase-by-phase table is in `lucidos-ops/release-process/phase-table`.
 Load it with `load_knowhow` before you start a release.
 ```
 
-Nothing else routes to a reference. It stays loadable by full id forever, but a
-reference no doc names is one nothing can find.
+Nothing else routes to a reference. It stays loadable by full id forever, but if no doc
+names it, nothing can find it.
 
 ## Lifecycle: load-once-stays-loaded
 
-When the engine LLM calls `load_knowhow` on a doc, the body lives in the `[LOADED KNOWHOW]` block of every subsequent turn's user message — the LLM does **not** need to re-call `load_knowhow` for the same id later in the thread. Calling it twice for the same id is a no-op (the loaded set is keyed by id; the second insert overwrites with the same body). The engine restores the loaded set from events on restart, so the doc stays loaded across engine restarts within the same thread. There is no auto-unload and no LRU; once loaded, a knowhow doc stays loaded for the whole thread's lifetime — matching Claude Code Skills (loaded once → persists for the session) and Codex AGENTS.md (re-sent each turn via stateless conversation history).
+When the engine LLM calls `load_knowhow` on a doc, the body goes into the `[LOADED KNOWHOW]` block of every later turn's user message. The LLM does **not** need to call `load_knowhow` again for that id. A second call is a no-op: the loaded set is keyed by id, so the body is overwritten with itself. The engine restores the loaded set from events on restart, so the doc stays loaded across engine restarts. There is no auto-unload and no LRU: a loaded doc stays loaded for the thread's lifetime.
 
-Practical implication for knowhow authors: write the body assuming it will be in context for the rest of the thread once it's been loaded. Don't structure it to be re-read on each turn, and don't worry about it being evicted partway through. The LLM Context Viewer surfaces loaded docs under the **Loaded knowhow** tier inside the user-message group so you can see exactly what's currently in context.
+So write the body for a reader who has it in context for the rest of the thread. Don't structure it to be re-read each turn, and don't plan for eviction. The LLM Context Viewer shows loaded docs under the **Loaded knowhow** tier, inside the user-message group.
 
 ## Questions to settle with the user before creating
 
-A new top-level knowhow file shows up in retrieval forever — confirm before adding one. Skip questions only when the user has already answered them.
+A new top-level knowhow file shows up in retrieval forever, so confirm before adding one. Skip a question only when the user has already answered it.
 
-1. **Is this stable workspace knowledge, or a one-shot answer?** If they just need the answer once, give it in chat or save it under `artifacts/`. Knowhow is for things that should be reused across future threads.
-2. **Top-level or app-scoped?** Both are listed for routing and loaded on demand with `load_knowhow`, never injected whole. What placement changes is where the doc lives and how it is addressed: app-scoped (`data/apps/<id>/knowhow/<name>.md`) answers to the id `<id>/<name>`, and a thread with that app open sees it named again in its own block. If the file only makes sense inside one app, scope it there.
-3. **What phrases would the user say when this becomes relevant?** The `description` is what the engine LLM sees in every thread — list the synonyms / keywords the user actually uses. Confirm them with the user; they know their own vocabulary better than you do.
+1. **Is this stable workspace knowledge, or a one-shot answer?** For a one-off, answer in chat or save it under `artifacts/`. Knowhow is for reuse across future threads.
+2. **Top-level or app-scoped?** Both are listed for routing and loaded on demand with `load_knowhow`, never injected whole. Placement changes where the doc lives and how it is addressed. App-scoped (`data/apps/<id>/knowhow/<name>.md`) answers to the id `<id>/<name>`. A thread with that app open also sees it named in its own block. If the file only makes sense inside one app, scope it there.
+3. **What phrases would the user say when this becomes relevant?** The engine LLM sees the `description` in every thread, so list the synonyms and keywords the user actually uses. Confirm them with the user: they know their own vocabulary.
 4. **Augment instead of fork.** If a knowhow on the topic exists, propose updating it rather than creating a new file. Confirm with the user before splitting one knowhow into two.
 
-A short append to a knowhow you're already maintaining in the current task does NOT need a question — that's part of the work (see "Writing knowhow during execution" below).
+A short append to a knowhow you already maintain in the current task needs no question. That is part of the work.
 
 ## The `description` field is for retrieval, not for humans
 
-The engine LLM sees every knowhow doc's name + description in every thread (the body only loads when the LLM chooses to read it). A reference is not listed, so its description does no routing. It picks what to load by reading those descriptions and matching them against the user's message. Write descriptions in terms of *what the user would be saying when this becomes relevant*, not as a tagline.
+The engine LLM sees every knowhow doc's name and description in every thread. It picks what to load by matching those descriptions against the user's message. The body loads only when the LLM chooses to read it. A reference is not listed, so its description does no routing. Write the description as *what the user would be saying when this becomes relevant*, not as a tagline.
 
 Bad:
 
@@ -92,41 +92,41 @@ description: Panasonic Comfort Cloud integration
 Good:
 
 ```yaml
-description: API quirks, auth flow, and payload shape for controlling Panasonic heatpumps via Comfort Cloud — load when the user mentions heatpump, varmepumpe, Panasonic, or temperature control
+description: API quirks, auth flow, and payload shape for controlling Panasonic heatpumps via Comfort Cloud. Load when the user mentions heatpump, varmepumpe, Panasonic, or temperature control
 ```
 
-Specific keywords win. List the synonyms a user might actually use. The description loads in every thread; the body only loads when retrieval fires — so it's worth investing 1–2 sentences here to make the body discoverable.
+Specific keywords win. Spend 1–2 sentences here: they are what make the body discoverable.
 
 ## Augment, don't fork
 
-If a knowhow on the topic exists, edit it. Don't create `panasonic-v2.md` or `panasonic-better.md` — that fragments retrieval and the LLM ends up loading the wrong one. The exception: a genuinely separate concern (e.g. `panasonic-auth.md` vs `panasonic-payloads.md`) when one file would otherwise grow unwieldy.
+If a knowhow on the topic exists, edit it. Don't create `panasonic-v2.md` or `panasonic-better.md`: that fragments retrieval, and the LLM loads the wrong one. The exception is a separate concern (e.g. `panasonic-auth.md` vs `panasonic-payloads.md`) when one file would grow unwieldy.
 
 ## Good knowhow content
 
-- **Working examples** — actual API requests/responses, not abstract descriptions
-- **Quirks and failure modes** — "the API returns 200 with `error: true` in the body when X"
-- **Concrete payload shapes** — JSON snippets, not English summaries
-- **Workarounds with the reason** — why the obvious approach doesn't work
+- **Working examples**: actual API requests and responses, not abstract descriptions
+- **Quirks and failure modes**: "the API returns 200 with `error: true` in the body when X"
+- **Concrete payload shapes**: JSON snippets, not English summaries
+- **Workarounds with the reason**: why the obvious approach fails
 
 Avoid:
 
-- Philosophy ("the user values reliability over speed") — that's user profile, not knowhow
-- Restating intent ("the user wants to track jobs") — intents own that
+- Philosophy ("the user values reliability over speed"): that's user profile, not knowhow
+- Restating intent ("the user wants to track jobs"): intents own that
 - Documenting the obvious ("call the API to get data")
-- Stale specifics ("this works as of last Tuesday") — date them or remove them
+- Stale specifics ("this works as of last Tuesday"): date them or remove them
 
 ## Calling external APIs from a recipe
 
-If the knowhow describes how to call an external HTTP API the workspace owns a credential for, the recipe should use the engine proxy — not raw `curl -H "Authorization: Bearer $CRED_..."` or pasted-in headers. The proxy injects the auth header server-side, so the credential never appears in the script source, args, env vars, log lines, or the LLM tool transcript. Surfaces by consumer:
+A recipe that calls an external HTTP API the workspace holds a credential for uses the engine proxy. Never raw `curl -H "Authorization: Bearer $CRED_..."` or pasted-in headers. The proxy injects the auth header server-side. The credential never appears in script source, args, env vars, log lines, or the LLM tool transcript. Surfaces by consumer:
 
-- **LLM running a trigger or agent step** — `proxy_request` tool. Same `data/config/apis.json` entry, called by name.
-- **Script (bash / Python) invoked by an intent or trigger** — `lucidos proxy <name> ...` CLI (see `system-knowhow/lucidos-cli.md` § `lucidos proxy`).
-- **App UI inside an iframe** — `lucidos.proxy(name).fetch(path, init)` (see `system-knowhow/js-sdk.md` § `lucidos.proxy`).
+- **LLM running a trigger or agent step**: the `proxy_request` tool, calling the `data/config/apis.json` entry by name.
+- **Script (bash / Python) invoked by an intent or trigger**: the `lucidos proxy <name> ...` CLI (see `system-knowhow/lucidos-cli.md` § `lucidos proxy`).
+- **App UI inside an iframe**: `lucidos.proxy(name).fetch(path, init)` (see `system-knowhow/js-sdk.md` § `lucidos.proxy`).
 
-Configure the backend once in `data/config/apis.json` (schema in `system-knowhow/best-practices.md` § `config/`); knowhow then references it by name instead of restating credentials.
+Configure the backend once in `data/config/apis.json` (schema in `system-knowhow/best-practices.md` § `config/`). Knowhow then names it instead of restating credentials.
 
 **A model provider needs no entry at all.** Every model provider the engine holds auth for is a *builtin provider proxy*: `anthropic`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. They are not in `apis.json`, and a recipe never asks for their key. Each default base already includes `/v1`, so a recipe writes `lucidos proxy openai /models`, never `/v1/models`. See `system-knowhow/lucidos-cli.md` § `lucidos proxy`.
 
 ## Writing knowhow during execution
 
-Knowhow is your *living* memory. When you discover something new while running a trigger or app — a quirk, a better approach, a failure mode — update the relevant knowhow before moving on. The engine prompt's `CONTINUOUS LEARNING` note is the explicit license to do this. Confirm with the user before creating a new top-level knowhow file (it shows up in retrieval forever); appending to one you're already maintaining for the task at hand is part of the work.
+Knowhow is your *living* memory. When a trigger or app run teaches you something (a quirk, a better approach, a failure mode), update the relevant knowhow before moving on. The engine prompt's `CONTINUOUS LEARNING` note licenses this. Creating a new top-level file still needs the user's confirmation, per § "Questions to settle with the user before creating".

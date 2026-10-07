@@ -43,6 +43,7 @@ import { makeOptimisticThreadState, type StoredEvent, type ThreadMeta } from '..
 import { clearDraft, composeDrafts, draftIsEmpty, getDraft, patchDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { API, ApiError, ensureThreadStarted, putComposeOnThread, deleteThread, isTransientFetchError, type ComposePutResult } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
+import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { createFailureCounter } from '../../utils/failureCounter';
 import { instantMicros } from '../../utils/isoInstant';
 import { appendMessagesToCompose, sendMessage } from './chat';
@@ -1561,14 +1562,14 @@ export async function sendCompose(
     // first-send `POST /threads` may still be in flight.
     // `ensureFocusedComposeThread` fires it without awaiting. Every optimistic
     // local step above stays synchronous, since the input must clear on the
-    // gesture. So this sits as late as possible, before the network call.
+    // gesture. `sendMessage` waits for it after its optimistic row, so the
+    // composer shows a turn in flight meanwhile, never an idle thread.
     //
     // A button that composes and sends in one gesture is the case that needs
     // it. Typing hides the race, the draft PUT awaiting the same promise in
     // `pushNow`, and `cancelPendingPush` above has just dropped that PUT. A
-    // failed start rejects here and lands in the catch below, which rolls the
-    // draft back and rethrows for the caller to toast.
-    await awaitThreadStarted(threadId);
+    // failed start rejects out of `sendMessage` into the catch below, which
+    // rolls the draft back and rethrows for the caller to toast.
     const outcome = await sendMessage(text, wireHashes.length > 0 ? wireHashes : undefined, {
       useCodingAgent: opts.useCodingAgent,
       context: opts.context,
@@ -1579,6 +1580,7 @@ export async function sendCompose(
       providerOverride,
       ccModelOverride,
       ccReasoningEffortOverride,
+      threadStarted: () => awaitThreadStarted(threadId),
       settlement: { kind: 'first-send', mode, engineDraftAtSend },
     });
     if (outcome === 'dropped') {
@@ -1633,9 +1635,7 @@ export async function sendFollowup(
  *  carries origin_device_id=None, and other tabs cannot suppress the echo. That
  *  can clobber newer text typed elsewhere right after the close. */
 function flushAllPending(): void {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  const deviceId = typeof localStorage !== 'undefined' ? localStorage.getItem('lucidos-device-id') : null;
-  if (deviceId) headers['x-lucidos-device-id'] = deviceId;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', ...deviceIdHeader() };
 
   // Every thread holding an intent the engine has not seen. **Two states
   // qualify, not one**: a debounce still counting down (`pendingTimers`), and

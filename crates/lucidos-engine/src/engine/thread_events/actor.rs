@@ -352,6 +352,18 @@ impl MessageOrigin {
         origin.map_or(fallback, Self::mode)
     }
 
+    /// The local thread whose subprocess made this request, as the origin
+    /// token proves. A `Workspace` caller's thread lives in another
+    /// workspace, so it never answers here.
+    pub fn source_thread_id(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Api {
+                source_thread_id, ..
+            } => *source_thread_id,
+            _ => None,
+        }
+    }
+
     /// The agent that authored this event, when an agent did.
     pub fn agent(&self) -> Option<&AgentParticipant> {
         match self {

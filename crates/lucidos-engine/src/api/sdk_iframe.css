@@ -353,3 +353,20 @@ button:hover {
 ::-webkit-scrollbar-thumb:hover {
     background: var(--text-muted);
 }
+
+/* Find in app: every match, and the current one, as the host's find bar
+   steps through them (packages/lucidos-sdk/src/find.ts). The SDK reads
+   `--find-highlights` to know these rules are here. An app without this
+   stylesheet gets the current match as its selection instead. */
+:root {
+    --find-highlights: styled;
+}
+
+::highlight(lucidos-find) {
+    background-color: color-mix(in srgb, var(--accent-yellow) 45%, transparent);
+}
+
+::highlight(lucidos-find-current) {
+    background-color: var(--accent);
+    color: var(--text-on-accent);
+}

@@ -61,7 +61,7 @@ fn enabled() -> bool {
 }
 
 fn probe_enabled_value(value: Option<&str>) -> bool {
-    matches!(value.map(str::trim), Some("1" | "true" | "yes" | "on"))
+    value.is_some_and(crate::core::prefs::env_switch_is_on)
 }
 
 /// Emit the request line. Returns before any work when the probe is off.

@@ -1,4 +1,5 @@
 import type {
+  McpBudget,
   McpCostTotals,
   McpServerStatus,
   McpServersResponse,
@@ -142,9 +143,11 @@ export function patchToolDisabled(
 export interface McpHeaderSummary {
   /** What every request is paying right now. */
   live: string;
-  /** Share of the resolved model's window, or `null` when the engine reports
-   *  no window for it. */
+  /** Share of what a request to the resolved model can carry, or `null`
+   *  when the engine reports no window for it. */
   share: string | null;
+  /** The engine's warning once the tools are past or near their ceiling. */
+  warning: string | null;
   /** What the stopped servers would add if switched on. */
   stopped: string | null;
   /** What the switched-off tools are keeping out. */
@@ -155,18 +158,20 @@ export function mcpHeaderSummary(
   totals: McpCostTotals,
   contextWindow: number,
   model: string,
+  budget: McpBudget,
 ): McpHeaderSummary {
   const live =
     totals.running_servers === 0
       ? 'No servers on, so MCP adds nothing to a request'
-      : `${plural(totals.running_servers, 'server')} on, ${plural(totals.tools, 'tool')}, ~${formatTokens(totals.tokens)} tokens per request`;
+      : `${plural(totals.running_servers, 'server')} on, ${plural(budget.sent_tools, 'tool')}, ~${formatTokens(budget.sent_tokens)} tokens per request`;
 
   let share: string | null = null;
-  if (contextWindow > 0) {
-    const pct = contextPercent(totals.tokens, contextWindow);
+  if (budget.request_chars > 0) {
+    // Chars over chars: the request budget is the total the packer fills.
+    const pct = contextPercent(budget.sent_chars, budget.request_chars);
     // A figure that rounds to zero is still a cost, and "0%" reads as free.
-    const text = pct === 0 && totals.tokens > 0 ? 'Under 1%' : `${pct}%`;
-    share = `${text} of ${model}'s ${formatTokens(contextWindow)} context window`;
+    const text = pct === 0 && budget.sent_chars > 0 ? 'Under 1%' : `${pct}%`;
+    share = `${text} of what a request to ${model} can carry (${formatTokens(contextWindow)} context window)`;
   }
 
   const stopped =
@@ -179,7 +184,7 @@ export function mcpHeaderSummary(
       ? null
       : `${plural(totals.disabled_tools, 'tool')} switched off, keeping ~${formatTokens(totals.disabled_tokens)} tokens out of every request`;
 
-  return { live, share, stopped, disabled };
+  return { live, share, warning: budget.warning, stopped, disabled };
 }
 
 /** How a failed per-server verb reads on the row.

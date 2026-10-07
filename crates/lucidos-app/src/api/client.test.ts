@@ -69,6 +69,14 @@ describe('mutating fetch retry on TypeError', () => {
     ).rejects.toThrow('Load failed');
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
+
+  it('submitChat carries a deadline, so a stalled POST cannot hang for minutes', async () => {
+    mockFetch.mockResolvedValueOnce(new Response('{"event_id":"evt-1"}', { status: 200 }));
+
+    await submitChat({ message: 'hi', mode: 'human', event_id: 'evt-1', thread_id: 't-1' });
+
+    expect(mockFetch.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+  });
 });
 
 describe('fetchCodingAgentCommands url construction', () => {

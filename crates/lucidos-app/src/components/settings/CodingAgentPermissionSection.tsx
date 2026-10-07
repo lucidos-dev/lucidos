@@ -6,22 +6,28 @@ import {
 } from '../../store/actions/preferences';
 import { Dropdown, type DropdownOption } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
+import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
+
+const PERMISSION_MODE_COPY: Record<CcPermissionMode, { label: string; description: string }> = {
+  'accept-edits': {
+    label: 'Accept edits',
+    description: 'You approve anything outside the working directories',
+  },
+  auto: {
+    label: 'Auto',
+    description: "Claude Code's safety classifier approves routine actions",
+  },
+};
+
+const DEFAULT_PERMISSION_MODE = PREFERENCE_CATALOG.coding_agent_claude_permission_mode.fallback;
 
 /** The picker's options, in the order a user should weigh them: the safe
  *  default first. Each carries its one-line trade-off as a second row, so the
  *  cost is on screen while choosing, not only in the explainer. */
 export const PERMISSION_MODE_OPTIONS: DropdownOption[] = [
-  {
-    value: 'accept-edits',
-    label: 'Accept edits',
-    description: 'You approve anything outside the working directories',
-  },
-  {
-    value: 'auto',
-    label: 'Auto',
-    description: "Claude Code's safety classifier approves routine actions",
-  },
-];
+  DEFAULT_PERMISSION_MODE,
+  ...CC_PERMISSION_MODES.filter((mode) => mode !== DEFAULT_PERMISSION_MODE),
+].map((mode) => ({ value: mode, ...PERMISSION_MODE_COPY[mode] }));
 
 /** Guards against a value the engine would reject, so a stale or hand-edited
  *  preference cannot be re-saved from here. Pure, unit tested. */
@@ -57,7 +63,8 @@ export function CodingAgentPermissionSection() {
             to new sessions.
           </p>
           <p>
-            <strong>Accept edits</strong> is the default. Writes inside the session's
+            <strong>{PERMISSION_MODE_COPY[DEFAULT_PERMISSION_MODE].label}</strong> is the
+            default. Writes inside the session's
             working directories go through, and anything else asks you first. Those are
             the session's own worktree, this workspace's <code>data</code> folder, and{' '}
             <code>/tmp</code>.

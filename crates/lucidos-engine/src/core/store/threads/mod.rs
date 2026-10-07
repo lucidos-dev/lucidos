@@ -1,4 +1,3 @@
-use super::messages::build_session_messages;
 use super::types::SessionMessage;
 use super::EventStore;
 use crate::core::event_subscription::EventSubscription;
@@ -6,22 +5,6 @@ use crate::core::EventRow;
 use crate::engine::thread_lifecycle::{ArchiveState, ThreadStatus};
 use crate::engine::thread_state::ThreadState;
 use serde::{Deserialize, Serialize};
-
-/// Preference marker: set after `backfill_trigger_id_v5_to_config_id` runs
-/// successfully so subsequent boots skip the events scan.
-const BACKFILL_TRIGGER_ID_V5_MARKER: &str = "backfill_trigger_id_v5_to_config_id_done";
-
-/// Preference marker: set after `backfill_trigger_id_from_events` runs
-/// successfully so subsequent boots skip the events scan.
-const BACKFILL_TRIGGER_ID_FROM_EVENTS_MARKER: &str = "backfill_trigger_id_from_events_done";
-
-/// Preference marker: set after `backfill_repo_names_from_changes` runs
-/// successfully so subsequent boots skip the `changes` scan.
-const BACKFILL_REPO_NAMES_FROM_CHANGES_MARKER: &str = "backfill_repo_names_from_changes_done";
-
-/// Preference marker: set after `backfill_cc_repo_id_to_deterministic` runs
-/// successfully so subsequent boots don't re-point thread bindings.
-const BACKFILL_CC_REPO_ID_DETERMINISTIC_MARKER: &str = "backfill_cc_repo_id_to_deterministic_done";
 
 /// Two-state initiator stored in the `thread_summaries.initiator` text column
 /// and exposed on `ThreadSummary` for the frontend (`'user' | 'system'`).
@@ -90,18 +73,6 @@ pub struct EventWaitSummary {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// One turn of a call, as a reader of the call gets it back.
-///
-/// Who spoke is a `bool` because a call has exactly two voices. The caller and
-/// the talker are the whole set, and a third would be a different feature
-/// rather than a third variant here.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpokenTurn {
-    /// True when the caller said it, false when the talker did.
-    pub from_caller: bool,
-    pub text: String,
-}
-
 /// Format a display title from optional title and first_message fields.
 /// Falls back to truncated first_message if title is None.
 pub(crate) fn format_display_title(title: Option<String>, first_message: Option<String>) -> String {
@@ -147,6 +118,10 @@ pub struct ThreadSummary {
     /// `false` or re-fetch the whole grouped payload. Both sources read this same
     /// column, so they cannot disagree.
     pub saved: bool,
+    /// Whether this is the workspace's *home thread* (ADR 0362). Omitted when
+    /// false, so every other thread's wire bytes are unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub home: bool,
     /// Thread section: "archived" (history/saved), "inbox" (needs user attention).
     /// Stored in `thread_summaries.archive_state` column; aliased to `section` in
     /// SELECTs to keep the JSON wire format stable.
@@ -429,6 +404,7 @@ struct ThreadRow {
     coding_agent_is_external_repo: bool,
     last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
     is_saved: bool,
+    is_home: bool,
     has_response: bool,
     parent_thread_id: Option<String>,
     parent_thread_title: Option<String>,
@@ -639,7 +615,7 @@ fn thread_cols(alias: &str) -> String {
         {a}.live_event_wait_count::bigint, {a}.live_event_waits, \
         {a}.status, {a}.summary_version, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, {a}.coding_agent_incomplete, \
         {a}.coding_agent_is_external_repo, {a}.last_revived_at, \
-        {a}.is_saved, {a}.has_response, \
+        {a}.is_saved, {a}.is_home, {a}.has_response, \
         {a}.parent_thread_id::text AS parent_thread_id, \
         (SELECT p.title FROM thread_summaries p WHERE p.thread_id = {a}.parent_thread_id) AS parent_thread_title, \
         {a}.trigger_id, {a}.trigger_name, \
@@ -717,6 +693,7 @@ fn row_to_thread_summary(
         last_agent_action: r.last_agent_action,
         message_count: r.message_count,
         saved: r.is_saved,
+        home: r.is_home,
         section: r.section,
         active_children_count: r.active_children_count,
         waiting_children_count: r.waiting_children_count,
@@ -797,10 +774,47 @@ static SUMMARY_FILTER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::ne
         "($3::text[] IS NULL OR t.source = ANY($3)) \
          AND ($4::uuid IS NULL OR t.parent_thread_id = $4) \
          AND ($5::bool IS NULL OR ({has_draft}) = $5) \
-         AND ($6::bool IS NULL OR t.coding_agent_has_diff = $6)",
+         AND ($6::bool IS NULL OR t.coding_agent_has_diff = $6) \
+         AND {home_visible}",
         has_draft = HAS_DRAFT_SQL,
+        home_visible = home_visible_sql("t"),
     )
 });
+
+/// Keeps a row unless it is the home thread with its switch off (ADR 0362).
+/// Every thread list a person or an agent reads carries it, so a hidden home
+/// thread appears in none of them.
+/// The switch reads exactly as `prefs::parse_flag` reads it, and an absent or
+/// unrecognised row takes the catalog default.
+pub(crate) fn home_visible_sql(alias: &str) -> String {
+    use crate::core::preference_catalog::{FLAG_OFF_VALUES, FLAG_ON_VALUES};
+    let switch = &crate::core::prefs::HOME_THREAD_ENABLED;
+    let default_on = switch.default_flag();
+    // A row that flips the default: on-spellings hide nothing when the default
+    // is off, so it is their presence that shows the thread, and vice versa.
+    let flipping = if default_on {
+        FLAG_OFF_VALUES
+    } else {
+        FLAG_ON_VALUES
+    };
+    let spellings = flipping
+        .iter()
+        .map(|v| format!("'{v}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let row = format!(
+        "EXISTS (SELECT 1 FROM preferences hp WHERE hp.key = '{key}' \
+         AND hp.device_id IS NULL \
+         AND lower(btrim(hp.value, E' \\t\\r\\n')) IN ({spellings}))",
+        key = switch.key(),
+    );
+    let shown = if default_on {
+        format!("NOT {row}")
+    } else {
+        row
+    };
+    format!("NOT ({alias}.is_home AND NOT {shown})")
+}
 
 /// How a `list` / `count` query narrows by thread status.
 ///
@@ -960,6 +974,7 @@ pub use drafts::{
     HAS_DRAFT_SQL, PREVIEW_CHARS,
 };
 mod search;
+pub use search::MessageMatch;
 mod summaries;
 
 #[cfg(test)]

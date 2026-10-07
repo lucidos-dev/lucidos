@@ -1,6 +1,6 @@
 import type { VNode } from 'preact';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
-import { dismissSideQuestion, reopenSideQuestion, type SideQuestion } from '../../store/sideQuestions';
+import { dismissSideQuestion, reopenSideQuestion, retrySideQuestion, type SideQuestion } from '../../store/sideQuestions';
 import type { BodyRow, BodySection } from '../../store/event-rendering';
 import { exchangeKey, type Exchange } from '../../store/thread-events/exchange';
 import { renderMarkdown } from '../../utils/renderMarkdown';
@@ -8,8 +8,8 @@ import { appsList } from '../../store/store';
 import { loadedOr } from '../../store/types';
 import { Disclosure } from '../shared/Disclosure';
 import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
-import { ChevronDownIcon } from '../shared/icons';
-import { MarkdownBlock, UserImages } from './chat-exchange-parts';
+import { ChevronDownIcon, RetryIcon } from '../shared/icons';
+import { MarkdownBlock, UserMessageBody } from './chat-exchange-parts';
 
 /** One shared empty list, so a turn without cards keeps a stable prop. */
 export const NO_SIDE_QUESTIONS: readonly SideQuestion[] = [];
@@ -37,6 +37,9 @@ function Thinking() {
  *  a folded card shows it again on this device only. */
 export function SideQuestionCard({ item }: { item: SideQuestion }) {
   const open = !item.dismissed;
+  // The card sits outside the turn body, so it carries the router itself.
+  // Without it the webview follows a `repo:` link to the OS.
+  const routeLinks = (e: MouseEvent) => handleMarkdownLinkClick(e, loadedOr(appsList.value, []));
   return (
     <div
       class="side-question-card"
@@ -58,21 +61,20 @@ export function SideQuestionCard({ item }: { item: SideQuestion }) {
         <span class="side-question-chevron" aria-hidden="true"><ChevronDownIcon /></span>
       </button>
       <Disclosure open={open} bodyClass="side-question-body">
-        <div class="user-bubble side-question-question">
-          {item.question}
-          <UserImages imageHashes={item.imageHashes} />
+        <div class="user-bubble side-question-question" onClick={routeLinks}>
+          <UserMessageBody html={renderMarkdown(item.question)} imageHashes={item.imageHashes} />
         </div>
         {item.status === 'pending' && <Thinking />}
         {item.status === 'answered' && (
-          // The card sits outside the turn body, so it carries the router
-          // itself. Without it the webview follows a `repo:` link to the OS.
-          <MarkdownBlock
-            html={renderMarkdown(item.answer)}
-            onClick={(e) => handleMarkdownLinkClick(e, loadedOr(appsList.value, []))}
-          />
+          <MarkdownBlock html={renderMarkdown(item.answer)} onClick={routeLinks} />
         )}
         {item.status === 'failed' && (
-          <div class="side-question-error" role="alert">{item.error}</div>
+          <div class="side-question-failure">
+            <span class="side-question-error" role="alert">{item.error}</span>
+            <button type="button" class="side-question-retry" onClick={() => void retrySideQuestion(item)}>
+              <RetryIcon />Retry
+            </button>
+          </div>
         )}
       </Disclosure>
     </div>

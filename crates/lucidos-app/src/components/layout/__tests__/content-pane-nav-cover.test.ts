@@ -63,9 +63,8 @@ describe('content pane navigation cover', () => {
   it('ends an arrival on a fuse, never on the animation alone', () => {
     // Reduced motion drops the animation, so an `animationend`-driven unmount
     // would never fire and the pane would stay covered forever.
-    expect(cover).toMatch(
-      /setTimeout\(\s*\(\) => setArriving\(null\),\s*scaledDurationMs\(NAV_COVER_MOTIONS\[motion\]\.animMs\) \+ NAV_COVER_SLACK_MS,\s*\)/,
-    );
+    expect(cover).toMatch(/setTimeout\(\(\) => setArriving\(null\), navCoverFuseMs\(motion\)\)/);
+    expect(cover).toMatch(/return scaledDurationMs\(NAV_COVER_MOTIONS\[motion\]\.animMs\) \+ NAV_COVER_SLACK_MS;/);
     expect(cover).not.toMatch(/onAnimationEnd/);
   });
 
@@ -141,7 +140,7 @@ describe('the pane titles switch word at once, with no fade of their own', () =>
 
   it('the drawer title is one plain word, not a stack', () => {
     const title = filterButton.slice(filterButton.indexOf('export function ThreadsPaneTitle'));
-    expect(title).toMatch(/return <span class=\{className\}>\{THREADS_TITLES\[/);
+    expect(title).toMatch(/return <span class=\{className\}>\{threadFilterPanelOpen\.value \? 'Filters' : 'Threads'\}<\/span>/);
     expect(title).not.toMatch(/CrossfadeStack/);
   });
 });

@@ -1,7 +1,7 @@
 //! What the turn's tool array does when an MCP server comes up or goes away
 //! mid-turn. The loop's half is the generation check; this is the swap itself.
 
-use crate::engine::agentic_loop::{mcp_surface_correction, TurnTools};
+use crate::engine::agentic_loop::{mcp_dropped_correction, mcp_surface_correction, TurnTools};
 use crate::llm::provider::ToolDefinition;
 use crate::mcp::McpToolSurface;
 
@@ -17,13 +17,18 @@ fn surface(names: &[&str], generation: u64) -> McpToolSurface {
     McpToolSurface {
         tools: names.iter().map(|n| tool(n)).collect(),
         generation,
+        dropped: Vec::new(),
     }
 }
 
 /// The turn as it stood before the model started anything: engine-authored
 /// families only.
 fn engine_only() -> TurnTools {
-    TurnTools::new(vec![tool("read_file"), tool("run_bash"), tool("mcp")], 7)
+    TurnTools::new(
+        vec![tool("read_file"), tool("run_bash"), tool("mcp")],
+        surface(&[], 7),
+        crate::mcp::mcp_tool_char_ceiling(200_000),
+    )
 }
 
 #[test]
@@ -209,4 +214,48 @@ fn one_line_carries_both_halves() {
         "{correction}"
     );
     assert_eq!(correction.lines().count(), 1, "{correction}");
+}
+
+/// The setup's ceiling is what a mid-turn refresh fits under, and what the
+/// surface left out reaches the model as one line.
+#[test]
+fn the_array_keeps_its_ceiling_and_says_what_the_surface_left_out() {
+    let mut tools = engine_only();
+    assert_eq!(
+        tools.mcp_char_ceiling(),
+        crate::mcp::mcp_tool_char_ceiling(200_000)
+    );
+    assert_eq!(tools.mcp_dropped_notice(), None);
+
+    let mut cut = surface(&["mcp__slack__search"], 8);
+    cut.dropped = vec![crate::mcp::McpDroppedTools {
+        server_id: "slack".to_string(),
+        tools: vec!["mcp__slack__post".to_string()],
+    }];
+    tools.refresh_mcp(cut);
+
+    let notice = tools.mcp_dropped_notice().expect("a tool was left out");
+    assert!(notice.contains("mcp__slack__post"), "{notice}");
+    assert_eq!(notice.lines().count(), 1, "{notice}");
+
+    tools.refresh_mcp(surface(&["mcp__slack__search"], 9));
+    assert_eq!(tools.mcp_dropped_notice(), None);
+}
+
+/// The first message keeps the setup's notice for the whole turn. So every
+/// change to what is left out owes a line, a cleared set included.
+#[test]
+fn a_moved_dropped_set_owes_a_line_and_an_unchanged_one_does_not() {
+    assert_eq!(mcp_dropped_correction(None, None), None);
+    assert_eq!(mcp_dropped_correction(Some("cut a"), Some("cut a")), None);
+    assert_eq!(
+        mcp_dropped_correction(None, Some("cut a")).as_deref(),
+        Some("cut a")
+    );
+    assert_eq!(
+        mcp_dropped_correction(Some("cut a"), Some("cut b")).as_deref(),
+        Some("cut b")
+    );
+    let cleared = mcp_dropped_correction(Some("cut a"), None).expect("a cleared set is news");
+    assert!(cleared.contains("Every MCP tool is sent now"), "{cleared}");
 }

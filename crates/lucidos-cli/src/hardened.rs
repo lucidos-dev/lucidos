@@ -93,10 +93,10 @@ pub(crate) fn cmd_mark(ws: &Workspace) -> Result<(), BoxError> {
         .send()
         .map_err(|e| format!("POST {} failed: {}", url, e))?;
     let status = resp.status();
+    let text = resp
+        .text()
+        .map_err(|e| format!("POST {} returned {}, body read failed: {}", url, status, e))?;
     if !status.is_success() {
-        let text = resp
-            .text()
-            .map_err(|e| format!("POST {} returned {}, body read failed: {}", url, status, e))?;
         return Err(format!("POST {} returned {}: {}", url, status, text).into());
     }
     // `floor_char_boundary` rather than a byte index: `head_sha` is whatever
@@ -107,7 +107,58 @@ pub(crate) fn cmd_mark(ws: &Workspace) -> Result<(), BoxError> {
         branch,
         &head_sha[..head_sha.floor_char_boundary(12)]
     );
+    // An engine predating the report answers 204 with no body.
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    for line in mark_report_lines(&report) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// What the engine did to the calling thread when it recorded the marker, as
+/// lines for the agent: the leftover background tasks it stopped, and every
+/// wait still live. Nothing for a caller with no thread.
+pub(crate) fn mark_report_lines(report: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let stopped = report
+        .get("stopped_background_tasks")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for task in stopped {
+        let text = |key: &str| task.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+        lines.push(format!(
+            "Stopped background task {} ({}): this hardening supersedes it, and its \
+             completion will not re-open this thread.",
+            text("task_id"),
+            text("label"),
+        ));
+        let ended: Vec<&str> = task
+            .get("ended_with_others")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|r| r.as_str()).collect())
+            .unwrap_or_default();
+        if !ended.is_empty() {
+            lines.push(format!(
+                "  That also ended your wait for {}, which watched more than this task.",
+                ended.join("; ")
+            ));
+        }
+    }
+    let waiting: Vec<&str> = report
+        .get("still_waiting_on")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|r| r.as_str()).collect())
+        .unwrap_or_default();
+    if !waiting.is_empty() {
+        lines.push(format!(
+            "Still waiting on: {}. Ending your turn leaves this thread waiting, and Apply \
+             stays withheld until that resolves. Say so in your summary, or stand the wait \
+             down with `lucidos event-waits cancel` if you no longer need it.",
+            waiting.join("; ")
+        ));
+    }
+    lines
 }
 
 /// GET the hardening state of the current branch from the parent engine.
@@ -214,5 +265,59 @@ mod tests {
             hardened_sha(&serde_json::json!({ "state": "FRESH", "head_sha": "" })),
             None
         );
+    }
+
+    /// The evidence case: a leftover `make lint` the marker stopped. The agent
+    /// must read that it was stopped and that it will not wake the thread.
+    #[test]
+    fn a_stopped_leftover_task_is_named_with_its_consequence() {
+        let lines = mark_report_lines(&serde_json::json!({
+            "stopped_background_tasks": [{
+                "task_id": "t1",
+                "label": "make lint",
+                "ended_with_others": [],
+            }],
+            "still_waiting_on": [],
+        }));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("Stopped background task t1 (make lint)"));
+        assert!(lines[0].contains("will not re-open this thread"));
+    }
+
+    /// A wait the marker cannot judge stays, so the agent must hear that its
+    /// turn will not end finished: the thread keeps waiting and Apply is held.
+    #[test]
+    fn a_wait_still_live_is_named_with_what_it_withholds() {
+        let lines = mark_report_lines(&serde_json::json!({
+            "stopped_background_tasks": [],
+            "still_waiting_on": ["the release build to finish"],
+        }));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("Still waiting on: the release build to finish."));
+        assert!(lines[0].contains("Apply stays withheld"));
+    }
+
+    #[test]
+    fn a_model_wait_ended_whole_is_named_under_its_task() {
+        let lines = mark_report_lines(&serde_json::json!({
+            "stopped_background_tasks": [{
+                "task_id": "t1",
+                "label": "make lint",
+                "ended_with_others": ["the lint or the review"],
+            }],
+        }));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("the lint or the review"));
+    }
+
+    /// No thread (the user's shell), or an engine predating the report.
+    #[test]
+    fn an_empty_or_missing_report_prints_nothing() {
+        assert!(mark_report_lines(&serde_json::Value::Null).is_empty());
+        assert!(mark_report_lines(&serde_json::json!({
+            "stopped_background_tasks": [],
+            "still_waiting_on": [],
+        }))
+        .is_empty());
     }
 }

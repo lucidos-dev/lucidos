@@ -149,10 +149,11 @@ pub fn err_no_lucidos_source() -> FolderResolutionError {
      or restart for such a change. What DOES work: `folder=\"data/apps/<id>\"` to \
      edit an installed app, or `folder=<repo name>` for a repository registered \
      via `manage_repositories`. Changing Lucidos itself requires an engine \
-     running from a Lucidos source checkout (a dev build) — if the user has such \
-     a workspace, route the work there with \
-     `run_coding_agent(workspace=\"<name>\", relation=\"top\")`, which is \
-     forwarded to that engine and is NOT blocked by this refusal."
+     running from a Lucidos source checkout (a dev build). That is another \
+     install, which `run_coding_agent(workspace=…)` cannot reach. If the user \
+     has such a workspace, route the work there with `run_bash`: `lucidos \
+     spawn-thread --to <absolute workspace path> --coding-agent \
+     claude-code|codex --message '<task>'`. This refusal does not block it."
         .into()
 }
 
@@ -708,12 +709,13 @@ mod tests {
             msg.contains("Apply"),
             "must warn off the apply/restart narration that made this a user-visible lie: {msg}"
         );
-        // Scoped to this install: a cross-workspace spawn returns before this
-        // guard and is enforced by the target engine, so the refusal must not
-        // read as "no coding agent can ever do platform work".
+        // Scoped to this install, so it must not read as "no coding agent can
+        // ever do platform work". A source checkout lives on another install,
+        // which only the CLI's absolute `--to` reaches.
         assert!(
-            msg.contains("ON THIS INSTALL") && msg.contains("run_coding_agent(workspace="),
-            "refusal must scope itself and keep the cross-workspace route open: {msg}"
+            msg.contains("ON THIS INSTALL")
+                && msg.contains("lucidos spawn-thread --to <absolute workspace path>"),
+            "refusal must scope itself and name the route to another install: {msg}"
         );
     }
 }

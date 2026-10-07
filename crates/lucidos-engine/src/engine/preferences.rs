@@ -24,7 +24,7 @@
 //! catalog to decide a key's side-effect.
 
 use super::LucidosEngine;
-use crate::core::preference_catalog::{self, PrefSideEffect};
+use crate::core::prefs::{self, PrefSideEffect};
 use crate::core::{DeviceStore, PreferenceStore};
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
@@ -55,11 +55,22 @@ impl LucidosEngine {
         // it for the paired `DevicePushChanged`.
         let side_effect_actor = actor.clone();
         // Side-effect declared in the catalog (plain/unknown key → None).
-        let side_effect = preference_catalog::lookup(key)
+        let side_effect = prefs::lookup(key)
             .map(|s| s.side_effect)
             .unwrap_or(PrefSideEffect::None);
 
         refuse_bad_value(key, value, side_effect)?;
+
+        // The home thread exists BEFORE its switch says so. A device reloading
+        // its thread list on `PreferencesChanged` then always finds it, and a
+        // failure leaves the switch off rather than on with no thread.
+        if side_effect == PrefSideEffect::HomeThread
+            && crate::core::prefs::HOME_THREAD_ENABLED.resolve(Some(value))
+        {
+            crate::engine::home_thread::ensure_home_thread(&self.event_bus, &self.pool)
+                .await
+                .map_err(|e| format!("Failed to create the home thread: {e}"))?;
+        }
 
         // Persist. Scope follows the caller's device_id, matching the historical
         // HTTP behavior (frontend sends device_id for device-scoped keys, omits it
@@ -116,7 +127,7 @@ impl LucidosEngine {
                     }
                 }
             }
-            PrefSideEffect::None => {}
+            PrefSideEffect::HomeThread | PrefSideEffect::None => {}
         }
 
         Ok(PreferenceWriteOutcome { push_enabled })
@@ -141,7 +152,7 @@ fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Resu
     // the user every style they wrote. So it is checked here rather than in
     // the tool handler: the Settings UI reaches only this path, and it is
     // the writer that edits the document. Refused whole, never trimmed.
-    if key == crate::core::PREF_RESPONSE_STYLES {
+    if key == prefs::RESPONSE_STYLES.key() {
         crate::core::response_style::validate_document(value)?;
     }
 
@@ -157,16 +168,16 @@ fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Resu
     //   value, so a bad write would break every proxied call;
     // - `theme` named the light/dark mode before the rename, so an older
     //   app still sends `theme=dark`, refused with the key it meant.
-    if key == crate::core::PREF_PROXY_TIMEOUT_SECS || key == crate::core::themes::THEME_KEY {
-        if let Some(spec) = preference_catalog::lookup(key) {
-            preference_catalog::validate(spec, value)?;
+    if key == prefs::PROXY_TIMEOUT_SECS.key() || key == prefs::THEME.key() {
+        if let Some(spec) = prefs::lookup(key) {
+            prefs::validate(spec, value)?;
         }
     }
 
     // Settings writes the local model host through this path, and so does any
     // caller that can present itself as the shell (ADR 0156 decision 1). An
     // empty value clears it, and every reader then falls back to env or default.
-    if key == crate::core::PREF_LOCAL_BASE_URL && !value.trim().is_empty() {
+    if key == prefs::LOCAL_BASE_URL.key() && !value.trim().is_empty() {
         if let Some(reason) = crate::core::preferences::local_base_url_rejection(value) {
             return Err(reason);
         }
@@ -176,9 +187,7 @@ fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Resu
     // scheduler's `PreferencesChanged` subscriber. A bad expression is refused
     // here, on the path every writer shares, rather than failing to register
     // later. `"off"` and other inactive values skip cron parsing.
-    if key == crate::core::backup::PREF_BACKUP_SCHEDULE
-        && crate::core::backup::is_schedule_active(value)
-    {
+    if key == prefs::BACKUP_SCHEDULE.key() && crate::core::backup::is_schedule_active(value) {
         crate::engine::tools::scheduler::parse_standard_cron(value)
             .map_err(|e| format!("Invalid backup schedule cron '{}': {}", value, e))?;
     }
@@ -195,7 +204,7 @@ mod tests {
     #[test]
     fn a_public_local_base_url_is_refused_on_the_shared_write_path() {
         let err = refuse_bad_value(
-            crate::core::PREF_LOCAL_BASE_URL,
+            prefs::LOCAL_BASE_URL.key(),
             "https://attacker.example/v1",
             PrefSideEffect::None,
         )
@@ -208,13 +217,13 @@ mod tests {
     #[test]
     fn a_loopback_or_lan_local_base_url_passes_the_shared_write_path() {
         for url in [
-            crate::core::DEFAULT_LOCAL_BASE_URL,
+            prefs::LOCAL_BASE_URL.default_text(),
             "http://127.0.0.1:1234/v1",
             "http://192.168.1.20:11434/v1",
             "",
             "  ",
         ] {
-            refuse_bad_value(crate::core::PREF_LOCAL_BASE_URL, url, PrefSideEffect::None)
+            refuse_bad_value(prefs::LOCAL_BASE_URL.key(), url, PrefSideEffect::None)
                 .unwrap_or_else(|e| panic!("{url}: {e}"));
         }
     }

@@ -13,7 +13,7 @@
  * pin the symmetric debounce: N consecutive failures to go red, mirroring the
  * MIN_RECONNECT_SUCCESSES hysteresis on the way back to green.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { connectionStatus, engineStartedAt } from '../store';
 
 const mockCheckHealth = vi.fn();
@@ -46,6 +46,7 @@ const postClientLog = vi.fn();
 vi.mock('../../utils/clientLog', () => ({ postClientLog: (...a: unknown[]) => postClientLog(...a) }));
 
 const { checkConnection } = await import('./connection');
+const { connectThreadEvents } = await import('./thread-sync');
 
 const STARTED_AT = '2026-06-09T06:00:00Z';
 const loaded = {
@@ -145,6 +146,70 @@ describe('connection dot debounces transient health failures', () => {
     expect(connectionStatus.value).toBe('disconnected');
 
     // Second consecutive success reconnects.
+    await succeedOnce();
+    expect(connectionStatus.value).toBe('connected');
+  });
+});
+
+/**
+ * iOS cuts a backgrounded PWA's network and freezes its timers, while the 5s
+ * poll keeps probing. So the phone went red behind the user's back. It then
+ * stayed red for a hysteresis window after they came back, on a link that was fine.
+ */
+describe('a probe the page was away for proves nothing', () => {
+  function setVisibility(state: DocumentVisibilityState) {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }
+
+  afterEach(() => {
+    setVisibility('visible');
+    mockCheckHealth.mockReset();
+  });
+
+  it('does not charge failures made while hidden against the tolerance', async () => {
+    await settleConnected();
+    setVisibility('hidden');
+    for (let i = 0; i < 6; i++) await failOnce();
+    expect(connectionStatus.value).toBe('connected');
+
+    setVisibility('visible');
+    await failOnce();
+    await failOnce();
+    await failOnce();
+    expect(connectionStatus.value).toBe('connected');
+    await failOnce();
+    expect(connectionStatus.value).toBe('disconnected');
+  });
+
+  it('does not charge a failure that straddled a hide', async () => {
+    await settleConnected();
+    mockCheckHealth.mockImplementation(async () => {
+      setVisibility('hidden');
+      setVisibility('visible');
+      return unreachable;
+    });
+    for (let i = 0; i < 6; i++) await checkConnection();
+    expect(connectionStatus.value).toBe('connected');
+  });
+
+  it('does not reopen the event stream on a failed probe the dot is hiding', async () => {
+    // A hidden desktop tab can outlast an outage, so this would run every tick.
+    await settleConnected();
+    vi.mocked(connectThreadEvents).mockClear();
+    setVisibility('hidden');
+    await failOnce();
+    expect(connectionStatus.value).toBe('connected');
+    expect(connectThreadEvents).not.toHaveBeenCalled();
+  });
+
+  it('reconnects on the first good probe after the page comes back', async () => {
+    await settleConnected();
+    for (let i = 0; i < 4; i++) await failOnce();
+    expect(connectionStatus.value).toBe('disconnected');
+
+    setVisibility('hidden');
+    setVisibility('visible');
     await succeedOnce();
     expect(connectionStatus.value).toBe('connected');
   });

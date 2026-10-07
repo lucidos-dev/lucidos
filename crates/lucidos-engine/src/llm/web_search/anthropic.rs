@@ -13,10 +13,11 @@
 use async_trait::async_trait;
 use std::time::Duration;
 
-use super::{format_search_result, WebSearchProvider, SEARCH_SYSTEM_PROMPT};
+use super::{format_search_result, WebSearchProvider, WebSearchResult, SEARCH_SYSTEM_PROMPT};
 use crate::llm::anthropic::chat::{auth_header, ANTHROPIC_VERSION};
 use crate::llm::anthropic::{AnthropicAuth, ANTHROPIC_OAUTH_BETA};
 use crate::llm::anthropic_wire::{thinking_mode, ThinkingMode};
+use crate::llm::metered::CallToken;
 use crate::llm::ANTHROPIC_API_BASE_URL;
 
 /// Output ceiling for the summary Claude writes over the search results. Small
@@ -203,7 +204,8 @@ impl WebSearchProvider for AnthropicServerToolSearch {
         &self,
         query: &str,
         max_results: usize,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        _call: CallToken,
+    ) -> Result<WebSearchResult, Box<dyn std::error::Error + Send + Sync>> {
         let (auth_name, auth_value) = auth_header(&self.auth);
         let mut request = self
             .client
@@ -230,7 +232,11 @@ impl WebSearchProvider for AnthropicServerToolSearch {
 
         let parsed: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("Failed to parse Anthropic search response: {e}"))?;
-        parse_response(&parsed, max_results)
+        Ok(WebSearchResult {
+            text: parse_response(&parsed, max_results)?,
+            usage: crate::llm::usage_wire::from_json(&parsed),
+            model: self.model.clone(),
+        })
     }
 
     fn id(&self) -> &'static str {

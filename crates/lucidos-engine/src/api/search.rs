@@ -1,5 +1,8 @@
+use tokio_util::sync::CancellationToken;
+
 use super::*;
 use crate::core::{is_build_output_path, ArtifactManager};
+use crate::engine::text_search::{search_workspace_text, TextSearchMode, TextSearchResponse};
 use crate::engine::thread_search::recency_boost;
 use crate::engine::title_match::{title_rank, TitleRank};
 
@@ -339,9 +342,37 @@ async fn search_changes_internal(
     Ok(rank_lexical(matches, query, limit))
 }
 
-/// Route for the global `/search` surface.
+#[derive(Debug, Deserialize)]
+pub(super) struct TextSearchQuery {
+    q: Option<String>,
+    mode: TextSearchMode,
+}
+
+/// GET /api/v1/search/text?q=<query>&mode=preview|all
+pub(super) async fn search_text(
+    State(state): State<AppState>,
+    Query(query): Query<TextSearchQuery>,
+) -> Result<Json<TextSearchResponse>, ApiError> {
+    // Axum drops the handler future when the client aborts, so a superseded
+    // keystroke cancels the blocking scan it started.
+    let cancelled = CancellationToken::new();
+    let _cancel_on_drop = cancelled.clone().drop_guard();
+    let workspace_path = state.workspace_path.clone();
+    let q = query.q.unwrap_or_default();
+    let response = tokio::task::spawn_blocking(move || {
+        search_workspace_text(&workspace_path, &q, query.mode, &cancelled)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("Text search task failed: {e}")))?
+    .map_err(|e| ApiError::internal(format!("Text search failed: {e}")))?;
+    Ok(Json(response))
+}
+
+/// Routes for the global `/search` surface.
 pub(super) fn router() -> Router<AppState> {
-    Router::new().route("/search", get(search))
+    Router::new()
+        .route("/search", get(search))
+        .route("/search/text", get(search_text))
 }
 
 #[cfg(test)]

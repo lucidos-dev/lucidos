@@ -87,11 +87,14 @@ APP_EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Content
 [ -n "$APP_EXEC" ] || fail "could not read CFBundleExecutable from $APP/Contents/Info.plist"
 APP_BIN="$APP/Contents/MacOS/$APP_EXEC"
 [ -x "$APP_BIN" ] || fail "bundle is missing its executable at $APP_BIN"
-log "using app bundle: $APP (executable: $APP_EXEC)"
+# The app names its data dir after its bundle identifier, so read that too.
+APP_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" 2>/dev/null || true)"
+[ -n "$APP_ID" ] || fail "could not read CFBundleIdentifier from $APP/Contents/Info.plist"
+log "using app bundle: $APP (executable: $APP_EXEC, identifier: $APP_ID)"
 
 # ── Isolated temp HOME + free port + seeded fastembed cache ───────────────────
 TMP_HOME="$(mktemp -d -t lucidos-pkg-e2e)"
-APP_DATA="$TMP_HOME/Library/Application Support/com.lucidos.app"
+APP_DATA="$TMP_HOME/Library/Application Support/$APP_ID"
 mkdir -p "$APP_DATA"
 
 # Seed the embedding-model cache so engine warmup is offline/instant when the

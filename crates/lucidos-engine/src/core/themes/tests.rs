@@ -1123,7 +1123,11 @@ fn is_theme_path_matches_the_folder_and_nothing_beside_it() {
 fn a_theme_mode_value_is_never_a_theme_id() {
     for mode in THEME_MODE_VALUES {
         let err = validate_id(mode).expect_err("a mode value must be refused");
-        assert!(err.to_string().contains("theme-mode"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(crate::core::prefs::THEME_MODE.key()),
+            "{err}"
+        );
     }
     assert!(validate_id("nord").is_ok());
 }

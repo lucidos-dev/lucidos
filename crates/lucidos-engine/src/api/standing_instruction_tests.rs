@@ -239,7 +239,7 @@ async fn resume_turn(bus: &EventBus, thread_id: Uuid, origin: Option<MessageOrig
         event: ThreadEvent::ContinuationStarted {
             branch: String::new(),
             origin,
-            reason: Some("auto_resume_after_switch".into()),
+            reason: Some(crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON.into()),
         },
         meta: EventMeta::NONE,
     })

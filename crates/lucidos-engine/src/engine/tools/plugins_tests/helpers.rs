@@ -38,6 +38,11 @@ description = "test"
 source = "https://github.com/x/y"
 "#;
 
+/// The release staging checks an `engine` requirement against in production.
+pub(super) fn running() -> Result<semver::Version, String> {
+    crate::engine::release_notices::running_release()
+}
+
 pub(super) fn build_archive(
     tmp: &Path,
     archive_name: &str,

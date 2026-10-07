@@ -28,8 +28,8 @@ fn lookback_of(items: &[(&str, Value, i64)]) -> ArmingLookback {
     }
 }
 
-/// The store's high-water sequence, which is what a registration records as its
-/// watermark.
+/// The store's highest sequence. Nothing is in flight in a quiet test
+/// database, so it equals the committed horizon a registration records.
 async fn max_sequence(pool: &sqlx::PgPool) -> i64 {
     sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM events")
         .fetch_one(pool)

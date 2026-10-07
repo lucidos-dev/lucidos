@@ -13,7 +13,13 @@ const postClientLog = vi.hoisted(() => vi.fn());
 vi.mock('../../../store/store', () => ({ showToast }));
 vi.mock('../../../utils/clientLog', () => ({ postClientLog }));
 
-import { installDeadPressProbe, _resetNudgeStateForTesting } from '../deadPressProbe';
+import {
+  installDeadPressProbe,
+  _resetNudgeStateForTesting,
+  LIFT_DEADLINE_MS,
+  SCHEDULED_CHECK_MS,
+  UNTOUCHED_QUIET_MS,
+} from '../deadPressProbe';
 import {
   noteViewportResize,
   resetKeyboardCloseState,
@@ -317,12 +323,13 @@ describe('the press ledger keeps every press it watched', () => {
   it('logs a still press held past a tap as a long hold, and does not toast', () => {
     // The 13:49 report. A thumb rested on Apply, iOS owed no click for the
     // hold, and the toast said a press the user never made had died.
+    const heldMs = 1500;
     fire('touchstart', touch(send, 350, 420));
-    vi.advanceTimersByTime(1500);
+    vi.advanceTimersByTime(heldMs);
     fire('touchend', touch(send, 350, 420));
     vi.advanceTimersByTime(1000);
     expect(verdicts()).toEqual(['long-hold']);
-    expect(lines()[0].heldMs).toBe(1500);
+    expect(lines()[0].heldMs).toBe(heldMs);
     expect(showToast).not.toHaveBeenCalled();
   });
 
@@ -471,7 +478,7 @@ describe('the press ledger keeps every press it watched', () => {
     fire('touchstart', touch(send, 350, 420));
     vi.advanceTimersByTime(1000);
     expect(verdicts()).toEqual([]);
-    vi.advanceTimersByTime(4000);
+    vi.advanceTimersByTime(LIFT_DEADLINE_MS);
     expect(verdicts()).toEqual(['no-lift']);
   });
 
@@ -620,19 +627,11 @@ describe('a click with no touch behind it', () => {
   });
 });
 
-/** The scheduled check's period, mirrored from the module. */
-const TICK = 3000;
-
-/** How long after the last keystroke the recovery is owed, mirrored from the
- *  module. Round 20 armed it from the keystroke rather than the scheduled
- *  phase, and left the bound alone: ADR 0228 records cutting it as rejected. */
-const UNTOUCHED_QUIET_MS = 3000;
-
 /** Let the row answer once. A healthy reading forgets both latches. They are
  *  keyed by face NAME, so they outlive the fresh `FakeEl` each case builds. */
 function settleHealthy() {
   atPoint = send;
-  vi.advanceTimersByTime(TICK);
+  vi.advanceTimersByTime(SCHEDULED_CHECK_MS);
   vi.advanceTimersByTime(200);
   postClientLog.mockClear();
   showToast.mockClear();
@@ -650,7 +649,7 @@ describe('the reading that does not wait to be touched', () => {
     settleHealthy();
     row.box = { left: 0, right: 0, top: 0, bottom: 0 };
     atPoint = null;
-    vi.advanceTimersByTime(TICK);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS);
     expect(verdicts()).toEqual([]);
   });
 
@@ -659,7 +658,7 @@ describe('the reading that does not wait to be touched', () => {
     const doc = globalThis.document as unknown as Record<string, unknown>;
     doc.visibilityState = 'hidden';
     atPoint = row;
-    vi.advanceTimersByTime(TICK);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS);
     doc.visibilityState = 'visible';
     expect(verdicts()).toEqual([]);
   });
@@ -691,7 +690,7 @@ describe('a cover the app raised itself is not a wedge', () => {
     settleHealthy();
     blockUi(true);
     atPoint = row;                        // the cover answers, not the face
-    vi.advanceTimersByTime(TICK);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS);
     expect(verdicts()).toEqual([]);
     expect(showToast).not.toHaveBeenCalled();
   });
@@ -718,6 +717,37 @@ describe('a cover the app raised itself is not a wedge', () => {
     atPoint = row;
     fire('touchstart', touch(row, 350, 420));
     expect(lines()[0].cover).toBe('data-overlay-open');
+  });
+
+  it('judges the cover as it stood at the pointerdown, not at the touchstart', () => {
+    // A tap on Send while a menu is open. The menu's dismiss runs on the
+    // `pointerdown`, which WebKit fires first, so the cover is gone by the
+    // `touchstart`. The browser hit-tested under it and sent the touch to the
+    // shell, while Send answers at the point. That read as a dead Send.
+    settleHealthy();
+    const shell = new FakeEl(null, { left: 0, right: 390, top: 0, bottom: 844 }, ['app-shell']);
+    root().hasAttribute = (name: string) => name === 'data-overlay-open';
+    fire('pointerdown', { target: shell, isPrimary: true });
+    root().hasAttribute = priorHasAttribute;
+    atPoint = send;
+    fire('touchstart', touch(shell, 350, 420));
+    expect(verdicts()).toEqual(['covered']);
+    expect(lines()[0].cover).toBe('data-overlay-open');
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('spends that reading on one touch, so the next does not inherit it', () => {
+    settleHealthy();
+    root().hasAttribute = (name: string) => name === 'data-overlay-open';
+    fire('pointerdown', { target: row, isPrimary: true });
+    root().hasAttribute = priorHasAttribute;
+    atPoint = send;
+    fire('touchstart', touch(elsewhere, 350, 420));
+    fire('touchend', touch(elsewhere, 350, 420));
+    // No pointerdown of its own, so nothing says a cover was up.
+    fire('touchstart', touch(elsewhere, 350, 420));
+    expect(verdicts()).toEqual(['covered', 'missed']);
+    expect(showToast).toHaveBeenCalledTimes(1);
   });
 
   it('stays silent for a tap that reached neither the row nor a face', () => {
@@ -1271,7 +1301,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
   it('relayouts for a typed draft the page has taken no touch since', () => {
     settleTouched();
     type();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     expect(untouched()).not.toHaveLength(0);
     expect(untouched()[0].face).toBe('Send message');
     expect(untouched()[0].nudged).toBe(true);
@@ -1281,7 +1311,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
   it('restores the height it nudged', () => {
     settleTouched();
     type();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     expect(props['--app-height']).toBe('476px');
   });
 
@@ -1291,7 +1321,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
     settleTouched();
     const before = send.clicks;
     type();
-    vi.advanceTimersByTime(TICK * 6);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 6);
     expect(send.clicks).toBe(before);
   });
 
@@ -1321,14 +1351,14 @@ describe('the recovery a composer nobody can touch still gets', () => {
     type();
     // Past the keystroke timer and its coalescing window, so the next line is
     // the scheduled one.
-    vi.advanceTimersByTime(TICK * 3);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 3);
     const byTick = untouched().filter((l) => l.nudgeTrigger === 'tick');
     expect(byTick).not.toHaveLength(0);
   });
 
   it('stays quiet on a composer nobody has typed into', () => {
     settleTouched();
-    vi.advanceTimersByTime(TICK * 4);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 4);
     expect(untouched()).toHaveLength(0);
   });
 
@@ -1337,7 +1367,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
     type();
     vi.advanceTimersByTime(1000);
     settleTouched();
-    vi.advanceTimersByTime(TICK * 4);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 4);
     expect(untouched()).toHaveLength(0);
   });
 
@@ -1349,7 +1379,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
     type();
     vi.advanceTimersByTime(1000);
     fire('touchstart', touch(elsewhere, 10, 90));
-    vi.advanceTimersByTime(TICK * 4);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 4);
     expect(untouched()).not.toHaveLength(0);
   });
 
@@ -1358,7 +1388,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
     type();
     vi.advanceTimersByTime(1000);
     fire('click', { target: textarea });
-    vi.advanceTimersByTime(TICK * 4);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 4);
     expect(untouched()).toHaveLength(0);
   });
 
@@ -1368,7 +1398,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
     settleTouched();
     send.label = 'Cancel';
     type();
-    vi.advanceTimersByTime(TICK * 4);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 4);
     expect(untouched()).toHaveLength(0);
   });
 
@@ -1376,7 +1406,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
     settleTouched();
     root().hasAttribute = (name: string) => name === 'data-overlay-open';
     type();
-    vi.advanceTimersByTime(TICK * 4);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 4);
     expect(untouched()).toHaveLength(0);
   });
 
@@ -1393,10 +1423,10 @@ describe('the recovery a composer nobody can touch still gets', () => {
   it('stops once the user has plainly put the phone down', () => {
     settleTouched();
     type();
-    vi.advanceTimersByTime(TICK * 30);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 30);
     const spent = untouched().length;
     expect(spent).toBeGreaterThan(0);
-    vi.advanceTimersByTime(TICK * 30);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 30);
     expect(untouched()).toHaveLength(spent);
   });
 
@@ -1405,7 +1435,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
     // nudge behind it is what the next episode reads.
     settleTouched();
     type();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     postClientLog.mockClear();
     tapSend();
     vi.advanceTimersByTime(1000);
@@ -1416,7 +1446,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
   it('starts the next silence at no nudges', () => {
     settleTouched();
     type();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     settleTouched();
     vi.advanceTimersByTime(1000);
     tapSend();
@@ -1431,7 +1461,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
     // so the relayout could not be scored at all.
     settleTouched();
     type();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     fire('touchstart', touch(elsewhere, 10, 90));
     vi.advanceTimersByTime(1000);
     postClientLog.mockClear();
@@ -1449,7 +1479,7 @@ describe('the recovery a composer nobody can touch still gets', () => {
   it('starts that count over at the next keystroke', () => {
     settleTouched();
     type();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     type();
     postClientLog.mockClear();
     tapSend();
@@ -1461,14 +1491,15 @@ describe('the recovery a composer nobody can touch still gets', () => {
   it('leaves the quiet window measuring touches, never keystrokes', () => {
     // Typing must not close the window. It is the one reading that brackets a
     // silence, and a keystroke resetting it would erase the episode.
+    const gapMs = 4000;
     settleTouched();
-    vi.advanceTimersByTime(4000);
+    vi.advanceTimersByTime(gapMs);
     type();
-    vi.advanceTimersByTime(4000);
+    vi.advanceTimersByTime(gapMs);
     tapSend();
     vi.advanceTimersByTime(1000);
     const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
-    expect(press?.quiet?.ms ?? 0).toBeGreaterThanOrEqual(8000);
+    expect(press?.quiet?.ms ?? 0).toBeGreaterThanOrEqual(gapMs * 2);
   });
 });
 
@@ -1528,7 +1559,7 @@ describe('the silence that follows a keyboard close', () => {
   it('writes the line the wedge has never had', () => {
     closeKeyboard();
     postClientLog.mockClear();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     expect(silences()).toHaveLength(1);
     expect(silences()[0].face).toBe('Send message');
     expect(silences()[0].scheduled).toBe(true);
@@ -1538,7 +1569,7 @@ describe('the silence that follows a keyboard close', () => {
     closeKeyboard();
     expect(writes).toEqual([`${FULL - 1}px`, `${FULL}px`]);
     postClientLog.mockClear();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     expect(silences()[0].nudged).toBe(true);
   });
 
@@ -1550,7 +1581,7 @@ describe('the silence that follows a keyboard close', () => {
     vi.advanceTimersByTime(1000);
     fire('touchstart', touch(elsewhere, 10, 90));
     postClientLog.mockClear();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     const line = silences()[0];
     expect(line.sinceInputMs ?? 0).toBeLessThan(line.sinceKeyboardMs ?? 0);
   });
@@ -1567,7 +1598,7 @@ describe('the silence that follows a keyboard close', () => {
       vi.advanceTimersByTime(1000);
     }
     expect(silences()).toHaveLength(0);
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     expect(silences()).toHaveLength(1);
   });
 
@@ -1584,13 +1615,13 @@ describe('the silence that follows a keyboard close', () => {
     send.label = 'Cancel';
     closeKeyboard();
     postClientLog.mockClear();
-    vi.advanceTimersByTime(TICK * 4);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 4);
     expect(silences()).toEqual([]);
   });
 
   it('stays quiet when no keyboard has closed at all', () => {
     postClientLog.mockClear();
-    vi.advanceTimersByTime(TICK * 4);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 4);
     expect(silences()).toEqual([]);
   });
 
@@ -1600,7 +1631,7 @@ describe('the silence that follows a keyboard close', () => {
     // the mechanism the investigation is looking for.
     closeKeyboard();
     postClientLog.mockClear();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     expect(silences()[0].closePath).toBe('resize');
   });
 
@@ -1610,22 +1641,22 @@ describe('the silence that follows a keyboard close', () => {
     closeKeyboard();
     noteViewportResize(UP, Date.now());
     postClientLog.mockClear();
-    vi.advanceTimersByTime(TICK * 4);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 4);
     expect(silences()).toEqual([]);
   });
 
   it('writes one line per close, not one per tick of the same silence', () => {
     closeKeyboard();
     postClientLog.mockClear();
-    vi.advanceTimersByTime(TICK * 10);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 10);
     expect(silences()).toHaveLength(1);
   });
 
   it('writes again for the NEXT close, since a wedge can return', () => {
     closeKeyboard();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     closeKeyboard();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     expect(silences()).toHaveLength(2);
   });
 
@@ -1634,7 +1665,7 @@ describe('the silence that follows a keyboard close', () => {
     closeKeyboard();
     postClientLog.mockClear();
     root().hasAttribute = (name: string) => name === 'data-ui-blocked';
-    vi.advanceTimersByTime(TICK * 4);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 4);
     root().hasAttribute = priorHasAttribute;
     expect(silences()).toEqual([]);
   });
@@ -1642,13 +1673,13 @@ describe('the silence that follows a keyboard close', () => {
   it('never toasts, because the user cannot act on it', () => {
     closeKeyboard();
     showToast.mockClear();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     expect(showToast).not.toHaveBeenCalled();
   });
 
   it('presses nothing, on the close or on the line', () => {
     closeKeyboard();
-    vi.advanceTimersByTime(TICK * 2);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS * 2);
     expect(send.clicks).toBe(0);
   });
 
@@ -1659,7 +1690,7 @@ describe('the silence that follows a keyboard close', () => {
     vi.advanceTimersByTime(1000);
     closeKeyboard();
     postClientLog.mockClear();
-    vi.advanceTimersByTime(TICK);
+    vi.advanceTimersByTime(SCHEDULED_CHECK_MS);
     tapSend();
     vi.advanceTimersByTime(1000);
     const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');

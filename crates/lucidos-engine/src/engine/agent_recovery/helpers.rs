@@ -260,8 +260,9 @@ const ANSWER_OUT_OF_BAND_NOTE: &str =
 /// continue, so I may proceed with what I was about to do".
 const ANSWER_OUT_OF_BAND_TRAILER: &str =
     "Continue the turn from that answer, and from nothing else. Do not re-ask the same \
-     question. Do not read the interrupted tool call as approval, as a refusal, or as \
-     permission to carry on with what you were doing before you asked.";
+     question unless the answer left it open. Do not read the interrupted tool call as \
+     approval, as a refusal, or as permission to carry on with what you were doing before \
+     you asked.";
 
 /// The user message the spawn consumer hands a `SpawnRequest::Continue`,
 /// chosen by the `ContinuationRequested.reason` that produced it.
@@ -1348,9 +1349,8 @@ mod tests {
             .await
             .expect("a non-app worktree must rebuild on its surviving branch");
 
-        // `worktree_add` passes `--no-checkout`, so the spawn that follows does
-        // the checkout. Git registering the worktree on our branch, unnarrowed,
-        // is the fact this arm owns.
+        // Git registering the worktree on our branch, unnarrowed, is the fact
+        // this arm owns.
         let head = git_cmd(&["rev-parse", "--abbrev-ref", "HEAD"], &wt)
             .await
             .unwrap();

@@ -87,8 +87,9 @@ impl FreshBranch<'_> {
     /// [`MAX_BRANCH_CREATE_ATTEMPTS`], and every other failure returns at once
     /// rather than being retried into.
     ///
-    /// Nothing here is destructive. A losing `-b` created no ref, so it leaves
-    /// nothing of its own behind and the winner's branch is untouched. That
+    /// Nothing here touches what another spawn made. A losing `-b` created no
+    /// ref, so the winner's branch is untouched. A failed checkout removes only
+    /// the tree and branch this attempt just created (`worktree_add`). That
     /// keeps the caller's `branch_created` bookkeeping true: on success this
     /// attempt created exactly the branch it returns.
     pub(super) async fn create_worktree(

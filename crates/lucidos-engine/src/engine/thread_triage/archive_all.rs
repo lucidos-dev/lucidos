@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use super::facts::TriageRow;
 use super::{refuse_apply, refuse_fresh, NeedFact, TriageAction};
+use crate::engine::thread_lifecycle::Blocker;
 
 /// A thread the confirm will archive.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -74,11 +75,45 @@ pub(crate) fn preflight(rows: &[TriageRow]) -> ArchiveAllPreflight {
     }
 }
 
-/// A confirmed id Archive all did not archive, and why.
+/// A confirmed id Archive all did not archive, and why: `reason` in words for
+/// an agent, `slug` for the client to word as the confirm does.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct KeptThread {
     pub(crate) thread_id: Uuid,
     pub(crate) reason: String,
+    pub(crate) slug: &'static str,
+}
+
+/// The slug for a confirmed id that changed since the confirm: the preflight's
+/// slugs, plus the three ways a row can leave the plan. Checked in
+/// `refuse_fresh`'s order, so the slug names the refusal that fired.
+fn fresh_kept_slug(row: Option<&TriageRow>) -> &'static str {
+    match row {
+        None => "gone",
+        Some(row) if row.section != "inbox" => "archived",
+        Some(row) if row.facts.busy_reason().is_some() || row.facts.needs_user() => kept_slug(row),
+        Some(_) => "pinned",
+    }
+}
+
+/// The slug for a family the archive cascade refused, from its refusal body: a
+/// thread gone or pinned since the confirm, else its `blocker`. Any other
+/// refusal, such as a change claim, is something still working.
+pub(crate) fn refusal_kept_slug(body: &serde_json::Value) -> &'static str {
+    let field = |key: &str| body.get(key).and_then(|v| v.as_str());
+    match field("reason") {
+        Some("thread_not_found") => return "gone",
+        Some(crate::api::threads::archive::THREAD_PINNED) => return "pinned",
+        _ => {}
+    }
+    let is = |b: Blocker| field("blocker") == Some(b.as_str());
+    if is(Blocker::Question) || is(Blocker::DescendantQuestion) {
+        "question"
+    } else if is(Blocker::PendingChange) || is(Blocker::DescendantPendingChange) {
+        "pending_change"
+    } else {
+        "busy"
+    }
 }
 
 /// Split the confirmed ids into the ones still safe and the ones that changed.
@@ -94,6 +129,7 @@ pub(crate) fn still_safe(rows: &[TriageRow], confirmed: &[Uuid]) -> (Vec<Uuid>, 
             Some(reason) => kept.push(KeptThread {
                 thread_id: *id,
                 reason,
+                slug: fresh_kept_slug(row),
             }),
         }
     }

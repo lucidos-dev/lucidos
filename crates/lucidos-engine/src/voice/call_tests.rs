@@ -113,38 +113,6 @@ fn free_doer() -> &'static NoDecisions {
     FREE.get_or_init(NoDecisions::default)
 }
 
-/// A namer that records every thread it was asked to name, and names nothing.
-///
-/// Naming reaches a model, so the real one is not something a call test can
-/// run. What a test can assert is WHEN the call asked, which is the whole of
-/// this file's half of the rule.
-#[derive(Default)]
-struct RecordingNames {
-    asked: Mutex<Vec<uuid::Uuid>>,
-}
-
-impl RecordingNames {
-    fn asked(&self) -> Vec<uuid::Uuid> {
-        self.asked.lock().unwrap().clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::voice::naming::ThreadNamer for RecordingNames {
-    async fn name_this_call(&self, thread_id: uuid::Uuid) {
-        self.asked.lock().unwrap().push(thread_id);
-    }
-}
-
-/// The default namer, shared: every case that is about something else.
-///
-/// The same shape as [`free_doer`]. A case asserting what was NAMED builds its
-/// own, so nothing it reads was recorded by another test.
-fn nobody_names() -> &'static RecordingNames {
-    static NOBODY: std::sync::OnceLock<RecordingNames> = std::sync::OnceLock::new();
-    NOBODY.get_or_init(RecordingNames::default)
-}
-
 #[async_trait::async_trait]
 impl DecisionResolver for NoDecisions {
     async fn resolve(
@@ -631,7 +599,6 @@ async fn a_hangup_pairs_the_start_with_one_end() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     )
@@ -670,7 +637,6 @@ async fn a_dropped_socket_still_closes_the_pair() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -721,7 +687,6 @@ async fn a_whole_call_leaves_the_thread_a_chat_thread() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -768,7 +733,6 @@ async fn a_spoken_reply_records_what_it_spent() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -809,7 +773,6 @@ async fn a_talker_that_never_answers_leaves_no_trace() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -857,7 +820,6 @@ async fn talker_audio_reaches_the_caller_and_no_event() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -934,7 +896,6 @@ async fn a_talker_that_drops_the_call_ends_it_as_a_failure() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -981,7 +942,6 @@ async fn a_caller_who_stops_receiving_is_not_a_provider_failure() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -1162,21 +1122,6 @@ async fn a_call_that_hears(
     session_id: uuid::Uuid,
     script: Vec<VoiceEvent>,
 ) -> WhatTheCallDid {
-    a_call_named_by(pool, bus, thread_id, session_id, script, nobody_names()).await
-}
-
-/// The same call, with a namer the case can read afterwards.
-///
-/// Separate because most cases are about what a call WROTE, and only the
-/// naming cases care who was asked for a name.
-async fn a_call_named_by(
-    pool: &PgPool,
-    bus: &EventBus,
-    thread_id: uuid::Uuid,
-    session_id: uuid::Uuid,
-    script: Vec<VoiceEvent>,
-    namer: &RecordingNames,
-) -> WhatTheCallDid {
     // Counted, not guessed, and with a trailing frame of its own.
     //
     // A delegation reaches the caller as NOTHING, by design: they hear one
@@ -1203,7 +1148,6 @@ async fn a_call_named_by(
         &mut caller,
         &turns,
         free_doer(),
-        namer,
         opening(),
         subject(thread_id, session_id),
     )
@@ -1481,109 +1425,6 @@ async fn a_spoken_answer_never_lands_above_its_question() {
     teardown_test_db(&db_name).await;
 }
 
-/// **A call earns a name when the caller answers something.**
-///
-/// The opening utterance names nothing: a person starts a call with "hey" or
-/// "what's going on", and that is what the thread was called for as long as it
-/// existed. What the caller says AFTER a reply is about something, and it
-/// arrives with the reply behind it.
-#[tokio::test]
-async fn a_call_is_named_once_the_caller_answers_a_reply() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let thread_id = a_chat_thread(&pool).await;
-    let namer = RecordingNames::default();
-
-    a_call_named_by(
-        &pool,
-        &bus,
-        thread_id,
-        uuid::Uuid::new_v4(),
-        vec![
-            the_caller_says("what's going on"),
-            the_talker_says("Watching the tab-icon fix."),
-            the_caller_says("yeah, please check"),
-        ],
-        &namer,
-    )
-    .await;
-
-    assert_eq!(
-        namer.asked(),
-        vec![thread_id],
-        "the second utterance answers a reply, so the call has a subject"
-    );
-
-    teardown_test_db(&db_name).await;
-}
-
-/// A call nobody answered is not a conversation, and names nothing.
-///
-/// The caller says one thing into the void and rings off. Named anyway, the
-/// model describes the fragment: " So, yeah, I think" became "Incomplete
-/// Conversation Opener", and a name is permanent. The fallback shows their own
-/// words instead, and the thread stays nameable.
-#[tokio::test]
-async fn a_call_nothing_answered_is_never_named() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let thread_id = a_chat_thread(&pool).await;
-    let namer = RecordingNames::default();
-
-    a_call_named_by(
-        &pool,
-        &bus,
-        thread_id,
-        uuid::Uuid::new_v4(),
-        vec![the_caller_says(" So, yeah, I think")],
-        &namer,
-    )
-    .await;
-
-    assert!(
-        namer.asked().is_empty(),
-        "nothing answered them, so the loop asked for no name: {:?}",
-        namer.asked()
-    );
-
-    teardown_test_db(&db_name).await;
-}
-
-/// One ask per call, however long the call runs.
-///
-/// Every later utterance also answers a reply, and asking on each would put a
-/// model call behind every sentence a caller says. The name is settled by the
-/// first one.
-#[tokio::test]
-async fn a_long_call_asks_for_one_name() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let thread_id = a_chat_thread(&pool).await;
-    let namer = RecordingNames::default();
-
-    a_call_named_by(
-        &pool,
-        &bus,
-        thread_id,
-        uuid::Uuid::new_v4(),
-        vec![
-            the_caller_says("what's going on"),
-            the_talker_says("Watching the tab-icon fix."),
-            the_caller_says("yeah, please check"),
-            the_talker_says("Still running."),
-            the_caller_says("and the release"),
-            the_talker_says("Tagged this morning."),
-            the_caller_says("good"),
-        ],
-        &namer,
-    )
-    .await;
-
-    assert_eq!(namer.asked(), vec![thread_id], "one name, one call");
-
-    teardown_test_db(&db_name).await;
-}
-
 /// The reply rows of a call, oldest first.
 fn replies(events: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
     events
@@ -1763,7 +1604,6 @@ async fn a_stall_is_written_before_the_work_it_promised() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -1890,7 +1730,6 @@ async fn a_reply_says_how_long_it_had_been_speaking() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2026,7 +1865,6 @@ async fn the_callers_frame_matches_the_row_it_becomes() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -2081,7 +1919,6 @@ async fn a_barge_in_writes_the_question_before_the_answer() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2412,7 +2249,6 @@ async fn a_cut_reply_is_not_written_again_in_full() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2479,7 +2315,6 @@ async fn a_partial_the_caller_got_in_over_a_reply_reads_below_it() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2545,7 +2380,6 @@ async fn a_cut_the_provider_reports_late_writes_no_second_row() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2608,7 +2442,6 @@ async fn the_teardown_writes_no_second_row_for_a_cut_reply() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2671,7 +2504,6 @@ async fn a_caller_still_talking_over_the_goodbye_keeps_the_call() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -2752,7 +2584,6 @@ async fn a_reply_the_caller_cuts_into(
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2988,7 +2819,6 @@ async fn a_refused_utterance_is_written_down_and_said_out_loud() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, session_id),
         ),
@@ -3261,7 +3091,6 @@ async fn every_ask_is_acknowledged() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -3316,7 +3145,6 @@ async fn a_call_that_drops_mid_utterance_loses_nothing() {
             &mut caller,
             &RecordingTurns::default(),
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         )
@@ -3385,7 +3213,6 @@ async fn a_call_that_drops_mid_reply_keeps_what_the_caller_heard() {
             &mut caller,
             &RecordingTurns::default(),
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         )
@@ -3431,7 +3258,6 @@ async fn a_call_that_drops_before_a_word_writes_no_reply() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -3469,7 +3295,6 @@ async fn a_finished_reply_is_not_written_twice_by_the_teardown() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -3605,7 +3430,6 @@ async fn a_duplicate_ask_leaves_the_caller_owed_an_answer() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -3681,7 +3505,6 @@ async fn the_doers_answer_is_spoken_and_progress_is_not() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -3797,7 +3620,6 @@ async fn a_question_is_put_to_the_caller_out_loud() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -3877,7 +3699,6 @@ async fn an_answered_question_is_appended_and_never_asked_again() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4001,7 +3822,6 @@ async fn a_permission_card_is_put_to_the_caller_out_loud_in_every_lane() {
                 &mut caller,
                 &turns,
                 free_doer(),
-                nobody_names(),
                 opening(),
                 subject(thread_id, uuid::Uuid::new_v4()),
             ),
@@ -4069,7 +3889,6 @@ async fn a_permission_settled_mid_call_is_appended_and_never_asked_again() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4265,7 +4084,6 @@ async fn the_talker_is_not_asked_to_speak_over_itself() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4389,7 +4207,6 @@ async fn an_answer_spoken_after(
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4515,7 +4332,6 @@ async fn a_spoken_reply_is_written_down_under_the_talkers_name() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     )
@@ -4563,7 +4379,6 @@ async fn an_interrupted_reply_says_so() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -4602,7 +4417,6 @@ async fn a_reply_with_no_words_is_not_written_down() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -4683,7 +4497,6 @@ async fn a_stopped_turn_tells_the_caller_it_is_not_coming() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4736,7 +4549,6 @@ async fn a_turn_superseded_by_the_next_utterance_says_nothing() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4856,7 +4668,6 @@ async fn the_talkers_own_words_are_offered_to_a_running_round() {
         &mut caller,
         &turns,
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -4890,7 +4701,6 @@ async fn an_answer_the_talker_relayed_is_not_offered_back() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -4975,7 +4785,6 @@ async fn a_relayed_answer_writes_the_question_before_the_stall() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -5064,7 +4873,6 @@ async fn words_the_caller_finished_over_a_stall_read_above_it() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -5205,7 +5013,6 @@ async fn a_call_driven_by(
         &mut caller,
         &turns,
         decisions,
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5338,7 +5145,6 @@ async fn words_spent_on_an_answer_are_still_written_down_as_speech() {
         &mut caller,
         &RecordingTurns::default(),
         &decisions,
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5426,7 +5232,6 @@ async fn a_delegation_is_refused_while_the_doer_is_parked() {
         &mut caller,
         &turns,
         &NoDecisions::parked(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5479,7 +5284,6 @@ async fn a_delegation_goes_through_when_nothing_is_waiting() {
         &mut caller,
         &turns,
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5531,7 +5335,6 @@ async fn a_talker_with_no_answering_tool_settles_a_question_with_the_callers_wor
         &mut caller,
         &turns,
         &decisions,
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5618,7 +5421,6 @@ async fn a_permission_card_is_not_settled_by_an_ask_and_the_note_names_the_scree
         &mut caller,
         &turns,
         &decisions,
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5722,7 +5524,6 @@ async fn the_talker_can_ring_off_when_the_caller_says_they_are_done() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     )
@@ -5789,7 +5590,6 @@ async fn a_caller_who_cuts_in_over_the_goodbye_keeps_the_call() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5838,7 +5638,6 @@ async fn an_ask_waiting_on_words_an_answer_spent_never_pairs_with_a_later_one() 
         &mut caller,
         &turns,
         &decisions,
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -5889,7 +5688,6 @@ async fn a_held_answer_gives_up_rather_than_claiming_a_later_sentence() {
         &mut caller,
         &RecordingTurns::default(),
         &decisions,
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -6041,7 +5839,6 @@ async fn a_caller_nobody_answers_reaches_the_doer_and_is_told_so() {
         &mut caller,
         &turns,
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     );
@@ -6115,7 +5912,6 @@ async fn words_the_session_was_still_holding_reach_the_row() {
         &mut caller,
         &turns,
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     )
@@ -6207,7 +6003,6 @@ async fn blank_talker_deltas_do_not_hold_the_bound_off() {
         &mut caller,
         &turns,
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     );
@@ -6262,7 +6057,6 @@ async fn words_the_bound_spends_are_not_written_twice() {
         &mut caller,
         &turns,
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     );
@@ -6322,7 +6116,6 @@ async fn a_parked_doer_is_not_woken_by_the_bound_and_the_caller_is_told() {
         &mut caller,
         &turns,
         &parked,
-        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     );
@@ -6377,7 +6170,6 @@ async fn an_ask_whose_words_never_came_tells_the_caller() {
         &mut caller,
         &turns,
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, session_id),
     );
@@ -6445,7 +6237,6 @@ async fn a_talker_that_speaks_before_the_caller_reaches_nobody() {
         &mut caller,
         &turns,
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -6496,7 +6287,6 @@ async fn the_callers_first_word_opens_the_floor() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -6533,7 +6323,6 @@ async fn a_partial_is_enough_to_open_the_floor() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -6565,7 +6354,6 @@ async fn a_blank_partial_leaves_the_floor_shut() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -6610,7 +6398,6 @@ async fn audio_before_the_caller_speaks_latches_nothing() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -6650,7 +6437,6 @@ async fn a_turn_the_engine_asked_for_is_heard_on_a_silent_call() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -6705,7 +6491,6 @@ async fn a_turn_decided_unheard_does_not_resume_when_the_caller_speaks() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -6785,7 +6570,6 @@ async fn a_muted_run_is_not_heard_from_its_middle() {
         &mut caller,
         &turns,
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -6844,7 +6628,6 @@ async fn a_finished_muted_run_lets_the_next_turn_be_heard() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -6922,7 +6705,6 @@ async fn an_unheard_turn_leaves_the_caller_still_owed_an_answer() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -6977,7 +6759,6 @@ async fn a_relayed_turn_with_no_delta_still_gets_its_row() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -7036,7 +6817,6 @@ async fn a_relayed_answer_stays_audible_across_the_pause_in_it() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -7109,7 +6889,6 @@ async fn the_callers_own_device_opens_the_floor() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -7176,7 +6955,6 @@ async fn the_callers_first_sound_cuts_nothing_off() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -7246,7 +7024,6 @@ async fn the_caller_starting_to_speak_opens_the_floor_with_no_transcript() {
         &mut caller,
         &RecordingTurns::default(),
         free_doer(),
-        nobody_names(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -7437,7 +7214,6 @@ async fn an_engine_relay_reopens_a_spent_floor() {
             &mut caller,
             &turns,
             free_doer(),
-            nobody_names(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),

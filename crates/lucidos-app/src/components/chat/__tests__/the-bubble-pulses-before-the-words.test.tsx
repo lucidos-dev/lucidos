@@ -16,7 +16,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { chatExchangePropsEqual, describeInitiator, isUserBubbleEvent, liveRowDrawsNoPanel } from '../ChatExchange';
+import { chatExchangePropsEqual, describeInitiator, liveRowDrawsNoPanel } from '../ChatExchange';
+import { isUserBubbleEvent } from '../../../store/thread-events/exchange';
 import { vnodeToText } from './vnodeToText';
 import { HEARING_YOU } from '../../../voice/callState';
 import { exchangeStatus } from '../../../store/thread-events';

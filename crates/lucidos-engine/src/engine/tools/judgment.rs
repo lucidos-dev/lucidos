@@ -5,10 +5,10 @@
 //! probability distributions. The distribution is the reason the tool exists,
 //! so returning only the chosen option would empty it out.
 //!
-//! **A failure is reported as a failure.** The two classification sites fall
-//! through to their own prompt-and-parse path when Jev errors. This caller has
-//! no other path, and inventing an answer would be a lie about a number, so the
-//! error goes to the model verbatim.
+//! **A failure is reported as a failure.** The judgment sites fall back to their
+//! chat model when a System One call errors. This caller has no other path, and
+//! inventing an answer would be a lie about a number, so the error goes to the
+//! model verbatim.
 
 use std::time::Duration;
 
@@ -47,33 +47,28 @@ fn parse_questions(value: Option<&Value>) -> Result<Vec<(String, Question)>, Str
 /// resolving a provider needs a key and a server, so only a split lets a stub
 /// exercise the ask, the capture and the rendering offline.
 ///
-/// **The deadline covers the provider call alone.** Around the whole function
-/// it would cover the capture too. A call answering just inside the deadline
-/// could then have its row cancelled mid-write, losing the accounting for a
-/// call the user paid for.
+/// `deadline` bounds the provider call alone, so an answer that arrived in
+/// time is never lost to its record.
 pub(crate) async fn ask_and_render<J: JudgmentProvider + ?Sized>(
     provider: &J,
     state: Value,
     questions: Vec<(String, Question)>,
     deadline: Duration,
-    capture: Option<&AuxCapture>,
+    capture: &AuxCapture,
 ) -> ToolOutcome {
     let asked = questions.len();
-    let judgment = match tokio::time::timeout(deadline, provider.ask(state, questions)).await {
-        Ok(Ok(judgment)) => judgment,
-        Ok(Err(e)) => return Err(format!("Error: the judgment call failed: {}", e)),
-        Err(_) => {
+    let bounded = capture.until(tokio::time::Instant::now() + deadline);
+    let judgment = match bounded.judge(provider, state, questions).await {
+        Ok(judgment) => judgment,
+        Err(e) if e.is::<tokio::time::error::Elapsed>() => {
             return Err(format!(
                 "Error: the judgment call did not answer within {:?}",
                 deadline
             ))
         }
+        Err(e) => return Err(format!("Error: the judgment call failed: {}", e)),
     };
     let model = judgment.model.as_deref().unwrap_or(JEV_DEFAULT_MODEL);
-
-    if let Some(capture) = capture {
-        capture.record_judgment(&judgment).await;
-    }
 
     log!(
         "[Judgment] judge answered {}/{} questions on {} ({} in, {} out)",
@@ -120,7 +115,7 @@ impl LucidosEngine {
             state.clone(),
             questions,
             budget.deadline,
-            Some(&capture),
+            &capture,
         )
         .await
     }

@@ -105,7 +105,8 @@ const PAIRING_CODE_TTL: Duration = Duration::from_secs(300);
 
 /// Digits in a pairing code. Short enough to type on a phone. Its safety comes
 /// from the TTL and single use, not from the digits alone.
-const PAIRING_CODE_DIGITS: u32 = 8;
+/// The app reads it from the generated `gateway-constants.ts`.
+pub(crate) const PAIRING_CODE_DIGITS: u32 = 8;
 
 /// What a request proved about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]

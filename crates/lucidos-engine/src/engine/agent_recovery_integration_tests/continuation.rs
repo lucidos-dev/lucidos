@@ -159,6 +159,7 @@ async fn continuation_retry_input_recaps_the_thread_before_the_continue_message(
         event: ThreadEvent::CodingAgentTextStreamed {
             text: "Traced it to the debounced compose PUT.".into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            parent_tool_use_id: None,
         },
         meta: cc_meta,
     })
@@ -357,9 +358,11 @@ async fn answered_after_idle_resume_carries_the_answer_and_denies_the_rejection(
     );
 
     // 4. And it must not read as licence to carry on with the pre-question plan.
+    //    Yet a typed reply often asks something else, and leaves the question
+    //    open for a re-ask.
     assert!(
-        input.contains("Do not re-ask the same question"),
-        "the resume must block a re-ask: {input}"
+        input.contains("Do not re-ask the same question unless the answer left it open"),
+        "the resume must block a re-ask of an answered question only: {input}"
     );
 
     pool.close().await;

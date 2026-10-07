@@ -442,26 +442,23 @@ function resolveNavigate(relativeUrl) {
 
 self.addEventListener('push', (event) => {
   let raw = null;
+  let textBody;
   try {
     raw = event.data.json();
   } catch {
-    // Non-JSON or empty payload — fall back to a generic notification so we
-    // still satisfy `userVisibleOnly: true` and don't burn the silent-push
-    // budget. Bare-text payloads land in `body`. Stamped at the top level
-    // (legacy shape) so the legacy-branch readers below pick them up.
-    raw = { title: 'Lucidos', body: event.data?.text() || 'New notification' };
+    // A non-JSON or empty payload still shows a generic notification, so we
+    // satisfy `userVisibleOnly: true` and don't burn the silent-push budget.
+    // Bare-text payloads land in `body`.
+    textBody = event.data?.text();
   }
 
-  // Two payload shapes — the engine ships Declarative Web Push
-  // (`{web_push: 8030, notification: {…}}`, see
-  // crates/lucidos-engine/src/scheduler/push.rs::build_push_payload), but a
-  // sub-population of in-flight pushes during a deploy window may arrive in
-  // the legacy flat shape. The legacy branch is intentionally narrow — kept
-  // for one cycle, then removable once monitoring confirms no flat-shape
-  // pushes are still being sent.
+  // The engine ships only Declarative Web Push (`{web_push: 8030,
+  // notification: {…}}`, see scheduler/push.rs::build_push_payload). Any
+  // other payload shows the generic notification.
   const isDeclarative =
     raw && typeof raw === 'object' && raw.web_push === 8030
     && raw.notification && typeof raw.notification === 'object';
+  const notification = isDeclarative ? raw.notification : { body: textBody };
 
   // `wake: true` rides at the TOP LEVEL (sibling to `web_push` / `notification`)
   // so Safari ignores it. Layer 3 of the macOS-Chrome partial-wedge
@@ -469,35 +466,19 @@ self.addEventListener('push', (event) => {
   // real push to a macOS-Chrome device the engine sends a wake push with
   // identical content + `wake: true`; the SW gates `renotify` / `silent`
   // off it so the user sees no visible re-pop.
-  const isWake = raw && raw.wake === true;
+  const isWake = raw?.wake === true;
 
-  const title = isDeclarative
-    ? (raw.notification.title || 'Lucidos')
-    : (raw && raw.title) || 'Lucidos';
-  // Both branches default to 'New notification' on an empty body so the user
-  // never sees a title-only notification with a blank subtitle line.
-  const body = isDeclarative
-    ? (raw.notification.body || 'New notification')
-    : (raw && raw.body) || 'New notification';
-  const tag = isDeclarative
-    ? (raw.notification.tag || DEFAULT_NOTIFICATION_TAG)
-    : ((raw && raw.notification_id) || DEFAULT_NOTIFICATION_TAG);
-  const navigateRelative = isDeclarative
-    ? raw.notification.navigate
-    : null;
+  const title = notification.title || 'Lucidos';
+  // An empty body reads 'New notification', so the user never sees a
+  // title-only notification with a blank subtitle line.
+  const body = notification.body || 'New notification';
+  const tag = notification.tag || DEFAULT_NOTIFICATION_TAG;
+  const navigateRelative = notification.navigate;
 
   // `data` is what `event.notification.data` returns inside notificationclick.
-  // Declarative: read straight from `notification.data` (engine duplicates the
-  // navigate URL in there for the click handler). Legacy: rebuild from flat
-  // top-level fields. Both paths carry the structured `tap`.
-  const data = isDeclarative
-    ? (raw.notification.data || {})
-    : {
-        notification_id: raw && raw.notification_id,
-        thread_id: raw && raw.thread_id,
-        event_id: raw && raw.event_id,
-        tap: raw && raw.tap,
-      };
+  // The engine duplicates the navigate URL in there for the click handler, and
+  // it carries the structured `tap`.
+  const data = notification.data || {};
 
   // App-icon badge (Badging API). The engine carries the count THIS install
   // should show in the TOP-LEVEL `app_badge` field (sibling of `web_push` /
@@ -601,10 +582,8 @@ self.addEventListener('notificationclick', (event) => {
   // from `data.navigate` so the freshly-opened page's `handleHashLocation`
   // cold-start router reads the params off the hash.
   //
-  // The legacy SW-side `buildDeepLinkUrl` was deleted with the declarative
-  // migration — a missing `data.navigate` therefore means the push arrived in
-  // legacy flat shape (in-flight during deploy) AND with no usable deep-link
-  // payload; fall back to opening the app at root.
+  // A missing `data.navigate` means the push carried no usable deep link, so
+  // the tap opens the app at root.
   const targetUrl = data.navigate
     ? resolveNavigate(data.navigate)
     : self.location.origin + SCOPE_PATH;

@@ -1,7 +1,7 @@
 /**
  * The unified thread Filter panel (ThreadFilterPanel), which renders inside the
  * thread drawer pane: ONE single-select set split by an "or" rule. Above it the
- * four real statuses (Needs attention / Review / Running / Drafts); below it the
+ * four real statuses (Needs attention / Review / In flight / Drafts); below it the
  * fifth and last option, "All statuses", then the multi-select channel rows
  * under a "By thread types" heading. Those rows NARROW All statuses rather than
  * competing with it, so the checkmark stays on that row and it grows a
@@ -13,10 +13,10 @@
  * own level, so direct invocation is safe.
  *
  * The header button's needs-attention badge renders `attentionThreadCount`
- * directly; its semantics (attention-only, excluding review / running) are
+ * directly; its semantics (attention-only, excluding review / in flight) are
  * covered by `components/drawer/attention-view.test.ts`.
  */
-import type { ComponentChildren, VNode } from 'preact';
+import type { ComponentChildren } from 'preact';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { ThreadFilterPanel, filterButtonState, FILTER_BUTTON_GLYPHS } from './ThreadFilterPanel';
 import {
@@ -24,11 +24,11 @@ import {
   selectedTriggerIds, setSelectedTriggerIds, setSelectedRepoIds, setSelectedAppIds,
   setIncludeDeletedFilterOptions,
 } from '../../store/store';
-import { FilterIcon, FilteredIcon, AttentionIcon, ReviewIcon, RunningIcon, DraftsIcon } from '../shared/icons';
+import { FilterIcon, FilteredIcon, AttentionIcon, ReviewIcon, InFlightIcon, DraftsIcon } from '../shared/icons';
 import type { DrawerView } from '../../store/store';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
+import { findByClass, textOf, type AnyVNode } from './__tests__/vnodeWalk';
 
-type AnyVNode = VNode<Record<string, unknown>>;
 
 function makeThread(id: string, opts: {
   status?: ThreadStatus;
@@ -79,21 +79,6 @@ function asMap(threads: ThreadState[]): Map<string, ThreadState> {
   return new Map(threads.map(t => [t.meta.id, t]));
 }
 
-/** Collect DOM (string-typed) vnodes matching `cls`, walking arrays + DOM
- *  children. Deliberately does NOT descend into function components, so the
- *  hooks-using <Overlay> / <ExpandableChannelRow> / <TriCheckbox> are never
- *  invoked. */
-function findByClass(node: ComponentChildren, cls: string): AnyVNode[] {
-  if (node === null || node === undefined || typeof node !== 'object') return [];
-  if (Array.isArray(node)) return node.flatMap(n => findByClass(n, cls));
-  const v = node as AnyVNode;
-  if (typeof v.type !== 'string') return []; // function component — don't invoke
-  const out: AnyVNode[] = [];
-  const klass = (v.props.class as string | undefined) ?? '';
-  if (klass.split(' ').includes(cls)) out.push(v);
-  return out.concat(findByClass(v.props.children as ComponentChildren, cls));
-}
-
 /** Every DOM `<input>` of a subtree. Same walk as `findByClass`, so it likewise
  *  stops at a function component. */
 function findInputs(node: ComponentChildren): AnyVNode[] {
@@ -103,16 +88,6 @@ function findInputs(node: ComponentChildren): AnyVNode[] {
   if (typeof v.type !== 'string') return [];
   const out: AnyVNode[] = v.type === 'input' ? [v] : [];
   return out.concat(findInputs(v.props.children as ComponentChildren));
-}
-
-/** Plain-text content of a vnode subtree (DOM nodes only). */
-function textOf(node: ComponentChildren): string {
-  if (node === null || node === undefined || typeof node === 'boolean') return '';
-  if (typeof node === 'string' || typeof node === 'number') return String(node);
-  if (Array.isArray(node)) return node.map(textOf).join('');
-  const v = node as AnyVNode;
-  if (typeof v.type !== 'string') return '';
-  return textOf(v.props.children as ComponentChildren);
 }
 
 /** Every labelled row of a subtree, in render order, whichever family it belongs
@@ -253,7 +228,7 @@ describe('ThreadFilterPanel: View section', () => {
     // narrows it, and the two of them own the channel rows below.
     const { options } = render();
     expect(options.map(o => textOf(o))).toEqual([
-      'Needs attention', 'Review', 'Running', 'Drafts', 'All statuses',
+      'Needs attention', 'Review', 'In flight', 'Drafts', 'All statuses',
     ]);
   });
 
@@ -279,10 +254,10 @@ describe('ThreadFilterPanel: View section', () => {
     expect(closed).toBe(1);
   });
 
-  it('selecting Running switches the drawer view', () => {
-    const running = render().options.find(o => textOf(o) === 'Running')!;
-    (running.props.onClick as () => void)();
-    expect(drawerView.value).toBe('running');
+  it('selecting In flight switches the drawer view', () => {
+    const inFlight = render().options.find(o => textOf(o) === 'In flight')!;
+    (inFlight.props.onClick as () => void)();
+    expect(drawerView.value).toBe('in-flight');
   });
 
   it('per-view counts render on the option rows', () => {
@@ -294,10 +269,10 @@ describe('ThreadFilterPanel: View section', () => {
     const { options } = render();
     const attention = options.find(o => textOf(o).startsWith('Needs attention'))!;
     const review = options.find(o => textOf(o).startsWith('Review'))!;
-    const running = options.find(o => textOf(o).startsWith('Running'))!;
+    const inFlight = options.find(o => textOf(o).startsWith('In flight'))!;
     expect(findByClass(attention, 'drawer-view-count').map(textOf)).toEqual(['1']);
     expect(findByClass(review, 'drawer-view-count').map(textOf)).toEqual(['1']);
-    expect(findByClass(running, 'drawer-view-count').map(textOf)).toEqual(['1']);
+    expect(findByClass(inFlight, 'drawer-view-count').map(textOf)).toEqual(['1']);
   });
 
   it('only "Needs attention" wears the blue badge — the others show a plain number', () => {
@@ -309,12 +284,12 @@ describe('ThreadFilterPanel: View section', () => {
     const { options } = render();
     const attention = options.find(o => textOf(o).startsWith('Needs attention'))!;
     const review = options.find(o => textOf(o).startsWith('Review'))!;
-    const running = options.find(o => textOf(o).startsWith('Running'))!;
+    const inFlight = options.find(o => textOf(o).startsWith('In flight'))!;
     // The attention count carries `badge` (blue pill); the others carry only
     // the plain `drawer-view-count` class.
     expect(findByClass(attention, 'badge')).toHaveLength(1);
     expect(findByClass(review, 'badge')).toHaveLength(0);
-    expect(findByClass(running, 'badge')).toHaveLength(0);
+    expect(findByClass(inFlight, 'badge')).toHaveLength(0);
   });
 });
 
@@ -431,7 +406,7 @@ describe('ThreadFilterPanel: All statuses and the types that narrow it', () => {
     threadChannelFilter.value = new Set(['chat']);
     setIncludeDeletedFilterOptions(false);
     threadMap.value = asMap([makeThread('t1', { triggerId: 'gone' })]);
-    setDrawerView('running');
+    setDrawerView('in-flight');
     expect(suffixes()).toEqual([]);
   });
 
@@ -532,7 +507,7 @@ describe('ThreadFilterPanel: Show (channel) section', () => {
     // is also how the expandable rows' own checkboxes used to go dead: nothing
     // hands them a `disabled` of their own, so removing the fieldset is what
     // makes the whole section live).
-    for (const v of ['all', 'attention', 'review', 'running', 'drafts'] as const) {
+    for (const v of ['all', 'attention', 'review', 'in-flight', 'drafts'] as const) {
       setDrawerView(v);
       const group = render().typesGroup;
       expect(group.type).toBe('div');
@@ -574,7 +549,7 @@ describe('ThreadFilterPanel: Include deleted', () => {
     // the "By thread types" heading (outside this group) pressed right up
     // against the thread types it names.
     expect(rowLabelsInOrder(render().radiogroup)).toEqual([
-      'Needs attention', 'Review', 'Running', 'Drafts',
+      'Needs attention', 'Review', 'In flight', 'Drafts',
       'All statuses', 'Include deleted',
     ]);
   });
@@ -608,7 +583,7 @@ describe('filterButtonState', () => {
     expect(glyphOf()).toBe(FilterIcon);
     expect(glyphOf({ view: 'attention' })).toBe(AttentionIcon);
     expect(glyphOf({ view: 'review' })).toBe(ReviewIcon);
-    expect(glyphOf({ view: 'running' })).toBe(RunningIcon);
+    expect(glyphOf({ view: 'in-flight' })).toBe(InFlightIcon);
     expect(glyphOf({ view: 'drafts' })).toBe(DraftsIcon);
   });
 
@@ -638,7 +613,7 @@ describe('filterButtonState', () => {
   // Pressed means the panel is open and nothing else. A highlight that also
   // meant "a filter is on" left a filtered list looking pressed all the time.
   it('is not pressed while the panel is closed, whatever the filter', () => {
-    for (const view of ['all', 'attention', 'review', 'running', 'drafts'] as const) {
+    for (const view of ['all', 'attention', 'review', 'in-flight', 'drafts'] as const) {
       for (const channelFilterActive of [false, true]) {
         expect(shut({ view, channelFilterActive }).pressed).toBe(false);
       }
@@ -653,7 +628,7 @@ describe('filterButtonState', () => {
   // still says what the list is filtered to. Never an X: at the far end of the
   // header that reads as "close this pane".
   it('is pressed with no badge while the panel is open, wearing the same glyph', () => {
-    for (const view of ['all', 'attention', 'review', 'running', 'drafts'] as const) {
+    for (const view of ['all', 'attention', 'review', 'in-flight', 'drafts'] as const) {
       for (const channelFilterActive of [false, true]) {
         const closed = shut({ view, channelFilterActive, attentionCount: 4 });
         const open = shut({ view, channelFilterActive, attentionCount: 4, panelOpen: true });

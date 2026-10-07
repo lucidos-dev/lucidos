@@ -92,13 +92,13 @@ const AGENT_ORIGIN_SHIM_PY: &str = r#"# Lucidos venv bootstrap — auto-attribut
 # for the parallel CLI implementation.
 import os as _os
 
-_TOKEN = _os.environ.get("LUCIDOS_AGENT_ORIGIN_TOKEN")
+_TOKEN = _os.environ.get("{ENV_AGENT_ORIGIN_TOKEN}")
 _PORT = _os.environ.get("LUCIDOS_API_PORT")
 
 if _TOKEN and _PORT:
     import http.client as _http_client
 
-    _HEADER_TOKEN = "x-lucidos-agent-origin-token"
+    _HEADER_TOKEN = "{HEADER_AGENT_ORIGIN_TOKEN}"
     _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
     _orig_request = _http_client.HTTPConnection.request
 
@@ -134,6 +134,16 @@ if _TOKEN and _PORT:
 
     _http_client.HTTPConnection.request = _request_with_token
 "#;
+
+/// The shim as written to disk, with the engine's own env-var and header names
+/// spliced in. Python cannot import them, so each `{NAME}` placeholder stands
+/// for the `api::actor` constant of that name.
+fn agent_origin_shim_py() -> String {
+    use crate::api::actor::{ENV_AGENT_ORIGIN_TOKEN, HEADER_AGENT_ORIGIN_TOKEN};
+    AGENT_ORIGIN_SHIM_PY
+        .replace("{ENV_AGENT_ORIGIN_TOKEN}", ENV_AGENT_ORIGIN_TOKEN)
+        .replace("{HEADER_AGENT_ORIGIN_TOKEN}", HEADER_AGENT_ORIGIN_TOKEN)
+}
 
 pub struct PythonRuntime {
     workspace_path: PathBuf,
@@ -312,7 +322,7 @@ impl PythonRuntime {
     /// engine API.
     ///
     /// Two files, side by side in `site-packages/`:
-    ///   - `_lucidos_agent_origin.py` — the shim (`AGENT_ORIGIN_SHIM_PY`).
+    ///   - `_lucidos_agent_origin.py`, the shim (`agent_origin_shim_py`).
     ///   - `_lucidos_agent_origin.pth` — one line, `import _lucidos_agent_origin`.
     ///
     /// The `.pth` is what makes this load. We deliberately do NOT use
@@ -354,7 +364,7 @@ impl PythonRuntime {
             let site_packages = path.join("site-packages");
             if site_packages.is_dir() {
                 let module = site_packages.join("_lucidos_agent_origin.py");
-                fs::write(&module, AGENT_ORIGIN_SHIM_PY)
+                fs::write(&module, agent_origin_shim_py())
                     .map_err(|e| format!("write {}: {}", module.display(), e))?;
                 // `.pth` lines that start with `import` are exec'd by `site`
                 // for every `.pth` in the dir — not subject to the single

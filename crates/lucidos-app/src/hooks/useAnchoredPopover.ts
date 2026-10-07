@@ -3,6 +3,7 @@ import type { JSX } from 'preact';
 import { clampWithin, safeAreaTopPx } from '../utils/dom';
 import { notePressOutcome } from '../utils/tapGesture';
 import { primaryPointerIsDown } from '../utils/pointerPress';
+import { SURFACE_STEP_ATTR, boxOf, startStepMorph, stepSignature, type Box, type StepMorph } from './panelStepMorph';
 
 export interface AnchorPosition {
   top: number;
@@ -173,7 +174,9 @@ function isInToastLayer(target: Node): boolean {
  *  when the popover is closed (`anchor === null`).
  *
  *  Recomputes on scroll, on resize (window and visual viewport) and when the
- *  PANEL itself changes size, since its height is an input to the position.
+ *  PANEL itself changes size or content, since its height is an input to the
+ *  position. A change of *surface step* glides through a step morph
+ *  (`panelStepMorph.ts`).
  *  rAF-coalesced + equality-guarded so a fast scroll burst produces at most one
  *  recompute per frame and no re-render when the anchor's screen position
  *  hasn't actually changed (common during inertia scroll where anchor and
@@ -198,9 +201,15 @@ export function useAnchoredPosition(
       ? (anchor as HTMLElement).closest<HTMLElement>(containerSelector)
       : null;
     let rafId: number | null = null;
+    /** The panel as drawn at the last measure: where a step morph starts. */
+    let drawn: Box | null = null;
+    let morph: StepMorph | null = null;
+    let morphFrame: number | null = null;
     const measure = () => {
       const panel = panelRef.current;
-      if (!panel) return;
+      // A running morph owns the box, and an intermediate height would move `top`.
+      if (!panel || morph) return;
+      drawn = boxOf(panel);
       const next = computeAnchorPosition(
         anchor, naturalPanelHeight(panel), panel.offsetWidth, container, align, safeAreaTopPx(),
       );
@@ -256,10 +265,61 @@ export function useAnchoredPosition(
     // the uncapped height (`naturalPanelHeight`), so this cannot cycle.
     const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(schedule);
     if (ro && panelRef.current) ro.observe(panelRef.current);
+    // The observer above re-measures a frame late, so the frame that first
+    // shows new content would place it by the old content's size. A mutation
+    // callback runs right after the render commits, before that frame paints.
+    // It is also where a step change shows, which starts a step morph.
+    let steps = panelRef.current ? stepSignature(panelRef.current) : '';
+    /** Where the queued morph starts. Two steps inside one frame keep the first. */
+    let morphFrom: Box | null = null;
+    const queueMorph = (from: Box) => {
+      morphFrom ??= from;
+      if (morphFrame !== null) return;
+      // A frame callback runs after the re-render the measure queued, so the
+      // panel already sits at its new position, and still before the paint.
+      morphFrame = requestAnimationFrame(() => {
+        morphFrame = null;
+        const panel = panelRef.current;
+        const start = morphFrom;
+        morphFrom = null;
+        if (!panel || !start) return;
+        morph = startStepMorph(panel, start, () => {
+          morph = null;
+          measure();
+        });
+      });
+    };
+    const onContentChanged = () => {
+      const panel = panelRef.current;
+      if (!panel) return;
+      const next = stepSignature(panel);
+      const stepped = steps !== '' && next !== '' && next !== steps;
+      steps = next;
+      if (stepped) {
+        // Mid-morph, the next morph starts from the box as drawn right now.
+        const from = morph ? boxOf(panel) : drawn;
+        morph?.cancel();
+        morph = null;
+        if (from) queueMorph(from);
+      }
+      measure();
+    };
+    const mo = typeof MutationObserver === 'undefined' ? null : new MutationObserver(onContentChanged);
+    if (mo && panelRef.current) {
+      mo.observe(panelRef.current, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributeFilter: [SURFACE_STEP_ATTR],
+      });
+    }
     return () => {
       measureNow.current = null;
       if (rafId !== null) cancelAnimationFrame(rafId);
+      if (morphFrame !== null) cancelAnimationFrame(morphFrame);
+      morph?.cancel();
       ro?.disconnect();
+      mo?.disconnect();
       window.removeEventListener('scroll', schedule, true);
       window.removeEventListener('resize', schedule);
       if (vv) {

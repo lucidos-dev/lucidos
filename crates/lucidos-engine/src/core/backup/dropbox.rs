@@ -136,7 +136,7 @@ pub fn missing_scope_from_body(body: &str) -> Option<String> {
 /// existing grant when a permission is ticked in the console.
 pub fn missing_scope_message(missing: &[&str]) -> String {
     format!(
-        "Dropbox is missing the permission{} {}. Enable {} on the Permissions tab of your app in the Dropbox App Console, then reconnect the account in Settings > Accounts (ticking the box does not change a token that already exists).",
+        "Dropbox is missing the permission{} {}. Enable {} on the Permissions tab of your app in the Dropbox App Console, then reconnect the account in Settings → Accounts (ticking the box does not change a token that already exists).",
         if missing.len() == 1 { "" } else { "s" },
         missing.join(", "),
         if missing.len() == 1 { "it" } else { "them" },
@@ -338,7 +338,7 @@ impl DropboxBackupProvider {
             .send()
             .await
             .map_err(|e| ChunkError::Transient {
-                message: format!("network: {}", e),
+                message: super::transport_failure("Dropbox", "uploading", e),
                 retry_after: 0,
             })
     }
@@ -1185,7 +1185,7 @@ mod tests {
         let msg = missing_scope_message(&["files.content.write"]);
         assert!(msg.contains("files.content.write"));
         assert!(msg.contains("Dropbox App Console"));
-        assert!(msg.contains("Settings > Accounts"));
+        assert!(msg.contains("Settings → Accounts"));
         // Singular wording for one scope, plural for several.
         assert!(msg.contains("the permission files.content.write"));
         let many = missing_scope_message(&["files.content.write", "files.metadata.read"]);

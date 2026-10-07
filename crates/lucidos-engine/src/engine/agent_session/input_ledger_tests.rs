@@ -17,6 +17,8 @@ fn tool_use(name: &str) -> AgentEvent {
         name: name.into(),
         input: serde_json::json!({}),
         id: "toolu-1".into(),
+        parent_tool_use_id: None,
+        api_call_id: None,
     }
 }
 
@@ -25,6 +27,7 @@ fn tool_result() -> AgentEvent {
         output: "Red".into(),
         status: "success".into(),
         id: "toolu-1".into(),
+        parent_tool_use_id: None,
     }
 }
 

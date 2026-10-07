@@ -417,6 +417,8 @@ async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
             description: String::new(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             tool_use_id: String::new(),
+            parent_tool_use_id: None,
+            api_call_id: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -499,6 +501,7 @@ async fn test_cc_text_streamed_after_idled_bumps_status_back_to_running() {
         event: ThreadEvent::CodingAgentTextStreamed {
             text: "still working...".into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            parent_tool_use_id: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

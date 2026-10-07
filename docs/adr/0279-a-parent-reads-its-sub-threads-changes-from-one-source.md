@@ -53,6 +53,8 @@ source guard covers a reader that never asks at all.
 The card is a snapshot, and it cannot be anything else: events are immutable.
 It carries the settled state as of the card and says so, which is honest. The
 live answer stays one `changes` list call away, now with a subtree filter.
+ADR 0357 amends this for change status: a rebuilt card marks a change that left
+Review since.
 
 Keeping the two lists apart matters because they answer different questions.
 The child's own change is what the parent may apply for the child. A sub-thread

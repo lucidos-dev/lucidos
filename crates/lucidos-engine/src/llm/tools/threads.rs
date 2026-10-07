@@ -88,11 +88,11 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     },
                     "folder": {
                         "type": "string",
-                        "description": "What to edit, which also picks the spawn kind: `data/apps/<id>`, or a registered repository name or UUID from `manage_repositories`. Omit to edit Lucidos source, which works only on an install launched from a Lucidos source checkout; otherwise a `folder`-less call is refused unless it carries `workspace`."
+                        "description": "What to edit, which also picks the spawn kind: `data/apps/<id>`, or a registered repository name or UUID from `manage_repositories`. Omit to edit Lucidos source, which works only on an install launched from a Lucidos source checkout."
                     },
                     "workspace": {
                         "type": "string",
-                        "description": "Target workspace basename. Omit for this one. Another needs `relation=\"top\"` and resolves `folder` there."
+                        "description": "Basename of a workspace on THIS install; omit for this one. Needs `relation=\"top\"`; resolves `folder` there. Another install: `lucidos spawn-thread --to <absolute path>`."
                     },
                     // No `allowed_tools` and no `append_system_prompt` here, on
                     // purpose. Both were declared for a year and neither ever
@@ -168,17 +168,17 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
 /// rather than by digging the tool back out of the list.
 const FOLLOW_UP_CHILD_THREAD_DESCRIPTION: &str = concat!(
     "Send a follow-up to a child thread YOU already spawned: redirect one going the wrong ",
-    "way, hand it something a sibling learned, or tell a stalled one to continue. It does ",
-    "NOT consume a child slot, so reviving one beats spawning another near the per-thread ",
-    "limit. Refer to the child by TITLE in anything you write for the user. Returns as soon ",
-    "as the message lands, so issue it and end your turn.\n\n",
+    "way, hand it something a sibling learned, or tell a stalled one to continue. The ",
+    "child cap never refuses it, so reviving a child beats spawning another. ",
+    "Refer to the child by TITLE in anything the user reads. Returns at once, ",
+    "even when held, so issue it and end your turn.\n\n",
     "By default the message QUEUES: a mid-turn child reads it at its next natural break, ",
     "which inside a long tool call can be many minutes, and nothing in flight is thrown away. ",
     "urgent: true stops the child's current turn instead. On a CODEX child urgent changes ",
     "nothing, since a Codex turn cannot read a queued message until it ends.\n\n",
     "Side effects invisible from the verb, all three in ",
-    "`system-knowhow/coding-agent-events`: it RESOLVES ANY PENDING PERMISSION CARD on the ",
-    "child as superseded; a follow-up racing the child's own finish can produce a completion ",
+    "`system-knowhow/coding-agent-events`: a child's PENDING PERMISSION CARD HOLDS your ",
+    "message until a human acts; a follow-up racing the child's own finish can produce a completion ",
     "card for the turn you interrupted, which does not mean the redirect failed; and a child ",
     "parked on a question is blocked on a human, so your message is not an answer to it."
 );
@@ -281,10 +281,10 @@ mod tests {
         let d = &follow_up.description;
 
         assert!(
-            d.contains("RESOLVES ANY PENDING PERMISSION CARD"),
-            "a redirect resolves the child's pending permission cards as \
-             superseded, which can cancel a request a human was about to \
-             approve:\n{d}"
+            d.contains("PENDING PERMISSION CARD HOLDS your message"),
+            "a redirect into a child with a pending permission card is held \
+             until a human resolves the card (ADR 0256), so the parent must \
+             not expect it to land at once:\n{d}"
         );
         assert!(
             d.contains("parked on a question"),
@@ -297,8 +297,9 @@ mod tests {
              the turn it interrupted:\n{d}"
         );
         assert!(
-            d.contains("does NOT consume a child slot"),
-            "reviving an existing child is cheaper than spawning another:\n{d}"
+            d.contains("child cap never refuses it"),
+            "a follow-up is never refused at the child cap, so reviving an \
+             existing child beats spawning another:\n{d}"
         );
         assert!(
             d.contains("by TITLE"),

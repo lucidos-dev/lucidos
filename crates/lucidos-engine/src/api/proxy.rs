@@ -614,6 +614,38 @@ fn may_render_as_document(headers: &HeaderMap) -> bool {
             .any(crate::api::file_response::is_active_document)
 }
 
+/// The *proxy-origin marker*: every request the proxy forwards carries it.
+///
+/// The strip above drops the caller's `x-lucidos-app-id` stamp, so a forward
+/// aimed at a local engine would arrive unstamped and read as the shell. The
+/// marker goes on after the strip, so no caller can remove or forge it.
+pub const PROXY_ORIGIN_HEADER: &str = "x-lucidos-proxied";
+
+/// Refuse every inbound request the proxy forwarded (403).
+///
+/// An `apis.json` entry may point at this engine, a sibling, or the gateway in
+/// front of them. A proxied request is never the shell, whatever else it
+/// carries, and a self-loop dies on its first hop. Layered outermost, so
+/// `/app`, `/data` and the frontend fallback refuse it too.
+pub(crate) async fn refuse_proxied_request(
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if !request.headers().contains_key(PROXY_ORIGIN_HEADER) {
+        return next.run(request).await;
+    }
+    log!(
+        "[Proxy] Refusing {} {}: it came through a credentialed proxy",
+        request.method(),
+        request.uri().path()
+    );
+    super::error::ApiError::new(
+        StatusCode::FORBIDDEN,
+        "A request forwarded by a Lucidos proxy may not call a Lucidos engine.",
+    )
+    .into_response()
+}
+
 /// Build a copy of `headers` with stripped headers removed.
 pub fn filter_request_headers(headers: &HeaderMap) -> HeaderMap {
     let mut filtered = HeaderMap::new();
@@ -924,14 +956,6 @@ pub(crate) async fn resolve_proxy_target(
 /// `script_handshake` layer whose script does its own token exchange), and it is
 /// named rather than merely present, so the ambiguity `get`'s exclusion exists
 /// to prevent does not arise here.
-///
-/// **Temporary measure**, registered in `docs/temporary-measures.md` under
-/// "`oauth:` prefix stripped from a caller-supplied credential name". An older
-/// config, written before the prefix migration renamed the credential, spells
-/// that name `oauth:<provider>`, which is now stored as just `<provider>`. The
-/// fallback keeps those entries working: without it a live `apis.json` 502s on
-/// every request the moment the prefix migration runs, and `data/config/` is
-/// user data no DB migration can rewrite.
 pub(crate) async fn fetch_required_credential(
     pool: &sqlx::PgPool,
     name: &str,
@@ -939,19 +963,7 @@ pub(crate) async fn fetch_required_credential(
     let found = match CredentialStore::get(pool, name).await {
         Ok(Some(c)) => Ok(Some(c)),
         Ok(None) => {
-            // Normalize ONLY a name that actually carries the legacy prefix.
-            // Running every miss through `client_provider_name` would also
-            // lowercase it, so a config naming `Stripe` (no such credential)
-            // would silently resolve an unrelated `stripe` OAuth registration
-            // and the proxy would send a `{client_id, ...}` blob as its auth
-            // header. A miss must stay a miss unless the name is one of the two
-            // spellings of the same thing.
-            let lookup = if name.trim().to_lowercase().starts_with("oauth:") {
-                crate::core::oauth::client_provider_name(name)
-            } else {
-                name.to_string()
-            };
-            CredentialStore::get_typed(pool, &lookup, crate::core::AuthType::OauthClient).await
+            CredentialStore::get_typed(pool, name, crate::core::AuthType::OauthClient).await
         }
         Err(e) => Err(e),
     };
@@ -1396,6 +1408,7 @@ pub async fn forward_request(
     for (name, value) in &auth_headers {
         builder = builder.header(name.as_str(), value.as_bytes());
     }
+    builder = builder.header(PROXY_ORIGIN_HEADER, "1");
     if !body.is_empty() {
         builder = builder.body(body);
     }
@@ -1654,6 +1667,9 @@ pub(crate) async fn resolve_named_proxy(
 
 /// Dispatch a [`ResolvedProxy`]. Both arms bind a [`ScopedPipeline`] before
 /// anything reaches the network.
+///
+/// A model provider's reply records what the call cost, on `cost_thread` or
+/// the home thread (`api::proxy_cost`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_resolved(
     engine: &Arc<crate::engine::LucidosEngine>,
@@ -1662,12 +1678,29 @@ pub(crate) async fn dispatch_resolved(
     method: Method,
     path: String,
     query: Option<String>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: Bytes,
+    cost_thread: Option<uuid::Uuid>,
 ) -> Result<Response, (StatusCode, String)> {
+    use crate::api::proxy_cost::{prepare_request, record_model_call, Upstream};
     match resolved {
         ResolvedProxy::Config(config) => {
-            dispatch_proxy_request(engine, name, &config, method, path, query, headers, body).await
+            let upstream = Upstream::Configured {
+                base_url: &config.base_url,
+            };
+            prepare_request(&upstream, &mut headers);
+            let response = dispatch_proxy_request(
+                engine,
+                name,
+                &config,
+                method,
+                path.clone(),
+                query,
+                headers,
+                body.clone(),
+            )
+            .await?;
+            Ok(record_model_call(engine, cost_thread, upstream, &path, &body, response).await)
         }
         // The builtin arm builds its own layers, so it binds its own pipeline.
         // Same gate, same type, no second way to reach the network.
@@ -1676,7 +1709,27 @@ pub(crate) async fn dispatch_resolved(
             let scoped = ScopedPipeline::bind(&ctx, name, base_url, layers, false).await?;
             // A builtin has no entry, so only the workspace value applies.
             let timeout = crate::api::proxy_timeout::resolve(ctx.pool, None).await?;
-            dispatch_scoped(name, &scoped, timeout, method, path, query, headers, body).await
+            prepare_request(&Upstream::Builtin, &mut headers);
+            let response = dispatch_scoped(
+                name,
+                &scoped,
+                timeout,
+                method,
+                path.clone(),
+                query,
+                headers,
+                body.clone(),
+            )
+            .await?;
+            Ok(record_model_call(
+                engine,
+                cost_thread,
+                Upstream::Builtin,
+                &path,
+                &body,
+                response,
+            )
+            .await)
         }
     }
 }
@@ -1705,6 +1758,7 @@ async fn proxy_handle_inner(
     let method = req.method().clone();
     let query = req.uri().query().map(|s| s.to_string());
     let headers = req.headers().clone();
+    let cost_thread = crate::api::proxy_cost::cost_thread(&headers);
     let body = match axum::body::to_bytes(req.into_body(), 100 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
@@ -1721,6 +1775,7 @@ async fn proxy_handle_inner(
         query,
         headers,
         body,
+        cost_thread,
     )
     .await
     {

@@ -10,9 +10,30 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-use crate::core::oauth;
+use crate::core::{oauth, prefs};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A transport failure as the user reads it: the provider, the step that lost
+/// the connection, then every cause in the chain.
+///
+/// reqwest's own text stops at "error sending request for url (…)", which hides
+/// the reason. The URL is dropped too: an upload session URI carries its
+/// upload id, and every backup error is persisted.
+fn transport_failure(provider: &str, step: &str, e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut chain = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !chain.ends_with(&text) {
+            chain.push_str(": ");
+            chain.push_str(&text);
+        }
+        source = cause.source();
+    }
+    format!("Lost the connection to {provider} while {step} ({chain}).")
+}
 
 /// Registry entry: (id, name, oauth_provider, required_scopes, grant_scopes,
 /// constructor).
@@ -29,20 +50,6 @@ type BackupProviderEntry = (
     &'static [&'static str],
     fn(PgPool, &'static [&'static str]) -> Box<dyn BackupProvider>,
 );
-
-/// Preference key for the backup cron schedule expression.
-pub const PREF_BACKUP_SCHEDULE: &str = "backup_schedule";
-/// Preference key for the backup provider ID.
-pub const PREF_BACKUP_PROVIDER: &str = "backup_provider";
-/// Preference key for how many backups to keep (oldest are deleted after a new backup).
-pub const PREF_BACKUP_RETENTION: &str = "backup_retention";
-/// Default number of backups to keep when no preference is set.
-pub const DEFAULT_BACKUP_RETENTION: usize = 5;
-/// Preference key for the persisted outcome of the last backup run (success or
-/// failure). Stored as a JSON `BackupLastRun` so the Settings → Backup page can
-/// show "did the last run succeed or fail, and when?" even after an engine
-/// restart — terminal outcome otherwise lives only in ephemeral SSE events.
-pub const PREF_BACKUP_LAST_RUN: &str = "backup_last_run";
 
 /// A backup is "stale" once the newest good one is older than this. 24h matches
 /// the most aggressive built-in schedule.
@@ -81,14 +88,14 @@ pub fn schedule_will_run(schedule: Option<&str>, provider: Option<&str>) -> bool
 /// verdict the picker states out loud, so a transient `sqlx` failure must not be
 /// dressed up as one.
 pub async fn backups_are_configured(pool: &PgPool) -> Result<bool, BoxError> {
-    use crate::core::PreferenceStore;
-    let provider = PreferenceStore::get(pool, PREF_BACKUP_PROVIDER).await?;
-    let schedule = PreferenceStore::get(pool, PREF_BACKUP_SCHEDULE).await?;
+    let provider = prefs::BACKUP_PROVIDER.try_stored(pool).await?;
+    let schedule = prefs::BACKUP_SCHEDULE.try_stored(pool).await?;
     Ok(schedule_will_run(schedule.as_deref(), provider.as_deref()))
 }
 
 /// Read the backup retention count from preferences. A missing or unparseable
-/// row is the default; a FAILED read is an `Err`.
+/// row is the catalog default, and a stored count is held inside the catalog
+/// bounds; a FAILED read is an `Err`.
 ///
 /// The split matters because one caller acts destructively on the answer.
 /// Collapsing a failed read into the default means a transient `sqlx` failure
@@ -100,11 +107,7 @@ pub async fn backups_are_configured(pool: &PgPool) -> Result<bool, BoxError> {
 /// deleting. The two display callers still want the default on an unknown, and
 /// say so at their own call sites; the prune caller skips the prune.
 pub async fn get_retention_count(pool: &PgPool) -> Result<usize, BoxError> {
-    use crate::core::PreferenceStore;
-    Ok(PreferenceStore::get(pool, PREF_BACKUP_RETENTION)
-        .await?
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_BACKUP_RETENTION))
+    Ok(prefs::BACKUP_RETENTION.try_read(pool).await?.round() as usize)
 }
 
 /// Static registry of all backup providers: (id, name, oauth_provider,
@@ -366,7 +369,7 @@ pub enum BackupRunStatus {
 }
 
 /// Persisted record of the most recent backup run's terminal outcome. Written
-/// by `run_backup` on both paths and stored under `PREF_BACKUP_LAST_RUN`, so the
+/// by `run_backup` on both paths and stored under `prefs::BACKUP_LAST_RUN`, so the
 /// page survives engine restarts. The `BackupCompleted` and `BackupFailed` SSE
 /// events are ephemeral.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,13 +417,13 @@ impl BackupLastRun {
     }
 }
 
-/// Persist the last-run outcome under `PREF_BACKUP_LAST_RUN`. Failure to
+/// Persist the last-run outcome under `prefs::BACKUP_LAST_RUN`. Failure to
 /// persist is returned to the caller so it can log it — the health card would
 /// otherwise silently lag behind the real outcome.
 pub async fn persist_last_run(pool: &PgPool, run: &BackupLastRun) -> Result<(), BoxError> {
     use crate::core::PreferenceStore;
     let value = serde_json::to_string(run)?;
-    PreferenceStore::set_silent(pool, PREF_BACKUP_LAST_RUN, &value).await?;
+    PreferenceStore::set_silent(pool, prefs::BACKUP_LAST_RUN.key(), &value).await?;
     Ok(())
 }
 
@@ -431,18 +434,18 @@ pub async fn persist_last_run(pool: &PgPool, run: &BackupLastRun) -> Result<(), 
 /// `None` reads exactly like a workspace that has never backed up, and that is
 /// the reading a user acts on.
 pub async fn load_last_run(pool: &PgPool) -> Option<BackupLastRun> {
-    use crate::core::PreferenceStore;
-    let raw = match PreferenceStore::get(pool, PREF_BACKUP_LAST_RUN).await {
+    let key = prefs::BACKUP_LAST_RUN.key();
+    let raw = match prefs::BACKUP_LAST_RUN.try_stored(pool).await {
         Ok(raw) => raw?,
         Err(e) => {
-            crate::log!("[Backup] Could not read {PREF_BACKUP_LAST_RUN}: {e}");
+            crate::log!("[Backup] Could not read {key}: {e}");
             return None;
         }
     };
     match serde_json::from_str(&raw) {
         Ok(run) => Some(run),
         Err(e) => {
-            crate::log!("[Backup] Ignoring malformed {PREF_BACKUP_LAST_RUN}: {e}");
+            crate::log!("[Backup] Ignoring malformed {key}: {e}");
             None
         }
     }
@@ -503,7 +506,7 @@ pub async fn load_recent_runs(pool: &PgPool, limit: i64) -> Vec<BackupRunSummary
 /// has never produced one.
 ///
 /// The `BackupCompleted` row is the evidence, so a failure since the last good
-/// run cannot hide it. `PREF_BACKUP_LAST_RUN` would: it holds the last run
+/// run cannot hide it. `prefs::BACKUP_LAST_RUN` would: it holds the last run
 /// whatever its outcome. `idx_events_type_created` covers the lookup, so this is
 /// one indexed read, cheap enough for the gateway's per-workspace poll.
 ///
@@ -613,6 +616,12 @@ pub fn key_file_path(workspace: &Path) -> PathBuf {
     workspace.join(".lucidos").join("backup.key")
 }
 
+/// A backup archive's filename is `{ARCHIVE_PREFIX}{name}-{timestamp}{ARCHIVE_SUFFIX}`.
+/// The gateway's `registry::parse_workspace_name_from_archive` spells the same
+/// shape and cannot import these.
+const ARCHIVE_PREFIX: &str = "lucidos-backup-";
+const ARCHIVE_SUFFIX: &str = ".enc";
+
 /// The workspace directory name used in backup archive filenames
 /// (`lucidos-backup-{name}-{timestamp}.enc`). Falls back to `"workspace"` when
 /// the path has no final component. The upload path and the prune matcher both
@@ -635,8 +644,8 @@ pub fn workspace_archive_name(workspace: &Path) -> &str {
 /// — the caller then asks the user for a name.
 pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
     let rest = filename
-        .strip_prefix("lucidos-backup-")?
-        .strip_suffix(".enc")?;
+        .strip_prefix(ARCHIVE_PREFIX)?
+        .strip_suffix(ARCHIVE_SUFFIX)?;
     // Split off the trailing `-HHMMSS`, then the `-YYYYMMDD` before it; whatever
     // remains is the workspace name. Both halves must be timestamp-shaped.
     let (before_time, time) = rest.rsplit_once('-')?;
@@ -892,7 +901,7 @@ pub async fn create_backup(
     progress("uploading", encrypt_end, 100);
     let workspace_name = workspace_archive_name(workspace);
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
-    let filename = format!("lucidos-backup-{workspace_name}-{timestamp}.enc");
+    let filename = format!("{ARCHIVE_PREFIX}{workspace_name}-{timestamp}{ARCHIVE_SUFFIX}");
 
     let upload_progress = |done: u64, total: u64| {
         let pct = if total > 0 {
@@ -939,12 +948,8 @@ fn is_backup_timestamp(s: &str) -> bool {
 /// exactly, timestamp shape included. This is the guard that keeps pruning off
 /// another workspace's archives, and off any unrelated file in the shared
 /// folder.
-fn is_own_backup_archive(filename: &str, workspace_name: &str) -> bool {
-    let prefix = format!("lucidos-backup-{workspace_name}-");
-    filename
-        .strip_prefix(&prefix)
-        .and_then(|rest| rest.strip_suffix(".enc"))
-        .is_some_and(is_backup_timestamp)
+pub(crate) fn is_own_backup_archive(filename: &str, workspace_name: &str) -> bool {
+    parse_workspace_name_from_archive(filename).as_deref() == Some(workspace_name)
 }
 
 /// From everything the provider lists in the shared backup folder, choose which

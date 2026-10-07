@@ -445,6 +445,8 @@
 
 .content-header-actions {
     display: flex;
+    /* The header row already places this cluster at the pane's right end. */
+    justify-content: flex-end;
     align-items: center;
     gap: 0.25rem;
 }
@@ -559,6 +561,8 @@
     overflow-y: auto;
     overscroll-behavior: contain;
     position: relative;
+    /* The end space every view keeps below its last element (panels/content.css). */
+    --pane-end-space: calc(var(--space-xl) + var(--safe-area-bottom));
 }
 
 /* A column view reserves the scrollbar's gutter even while it fits, as
@@ -760,26 +764,27 @@
            brand cluster to clear. Sized to the WIDER of the two ends and paid
            at both, because the cluster is centred on the PANE. Spending the
            difference on one side is what would stop it being centred.
-           - leading: the drawer toggle, wherever it rests.
+           - leading: the drawer toggle, wherever it rests, and Home while it
+             is shown (the override on .pane-header-brand).
            - trailing: the actions at their widest, which is setup + compose +
              search, 3 buttons and 2 gaps, plus the row's padding.
            The leading term is not decoration. The packaged macOS build starts
            the toggle 80px in, and below 100% ui-scale that end is the wider one
            on every build. Reading it as "the drawer toggle alone, so narrower"
            is what let the back chevron land on the toggle. */
+        --brand-trail-end: calc(0.5rem + 3 * var(--header-icon-box) + 2 * 0.25rem);
         --brand-side-reserve: max(
             calc(var(--header-lead-inset) + var(--header-icon-box)),
-            calc(0.5rem + 3 * var(--header-icon-box) + 2 * 0.25rem)
+            var(--brand-trail-end)
         );
         /* The content pane's copy of the reserve above, and the same rule: room
            kept at EACH end of the row for the centred title cluster to clear,
            sized to the WIDER of the two ends. The leading end is one hamburger;
-           the trailing one is the actions cluster at its WIDEST, which is three
-           boxes (two context icons riding the row, plus the bell) and the two
-           gaps between them. Three is the most that can ever stand there:
-           `useHeaderActionCollapse`'s alwaysCollapseFrom folds a set of three or
-           more whole, so past two icons the cluster gets NARROWER rather than
-           wider. The last two gaps are the clearance between that cluster and
+           the trailing one is the actions cluster on the clamp's middle arm,
+           which is three boxes (two context icons riding the row, plus the
+           bell) and the two gaps between them. A third icon rides only where
+           the box sits at its span cap and leaves more room; anywhere tighter,
+           `useHeaderActionCollapse` folds two of them into ⋯ first. The last two gaps are the clearance between that cluster and
            the title box: two rather than one because that is what the collapse
            measurement charges (`computeFitsInOneRow` gives the centred box a
            gap at each of its sides, and the reserve is symmetric, so both land
@@ -1428,7 +1433,7 @@
        against the header, not a member of this region); --brand-side-reserve is
        what keeps the centred label clear of it (and of the wider trailing
        cluster opposite). With the drawer open the toggle rests over the drawer
-       row instead, and this region's leading end is empty. */
+       row instead. Home, when present, leads the region in both states. */
     .app-header .pane-header-brand {
         position: absolute;
         left: calc(var(--co) + var(--ddo));
@@ -1468,15 +1473,36 @@
            reach of every automated surface (no WebDriver reaches WKWebView,
            ADR 0016). A clip-path is no scroll container on any engine. */
         clip-path: inset(-100% calc(-1 * var(--focus-ring-width)));
-        /* The actions cluster is the region's ONLY in-flow child (the
-           brand-label is absolutely centred, below), so it is pinned to the
-           trailing edge directly. This was `space-between`, which needed a
-           second in-flow child at the leading edge to mean the same thing: with
-           the drawer toggle gone from the flow it would have put the actions at
-           the LEADING edge instead. */
+        /* The actions cluster is pinned to the trailing edge. Home, when
+           present, leads the row through its own auto margin below, so the
+           actions stay at the trailing edge whether or not it is there. */
         justify-content: flex-end;
+        /* Room at the leading edge for Home. With the drawer open the region
+           starts at the drawer divider and the row gap is enough. */
+        padding-left: var(--pane-header-gap);
         transition: left var(--duration-slow) ease, width var(--duration-slow) ease,
+                    padding-left var(--duration-slow) ease,
                     opacity var(--duration-slow) ease, visibility var(--duration-slow);
+    }
+
+    /* With the drawer shut the region starts at the window edge, where the
+       drawer toggle overlaps it from outside, so Home starts past the toggle. */
+    :root:not([data-thread-drawer-open]) .app-header .pane-header-brand {
+        padding-left: calc(var(--header-lead-inset) + var(--header-icon-box) + var(--pane-header-gap));
+    }
+
+    .app-header .pane-header-brand > .home-thread-btn {
+        flex-shrink: 0;
+        margin-right: auto;
+    }
+
+    /* Home widens the row's leading end by its box and a gap, so the centred
+       cluster's reserve grows with it. The reserve stays the WIDER end. */
+    .app-header .pane-header-brand:has(> .home-thread-btn) {
+        --brand-side-reserve: max(
+            calc(var(--header-lead-inset) + 2 * var(--header-icon-box) + var(--pane-header-gap)),
+            var(--brand-trail-end)
+        );
     }
 
     /* brand-label is absolutely centered on the pane's true middle, and it is
@@ -1851,6 +1877,8 @@
    centered brand-label floats over the middle independently. */
 .pane-header-brand-actions {
     display: flex;
+    /* The brand's own justify-content already places the cluster. */
+    justify-content: flex-end;
     align-items: center;
     gap: 0.25rem;
     flex-shrink: 0;
@@ -1951,10 +1979,9 @@
    the one that means "you can switch right now". The Lucidos menu's pending
    row is the way back to its toast. */
 /* The unread count's box, so the mark's two badges share one size and one
-   column on its right edge. Ahead of the dot, whose round corners must win. */
+   column on its right edge. */
 .brand-badge {
     --badge-height: var(--header-mark-count-size);
-    border-radius: var(--radius-control);
 }
 
 .brand-badge-dot {
@@ -1964,7 +1991,6 @@
        applies to an empty box, and both would stretch the dot out of round. */
     padding: 0;
     line-height: 0;
-    border-radius: var(--radius-round);
 }
 
 /* Rebuilding has been proved unable to deliver the pending version, so this one
@@ -2148,11 +2174,13 @@
 
 /* The badge stays mounted and fades both ways. `visibility` flips at the END
    of a fade out and at the START of a fade in, so a hidden badge takes no
-   pointer at any point. The ring keeps its own transition, on this timing. */
+   pointer at any point. The ring keeps its own transition, on this timing.
+   `transform` stays in `will-change`, because the layer it keeps is what holds
+   the count on its pill's middle (badges.css). */
 .app-header .badge.filter-badge {
     opacity: 0;
     visibility: hidden;
-    will-change: opacity;
+    will-change: transform, opacity;
     transition:
         box-shadow var(--duration-fast),
         opacity var(--duration-fast) ease,

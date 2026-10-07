@@ -155,11 +155,10 @@ export function handleChoiceCardKeyDown(e: KeyboardEvent, root: HTMLElement | nu
   // correction wrote an armed reader back to the live edge, taking the option
   // they had just stepped to off the screen. See `markRevealScroll`.
   //
-  // The transcript's own `focusin` listener would also catch this, since the
-  // `focus()` above bubbles one, and this call is kept anyway: it stamps the
+  // The transcript's own `focusin` listener marks only an option not wholly in
+  // view, so this call is what marks a step to a visible one. It also stamps the
   // position AFTER the reveal rather than before it, and it does not depend on
   // the observers being attached to the container this card happens to sit in.
-  // Belt and braces on a keypress costs one visibility check.
   markRevealScroll();
 }
 

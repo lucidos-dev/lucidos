@@ -16,7 +16,7 @@
 
 use std::collections::HashSet;
 
-use crate::core::{PreferenceStore, PREF_VOICE_RESIDENT_SECTIONS};
+use crate::core::prefs;
 use crate::engine::LucidosEngine;
 
 use super::sections::{ResidentSection, SECTIONS};
@@ -27,21 +27,19 @@ const BLOCK_HEADING: &str = "[WHAT YOU ALREADY KNOW]";
 /// Which sections a stored preference names.
 ///
 /// **A row that exists means exactly what it lists, and an EMPTY one means
-/// none.** Only `None`, a row that was never written, falls back to the default
-/// set. The two used to be one case, which made the last section impossible to
-/// turn off: clearing it read as "never set" and brought all three back.
+/// none.** Only `None`, a row that was never written, falls back to the
+/// catalog default. The two used to be one case, which made the last section
+/// impossible to turn off: clearing it read as "never set" and brought all
+/// three back.
 ///
 /// A named section nobody defines is dropped with a log line: a typo must not
 /// cost the user the whole block.
 ///
 /// Ordered by the registry, never by the preference. The block then reads the
 /// same way whatever order the reader toggled them in.
-fn sections_from(stored: Option<&str>) -> Vec<&'static ResidentSection> {
-    let Some(stored) = stored else {
-        return SECTIONS.iter().filter(|s| s.on_by_default).collect();
-    };
-
-    let wanted: HashSet<&str> = stored
+pub(super) fn sections_from(stored: Option<&str>) -> Vec<&'static ResidentSection> {
+    let listed = stored.unwrap_or_else(|| prefs::VOICE_RESIDENT_SECTIONS.default_text());
+    let wanted: HashSet<&str> = listed
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -50,7 +48,7 @@ fn sections_from(stored: Option<&str>) -> Vec<&'static ResidentSection> {
         if !SECTIONS.iter().any(|s| s.id == *name) {
             log!(
                 "[Voice] {} names an unknown section '{}'. Ignoring it",
-                PREF_VOICE_RESIDENT_SECTIONS,
+                prefs::VOICE_RESIDENT_SECTIONS.key(),
                 name
             );
         }
@@ -66,12 +64,15 @@ fn sections_from(stored: Option<&str>) -> Vec<&'static ResidentSection> {
 /// talker the thread and the workspace shape that this reader deliberately
 /// turned off. The call still goes up, knowing less (`.claude/rules/rust.md`).
 pub async fn enabled_sections(engine: &LucidosEngine) -> Vec<&'static ResidentSection> {
-    match PreferenceStore::get(engine.pool(), PREF_VOICE_RESIDENT_SECTIONS).await {
+    match prefs::VOICE_RESIDENT_SECTIONS
+        .try_stored(engine.pool())
+        .await
+    {
         Ok(stored) => sections_from(stored.as_deref()),
         Err(e) => {
             log!(
                 "[Voice] Could not read {}: {}. Opening with no resident block",
-                PREF_VOICE_RESIDENT_SECTIONS,
+                prefs::VOICE_RESIDENT_SECTIONS.key(),
                 e
             );
             vec![]
@@ -144,14 +145,15 @@ mod tests {
         sections_from(stored).iter().map(|s| s.id).collect()
     }
 
-    /// A workspace that never touched the preference opens with the built-in
-    /// set. It is the only case that falls back.
+    /// A workspace that never touched the preference opens with the catalog
+    /// default. It is the only case that falls back.
     #[test]
     fn no_row_at_all_means_the_default_set() {
         assert_eq!(
             ids(None),
-            vec!["who-and-where", "this-thread", "workspace-shape"]
+            ids(Some(prefs::VOICE_RESIDENT_SECTIONS.default_text()))
         );
+        assert!(!ids(None).is_empty());
     }
 
     /// The bug the toggles would otherwise have. Clearing every section used to
@@ -216,16 +218,17 @@ mod tests {
         assert_eq!(ids.len(), count, "two sections share an id");
     }
 
-    /// The default set is what a workspace that never edited the preference
-    /// gets, so it is a product decision worth pinning.
+    /// The catalog default names only sections that exist. An id nobody
+    /// defines would quietly shrink what a fresh workspace opens with.
     #[test]
-    fn the_default_set_is_the_workspace_shape_one() {
-        let on: Vec<&str> = SECTIONS
-            .iter()
-            .filter(|s| s.on_by_default)
-            .map(|s| s.id)
-            .collect();
-        assert_eq!(on, vec!["who-and-where", "this-thread", "workspace-shape"]);
+    fn every_default_section_exists() {
+        for id in prefs::VOICE_RESIDENT_SECTIONS.default_text().split(',') {
+            assert!(
+                SECTIONS.iter().any(|s| s.id == id.trim()),
+                "the default names '{}', which no section defines",
+                id
+            );
+        }
     }
 
     /// A section id is a preference value the user types, so it must stay

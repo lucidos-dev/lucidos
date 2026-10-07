@@ -286,7 +286,7 @@ fn widen_scope_request(existing: &Credential, adding: &[String]) -> String {
 }
 
 /// The lowercased host a URL names, if it names one.
-fn host_of(url: &str) -> Option<String> {
+pub(crate) fn host_of(url: &str) -> Option<String> {
     reqwest::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_ascii_lowercase))

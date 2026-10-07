@@ -1,11 +1,15 @@
 import { useLayoutEffect, useMemo, useRef } from 'preact/hooks';
 import { renderMarkdown } from '../../utils/renderMarkdown';
+import type { MarkdownDocumentLocation } from '../../utils/markdownImageSource';
 import { splitFrontmatter, type Frontmatter } from '../../utils/frontmatter';
 import { COPY_ID_NONCE, TASK_CHECKBOX_ATTR } from '../../utils/markedConfig';
 import { countTaskListItems } from '../../utils/taskListToggle';
 
 /** A markdown file as a document: its frontmatter as a properties card, then
  *  the rendered body. The raw text stays in the editor and the Source view.
+ *
+ *  `location` says where the file lives. Its headings get anchor ids, and a
+ *  relative image resolves against its folder (see `renderMarkdown`).
  *
  *  `editable` lets the reader flip a GFM task-list checkbox in place, by the
  *  box or by its text. Left
@@ -17,16 +21,19 @@ import { countTaskListItems } from '../../utils/taskListToggle';
  *  otherwise, so the checkbox can revert a failed toggle. If the rendered
  *  checkbox count ever disagrees with that count, every checkbox stays
  *  disabled instead: see the fail-closed comment inside the wiring effect. */
-export function MarkdownDocument({ content, onClick, editable = false, onToggleCheckbox }: {
+export function MarkdownDocument({ content, location, onClick, editable = false, onToggleCheckbox }: {
   content: string;
+  location: MarkdownDocumentLocation;
   onClick?: (e: MouseEvent) => void;
   editable?: boolean;
   onToggleCheckbox?: (taskIndex: number) => Promise<boolean>;
 }) {
+  // By value: a caller builds a fresh location object on every render.
+  const locationKey = JSON.stringify(location);
   const { frontmatter, html } = useMemo(() => {
     const split = splitFrontmatter(content);
-    return { frontmatter: split.frontmatter, html: renderMarkdown(split.body) };
-  }, [content]);
+    return { frontmatter: split.frontmatter, html: renderMarkdown(split.body, { document: location }) };
+  }, [content, locationKey]);
   const bodyRef = useRef<HTMLDivElement>(null);
   // The latest callback, read inside the click handler rather than closed
   // over by the effect below. A caller re-rendering with a fresh function

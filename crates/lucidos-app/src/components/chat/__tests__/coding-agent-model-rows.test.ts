@@ -13,7 +13,7 @@ const served = [
   row('claude-fable-5-1', 'claude-fable-5-1'),
   row('opus', 'claude-opus-5-5[1m]'),
   row('sonnet', 'claude-sonnet-5[1m]'),
-  row('haiku', 'claude-haiku-4-5'),
+  row('haiku', 'claude-haiku-4-5-20251001'),
 ];
 
 describe('pickerRowValue', () => {

@@ -182,16 +182,21 @@ mod tests {
 
     #[test]
     fn linux_is_raised_exactly_when_elevated() {
-        for some_avg60 in [0.0, 9.99, 10.0, 40.0] {
+        let floor = PSI_SOME_AVG60_FLOOR;
+        for some_avg60 in [0.0, floor - 0.01, floor, 40.0] {
             let reading = PressureReading::Linux { some_avg60 };
             assert_eq!(reading.is_raised(), reading.is_elevated());
         }
     }
 
     #[test]
-    fn linux_psi_counts_at_ten_percent() {
-        assert!(PressureReading::Linux { some_avg60: 10.0 }.is_elevated());
-        assert!(!PressureReading::Linux { some_avg60: 9.99 }.is_elevated());
+    fn linux_psi_counts_at_the_floor() {
+        let at = PSI_SOME_AVG60_FLOOR;
+        assert!(PressureReading::Linux { some_avg60: at }.is_elevated());
+        assert!(!PressureReading::Linux {
+            some_avg60: at - 0.01
+        }
+        .is_elevated());
     }
 
     #[test]

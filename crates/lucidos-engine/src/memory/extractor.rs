@@ -1,13 +1,11 @@
 use crate::engine::aux_purpose::AuxCall;
-use crate::llm::judgment::{jev_for, JudgmentProvider, JudgmentSite};
-use crate::llm::openai::OpenAiProvider;
+use crate::llm::judgment::{
+    for_site, system_one_for, ChatJudgmentProvider, JudgmentProvider, JudgmentSite,
+};
 use crate::llm::provider::{LlmProvider, LlmResponse, Message, MessageContent};
-use crate::llm::vertex::{location_handle, LocationHandle, TokenCache, VertexProvider};
 use crate::memory::{query_judgment, RETRIEVAL_MIN_IMPORTANCE};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::sync::Arc;
-use std::time::Duration;
 
 /// Bump when extractor logic changes in a way that produces materially
 /// different facts from the same input — new prompt, new filter, new context
@@ -110,31 +108,10 @@ pub(crate) fn extraction_prompt_chars() -> usize {
     EXTRACTION_PROMPT.chars().count()
 }
 
-const QUERY_CLASSIFICATION_PROMPT: &str = r#"Classify this user message and optionally decompose into search queries.
-You will receive the current message and optionally a summary of the recent conversation for context.
-Use the conversation context to understand the TOPIC being discussed, not just the latest message in isolation.
-
-Determine:
-- needs_memory: Does answering this require the user's long-term memory (past conversations, projects, preferences, personal facts)? true whenever the message references past conversations, "earlier today", "what we discussed", "the research", "last time", or any prior interaction — even if the request also involves a tool action like saving to a file. false ONLY for greetings, time queries, general knowledge, or pure tool commands that don't reference any past content (e.g. "create an empty file", "what time is it").
-- needs_file_list: Does answering this require knowing what files exist in the workspace? false for greetings, time queries, memory-only questions.
-- needs_credentials: Does this conversation involve external APIs, tokens, authentication, or services that might need credentials? Consider the full conversation topic, not just the latest message. A follow-up like "try again" or "the token should be active" in a conversation about API access still needs credentials.
-- sub_queries: If needs_memory is true, decompose into search queries about the TOPIC or CONTENT being referenced, NOT about the action being requested. Strip away action verbs like "save", "summarize", "write" and focus on the subject matter. For example, "save research about Example Org" → ["Example Org", "Example Org company analysis"]. If needs_memory is false, return empty array.
-  A BARE SUBJECT NAME IS A BAD QUERY when the workspace is largely about that subject: it matches thousands of entries equally and the results come back arbitrary. So when the message asks for a JUDGEMENT, an OPINION, a COMPARISON or ADVICE about something, query that subject's STATE and OUTCOME (progress, results, adoption, recent milestones, setbacks, what happened lately), never the name on its own. "should I give up on Example Project and do something else?" → ["Example Project recent progress", "Example Project launch outcome", "Example Project adoption and traction", "Example Project setbacks"], NOT ["Example Project"]. Queries about the decision itself ("job application", "career change") retrieve nothing useful: the facts that answer such a question are facts about how the subject is going.
-
-Return ONLY a JSON object, no markdown fences, no extra text.
-Example (memory needed): {"needs_memory": true, "needs_file_list": false, "needs_credentials": false, "sub_queries": ["habit tracker progress", "weekly exercise routine"]}
-Example (referencing past content): {"needs_memory": true, "needs_file_list": true, "needs_credentials": false, "sub_queries": ["Example Org", "Example Org company analysis"]}
-Example (asking for a judgement): {"needs_memory": true, "needs_file_list": false, "needs_credentials": false, "sub_queries": ["Example Project recent progress", "Example Project launch outcome", "Example Project adoption and traction"]}
-Example (no memory): {"needs_memory": false, "needs_file_list": false, "needs_credentials": false, "sub_queries": []}"#;
-
-/// Decomposition alone, for the Jev path.
+/// Decomposition into search queries.
 ///
-/// Jev answers the three booleans, so this prompt asks for the one thing it
-/// cannot produce. It repeats the query-writing guidance from
-/// [`QUERY_CLASSIFICATION_PROMPT`] because that prompt stays byte-for-byte as
-/// it was: it is the default path, and rebuilding it out of shared fragments
-/// would risk the very change this split exists to avoid. Edit the two
-/// together.
+/// A judgment provider answers the three booleans, so this prompt asks for the
+/// one thing it cannot produce: new text. It runs only when memory is wanted.
 const SUB_QUERY_PROMPT: &str = r#"Turn this user message into search queries over the user's long-term memory.
 You will receive the current message and optionally a summary of the recent conversation for context.
 Use the conversation context to understand the TOPIC being discussed, not just the latest message in isolation.
@@ -146,7 +123,7 @@ A BARE SUBJECT NAME IS A BAD QUERY when the workspace is largely about that subj
 Return ONLY a JSON array of strings, no markdown fences, no extra text. Return [] when no useful query exists.
 Example: ["habit tracker progress", "weekly exercise routine"]"#;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryClassification {
     pub needs_memory: bool,
     pub needs_file_list: bool,
@@ -165,434 +142,257 @@ impl Default for QueryClassification {
     }
 }
 
-/// Default model the extractor falls back to when no per-call override is passed
-/// (and the `PREF_MODEL_MEMORY` preference is also empty). Override at process
-/// startup with `LUCIDOS_EXTRACTION_MODEL`. Mirrors the
-/// `LUCIDOS_MODEL` / `LUCIDOS_EMBEDDING_MODEL` env-var convention from CLAUDE.md.
-const EXTRACTION_MODEL_DEFAULT: &str = "gemini-3-flash-preview";
-
-fn default_extraction_model() -> String {
-    std::env::var("LUCIDOS_EXTRACTION_MODEL")
-        .unwrap_or_else(|_| EXTRACTION_MODEL_DEFAULT.to_string())
-}
-
-pub struct MemoryExtractor {
-    provider: VertexProvider,
-    project_id: String,
-    location: LocationHandle,
-    token_cache: TokenCache,
-    /// Resolved OpenAI API key (a Settings → Providers `openai` credential or
-    /// the `OPENAI_API_KEY` env var), attached via [`Self::with_openai_key`].
-    /// Lets `provider_for_model` route `gpt-*` background-task models to OpenAI;
-    /// `None` → a `gpt-*` model errors clearly instead of hitting Vertex.
-    openai_api_key: Option<String>,
-}
-
-impl MemoryExtractor {
-    pub fn new(
-        project_id: String,
-        location: String,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let token_cache: TokenCache = std::sync::Arc::new(std::sync::Mutex::new(None));
-        Self::with_location_handle(project_id, location_handle(location), token_cache)
-    }
-
-    pub fn with_location_handle(
-        project_id: String,
-        location: LocationHandle,
-        token_cache: TokenCache,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let provider = VertexProvider::with_location_handle(
-            project_id.clone(),
-            location.clone(),
-            default_extraction_model(),
-            token_cache.clone(),
-        )?;
-        Ok(Self {
+/// Single-shot LLM call against a routed provider.
+///
+/// Every memory chat call funnels through here, and `capture` makes and
+/// records it.
+async fn chat_with_provider(
+    provider: &dyn LlmProvider,
+    system: &str,
+    user_content: &str,
+    reasoning_effort: Option<&str>,
+    capture: &crate::engine::AuxCapture,
+) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: MessageContent::Text(user_content.to_string()),
+    }];
+    capture
+        .chat(
             provider,
-            project_id,
-            location,
-            token_cache,
-            openai_api_key: None,
-        })
-    }
+            messages,
+            vec![],
+            crate::llm::ModelSelection::default().with_effort(reasoning_effort),
+            Some(system),
+            None,
+        )
+        .await
+}
 
-    /// Attach the resolved OpenAI key so background-task models named `gpt-*`
-    /// (title, image description, memory, command judge) route to OpenAI.
-    /// Builder-style so the existing constructor call sites stay unchanged.
-    pub fn with_openai_key(mut self, key: Option<String>) -> Self {
-        self.openai_api_key = key;
-        self
-    }
-
-    /// Build the provider for a background-task model, routed by model id:
-    /// `gpt-*` → OpenAI (requires [`Self::with_openai_key`]); everything else →
-    /// Vertex (Gemini / Vertex-served Claude), preserving the prior behavior.
-    /// Empty / `"default"` returns the shared default-model Vertex provider. The
-    /// reqwest builder can fail — callers propagate via `?`.
-    ///
-    /// Only the `gpt-*`-vs-Vertex split is handled because those are the only
-    /// providers a background-task model can name: the picker offers Gemini
-    /// Flash, Vertex-served Haiku, and GPT-5.4. Direct-Anthropic models (Fable)
-    /// are deliberately never offered as background options.
-    ///
-    /// `attempt_timeout` caps one HTTP attempt, so the purpose's deadline can
-    /// contain the provider's retries rather than cutting one off mid-flight.
-    /// Callers take it from `engine::aux_purpose::budget_for`.
-    pub fn provider_for_model(
-        &self,
-        model: &str,
-        attempt_timeout: Duration,
-    ) -> Result<Arc<dyn LlmProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        if model.starts_with("gpt-") {
-            let key = self.openai_api_key.clone().ok_or_else(|| {
-                format!(
-                    "OpenAI background model '{model}' selected but no OpenAI key is configured (Settings → Models → Providers or OPENAI_API_KEY)"
-                )
-            })?;
-            Ok(Arc::new(
-                OpenAiProvider::new(key, model.to_string())?
-                    .with_request_timeout(attempt_timeout)?,
-            ))
-        } else if crate::engine::aux_purpose::is_extractor_default(model) {
-            Ok(Arc::new(
-                self.provider
-                    .clone()
-                    .with_request_timeout(attempt_timeout)?,
-            ))
-        } else {
-            Ok(Arc::new(
-                VertexProvider::with_location_handle(
-                    self.project_id.clone(),
-                    self.location.clone(),
-                    model.to_string(),
-                    self.token_cache.clone(),
-                )?
-                .with_request_timeout(attempt_timeout)?,
-            ))
+/// Extract atomic facts from raw content.
+/// Optional `context` provides background (system, user, conversation) so
+/// the model can correctly identify implicit entities and assess importance.
+/// `call` carries the resolved *model selection* and the call's budget.
+pub(crate) async fn extract_facts(
+    content: &str,
+    context: Option<&str>,
+    language: Option<&str>,
+    call: &AuxCall,
+    capture: &crate::engine::AuxCapture,
+) -> Result<Vec<ExtractedFact>, Box<dyn std::error::Error + Send + Sync>> {
+    let language_instruction = match language {
+        Some(lang) if !lang.is_empty() => {
+            format!("\n\nIMPORTANT: Write ALL extracted facts in {}.", lang)
         }
+        _ => String::new(),
+    };
+
+    // System prompt: extraction instructions + background context (user profile, language).
+    // User message: only the content to extract from.
+    // This structural separation prevents the LLM from extracting facts from the
+    // background context (e.g., user's employer from their profile).
+    let system = match context {
+        Some(ctx) => format!("{}{}\n\n{}", EXTRACTION_PROMPT, language_instruction, ctx),
+        None => format!("{}{}", EXTRACTION_PROMPT, language_instruction),
+    };
+    let response = chat_with_provider(
+        call.provider().as_ref(),
+        &system,
+        content,
+        call.reasoning(),
+        capture,
+    )
+    .await?;
+
+    let raw = response.content.unwrap_or_default();
+    let cleaned = strip_code_fences(&raw);
+
+    // Parse via Value first — LLMs sometimes emit duplicate keys (e.g. "topic"
+    // twice), which serde's derived Deserialize rejects but Value handles
+    // with last-wins semantics.
+    // TEMPORARY MEASURE — model-tolerance (removable; see
+    // docs/temporary-measures.md § "Duplicate-key tolerant memory-extraction
+    // parse", governed by .claude/rules/temporary-measures.md). Drop the
+    // intermediate Value step and deserialize Vec<ExtractedFact> directly once
+    // extraction responses reliably contain no duplicate keys.
+    let value: serde_json::Value = serde_json::from_str(&cleaned)
+        .map_err(|e| parse_failure("Failed to parse extraction JSON", e, &cleaned))?;
+    let mut facts: Vec<ExtractedFact> = serde_json::from_value(value)
+        .map_err(|e| parse_failure("Failed to deserialize extraction facts", e, &cleaned))?;
+
+    // Drop facts that wouldn't survive RETRIEVAL_MIN_IMPORTANCE — pointless to embed.
+    for fact in &mut facts {
+        fact.importance = fact.importance.clamp(0.0, 1.0);
     }
+    facts.retain(|f| {
+        f.importance >= RETRIEVAL_MIN_IMPORTANCE && !is_fabricated_engine_internal_claim(&f.fact)
+    });
 
-    /// Single-shot LLM call against a routed provider.
-    ///
-    /// Every memory call funnels through here, so this is the one place that
-    /// records them for token accounting. A caller with no thread to anchor
-    /// to passes no capture, and the call goes unrecorded rather than
-    /// inventing a thread: artifact indexing is the case that has none.
-    ///
-    /// Associated rather than a method: it reads no `self` state, and that is
-    /// what lets a detached task make one of these calls holding only the
-    /// provider.
-    async fn chat_with_provider(
-        provider: &dyn LlmProvider,
-        system: &str,
-        user_content: &str,
-        reasoning_effort: Option<&str>,
-        capture: Option<&crate::engine::AuxCapture>,
-    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text(user_content.to_string()),
-        }];
-        let response = provider
-            .chat(
-                messages,
-                vec![],
-                crate::llm::ModelSelection::default().with_effort(reasoning_effort),
-                Some(system),
-                None,
-            )
-            .await?;
-        if let Some(capture) = capture {
-            let request_chars = system.chars().count() + user_content.chars().count();
-            capture
-                .record(provider.default_model(), request_chars, &response)
-                .await;
-        }
-        Ok(response)
+    Ok(facts)
+}
+
+/// Classify a user query, and decompose it into search sub-queries when
+/// memory is wanted and the caller reads queries. The Tree memory module
+/// retrieves no recall, so it passes `wants_queries: false` and pays one call.
+///
+/// Optional `conversation_context` provides recent conversation summary so
+/// the classifier can understand the topic (e.g. a follow-up "try again" in
+/// an API conversation still needs credentials). `call` carries the
+/// resolved *model selection* and the call's budget.
+///
+/// The three booleans are typed questions to the site's judgment provider:
+/// the chat model `call` names, unless `judgment_query_classification`
+/// picks a System One row (ADR 0363). A missing answer reads as yes.
+///
+/// **A message that needs memory costs two sequential calls, inside the
+/// ONE deadline the caller wraps this in.** Each attempt is bounded, but two
+/// can exceed that deadline where one would not. The caller then reads
+/// `QueryClassification::default()`, which loads everything, so the
+/// overrun costs latency rather than context.
+pub(crate) async fn classify_query(
+    pool: &PgPool,
+    query: &str,
+    conversation_context: Option<&str>,
+    call: &AuxCall,
+    wants_queries: bool,
+    capture: &crate::engine::AuxCapture,
+) -> Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>> {
+    let system_one = system_one_for(
+        pool,
+        JudgmentSite::QueryClassification,
+        call.attempt_timeout(),
+    )
+    .await;
+    let chat = ChatJudgmentProvider::new(call.provider(), call.reasoning().map(str::to_string));
+    let judge = for_site(system_one, chat);
+    let mut classification =
+        judge_query(judge.as_ref(), query, conversation_context, capture).await?;
+    if classification.needs_memory && wants_queries {
+        classification.sub_queries =
+            decompose_query(query, conversation_context, call, capture).await;
     }
+    Ok(classification)
+}
 
-    /// Extract atomic facts from raw content.
-    /// Optional `context` provides background (system, user, conversation) so
-    /// the model can correctly identify implicit entities and assess importance.
-    /// `call` carries the resolved *model selection* and the call's budget.
-    pub(crate) async fn extract_facts(
-        &self,
-        content: &str,
-        context: Option<&str>,
-        language: Option<&str>,
-        call: &AuxCall,
-        capture: Option<&crate::engine::AuxCapture>,
-    ) -> Result<Vec<ExtractedFact>, Box<dyn std::error::Error + Send + Sync>> {
-        let language_instruction = match language {
-            Some(lang) if !lang.is_empty() => {
-                format!("\n\nIMPORTANT: Write ALL extracted facts in {}.", lang)
-            }
-            _ => String::new(),
-        };
-
-        // System prompt: extraction instructions + background context (user profile, language).
-        // User message: only the content to extract from.
-        // This structural separation prevents the LLM from extracting facts from the
-        // background context (e.g., user's employer from their profile).
-        let system = match context {
-            Some(ctx) => format!("{}{}\n\n{}", EXTRACTION_PROMPT, language_instruction, ctx),
-            None => format!("{}{}", EXTRACTION_PROMPT, language_instruction),
-        };
-        let provider = self.provider_for_model(call.model(), call.attempt_timeout())?;
-        let response = Self::chat_with_provider(
-            provider.as_ref(),
-            &system,
-            content,
-            call.reasoning(),
-            capture,
+/// The three booleans from one judgment, with `sub_queries` left empty.
+async fn judge_query(
+    judge: &dyn JudgmentProvider,
+    query: &str,
+    conversation_context: Option<&str>,
+    capture: &crate::engine::AuxCapture,
+) -> Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>> {
+    let judgment = capture
+        .judge(
+            judge,
+            query_judgment::state(query, conversation_context),
+            query_judgment::questions(),
         )
         .await?;
+    Ok(query_judgment::read(&judgment.answers))
+}
 
-        let raw = response.content.unwrap_or_default();
-        let cleaned = strip_code_fences(&raw);
-
-        // Parse via Value first — LLMs sometimes emit duplicate keys (e.g. "topic"
-        // twice), which serde's derived Deserialize rejects but Value handles
-        // with last-wins semantics.
-        // TEMPORARY MEASURE — model-tolerance (removable; see
-        // docs/temporary-measures.md § "Duplicate-key tolerant memory-extraction
-        // parse", governed by .claude/rules/temporary-measures.md). Drop the
-        // intermediate Value step and deserialize Vec<ExtractedFact> directly once
-        // extraction responses reliably contain no duplicate keys.
-        let value: serde_json::Value = serde_json::from_str(&cleaned)
-            .map_err(|e| parse_failure("Failed to parse extraction JSON", e, &cleaned))?;
-        let mut facts: Vec<ExtractedFact> = serde_json::from_value(value)
-            .map_err(|e| parse_failure("Failed to deserialize extraction facts", e, &cleaned))?;
-
-        // Drop facts that wouldn't survive RETRIEVAL_MIN_IMPORTANCE — pointless to embed.
-        for fact in &mut facts {
-            fact.importance = fact.importance.clamp(0.0, 1.0);
-        }
-        facts.retain(|f| {
-            f.importance >= RETRIEVAL_MIN_IMPORTANCE
-                && !is_fabricated_engine_internal_claim(&f.fact)
-        });
-
-        Ok(facts)
-    }
-
-    /// Classify a user query and optionally decompose into search sub-queries.
-    /// Optional `conversation_context` provides recent conversation summary so the
-    /// classifier can understand the topic (e.g. a follow-up "try again" in an API
-    /// conversation still needs credentials).
-    /// `call` carries the resolved *model selection* and the call's budget.
-    ///
-    /// `judgment_query_classification` picks the path. It is `chat` unless the
-    /// user set it, so the default is the one prompt below and nothing else.
-    /// A Jev call that fails falls through to that same prompt, because a
-    /// working path is a better answer than the all-true default.
-    pub(crate) async fn classify_query(
-        &self,
-        pool: &PgPool,
-        query: &str,
-        conversation_context: Option<&str>,
-        call: &AuxCall,
-        capture: Option<&crate::engine::AuxCapture>,
-    ) -> Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(jev) = jev_for(
-            pool,
-            JudgmentSite::QueryClassification,
-            call.attempt_timeout(),
-        )
-        .await
-        {
-            match self
-                .classify_on_jev(&jev, query, conversation_context, call, capture)
-                .await
-            {
-                Ok(classification) => return Ok(classification),
-                Err(e) => log!(
-                    "[Memory] Jev query classification failed: {}. Using the chat path",
-                    e
-                ),
-            }
-        }
-        self.classify_on_chat(query, conversation_context, call, capture)
-            .await
-    }
-
-    /// The three booleans from Jev, then decomposition on the chat model when
-    /// memory is wanted.
-    ///
-    /// A message needing no memory costs one judgment and no chat call at all,
-    /// which is most greetings and most bare tool commands.
-    ///
-    /// **A message that does need memory costs two sequential calls, inside
-    /// the ONE deadline the caller wraps this in.** Each attempt is bounded,
-    /// but two of them can exceed that deadline where one would not. The
-    /// caller then reads `QueryClassification::default()`, which loads
-    /// everything, so the overrun costs latency rather than context.
-    async fn classify_on_jev(
-        &self,
-        jev: &dyn JudgmentProvider,
-        query: &str,
-        conversation_context: Option<&str>,
-        call: &AuxCall,
-        capture: Option<&crate::engine::AuxCapture>,
-    ) -> Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>> {
-        let state = query_judgment::state(query, conversation_context);
-        let judgment = jev.ask(state, query_judgment::questions()).await?;
-        if let Some(capture) = capture {
-            capture.record_judgment(&judgment).await;
-        }
-
-        let mut classification = query_judgment::read(&judgment.answers);
-        if classification.needs_memory {
-            classification.sub_queries = self
-                .decompose_query(query, conversation_context, call, capture)
-                .await;
-        }
-        Ok(classification)
-    }
-
-    /// Search queries for one message, or none when the model could not give
-    /// any.
-    ///
-    /// Total on purpose. An empty list makes the retriever search the raw
-    /// message, which is what a workspace without decomposition already does.
-    /// Losing the turn over it would be the worse trade.
-    async fn decompose_query(
-        &self,
-        query: &str,
-        conversation_context: Option<&str>,
-        call: &AuxCall,
-        capture: Option<&crate::engine::AuxCapture>,
-    ) -> Vec<String> {
-        let system = match conversation_context {
-            Some(ctx) if !ctx.is_empty() => {
-                format!(
-                    "{}\n\nConversation context (recent messages): {}",
-                    SUB_QUERY_PROMPT, ctx
-                )
-            }
-            _ => SUB_QUERY_PROMPT.to_string(),
-        };
-        let provider = match self.provider_for_model(call.model(), call.attempt_timeout()) {
-            Ok(p) => p,
-            Err(e) => {
-                log!("[Memory] Sub-query decomposition has no provider: {}", e);
-                return vec![];
-            }
-        };
-        let response = match Self::chat_with_provider(
-            provider.as_ref(),
-            &system,
-            query,
-            call.reasoning(),
-            capture,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                log!("[Memory] Sub-query decomposition failed: {}", e);
-                return vec![];
-            }
-        };
-        let cleaned = strip_code_fences(&response.content.unwrap_or_default());
-        serde_json::from_str::<Vec<String>>(&cleaned).unwrap_or_else(|e| {
-            log!(
-                "[Memory] Could not read the sub-queries ({}): {}",
-                e,
-                cleaned
-            );
-            vec![]
-        })
-    }
-
-    /// The prompt-and-parse path, unchanged and still the default.
-    async fn classify_on_chat(
-        &self,
-        query: &str,
-        conversation_context: Option<&str>,
-        call: &AuxCall,
-        capture: Option<&crate::engine::AuxCapture>,
-    ) -> Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>> {
-        let system = match conversation_context {
-            Some(ctx) if !ctx.is_empty() => format!(
+/// Search queries for one message, or none when the model could not give
+/// any.
+///
+/// Total on purpose. An empty list makes the retriever search the raw
+/// message, which is what a workspace without decomposition already does.
+/// Losing the turn over it would be the worse trade.
+async fn decompose_query(
+    query: &str,
+    conversation_context: Option<&str>,
+    call: &AuxCall,
+    capture: &crate::engine::AuxCapture,
+) -> Vec<String> {
+    let system = match conversation_context {
+        Some(ctx) if !ctx.is_empty() => {
+            format!(
                 "{}\n\nConversation context (recent messages): {}",
-                QUERY_CLASSIFICATION_PROMPT, ctx
-            ),
-            _ => QUERY_CLASSIFICATION_PROMPT.to_string(),
-        };
-        let provider = self.provider_for_model(call.model(), call.attempt_timeout())?;
-        let response =
-            Self::chat_with_provider(provider.as_ref(), &system, query, call.reasoning(), capture)
-                .await?;
-
-        let raw = response.content.unwrap_or_default();
-        let cleaned = strip_code_fences(&raw);
-
-        let classification: QueryClassification = serde_json::from_str(&cleaned)
-            .map_err(|e| parse_failure("Failed to parse query classification", e, &cleaned))?;
-
-        Ok(classification)
-    }
-
-    /// Summarize a thread's older ASSISTANT turns into one paragraph.
-    ///
-    /// `turns` carries assistant turns only (ADR 0102). User turns stay
-    /// verbatim in the history block, so nothing the person said passes
-    /// through a model's judgment on its way to the prompt.
-    ///
-    /// The caller caches the result as a `ConversationSummarized` event, so
-    /// this runs on a refresh rather than once per turn.
-    ///
-    /// It takes a built `provider` rather than an `AuxCall`, because the caller
-    /// runs it in a detached task that outlives the turn. Resolving the model
-    /// selection needs the extractor; making the call does not.
-    pub(crate) async fn summarize_conversation(
-        provider: &dyn LlmProvider,
-        turns: &str,
-        reasoning_effort: Option<&str>,
-        capture: Option<&crate::engine::AuxCapture>,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let system = "Summarize these ASSISTANT turns for continuity with the ongoing conversation. \
-            Focus on: (1) what is being worked on, (2) issues that were RESOLVED — explicitly mark them as fixed/done \
-            so they are not revisited, (3) the current state of work at the end of this segment, \
-            (4) dead ends and approaches that failed, so they are not retried. \
-            CRITICAL: if a problem was reported and then fixed, say it \"was fixed\" — do NOT just describe the problem \
-            without its resolution, as that causes the assistant to re-attempt already-completed fixes. \
-            The user's own messages are NOT in this input and are supplied to the model verbatim elsewhere, \
-            so do not try to reconstruct what they asked for. \
-            Write concise flowing prose, no bullet points.";
-        let response =
-            Self::chat_with_provider(provider, system, turns, reasoning_effort, capture).await?;
-        let summary = response.content.unwrap_or_default().trim().to_string();
-        Ok(summary)
-    }
-
-    /// Create a single fallback fact when structured extraction fails, or
-    /// `None` when the raw content isn't worth storing. The fallback bypasses
-    /// `extract_facts`' validation, so it must re-apply the same guard the
-    /// extractor uses: skip empty content and fabricated engine-internal
-    /// claims, which would otherwise smuggle past the filter that exists to
-    /// keep them out of memory. Truncates to 500 chars, importance 0.5.
-    pub fn fallback_fact(content: &str, topic: &str) -> Option<ExtractedFact> {
-        let trimmed = content.trim();
-        if trimmed.is_empty() || is_fabricated_engine_internal_claim(trimmed) {
-            return None;
+                SUB_QUERY_PROMPT, ctx
+            )
         }
-        let chars: String = content.chars().take(500).collect();
-        let truncated = if chars.len() < content.len() {
-            format!("{}...", chars)
-        } else {
-            chars
-        };
+        _ => SUB_QUERY_PROMPT.to_string(),
+    };
+    let response = match chat_with_provider(
+        call.provider().as_ref(),
+        &system,
+        query,
+        call.reasoning(),
+        capture,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log!("[Memory] Sub-query decomposition failed: {}", e);
+            return vec![];
+        }
+    };
+    let cleaned = strip_code_fences(&response.content.unwrap_or_default());
+    serde_json::from_str::<Vec<String>>(&cleaned).unwrap_or_else(|e| {
+        log!(
+            "[Memory] Could not read the sub-queries ({}): {}",
+            e,
+            cleaned
+        );
+        vec![]
+    })
+}
 
-        Some(ExtractedFact {
-            fact: truncated,
-            importance: 0.5,
-            topic: topic.to_string(),
-            entities: vec![],
-        })
+/// Summarize a thread's older ASSISTANT turns into one paragraph.
+///
+/// `turns` carries assistant turns only (ADR 0102). User turns stay
+/// verbatim in the history block, so nothing the person said passes
+/// through a model's judgment on its way to the prompt.
+///
+/// The caller caches the result as a `ConversationSummarized` event, so
+/// this runs on a refresh rather than once per turn.
+///
+/// It takes a built `provider` rather than an `AuxCall`, because the caller
+/// runs it in a detached task that outlives the turn.
+pub(crate) async fn summarize_conversation(
+    provider: &dyn LlmProvider,
+    turns: &str,
+    reasoning_effort: Option<&str>,
+    capture: &crate::engine::AuxCapture,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let system = "Summarize these ASSISTANT turns for continuity with the ongoing conversation. \
+        Focus on: (1) what is being worked on, (2) issues that were RESOLVED — explicitly mark them as fixed/done \
+        so they are not revisited, (3) the current state of work at the end of this segment, \
+        (4) dead ends and approaches that failed, so they are not retried. \
+        CRITICAL: if a problem was reported and then fixed, say it \"was fixed\" — do NOT just describe the problem \
+        without its resolution, as that causes the assistant to re-attempt already-completed fixes. \
+        The user's own messages are NOT in this input and are supplied to the model verbatim elsewhere, \
+        so do not try to reconstruct what they asked for. \
+        Write concise flowing prose, no bullet points.";
+    let response = chat_with_provider(provider, system, turns, reasoning_effort, capture).await?;
+    let summary = response.content.unwrap_or_default().trim().to_string();
+    Ok(summary)
+}
+
+/// Create a single fallback fact when structured extraction fails, or
+/// `None` when the raw content isn't worth storing. The fallback bypasses
+/// `extract_facts`' validation, so it must re-apply the same guard the
+/// extractor uses: skip empty content and fabricated engine-internal
+/// claims, which would otherwise smuggle past the filter that exists to
+/// keep them out of memory. Truncates to 500 chars, importance 0.5.
+pub fn fallback_fact(content: &str, topic: &str) -> Option<ExtractedFact> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() || is_fabricated_engine_internal_claim(trimmed) {
+        return None;
     }
+    let chars: String = content.chars().take(500).collect();
+    let truncated = if chars.len() < content.len() {
+        format!("{}...", chars)
+    } else {
+        chars
+    };
+
+    Some(ExtractedFact {
+        fact: truncated,
+        importance: 0.5,
+        topic: topic.to_string(),
+        entities: vec![],
+    })
 }
 
 /// True for facts asserting engine internals the chat agent cannot observe
@@ -677,7 +477,9 @@ fn strip_code_fences(text: &str) -> String {
 mod capture_tests {
     use super::*;
     use crate::engine::event_bus::EventBus;
-    use crate::test_support::{aux_captures, setup_test_db, teardown_test_db, ScriptedProvider};
+    use crate::test_support::{
+        aux_captures, setup_test_db, teardown_test_db, JudgmentChatStub, ScriptedProvider,
+    };
     use uuid::Uuid;
 
     /// `chat_with_provider` is the choke point every memory call funnels
@@ -693,15 +495,9 @@ mod capture_tests {
 
         let provider =
             ScriptedProvider::new("gemini-3-flash-preview", vec!["[]"]).reporting(1_500, 20);
-        MemoryExtractor::chat_with_provider(
-            &provider,
-            "system",
-            "content",
-            Some("none"),
-            Some(&capture),
-        )
-        .await
-        .expect("scripted call succeeds");
+        chat_with_provider(&provider, "system", "content", Some("none"), &capture)
+            .await
+            .expect("scripted call succeeds");
 
         let captures = aux_captures(&pool, thread_id, "memory").await;
         assert_eq!(captures.len(), 1);
@@ -719,19 +515,130 @@ mod capture_tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// Artifact indexing and a thread-less event both reach here with no
-    /// capture. The call must still run; only the bookkeeping is skipped.
+    /// Query classification on the default backend: typed questions to the
+    /// chat model, its cost recorded under the site's own purpose.
     #[tokio::test]
-    async fn a_memory_call_with_no_thread_records_nothing() {
+    async fn query_classification_asks_the_chat_model_typed_questions() {
         let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
+        let capture = crate::engine::AuxCapture::new(
+            &bus,
+            thread_id,
+            crate::engine::ContextPurpose::QueryClassification,
+        );
+        let stub = std::sync::Arc::new(JudgmentChatStub::answering(serde_json::json!({
+            "needs_memory": 0.9,
+            "needs_file_list": 0.1,
+            "needs_credentials": 0.0,
+        })));
+        let chat = ChatJudgmentProvider::new(stub.clone(), Some("none".to_string()));
+
+        let c = judge_query(
+            &chat,
+            "what did we decide last time?",
+            Some("a talk about the habit tracker"),
+            &capture,
+        )
+        .await
+        .expect("answered");
+        assert!(c.needs_memory);
+        assert!(!c.needs_file_list);
+        assert!(!c.needs_credentials);
+        assert!(
+            stub.messages()[0].contains("habit tracker"),
+            "the context rides along"
+        );
+
+        let captures = aux_captures(&pool, thread_id, "query_classification").await;
+        assert_eq!(captures.len(), 1, "one call, one row: {captures:?}");
+        assert_eq!(captures[0]["usage"]["input_tokens"], 210);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The model calls one classification makes when memory is wanted.
+    async fn classification_calls(wants_queries: bool) -> usize {
+        let (pool, db_name) = setup_test_db().await;
+        let stub = std::sync::Arc::new(JudgmentChatStub::answering(serde_json::json!({
+            "needs_memory": 0.9,
+            "needs_file_list": 0.1,
+            "needs_credentials": 0.0,
+        })));
+        let call = AuxCall::over(
+            stub.clone(),
+            crate::engine::ContextPurpose::QueryClassification,
+        );
+        let c = classify_query(
+            &pool,
+            "what did we decide?",
+            None,
+            &call,
+            wants_queries,
+            &crate::engine::AuxCapture::discarding(
+                crate::engine::ContextPurpose::QueryClassification,
+            ),
+        )
+        .await
+        .expect("answered");
+        assert!(c.needs_memory);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+        stub.messages().len()
+    }
+
+    /// The classic module searches with the queries, so it asks for them.
+    #[tokio::test]
+    async fn classic_classification_also_writes_search_queries() {
+        assert_eq!(classification_calls(true).await, 2);
+    }
+
+    /// Tree retrieves no recall, so the second call would write queries
+    /// nothing reads.
+    #[tokio::test]
+    async fn tree_classification_makes_one_call() {
+        assert_eq!(classification_calls(false).await, 1);
+    }
+
+    /// An unreadable reply loads everything, never starves the turn.
+    #[tokio::test]
+    async fn an_unreadable_classification_loads_everything() {
+        let chat = ChatJudgmentProvider::new(
+            std::sync::Arc::new(JudgmentChatStub::replying("not sure")),
+            None,
+        );
+        let capture = crate::engine::AuxCapture::discarding(
+            crate::engine::ContextPurpose::QueryClassification,
+        );
+        let c = judge_query(&chat, "hi", None, &capture)
+            .await
+            .expect("a reply is not an error");
+        assert_eq!(c, QueryClassification::default());
+    }
+
+    /// Artifact indexing and a thread-less event reach here with no thread.
+    /// The call still runs, and records on the home thread.
+    #[tokio::test]
+    async fn a_memory_call_with_no_thread_records_on_the_home_thread() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        let capture = crate::engine::AuxCapture::for_thread_or_home(
+            &bus,
+            None,
+            crate::engine::ContextPurpose::Memory,
+        );
 
         let provider = ScriptedProvider::new("gemini-3-flash-preview", vec!["[]"]);
-        MemoryExtractor::chat_with_provider(&provider, "system", "content", Some("none"), None)
+        chat_with_provider(&provider, "system", "content", Some("none"), &capture)
             .await
             .expect("scripted call succeeds");
 
-        assert!(aux_captures(&pool, thread_id, "memory").await.is_empty());
+        let home: Uuid = sqlx::query_scalar("SELECT thread_id FROM thread_summaries WHERE is_home")
+            .fetch_one(&pool)
+            .await
+            .expect("a home thread to record on");
+        assert_eq!(aux_captures(&pool, home, "memory").await.len(), 1);
 
         pool.close().await;
         teardown_test_db(&db_name).await;
@@ -741,57 +648,6 @@ mod capture_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Any finite attempt cap does for these: they check which provider comes
-    /// back, not how long it waits. The real ones come from
-    /// `engine::aux_purpose::budget_for`.
-    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
-
-    /// A `gpt-*` background-task model routes to OpenAI (with the key attached)
-    /// — the model is baked into the returned provider.
-    #[test]
-    fn provider_for_model_routes_gpt_to_openai() {
-        let ext = MemoryExtractor::new("proj".into(), "europe-west1".into())
-            .expect("extractor builds")
-            .with_openai_key(Some("sk-test".into()));
-        let provider = ext
-            .provider_for_model("gpt-5.4", TEST_TIMEOUT)
-            .expect("openai provider builds");
-        assert_eq!(provider.default_model(), "gpt-5.4");
-    }
-
-    /// A `gpt-*` model without an OpenAI key errors clearly rather than silently
-    /// falling through to Vertex (which can't serve it).
-    #[test]
-    fn provider_for_model_gpt_without_key_errors() {
-        let ext =
-            MemoryExtractor::new("proj".into(), "europe-west1".into()).expect("extractor builds");
-        assert!(ext.provider_for_model("gpt-5.4", TEST_TIMEOUT).is_err());
-    }
-
-    /// Non-`gpt-*` models stay on Vertex even when an OpenAI key is present.
-    #[test]
-    fn provider_for_model_routes_non_gpt_to_vertex() {
-        let ext = MemoryExtractor::new("proj".into(), "europe-west1".into())
-            .expect("extractor builds")
-            .with_openai_key(Some("sk-test".into()));
-        let provider = ext
-            .provider_for_model("gemini-3-flash-preview", TEST_TIMEOUT)
-            .expect("vertex provider builds");
-        assert_eq!(provider.default_model(), "gemini-3-flash-preview");
-    }
-
-    /// Empty / "default" returns the shared extractor base provider (the default
-    /// extraction model on Vertex), unchanged from the pre-routing behavior.
-    #[test]
-    fn provider_for_model_default_uses_base_model() {
-        let ext =
-            MemoryExtractor::new("proj".into(), "europe-west1".into()).expect("extractor builds");
-        let provider = ext
-            .provider_for_model("", TEST_TIMEOUT)
-            .expect("base provider");
-        assert_eq!(provider.default_model(), default_extraction_model());
-    }
 
     #[test]
     fn test_strip_code_fences_json() {
@@ -813,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_fallback_fact_short() {
-        let fact = MemoryExtractor::fallback_fact("Short content", "General").unwrap();
+        let fact = fallback_fact("Short content", "General").unwrap();
         assert_eq!(fact.fact, "Short content");
         assert_eq!(fact.importance, 0.5);
         assert_eq!(fact.topic, "General");
@@ -823,7 +679,7 @@ mod tests {
     #[test]
     fn test_fallback_fact_truncation() {
         let long_content = "a".repeat(600);
-        let fact = MemoryExtractor::fallback_fact(&long_content, "Test").unwrap();
+        let fact = fallback_fact(&long_content, "Test").unwrap();
         assert_eq!(fact.fact.len(), 503); // 500 chars + "..."
         assert!(fact.fact.ends_with("..."));
     }
@@ -833,8 +689,8 @@ mod tests {
     /// not be stored as a "fact".
     #[test]
     fn fallback_fact_rejects_empty_content() {
-        assert!(MemoryExtractor::fallback_fact("", "General").is_none());
-        assert!(MemoryExtractor::fallback_fact("   \n  ", "General").is_none());
+        assert!(fallback_fact("", "General").is_none());
+        assert!(fallback_fact("   \n  ", "General").is_none());
     }
 
     /// The fallback must apply the same `is_fabricated_engine_internal_claim`
@@ -844,7 +700,7 @@ mod tests {
     fn fallback_fact_rejects_fabricated_engine_internal_claim() {
         let claim = "The agentic loop hit its max_iterations cap after 25 tool calls";
         assert!(is_fabricated_engine_internal_claim(claim));
-        assert!(MemoryExtractor::fallback_fact(claim, "General").is_none());
+        assert!(fallback_fact(claim, "General").is_none());
     }
 
     #[test]
@@ -866,24 +722,6 @@ mod tests {
         assert!(facts[0].entities.is_empty());
     }
 
-    #[test]
-    fn test_query_classification_with_memory() {
-        let json = r#"{"needs_memory": true, "needs_file_list": false, "needs_credentials": false, "sub_queries": ["habit tracker", "exercise plan"]}"#;
-        let c: QueryClassification = serde_json::from_str(json).unwrap();
-        assert!(c.needs_memory);
-        assert!(!c.needs_file_list);
-        assert!(!c.needs_credentials);
-        assert_eq!(c.sub_queries, vec!["habit tracker", "exercise plan"]);
-    }
-
-    #[test]
-    fn test_query_classification_no_memory() {
-        let json = r#"{"needs_memory": false, "needs_file_list": false, "needs_credentials": false, "sub_queries": []}"#;
-        let c: QueryClassification = serde_json::from_str(json).unwrap();
-        assert!(!c.needs_memory);
-        assert!(c.sub_queries.is_empty());
-    }
-
     /// The evaluative-question failure, at the layer where it happens.
     ///
     /// A question of the shape "should I give up on Example Project and do
@@ -903,15 +741,15 @@ mod tests {
     #[test]
     fn the_prompt_forbids_a_bare_subject_name_for_an_evaluative_question() {
         assert!(
-            QUERY_CLASSIFICATION_PROMPT.contains("A BARE SUBJECT NAME IS A BAD QUERY"),
+            SUB_QUERY_PROMPT.contains("A BARE SUBJECT NAME IS A BAD QUERY"),
             "the non-discriminating-query rule must be stated"
         );
         assert!(
-            QUERY_CLASSIFICATION_PROMPT.contains("STATE and OUTCOME"),
+            SUB_QUERY_PROMPT.contains("STATE and OUTCOME"),
             "it must say what to query instead of the name"
         );
         assert!(
-            QUERY_CLASSIFICATION_PROMPT.contains("JUDGEMENT"),
+            SUB_QUERY_PROMPT.contains("JUDGEMENT"),
             "it must name the case that triggers the rule"
         );
     }
@@ -921,16 +759,18 @@ mod tests {
     /// query about the decision rather than the subject.
     #[test]
     fn the_evaluative_example_shows_state_queries_and_not_the_bare_name() {
-        let example = QUERY_CLASSIFICATION_PROMPT
-            .lines()
-            .find(|l| l.starts_with("Example (asking for a judgement)"))
-            .expect("the evaluative example must exist");
+        let after = SUB_QUERY_PROMPT
+            .split_once("do something else?\" → ")
+            .expect("the evaluative example must exist")
+            .1;
+        let list = &after[..=after.find(']').expect("the example closes its list")];
+        let sub_queries: Vec<String> = serde_json::from_str(list)
+            .expect("the example must be valid JSON, or it teaches a broken shape");
+        let c = QueryClassification {
+            sub_queries,
+            ..QueryClassification::default()
+        };
 
-        let c: QueryClassification =
-            serde_json::from_str(example.split_once(": ").expect("example has a JSON body").1)
-                .expect("the example must be valid JSON, or it teaches a broken shape");
-
-        assert!(c.needs_memory);
         assert!(
             c.sub_queries.len() >= 2,
             "one query cannot show a decomposition"
@@ -1040,26 +880,29 @@ mod tests {
         let project_id = match std::env::var("VERTEX_PROJECT_ID") {
             Ok(id) => id,
             Err(_) => {
-                crate::log!("[MemoryExtractor] Skipping: VERTEX_PROJECT_ID not set");
+                crate::log!("[Memory] Skipping: VERTEX_PROJECT_ID not set");
                 return;
             }
         };
         let location =
             std::env::var("VERTEX_REGION").unwrap_or_else(|_| "europe-west1".to_string());
 
-        let extractor = MemoryExtractor::new(project_id, location).expect("extractor builds");
+        let vertex = crate::llm::VertexProvider::new(
+            project_id,
+            location,
+            crate::core::prefs::MODEL_MEMORY.default_text().to_string(),
+        )
+        .expect("vertex provider builds");
+        let call = AuxCall::over(
+            std::sync::Arc::new(vertex),
+            crate::engine::ContextPurpose::Memory,
+        );
 
         let context = "Background:\n- The user is Jane Smith, born 01.01.1990, works at FakeCorp as a data scientist";
         let content = "Temperature control loop completed. Adjusted 3 heat pumps down by 1°C each. Outside temp 2°C.";
 
-        let facts = extractor
-            .extract_facts(
-                content,
-                Some(context),
-                None,
-                &AuxCall::defaults(crate::engine::ContextPurpose::Memory),
-                None,
-            )
+        let capture = crate::engine::AuxCapture::discarding(crate::engine::ContextPurpose::Memory);
+        let facts = extract_facts(content, Some(context), None, &call, &capture)
             .await
             .expect("extraction should succeed");
 

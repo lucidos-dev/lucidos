@@ -41,6 +41,9 @@ fn plugin(marketplace_id: &str, id: &str) -> MarketplacePlugin {
         app_id: None,
         modified: false,
         modified_paths: vec![],
+        engine_requirement: None,
+        engine_compatible: true,
+        engine_incompatible_reason: None,
     }
 }
 

@@ -34,10 +34,7 @@
 
 use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, RetryHint, ScopeBinding};
 use crate::api::proxy_static_layers::StaticHeaderLayer;
-use crate::core::{
-    preferences::local_base_url_rejection, AuthType, CredentialStore, PreferenceStore,
-    DEFAULT_LOCAL_BASE_URL, PREF_LOCAL_BASE_URL,
-};
+use crate::core::{preferences::local_base_url_rejection, prefs, AuthType, CredentialStore};
 use crate::llm::judgment::{
     TYPESAFE_API_BASE_URL, TYPESAFE_API_KEY_ENV, TYPESAFE_CREDENTIAL_SERVICE,
 };
@@ -94,7 +91,7 @@ pub(crate) const BUILTIN_PROXIES: [BuiltinProxy; 7] = [
     BuiltinProxy {
         name: "local",
         aliases: &[],
-        default_base_url: Some(DEFAULT_LOCAL_BASE_URL),
+        default_base_url: Some(prefs::LOCAL_BASE_URL.default_text()),
         resolver: Resolver::Local,
     },
     BuiltinProxy {
@@ -493,7 +490,7 @@ fn anthropic_target(auth: Option<AnthropicAuth>) -> Result<BuiltinTarget, (Statu
 /// Where the `local` key came from, and therefore what binds it.
 ///
 /// `local` is the one builtin whose upstream a preference names, and
-/// `local_base_url` moves without the key being re-saved. So the key's own
+/// `prefs::LOCAL_BASE_URL` moves without the key being re-saved. So the key's own
 /// source has to name the host, never the preference (ADR 0144 decision 4).
 enum LocalKeySource {
     /// A stored `local` credential. Its `base_url` is the scope, and Settings
@@ -512,7 +509,8 @@ enum LocalKeySource {
 /// off the user's own network, which the provider refuses. The boot pass reads
 /// this to give an unscoped `local` credential the scope it needs (ADR 0144).
 pub async fn local_upstream_base_url(pool: &sqlx::PgPool) -> Option<String> {
-    let base_pref = PreferenceStore::get(pool, PREF_LOCAL_BASE_URL)
+    let base_pref = prefs::LOCAL_BASE_URL
+        .try_stored(pool)
         .await
         .ok()?
         .filter(|s| !s.trim().is_empty());
@@ -527,7 +525,7 @@ pub async fn local_upstream_base_url(pool: &sqlx::PgPool) -> Option<String> {
                     .ok()
                     .filter(|s| !s.trim().is_empty())
             })
-            .unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_string()),
+            .unwrap_or_else(|| prefs::LOCAL_BASE_URL.default_text().to_string()),
     )
 }
 
@@ -540,12 +538,15 @@ async fn resolve_local(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode
     // Opt-in, mirroring `build_local_provider`: only resolve when a base URL
     // (pref or env) or key is configured — otherwise a default localhost
     // backend isn't conjured for a workspace that never asked for one.
-    let base_pref = match PreferenceStore::get(pool, PREF_LOCAL_BASE_URL).await {
+    let base_pref = match prefs::LOCAL_BASE_URL.try_stored(pool).await {
         Ok(opt) => opt.filter(|s| !s.trim().is_empty()),
         Err(e) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to read local_base_url preference: {e}"),
+                format!(
+                    "failed to read {} preference: {e}",
+                    prefs::LOCAL_BASE_URL.key()
+                ),
             ));
         }
     };
@@ -571,7 +572,7 @@ async fn resolve_local(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode
                 // below: an env key follows the env base URL, or the default.
                 let host = base_env
                     .clone()
-                    .unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_string());
+                    .unwrap_or_else(|| prefs::LOCAL_BASE_URL.default_text().to_string());
                 (v, LocalKeySource::Environment(host))
             }),
     };
@@ -580,13 +581,16 @@ async fn resolve_local(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode
         return Err(unconfigured_msg(
             "local",
             "a local OpenAI-compatible backend",
-            "set local_base_url in Settings → Models → Providers or LUCIDOS_LOCAL_BASE_URL",
+            &format!(
+                "set {} in Settings → Models → Providers or LUCIDOS_LOCAL_BASE_URL",
+                prefs::LOCAL_BASE_URL.key()
+            ),
         ));
     }
 
     let base = base_pref
         .or(base_env)
-        .unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_string());
+        .unwrap_or_else(|| prefs::LOCAL_BASE_URL.default_text().to_string());
     // A keyless local server (Ollama / llama.cpp) gets no auth layer.
     let layers: Vec<Arc<dyn AuthLayer>> = match key {
         Some((k, source)) => {
@@ -1229,18 +1233,18 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// A `local_base_url` preference makes the `local` builtin resolve to that
+    /// A `prefs::LOCAL_BASE_URL` preference makes the `local` builtin resolve to that
     /// base; with no key it injects no auth header (keyless local server).
     #[tokio::test]
     async fn resolve_local_uses_pref_base_and_is_keyless() {
         let (pool, db) = setup_test_db().await;
         crate::test_support::seed_preference(
             &pool,
-            PREF_LOCAL_BASE_URL,
+            prefs::LOCAL_BASE_URL.key(),
             "http://localhost:1234/v1",
         )
         .await
-        .expect("seed local_base_url pref");
+        .expect("seed the local base URL pref");
 
         let target = resolve_local(&pool).await.expect("local resolves");
         assert_eq!(target.0, "http://localhost:1234/v1");
@@ -1264,11 +1268,11 @@ mod tests {
         let (pool, db) = setup_test_db().await;
         crate::test_support::seed_preference(
             &pool,
-            PREF_LOCAL_BASE_URL,
+            prefs::LOCAL_BASE_URL.key(),
             "https://attacker.example/v1",
         )
         .await
-        .expect("seed local_base_url pref");
+        .expect("seed the local base URL pref");
 
         let err = match resolve_local(&pool).await {
             Err(e) => e,
@@ -1286,11 +1290,11 @@ mod tests {
         let (pool, db) = setup_test_db().await;
         crate::test_support::seed_preference(
             &pool,
-            PREF_LOCAL_BASE_URL,
+            prefs::LOCAL_BASE_URL.key(),
             "http://localhost:1234/v1",
         )
         .await
-        .expect("seed local_base_url pref");
+        .expect("seed the local base URL pref");
         seed_credential(
             &pool,
             "local",
@@ -1317,11 +1321,11 @@ mod tests {
         let (pool, db) = setup_test_db().await;
         crate::test_support::seed_preference(
             &pool,
-            PREF_LOCAL_BASE_URL,
+            prefs::LOCAL_BASE_URL.key(),
             "http://localhost:1234/v1",
         )
         .await
-        .expect("seed local_base_url pref");
+        .expect("seed the local base URL pref");
         seed_credential(
             &pool,
             "local",
@@ -1364,13 +1368,16 @@ mod tests {
         let layer = StaticHeaderLayer::bearer(
             "local".to_string(),
             "env-key".to_string(),
-            pinned("LUCIDOS_LOCAL_API_KEY", DEFAULT_LOCAL_BASE_URL),
+            pinned(
+                "LUCIDOS_LOCAL_API_KEY",
+                prefs::LOCAL_BASE_URL.default_text(),
+            ),
         );
         assert_eq!(
             layer.scope_bindings(),
             vec![ScopeBinding::Pinned {
                 what: "LUCIDOS_LOCAL_API_KEY".to_string(),
-                base_url: DEFAULT_LOCAL_BASE_URL.to_string(),
+                base_url: prefs::LOCAL_BASE_URL.default_text().to_string(),
             }]
         );
     }

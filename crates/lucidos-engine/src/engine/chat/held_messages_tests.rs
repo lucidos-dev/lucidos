@@ -120,6 +120,8 @@ async fn an_agent_message_is_not_held_behind_an_overtaken_question() {
             description: String::new(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             tool_use_id: "toolu-sibling".into(),
+            parent_tool_use_id: None,
+            api_call_id: None,
         },
     )
     .await;

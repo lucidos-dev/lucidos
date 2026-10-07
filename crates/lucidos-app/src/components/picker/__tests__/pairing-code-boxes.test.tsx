@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 import { PairingCodeBoxes, applyCodeInput, codeSlots, digitsOnly } from '../PairingGate';
-import { PAIRING_CODE_LENGTH } from '../../../utils/pairingCodeSeed';
+import { PAIRING_CODE_DIGITS } from '../../../utils/pairingCodeSeed';
 import { findByClass } from '../../layout/__tests__/vnodeWalk';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -31,8 +31,8 @@ function boxes(code: string) {
 
 describe('one box per digit of the code', () => {
   it('draws exactly as many boxes as the gateway mints digits', () => {
-    expect(boxes('').length).toBe(PAIRING_CODE_LENGTH);
-    expect(boxes('4711').length).toBe(PAIRING_CODE_LENGTH);
+    expect(boxes('').length).toBe(PAIRING_CODE_DIGITS);
+    expect(boxes('4711').length).toBe(PAIRING_CODE_DIGITS);
   });
 
   it('starts empty, so the field asks rather than answers', () => {
@@ -56,7 +56,7 @@ describe('one box per digit of the code', () => {
     // A full code still marks its last box, which is where a backspace lands.
     // A caret over the digit there would read as a second glyph.
     const full = codeSlots('47118899');
-    expect(full[PAIRING_CODE_LENGTH - 1].active).toBe(true);
+    expect(full[PAIRING_CODE_DIGITS - 1].active).toBe(true);
     expect(full.some((s) => s.caret)).toBe(false);
   });
 
@@ -73,7 +73,7 @@ describe('what reaches the field', () => {
   });
 
   it('never overfills the boxes', () => {
-    expect(digitsOnly('471188990000').length).toBe(PAIRING_CODE_LENGTH);
+    expect(digitsOnly('471188990000').length).toBe(PAIRING_CODE_DIGITS);
   });
 
   it('caps the length AFTER the punctuation goes, so a spaced paste survives', () => {

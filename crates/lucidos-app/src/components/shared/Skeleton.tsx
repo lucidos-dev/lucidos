@@ -144,9 +144,16 @@ export function ListSkeletonOf({
   );
 }
 
+/** The end space the pane keeps below the view holding `el` (panels/content.css),
+ *  read off the view's own spacer so the two cannot disagree. */
+function paneEndSpacePx(pane: Element, el: Element): number {
+  const view = Array.from(pane.children).find((child) => child.contains(el));
+  return view ? parseFloat(getComputedStyle(view, '::after').height) || 0 : 0;
+}
+
 /** Full-pane variant: measures the distance from the run's top to the bottom of
- *  its scrolling `.content-pane-body` ancestor and pins the run to exactly that
- *  height, rendering enough rows to fill it (the trailing partial row is clipped
+ *  its scrolling `.content-pane-body` ancestor. Less the pane's end space, that
+ *  pins the run's height, rendering enough rows to fill it (the trailing partial row is clipped
  *  by `.sk-fill`'s `overflow: hidden`). Row stride is derived from the actually
  *  rendered rows (`scrollHeight / rowCount`, which includes the container gap),
  *  so any row height fills correctly. Tracks pane resizes via a ResizeObserver;
@@ -160,7 +167,7 @@ function FillSkeleton({ row, containerClass }: { row: (i: number) => VNode; cont
     const pane = el?.closest('.content-pane-body');
     if (!el || !pane) return; // unmeasurable (tests / detached) → content-sized fallback
     const measure = () => {
-      const available = pane.getBoundingClientRect().bottom - el.getBoundingClientRect().top;
+      const available = pane.getBoundingClientRect().bottom - el.getBoundingClientRect().top - paneEndSpacePx(pane, el);
       if (available <= 0) return;
       const rendered = el.children.length;
       const stride = rendered > 0 ? el.scrollHeight / rendered : 0;

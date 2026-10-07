@@ -323,4 +323,30 @@ describe('Phantom thread prevention', () => {
     expect(threadMap.value.get(childId)!.meta.title).toBe('Fix the bug');
     expect(threadMap.value.get(childId)!.meta.channel).toBe('claude_code');
   });
+
+  it('CodingAgentThreadSpawned leaves the focused thread\'s pending rows where the user sent them', () => {
+    // An agent's spawn is unrelated to what the user is sending elsewhere. The
+    // pending row belongs to the focused thread, whose MessageReceived swaps it
+    // by event id. Moved, it sat in the child as a stuck "Requesting" row.
+    const focusedId = 'thread-the-user-is-typing-in';
+    const childId = 'cc-child-of-another-thread';
+    const map = threadMap.value;
+    const focused = makeThread(focusedId, { initiator: 'user' });
+    focused.pendingUserMessages = [{ text: 'my follow-up', eventId: 'evt-mine', created: '2026-04-16T12:00:00Z' }];
+    map.set(focusedId, focused);
+    threadMap.value = new Map(map);
+    focusedThreadId.value = focusedId;
+
+    handleThreadEvent({
+      thread_id: childId,
+      event: { type: 'CodingAgentThreadSpawned', cc_thread_id: childId, title: 'Fix the bug' },
+      created: '2026-04-16T12:00:01Z',
+    });
+
+    expect(threadMap.value.get(focusedId)!.pendingUserMessages.map(p => p.eventId)).toEqual(['evt-mine']);
+    const child = threadMap.value.get(childId)!;
+    expect(child.pendingUserMessages).toEqual([]);
+    // The engine stores `system` for a thread an agent's message started.
+    expect(child.meta.initiator).toBe('system');
+  });
 });

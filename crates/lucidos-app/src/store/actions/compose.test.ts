@@ -25,7 +25,7 @@ vi.mock('../../api/threads', () => ({
 
 import { seedSuggestion, clearSupersededDraft, composeEditedAt, discardCompose, hasUnsentLocalDraft, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, awaitThreadStarted, isThreadStartPending, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, applyRemoteCompose, _composeEpochForTesting, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
 import { focusThread, unfocusThread } from './threads';
-import { connectionStatus, confirmState, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
+import { connectionStatus, confirmState, effectiveThreadStatus, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
 import { promptOverrideSyncSeq, promptOverrideReplacesDraft } from '../../components/chat/promptValueSync';
 import { patchComposeSelection, getComposeSelectionOverride, resolveProvider, resolveScope, _resetComposeSelectionsForTesting } from '../composeSelections';
 import {
@@ -1930,7 +1930,7 @@ describe('a send leaves the engine holding an empty draft', () => {
     // straight back onto the row, so the write is scheduled only after
     // `clearComposeSelection` has consumed them.
     threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'the draft' })]]);
-    patchComposeSelection('t-1', { model: 'claude-opus-5' });
+    patchComposeSelection('t-1', { model: 'claude-sonnet-5' });
 
     await sendCompose('t-1', {});
     await vi.runAllTimersAsync();
@@ -1968,14 +1968,15 @@ describe('a send leaves the engine holding an empty draft', () => {
       return Promise.resolve(chatAccepted());
     });
     threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'the draft' })]]);
-    patchComposeSelection('t-1', { model: 'claude-opus-5' });
+    patchComposeSelection('t-1', { model: 'claude-sonnet-5' });
 
-    await sendCompose('t-1', {});
+    const sending = sendCompose('t-1', {});
     await vi.runAllTimersAsync();
+    await sending;
 
     const sent = composePutTexts();
     expect(sent[sent.length - 1]).toBe('');
-    expect(getComposeSelectionOverride('t-1').model).toBe('claude-opus-5');
+    expect(getComposeSelectionOverride('t-1').model).toBe('claude-sonnet-5');
 
     chatAnswers = true;
     const [eventId] = [...unsentMessages.value.keys()];
@@ -2001,8 +2002,9 @@ describe('a send leaves the engine holding an empty draft', () => {
     });
     threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'the draft, typed in full' })]]);
 
-    await sendCompose('t-1', {});
+    const sending = sendCompose('t-1', {});
     await vi.runAllTimersAsync();
+    await sending;
     vi.advanceTimersByTime(1000);
 
     const map = new Map(threadMap.value);
@@ -2032,9 +2034,11 @@ describe('a send leaves the engine holding an empty draft', () => {
       return Promise.resolve(chatAccepted());
     });
     threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'the draft' })]]);
-    patchComposeSelection('t-1', { model: 'claude-opus-5' });
+    patchComposeSelection('t-1', { model: 'claude-sonnet-5' });
 
-    await sendCompose('t-1', {});
+    const sending = sendCompose('t-1', {});
+    await vi.runAllTimersAsync();
+    await sending;
     chatAnswer = 'refuse';
     const [eventId] = [...unsentMessages.value.keys()];
     expect(await retryUnsentMessage(eventId)).toBe('dropped');
@@ -2042,7 +2046,7 @@ describe('a send leaves the engine holding an empty draft', () => {
 
     expect(threadMap.value.get('t-1')!.meta.state).toBe('composing');
     expect(getDraft('t-1').text).toBe('the draft');
-    expect(getComposeSelectionOverride('t-1').model).toBe('claude-opus-5');
+    expect(getComposeSelectionOverride('t-1').model).toBe('claude-sonnet-5');
     // Back in the local draft, so the engine stores it once, not twice.
     expect(lastComposePutText()).toBe('the draft');
   });
@@ -2194,6 +2198,20 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
     releaseThreadStart!(new Response(null, { status: 200 }));
     await expect(started).resolves.toBe(true);
     expect(chatCalls(), 'chat POST never fired after the thread row landed').toHaveLength(1);
+  });
+
+  // Without the row the thread read as idle: the composer dropped its Stop
+  // flag and offered Archive on a send that was still in flight.
+  it('shows the send as in flight while POST /threads is held', async () => {
+    const started = startSetupInterview();
+    await Promise.resolve();
+    await Promise.resolve();
+    const thread = threadMap.value.get(focusedThreadId.value!)!;
+    expect(thread.pendingUserMessages, 'no optimistic row while the thread starts').toHaveLength(1);
+    expect(effectiveThreadStatus(thread)).toBe('running');
+
+    releaseThreadStart!(new Response(null, { status: 200 }));
+    await expect(started).resolves.toBe(true);
   });
 
   it('reports a failed thread start instead of silently sending nothing', async () => {

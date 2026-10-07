@@ -334,7 +334,7 @@ impl LucidosEngine {
     ) -> Option<String> {
         if tool_name == tn::ASK_USER_QUESTION {
             return Some(
-                self.handle_chat_ask_user_question(thread_id, tool_use_id, tool_args)
+                self.handle_chat_ask_user_question(thread_id, tool_use_id, tool_args, meta)
                     .await,
             );
         }
@@ -695,8 +695,19 @@ impl LucidosEngine {
                 let (parent_thread_id, spawning_event_id) =
                     relation.spawn_linkage(thread_id, tool_called_event_id);
                 let origin = spawn_origin(thread_id, tool_called_event_id);
+                let max_live_children = self
+                    .thread_queue
+                    .policy()
+                    .await
+                    .max_concurrent_children_per_thread;
                 Some(
-                    match LucidosEngine::check_thread_recursion_guard(&self.pool, thread_id).await {
+                    match LucidosEngine::check_thread_recursion_guard(
+                        &self.pool,
+                        thread_id,
+                        max_live_children,
+                    )
+                    .await
+                    {
                         Err(guard_err) => format!("Error: {}", guard_err),
                         Ok(_) => {
                             let child_thread_id = uuid::Uuid::new_v4();
@@ -708,7 +719,7 @@ impl LucidosEngine {
                                 match resolve_sub_thread_model_and_effort(
                                     tool_args,
                                     chat_model,
-                                    chat_effort,
+                                    Some(chat_effort),
                                 ) {
                                     Ok(pins) => pins,
                                     Err(e) => return Some(format!("Error: {}", e)),
@@ -926,11 +937,13 @@ impl LucidosEngine {
     /// `{question_text: answer_label}` map as a JSON string. The `Chat`
     /// channel is what makes `answer_pending_question` skip the CC-only
     /// resume side-effects (no `CodingAgentPromptSent`, no `ContinuationRequested`).
+    /// The card's `message` renders in the turn `meta` belongs to.
     async fn handle_chat_ask_user_question(
         &self,
         thread_id: Uuid,
         tool_use_id: &str,
         tool_args: &serde_json::Value,
+        meta: &EventMeta,
     ) -> String {
         let questions = tool_args
             .get("questions")
@@ -940,11 +953,14 @@ impl LucidosEngine {
             return "Error: `questions` must be an array of question objects".to_string();
         }
 
+        use crate::engine::agent_question::{card_message, CardMessage};
+        let message = card_message(tool_args).map(|text| CardMessage { text, meta });
         let outcome = self
             .walk_question_batch(
                 thread_id,
                 tool_use_id,
                 &questions,
+                message,
                 String::new(),
                 EventChannel::Chat,
             )
@@ -1051,26 +1067,20 @@ impl LucidosEngine {
                 },
             );
 
-            // Call LLM with no streaming (sub-loop doesn't stream text to frontend)
-            let request_chars =
-                crate::engine::context::request_chars(system_prompt, &messages, &tools);
-            let response = provider
+            // One row per round, up to `MAX_INTENT_ITERATIONS` of them on the
+            // agent's own model. No streaming: the sub-loop shows no text.
+            let response = capture
                 .chat(
+                    provider.as_ref(),
                     messages.clone(),
                     tools.clone(),
                     // No model, provider or effort pick: the sub-loop runs on
-                    // the agent's own default, and streams nothing.
+                    // the agent's own default.
                     crate::llm::ModelSelection::default(),
                     Some(system_prompt),
                     None,
                 )
                 .await?;
-            // One row per round. The sub-loop runs up to `MAX_INTENT_ITERATIONS`
-            // of them on the agent's own model, and none of that spend reached
-            // a cost rollup before.
-            capture
-                .record(provider.default_model(), request_chars, &response)
-                .await;
 
             // No tool calls → final answer
             if response.tool_calls.is_empty() {

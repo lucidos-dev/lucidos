@@ -29,6 +29,7 @@ const POLICY: CapacityPolicy = {
   max_queued_per_trigger: 10,
   reserved_background: 1,
   max_event_trigger_depth: 5,
+  max_concurrent_children_per_thread: 10,
   overflow: 'drop-oldest',
 };
 

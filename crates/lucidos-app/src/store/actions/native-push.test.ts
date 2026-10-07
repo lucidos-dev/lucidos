@@ -48,8 +48,12 @@ vi.mock('../../utils/tauri', () => ({
 }));
 
 const dispatchDeepLink = vi.fn();
+// A budget only this suite uses. Read back as NATIVE_PUSH_STALE_AFTER_MS, it
+// proves the banner gate takes the toast's budget rather than its own.
+const testStaleBudgetMs = vi.hoisted(() => 1234);
 vi.mock('./in-app-notification-toast', () => ({
   dispatchDeepLink: (...args: unknown[]) => dispatchDeepLink(...args),
+  TOAST_REQUEST_STALE_AFTER_MS: testStaleBudgetMs,
 }));
 
 // Breadcrumb telemetry — assert nothing, just keep it from hitting the network.
@@ -125,6 +129,7 @@ describe('NativePushRequested → native desktop banner', () => {
   });
 
   it('drops a stale frame (late SSE-queue flush) past the freshness budget', async () => {
+    expect(NATIVE_PUSH_STALE_AFTER_MS).toBe(testStaleBudgetMs);
     emit({ sent_at_ms: Date.now() - NATIVE_PUSH_STALE_AFTER_MS - 1 });
     await flush();
     expect(showNativeNotification).not.toHaveBeenCalled();

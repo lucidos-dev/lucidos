@@ -145,6 +145,59 @@ async fn a_system_frame_carries_the_emitting_runs_trigger_depth() {
 }
 
 // --- Recursion guard tests ---
+
+/// The default child cap. The guard takes the live policy value, so these
+/// tests pass the default explicitly.
+const CAP: usize = crate::engine::thread_queue::DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD;
+
+async fn guard(pool: &sqlx::PgPool, parent: Uuid) -> Result<i32, String> {
+    crate::engine::LucidosEngine::check_thread_recursion_guard(pool, parent, CAP).await
+}
+
+/// Spawn `n` children of `parent`. Each starts `running`, as a real spawn does.
+async fn spawn_children(bus: &EventBus, parent: Uuid, n: usize) -> Vec<Uuid> {
+    let mut children = Vec::new();
+    for i in 0..n {
+        let child = Uuid::new_v4();
+        emit_thread_message(bus, child, Some(parent), &format!("child {i}")).await;
+        children.push(child);
+    }
+    children
+}
+
+/// End a child's turn the ordinary way, so its row settles at `idle`.
+async fn finish(bus: &EventBus, thread_id: Uuid) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("finish");
+}
+
+/// Put a child's row in a state the guard reads. These states take a whole
+/// session to reach through events, and the guard reads only the row.
+async fn set_row(pool: &sqlx::PgPool, thread_id: Uuid, status: &str, live_waits: i32) {
+    sqlx::query(
+        "UPDATE thread_summaries SET status = $2, live_event_wait_count = $3 \
+         WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .bind(status)
+    .bind(live_waits)
+    .execute(pool)
+    .await
+    .expect("set row");
+}
 #[tokio::test]
 async fn test_recursion_guard_allows_shallow_threads() {
     let (pool, db_name) = setup_test_db().await;
@@ -154,7 +207,7 @@ async fn test_recursion_guard_allows_shallow_threads() {
     emit_thread_message(&bus, root, None, "root task").await;
 
     // Spawning a child from root (depth 0 → child depth 1) should succeed
-    let result = crate::engine::LucidosEngine::check_thread_recursion_guard(&pool, root).await;
+    let result = guard(&pool, root).await;
     assert!(result.is_ok(), "depth 0→1 should be allowed");
     assert_eq!(result.unwrap(), 1);
 
@@ -187,7 +240,7 @@ async fn test_recursion_guard_enforces_max_depth() {
 
     // Last thread in chain is at MAX_THREAD_DEPTH — spawning from it should fail
     let deepest = *chain.last().unwrap();
-    let result = crate::engine::LucidosEngine::check_thread_recursion_guard(&pool, deepest).await;
+    let result = guard(&pool, deepest).await;
     assert!(result.is_err(), "spawning beyond max depth should fail");
     let err = result.unwrap_err();
     assert!(
@@ -198,8 +251,7 @@ async fn test_recursion_guard_enforces_max_depth() {
 
     // But spawning from the second-to-last should still succeed
     let second_to_last = chain[chain.len() - 2];
-    let result2 =
-        crate::engine::LucidosEngine::check_thread_recursion_guard(&pool, second_to_last).await;
+    let result2 = guard(&pool, second_to_last).await;
     assert!(
         result2.is_ok(),
         "spawning at exactly max depth should succeed"
@@ -254,7 +306,7 @@ async fn test_recursion_guard_unknown_parent_treated_as_root() {
 
     // Check guard for a thread_id that doesn't exist in thread_summaries
     let unknown = Uuid::new_v4();
-    let result = crate::engine::LucidosEngine::check_thread_recursion_guard(&pool, unknown).await;
+    let result = guard(&pool, unknown).await;
     assert!(result.is_ok(), "unknown parent should default to depth 0");
     assert_eq!(result.unwrap(), 1);
 
@@ -276,7 +328,7 @@ async fn test_recursion_guard_graceful_error_message() {
     }
 
     // Try to spawn from the deepest — should get clear error
-    let result = crate::engine::LucidosEngine::check_thread_recursion_guard(&pool, parent).await;
+    let result = guard(&pool, parent).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -302,12 +354,12 @@ async fn test_recursion_guard_parallel_children_within_limit() {
     emit_thread_message(&bus, root, None, "root").await;
 
     // Spawn children up to the limit — all should succeed
-    for i in 0..crate::engine::chat::MAX_CHILDREN_PER_THREAD {
+    for i in 0..CAP {
         let child = Uuid::new_v4();
         emit_thread_message(&bus, child, Some(root), &format!("child {}", i)).await;
 
         // Each child should be allowed to spawn its own children
-        let result = crate::engine::LucidosEngine::check_thread_recursion_guard(&pool, child).await;
+        let result = guard(&pool, child).await;
         assert!(result.is_ok(), "child {}'s children should be allowed", i);
         assert_eq!(result.unwrap(), 2);
     }
@@ -316,28 +368,150 @@ async fn test_recursion_guard_parallel_children_within_limit() {
 }
 
 #[tokio::test]
-async fn test_recursion_guard_enforces_max_children() {
+async fn test_recursion_guard_enforces_max_live_children() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let root = Uuid::new_v4();
     emit_thread_message(&bus, root, None, "root").await;
+    spawn_children(&bus, root, CAP).await;
 
-    // Fill up the children limit
-    for i in 0..crate::engine::chat::MAX_CHILDREN_PER_THREAD {
-        let child = Uuid::new_v4();
-        emit_thread_message(&bus, child, Some(root), &format!("child {}", i)).await;
+    let err = guard(&pool, root)
+        .await
+        .expect_err("a full set of live children refuses");
+    assert!(
+        err.contains("at the same time") && err.contains("A slot frees"),
+        "the refusal names a limit at one moment and how a slot frees: {err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("top-level") && !err.to_lowercase().contains("top level"),
+        "the refusal must not send the work out of the family: {err}"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The tester's case: a coordinator whose children all finished could never
+/// spawn again. A finished child frees its slot.
+#[tokio::test]
+async fn finished_children_free_their_slots() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let root = Uuid::new_v4();
+    emit_thread_message(&bus, root, None, "root").await;
+    for child in spawn_children(&bus, root, CAP).await {
+        finish(&bus, child).await;
+    }
+    assert_eq!(
+        guard(&pool, root).await,
+        Ok(1),
+        "ten finished children hold nothing"
+    );
+
+    // A failed child has reported too.
+    let failed = spawn_children(&bus, root, 1).await[0];
+    set_row(&pool, failed, "failed", 0).await;
+    assert_eq!(guard(&pool, root).await, Ok(1));
+
+    teardown_test_db(&db_name).await;
+}
+
+/// Every state in which a child still owes its parent a result holds a slot.
+/// One live child on top of `CAP - 1` running ones tips the parent over.
+#[tokio::test]
+async fn every_live_state_holds_a_slot() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    for (status, live_waits) in [
+        ("waiting_for_user_answer", 0),
+        ("paused", 0),
+        ("idle", 1),
+        ("failed", 1),
+    ] {
+        let root = Uuid::new_v4();
+        emit_thread_message(&bus, root, None, "root").await;
+        let children = spawn_children(&bus, root, CAP).await;
+        set_row(&pool, children[0], status, live_waits).await;
+        assert!(
+            guard(&pool, root).await.is_err(),
+            "a child at {status} with {live_waits} live waits must hold its slot"
+        );
+
+        set_row(&pool, children[0], "idle", 0).await;
+        assert_eq!(
+            guard(&pool, root).await,
+            Ok(1),
+            "and frees it once finished"
+        );
     }
 
-    // Now trying to spawn from root should fail — max children reached
-    let result = crate::engine::LucidosEngine::check_thread_recursion_guard(&pool, root).await;
-    assert!(result.is_err(), "should reject when max children reached");
-    let err = result.unwrap_err();
+    teardown_test_db(&db_name).await;
+}
+
+/// A spawn still waiting for capacity has no row yet, but it will run. Without
+/// counting it, a parent could queue any number of children.
+#[tokio::test]
+async fn a_queued_child_holds_a_slot() {
+    use crate::engine::thread_queue::{ThreadQueueKind, ThreadQueueRequest};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let root = Uuid::new_v4();
+    emit_thread_message(&bus, root, None, "root").await;
+    spawn_children(&bus, root, CAP - 1).await;
+    assert_eq!(guard(&pool, root).await, Ok(1));
+
+    let queued = Uuid::new_v4();
+    let request = ThreadQueueRequest::SubThread {
+        prompt: "queued work".into(),
+        child_thread_id: queued,
+        depth: 0,
+        parent_thread_id: Some(root),
+        spawning_event_id: None,
+        title: None,
+        model: None,
+        reasoning_effort: None,
+        pre_emitted_origin: None,
+        origin: None,
+    };
+    bus.emit(BusEvent::System(SystemEvent::ThreadQueued {
+        entry_id: Uuid::new_v4(),
+        kind: ThreadQueueKind::SubThread,
+        trigger_id: None,
+        trigger_name: None,
+        thread_id: request.thread_id(),
+        summary: "queued work".into(),
+        request: serde_json::to_value(&request).unwrap(),
+        requeued: false,
+        actor: None,
+    }))
+    .await
+    .expect("queue the child");
+
     assert!(
-        err.contains("Maximum child threads per parent"),
-        "error should mention children limit: {}",
-        err
+        guard(&pool, root).await.is_err(),
+        "the queued child is the tenth live one"
     );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The cap is the policy's value, not a constant.
+#[tokio::test]
+async fn the_guard_enforces_the_cap_it_is_given() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let root = Uuid::new_v4();
+    emit_thread_message(&bus, root, None, "root").await;
+    spawn_children(&bus, root, 2).await;
+
+    let check = |cap| crate::engine::LucidosEngine::check_thread_recursion_guard(&pool, root, cap);
+    assert!(check(2).await.is_err());
+    assert_eq!(check(3).await, Ok(1));
 
     teardown_test_db(&db_name).await;
 }
@@ -352,7 +526,7 @@ async fn test_recursion_guard_children_limit_per_parent_not_global() {
 
     // Fill root's children limit
     let mut first_child = Uuid::new_v4();
-    for i in 0..crate::engine::chat::MAX_CHILDREN_PER_THREAD {
+    for i in 0..CAP {
         let child = Uuid::new_v4();
         emit_thread_message(&bus, child, Some(root), &format!("root child {}", i)).await;
         if i == 0 {
@@ -361,8 +535,7 @@ async fn test_recursion_guard_children_limit_per_parent_not_global() {
     }
 
     // Root is full, but first_child should still be able to spawn its own children
-    let result =
-        crate::engine::LucidosEngine::check_thread_recursion_guard(&pool, first_child).await;
+    let result = guard(&pool, first_child).await;
     assert!(
         result.is_ok(),
         "child should have its own independent children budget"

@@ -298,11 +298,9 @@ pub fn workspace_path() -> PathBuf {
     }
 }
 
-/// Read the postgres port for the E2E workspace from its docker container.
+/// The E2E workspace's database URL.
 pub fn db_url() -> String {
     let ws = workspace_path();
-    let container =
-        std::env::var("LUCIDOS_SHARED_PG_CONTAINER").unwrap_or_else(|_| "lucidos-pg-shared".into());
     let db_slug = ws
         .file_name()
         .and_then(|s| s.to_str())
@@ -326,8 +324,17 @@ pub fn db_url() -> String {
             &db_slug
         }
     );
+    format!("postgres://lucidos:lucidos@localhost:{}/{}", db_port(), db)
+}
 
-    // Get the host port from docker
+/// The shared cluster's host port. `shared_pg_psql` in
+/// `scripts/lib/workspace.sh` reads `LUCIDOS_EXTERNAL_PG_PORT` the same way.
+fn db_port() -> String {
+    if let Ok(port) = std::env::var("LUCIDOS_EXTERNAL_PG_PORT") {
+        return port;
+    }
+    let container =
+        std::env::var("LUCIDOS_SHARED_PG_CONTAINER").unwrap_or_else(|_| "lucidos-pg-shared".into());
     let port_output = std::process::Command::new("docker")
         .args(["port", &container, "5432"])
         .output()
@@ -336,12 +343,12 @@ pub fn db_url() -> String {
         .trim()
         .to_string();
     // Format: "0.0.0.0:5438" or "[::]:5438" — take the last port number
-    let port = port_line
+    port_line
         .lines()
         .next()
         .and_then(|l| l.rsplit(':').next())
-        .expect("Could not parse docker port");
-    format!("postgres://lucidos:lucidos@localhost:{}/{}", port, db)
+        .expect("Could not parse docker port")
+        .to_string()
 }
 
 pub fn base_url() -> String {

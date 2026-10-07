@@ -113,15 +113,9 @@ pub fn generate(fixture_dir: &Path) -> Fallible<()> {
 }
 
 fn resolve_model(id: &str) -> Fallible<fastembed::EmbeddingModel> {
-    match id {
-        "multilingual-e5-small" => Ok(fastembed::EmbeddingModel::MultilingualE5Small),
-        "bge-small-en-v1.5" => Ok(fastembed::EmbeddingModel::BGESmallENV15),
-        other => Err(format!(
-            "unknown embedding model {other:?} in memory-seed.toml. It must be one the \
-             engine can also load, or recall would compare vectors from two models."
-        )
-        .into()),
-    }
+    lucidos_engine::memory::fastembed::resolve_model(id)
+        .map(|(model, _dimensions)| model)
+        .map_err(|e| format!("memory-seed.toml: {e}").into())
 }
 
 /// Escape a value for a single-quoted SQL literal.

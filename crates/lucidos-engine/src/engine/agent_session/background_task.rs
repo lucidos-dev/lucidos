@@ -10,6 +10,7 @@
 
 use uuid::Uuid;
 
+use crate::engine::event_wait::StoppedTask;
 use crate::engine::LucidosEngine;
 use crate::llm::tools::BG_MAX_TIMEOUT_SECS;
 
@@ -48,6 +49,29 @@ fn settle_start(task_id: &str, covered: &[String], still_running: bool) -> Settl
     } else {
         Settled::AlreadyFinished
     }
+}
+
+/// What `lucidos background-task stop` prints, for the agent reading it.
+pub(crate) fn stopped_message(stopped: &StoppedTask) -> String {
+    let mut message = format!(
+        "Stopped background task {} ({}). Its completion will not re-open this thread.",
+        stopped.task_id, stopped.label
+    );
+    message.push_str(&ended_waits_note(&stopped.ended_with_others));
+    message
+}
+
+/// The note for waits a stop ended whole because they watched more than the
+/// stopped task. Empty when there were none.
+pub(crate) fn ended_waits_note(ended_with_others: &[String]) -> String {
+    if ended_with_others.is_empty() {
+        return String::new();
+    }
+    format!(
+        " It also ended your wait for {}, which watched more than this task. Re-arm it \
+         if you still need the rest.",
+        ended_with_others.join("; ")
+    )
 }
 
 /// The thread events that end a thread's work, and so its background tasks.
@@ -148,20 +172,20 @@ impl LucidosEngine {
     }
 
     /// Stop one of this thread's running background tasks. Its completion is
-    /// still recorded, as killed, and delivered to the thread's wait.
+    /// still recorded, as killed, but it does not re-open this thread: the
+    /// stop stands the thread's own waits on it down first (ADR 0369).
     pub(crate) async fn stop_background_task_for_agent(
         &self,
         thread_id: Uuid,
         task_id: &str,
     ) -> Result<String, String> {
         self.refuse_another_threads_task(thread_id, task_id).await?;
-        if self.bash_background.kill(task_id).await {
-            Ok(format!("Stopped background task {task_id}."))
-        } else {
-            Err(format!(
-                "Background task {task_id} is not running on this thread. It may already \
-                 have finished: read its output instead."
-            ))
+        match self.stop_background_task_as(thread_id, task_id).await {
+            Some(stopped) => Ok(stopped_message(&stopped)),
+            None => Err(format!(
+                "Background task {task_id} is not running on this thread, or a stop is \
+                 already on its way. It may have finished: read its output instead."
+            )),
         }
     }
 

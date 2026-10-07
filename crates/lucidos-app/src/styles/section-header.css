@@ -66,6 +66,8 @@
    button overflows into it, centred on the label's line. */
 .list-section-actions {
     display: flex;
+    /* The header row already places these at its right end. */
+    justify-content: flex-end;
     align-items: center;
     gap: 0.25rem;
     flex-shrink: 0;
@@ -96,7 +98,6 @@
     min-width: var(--badge-box, var(--badge-height));
     padding: 0 0.3125rem;
     text-align: center;
-    border-radius: calc(var(--radius-control) * 1.25);
     color: var(--text-secondary);
     --section-count-fill: color-mix(in srgb, var(--accent) 15%, transparent);
     background: var(--section-count-fill);

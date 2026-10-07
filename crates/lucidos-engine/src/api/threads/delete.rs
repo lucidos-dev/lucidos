@@ -12,7 +12,7 @@
 //! so the events are the only way to find one. Delete the events first and the
 //! rows are unreachable orphans forever.
 //!
-//! **One transaction.** Every destructive statement is in
+//! **One transaction.** Every destructive statement runs from
 //! [`delete_family_rows`], so a failure anywhere rolls the whole family back.
 //! What follows the commit (the audit event, the worktrees, the projection
 //! repair) is best effort and never rolled back: the data is already gone.
@@ -27,12 +27,13 @@ use uuid::Uuid;
 
 use crate::api::error::ApiError;
 use crate::api::AppState;
+use crate::engine::thread_lifecycle::Blocker;
 use crate::engine::worktree_cleanup::BranchDisposal;
 
 use super::extract_thread_uuid;
 use super::family::{
-    classify_family, coding_agent_members, every_member, load_family, FamilyDecision, FamilyRow,
-    FamilyVerb,
+    classify_family, coding_agent_members, every_member, load_family, with_blocker, FamilyDecision,
+    FamilyRow, FamilyVerb, HOME_THREAD,
 };
 
 /// A rejection body in the `{reason, ...}` shape archive already answers with,
@@ -70,8 +71,8 @@ fn internal(e: impl std::fmt::Display) -> Rejection {
 pub(in crate::api) struct BlockingMember {
     thread_id: Uuid,
     title: Option<String>,
-    /// `running`, `waiting_for_user_answer`, `pending_change` or
-    /// `agent_session_live`. The first three are DB state; the last is the
+    /// `home_thread`, `running`, `waiting_for_user_answer`, `pending_change`
+    /// or `agent_session_live`. The first four are DB state; the last is the
     /// in-memory session set, which no row records.
     reason: &'static str,
 }
@@ -90,6 +91,9 @@ pub(in crate::api) struct DeletePreflight {
     sub_thread_titles: Vec<String>,
     /// `memory_entries` rows sourced to the family's events.
     memory_count: i64,
+    /// Model-written *summary tree* lines the delete sends back to the
+    /// compactor, each one background model call to rebuild.
+    summary_rebuild_count: i64,
     /// Any coding-agent member with a diff on disk, or a recorded branch some
     /// repo still holds. Both halves are needed: `ThreadArchived` clears
     /// `coding_agent_has_diff`, so the column alone reads false for exactly the
@@ -140,6 +144,10 @@ pub(in crate::api) async fn delete_preflight(
     let memory_count = count_memory_rows(&mut tx, &event_ids)
         .await
         .map_err(internal)?;
+    let summary_rebuild_count =
+        crate::engine::summary_tree::store::family_rebuild_count(&mut tx, &ids)
+            .await
+            .map_err(internal)?;
     let facts = load_preflight_facts(&mut tx, &ids, query.thread_id)
         .await
         .map_err(internal)?;
@@ -173,6 +181,7 @@ pub(in crate::api) async fn delete_preflight(
         thread_count: ids.len(),
         sub_thread_titles: facts.sub_thread_titles,
         memory_count,
+        summary_rebuild_count,
         has_unapplied_branch_work,
         has_applied_changes: facts.has_applied_changes,
         backups_present,
@@ -217,10 +226,7 @@ pub(in crate::api) async fn delete_thread_family(
         let _ = tx.rollback().await;
         return Err((
             StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "reason": "descendants_blocking",
-                "blocking": live,
-            })),
+            Json(live_session_body(live, thread_uuid)),
         ));
     }
 
@@ -304,7 +310,7 @@ struct DeletedCounts {
     memory: i64,
 }
 
-/// Every destructive statement, in one transaction and in one function.
+/// Every destructive statement, in one transaction and run from one function.
 ///
 /// Private on purpose. `core::announced_surfaces` allows a raw write to an
 /// announced table only from a declared owner file. It also forces a reachable
@@ -381,6 +387,11 @@ async fn delete_family_rows(
         .bind(ids)
         .execute(&mut **tx)
         .await?;
+
+    // 5. The summary trees (I9): the family's own, its workspace leaves, and
+    //    every workspace merge those leaves shift. The compactor rebuilds the
+    //    merges once `ThreadsDeleted` reaches it.
+    crate::engine::summary_tree::store::delete_family(tx, ids).await?;
 
     Ok(DeletedCounts { events, memory })
 }
@@ -490,6 +501,21 @@ async fn load_preflight_facts(
     Ok(facts)
 }
 
+/// The 409 for members whose agent session is live in memory. The classifier
+/// passed every row, so a live session is a turn still running: in the target,
+/// or in a sub-thread.
+fn live_session_body(live: Vec<BlockingMember>, target: Uuid) -> serde_json::Value {
+    let blocker = if live.iter().any(|m| m.thread_id == target) {
+        Blocker::Running
+    } else {
+        Blocker::DescendantRunning
+    };
+    with_blocker(
+        serde_json::json!({ "reason": "descendants_blocking", "blocking": live }),
+        blocker,
+    )
+}
+
 /// Which members refuse the cascade, with the reason, for the dialog and for
 /// the 409 body.
 ///
@@ -503,35 +529,26 @@ async fn blocking_members(
     target: Uuid,
     titles: &std::collections::HashMap<Uuid, String>,
 ) -> Vec<BlockingMember> {
-    use crate::engine::thread_lifecycle::{ArchiveState, ThreadStatus, ThreadType};
+    use crate::engine::thread_lifecycle::{ArchiveState, OwnBlocker};
 
     let mut blocked = Vec::new();
     for row in family {
-        let status = ThreadStatus::parse(&row.status);
-        let thread_type = if row.is_coding_agent {
-            ThreadType::CodingAgent
-        } else {
-            ThreadType::Chat
-        };
         // The target itself is judged as if it were in the inbox, exactly as
-        // `thread_is_deletable` does. A descendant keeps its real section, so
-        // an archived one holding a pending change does not block.
+        // `action_blocker` asks. A descendant keeps its real section, so an
+        // archived one holding a pending change does not block.
         let archive_state = if row.thread_id == target {
             ArchiveState::Inbox
         } else {
             row.archive_state_enum()
         };
-        let reason = if crate::engine::thread_lifecycle::is_blocking(
-            thread_type,
-            status,
-            archive_state,
-            row.coding_agent_proposed,
-            row.coding_agent_is_external_repo,
-        ) {
-            match status {
-                ThreadStatus::Running | ThreadStatus::WaitingForUserAnswer => Some(status.as_str()),
-                _ => Some("pending_change"),
-            }
+        let reason = if row.is_home {
+            Some(HOME_THREAD)
+        } else if let Some(own) = row.own_blocker(archive_state) {
+            Some(match own {
+                OwnBlocker::Running => "running",
+                OwnBlocker::Question => "waiting_for_user_answer",
+                OwnBlocker::PendingChange => "pending_change",
+            })
         } else if state.engine.is_agent_running_for(row.thread_id).await {
             Some("agent_session_live")
         } else {
@@ -638,6 +655,19 @@ async fn reclaim_worktrees(state: &AppState, coding_agents: &[CodingAgentMember]
             delete_orphaned_branch(state, member).await;
             continue;
         }
+        let on_recorded_branch =
+            match detach_unless_on_recorded_branch(&worktree, member.branch.as_deref()).await {
+                Ok(on_recorded) => on_recorded,
+                Err(e) => {
+                    log!(
+                        "[Delete] Could not detach the worktree at {}, so it is left on disk: {}",
+                        worktree.display(),
+                        e
+                    );
+                    delete_orphaned_branch(state, member).await;
+                    continue;
+                }
+            };
         // `Some(0)` rather than `None`. Otherwise the helper walks the whole
         // tree to size it, synchronously on this request task. The log line
         // below is the only reader of that number.
@@ -664,8 +694,38 @@ async fn reclaim_worktrees(state: &AppState, coding_agents: &[CodingAgentMember]
         if let Some(branch) = outcome.branch.as_deref() {
             sweep_branch_markers(state, &outcome.repo_root, branch).await;
         }
+        if !on_recorded_branch {
+            delete_orphaned_branch(state, member).await;
+        }
     }
     removed
+}
+
+/// Detach `worktree` unless it is on `recorded`, the branch its thread started.
+///
+/// The removal deletes whatever branch the worktree is on, whatever it holds. A
+/// coding agent can `git checkout` inside its own tree, so that branch may be
+/// the user's or another thread's. A detached tree gives the removal no branch
+/// to take, and the caller then deletes the recorded branch by name.
+///
+/// `Ok(true)` means the tree is on its own branch. An unreadable branch is not
+/// a match, so it is detached too. `Err` means the detach failed, and the tree
+/// must stay on disk.
+async fn detach_unless_on_recorded_branch(
+    worktree: &std::path::Path,
+    recorded: Option<&str>,
+) -> Result<bool, String> {
+    use crate::engine::git_ops::{git_cmd, worktree_current_branch};
+
+    let current = worktree_current_branch(worktree).await;
+    if current.is_some() && current.as_deref() == recorded {
+        return Ok(true);
+    }
+    match git_cmd(&["checkout", "--detach"], worktree).await {
+        Ok(o) if o.status.success() => Ok(false),
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Delete a recorded branch whose worktree is already gone, from whichever repo

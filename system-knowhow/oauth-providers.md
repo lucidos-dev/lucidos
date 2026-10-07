@@ -6,99 +6,95 @@ description: OAuth 2.0 provider rules, beside the endpoint rows in the sibling o
 # OAuth providers registry
 
 The **rows** live in the sibling data file
-[`oauth-providers.json`](oauth-providers.json). **This file is the prose that
-goes with them**, and deliberately restates no row.
-
-The engine reads the JSON (`core/oauth_registry.rs`) to prefill the Connect form
-on **Settings → Accounts** and to fill in any endpoint you did not pass to
-`connect_oauth_account`. It still hardcodes no provider: adding one is a data
-edit. You read the same rows, and you keep them up to date.
+[`oauth-providers.json`](oauth-providers.json); this file is the prose that goes
+with them. The engine reads the JSON (`core/oauth_registry.rs`) to prefill the
+Connect form on **Settings → Accounts**, so a known provider asks only for a
+Client ID. It also fills in any endpoint you did not pass to
+`connect_oauth_account`. No provider is hardcoded, so adding one is a data edit.
+You read the same rows, and you keep them up to date.
 
 ## How it's used
 
 When a service needs OAuth client credentials:
 
 1. Call **`connect_oauth_account`** with the provider name and the scopes. For a
-   provider in [`oauth-providers.json`](oauth-providers.json) that is all it
-   needs: **the engine fills the endpoints in from the row itself.** That one
-   tool covers the whole flow: with no client credentials yet it opens the
-   credential modal (prefilled, so the user enters only `client_id`, plus
-   `client_secret` for a confidential/web client), and once the client is saved
-   the same call runs the authorization.
-   **Do not hand-roll a `request_credential(auth_type: "oauth_client")` call
-   first.** It is a second modal for the same value, and that extra step is what
-   produced a duplicate credential on 2026-08-05.
+   provider in [`oauth-providers.json`](oauth-providers.json), that is all it
+   needs: the engine fills in the endpoints from the row. With no client
+   credentials yet, it opens the credential modal, prefilled. The user enters
+   only `client_id`, plus `client_secret` for a confidential/web client. Once
+   the client is saved, the same call runs the authorization.
+   **Do not call `request_credential(auth_type: "oauth_client")` first.** It is
+   a second modal for the same value, and it once produced a duplicate credential.
 2. For a provider the registry does **not** know, pass the endpoints yourself:
-   `auth_url`, `token_url`, `userinfo_url`, and `userinfo_method` /
-   `authorize_params` / `redirect_uri` where the provider needs one. Anything you
-   pass wins over the registry, so this is also how a *derived provider* name
-   (see the alias rule below) runs on a known provider's endpoints.
-3. The values are stored in the credential's JSON
+   `auth_url`, `token_url`, `userinfo_url`, plus `userinfo_method`,
+   `authorize_params` or `redirect_uri` where the provider needs one. What you
+   pass wins over the registry. That is also how a *derived provider* name runs
+   on a known provider's endpoints (see the alias rule below).
+3. The credential's JSON stores the values
    (`{client_id, client_secret?, auth_url, token_url, userinfo_url,
-   userinfo_method?, authorize_params?, redirect_uri?}`), which is the
+   userinfo_method?, authorize_params?, redirect_uri?}`). It is the
    **per-credential source of truth** for endpoints. Token refresh and
-   re-authorization read them back from there, and the registry is not consulted
-   again: a credential fully describes its own flow.
-   `client_secret` and `redirect_uri` are optional, see the two sections below
-   for what their absence means.
+   re-authorization read them back from there and never consult the registry
+   again: a credential fully describes its own flow. `client_secret` and
+   `redirect_uri` are optional; the two sections below say what their absence
+   means.
 
-**Read the result, do not assume it means everything worked.** A provider can
-grant part of what was asked for and still complete the authorization, so
-`connect_oauth_account` reports the account as connected AND names any scope it
-did not get. When it does, the connection is real but cannot do the thing it was
-connected for: relay the missing scopes, have the user enable them in the
-provider's console (the result carries that provider's own console link and
-instruction), and then RECONNECT. Do not retry the same call first, and do not
+**Read the result; do not assume it all worked.** A provider can grant only part
+of the request and still complete the authorization. `connect_oauth_account`
+then reports the account as connected AND names each scope it did not get. The
+connection is real but cannot do its job. Relay the missing scopes, have the
+user enable them in the provider's console (the result carries its link and
+instruction), then RECONNECT. Do not retry the same call first, and do not
 refresh the token: neither picks up a newly enabled scope.
 
-A provider that is in neither the registry nor your args leaves the user typing
-URLs in by hand, so only do that for one you genuinely cannot find. **Better:
-find it via `web_search` and add a row to the JSON** so the next connection, for
-you and for the Connect button alike, is one step.
+A provider in neither the registry nor your args leaves the user typing URLs by
+hand, so do that only when you cannot find it. **Better: find it via
+`web_search` and add a row to the JSON**, so the next connection is one step,
+for you and for the Connect button.
 
 ### The credential is named for the provider, and typed `oauth_client`
 
 An OAuth client registration is identified by its provider name **plus** its
 auth type. Pass `dropbox` to `request_credential` with
-`auth_type: "oauth_client"` and it is stored as exactly `dropbox`. Same for the
-Add Credential form in Settings > Accounts.
+`auth_type: "oauth_client"` and it is stored as exactly `dropbox`. The Add
+Credential form in Settings > Accounts does the same.
 
-The type is what marks it, so the name needs no namespace of its own. That also
-means the same provider can legitimately hold two credentials: a plain `dropbox`
-API key and the `dropbox` app registration are different rows, distinguished by
-the OAUTH CLIENT badge in the list, and neither shadows the other.
+The type marks it, so the name needs no namespace. The same provider can hold
+two credentials: a plain `dropbox` API key and the `dropbox` app registration
+are different rows. The OAUTH CLIENT badge in the list tells them apart, and
+neither shadows the other.
 
-So when you tell the user which credential holds their client:
+When you tell the user which credential holds their client:
 
 - Call it **the OAuth Client credential for `<provider>`**. In the list it shows
   the bare provider name with an OAUTH CLIENT badge and the note "App
   registration for the `<provider>` connected account".
-- Never tell them to name it `oauth:<provider>`. That was the storage key until
-  2026-08-05 and no longer exists; if you pass it anyway the engine strips the
-  prefix, so you land on the right row but the user sees a name they did not type.
-- If they have an old `oauth:<provider>` row still showing, its unprefixed name
-  was already taken by another credential when the rename ran. Have them check
-  which of the two is live, delete the dead one, and re-save the survivor.
+- Never tell them to name it `oauth:<provider>`. That old storage key no longer
+  exists. If you pass it anyway, the engine strips the prefix: you land on the
+  right row, but the user sees a name they did not type.
+- An old `oauth:<provider>` row that still shows means another credential held
+  its unprefixed name when the rename ran. Have them check which of the two is
+  live, delete the dead one, and re-save the survivor.
 
 ### Redirect URI
 
 The provider's OAuth app must whitelist the exact loopback redirect URI Lucidos
-will send. The **default** is the loopback-IP form:
+sends. The **default** is the loopback-IP form:
 
 ```
 http://127.0.0.1:14981/oauth/callback
 ```
 
 Some providers (e.g. Spotify) reject `localhost` but accept the `127.0.0.1`
-loopback IP — that's why the IP is the default. Others do the opposite: **the
-Microsoft Entra portal's Redirect URIs box refuses `http://` + `127.0.0.1`** and
-accepts only `https://…` or `http://localhost…`.
+loopback IP, so the IP is the default. Others do the opposite: **the Microsoft
+Entra portal's Redirect URIs box refuses `http://` + `127.0.0.1`** and accepts
+only `https://…` or `http://localhost…`.
 
-So the URI is **overridable per credential**. Pass `redirect_uri` to
-`request_credential` / `connect_oauth_account` (it pre-fills the modal, and the
-user can edit it) when the provider needs a different host form. Only these
-three values are accepted — the engine's listener owns the port and path, and
-binds **both** loopback families so all three genuinely work:
+So the URI is **overridable per credential**. When the provider needs a
+different host form, pass `redirect_uri` to `request_credential` /
+`connect_oauth_account`. It pre-fills the modal, and the user can edit it. Only
+these three values are accepted. The engine's listener owns the port and path,
+and binds **both** loopback families, so all three work:
 
 | Redirect URI | Use it when |
 |---|---|
@@ -106,8 +102,8 @@ binds **both** loopback families so all three genuinely work:
 | `http://localhost:14981/oauth/callback` | The provider rejects the IP literal (Microsoft's Web platform). |
 | `http://[::1]:14981/oauth/callback` | Only if a provider demands the IPv6 literal. |
 
-Anything else — a different port, a different path, a trailing slash, `https` —
-is rejected when the flow starts, with an error listing these three. Tell the
+Anything else (a different port, a different path, a trailing slash, `https`)
+is rejected when the flow starts, with an error that lists these three. Tell the
 user to register the URI **exactly**, character for character.
 
 ### Confidential vs public client
@@ -120,26 +116,25 @@ a `client_secret`.** There is no provider list for this.
 | `client_secret` filled in | the secret, no PKCE | a **web / confidential** app |
 | `client_secret` left blank | no secret, PKCE (`S256`) | a **desktop / native / public** app |
 
-Both are correct; they must match how the app is registered, because providers
-reject a secret from a public client *and* reject a secret-less redemption from
-a confidential one. Lucidos runs on the user's own machine, so the desktop/public
-shape (RFC 8252) is the more natural fit when the provider offers it — tell the
-user they can leave the client secret blank in that case.
+Both are correct, but they must match how the app is registered. Providers
+reject a secret from a public client *and* a secret-less redemption from a
+confidential one. Lucidos runs on the user's own machine, so the desktop/public
+shape (RFC 8252) fits best when the provider offers it. Then tell the user they
+can leave the client secret blank.
 
-## Alias rule — dedicated connections
+## Alias rule: dedicated connections
 
 Some APIs reject an access token that *also* carries unrelated scopes. Google's
 Health API, for example, 403s ("Request contains disallowed OAuth scope(s)") any
 token that also holds calendar / drive / docs / fitness scopes. The fix is a
 **dedicated connection under a distinct provider name** that requests only the
-narrow scopes — but it still uses the **base provider's endpoints**.
+narrow scopes, on the **base provider's endpoints**.
 
-A derived name is **not** in the registry and must not be added to it: aliases
-are ad hoc, one per user need. So the engine cannot resolve one for you, and
-deliberately does not try to guess a base provider from the spelling. Read the
-base provider's row out of [`oauth-providers.json`](oauth-providers.json) and
-pass its endpoints explicitly, under the distinct name, so the token is stored
-separately:
+A derived name is **not** in the registry and must not be added: aliases are ad
+hoc, one per user need. So the engine cannot resolve one, and does not guess a
+base provider from the spelling. Read the base provider's row from
+[`oauth-providers.json`](oauth-providers.json) and pass its endpoints
+explicitly, under the distinct name, so the token is stored separately:
 
 ```
 connect_oauth_account(
@@ -151,112 +146,101 @@ connect_oauth_account(
   base_url="<the narrow API's own base URL>")
 ```
 
-`configure_email` reads a connection's issuer from its stored `token_url`. So an
+`configure_email` reads a connection's issuer from its stored `token_url`, so an
 alias on Google's or Microsoft's endpoints can back an email account.
 
-Match a derived name to its base by asking what the connection is for, or by
-asking the user outright. The Connect button on **Settings → Accounts** does the
-same thing: type a name the registry does not know and it asks which known
-provider the connection runs on, then prefills from that provider's row.
+Match a derived name to its base by what the connection is for, or ask the user.
+The Connect button on **Settings → Accounts** does the same: type a name the
+registry does not know and it asks which known provider the connection runs on,
+then prefills from that row.
 
 ## Known providers
 
-**The rows live in [`oauth-providers.json`](oauth-providers.json), beside this
-file.** Read it for a provider's `auth_url`, `token_url`, `userinfo_url`,
-`userinfo_method`, `authorize_params`, `base_url`, and its console fields
-(`console_url`, `client_type`, `setup_hint`, `permissions_hint`).
+**The rows live in [`oauth-providers.json`](oauth-providers.json).** Read it for
+a provider's `auth_url`, `token_url`, `userinfo_url`, `userinfo_method`,
+`authorize_params`, `base_url`, and its console fields (`console_url`,
+`client_type`, `setup_hint`, `permissions_hint`).
 
-They are a data file rather than a table here because the engine serves them: the
-Connect form on **Settings → Accounts** reads the same rows to prefill a
-provider's whole app registration, so a user connecting a known provider enters
-only a Client ID. This file deliberately does **not** restate a single row, and
-`the_knowhow_markdown_restates_no_registry_row` fails the build if one comes
-back. Two copies of an endpoint are two things that can disagree.
-
-Everything below is the prose that goes with those rows: what the optional
-columns mean, and the per-provider quirks that are not expressible as a value.
+This file restates **no** row, and `the_knowhow_markdown_restates_no_registry_row`
+fails the build if one comes back: two copies of an endpoint can disagree. Below
+is what the optional columns mean, and the per-provider quirks no value can
+express.
 
 ### The `userinfo_method` field
 
 `userinfo_url` is what makes a *connected account* show **whose** account it is.
-Omit it and the account lists as "No email" and the connect tool reports it as
-unnamed, which is exactly what happened to Dropbox before its endpoint was
-recorded here.
+Without it, the account lists as "No email" and the connect tool reports it as
+unnamed.
 
-Almost every provider serves userinfo over **GET**, which is the default: pass
-`userinfo_method` only for the exceptions, and only when the provider's row says so.
-Dropbox is one: `users/get_current_account` is POST-only (Lucidos sends POST
-with no body and no `Content-Type`, the shape Dropbox accepts). Note also that
-Dropbox nests the display name as `name.display_name` rather than a flat `name`;
-Lucidos reads both shapes, so nothing extra is needed for that.
+Almost every provider serves userinfo over **GET**, the default. Pass
+`userinfo_method` only for an exception the provider's row names. Dropbox is
+one: `users/get_current_account` is POST-only (Lucidos sends POST with no body
+and no `Content-Type`, the shape Dropbox accepts). Dropbox also nests the
+display name as `name.display_name` rather than a flat `name`; Lucidos reads
+both shapes.
 
-Getting the method wrong costs only the account's name and email. The
-connection itself still works, because userinfo is fetched best-effort after the
-token exchange has already succeeded.
+A wrong method costs only the account's name and email. The connection still
+works, because Lucidos fetches userinfo best-effort after the token exchange
+succeeds.
 
 ### The `authorize_params` column
 
-Every provider has its own spelling of *"issue a refresh token"*, and getting it
-wrong is invisible until hours later. A token with no refresh token cannot be
+Every provider spells *"issue a refresh token"* its own way, and a wrong
+spelling stays invisible for hours. A token with no refresh token cannot be
 renewed, so `refresh_oauth_if_needed` can only report *"OAuth token expired but
-no refresh token available"*: everything works on the day it is connected and
-nothing works the next morning. That is what happened to Dropbox backups until
-2026-08-05.
+no refresh token available"*. Everything works on the day of connecting, and
+nothing works the next morning.
 
-The default, sent whenever this column says _(default)_ and whenever the field
-is left blank, is Google's: `access_type=offline&prompt=consent`. Pass an
-explicit value only where the provider's row gives one, and pass it **verbatim**:
-an explicit value REPLACES the default rather than adding to it, so what the
-table says is exactly what Lucidos sends.
+The default is Google's: `access_type=offline&prompt=consent`. Lucidos sends it
+whenever the row says _(default)_ or the field is blank. Pass an explicit value
+only where the provider's row gives one, and pass it **verbatim**. An explicit
+value REPLACES the default rather than adding to it, so Lucidos sends exactly
+what the row says.
 
 - **Dropbox** needs `token_access_type=offline`. Google's two parameters do
-  nothing for it, so a Dropbox connection made with the default gets a
-  four-hour access token and no refresh token at all.
+  nothing for it, so with the default a Dropbox connection gets a four-hour
+  access token and no refresh token.
 - The value is `key=value&key=value`. Percent-encode a value that itself
   contains `&` or `=`.
 - The flow owns `client_id`, `redirect_uri`, `response_type`, `scope`, `state`,
-  `code_challenge` and `code_challenge_method`. Setting one of those here is
-  refused outright. Set `redirect_uri` on the credential, and pass scopes to
-  `connect_oauth_account` when you connect.
-  `state` is generated per authorization and required back on the callback (see
-  "One authorization at a time" below), so a pinned value would break the
-  callback rather than configure anything.
-- Write `none` for a provider strict enough to reject a parameter it does not
-  recognize. That sends neither of the defaults.
-- A **Dropbox client connected before this column existed** was backfilled with
-  `token_access_type=offline` by a migration, so a reconnect from
-  Settings → Accounts renews correctly without the user editing anything. Any
-  other provider that turns out to need a value has to be set by hand (or by
-  you, on the credential) before reconnecting.
+  `code_challenge` and `code_challenge_method`, and refuses any of them here.
+  Set `redirect_uri` on the credential, and pass scopes to
+  `connect_oauth_account` when you connect. `state` is generated per
+  authorization and must come back on the callback. A pinned value would break
+  the callback (see "One authorization at a time" below).
+- Write `none` for a provider that rejects a parameter it does not recognize.
+  That sends neither default.
+- A migration backfilled `token_access_type=offline` on each **Dropbox client
+  connected before this column existed**. A reconnect from Settings → Accounts
+  then renews correctly with no edit. Any other provider that needs a value must
+  be set by hand (or by you, on the credential) before reconnecting.
 
 ### One authorization at a time
 
 The callback listener binds a **fixed** loopback port (14981), because the
-redirect URI has to be registered with the provider ahead of time. So a
-workspace engine can have **at most one authorization in flight**, whatever the
-provider, and whether it was started by `connect_oauth_account` or by a Connect
-/ Reconnect / *Grant access* button.
+redirect URI must be registered with the provider ahead of time. So a workspace
+engine can have **at most one authorization in flight**, whatever the provider.
+That holds whether `connect_oauth_account` started it or a Connect / Reconnect /
+*Grant access* button did.
 
-Two consequences worth knowing before you diagnose one of them:
+Two consequences:
 
 - **Starting a new authorization cancels the previous one.** If the user
-  abandoned a consent screen (or you started a flow they never finished), the
-  next one supersedes it rather than failing. The abandoned flow reports
-  *"This authorization was canceled, most likely because a newer one was
-  started"*. That is expected, not an error to chase. Before 2026-08-06 the
-  abandoned flow instead held the port for its full 120 second timeout and every
-  retry inside that window died with *"Address already in use (os error 48)"*.
-- **A port clash that survives that is another program**, almost always a second
-  Lucidos workspace part-way through connecting an account: workspaces run
-  concurrently, each with its own engine, and they share this one machine-wide
-  port. The error says so. Finish or abandon the other one; there is nothing to
-  fix on this credential.
+  abandoned a consent screen (or never finished a flow you started), the next
+  one supersedes it rather than failing. The abandoned flow reports *"This
+  authorization was canceled, most likely because a newer one was started"*.
+  That is expected, not an error to chase.
+- **A port clash that survives that is another program.** Almost always it is a
+  second Lucidos workspace part-way through connecting an account. Workspaces
+  run concurrently, each with its own engine, and share this one machine-wide
+  port. The error says so. Finish or abandon the other one; this credential
+  needs no fix.
 
 Each authorization also carries its own random `state`, and the listener ignores
-any callback that does not echo it back. So a stale redirect from a superseded
-flow, or a request from anything else that can reach the loopback port, cannot be
-redeemed. Nothing to configure; it is listed here because `state` is refused in
-`authorize_params` for this reason.
+any callback that does not echo it back. So nothing can redeem a stale redirect
+from a superseded flow, or a request from anything else that reaches the
+loopback port. There is nothing to configure; this is why `authorize_params`
+refuses `state`.
 
 ### Notes on scopes
 
@@ -267,48 +251,46 @@ redeemed. Nothing to configure; it is listed here because `state` is refused in
   short names like `offline_access User.Read`. Include `offline_access` to get a
   refresh token. The token response will not echo it back, so the refresh token
   is what proves it was granted (see "what the token response echoes" below).
-  Its app registration also needs more care than the others.
-- **GitHub**: scopes are short names (`repo read:user`). GitHub tokens don't
-  expire and have no refresh token — that's expected.
+  Its app registration also needs extra care.
+- **GitHub**: scopes are short names (`repo read:user`). GitHub tokens do not
+  expire and have no refresh token. That is expected.
 - **Spotify / Dropbox**: short scope names per their docs. Dropbox's account
-  scope is `account_info.read`, which is what its POST userinfo endpoint needs.
-  A connection without it still works, it just reports no email.
+  scope is `account_info.read`, which its POST userinfo endpoint needs. A
+  connection without it still works, but reports no email.
 - **Dropbox for backups** needs four:
   `files.content.write files.content.read files.metadata.read account_info.read`.
-  Write covers the folder create, the upload and the retention delete; read is
-  restoring; metadata is the backup listing that drives pruning and the health
-  card. Request all four, and see the App Console section below, because
-  Dropbox will not grant a scope the app itself has not been permitted.
+  Write covers the folder create, the upload and the retention delete. Read
+  covers restoring. Metadata covers the backup listing that drives pruning and
+  the health card. Request all four. Dropbox grants no scope the app itself is
+  not permitted, so see the App Console section below.
 
 ### Dropbox: the App Console decides what may be asked for
 
-Dropbox is the one provider in this table where enabling the app is a separate
-step from requesting the scope, and every way of getting it wrong looks
-identical to the user, so walk them through all three:
+In Dropbox, enabling a scope on the app is a separate step from requesting it.
+Every way to get it wrong looks identical to the user, so walk them through all
+three:
 
 1. **The Permissions tab of their app in the Dropbox App Console is the maximum
    AND the default set.** An authorization request can narrow that set, never
-   widen it. Ask for a scope the app has not been permitted and the call that
-   needs it fails with *"Your app … does not have the required scope"*.
-2. **A ticked box is not a saved box until they press Submit.** The Permissions
-   tab keeps the ticks as unsaved page state and its **Submit** button sits at
-   the bottom, below the fold, so it is easy to tick four boxes, navigate away,
-   and change nothing at all. Have them scroll down and press Submit, then
-   reload the tab and confirm the ticks survived. This one step cost a user an
-   hour on 2026-08-07: everything else had been done correctly.
-3. **Ticking a box there changes nothing that already exists.** Neither an
-   issued access token nor the user's existing grant picks up a newly enabled
-   scope. After changing the permissions they MUST reconnect the account from
+   widen it. A call that needs a scope the app is not permitted fails with
+   *"Your app … does not have the required scope"*.
+2. **A ticked box is not saved until they press Submit.** The tab keeps the
+   ticks as unsaved page state, and its **Submit** button sits at the bottom,
+   below the fold. It is easy to tick four boxes, navigate away, and change
+   nothing. Have them scroll down and press Submit, then reload the tab and
+   confirm the ticks survived.
+3. **Ticking a box changes nothing that already exists.** Neither an issued
+   access token nor the user's existing grant picks up a newly enabled scope.
+   After a permissions change they MUST reconnect the account from
    Settings → Accounts (the Backup page's *Grant access* button does the same
-   thing for a backup provider). A refresh does not help: refreshing renews the
-   scopes the token already has.
+   for a backup provider). A refresh does not help: it renews only the scopes
+   the token already has.
 
 So the order is: enable the permissions in the App Console, press Submit, then
-connect. If they connected first, the fix is to enable, Submit, and then
-reconnect, and saying "tick the box" alone leaves them looking at the same
-error.
+connect. If they connected first: enable, Submit, then reconnect. "Tick the box"
+alone leaves them looking at the same error.
 
-## Microsoft (Entra) — redirect URI platform buckets
+## Microsoft (Entra): redirect URI platform buckets
 
 Entra does not store one flat list of redirect URIs. Each one lives in a
 **platform bucket**, and the bucket decides which client type may redeem a code
@@ -321,20 +303,20 @@ with it:
 | Single-page application | public + CORS | not what Lucidos is |
 
 `/authorize` accepts a URI from **any** bucket, so a wrong bucket authorizes
-fine and only fails at the token exchange. Two symptoms, one cause:
+fine and fails only at the token exchange. Two symptoms, one cause:
 
-- **`AADSTS90023` — `invalid_request`, *"The provided value for the input
+- **`AADSTS90023`, `invalid_request`: *"The provided value for the input
   parameter 'redirect_uri' is not valid"*, after the browser already said
-  "Authorization successful!"** — the URI is registered in a bucket that doesn't
-  match the client type being used. Classically: the URI sits under *Mobile and
-  desktop applications* while Lucidos is sending a `client_secret`.
-- **`AADSTS50011` / redirect-URI mismatch at the consent screen** — the string
-  doesn't match anything registered. Usually the `127.0.0.1` ↔ `localhost`
-  difference, because the portal won't let the IP form into the Web bucket.
+  "Authorization successful!"** The URI sits in a bucket that does not match
+  the client type in use. Classic case: the URI is under *Mobile and desktop
+  applications* while Lucidos sends a `client_secret`.
+- **`AADSTS50011`, a redirect-URI mismatch at the consent screen.** The string
+  matches nothing registered. Usually it is the `127.0.0.1` ↔ `localhost`
+  difference, because the portal keeps the IP form out of the Web bucket.
 
 Pick one of the two coherent setups and make both halves agree:
 
-**Desktop / public (recommended — Lucidos runs on the user's machine):**
+**Desktop / public (recommended, since Lucidos runs on the user's machine):**
 1. Portal → *Authentication* → add a **Mobile and desktop applications**
    platform with `http://127.0.0.1:14981/oauth/callback`.
 2. Set *Allow public client flows* to **Yes**.
@@ -344,14 +326,13 @@ Pick one of the two coherent setups and make both halves agree:
 **Web / confidential:**
 1. Portal → *Authentication* → add a **Web** platform with
    `http://localhost:14981/oauth/callback` (the box rejects the `127.0.0.1`
-   form — that's a portal limitation, not a protocol one).
+   form: a portal limitation, not a protocol one).
 2. Create a client secret under *Certificates & secrets*.
 3. In Lucidos, enter the **Client Secret** and pass
    `redirect_uri="http://localhost:14981/oauth/callback"`.
 
-Do **not** register the same callback in both buckets — Entra picks one
-arbitrarily when URIs differ only by bucket, which makes the failure
-intermittent.
+Do **not** register the same callback in both buckets. Entra picks one
+arbitrarily when URIs differ only by bucket, so the failure turns intermittent.
 
 ## Microsoft (Entra): what the token response echoes
 
@@ -361,17 +342,16 @@ resource's own scopes and nothing else. `offline_access`, `openid`, `profile`
 and `email` are never in that list, however the consent went.
 
 So **a scope absent from the echo is not a refused scope**. For
-`offline_access` the authoritative signal is the refresh token: one was issued
-and stored, so it was granted. Lucidos reads it that way on the account card
-and in the `connect_oauth_account` result alike. It warns only when the refresh
-token is genuinely absent, which is the case that breaks renewal.
+`offline_access`, the refresh token is the authoritative signal: if one was
+issued and stored, the scope was granted. Lucidos reads it that way on the
+account card and in the `connect_oauth_account` result. It warns only when the
+refresh token is truly absent, the case that breaks renewal.
 
-Do not send a user to the Entra portal over an unechoed `offline_access`. That
-is what the old echo-based check did, on connections that were working.
+Do not send a user to the Entra portal over an unechoed `offline_access`.
 
 A real refusal still surfaces. Ask for a **resource** scope the app
-registration has not been granted and it is missing from the echo, where
-nothing else vouches for it.
+registration lacks and it is missing from the echo, where nothing else vouches
+for it.
 
 ## Adding a new provider
 
@@ -383,5 +363,5 @@ Adding a known provider is a **knowhow edit, not an engine change**:
    button can help too, its `console_url`, `client_type` and `setup_hint`.
 3. Note any scope quirks under "Notes on scopes".
 
-That's it — the next `request_credential` / `connect_oauth_account` for that
-provider pre-fills from your new row.
+The next `request_credential` / `connect_oauth_account` for that provider then
+pre-fills from your new row.

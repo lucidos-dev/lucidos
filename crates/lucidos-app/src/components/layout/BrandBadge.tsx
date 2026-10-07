@@ -6,6 +6,7 @@ import { liveActivityRows, type ActivityRow } from '../../store/actions/activity
 // number at which a count stops being spelled out is shared.
 import { countLabel } from './NotificationsMenuRows';
 import { HourglassIcon, ReloadIcon } from '../shared/icons';
+import { GlyphBadge } from '../shared/GlyphBadge';
 
 /** Visible state of the brand badge. PURELY VISUAL in every state: a tap on it
  *  is a tap on the mark, which opens the Lucidos menu. The menu's activity
@@ -82,9 +83,9 @@ export function UnreadBrandBadge() {
   const count = crossWorkspaceUnreadTotal.value;
   if (count <= 0) return null;
   return (
-    <span class="badge brand-unread-badge" aria-hidden="true">
+    <GlyphBadge class="badge brand-unread-badge" aria-hidden="true">
       {countLabel(count)}
-    </span>
+    </GlyphBadge>
   );
 }
 
@@ -97,12 +98,12 @@ export function BrandBadge() {
   const state = brandBadgeState(rows.length);
   if (state === 'none') return null;
   if (state === 'ready') {
-    return <span class="badge brand-badge" aria-hidden="true">!</span>;
+    return <GlyphBadge class="badge brand-badge" aria-hidden="true">!</GlyphBadge>;
   }
   const pending = state === 'pending';
   const waiting = rows.every((r) => r.queued);
   return (
-    <span
+    <GlyphBadge
       class={`badge brand-badge${pending ? ' brand-badge-dot' : ''}${pending && engineRebuildWedged.value ? ' brand-badge-wedged' : ''}`}
       aria-hidden="true"
     >
@@ -117,6 +118,6 @@ export function BrandBadge() {
           a fresh element whose animation starts anew. */}
       {!pending && !waiting && <span key={mobileView.value} class="brand-badge-spinner"><ReloadIcon /></span>}
       {!pending && waiting && <span class="brand-badge-queued"><HourglassIcon /></span>}
-    </span>
+    </GlyphBadge>
   );
 }

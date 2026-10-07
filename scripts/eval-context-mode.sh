@@ -5,6 +5,7 @@
 #
 #   ./scripts/eval-context-mode.sh seed --repeat 1
 #   ./scripts/eval-context-mode.sh run --config smoke --tasks T01,T02 --repeats 1
+#   ./scripts/eval-context-mode.sh run --config pilot --run-id <id> --stop-after T04
 #   ./scripts/eval-context-mode.sh score --run-id <id>
 #   ./scripts/eval-context-mode.sh analyse --run-id <id>
 #   ./scripts/eval-context-mode.sh report --run-id <id>
@@ -16,6 +17,11 @@
 # window on the seeded model row, which is the budget-pressure knob. A sweep is
 # several runs at several windows, pooled by naming every id to `analyse` or
 # `report`.
+#
+# AN ARM IS A CONTEXT MODE AND A MEMORY MODULE (ADR 0362). `control` and `lean`
+# run Classic memory. `control-tree` and `lean-tree` run the Tree module, and
+# wait for its summary trees before scoring. `--arms lean,lean-tree` measures
+# both modules on the same tasks.
 #
 # THIS COSTS MONEY. A single-arm 14-task run is roughly $120 on Opus, and a
 # four-window sweep is four of those. Nothing here runs from `make test`,
@@ -33,9 +39,14 @@
 # refuses any path whose name lacks the `eval-` prefix (I5). Its database is
 # `lucidos_` plus that same name.
 #
-# The label is what lets two providers run at once. An arm is a context-mode
-# configuration and stays one, so the model is a separate axis and belongs in
-# the name. Without it, two concurrent runs both want `eval-lean-1`.
+# The label is what lets two providers run at once. The model is not an arm
+# dimension, so it is a separate axis and belongs in the name. Without it, two
+# concurrent runs both want `eval-lean-1`.
+#
+# A LONG RUN GOES IN CHUNKS. `--stop-after <task>` ends an invocation after that
+# task. The same command with a later task, or none, continues the repeat in the
+# workspaces it left, without reseeding. Splitting with `--tasks` instead seeds
+# each chunk afresh, and T01 to T12 build on each other (ADR 0110 amendment).
 #
 # CONFIGURATION, all overridable from the environment.
 #
@@ -117,20 +128,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
+# shellcheck source=scripts/lib/workspace_constants.sh
+source "$SCRIPT_DIR/lib/workspace_constants.sh"
 
 # Arms are ordinary workspaces. They live beside every other one, so the
 # picker lists them without a nested root nobody else uses.
 export LUCIDOS_EVAL_ROOT="${LUCIDOS_EVAL_ROOT:-$HOME/workspaces}"
-export LUCIDOS_EVAL_PG_BASE="${LUCIDOS_EVAL_PG_BASE:-postgres://lucidos:lucidos@localhost:5435}"
-export LUCIDOS_EVAL_MODEL="${LUCIDOS_EVAL_MODEL:-claude-opus-5}"
-export LUCIDOS_EVAL_MODEL_LABEL="${LUCIDOS_EVAL_MODEL_LABEL:-Model under test}"
-export LUCIDOS_EVAL_MODEL_PROVIDER="${LUCIDOS_EVAL_MODEL_PROVIDER:-vertex}"
-export LUCIDOS_EVAL_REASONING_EFFORT="${LUCIDOS_EVAL_REASONING_EFFORT:-default}"
+export LUCIDOS_EVAL_PG_BASE="${LUCIDOS_EVAL_PG_BASE:-postgres://$PG_USER:$PG_PASSWORD@localhost:5435}"
+# The model, its label and provider, and the reasoning effort default in the
+# harness itself (`seed_pins` in crates/lucidos-eval/src/main.rs).
 
-# The seeded memory vectors were produced by this model, and recall compares
-# them against whatever the engine loads. A different one here would compare
-# vectors from two models and quietly change what the control arm recalls.
-export LUCIDOS_EMBEDDING_MODEL="${LUCIDOS_EMBEDDING_MODEL:-multilingual-e5-small}"
+# The seeded memory vectors were produced by the model the fixture names, and
+# recall compares them against whatever the engine loads. A different one here
+# would compare vectors from two models and quietly change what the control arm
+# recalls.
+if [ -z "${LUCIDOS_EMBEDDING_MODEL:-}" ]; then
+    LUCIDOS_EMBEDDING_MODEL="$(sed -n 's/^embedding_model = "\(.*\)"$/\1/p' \
+        "$PROJECT_DIR/eval/context-mode/fixtures/memory-seed.toml")"
+    if [ -z "$LUCIDOS_EMBEDDING_MODEL" ]; then
+        echo "ERROR: eval/context-mode/fixtures/memory-seed.toml names no embedding_model" >&2
+        exit 1
+    fi
+fi
+export LUCIDOS_EMBEDDING_MODEL
 
 # Follow the dev stack's scheme, mirroring `detect_tls` in
 # scripts/lib/workspace.sh arm for arm: the checkout's `.certs/` first, then the
@@ -157,7 +177,7 @@ if [ -n "${LUCIDOS_EVAL_ENGINE_TLS_CERT:-}" ]; then
 else
     eval_gateway_proto=http
 fi
-export LUCIDOS_EVAL_GATEWAY_URL="${LUCIDOS_EVAL_GATEWAY_URL:-$eval_gateway_proto://localhost:${LUCIDOS_DEV_GATEWAY_PORT:-5251}}"
+export LUCIDOS_EVAL_GATEWAY_URL="${LUCIDOS_EVAL_GATEWAY_URL:-$eval_gateway_proto://localhost:${LUCIDOS_DEV_GATEWAY_PORT:-$DEFAULT_DEV_GATEWAY_PORT}}"
 
 if [ $# -eq 0 ]; then
     echo "usage: $0 <seed|run|score|analyse|report> [args...]" >&2
@@ -180,6 +200,6 @@ fi
 
 echo "[eval] engine     $LUCIDOS_EVAL_ENGINE_BIN"
 echo "[eval] workspaces $LUCIDOS_EVAL_ROOT"
-echo "[eval] model      $LUCIDOS_EVAL_MODEL"
+echo "[eval] model      ${LUCIDOS_EVAL_MODEL:-the harness default}"
 
 exec "$PROJECT_DIR/target/release/lucidos-eval" "$@"

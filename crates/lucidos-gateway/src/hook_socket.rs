@@ -262,10 +262,13 @@ mod tests {
 
     #[test]
     fn the_hook_port_derives_from_the_gateway_port() {
-        assert_eq!(hook_port(None, 5251), Some(5261));
-        assert_eq!(hook_port(None, 5252), Some(5262));
-        assert_eq!(hook_port(Some(""), 5251), Some(5261));
-        assert_eq!(hook_port(Some("  "), 5251), Some(5261));
+        use lucidos_installs::{DEFAULT_DEV_GATEWAY_PORT as DEV, DEFAULT_GATEWAY_PORT as PACKAGED};
+        // 5261 and 5262 are a pin: `remote-access.md` tells users to funnel
+        // those exact ports.
+        assert_eq!(hook_port(None, DEV), Some(5261));
+        assert_eq!(hook_port(None, PACKAGED), Some(5262));
+        assert_eq!(hook_port(Some(""), DEV), Some(5261));
+        assert_eq!(hook_port(Some("  "), DEV), Some(5261));
     }
 
     #[test]

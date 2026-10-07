@@ -1,15 +1,13 @@
 import { useRef } from 'preact/hooks';
 import { CrossfadeStack } from '../shared/CrossfadeStack';
-import { drawerViewKey } from '../drawer/ThreadFilterCover';
 import { FILTER_BUTTON_GLYPHS, filterButtonState, type FilterGlyph } from './ThreadFilterPanel';
 import { threadFilterPanelOpen, toggleThreadFilterPanel } from '../../store/threadFilterPanel';
 import { threadFilterActive } from '../../store/threadFilterActive';
 import { drawerView, attentionThreadCount } from '../../store/store';
+import { GlyphBadge } from '../shared/GlyphBadge';
 
 /** The glyph layers never change, so they are built once. */
 const GLYPH_LAYERS = Object.entries(FILTER_BUTTON_GLYPHS).map(([key, Icon]) => ({ key, node: <Icon /> }));
-
-const THREADS_TITLES = { threads: 'Threads', filters: 'Filters' } as const;
 
 /** The Filter button's glyph: every glyph it can wear, crossfading to `glyph`.
  *
@@ -31,9 +29,9 @@ export function FilterButtonBadge({ count }: { count: number }) {
   const lastShown = useRef(count);
   if (count > 0) lastShown.current = count;
   return (
-    <span class="badge filter-badge" data-shown={count > 0 ? '' : undefined} aria-hidden="true">
+    <GlyphBadge class="badge filter-badge" data-shown={count > 0 ? '' : undefined} aria-hidden="true">
       {lastShown.current > 0 ? lastShown.current : ''}
-    </span>
+    </GlyphBadge>
   );
 }
 
@@ -74,5 +72,5 @@ export function ThreadFilterButton({ class: extraClass, tooltip }: { class?: str
  *  own. Just "Filters": the pane is already the Threads pane. It switches word
  *  at once: only the view below it moves. */
 export function ThreadsPaneTitle({ class: className }: { class: string }) {
-  return <span class={className}>{THREADS_TITLES[drawerViewKey(threadFilterPanelOpen.value)]}</span>;
+  return <span class={className}>{threadFilterPanelOpen.value ? 'Filters' : 'Threads'}</span>;
 }

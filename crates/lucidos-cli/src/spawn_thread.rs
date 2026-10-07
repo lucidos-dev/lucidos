@@ -124,6 +124,9 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
         )?;
     }
 
+    require_input(&args.message, &args.images)?;
+    let images = inline_images(&args.images)?;
+
     let target_root = resolve_target(&args.to)?;
     let target_ports = target_root.join(".lucidos/ports");
     let (api_port, recorded_proto) = read_ports(&target_ports)?;
@@ -193,6 +196,9 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
         .expect("json! created an object literal");
     if let Some(ref t) = args.title {
         obj.insert("title".into(), t.clone().into());
+    }
+    if !images.is_empty() {
+        obj.insert("images".into(), images.into());
     }
     if use_coding_agent {
         obj.insert("use_coding_agent".into(), true.into());
@@ -284,6 +290,40 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     let label = link_label(args.title.as_deref(), &args.message);
     println!("[{}](thread:{}/{})", label, target_basename, thread_id);
     Ok(())
+}
+
+/// Why a spawn with no text and no image is refused.
+const NOTHING_TO_SEND: &str = "--message is empty and no --image was given, so there is \
+    nothing to start the thread with. If the message comes from `$(cat <file>)`, check the \
+    file exists.";
+
+/// Refuse a spawn with no text and no image before any request goes out.
+///
+/// The target engine refuses one too. Failing here also names the likely cause,
+/// a command substitution that read nothing.
+fn require_input(message: &str, images: &[PathBuf]) -> Result<(), BoxError> {
+    if message.trim().is_empty() && images.is_empty() {
+        return Err(NOTHING_TO_SEND.into());
+    }
+    Ok(())
+}
+
+/// Each `--image` file as an entry of the engine's inline `images` body.
+///
+/// This only reads. The target engine stores each image as it stores an upload
+/// in the app, so it alone judges the format and fits the size.
+fn inline_images(paths: &[PathBuf]) -> Result<Vec<serde_json::Value>, BoxError> {
+    use base64::Engine as _;
+    paths
+        .iter()
+        .map(|path| {
+            let bytes =
+                std::fs::read(path).map_err(|e| format!("--image {}: {e}", path.display()))?;
+            Ok(serde_json::json!({
+                "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }))
+        })
+        .collect()
 }
 
 /// Refuse a level the spawn cannot actually run at.
@@ -407,8 +447,8 @@ fn resolve_target(name_or_path: &str) -> Result<PathBuf, BoxError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_effort_fits_model, effort_rows, link_label, models_offering, workspaces_root,
-        CC_MENU, CODEX_MENU, EFFORT_LEVELS,
+        check_effort_fits_model, effort_rows, inline_images, link_label, models_offering,
+        require_input, workspaces_root, CC_MENU, CODEX_MENU, EFFORT_LEVELS, NOTHING_TO_SEND,
     };
     use crate::CliCodingAgent;
     use std::collections::BTreeSet;
@@ -613,5 +653,50 @@ mod tests {
     #[test]
     fn label_falls_back_to_message_when_title_is_blank() {
         assert_eq!(link_label(Some("   "), "real message"), "real message");
+    }
+
+    /// Each file goes out as its bytes, untouched and unlabelled. The format
+    /// and the size are the target engine's to judge, as for an app upload.
+    #[test]
+    fn an_image_is_sent_as_its_raw_bytes_with_no_format_claim() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.tiff");
+        std::fs::write(&path, b"any bytes at all").unwrap();
+
+        let entries = inline_images(&[path]).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        let sent = base64::engine::general_purpose::STANDARD
+            .decode(entries[0]["base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(sent, b"any bytes at all");
+        assert!(
+            entries[0].get("mime_type").is_none(),
+            "the engine sniffs the format, so the CLI claims none"
+        );
+    }
+
+    /// `--message "$(cat brief.md)"` with no `brief.md` sends an empty string.
+    /// That must fail here, not come back as a link to a dead thread.
+    #[test]
+    fn a_blank_message_with_no_image_is_refused() {
+        for blank in ["", " \n\t"] {
+            let err = require_input(blank, &[]).unwrap_err().to_string();
+            assert_eq!(err, NOTHING_TO_SEND);
+        }
+    }
+
+    #[test]
+    fn text_or_an_image_is_enough() {
+        assert!(require_input("do the thing", &[]).is_ok());
+        assert!(require_input("", &[PathBuf::from("shot.png")]).is_ok());
+    }
+
+    #[test]
+    fn a_missing_image_fails_before_any_request_and_names_the_path() {
+        let missing = PathBuf::from("/nonexistent/shot.png");
+        let err = inline_images(&[missing]).unwrap_err().to_string();
+        assert!(err.contains("--image /nonexistent/shot.png"), "{err}");
     }
 }

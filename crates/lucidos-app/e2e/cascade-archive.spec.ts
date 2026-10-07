@@ -114,8 +114,10 @@ test.describe('Cascading archive — Archive button gating', () => {
     // exact "Archive" text. `:text-is` enforces an exact match so the "Archive..."
     // spinner state (Archive in progress) doesn't accidentally satisfy the
     // "not present" assertion.
-    const archiveBtn = page.locator('button.action-btn:text-is("Archive"):visible');
+    const archiveBtn = page.locator('button.action-btn:not([aria-disabled="true"]):text-is("Archive"):visible');
     await expect(archiveBtn).toHaveCount(0, { timeout: 5_000 });
+    // It shows held back instead, and a tap says why (ADR 0378).
+    await expect(page.locator('button.action-btn-blocked[aria-disabled="true"]:visible')).toHaveCount(1);
     // Scoped to the focused thread: every drawer row carries a pin too.
     await expectFocusedPinned(page, false);
 

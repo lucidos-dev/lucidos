@@ -2,7 +2,9 @@
 /** A card the user has answered says so before the engine confirms it. On a
  *  slow link or a busy host that wait can last seconds. The header reads
  *  "Sending" for the whole wait. Past the delay gate, the picked option or
- *  button also spins in place of its mark. */
+ *  button also spins in its mark's slot.
+ *
+ *  The mark only moves forward: empty, then the spinner, then the mark. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, type ComponentChildren } from 'preact';
 import { act } from 'preact/test-utils';
@@ -17,7 +19,8 @@ vi.mock('../../../store/actions/permissions', async (importOriginal) => ({
 }));
 
 import { SPINNER_DELAY_MS } from '../../../hooks/useDelayedLoading';
-import { QuestionBody, pendingAnswers } from '../QuestionCard';
+import { QuestionBody, type ResolvedAnswer } from '../QuestionCard';
+import { pendingAnswers } from '../../../store/pendingDecisions';
 import { PermissionBody, pendingVerdicts } from '../PermissionCard';
 import { describeInitiator } from '../ChatExchange';
 import type { Exchange } from '../../../store/thread-events';
@@ -44,12 +47,13 @@ function mount(node: ComponentChildren) {
 
 const options = [{ id: 'a', label: 'Skip it' }, { id: 'b', label: 'Wait' }];
 
-const question = (resolved?: { kind: 'Selected'; option_id: string }, terminated = false) => (
+const question = (resolved?: ResolvedAnswer, terminated = false, multiSelect = false) => (
   <QuestionBody
     threadId="t"
     toolUseId="tu-1"
     question="Wait for the lock?"
     options={options}
+    multiSelect={multiSelect}
     resolved={resolved}
     terminated={terminated}
   />
@@ -62,10 +66,13 @@ describe('a question card', () => {
     expect(pendingAnswers.map.value.get('tu-1')).toEqual({ kind: 'Selected', option_id: 'a' });
   });
 
-  it('spins the picked indicator only past the delay gate', () => {
+  it('leaves the picked indicator empty until the delay gate, then spins', () => {
     pendingAnswers.set('tu-1', { kind: 'Selected', option_id: 'a' });
     mount(question());
     expect(host.querySelector('.question-option-sending')).toBeNull();
+    const early = host.querySelector('.question-option-selected')!;
+    expect(early.querySelector('.question-option-indicator')).not.toBeNull();
+    expect(early.querySelector('.question-option-indicator-selected')).toBeNull();
     act(() => { vi.advanceTimersByTime(SPINNER_DELAY_MS); });
     const picked = host.querySelector('.question-option-selected')!;
     expect(picked.querySelector('.mini-spinner.question-option-sending')).not.toBeNull();
@@ -81,6 +88,22 @@ describe('a question card', () => {
     expect(host.querySelector('.question-option-sending')).toBeNull();
     expect(host.querySelector('.question-option-selected .question-option-indicator-selected')).not.toBeNull();
     expect(pendingAnswers.map.value.has('tu-1')).toBe(false);
+  });
+
+  it('fills the indicator straight from empty when the answer lands inside the gate', () => {
+    pendingAnswers.set('tu-1', { kind: 'Selected', option_id: 'a' });
+    mount(question());
+    mount(question({ kind: 'Selected', option_id: 'a' }));
+    expect(host.querySelector('.question-option-sending')).toBeNull();
+    expect(host.querySelector('.question-option-selected .question-option-indicator-selected')).not.toBeNull();
+  });
+
+  it('keeps a multi-select submit\'s ticks and never spins over them', () => {
+    pendingAnswers.set('tu-1', { kind: 'MultiSelected', option_ids: ['a'] });
+    mount(question(undefined, false, true));
+    act(() => { vi.advanceTimersByTime(SPINNER_DELAY_MS); });
+    expect(host.querySelector('.question-option-sending')).toBeNull();
+    expect(host.querySelector('.question-option-selected .question-option-indicator-selected')).not.toBeNull();
   });
 
   it('draws a dead card without the unconfirmed pick, and keeps it for a late answer', () => {
@@ -99,10 +122,12 @@ describe('a question card', () => {
 const permissionEvent = { request_id: 'req-1', tool_use_id: 'tu-p', tool_name: 'Bash', input: { command: 'ls' }, summary: 'list files' };
 
 describe('a permission card', () => {
-  it('spins in place of the check on the picked button, then shows the check on confirm', () => {
+  it('shows no check until the gate, spins, then shows the check on confirm', () => {
     mount(<PermissionBody event={permissionEvent} />);
     act(() => { host.querySelector<HTMLButtonElement>('button[aria-label="Allow this permission request once"]')!.click(); });
     expect(pendingVerdicts.map.value.get('req-1')).toEqual({ allowed: true, persist_scope: undefined });
+    expect(host.querySelector('.permission-btn-picked')).not.toBeNull();
+    expect(host.querySelector('.permission-btn-check')).toBeNull();
     act(() => { vi.advanceTimersByTime(SPINNER_DELAY_MS); });
     const picked = host.querySelector('.permission-btn-picked')!;
     expect(picked.querySelector('.mini-spinner.permission-btn-sending')).not.toBeNull();

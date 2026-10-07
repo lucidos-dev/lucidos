@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { resolveVisualStatus, statusTooltip, ThreadStatusIcon, visualStatusFor, type VisualStatus } from './ThreadStatusIcon';
+import { statusTooltip, ThreadStatusIcon } from './ThreadStatusIcon';
+import { resolveVisualStatus, visualStatusFor, type VisualStatus } from './threadVisualStatus';
 import type { ThreadMeta } from '../../store/thread-events';
 
 describe('visualStatusFor', () => {

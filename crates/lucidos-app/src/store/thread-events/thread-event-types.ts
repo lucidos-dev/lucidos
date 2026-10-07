@@ -37,6 +37,13 @@ export type {
   TriggerInvocation,
   VoiceSessionEndReason,
 } from '../../generated/thread-event-wire';
+import {
+  AUTO_RECOVERY_AFTER_HANG_REASON,
+  AUTO_RESUME_AFTER_API_ERROR_REASON,
+  AUTO_RESUME_AFTER_SWITCH_REASON,
+  ENGINE_RESTART_INTERRUPT_REASON,
+  USER_CLICKED_CONTINUE_REASON,
+} from '@lucidos/engine-constants';
 export { THREAD_EVENT_TYPE_NAMES } from '../../generated/thread-event-wire';
 
 /** The events that open a *form request*: something the agent asked the user
@@ -332,39 +339,35 @@ export const RESPONSE_CANCELED_SUMMARY = 'Response canceled';
  *  watchdog fire OR a stray signal-kill (e.g. another workspace's `cargo check`
  *  broad-kill landing on this CC subprocess). Distinct from a user clicking
  *  "continue" after a real restart, which DOES warrant the restart wording. */
-export const CONTINUATION_AUTO_RECOVERY_REASON = 'auto_recovery_after_hang';
+export const CONTINUATION_AUTO_RECOVERY_REASON = AUTO_RECOVERY_AFTER_HANG_REASON;
 
 /** ContinuationStarted.reason emitted when the user clicked Continue on an
- *  interrupted response. Mirrors Rust's `USER_CLICKED_CONTINUE_REASON`. This
- *  path also stamps the clicking device on the actor, so the popover shows a
- *  Device row alongside the explainer. */
-export const CONTINUATION_USER_CLICKED_REASON = 'user_clicked_continue';
+ *  interrupted response. This path also stamps the clicking device on the
+ *  actor, so the popover shows a Device row alongside the explainer. */
+export const CONTINUATION_USER_CLICKED_REASON = USER_CLICKED_CONTINUE_REASON;
 
 /** ContinuationStarted.reason emitted when the engine auto-resumes a
  *  coding-agent thread that was in flight during a user-initiated *Switch to
- *  new version*. Mirrors Rust's `AUTO_RESUME_AFTER_SWITCH_REASON`, which is
- *  stamped on the coding-agent resume path alone (`engine_version.rs`): a chat
- *  or trigger thread auto-resumed by the same Switch records no reason at all
- *  (`emit_resume_anchor`) and falls back to the generic engine explanation. The
- *  device that pressed Switch is recorded on the teardown `ResponseAborted`,
- *  not here, so the resume itself carries no actor. */
-export const CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON = 'auto_resume_after_switch';
+ *  new version*. The engine stamps it on the coding-agent resume path alone
+ *  (`engine_version.rs`): a chat or trigger thread auto-resumed by the same
+ *  Switch records no reason at all (`emit_resume_anchor`) and falls back to the
+ *  generic engine explanation. The device that pressed Switch is recorded on
+ *  the teardown `ResponseAborted`, not here, so the resume carries no actor. */
+export const CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON = AUTO_RESUME_AFTER_SWITCH_REASON;
 
 /** ContinuationStarted.reason emitted when the engine resumes a coding-agent
  *  turn the backend ended on a TRANSIENT upstream failure it reported itself
- *  (its own `API Error: …`, e.g. a connection closed mid-response). Mirrors
- *  Rust's `AUTO_RESUME_AFTER_API_ERROR_REASON`. Nothing restarted here either:
- *  the previous turn's `ResponseFailed` is in the timeline right above, and this
- *  is the engine picking the same work back up. */
-export const CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON = 'auto_resume_after_api_error';
+ *  (its own `API Error: …`, e.g. a connection closed mid-response). Nothing
+ *  restarted here either: the previous turn's `ResponseFailed` is in the
+ *  timeline right above, and this is the engine picking the same work back up. */
+export const CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON = AUTO_RESUME_AFTER_API_ERROR_REASON;
 
 /** `CodingAgentIdled.reason` stamped by crash recovery on the synthetic idle it
- *  emits directly beneath its own `ResponseAborted` boundary. Mirrors Rust's
- *  `ENGINE_RESTART_INTERRUPT_REASON` (`agent_recovery/helpers.rs`). It is the
- *  engine SAYING a mid-turn session was interrupted, not a turn reporting that
- *  it finished, and `continuableAbortIndex` has to tell those apart to know
- *  whether the boundary still wants a Continue button. */
-export const IDLE_ENGINE_RESTART_INTERRUPT_REASON = 'engine_restart_interrupt';
+ *  emits directly beneath its own `ResponseAborted` boundary. It is the engine
+ *  SAYING a mid-turn session was interrupted, not a turn reporting that it
+ *  finished. `continuableAbortIndex` tells the two apart to know whether the
+ *  boundary still wants a Continue button. */
+export const IDLE_ENGINE_RESTART_INTERRUPT_REASON = ENGINE_RESTART_INTERRUPT_REASON;
 
 /** Header label / preview text for a `ContinuationStarted` turn. The reason
  *  takes precedence: an `auto_recovery_after_hang` or
@@ -438,6 +441,14 @@ export type StoredEvent = ThreadEvent & {
    *  has not ended the turn, so the caller is still saying it. Nothing may
    *  settle on those words, and nothing is in flight behind them. */
   _livePartial?: true;
+  /** Marks both client-only rows of an *unsent message*: the message, and its
+   *  failure card on the next seq (`showUnsentExchange`). The engine never saw
+   *  the message, so no agent reads it and it holds no turn. */
+  _unsent?: true;
+  /** On an unsent message's client-only `MessageReceived`: the question card
+   *  it was typed to answer, by tool-use id. The fold draws it on that card
+   *  while the card awaits an answer. */
+  _answersQuestion?: string;
 };
 
 /** Events that define (or redefine) a thread's channel/source. */

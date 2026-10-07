@@ -129,11 +129,77 @@ fn one_isolated_refusal_declares_nothing() {
     // is one bad payload, not an outage, and the clock is what says so.
     assert_eq!(judge(&failing_verification(3, 4, 1)), CLEAR);
 
-    // The same three, once the clock has run out.
+    // The same three, spread across the clock.
     assert_eq!(
-        judge(&failing_verification(3, PAST_THE_CLOCK, 60)),
+        judge(&failing_verification(3, PAST_THE_CLOCK, 0)),
         RefusalVerdict::Refusing(RefusalCause::Verification)
     );
+}
+
+/// The false alarm this rule was changed for, in its real shape.
+///
+/// A local script sent three unsigned POSTs inside 61 seconds, and nothing came
+/// after. The bar went up 37 minutes later and blamed the secret, which was
+/// fine. The run was old, but its refusals spanned one minute.
+#[test]
+fn a_burst_of_refusals_followed_by_silence_declares_nothing() {
+    let burst = refusing(
+        true,
+        &[(DeliveryRefusal::SignatureMissing, 3)],
+        37 * 60,
+        37 * 60 - 61,
+    );
+    assert_eq!(judge(&burst), CLEAR);
+
+    // However long the silence lasts, short of the fortnight.
+    let week_later = refusing(
+        true,
+        &[(DeliveryRefusal::SignatureMissing, 3)],
+        7 * 86_400 + 61,
+        7 * 86_400,
+    );
+    assert_eq!(judge(&week_later), CLEAR);
+
+    // A burst of mismatches is no different. A burst is not an outage.
+    assert_eq!(
+        judge(&failing_verification(3, 37 * 60, 37 * 60 - 61)),
+        CLEAR
+    );
+}
+
+/// A mismatch run spread over hours is still an outage.
+#[test]
+fn a_spread_out_mismatch_run_still_declares() {
+    assert_eq!(
+        judge(&failing_verification(3, 3 * 3600, 600)),
+        RefusalVerdict::Refusing(RefusalCause::Verification)
+    );
+}
+
+/// The span reads the refusals, not the run's age, only for a hook that is on.
+///
+/// A switched-off hook declares on its first refusal, which spans nothing. Its
+/// clock stays the run's age, so a straggler right after the click is not news.
+#[test]
+fn a_switched_off_hook_needs_no_span() {
+    let one = refusing(
+        false,
+        &[(DeliveryRefusal::Disabled, 1)],
+        PAST_THE_CLOCK,
+        PAST_THE_CLOCK,
+    );
+    assert_eq!(
+        judge(&one),
+        RefusalVerdict::Refusing(RefusalCause::Disabled)
+    );
+}
+
+/// A verification run with no measured silence judges nothing.
+#[test]
+fn a_verification_run_with_no_measured_span_declares_nothing() {
+    let mut hook = failing_verification(42, 97_000, 300);
+    hook.refusal_run.quiet_secs = None;
+    assert_eq!(judge(&hook), CLEAR);
 }
 
 /// Both floors are `>=`, so each constant names the first value that counts.
@@ -141,13 +207,19 @@ fn one_isolated_refusal_declares_nothing() {
 fn the_two_floors_are_inclusive() {
     let exactly = failing_verification(
         REFUSALS_BEFORE_DEGRADED,
-        REFUSAL_RUN_BEFORE_DEGRADED_SECS,
+        REFUSAL_RUN_BEFORE_DEGRADED_SECS + 60,
         60,
     );
     assert_eq!(
         judge(&exactly),
         RefusalVerdict::Refusing(RefusalCause::Verification)
     );
+    let just_short = failing_verification(
+        REFUSALS_BEFORE_DEGRADED,
+        REFUSAL_RUN_BEFORE_DEGRADED_SECS + 60,
+        61,
+    );
+    assert_eq!(judge(&just_short), CLEAR);
 }
 
 /// A hook nobody delivers to any more is not news, however broken it is.

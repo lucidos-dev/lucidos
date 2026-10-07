@@ -19,9 +19,11 @@ pub mod git_auth;
 pub mod grants;
 pub mod handshake_approvals;
 pub mod home_path;
+pub mod host_sleep;
 pub mod image_described_backfill;
 pub mod image_migration;
 pub mod intents;
+pub mod keep_awake;
 pub mod knowhow;
 pub mod mcp_servers;
 pub mod models;
@@ -32,6 +34,7 @@ pub mod plugin_catalog_cache;
 pub mod plugin_marketplaces;
 pub mod plugins;
 pub mod preference_catalog;
+pub use preference_catalog as prefs;
 pub mod preferences;
 pub mod repositories;
 pub mod response_style;
@@ -254,7 +257,7 @@ pub fn injected_secret_values(env_vars: &[(String, String)]) -> Vec<String> {
                 || (key.starts_with("OAUTH_") && key.ends_with("_ACCESS_TOKEN"))
                 // Engine-minted, thread-bound, and accepted on every mutating
                 // route, so it is a credential in the sense that matters here.
-                || key == "LUCIDOS_AGENT_ORIGIN_TOKEN"
+                || key == crate::api::actor::ENV_AGENT_ORIGIN_TOKEN
         })
         .map(|(_, value)| value.clone())
         .collect()
@@ -314,7 +317,7 @@ pub fn write_json_atomic(
 pub use apps::{App, AppManager, AppReveal};
 pub use artifacts::{
     is_build_output_file, is_build_output_path, is_vendored_path, list_searchable_data_files,
-    ArtifactManager, WriteAnnouncement, VENDORED_DIR_NAMES,
+    list_user_data_files, ArtifactManager, WriteAnnouncement, VENDORED_DIR_NAMES,
 };
 pub use credentials::{
     credential_scope_covers, normalized_base_urls, AuthType, Credential, CredentialInfo,
@@ -500,24 +503,7 @@ pub use device_presence::DevicePresenceStore;
 pub use events::EventRow;
 pub use mcp_servers::{McpServer, McpServerStore};
 pub use models::{validate_routes, Model, ModelFields, ModelStore, Route};
-pub use preferences::{
-    PreferenceStore, ResolvedModelSelection, DEFAULT_CHAT_MODEL, DEFAULT_COMMAND_JUDGE_MODEL,
-    DEFAULT_COMMAND_JUDGE_REASONING, DEFAULT_LOCAL_BASE_URL, DEFAULT_MAX_TOOL_CALLS,
-    DEFAULT_VERTEX_REGION, MIN_MAX_TOOL_CALLS, PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT,
-    PREF_CODING_AGENT_CLAUDE_PATH, PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
-    PREF_CODING_AGENT_CODEX_PATH, PREF_IMAGE_MODEL, PREF_JUDGMENT_COMMAND_GUARD,
-    PREF_JUDGMENT_QUERY_CLASSIFICATION, PREF_LOCAL_BASE_URL, PREF_MODEL_CHANGE_SUMMARY,
-    PREF_MODEL_COMMAND_JUDGE, PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_IMAGE_DESCRIPTION,
-    PREF_MODEL_MEMORY, PREF_MODEL_QUERY_CLASSIFICATION, PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER,
-    PREF_MODEL_VOICE_TRANSCRIBER, PREF_OPENCODE_FREE_ENABLED, PREF_PROVIDER_ENABLED_ANTHROPIC,
-    PREF_PROVIDER_ENABLED_LOCAL, PREF_PROVIDER_ENABLED_OPENAI, PREF_PROVIDER_ENABLED_OPENROUTER,
-    PREF_PROVIDER_ENABLED_TYPESAFE, PREF_PROVIDER_ENABLED_VERTEX, PREF_PROVIDER_ENABLED_XAI,
-    PREF_PROXY_TIMEOUT_SECS, PREF_REASONING_CHANGE_SUMMARY, PREF_REASONING_COMMAND_JUDGE,
-    PREF_REASONING_CONVERSATION_SUMMARY, PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY,
-    PREF_REASONING_QUERY_CLASSIFICATION, PREF_REASONING_TITLE, PREF_RESPONSE_STYLE,
-    PREF_RESPONSE_STYLES, PREF_SELF_CURATED_CONTEXT_MODE, PREF_TECHNICAL_LITERACY,
-    PREF_VERTEX_REGION, PREF_VOICE_RESIDENT_SECTIONS, PREF_VOICE_TALKER_VOICE,
-};
+pub use preferences::{PreferenceStore, ResolvedModelSelection};
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, SessionMessage, Step, ThreadEventRow,
     ThreadSummary,
@@ -1412,6 +1398,14 @@ fn search_label(verb: &str, args: &serde_json::Value) -> String {
     }
 }
 
+/// A recall step's label, naming what it looks for.
+fn recall_label(verb: &str, what: Option<&str>) -> String {
+    match what.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(w) => format!("{verb} \"{}\" in memory...", middle_truncate(w, 50)),
+        None => format!("{verb} in memory..."),
+    }
+}
+
 /// The step label for the `threads` tool's `drafts` action: one thread's draft
 /// when a `thread_id` is named, every draft otherwise.
 fn drafts_label(args: &serde_json::Value) -> String {
@@ -1951,6 +1945,16 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some("source") => "Tracing a memory to its conversation...".to_string(),
             _ => "Updating memory...".to_string(),
         },
+        "recall" => match args["action"].as_str() {
+            Some("find") => recall_label("Finding", args["query"].as_str()),
+            Some("search") => recall_label("Searching messages", args["text"].as_str()),
+            Some("date") => "Dating a memory line...".to_string(),
+            _ => "Opening a memory line...".to_string(),
+        },
+        "recall_zoom" => "Opening a memory line...".to_string(),
+        "recall_find" => recall_label("Finding", args["query"].as_str()),
+        "recall_search" => recall_label("Searching messages", args["text"].as_str()),
+        "recall_date" => "Dating a memory line...".to_string(),
         "threads" => match args["action"].as_str() {
             Some("count") => "Counting threads...".to_string(),
             Some("search") => search_label("Searching past conversations", args),

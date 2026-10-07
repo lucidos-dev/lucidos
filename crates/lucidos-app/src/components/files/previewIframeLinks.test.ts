@@ -44,13 +44,16 @@ vi.mock('../../utils/basePath', async () => {
 const {
   classifyPreviewLink,
   resolvePreviewRelativePath,
+  resolvePreviewRelativeRepoPath,
   handlePreviewLinkClick,
   previewBaseHref,
   withPreviewBase,
   withPreviewSizing,
   documentDeclaresBase,
+  PREVIEW_FIND_RULES,
 } = await import('./previewIframeLinks');
-const { parseRepoPath, repositories } = await import('../../store/store');
+const { ALL_HIGHLIGHT, CURRENT_HIGHLIGHT } = await import('@lucidos/find');
+const { parseRepoPath, encodeRepoPath, repositories } = await import('../../store/store');
 
 const TID = '961b9b83-53b7-47cd-8982-3c959d7f1137';
 
@@ -176,6 +179,14 @@ describe('classifyPreviewLink', () => {
     expect(classifyPreviewLink('trigger:3f9b21c4-0a7e', ctx())).toEqual({
       kind: 'trigger',
       triggerId: '3f9b21c4-0a7e',
+    });
+  });
+
+  it('routes a settings page href to that page', () => {
+    expect(classifyPreviewLink('settings:backup', ctx())).toEqual({
+      kind: 'nav',
+      target: 'settings',
+      settingsView: 'backup',
     });
   });
 
@@ -319,6 +330,95 @@ describe('resolvePreviewRelativePath', () => {
   });
 });
 
+describe('resolvePreviewRelativeRepoPath', () => {
+  const locator = { repoId: 'repo-1', mode: 'file' as const, ref: 'main', path: 'docs/notes/start.md' };
+
+  it('resolves a sibling inside the checkout', () => {
+    expect(resolvePreviewRelativeRepoPath(locator, 'intro.md'))
+      .toEqual({ ...locator, path: 'docs/notes/intro.md' });
+  });
+
+  it('resolves a parent-relative path, preserving repoId/mode/ref', () => {
+    expect(resolvePreviewRelativeRepoPath(locator, '../guide.md'))
+      .toEqual({ ...locator, path: 'docs/guide.md' });
+  });
+
+  it('anchors a leading slash at the checkout root, not the workspace data root', () => {
+    expect(resolvePreviewRelativeRepoPath(locator, '/README.md'))
+      .toEqual({ ...locator, path: 'README.md' });
+  });
+
+  it('never climbs past the checkout root, however many `..` the href carries', () => {
+    expect(resolvePreviewRelativeRepoPath(locator, '../../../../../etc/passwd'))
+      .toEqual({ ...locator, path: 'etc/passwd' });
+  });
+
+  it('drops a query string and fragment', () => {
+    expect(resolvePreviewRelativeRepoPath(locator, 'intro.md?v=2#top'))
+      .toEqual({ ...locator, path: 'docs/notes/intro.md' });
+  });
+
+  it('carries a diff locator\'s changeId through untouched', () => {
+    const diffLocator = { repoId: 'repo-1', mode: 'diff' as const, changeId: 'change-7', path: 'docs/start.md' };
+    expect(resolvePreviewRelativeRepoPath(diffLocator, '../guide.md'))
+      .toEqual({ ...diffLocator, path: 'guide.md' });
+  });
+});
+
+describe('classifyPreviewLink with a repo-flavored context', () => {
+  const repoLocator = { repoId: 'repo-1', mode: 'file' as const, ref: 'main', path: 'docs/notes/start.md' };
+  const repoCtx = () => ctx({ repoLocator });
+
+  it('resolves a relative sibling against the checkout, encoded for the unified file preview', () => {
+    expect(classifyPreviewLink('../guide.md', repoCtx())).toEqual({
+      kind: 'file',
+      path: encodeRepoPath({ ...repoLocator, path: 'docs/guide.md' }),
+    });
+  });
+
+  it('anchors a root-relative href at the checkout, never the OS filesystem', () => {
+    // Without a repoLocator, a leading `/` is an absolute OS path
+    // (`extractLocalFileTarget`). A repo preview means something else by it.
+    expect(classifyPreviewLink('/README.md', repoCtx())).toEqual({
+      kind: 'file',
+      path: encodeRepoPath({ ...repoLocator, path: 'README.md' }),
+    });
+  });
+
+  it('still routes a thread/app/trigger/settings/repo/absolute-URL href unchanged', () => {
+    expect(classifyPreviewLink(`thread:${TID}`, repoCtx())).toEqual({
+      kind: 'thread', workspace: undefined, threadId: TID,
+    });
+    expect(classifyPreviewLink('app:habit-tracker', repoCtx())).toEqual({
+      kind: 'app', appId: 'habit-tracker', fragment: undefined,
+    });
+    expect(classifyPreviewLink('trigger:3f9b21c4-0a7e', repoCtx())).toEqual({
+      kind: 'trigger', triggerId: '3f9b21c4-0a7e',
+    });
+    expect(classifyPreviewLink('settings:backup', repoCtx())).toEqual({
+      kind: 'nav', target: 'settings', settingsView: 'backup',
+    });
+    expect(classifyPreviewLink('repo:repo-2:file:src/main.rs', repoCtx())).toEqual({
+      kind: 'repo-file', locator: parseRepoPath('repo:repo-2:file:src/main.rs'),
+    });
+    expect(classifyPreviewLink('https://example.com/x', repoCtx())).toEqual({
+      kind: 'external', url: 'https://example.com/x',
+    });
+  });
+
+  it('leaves an in-page fragment a fragment, not a repo-resolved file', () => {
+    expect(classifyPreviewLink('#section', repoCtx())).toEqual({ kind: 'fragment', id: 'section' });
+  });
+
+  // A `file://` URL is unambiguous in any context, unlike a bare leading `/`:
+  // it must keep going to the OS opener even when previewing a repo file.
+  it('still hands a file:// URL to the OS opener', () => {
+    expect(classifyPreviewLink('file:///Users/me/notes.txt', repoCtx())).toEqual({
+      kind: 'local-file', target: 'file:///Users/me/notes.txt',
+    });
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Markdown preview clicks (rendered in the host document)
 // ---------------------------------------------------------------------------
@@ -330,6 +430,7 @@ function clickOn(
   href: string | null,
   attrs: Record<string, string> = {},
   modifiers: Partial<{ metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; button: number }> = {},
+  documentRoot: ReturnType<typeof renderedDocument>['root'] | null = null,
 ) {
   const anchor =
     href === null
@@ -337,6 +438,7 @@ function clickOn(
       : {
         getAttribute: (name: string) => (name === 'href' ? href : attrs[name] ?? null),
         hasAttribute: (name: string) => name in attrs,
+        closest: (selector: string) => (selector === '.markdown-content' ? documentRoot : null),
       };
   const e = {
     defaultPrevented: false,
@@ -353,6 +455,16 @@ function clickOn(
   return e;
 }
 
+/** A rendered markdown document holding elements with these ids or names. */
+function renderedDocument(elements: { id?: string; name?: string }[]) {
+  const nodes = elements.map((el) => ({
+    id: el.id ?? '',
+    getAttribute: (attr: string) => (attr === 'name' ? el.name ?? null : null),
+    scrollIntoView: vi.fn(),
+  }));
+  return { nodes, root: { querySelectorAll: () => nodes, scrollIntoView: vi.fn() } };
+}
+
 function clickInMarkdown(
   href: string | null,
   artifactPath = 'artifacts/x.md',
@@ -365,8 +477,7 @@ function clickInMarkdown(
 
 // A markdown artifact renders into the HOST document. So its relative links
 // resolve against the engine-stamped `<base href="/<slug>/">`, and would reload
-// the whole workspace through the SPA fallback. Fragments there are a harmless
-// same-document hash change, so they stay with the browser.
+// the whole workspace through the SPA fallback.
 describe('markdown preview links (rendered in the host document)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -418,10 +529,64 @@ describe('markdown preview links (rendered in the host document)', () => {
     expect(mocks.openThreadAcrossWorkspaces).toHaveBeenCalledWith('My Workspace', TID);
   });
 
-  it('leaves an in-page fragment to the browser', () => {
-    const e = clickInMarkdown('#section-two');
-    expect(e.defaultPrevented).toBe(false);
-    expect(mocks.showToast).not.toHaveBeenCalled();
+  // The host page's hash belongs to the deep-link router. A heading id carries
+  // a prefix, so it cannot shadow one of the shell's own ids. So the preview
+  // scrolls itself rather than letting the browser follow `#x`.
+  describe('in-page fragments', () => {
+    const SLUG = 'auth-tier-compatibility-api-key-vs-subscription--oauth';
+
+    function clickFragment(href: string, doc: ReturnType<typeof renderedDocument>, repoLocator?: Parameters<typeof handlePreviewLinkClick>[2]) {
+      const e = clickOn(href, {}, {}, doc.root);
+      handlePreviewLinkClick(e as unknown as MouseEvent, 'artifacts/notes.md', repoLocator);
+      return e;
+    }
+
+    it('scrolls to the heading a table-of-contents link names', () => {
+      const doc = renderedDocument([{ id: 'user-content-intro' }, { id: `user-content-${SLUG}` }]);
+      const e = clickFragment(`#${SLUG}`, doc);
+      expect(e.defaultPrevented).toBe(true);
+      expect(doc.nodes[1].scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({ block: 'start' }));
+      expect(doc.nodes[0].scrollIntoView).not.toHaveBeenCalled();
+    });
+
+    it('decodes the fragment before matching it', () => {
+      const doc = renderedDocument([{ id: 'user-content-café' }]);
+      clickFragment('#caf%C3%A9', doc);
+      expect(doc.nodes[0].scrollIntoView).toHaveBeenCalled();
+    });
+
+    it('lands on an authored id or a named anchor too', () => {
+      const doc = renderedDocument([{ id: 'custom' }, { name: 'legacy' }]);
+      clickFragment('#custom', doc);
+      clickFragment('#legacy', doc);
+      expect(doc.nodes[0].scrollIntoView).toHaveBeenCalled();
+      expect(doc.nodes[1].scrollIntoView).toHaveBeenCalled();
+    });
+
+    it('prefers the heading over an authored id with the bare slug', () => {
+      const doc = renderedDocument([{ id: 'usage' }, { id: 'user-content-usage' }]);
+      clickFragment('#usage', doc);
+      expect(doc.nodes[1].scrollIntoView).toHaveBeenCalled();
+      expect(doc.nodes[0].scrollIntoView).not.toHaveBeenCalled();
+    });
+
+    it('scrolls to the top for a bare #', () => {
+      const doc = renderedDocument([]);
+      expect(clickFragment('#', doc).defaultPrevented).toBe(true);
+      expect(doc.root.scrollIntoView).toHaveBeenCalled();
+    });
+
+    it('says so when the document has no such section, naming the repo file by its path', () => {
+      const doc = renderedDocument([{ id: 'user-content-intro' }]);
+      clickFragment('#gone', doc, { repoId: 'repo-1', mode: 'file', path: 'docs/guide.md' });
+      expect(mocks.showToast).toHaveBeenCalledWith('No "gone" section in docs/guide.md', 'error');
+    });
+
+    it('leaves a fragment outside a rendered document to the browser', () => {
+      const e = clickInMarkdown('#section-two');
+      expect(e.defaultPrevented).toBe(false);
+      expect(mocks.showToast).not.toHaveBeenCalled();
+    });
   });
 
   it('leaves an unclaimed href and a non-anchor click completely alone', () => {
@@ -521,9 +686,11 @@ describe('withPreviewBase', () => {
 describe('withPreviewSizing', () => {
   const DOC = '<!DOCTYPE html><html><head><title>T</title></head><body>x</body></html>';
   const BODY = ':where(body){font-size:0.75rem}';
+  /** Everything after the zoom: the body default, then the find highlights. */
+  const AFTER_ZOOM = BODY + PREVIEW_FIND_RULES;
 
   it('stamps zoom and the body default as the first thing in <head>', () => {
-    expect(withPreviewSizing(DOC, 125)).toContain(`<head><style>:root{zoom:125%}${BODY}</style><title>`);
+    expect(withPreviewSizing(DOC, 125)).toContain(`<head><style>:root{zoom:125%}${AFTER_ZOOM}</style><title>`);
   });
 
   it('keeps the fractional step of the preference grid', () => {
@@ -545,7 +712,7 @@ describe('withPreviewSizing', () => {
   // The default scale stamps no zoom, so 100% zooms nothing. The body default
   // does not depend on the scale and still applies.
   it('stamps no zoom at 100%', () => {
-    expect(withPreviewSizing(DOC, 100)).toBe(DOC.replace('<head>', `<head><style>${BODY}</style>`));
+    expect(withPreviewSizing(DOC, 100)).toBe(DOC.replace('<head>', `<head><style>${AFTER_ZOOM}</style>`));
   });
 
   // An unreadable preference must never cost the reader the document.
@@ -558,7 +725,7 @@ describe('withPreviewSizing', () => {
 
   it('creates a head when the document has <html> but no <head>', () => {
     expect(withPreviewSizing('<html><body>x</body></html>', 125))
-      .toBe(`<html><head><style>:root{zoom:125%}${BODY}</style></head><body>x</body></html>`);
+      .toBe(`<html><head><style>:root{zoom:125%}${AFTER_ZOOM}</style></head><body>x</body></html>`);
   });
 
   it('keeps the doctype first, so the page stays out of quirks mode', () => {
@@ -566,7 +733,7 @@ describe('withPreviewSizing', () => {
   });
 
   it('prepends to a bare fragment', () => {
-    expect(withPreviewSizing('<p>x</p>', 125)).toBe(`<style>:root{zoom:125%}${BODY}</style><p>x</p>`);
+    expect(withPreviewSizing('<p>x</p>', 125)).toBe(`<style>:root{zoom:125%}${AFTER_ZOOM}</style><p>x</p>`);
   });
 
   // The two stamps compose the way the preview composes them, and the base has
@@ -583,5 +750,12 @@ describe('withPreviewSizing', () => {
     const sized = withPreviewSizing(html, 125);
     expect(documentDeclaresBase(sized)).toBe(true);
     expect(withPreviewBase(sized, 'https://h/ws/data/artifacts/')).toBe(sized);
+  });
+
+  it('styles the find bar\'s highlights with the system\'s own find colours', () => {
+    const out = withPreviewSizing(DOC, 100);
+    expect(out).toContain('--find-highlights:styled');
+    expect(out).toContain(`::highlight(${ALL_HIGHLIGHT})`);
+    expect(out).toContain(`::highlight(${CURRENT_HIGHLIGHT})`);
   });
 });

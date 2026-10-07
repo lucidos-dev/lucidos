@@ -13,6 +13,7 @@
  */
 import type { BackupProviderInfo, BackupSchedule } from '../../api/client';
 import { pickInitialProvider } from './backupProviderScopes';
+import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 
 /** May an in-flight background refresh apply what it read?
  *
@@ -91,7 +92,7 @@ export function backupSeed(
   }
   return {
     providers,
-    schedule: scheduleRead.value.schedule || 'off',
+    schedule: scheduleRead.value.schedule || PREFERENCE_CATALOG.backup_schedule.fallback,
     provider: pickInitialProvider(scheduleRead.value.provider, available),
   };
 }

@@ -40,8 +40,8 @@ const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// User-facing message for Drive auth failures. Shared between the metadata-call
 /// path (`check_drive_status`) and the resumable-upload path (`classify_chunk_response`)
 /// so the wording stays in sync.
-const DRIVE_AUTH_401_MSG: &str = "Google Drive authentication failed (401). Go to Settings > Backup and click 'Grant access' to re-authorize.";
-const DRIVE_AUTH_403_MSG: &str = "Google Drive access denied (403). Go to Settings > Backup and click 'Grant access' to authorize Drive permissions.";
+const DRIVE_AUTH_401_MSG: &str = "Google Drive authentication failed (401). Go to Settings → System → Backup and click 'Grant access' to re-authorize.";
+const DRIVE_AUTH_403_MSG: &str = "Google Drive access denied (403). Go to Settings → System → Backup and click 'Grant access' to authorize Drive permissions.";
 
 /// Shown when a 403 carries a storage-quota reason — an over-quota failure, NOT
 /// an access problem. Must NOT mention "Grant access": the old code mapped EVERY
@@ -64,7 +64,7 @@ pub const GRANT_SCOPES: &[&str] = &["https://www.googleapis.com/auth/drive.file"
 
 /// Shown by preflight when the granted token is missing the required Drive
 /// scope — the ONLY preflight case that should tell the user to re-grant access.
-const DRIVE_SCOPE_MISSING_MSG: &str = "Google Drive backup is missing the required Drive permission. Go to Settings > Backup and click 'Grant access' to re-authorize.";
+const DRIVE_SCOPE_MISSING_MSG: &str = "Google Drive backup is missing the required Drive permission. Go to Settings → System → Backup and click 'Grant access' to re-authorize.";
 
 /// Drive-specific resumable-upload headers (reqwest has no constants for these).
 const X_UPLOAD_CONTENT_TYPE: &str = "X-Upload-Content-Type";
@@ -377,7 +377,7 @@ impl GoogleDriveBackupProvider {
         //
         // Every caller of this is on the backup path, where an error string is
         // persisted: it becomes the `BackupFailed` event body, the
-        // `PREF_BACKUP_LAST_RUN` preference, an SSE frame to every device, and
+        // `prefs::BACKUP_LAST_RUN` preference, an SSE frame to every device, and
         // the `/api/v1/backup/status` response. The events table is append
         // only, so a live OAuth token written there cannot be redacted later.
         // One offline moment during a scheduled backup was enough.
@@ -515,41 +515,6 @@ impl GoogleDriveBackupProvider {
         Ok(folder_id)
     }
 
-    /// Step 1 of resumable upload: POST metadata, get back the session URI in
-    /// the `Location` header.
-    async fn initiate_resumable_session(
-        &self,
-        token: &str,
-        metadata: &serde_json::Value,
-        total_size: u64,
-    ) -> Result<String, BoxError> {
-        // `size` rides along with `id` so the completed upload can be checked
-        // against the local archive (see `verify_stored_size`).
-        let url = format!("{}?uploadType=resumable&fields=id,size", DRIVE_UPLOAD_URL);
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/json; charset=UTF-8",
-            )
-            .header(X_UPLOAD_CONTENT_TYPE, "application/octet-stream")
-            .header(X_UPLOAD_CONTENT_LENGTH, total_size.to_string())
-            .body(metadata.to_string())
-            .send()
-            .await?;
-        let resp = check_drive_status(resp).await?;
-        let location = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .ok_or("Drive resumable upload: missing Location header")?
-            .to_str()
-            .map_err(|e| format!("Invalid Location header: {}", e))?
-            .to_string();
-        Ok(location)
-    }
-
     /// Drive's resumable upload protocol: open a session, then feed the file to
     /// [`upload_chunks`].
     async fn resumable_upload(
@@ -564,20 +529,126 @@ impl GoogleDriveBackupProvider {
             return Err("Refusing to upload empty backup file".into());
         }
 
-        let session_uri = self
-            .initiate_resumable_session(token, metadata, total_size)
-            .await?;
+        // `size` rides along with `id` so the completed upload can be checked
+        // against the local archive (see `verify_stored_size`).
+        let url = format!("{}?uploadType=resumable&fields=id,size", DRIVE_UPLOAD_URL);
+        let cfg = ChunkLoopConfig::default();
+        let session = SessionRequest {
+            url: &url,
+            metadata,
+            total_size,
+        };
+        let session_uri =
+            open_resumable_session(&self.client, &session, token, || self.get_token(), &cfg)
+                .await?;
 
         upload_chunks(
             &self.client,
             &session_uri,
             file_path,
             total_size,
-            &ChunkLoopConfig::default(),
+            &cfg,
             progress,
         )
         .await
     }
+}
+
+/// What step 1 of a resumable upload sends: the file's metadata, to the
+/// endpoint that answers with the session URI.
+struct SessionRequest<'a> {
+    url: &'a str,
+    metadata: &'a serde_json::Value,
+    total_size: u64,
+}
+
+/// Step 1 of a resumable upload: POST the metadata and read the session URI
+/// from the `Location` header.
+///
+/// Retried like a chunk, on the same budget and backoff. Nothing is stored yet,
+/// so a retry costs one small request. A session nobody uses expires on its own.
+///
+/// Each retry asks `refresh_token` again: a retry after a long sleep would
+/// otherwise send an expired token, and the 401 would blame the grant. A
+/// refresh that fails keeps the token it had.
+async fn open_resumable_session<F, Fut>(
+    client: &reqwest::Client,
+    session: &SessionRequest<'_>,
+    token: &str,
+    refresh_token: F,
+    cfg: &ChunkLoopConfig,
+) -> Result<String, BoxError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<String, BoxError>>,
+{
+    let mut token = token.to_string();
+    let mut retry: u32 = 0;
+    loop {
+        let failure = match send_session_open(client, session, &token).await {
+            Ok(location) => return Ok(location),
+            Err(ChunkError::Fatal(e)) => return Err(e),
+            Err(ChunkError::Transient(msg)) => msg,
+        };
+        if retry >= MAX_RETRIES_PER_CHUNK {
+            return Err(format!(
+                "Could not start the Google Drive upload after {} retries. {}",
+                MAX_RETRIES_PER_CHUNK, failure
+            )
+            .into());
+        }
+        let backoff = (cfg.backoff)(retry);
+        crate::log!(
+            "[Backup] Opening the upload session failed (retry {}/{} after {:?}): {}",
+            retry + 1,
+            MAX_RETRIES_PER_CHUNK,
+            backoff,
+            failure
+        );
+        tokio::time::sleep(backoff).await;
+        retry += 1;
+        match refresh_token().await {
+            Ok(fresh) => token = fresh,
+            Err(e) => crate::log!("[Backup] Token refresh before the retry failed: {}", e),
+        }
+    }
+}
+
+async fn send_session_open(
+    client: &reqwest::Client,
+    session: &SessionRequest<'_>,
+    token: &str,
+) -> Result<String, ChunkError> {
+    let sent = client
+        .post(session.url)
+        .timeout(CHUNK_REQUEST_TIMEOUT)
+        .bearer_auth(token)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/json; charset=UTF-8",
+        )
+        .header(X_UPLOAD_CONTENT_TYPE, "application/octet-stream")
+        .header(X_UPLOAD_CONTENT_LENGTH, session.total_size.to_string())
+        .body(session.metadata.to_string())
+        .send()
+        .await;
+    let resp = sent.map_err(|e| {
+        ChunkError::Transient(super::transport_failure(
+            "Google Drive",
+            "starting the upload",
+            e,
+        ))
+    })?;
+    if !resp.status().is_success() {
+        return Err(classify_failed_status(resp).await);
+    }
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .ok_or_else(|| ChunkError::Fatal("Drive resumable upload: missing Location header".into()))?
+        .to_str()
+        .map_err(|e| ChunkError::Fatal(format!("Invalid Location header: {}", e).into()))?;
+    Ok(location.to_string())
 }
 
 /// Send one PUT to the resumable session URI: either a chunk (with body) or a
@@ -604,7 +675,11 @@ async fn send_resumable_put(
 
     match req.send().await {
         Ok(resp) => classify_chunk_response(resp).await,
-        Err(e) => Err(ChunkError::Transient(format!("network: {}", e))),
+        Err(e) => Err(ChunkError::Transient(super::transport_failure(
+            "Google Drive",
+            "uploading",
+            e,
+        ))),
     }
 }
 
@@ -764,14 +839,21 @@ async fn classify_chunk_response(resp: reqwest::Response) -> Result<ChunkOutcome
         return Ok(continue_from_range(header));
     }
 
+    Err(classify_failed_status(resp).await)
+}
+
+/// Classify a failed resumable-upload response, for the session open and for
+/// a chunk alike.
+async fn classify_failed_status(resp: reqwest::Response) -> ChunkError {
+    let status = resp.status();
     if status == StatusCode::UNAUTHORIZED {
-        return Err(ChunkError::Fatal(DRIVE_AUTH_401_MSG.into()));
+        return ChunkError::Fatal(DRIVE_AUTH_401_MSG.into());
     }
     if status == StatusCode::FORBIDDEN {
         // Classify by the error body so an over-quota 403 (the production
         // failure) isn't mislabeled as an access problem during the upload.
         let body = resp.text().await.unwrap_or_default();
-        return Err(ChunkError::Fatal(classify_403_body(&body).into()));
+        return ChunkError::Fatal(classify_403_body(&body).into());
     }
 
     // 5xx / 408 / 429 are transient per Drive's resumable-upload guidance.
@@ -781,15 +863,13 @@ async fn classify_chunk_response(resp: reqwest::Response) -> Result<ChunkOutcome
     {
         let code = status.as_u16();
         let body = resp.text().await.unwrap_or_default();
-        return Err(ChunkError::Transient(format!("HTTP {}: {}", code, body)));
+        return ChunkError::Transient(format!("HTTP {}: {}", code, body));
     }
 
     // Anything else (4xx) — give up.
     let code = status.as_u16();
     let body = resp.text().await.unwrap_or_default();
-    Err(ChunkError::Fatal(
-        format!("Drive upload failed with HTTP {}: {}", code, body).into(),
-    ))
+    ChunkError::Fatal(format!("Drive upload failed with HTTP {}: {}", code, body).into())
 }
 
 #[async_trait]
@@ -1604,5 +1684,117 @@ mod chunk_loop_tests {
         let err = f.run().await.unwrap_err().to_string();
         assert!(err.contains("stored 299 of 300 bytes"), "got: {err}");
         assert!(err.contains("was not recorded"), "got: {err}");
+    }
+}
+
+/// Step 1 of the upload, the POST that opens the session. A computer that
+/// slept with it in flight saw it fail on wake. With no retry, the whole backup
+/// failed before a single chunk was sent.
+#[cfg(test)]
+mod session_open_tests {
+    use super::*;
+    use axum::extract::State;
+    use axum::response::Response;
+
+    const SESSION_URI: &str = "https://upload.example/session?upload_id=abc";
+
+    /// The statuses still to send, and the bearer token of each POST.
+    type MockState = (Arc<Mutex<Vec<u16>>>, Arc<Mutex<Vec<String>>>);
+
+    /// Replies to the POST in order, then 200 with a Location for the rest.
+    async fn spawn_mock(script: Vec<u16>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state: MockState = (Arc::new(Mutex::new(script)), calls.clone());
+        async fn handler(
+            State((script, calls)): State<MockState>,
+            headers: axum::http::HeaderMap,
+        ) -> Response {
+            let bearer = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            calls.lock().await.push(bearer);
+            let mut script = script.lock().await;
+            let status = if script.is_empty() {
+                200
+            } else {
+                script.remove(0)
+            };
+            let mut builder = Response::builder().status(status);
+            if status == 200 {
+                builder = builder.header("location", SESSION_URI);
+            }
+            builder.body(axum::body::Body::empty()).unwrap()
+        }
+        let app = axum::Router::new()
+            .route("/upload", axum::routing::post(handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}/upload", addr), calls)
+    }
+
+    /// Opens a session with token `first`, refreshing to `fresh` per retry.
+    async fn open(url: &str) -> Result<String, BoxError> {
+        let metadata = serde_json::json!({ "name": "archive.enc" });
+        let session = SessionRequest {
+            url,
+            metadata: &metadata,
+            total_size: 300,
+        };
+        let cfg = ChunkLoopConfig {
+            chunk_size: RESUMABLE_CHUNK_SIZE,
+            backoff: |_| Duration::ZERO,
+        };
+        let refresh = || async { Ok::<_, BoxError>("fresh".to_string()) };
+        open_resumable_session(&reqwest::Client::new(), &session, "first", refresh, &cfg).await
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_is_retried_until_the_session_opens() {
+        let (url, calls) = spawn_mock(vec![503, 429]).await;
+        assert_eq!(open(&url).await.unwrap(), SESSION_URI);
+        assert_eq!(calls.lock().await.len(), 3);
+    }
+
+    /// A retry after a long sleep must not send the token it had before: it
+    /// may have expired, and the 401 would blame the grant.
+    #[tokio::test]
+    async fn each_retry_sends_a_refreshed_token() {
+        let (url, calls) = spawn_mock(vec![503]).await;
+        assert_eq!(open(&url).await.unwrap(), SESSION_URI);
+        assert_eq!(*calls.lock().await, vec!["Bearer first", "Bearer fresh"]);
+    }
+
+    #[tokio::test]
+    async fn an_auth_failure_is_not_retried() {
+        let (url, calls) = spawn_mock(vec![401]).await;
+        let err = open(&url).await.unwrap_err().to_string();
+        assert_eq!(err, DRIVE_AUTH_401_MSG);
+        assert_eq!(calls.lock().await.len(), 1);
+    }
+
+    /// The reported failure, with nothing listening: every attempt loses the
+    /// connection. The error names the step and its cause, never the URL.
+    #[tokio::test]
+    async fn a_lost_connection_exhausts_the_budget_and_says_what_happened() {
+        let err = open("http://127.0.0.1:1/upload?uploadType=resumable")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("after 6 retries"), "{err}");
+        assert!(
+            err.contains("Lost the connection to Google Drive while starting the upload"),
+            "{err}"
+        );
+        assert!(!err.contains("127.0.0.1"), "the URL leaked: {err}");
+        assert!(
+            err.to_lowercase().contains("refused"),
+            "the cause chain is missing: {err}"
+        );
     }
 }

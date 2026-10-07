@@ -1552,3 +1552,12 @@ async fn the_fan_out_runs_on_its_own_task_at_the_callers_chain_depth() {
 
     assert_eq!(depth_rx.await.expect("the fan-out task ran"), 3);
 }
+
+/// `sw.js` is a classic service worker served raw, so it cannot import the
+/// tag. This pins its copy to [`DEFAULT_NOTIFICATION_TAG`].
+#[test]
+fn the_service_worker_falls_back_to_the_same_tag() {
+    let sw = include_str!("../../../lucidos-app/public/sw.js");
+    let needle = format!("const DEFAULT_NOTIFICATION_TAG = '{DEFAULT_NOTIFICATION_TAG}';");
+    assert!(sw.contains(&needle), "sw.js must carry `{needle}`");
+}

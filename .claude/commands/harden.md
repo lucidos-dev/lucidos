@@ -183,11 +183,12 @@ elif git diff main...HEAD --name-only | grep -q '\.rs$'; then
 fi
 ```
 
-Then launch the suites in their own Bash call, with the tool's
-`run_in_background: true`:
+Then launch the suites in their own Bash call, behind a shell `&` with its
+output redirected. Claude Code's own background mode is off under Lucidos
+(ADR 0358), so the shell does the backgrounding:
 
 ```bash
-./scripts/harden-suites.sh start --early
+mkdir -p .lucidos && ./scripts/harden-suites.sh start --early > .lucidos/harden-suites-start.log 2>&1 &
 ```
 
 - **Codex-backend runs skip this step.** They have no background Bash, so they
@@ -221,12 +222,11 @@ This step is **advisory**: its findings feed the same validate→fix pipeline as
 - **Docs-only:** this whole phase is skipped, so Codex review is skipped too (it's a code reviewer, not a prose reviewer).
 - **Merge-only or incremental (Phase 0.4):** with a `codex-base <sha>` line, prefix the script in the launch call below with `CODEX_BASE=<sha>`. `INCREMENTAL` without one keeps the default base `main`. `MERGE_ONLY` skips this step: note "Codex review: skipped (merge-only)", since the earlier run already covered the branch.
 
-`./scripts/harden-codex-review.sh` runs the review. It resolves the companion installed with the `codex` plugin, so never hardcode a path. Run the launch below as **one** Bash call with the tool's own `run_in_background: true`. It writes the review to `.lucidos/codex-review.out` and drops `.lucidos/codex-review.done` when it ends, which is what Phase 3 joins on: Claude Code has no blocking wait tool. `CODEX_BASE` defaults to `main`, matching `/harden`'s diff base of `main...HEAD`:
+`./scripts/harden-codex-review.sh` runs the review. It resolves the companion installed with the `codex` plugin, so never hardcode a path. Run the launch below as **one** Bash call. The subshell runs behind a shell `&`, because Claude Code's own background mode is off under Lucidos (ADR 0358). It writes the review to `.lucidos/codex-review.out` and drops `.lucidos/codex-review.done` when it ends, which is what Phase 3 joins on: Claude Code has no blocking wait tool. `CODEX_BASE` defaults to `main`, matching `/harden`'s diff base of `main...HEAD`:
 
 ```bash
 mkdir -p .lucidos && rm -f .lucidos/codex-review.done
-./scripts/harden-codex-review.sh > .lucidos/codex-review.out 2>&1
-touch .lucidos/codex-review.done
+( ./scripts/harden-codex-review.sh > .lucidos/codex-review.out 2>&1; touch .lucidos/codex-review.done ) > /dev/null 2>&1 &
 ```
 
 The script header documents what it guarantees:
@@ -234,7 +234,7 @@ The script header documents what it guarantees:
 - **The last line of the output is always one status line**: a verdict, `NO VERDICT` with the upstream cause, or `unavailable`.
 - **It probes the CLI up to three times first.** An `npm install -g` of the Codex CLI breaks both of the companion's readiness checks for a few seconds.
 - **It retries a reviewer that returns no verdict once.**
-- **It never passes the companion's `--background` flag**, which `review` parses and then ignores. The parallelism comes from the Bash tool.
+- **It never passes the companion's `--background` flag**, which `review` parses and then ignores. The parallelism comes from the shell `&`.
 
 **The `.done` marker is the handle for the Phase 3 join.** There is no companion job id to capture. Do NOT wait for the review here, continue immediately into the `code-review` skill below.
 
@@ -276,7 +276,7 @@ Run `git diff main...HEAD` to get the current diff (including any Phase 1 fixes)
 **Subagents are optional — the angles are not.** Mirrors the `code-review` skill's contract:
 
 - **Small diff (Phase 0.6), merge-only or incremental (Phase 0.4):** run the three angles inline, as the Codex bullet below describes, on any backend.
-- **Claude Code:** launch the three agents as parallel subagents, all three in ONE assistant message, each with **`run_in_background: false`** (faster, independent perspectives). That flag is load-bearing under Lucidos. The Agent tool backgrounds a subagent by default and delivers its report later as a notification. The engine tears down your process group the moment your turn ends, so that notification never arrives. One message keeps the three parallel; `run_in_background: false` makes each call block and hand you its report inline. Never wait by launching a filler agent, sleeping, or asking a placeholder question.
+- **Claude Code:** launch the three agents as parallel subagents, all three in ONE assistant message (faster, independent perspectives). Under Lucidos each `Agent` call blocks and hands you its report inline, because Claude Code's background mode is off (ADR 0358). Do not pass `run_in_background`: the parameter does not exist, so the call fails. One message keeps the three parallel. Never wait by launching a filler agent, sleeping, or asking a placeholder question.
 - **Codex / any agent without a Task tool:** you have NO subagent capability — do NOT try to spawn agents, and do NOT improvise a "simulated parallel" pass (that interleaves output and stalls the turn, which is exactly how a Codex `/harden` run dies right after Phase 1). Run all three angles **yourself, inline and sequentially** — Agent 1, then Agent 2, then Agent 3 — in this same session, collecting findings as you go. The analysis and output are identical; only the execution is serial. Then continue to Phase 3 in the same turn — do not stop or idle until Phase 5 has written the marker.
 
 ### Agent 1: Bug Detection
@@ -354,7 +354,7 @@ If the diff edits the resource set or a staging/service/spawn-env path, run `./s
 If you launched a background Codex review in Phase 1, join it now: `.lucidos/codex-review.done` exists once it has ended. The last line of `.lucidos/codex-review.out` is the status line, and everything above it is the review. Read the status line first: it decides which case below applies.
 
 - **`verdict returned`:** fold Codex's findings into the validation set below. Treat each like any other reviewer's finding: confirm it against source, fix a real 🔴 in Phase 4, discard a false positive. Log recurring dismissals to `docs/code-review-priors.md`. Codex frequently returns "no actionable bugs": record that outcome and move on.
-- **Still running:** give it one bounded foreground wait on the marker: `for i in $(seq 1 300); do [ -f .lucidos/codex-review.done ] && break; sleep 1; done`. Cap the wait at ~5 minutes *since it was launched in Phase 1*. Usually it is already done, since Phases 1 to 2 ran in parallel with it. Remember the probe loop can hold the task for up to a minute before the review even starts, and a retry runs a second review.
+- **Still running:** give it one bounded foreground wait on the marker, with `timeout: 600000`: `for i in $(seq 1 300); do [ -f .lucidos/codex-review.done ] && break; sleep 1; done`. The default timeout would kill the loop at 2 minutes. Cap the wait at ~5 minutes *since it was launched in Phase 1*. Usually it is already done, since Phases 1 to 2 ran in parallel with it. Remember the probe loop can hold the task for up to a minute before the review even starts, and a retry runs a second review.
 - **`NO VERDICT`:** the reviewer started and failed twice. That is a lost review angle, never a pass and never "unavailable". Say so now, and quote the status line verbatim in the Phase 4 report, upstream cause included. It is still advisory, so proceed.
 - **`unavailable`, or abandoned after the wait:** it is advisory. Note "Codex review: unavailable (advisory), proceeding" and continue. NEVER block the marker or stall the turn on Codex. (If a prior iteration's Codex task is still running when a new one launches, you may abandon the stale one.)
 
@@ -369,7 +369,7 @@ Then validate every finding (Codex's included) per the rest of this phase.
 
 ### Validate every finding
 
-Once all three angles are done, validate each issue found. (Done means the parallel subagents are joined, or, for Codex and any agent without subagents, your own three inline passes are complete.) **Per the same subagents-are-optional rule:** Claude Code launches a parallel validation subagent per finding, all in ONE message with **`run_in_background: false`** on each. Codex and any agent without a Task tool validate each finding **inline and sequentially** in this same session. So do a small diff (Phase 0.6) and a merge-only or incremental run (Phase 0.4). Either way the validator must:
+Once all three angles are done, validate each issue found. (Done means the parallel subagents are joined, or, for Codex and any agent without subagents, your own three inline passes are complete.) **Per the same subagents-are-optional rule:** Claude Code launches a parallel validation subagent per finding, all in ONE message. Codex and any agent without a Task tool validate each finding **inline and sequentially** in this same session. So do a small diff (Phase 0.6) and a merge-only or incremental run (Phase 0.4). Either way the validator must:
 - Read the relevant source files (not just the diff)
 - Confirm the issue actually exists in the code
 - Discard findings that are false positives or depend on assumptions about runtime state
@@ -529,6 +529,19 @@ reading the variable at run time, never by exempting the file. The gate is
 scoped to a `build.rs` beside a `Cargo.toml`, so ordinary source keeping
 compile-time `env!` (`crates/lucidos-engine/src/paths.rs`) is untouched.
 
+### Also always: the e2e workflow keeps its limits
+
+```bash
+./scripts/check-e2e-workflow.sh
+```
+
+Whole-tree, unconditional, milliseconds. `.github/workflows/e2e.yml` runs a
+stripped tree on the public mirror (ADR 0382), so its limits are security
+limits: no secret, `contents: read` only, triggers only on `e2e/**` and `main`,
+caches saved only on `main`, one-day artifacts, and `mobile-webkit` on macOS.
+It also fails when another workflow starts triggering on `e2e/`. Fix a failure
+by restoring the limit, never by loosening the check.
+
 ### Also always: system-knowhow points at things that exist
 
 ```bash
@@ -596,14 +609,17 @@ prints one line per suite and a verdict. Act on its exit status:
 | 2 | RERUN | Format, start a normal run, and `wait` again (below). |
 | 3 | still running | Re-issue `wait`. It says if the Codex review is what it waits on. |
 
+**A start that refused shows up as MISSING.** `start` writes to
+`.lucidos/harden-suites-start.log`, so read that log before starting again.
+
 **RERUN means the early result no longer describes the branch.** A fix
 outside `HARDEN_SAFE_PATHS` landed, or the run was stopped, or no run exists.
 That is the normal outcome whenever review fixed code, and it costs no more
 than the old order did. Run the kickoff's format block, then start a normal
-run with `run_in_background: true` and `wait` again:
+run behind a shell `&`, as at the kickoff, and `wait` again:
 
 ```bash
-./scripts/harden-suites.sh start
+./scripts/harden-suites.sh start > .lucidos/harden-suites-start.log 2>&1 &
 ```
 
 **Codex-backend and docs-only runs start here.** They have no early run, so
@@ -719,7 +735,7 @@ see the `Makefile`) strictly supersedes `cargo check`: same compile, plus the
 lint set, plus every tracked `*.sh`, plus a rustfmt-clean tree. It is the single
 canonical invocation; never restate its flags here.
 
-**`/harden` finishes in one turn.** Apply sends "Run /harden now", waits for the next idle, and then refuses a branch with no marker. So do NOT hand the suites to `lucidos background-task run` and end your turn here, as the general rule suggests for long work: that idle would read as a finished `/harden`. Claude Code has no blocking wait tool. So `start` runs under the Bash tool's `run_in_background: true`, and each suite writes an exit file under `.lucidos/harden-suites/` when it ends. `wait` joins on those files in the foreground.
+**`/harden` finishes in one turn.** Apply sends "Run /harden now", waits for the next idle, and then refuses a branch with no marker. So do NOT hand the suites to `lucidos background-task run` and end your turn here, as the general rule suggests for long work: that idle would read as a finished `/harden`. Claude Code has no blocking wait tool. So `start` runs behind a shell `&`, and each suite writes an exit file under `.lucidos/harden-suites/` when it ends. `wait` joins on those files in the foreground.
 
 Each exit file holds the suite's real exit code: redirecting is not piping. `wait` and `verdict` print a few lines, so the logs never flood your context. Read the detail from the log a FAIL line names, with `tail -40` or `grep -nE "^error|test result:"`.
 
@@ -754,4 +770,15 @@ a stable one-liner even when the storage scheme changes.
 State lives in the `hardened_branches` DB table (keyed by repo root + branch),
 not on disk — do not look for or manage any marker files.
 
-Inform the user: "Hardening complete. Session can finish."
+The marker also stops every background task this thread still has running
+(`lucidos background-task run`), since this hardening supersedes it. Their
+completions will not re-open the thread (ADR 0369). Then it names every wait
+still live on the thread. Read what it printed:
+
+- **Stopped background tasks**: name them in your summary as superseded.
+- **Still waiting on**: the thread will re-open when that arrives, and Apply
+  stays withheld until it does. Either say so plainly, or stand the wait down
+  with `lucidos event-waits cancel` if you no longer need it. Never call the
+  session finished while it holds one.
+
+Then inform the user: "Hardening complete. Session can finish."

@@ -296,5 +296,8 @@ fn mcp_server_config_overrides_derive_from_the_json() {
         json["tools"]["ask_user_question"]["approval_mode"], "approve",
         "non-interactive Codex sessions must trust the Lucidos question tool"
     );
-    assert_eq!(json["tool_timeout_sec"], 86400);
+    assert_eq!(
+        json["tool_timeout_sec"],
+        crate::engine::cc_settings::USER_ANSWER_WAIT_SECS
+    );
 }

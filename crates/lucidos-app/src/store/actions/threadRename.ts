@@ -18,10 +18,19 @@ export function canRenameThread(thread: ThreadState | undefined): thread is Thre
   return !!thread && thread.meta.state !== 'composing';
 }
 
-/** The title a rename starts from, or null when the thread cannot be renamed. */
-function currentTitle(threadId: string): string | null {
+/** Whether to offer a suggested name. Only the user names the home thread, so
+ *  it is renamable but never suggested a name (ADR 0362). */
+export function canSuggestThreadName(thread: ThreadState | undefined): thread is ThreadState {
+  return canRenameThread(thread) && !thread.meta.home;
+}
+
+/** The thread's title, or null when `allowed` rules the thread out. */
+function currentTitle(
+  threadId: string,
+  allowed: (thread: ThreadState | undefined) => thread is ThreadState,
+): string | null {
   const thread = threadMap.value.get(threadId);
-  return canRenameThread(thread) ? threadDisplayTitle(thread) : null;
+  return allowed(thread) ? threadDisplayTitle(thread) : null;
 }
 
 async function rename(threadId: string, title: string, next: string): Promise<void> {
@@ -34,7 +43,7 @@ async function rename(threadId: string, title: string, next: string): Promise<vo
 
 /** Ask for a new name in a dialog prefilled with the current one. */
 export async function promptRenameThread(threadId: string): Promise<void> {
-  const title = currentTitle(threadId);
+  const title = currentTitle(threadId, canRenameThread);
   if (title === null) return;
   const answer = await showPrompt('Give this thread a new name.', {
     title: 'Rename thread',
@@ -48,7 +57,7 @@ export async function promptRenameThread(threadId: string): Promise<void> {
 /** Ask the engine for a name and offer it in a toast. Nothing changes unless
  *  the user takes it. */
 export async function suggestThreadName(threadId: string): Promise<void> {
-  const title = currentTitle(threadId);
+  const title = currentTitle(threadId, canSuggestThreadName);
   if (title === null) return;
   const key = `suggest-thread-name-${threadId}`;
   showToast('Finding a better name…', 'info', { key, spinning: true });

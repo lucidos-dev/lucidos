@@ -28,6 +28,8 @@ async function rotate(page: Page, size: { width: number; height: number }): Prom
   await page.waitForFunction(({ width }) => window.innerWidth === width, size);
 }
 
+/** Poll this after a `rotate`. The layout flips on the `resize` event, which
+ *  can fire after `innerWidth` already reads the new width. */
 function layout(page: Page): Promise<{ phone: boolean; split: boolean }> {
   return page.evaluate(() => ({
     phone: !!document.querySelector('.mobile-swipe-wrapper'),
@@ -99,7 +101,7 @@ test.describe('A phone in landscape', () => {
   test('keeps the phone layout and its fixed header', async ({ page }) => {
     await navigateToApp(page);
     await rotate(page, LANDSCAPE);
-    expect(await layout(page)).toEqual({ phone: true, split: false });
+    await expect.poll(() => layout(page)).toEqual({ phone: true, split: false });
     const position = await page.evaluate(() => getComputedStyle(document.querySelector('.app-header')!).position);
     expect(position).toBe('fixed');
   });
@@ -120,12 +122,12 @@ test.describe('A phone in landscape', () => {
     await expect.poll(() => promptHiddenPx(page)).toBeGreaterThan(10);
 
     await rotate(page, TABLET);
-    expect(await layout(page)).toEqual({ phone: false, split: true });
+    await expect.poll(() => layout(page)).toEqual({ phone: false, split: true });
     const headerTranslate = await page.evaluate(() => document.querySelector<HTMLElement>('.app-header')!.style.translate);
     expect(headerTranslate).toBe('');
 
     await rotate(page, PORTRAIT);
-    expect(await layout(page)).toEqual({ phone: true, split: false });
+    await expect.poll(() => layout(page)).toEqual({ phone: true, split: false });
     // The thread pane mounted afresh, so its transcript loads again.
     await page.waitForSelector(CONTAINER);
     await page.evaluate((sel) => {

@@ -182,6 +182,9 @@ mod delete_thread_test;
 #[path = "api_support/archive_all_test.rs"]
 mod archive_all_test;
 
+#[path = "api_support/home_thread_test.rs"]
+mod home_thread_test;
+
 #[path = "api_support/notifications_presence_test.rs"]
 mod notifications_presence_test;
 
@@ -194,6 +197,8 @@ mod form_requests_test;
 #[path = "api_support/oauth_connect_test.rs"]
 mod oauth_connect_test;
 
+#[path = "api_support/background_models_test.rs"]
+mod background_models_test;
 #[path = "api_support/models_test.rs"]
 mod models_test;
 
@@ -217,6 +222,9 @@ mod tailnet_status_test;
 
 #[path = "api_support/embedding_model_status_test.rs"]
 mod embedding_model_status_test;
+
+#[path = "api_support/tree_backfill_test.rs"]
+mod tree_backfill_test;
 
 #[path = "api_support/follow_up_test.rs"]
 mod follow_up_test;
@@ -253,3 +261,6 @@ mod app_reach_test;
 
 #[path = "api_support/side_question_test.rs"]
 mod side_question_test;
+
+#[path = "api_support/text_search_test.rs"]
+mod text_search_test;

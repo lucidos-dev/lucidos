@@ -162,6 +162,12 @@ export interface Step {
    *  ambiguous for parallel calls like two `Read SKILL.md`. Absent for
    *  engine tools and legacy DB rows. */
   tool_use_id?: string;
+  /** The `Agent` call whose sub-agent took this step. Absent for the
+   *  session's own steps. */
+  parent_tool_use_id?: string;
+  /** The coding agent's API call that made this step. Every step of one call
+   *  shows that call's capture. Absent from Codex and on older rows. */
+  api_call_id?: string;
   /** The chat `ToolCalled` event this step renders. Its `ToolResult` names
    *  the same id, which is how a parallel run's results find their rows. */
   call_event_id?: string;
@@ -230,6 +236,13 @@ type ResponseEventKind =
       tool_name?: string;
       outcome: StepOutcome;
       tool_use_id?: string;
+      /** See Step.parent_tool_use_id. */
+      parent_tool_use_id?: string;
+      /** See Step.api_call_id. */
+      api_call_id?: string;
+      /** The steps this `Agent` call's sub-agent took, in clock order. They
+       *  render folded under this row (`nestSubAgentSteps`). */
+      children?: Extract<ResponseEvent, { type: 'step' }>[];
       detail?: string;
       /** Legacy fields — see Step.context_tokens above. */
       context_tokens?: number;
@@ -601,6 +614,9 @@ export interface CapacityPolicy {
    *  before the rest are stopped and the user is notified. A spawn does not
    *  consume a hop. */
   max_event_trigger_depth: number;
+  /** Live children one thread may have at the same time. A finished child
+   *  frees its slot. Read by the spawn guard, not by admission. */
+  max_concurrent_children_per_thread: number;
   overflow: 'drop-oldest' | 'pause-trigger';
 }
 
@@ -788,6 +804,9 @@ export interface InstalledPlugin {
   /** The data/-relative paths that currently differ from the install (the badge
    *  tooltip). Empty/absent unless `modified`. */
   modified_paths?: string[];
+  /** The installed version's `engine` requirement as authored. Absent when its
+   *  manifest declares none. */
+  engine_requirement?: string;
 }
 
 
@@ -1034,6 +1053,15 @@ export interface MarketplacePlugin {
   /** The data/-relative paths that currently differ from the install (the badge
    *  tooltip + the update-warning detail). Empty/absent unless `modified`. */
   modified_paths?: string[];
+  /** The manifest's `engine` requirement as authored (`">=0.46.1"`). Absent
+   *  when it declares none: the row then shows a "No version requirement" chip. */
+  engine_requirement?: string;
+  /** False when this Lucidos cannot install this version: the Install or
+   *  Update button is disabled. Never blocks a plugin already installed. */
+  engine_compatible: boolean;
+  /** The engine's own words for why ("Needs Lucidos 0.46.1 or later"). Set
+   *  only when `engine_compatible` is false. */
+  engine_incompatible_reason?: string;
 }
 
 export interface MarketplaceScanError {
@@ -1089,6 +1117,9 @@ export interface PluginInstallRequest {
   plugin_id: string;
   plugin_version: string;
   plugin_name: string;
+  /** The manifest's `engine` requirement as authored. Null when it declares
+   *  none, which the panel says in a quiet note. */
+  engine_requirement?: string | null;
 }
 
 /** What a staged update will do with one locally-edited file.

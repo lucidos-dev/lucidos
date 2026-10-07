@@ -99,7 +99,7 @@ describe('the Voice settings section', () => {
     expect(ids.slice(0, 2)).toEqual(['gpt-live-transcribe', 'gpt-realtime-whisper']);
     expect(ids).toContain('gpt-transcribe');
     expect(ids).toEqual(
-      expect.arrayContaining(['gpt-4o-mini-transcribe', 'gpt-4o-transcribe', 'whisper-1']),
+      expect.arrayContaining([DEFAULT_VOICE_TRANSCRIBER_MODEL, 'gpt-4o-transcribe', 'whisper-1']),
     );
   });
 
@@ -109,8 +109,7 @@ describe('the Voice settings section', () => {
   it('offers the current realtime family, newest first, led by the default', () => {
     const ids = TALKER_MODELS.map((m) => m.value);
     expect(ids[0]).toBe(DEFAULT_VOICE_TALKER_MODEL);
-    expect(ids.slice(0, 4)).toEqual([
-      'gpt-realtime-2.1',
+    expect(ids.slice(1, 4)).toEqual([
       'gpt-realtime-2.1-mini',
       'gpt-realtime-2',
       'gpt-realtime-1.5',

@@ -21,10 +21,13 @@
     "paths": {
       "@/*": ["src/*"],
       "@lucidos/appearance": ["../../packages/lucidos-sdk/src/appearance.ts"],
+      "@lucidos/engine-constants": ["../../packages/lucidos-sdk/src/generated/engine-constants.ts"],
       "@lucidos/event-stream": ["../../packages/lucidos-sdk/src/eventStream.ts"],
+      "@lucidos/find": ["../../packages/lucidos-sdk/src/find.ts"],
       "@lucidos/font-faces": ["../../packages/lucidos-sdk/src/fontFaces.ts"],
       "@lucidos/geometry": ["../../packages/lucidos-sdk/src/geometry.ts"],
       "@lucidos/pane-swipe": ["../../packages/lucidos-sdk/src/paneSwipe.ts"],
+      "@lucidos/preference-catalog": ["../../packages/lucidos-sdk/src/generated/preference-catalog.ts"],
       "@lucidos/pull-to-refresh": ["../../packages/lucidos-sdk/src/pullToRefresh.ts"],
       "@lucidos/text-entry": ["../../packages/lucidos-sdk/src/textEntry.ts"],
       "@lucidos/tooltip": ["../../packages/lucidos-sdk/src/tooltip.ts"]

@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
-import { DEFAULT_THEME_ID, FALLBACK_FONT, FONT_STACKS, THEME_KEY, fontFeaturesFor, type WorkspaceFont } from '@lucidos/appearance';
+import { FALLBACK_FONT, FONT_STACKS, THEME_KEY, fontFeaturesFor, type WorkspaceFont } from '@lucidos/appearance';
 import type { Theme, ThemeFamily } from '../../../api/client';
 import { themeGallery, pickTheme as pickThemeAction } from '../../../store/actions/themes';
 
@@ -12,7 +12,7 @@ vi.mock('../../../store/actions/themes', async importOriginal => ({
   ...(await importOriginal<typeof import('../../../store/actions/themes')>()),
   pickTheme: vi.fn(),
 }));
-import { paintedThemeMode } from '../../../store/actions/preferences';
+import { DEFAULT_THEME_ID, paintedThemeMode } from '../../../store/actions/preferences';
 import { preferences } from '../../../store/store';
 import { viewportIsMobile } from '../../../utils/viewport';
 import { motionPreference } from '../../../utils/motion';

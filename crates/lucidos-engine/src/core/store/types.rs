@@ -62,8 +62,12 @@ pub struct SessionMessage {
     pub channel: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<Step>,
+    /// Handles of the thread images this message added, in walk order: the
+    /// uploads on a user turn, the generated images on an assistant turn.
+    /// Read off [`crate::core::events::thread_image_refs_of`], the resolver's
+    /// own rule, which is what lets the history state each image's `thread:N`.
     #[serde(skip)]
-    pub images: Vec<String>,
+    pub image_handles: Vec<String>,
     /// Sha256 hashes of user-attached image blobs. The history reader
     /// pulls these from `MessageReceived.user_image_hashes`; the LLM call
     /// resolves them to bytes via the blob store at send time.

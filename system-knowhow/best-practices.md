@@ -7,20 +7,20 @@ description: Workspace file layout (artifacts/, apps/, knowhow/, intents/, scrip
 
 How files and data are organized in a Lucidos workspace.
 
-## artifacts/ — User Data & Content
+## artifacts/: User Data & Content
 
 ### Fixed directories
 | Path | Purpose |
 |------|---------|
-| `user_profile.md` | Learned facts about the user — maintained explicitly by the agent on the user's behalf (write confirmed facts the user shares); never auto-appended by background memory extraction |
+| `user_profile.md` | Learned facts about the user. The agent writes confirmed facts the user shares. Background memory extraction never appends to it |
 | `imported/{service}/` | Data from APIs or local filesystem (e.g., `imported/oura/`, `imported/weather/`) |
-| `projects/{name}/` | Major project folders — each has `notes.md` and related files |
+| `projects/{name}/` | Major project folders, each with `notes.md` and related files |
 | `screenshots/` | Browser screenshots (auto-named with timestamp) |
 | `research/` | Research documents, deep dives, technical analysis |
 | `generated/` | AI-generated images and content (default location) |
 
 ### App data storage
-Apps that need persistent data store it in **`artifacts/{app-id}/`**:
+Apps store persistent data in `artifacts/{app-id}/`:
 
 | Folder | App | Contents |
 |--------|-----|----------|
@@ -29,18 +29,17 @@ Apps that need persistent data store it in **`artifacts/{app-id}/`**:
 | `morning-dashboard/` | Morning Dashboard | `YYYY-MM-DD.json` |
 | `google-docs/` | Google Docs | `state.json`, `cache.json` |
 
-**Convention**: Use the app's ID as the folder name. The app's knowhow documents the data format.
+Name the folder after the app's ID. The app's knowhow documents the data format.
 
 ### Generated content
 - Default: `artifacts/generated/`
 - Themed collections get their own folder (e.g., `artifacts/fargeleggingsark/`)
-- Never put generated content in `artifacts/artifacts/`
 
 ### Standalone HTML: paste this type scale, never recall one
 
-A design mockup, report or dashboard written to `artifacts/` is a **standalone document**. Unlike an app it links no Lucidos stylesheet, so it has no tokens unless you write them. Every such file written from memory so far has come out **too large**. A reconstructed "sensible scale" assumes a 16px body, and this one does not. Body text here is 12px, the size chat renders at.
+A design mockup, report or dashboard written to `artifacts/` is a **standalone document**. It links no Lucidos stylesheet, so it has no tokens unless you write them. A scale written from memory comes out too large: it assumes a 16px body. Body text here is 12px, the size chat renders at.
 
-Paste the block verbatim into `:root`, then use only these steps:
+Paste this block verbatim, then use only these steps:
 
 ```css
 :root {
@@ -59,14 +58,14 @@ body { font-size: var(--font-size-sm); line-height: 1.5; }
 input, textarea, select, button { font-family: inherit; font-size: inherit; }
 ```
 
-Four things that go wrong, in the order they actually happen:
+Four common mistakes, most frequent first:
 
-1. **`1rem` is a HEADING here**, `--font-size-xl`, not body. Body is `0.75rem`. Any size you reach for out of habit is two steps too big.
-2. **Do NOT bake the UI scale into the file** (`html { font-size: 125% }`, or `20px` "for the 125% scale"). The preview already zooms the document by the viewer's UI scale, so a baked one applies twice. It also pins one device's preference into a file the user opens on several. Leave the root alone and size in `rem`.
-3. **The body and control lines above are not optional.** A `<code>`, a `<button>` and an `<input>` each carry a UA font of their own and inherit nothing, so without them the document mixes its own font with the browser's.
-4. **Every `font-size` reads a step.** No `0.9375rem`, no `1.05rem`, no `0.8rem`. If none of the ten fits, you want a different step, not a new number.
+1. **`1rem` is a heading here** (`--font-size-xl`), not body. Body is `0.75rem`. A size you pick from habit is two steps too big.
+2. **Do not bake the UI scale into the file** (`html { font-size: 125% }`, or `20px` "for the 125% scale"). The preview already zooms the document by the viewer's UI scale, so a baked one applies twice. It also pins one device's preference into a file the user opens on several. Leave the root alone and size in `rem`.
+3. **Keep the body and control lines.** A `<code>`, a `<button>` and an `<input>` each carry their own UA font and inherit nothing. Without those lines the document mixes its font with the browser's.
+4. **Every `font-size` reads a step.** No `0.9375rem`, no `1.05rem`, no `0.8rem`. If none of the ten fits, pick a different step, not a new number.
 
-`--font-mono` for code, and the UI font is whatever the user picked, so a mockup meant to look like Lucidos should say `font-family: 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace`.
+Use `--font-mono` for code. The UI font is whatever the user picked, so a mockup meant to look like Lucidos says `font-family: 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace`.
 
 ### What a standalone HTML document can do
 
@@ -80,11 +79,11 @@ An HTML file under `artifacts/` is untrusted content: it may come from an upload
 | `<a href="results.csv" download>` in a browser, a Copy button, a video's fullscreen button | `localStorage`, `sessionStorage`, `IndexedDB`, cookies. An opaque origin has none. |
 | `mailto:` and `tel:` links | Reading or changing the Lucidos window around it (`parent.…`) |
 
-A document that needs live workspace data, or that must remember state between opens, is an **app**, not an artifact. An app reads the workspace through `lucidos.*` (`system-knowhow/js-sdk.md`). If a snapshot is enough, write the data into the report itself, as a JSON `<script>` block or inline in the markup.
+A document that needs live workspace data, or must remember state between opens, is an **app**, not an artifact. An app reads the workspace through `lucidos.*` (`system-knowhow/js-sdk.md`), and remembers per-device state in `lucidos.storage`. If a snapshot is enough, write the data into the report, as a JSON `<script>` block or inline in the markup.
 
-Relative assets load from `artifacts/` only. An HTML file stored elsewhere (`knowhow/`, an app folder) still renders, but behind the gateway its relative images and stylesheets do not load. Keep a report and its assets together under `artifacts/`.
+Relative assets load from `artifacts/` only. An HTML file elsewhere (`knowhow/`, an app folder) still renders, but behind the gateway its relative images and stylesheets do not load. Keep a report and its assets together under `artifacts/`.
 
-## apps/ — App UIs & Logic
+## apps/: App UIs & Logic
 
 Each app: `apps/{id}/`
 
@@ -97,118 +96,125 @@ Each app: `apps/{id}/`
 | `scripts/` | App-specific helper scripts |
 | `assets/` | Static files used by the app UI (images, fonts, PDFs) |
 
-**App assets** (images, brosjyrer, icons) go in `apps/{id}/assets/`, NOT in `artifacts/`.
+**App assets** (images, brochures, icons) go in `apps/{id}/assets/`, not in `artifacts/`.
 
-## knowhow/ — Shared Domain Knowledge
+## knowhow/: Shared Domain Knowledge
 
-Reusable reference docs consumed by multiple apps/prompts:
-- `knowhow/{domain}/` — e.g., `oura/`, `google-workspace/`
+Reusable reference docs for several apps or prompts:
+- `knowhow/{domain}/`, e.g. `oura/`, `google-workspace/`
 - Each file has a clear, descriptive name: `api-ref.md`, `lucidos-data-storage.md`, `data-format.md`
 
-**Rule**: If a knowhow doc is only used by one app → `apps/{id}/knowhow/`. If used by 2+ consumers → `knowhow/{domain}/`.
+**Placement**: a knowhow doc used by one app goes in `apps/{id}/knowhow/`. One used by 2+ consumers goes in `knowhow/{domain}/`.
 
 **Depth rule**: `knowhow/` lists `{name}.md` and `{domain}/{name}.md` as docs. An app's or a trigger's own `knowhow/` lists `{name}.md` only, since the app or the trigger is already the domain. A file deeper than that is one doc's reference: it stays loadable by full id, but nothing routes to it and the doc that owns it must name it. Put a doc's supporting files in a folder named after the doc. See `system-knowhow/building-knowhow.md` § "Where the file goes".
 
-## intents/ — User Intents
+## intents/: User Intents
 
 Intent definitions not tied to a single app. App-specific intents go in `apps/{id}/intents/`.
 
-## scripts/ — Shared Scripts
+## scripts/: Shared Scripts
 
-Helper scripts invoked by intents, knowhow, or proxy auth handshakes — not tied to a single app:
+Helper scripts that intents, knowhow or proxy auth handshakes invoke, not tied to a single app:
 - `scripts/{name}/run.py`
 - App-specific scripts go in `apps/{id}/scripts/`
 
-## config/ — Engine Configuration
+## config/: Engine Configuration
 
-Engine-read JSON files. Currently:
+JSON files the engine reads:
 
 | File | Purpose |
 |------|---------|
 | `config/apis.json` | API proxy entries: maps a name to a `base_url` (and optional `auth` referencing a stored credential, and an optional `timeout_secs`). Powers `lucidos proxy <name> ...` (CLI), `lucidos.proxy(name).fetch(...)` (SDK), and the `proxy_request` LLM tool. The builtin provider proxies (`openai`, `anthropic` and the other model providers) need no entry here, and an entry with the same name overrides one. See `system-knowhow/lucidos-cli.md` § `lucidos proxy` for the schema and `system-knowhow/js-sdk.md` § `lucidos.proxy` for the iframe-side API. |
 
-**This is the preferred way for scripts and apps to call external APIs.** Add an entry here once, then call the backend by name everywhere — the credential never appears in script source, args, env vars, log lines, or LLM tool transcripts. The pre-proxy pattern (`curl -H "Authorization: Bearer $CRED_..."` in scripts; `fetch` with the credential pasted into the iframe) is drift — see the workspace audit.
+**Scripts and apps should call external APIs this way.** Add an entry once, then call the backend by name everywhere. The credential never appears in script source, args, env vars, log lines or LLM tool transcripts. The pre-proxy pattern is drift (see the workspace audit): `curl -H "Authorization: Bearer $CRED_..."` in scripts, or `fetch` with the credential pasted into the iframe.
 
 ## Every subprocess call is a fresh process
 
-`run_bash`, `run_bash_background`, `run_python`, and `run_python_background` each spawn a **brand-new process** (bash runs via `bash -o pipefail -c`, so a failing stage of a pipeline is never masked by a later succeeding one). **No shell state carries over between calls** — an `export VAR=…`, a `cd somewhere`, and any shell functions you set in one call are gone by the next.
+`run_bash`, `run_bash_background`, `run_python` and `run_python_background` each spawn a **brand-new process**. Bash runs via `bash -o pipefail -c`, so a later stage never masks a failing one. **No shell state carries over between calls**: an `export VAR=…`, a `cd somewhere` and any shell functions are gone by the next call.
 
 ```bash
 # call 1
 export GWS_CONFIG_DIR=/Users/me/.config/gws-work   # set in this process only
 
-# call 2 — fresh process, the export above never happened
+# call 2: fresh process, the export above never happened
 gws calendar list        # GWS_CONFIG_DIR is empty → wrong/no account
 ```
 
 Fixes, in order of preference:
 
 1. **Inline the env var on the same line as the command**: `GWS_CONFIG_DIR=/Users/me/.config/gws-work gws calendar list`. For `cd`, chain in one call: `cd /some/dir && ./run.sh`.
-2. **Same value across ALL calls in the workspace?** Define an **environment variable** (see the section right below) so every subprocess inherits it without any export.
+2. **Same value across all calls in the workspace?** Define an **environment variable** (next section), so every subprocess inherits it.
 
-Exception: `CRED_*`, `OAUTH_*_ACCESS_TOKEN`, and `LUCIDOS_WORKSPACE` **are** injected into every subprocess by the engine, so those appear in each fresh call with no export needed.
+Exception: the engine injects `CRED_*`, `OAUTH_*_ACCESS_TOKEN` and `LUCIDOS_WORKSPACE` into every subprocess, so each fresh call has them.
 
-## Environment variables — Per-Workspace Config
+## Environment variables: Per-Workspace Config
 
-For environment that must be the **SAME for every subprocess in this workspace**, define an **environment variable** (Settings → System → Environment variables). These are DB-backed, non-secret `NAME=value` pairs the engine injects as real env vars into **every** subprocess it spawns — `run_bash`, `run_python`, background tasks, scheduled scripts, triggers, and coding-agent (Claude Code / Codex) sessions.
+For environment that must be the **same for every subprocess in this workspace**, define an **environment variable** (Settings → System → Environment variables). These are DB-backed, non-secret `NAME=value` pairs. The engine injects them as real env vars into every subprocess it spawns: `run_bash`, `run_python`, background tasks, scheduled scripts, triggers, and coding-agent (Claude Code / Codex) sessions.
 
-- **You (the agent) can list, set, and delete them** with the grouped `env_vars` tool (`action: list | set | delete`; `set`/`delete` take `name`, `set` also `value`). The retired `set_environment_variable` name still works as a back-compat alias for `set`. The user can also add/edit them in Settings. Changes take effect on the **next** tool call / agent turn — **no engine restart**. (Exception: vars consumed by the engine's *own* shell-outs — e.g. `GIT_SSH_COMMAND` / `GH_CONFIG_DIR` used by the engine's Apply-time `git push` — are read into the engine process env at startup, so a *change* to those reaches the engine's own git on the next restart. Tool/agent subprocesses still see the change immediately.)
-- **Non-secret only.** Values appear in logs, the event store, and tool-call payloads — that's intentional. For API keys, tokens, or passwords use a **credential** (`request_credential`) instead, which is injected as `CRED_<NAME>` and kept out of the event log.
-- **Names** are uppercase letters/digits/underscores, not starting with a digit (e.g. `CLAUDE_CODE_USE_VERTEX`, `LUCIDOS_REPO`). Engine-owned names (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, internal `LUCIDOS_*` like `LUCIDOS_WORKSPACE`) are rejected, and engine-owned vars always win a collision.
+- **You (the agent) can list, set and delete them** with the grouped `env_vars` tool (`action: list | set | delete`; `set`/`delete` take `name`, `set` also `value`). The retired `set_environment_variable` name still works as an alias for `set`. The user can also edit them in Settings. Changes take effect on the **next** tool call or agent turn, with **no engine restart**.
+  - Exception: the engine's *own* shell-outs read their vars at startup. For example, the Apply-time `git push` uses `GIT_SSH_COMMAND` / `GH_CONFIG_DIR`. A change reaches the engine's own git on the next restart. Tool and agent subprocesses see it immediately.
+- **Non-secret only.** Values appear in logs, the event store and tool-call payloads, by design. For API keys, tokens or passwords use a **credential** (`request_credential`). It is injected as `CRED_<NAME>` and kept out of the event log.
+- **Names** are uppercase letters, digits and underscores, not starting with a digit (e.g. `CLAUDE_CODE_USE_VERTEX`, `LUCIDOS_REPO`). Engine-owned names (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, internal `LUCIDOS_*` like `LUCIDOS_WORKSPACE`) are rejected. Engine-owned vars always win a collision.
 
-The motivating case is **per-workspace identity** — a `gh` config dir, a Google `gws` config dir + project id, an SSH command — so `gh` / `git push` from agent subprocesses authenticate as the right account:
+The main use is **per-workspace identity**: a `gh` config dir, a Google `gws` config dir and project id, an SSH command. Then `gh` / `git push` from agent subprocesses authenticate as the right account:
 
 ```
 GH_CONFIG_DIR=/Users/me/.config/gh-work
 GIT_SSH_COMMAND=ssh -i /Users/me/.ssh/id_work -o IdentitiesOnly=yes
 ```
 
-Setup is **partly interactive** — you can set the variables, but the user must complete the auth handshake:
+Setup is **partly interactive**. You can set the variables, but the user must complete the auth handshake:
 
 1. Pick a dedicated gh config dir and authenticate it once (user-run, opens a browser): `GH_CONFIG_DIR=<dir> gh auth login`.
 2. For SSH push, make sure the key referenced by `GIT_SSH_COMMAND` is registered on that GitHub account.
-3. Set `GH_CONFIG_DIR` and `GIT_SSH_COMMAND` via the `env_vars` tool (`action: set`) (or Settings → System → Environment variables).
+3. Set `GH_CONFIG_DIR` and `GIT_SSH_COMMAND` with the `env_vars` tool (`action: set`), or in Settings → System → Environment variables.
 
-**Want a credential's secret under a specific env var name?** A credential can be given a custom env var name, so its secret injects as e.g. `GITHUB_TOKEN` **in addition to** the default `CRED_<NAME>` (an extra alias — the `CRED_` form still works) — useful when a CLI/SDK expects an exact variable name. Set it two ways: in the credential editor (Settings → credential editor), or up front when the agent requests the credential — `request_credential` takes an optional `env_var_name` arg that pre-fills the modal's "Env var name" field (the user can still edit or clear it before saving). The name must match `[A-Z_][A-Z0-9_]*` and can't be an engine-owned name (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, `LUCIDOS_*`). Single-value auth types only — it's ignored for `password` credentials (which split into `_USERNAME`/`_PASSWORD`).
+**Want a credential's secret under a specific env var name?** Give the credential a custom env var name, for a CLI or SDK that expects an exact variable. Its secret then also injects as e.g. `GITHUB_TOKEN`, and the default `CRED_<NAME>` still works. Set it two ways:
+
+- In the credential editor (Settings → credential editor).
+- Up front, when the agent requests the credential. `request_credential` takes an optional `env_var_name` arg that pre-fills the modal's "Env var name" field. The user can still edit or clear it before saving.
+
+The name must match `[A-Z_][A-Z0-9_]*` and can't be an engine-owned name (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, `LUCIDOS_*`). It works for single-value auth types only. A `password` credential ignores it, since it splits into `_USERNAME`/`_PASSWORD`.
 
 **An auth handshake script never gets the custom name.** It receives only `CRED_*` and `OAUTH_*` names, so it reads `CRED_<NAME>`. See `building-an-auth-handshake`.
 
-**A credential names every host it may be sent to.** Its Base URLs field is a set, one row per hostname, and the secret is refused at any host outside it. So a provider whose API, clone and download traffic live on different hostnames takes **one** credential naming all of them, never one row per host. Nothing is inferred from a hostname's spelling: name each in full. `request_credential` takes the whole set in `base_urls`. Ask again for a host an existing credential does not cover and it reopens that credential, so the user never types the same secret twice.
+**A credential names every host it may be sent to.** Its Base URLs field is a set, one row per hostname, and the secret is refused at any host outside it. So a provider with API, clone and download traffic on different hostnames takes **one** credential naming all of them. Nothing is inferred from a hostname's spelling: name each in full. `request_credential` takes the whole set in `base_urls`. Asking for a host an existing credential does not cover reopens that credential, so the user never types the same secret twice.
 
-> Note: the legacy `data/.env` file mechanism was retired in favour of this store. Any existing `data/.env` is migrated into the environment-variables store on the next engine startup and the file is removed.
+The legacy `data/.env` file is retired. On the next engine startup, any existing `data/.env` moves into the environment-variables store and the file is removed.
 
 ## Key Rules
 
-1. **Never nest artifacts** — `artifacts/artifacts/` is always wrong
+1. **Never nest artifacts**: `artifacts/artifacts/` is always wrong
 2. **App data** → `artifacts/{app-id}/`
 3. **App assets** → `apps/{id}/assets/`
 4. **Imported data** → `artifacts/imported/{service}/`
 5. **Generated content** → `artifacts/generated/` (or themed subfolder if a pattern emerges)
 6. **Research** → `artifacts/research/`
-7. **One source of truth** — don't duplicate files across locations
-8. **Import the minimum** — never dump a whole repo, dataset, or archive into `artifacts/imported/` to grab one or two files from it. Artifact count is a performance axis: every additional file inflates linkify, file lists, scans, and per-render paths. Rules:
-   - **Cloning a repo to inspect/run/extract from it** → clone into `.lucidos/tmp/{repo-name}/` (ephemeral, gitignored, won't bloat artifact count). Inspect it with `read_file`, then copy only the specific files the app actually needs into `artifacts/imported/{service}/` with `copy_file`, which reads a `.lucidos/tmp/` source directly. If the user wants the full repo to persist (e.g., they plan to keep editing it), ASK first where to put it. Don't decide unilaterally to dump it under `artifacts/`.
-   - **Bulk datasets / archives** (Wikifonia-style — thousands of files where you only consume a few) → same rule. Inspect under `.lucidos/tmp/`, extract the entries the app uses into `artifacts/imported/{service}/`, leave the bulk archive out unless the user explicitly says "keep the whole archive available".
-   - **Persistent bulk reference corpora the user wants to keep but not in the workspace** → `~/.lucidos/data/{name}/` (sibling to `~/.lucidos/knowhow/`, cross-workspace, persistent, agent-discoverable). Pin the absolute path in the relevant app's knowhow so converter scripts can find it. Use `lucidos data-store add {name} {source-dir}` to move an existing directory there.
-   - **Intermediate / debug / one-shot render output** (e.g. cropping tiles, OMR debug pixmaps, scratch PNGs from a one-time analysis) does NOT belong in `artifacts/imported/` at all. Use `.lucidos/tmp/` and delete after the analysis.
-   - **Inherited cruft from earlier sessions** — if you find unexplained files under `data/artifacts/imported/` that don't appear in the consuming app's source, scripts, or knowhow, verify each one (grep app + scripts + knowhow), ask the user about ambiguous cases, then `git rm` the dead files in a single commit with before/after artifact counts in the message.
+7. **One source of truth**: don't duplicate files across locations
+8. **Import the minimum.** Never dump a whole repo, dataset or archive into `artifacts/imported/` to grab one or two files. Artifact count is a performance axis: every extra file inflates linkify, file lists, scans and per-render paths.
+   - **Cloning a repo to inspect, run or extract from it** → clone into `.lucidos/tmp/{repo-name}/` (ephemeral, gitignored, not counted). Inspect it with `read_file`. Then `copy_file` only the files the app needs into `artifacts/imported/{service}/`; it reads a `.lucidos/tmp/` source directly. If the user wants the full repo to persist (e.g. to keep editing it), ASK first where to put it. Never decide on your own to dump it under `artifacts/`.
+   - **Bulk datasets and archives** (Wikifonia-style: thousands of files, of which you use a few) → same rule. Inspect under `.lucidos/tmp/` and extract the entries the app uses into `artifacts/imported/{service}/`. Leave the bulk archive out unless the user says "keep the whole archive available".
+   - **Bulk reference corpora the user wants to keep, but not in the workspace** → `~/.lucidos/data/{name}/` (sibling to `~/.lucidos/knowhow/`, cross-workspace, persistent, agent-discoverable). Pin the absolute path in the app's knowhow so converter scripts find it. `lucidos data-store add {name} {source-dir}` moves an existing directory there.
+   - **Intermediate, debug or one-shot render output** (e.g. cropping tiles, OMR debug pixmaps, scratch PNGs from a one-time analysis) never goes in `artifacts/imported/`. Use `.lucidos/tmp/` and delete it after the analysis.
+   - **Inherited cruft from earlier sessions**: unexplained files under `data/artifacts/imported/` that the consuming app's source, scripts and knowhow never mention. Verify each one by grep, and ask the user about ambiguous cases. Then `git rm` the dead files in one commit, with before/after artifact counts in the message.
 9. **Chained edits use post-edit content.** When you `edit_file` the same file twice in one turn, build the second `old_string` from what the first call returned, not from an earlier read. Otherwise the call fails with "The file was likely modified by a previous edit". A file needing 3+ edits in one turn takes one `write_file` rewrite instead. Every text-mode edit answers `N of M occurrences replaced`: read both numbers. `N < M` leaves the rest in place, which is right only if you meant the first one; `replace_all: true` takes the rest.
 10. **Where the file tools can reach.** Three prefixes resolve, plus a registered repository by name. Everything else is rewritten or refused:
     - `data/` (the default): an untyped path like `notes.md` becomes `artifacts/notes.md`. Readable and writable.
-    - `.lucidos/tmp/…`: the ephemeral scratch tree, workspace-root-relative, gitignored. **Readable** by `read_file` and as a `copy_file` source, which is how you pull a file out of a `git_clone` tmp checkout or read what `http_request(temp_path)` just saved. **Not writable**: the file tools git-commit everything they write, so `write_file` / `edit_file` / `delete_file` refuse it. Create scratch with `run_python` (cwd is the workspace root), delete it with `run_bash`.
+    - `.lucidos/tmp/…`: the ephemeral scratch tree, workspace-root-relative, gitignored. **Readable** by `read_file` and as a `copy_file` source. That is how you pull a file out of a `git_clone` tmp checkout, or read what `http_request(temp_path)` saved. **Not writable**: the file tools git-commit everything they write, so `write_file` / `edit_file` / `delete_file` refuse it. Create scratch with `run_python` (cwd is the workspace root), delete it with `run_bash`.
     - `system-knowhow/…`: engine-shipped reference docs. Read-only.
-    - A **registered repository**, via the `repo` argument on `read_file`, `glob_files`, `grep_files` and `edit_file`. Pass its name or id (`manage_repositories` action `list`) and the path or pattern becomes repo-root-relative, over the working tree. This is how you work on code. Never `cd` into a checkout to `cat`, `sed`, `grep` or `awk` it: that hands back raw untruncated bytes and walks `target/`. The file tools chunk, slice by line, cap the match set, and see only what git does. Gitignored files stay invisible, so a build log still needs `run_bash`.
+    - A **registered repository**, via the `repo` argument on `read_file`, `glob_files`, `grep_files` and `edit_file`. Pass its name or id (`manage_repositories` action `list`), and the path or pattern becomes repo-root-relative, over the working tree. This is how you work on code. Never `cd` into a checkout to `cat`, `sed`, `grep` or `awk` it: that returns raw untruncated bytes and walks `target/`. The file tools chunk, slice by line, cap the match set, and see only what git sees. Gitignored files stay invisible, so a build log still needs `run_bash`.
 
-    **Editing a repository commits nothing.** `edit_file` needs `commit: false` there, and `write_file` / `delete_file` / `copy_file` refuse `repo` outright. The edit lands in the working tree and nowhere else. Say that when you report it, and point the user at `git diff`. Reach for `run_coding_agent` instead whenever the work adds or deletes files, or should arrive as a change the user reviews and applies.
+    **Editing a repository commits nothing.** `edit_file` needs `commit: false` there, and `write_file` / `delete_file` / `copy_file` refuse `repo` outright. The edit lands only in the working tree. Say so when you report it, and point the user at `git diff`. Use `run_coding_agent` instead when the work adds or deletes files, or should arrive as a change the user reviews and applies.
 
     Everything else under `.lucidos/` is engine runtime state (`worktrees/`, `exhaust/`, `engine.pid`) and is refused in both directions. `..` and absolute paths are rejected outright. For a path outside the workspace that is not a registered repository, use `run_bash` (`sed -n`, `cat`).
 
 ## Images posted in a thread
 
-Every image a user pastes (and every image you generate) has two addresses. `img-<hex>` is its **image handle**: content-derived, and the same string for as long as the image exists. `thread:N` is its position, counted 1-based across the conversation. On upload, each is auto-described by a fast vision model and that description is kept as a derived fact.
+Every image a user pastes (and every image you generate) has two addresses. `img-<hex>` is its **image handle**: content-derived, and stable for as long as the image exists. `thread:N` is its position, counted 1-based across the conversation. On upload, a fast vision model describes each one, and that description is kept as a derived fact.
 
-- **Prefer the handle, and note it if you may want the image later.** `thread:N` renumbers whenever an earlier image turns up, so a number you wrote down can end up naming a different picture. Every tool that takes an image reference accepts both forms.
+- **Prefer the handle, and note it if you may want the image later.** `thread:N` renumbers whenever an earlier image turns up, so a noted number can end up naming a different picture. Every tool that takes an image reference accepts both forms.
+- **Copy the handle, never count.** An image attached to the current message carries its handle in its label, e.g. `[1 image attached to this message (img-0123456789abcdef)]`. Pass that handle; do not work out its `thread:N`.
 - **Recent images are already in your vision**: you can see and describe them natively, so just answer.
-- **Older images age out of your vision** after a few newer messages (so stale screenshots don't mislead you in long threads). The conversation history then shows only a text note like `[attached image (thread:2, img-0123456789abcdef, 2h ago, image not included, may be outdated)]` plus the saved description.
-- **To see an aged-out image again, call `view_image`** with its handle, e.g. `view_image(image: "img-0123456789abcdef")`. It re-loads the actual pixels into your vision so you can describe or reason about it. **When the user refers to an image posted earlier and you cannot see it, call `view_image`.** Do NOT reply that there is no image, and do not ask them to re-send it. Take the address from the history's image notes.
-- **To keep an image** as a file, use `save_thread_image(image: "img-<hex>", path: "...")` (writes under `data/artifacts/`, git-committed). **To edit/restyle an image**, use `generate_image` with `input_images: ["img-<hex>"]`. To view an image *file* already under `data/artifacts/`, use `read_file` (not `view_image`).
+- **Older images age out of your vision** after a few newer messages, so stale screenshots don't mislead you in long threads. The history then shows only a text note like `[attached image (thread:2, img-0123456789abcdef, 2h ago, image not included, may be outdated)]` plus the saved description.
+- **To see an aged-out image again, call `view_image`** with its handle, e.g. `view_image(image: "img-0123456789abcdef")`. It reloads the actual pixels into your vision. **When the user refers to an earlier image you cannot see, call `view_image`.** Never reply that there is no image, and never ask them to re-send it. Take the address from the history's image notes.
+- **To keep an image** as a file, use `save_thread_image(image: "img-<hex>", path: "...")` (writes under `data/artifacts/`, git-committed). **To edit or restyle an image**, use `generate_image` with `input_images: ["img-<hex>"]`. To view an image *file* already under `data/artifacts/`, use `read_file`, not `view_image`.

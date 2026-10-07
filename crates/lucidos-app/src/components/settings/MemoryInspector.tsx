@@ -10,6 +10,7 @@ import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock, SkeletonProvider } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { Disclosure } from '../shared/Disclosure';
+import { Pager } from '../shared/Pager';
 import { setLoadingIfFresh, toFailed } from '../../store/types';
 import { formatTimeAgo, formatDateTime } from '../../utils/formatTime';
 import { errorDetail } from '../../utils/errorDetail';
@@ -350,14 +351,7 @@ export function MemoryInspector() {
     void loadEntries(0);
   }, [sourceFilter, sortBy, importanceParam, loadEntries]);
 
-  function handleNextPage() {
-    const newOffset = offset + PAGE_SIZE;
-    setOffset(newOffset);
-    void loadEntries(newOffset);
-  }
-
-  function handlePrevPage() {
-    const newOffset = Math.max(0, offset - PAGE_SIZE);
+  function goToPage(newOffset: number) {
     setOffset(newOffset);
     void loadEntries(newOffset);
   }
@@ -391,15 +385,13 @@ export function MemoryInspector() {
                   <MemoryEntryRow key={entry.id} entry={entry} />
                 ))}
               </div>
-              <div class="memory-pagination">
-                <span class="memory-pagination-info">
-                  {offset + 1}–{Math.min(offset + PAGE_SIZE, entries.data.total)} of {entries.data.total.toLocaleString()}
-                </span>
-                <div class="memory-pagination-buttons">
-                  <button class="action-btn" disabled={offset === 0} onClick={handlePrevPage}>Prev</button>
-                  <button class="action-btn" disabled={!entries.data.has_more} onClick={handleNextPage}>Next</button>
-                </div>
-              </div>
+              <Pager
+                offset={offset}
+                pageSize={PAGE_SIZE}
+                total={entries.data.total}
+                hasMore={entries.data.has_more}
+                onChange={goToPage}
+              />
             </>
           )
         ) : null}

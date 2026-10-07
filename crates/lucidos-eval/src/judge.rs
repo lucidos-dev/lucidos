@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use lucidos_engine::core::prefs;
 use lucidos_engine::llm::model_registry::{self, ModelRegistry, ModelRouting, ProviderKind};
 use lucidos_engine::llm::provider::{LlmProvider, Message, MessageContent};
 use lucidos_engine::llm::provider_build::{
@@ -31,9 +32,6 @@ pub const JUDGE_PROVIDER_VAR: &str = "LUCIDOS_EVAL_JUDGE_PROVIDER";
 /// Every provider the judge can be pinned to, in the engine's own vocabulary.
 /// The engine's own list, so a backend it gains is pinnable here at once.
 const PROVIDER_KINDS: [ProviderKind; 7] = ProviderKind::ALL;
-
-/// The region the engine defaults to when nothing names one.
-const DEFAULT_VERTEX_REGION: &str = "europe-west1";
 
 /// The one question the preflight asks, when the judge session is built.
 ///
@@ -336,8 +334,8 @@ fn judge_context(model: &str, registry: &ModelRegistry) -> ProviderBuildContext 
         .or_else(vertex::adc::project_from_files)
         .unwrap_or_default();
     let token_cache = (!project_id.is_empty()).then(|| Arc::new(std::sync::Mutex::new(None)));
-    let region =
-        std::env::var("VERTEX_REGION").unwrap_or_else(|_| DEFAULT_VERTEX_REGION.to_string());
+    let region = std::env::var("VERTEX_REGION")
+        .unwrap_or_else(|_| prefs::VERTEX_REGION.default_text().to_string());
     ProviderBuildContext {
         default_model: model.to_string(),
         model_is_mock: false,
@@ -459,6 +457,7 @@ pub async fn judge_call(judge: &Judge<'_>, rubric: &str, subject: &str) -> Falli
             lucidos_engine::llm::ModelSelection::model(&judge.config.model),
             None,
             None,
+            lucidos_engine::llm::metered::CallToken::for_eval_harness(),
         )
         .await?;
     Ok(response.content.unwrap_or_default())
@@ -507,7 +506,24 @@ mod tests {
     }
 
     /// The judge model `probes.toml` pins, which routes to Vertex by shape.
-    const MODEL: &str = "claude-haiku-4-5";
+    /// Read from the file, so a re-pin there cannot leave these tests behind.
+    fn pinned_judge_model() -> String {
+        #[derive(Deserialize)]
+        struct ProbesJudge {
+            judge: PinnedJudge,
+        }
+        #[derive(Deserialize)]
+        struct PinnedJudge {
+            model: String,
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../eval/context-mode/probes.toml");
+        let text = std::fs::read_to_string(&path).expect("the checked-in probes.toml");
+        toml::from_str::<ProbesJudge>(&text)
+            .expect("probes.toml has a [judge] model")
+            .judge
+            .model
+    }
 
     fn routes_to(registry: &ModelRegistry, model: &str) -> ProviderKind {
         model_registry::provider_kind_for(registry, model)
@@ -529,39 +545,43 @@ mod tests {
 
     #[test]
     fn the_pin_decides_and_without_one_the_model_id_does() {
-        let pinned = judge_registry(MODEL, Some(ProviderKind::Anthropic)).unwrap();
-        assert_eq!(routes_to(&pinned, MODEL), ProviderKind::Anthropic);
-        let bare = judge_registry(MODEL, None).unwrap();
-        assert_eq!(routes_to(&bare, MODEL), ProviderKind::Vertex);
+        let model = pinned_judge_model();
+        let pinned = judge_registry(&model, Some(ProviderKind::Anthropic)).unwrap();
+        assert_eq!(routes_to(&pinned, &model), ProviderKind::Anthropic);
+        let bare = judge_registry(&model, None).unwrap();
+        assert_eq!(routes_to(&bare, &model), ProviderKind::Vertex);
         assert_eq!(routes_to(&bare, "gpt-5.6"), ProviderKind::OpenAi);
     }
 
     #[test]
     fn the_routed_provider_wins_whenever_this_machine_has_it() {
-        let registry = judge_registry(MODEL, None).unwrap();
+        let model = pinned_judge_model();
+        let registry = judge_registry(&model, None).unwrap();
         let configured = [ProviderKind::Vertex, ProviderKind::OpenAi];
-        let resolved = resolve_provider(&registry, MODEL, None, &configured).unwrap();
+        let resolved = resolve_provider(&registry, &model, None, &configured).unwrap();
         assert_eq!(resolved, ProviderKind::Vertex);
     }
 
     #[test]
     fn the_only_configured_provider_serves_a_judge_nobody_pinned() {
-        let registry = judge_registry(MODEL, None).unwrap();
+        let model = pinned_judge_model();
+        let registry = judge_registry(&model, None).unwrap();
         let resolved =
-            resolve_provider(&registry, MODEL, None, &[ProviderKind::Anthropic]).unwrap();
+            resolve_provider(&registry, &model, None, &[ProviderKind::Anthropic]).unwrap();
         assert_eq!(resolved, ProviderKind::Anthropic);
         // The router reads the same handle, so the fallback has to reach it.
-        assert_eq!(routes_to(&registry, MODEL), ProviderKind::Anthropic);
+        assert_eq!(routes_to(&registry, &model), ProviderKind::Anthropic);
     }
 
     #[test]
     fn a_missing_provider_is_named_with_what_this_machine_lacks() {
-        let registry = judge_registry(MODEL, None).unwrap();
+        let model = pinned_judge_model();
+        let registry = judge_registry(&model, None).unwrap();
         let configured = [ProviderKind::OpenAi, ProviderKind::XAi];
-        let err = resolve_provider(&registry, MODEL, None, &configured)
+        let err = resolve_provider(&registry, &model, None, &configured)
             .unwrap_err()
             .to_string();
-        assert!(err.contains(MODEL), "{err}");
+        assert!(err.contains(&model), "{err}");
         assert!(err.contains("openai, xai"), "{err}");
         assert!(
             err.contains("gcloud auth application-default login"),
@@ -573,9 +593,10 @@ mod tests {
 
     #[test]
     fn a_pin_stands_even_when_it_is_the_provider_that_is_missing() {
+        let model = pinned_judge_model();
         let pinned = Some(ProviderKind::OpenAi);
-        let registry = judge_registry(MODEL, pinned).unwrap();
-        let err = resolve_provider(&registry, MODEL, pinned, &[ProviderKind::Vertex])
+        let registry = judge_registry(&model, pinned).unwrap();
+        let err = resolve_provider(&registry, &model, pinned, &[ProviderKind::Vertex])
             .unwrap_err()
             .to_string();
         assert!(err.contains(JUDGE_PROVIDER_VAR), "{err}");
@@ -716,10 +737,10 @@ mod tests {
 
     #[test]
     fn only_a_clear_judge_score_can_disagree() {
-        assert!(row("T02", Arm::Lean, 3, false, 1).disagrees());
-        assert!(row("T02", Arm::Lean, 1, true, 2).disagrees());
-        assert!(!row("T02", Arm::Lean, 2, true, 3).disagrees());
-        assert!(!row("T02", Arm::Lean, 3, true, 4).disagrees());
+        assert!(row("T02", Arm::LEAN, 3, false, 1).disagrees());
+        assert!(row("T02", Arm::LEAN, 1, true, 2).disagrees());
+        assert!(!row("T02", Arm::LEAN, 2, true, 3).disagrees());
+        assert!(!row("T02", Arm::LEAN, 3, true, 4).disagrees());
     }
 
     #[test]
@@ -727,9 +748,9 @@ mod tests {
         let mut rows = Vec::new();
         for index in 0..40u128 {
             let arm = if index % 2 == 0 {
-                Arm::Control
+                Arm::CONTROL
             } else {
-                Arm::Lean
+                Arm::LEAN
             };
             let task = if index < 20 { "T02" } else { "T05" };
             rows.push(row(task, arm, 3, false, index + 1));
@@ -745,7 +766,7 @@ mod tests {
     #[test]
     fn threads_the_scorers_agree_on_are_never_sampled() {
         let rows: Vec<TriageRow> = (0..40u128)
-            .map(|index| row("T02", Arm::Lean, 3, true, index + 1))
+            .map(|index| row("T02", Arm::LEAN, 3, true, index + 1))
             .collect();
         assert!(triage_sample(&rows, &config()).is_empty());
     }

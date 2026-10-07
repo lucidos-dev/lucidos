@@ -218,6 +218,9 @@ export type ThreadMeta = {
   channel: EventChannel | 'error_unknown_channel';
   initiator: ThreadInitiator;
   saved: boolean;
+  /** The workspace's home thread (ADR 0362). Set only on that one thread; it
+   *  never changes once the engine has created it. */
+  home?: true;
   createdAt: string;
   updatedAt: string;
   /** When the user last drove this thread forward (message sent, question
@@ -369,6 +372,18 @@ export type ThreadMeta = {
 export type ThreadComposeState = 'composing' | 'active' | 'discarded';
 export type ComposeChannelMode = 'lucidos' | 'claude_code' | null;
 
+export type PendingUserMessage = {
+  text: string;
+  eventId: string;
+  created: string;
+  image_hashes?: string[];
+  unconfirmed?: boolean;
+  /** The open question card this send answers, by tool-use id. The engine
+   *  routes it there as a `FreeText` answer, so it draws on that card rather
+   *  than as a row. `splitTypedAnswers` names the cases that keep the row. */
+  answersQuestion?: string;
+};
+
 export type ThreadState = {
   meta: ThreadMeta;
   events: Map<number, StoredEvent>;
@@ -409,7 +424,7 @@ export type ThreadState = {
    *  `unconfirmed` marks a row the safety refetch gave up on: the send was
    *  never confirmed and the row is kept so the text stays visible, but it no
    *  longer counts as a turn in flight (see `effectiveThreadStatus`). */
-  pendingUserMessages: Array<{ text: string; eventId: string; created: string; image_hashes?: string[]; unconfirmed?: boolean }>;
+  pendingUserMessages: PendingUserMessage[];
   /** Every utterance of this call the engine has not written down yet, oldest
    *  first.
    *
@@ -544,7 +559,9 @@ export function makeOptimisticThreadState(opts: {
       status: opts.status ?? 'running',
       summaryVersion: UNVERSIONED,
       messageCount: 0,
-      section: 'archived',
+      // The engine creates every row in the inbox. Archived here would drop
+      // the row from Current whenever it stops running before a summary lands.
+      section: 'inbox',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
       blockingDescendantCount: 0,

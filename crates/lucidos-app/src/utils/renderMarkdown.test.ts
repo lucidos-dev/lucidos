@@ -13,6 +13,7 @@ vi.mock('./basePath', () => ({
   get WORKSPACE_ID() {
     return base.workspaceId;
   },
+  API: '/myws/api/v1',
 }));
 
 import { lucidos } from '@lucidos/sdk';
@@ -33,6 +34,100 @@ describe('renderMarkdown', () => {
     expect(html).toContain('Heading 1');
     expect(html).toContain('<h2');
     expect(html).toContain('Heading 2');
+  });
+
+  it('gives no heading an id in chat, where messages would repeat them', () => {
+    expect(renderMarkdown('## Usage', { cache: false })).not.toContain('id=');
+  });
+
+  it('gives a document heading the anchor id GitHub gives it', () => {
+    const doc = { kind: 'repo', repoId: 'repo-1', path: 'docs/guide.md' } as const;
+    const html = renderMarkdown(
+      '## Auth tier compatibility (API key vs subscription / OAuth)',
+      { cache: false, document: doc },
+    );
+    expect(html).toContain('id="user-content-auth-tier-compatibility-api-key-vs-subscription--oauth"');
+  });
+
+  it('numbers a repeated document heading, and keeps an authored id', () => {
+    const doc = { kind: 'workspace', path: 'artifacts/notes.md' } as const;
+    const html = renderMarkdown(
+      '## Usage\n\n## Usage\n\n<h3 id="mine">Usage</h3>\n\n## 🚀',
+      { cache: false, document: doc },
+    );
+    expect(html).toContain('id="user-content-usage"');
+    expect(html).toContain('id="user-content-usage-1"');
+    expect(html).toContain('<h3 id="mine">');
+    expect(html).toContain('<h2>🚀</h2>');
+  });
+
+  it('caches a document separately from the same text in chat', () => {
+    const md = '## Cached heading';
+    renderMarkdown(md);
+    const doc = { kind: 'workspace', path: 'artifacts/notes.md' } as const;
+    expect(renderMarkdown(md, { document: doc })).toContain('id="user-content-cached-heading"');
+    expect(renderMarkdown(md)).not.toContain('id=');
+  });
+
+  describe('link tooltips', () => {
+    it('stamps no tooltip in chat, which has no document to resolve against', () => {
+      const html = renderMarkdown('[guide](../guide.md)', { cache: false });
+      expect(html).not.toContain('data-tooltip');
+    });
+
+    it('stamps the resolved path on a relative link in a document, matching a click', () => {
+      const doc = { kind: 'repo', repoId: 'repo-1', path: 'docs/databricks.md' } as const;
+      const html = renderMarkdown(
+        '[databricks guide](../deploy/databricks/README.md)',
+        { cache: false, document: doc },
+      );
+      expect(html).toContain('data-tooltip="deploy/databricks/README.md"');
+      expect(html).toContain('data-tooltip-longpress');
+    });
+
+    it("stamps a found heading's own text for an in-page anchor", () => {
+      const doc = { kind: 'workspace', path: 'notes/plan.md' } as const;
+      const md = '## Auth tier compatibility (API key vs subscription / OAuth)\n\n'
+        + 'See [the section](#auth-tier-compatibility-api-key-vs-subscription--oauth).';
+      const html = renderMarkdown(md, { cache: false, document: doc });
+      expect(html).toContain(
+        'data-tooltip="Auth tier compatibility (API key vs subscription / OAuth)"',
+      );
+    });
+
+    it('matches the "No ... section" toast wording when no heading matches', () => {
+      const doc = { kind: 'workspace', path: 'notes/plan.md' } as const;
+      const html = renderMarkdown('[missing](#nope)', { cache: false, document: doc });
+      expect(html).toContain('data-tooltip="No &quot;nope&quot; section in notes/plan.md"');
+    });
+
+    it('stamps the full URL on an external link', () => {
+      const doc = { kind: 'workspace', path: 'notes/plan.md' } as const;
+      const html = renderMarkdown(
+        '[example](https://example.com/docs)',
+        { cache: false, document: doc },
+      );
+      expect(html).toContain('data-tooltip="https://example.com/docs"');
+    });
+
+    it('marks a link climbing above the root as not reachable, without resolving it', () => {
+      const doc = { kind: 'workspace', path: 'notes/plan.md' } as const;
+      const html = renderMarkdown('[outside](../../outside.md)', { cache: false, document: doc });
+      expect(html).toContain('data-tooltip="../../outside.md (not reachable)"');
+    });
+
+    it('moves an authored markdown title to data-tooltip-title, next to the resolved target', () => {
+      const doc = { kind: 'repo', repoId: 'repo-1', path: 'docs/databricks.md' } as const;
+      const html = renderMarkdown(
+        '[guide](../deploy/databricks/README.md "The deploy guide")',
+        { cache: false, document: doc },
+      );
+      expect(html).toContain('data-tooltip-title="The deploy guide"');
+      expect(html).toContain('data-tooltip="deploy/databricks/README.md"');
+      // The bare `title` attribute is gone, not just overshadowed: strip the
+      // `data-tooltip-title` occurrence before checking for a leftover one.
+      expect(html.replace('data-tooltip-title="The deploy guide"', '')).not.toContain('title="');
+    });
   });
 
   it('converts soft breaks to hard breaks', () => {
@@ -525,6 +620,7 @@ describe('renderMarkdown', () => {
       'repo:aa11aaaa-bbbb-cccc-dddd-eeeeffff0001:file:README.md',
       'app:habit-tracker',
       'trigger:aa11aaaa-bbbb-cccc-dddd-eeeeffff0002',
+      'settings:backup',
     ])('keeps an app-owned scheme the extractors run on: %s', (href) => {
       expect(renderMarkdown(`[x](${href})`, { cache: false })).toContain(`href="${href}"`);
     });
@@ -1011,6 +1107,116 @@ describe('renderMarkdown images', () => {
   it('keeps a fragment attached after the path', () => {
     const html = renderMarkdown('![alt](artifacts/chart.svg#detail)', { cache: false });
     expect(imgSrc(html)).toBe('/myws/data/artifacts/chart.svg#detail');
+  });
+
+  /** A previewed file names its images relative to its own folder, the way
+   *  GitHub and every editor read them. */
+  describe('in a repository document', () => {
+    const doc = (path: string, rev: { ref?: string; changeId?: string } = {}) =>
+      ({ kind: 'repo', repoId: 'repo-1', path, ...rev }) as const;
+    const render = (md: string, document: ReturnType<typeof doc>) =>
+      renderMarkdown(md, { cache: false, document });
+    const fileUrl = (path: string, ref?: string) => {
+      const params = new URLSearchParams({ path });
+      if (ref) params.set('ref', ref);
+      return `/myws/api/v1/repositories/repo-1/file?${params}`.replace(/&/g, '&amp;');
+    };
+    const imgOf = (html: string) =>
+      new DOMParser().parseFromString(html, 'text/html').querySelector('img')!;
+
+    it('resolves an image against the document folder', () => {
+      const html = render('![LLM call flow](images/guide/llm-call-flow.png)', doc('docs/guide.md'));
+      expect(imgSrc(html)).toBe(fileUrl('docs/images/guide/llm-call-flow.png'));
+    });
+
+    it('resolves a raw HTML image the same way', () => {
+      const html = render('<img src="assets/banner.png" alt="Project banner">', doc('README.md'));
+      expect(imgSrc(html)).toBe(fileUrl('assets/banner.png'));
+    });
+
+    it('follows a ../ that stays inside the checkout', () => {
+      const html = render('![x](../assets/logo.png)', doc('docs/guide/setup.md'));
+      expect(imgSrc(html)).toBe(fileUrl('docs/assets/logo.png'));
+    });
+
+    it('anchors a leading slash at the checkout root', () => {
+      const html = render('![x](/assets/logo.png)', doc('docs/guide/setup.md'));
+      expect(imgSrc(html)).toBe(fileUrl('assets/logo.png'));
+    });
+
+    it('carries the branch the document was read at', () => {
+      const html = render('![x](img/a.png)', doc('docs/x.md', { ref: 'feature/images' }));
+      expect(imgSrc(html)).toBe(fileUrl('docs/img/a.png', 'feature/images'));
+    });
+
+    it('reads the image from the change a whole-file view shows', () => {
+      const html = render('![x](img/a.png)', doc('docs/x.md', { changeId: 'change-9', ref: 'branch' }));
+      expect(imgSrc(html)).toBe('/myws/api/v1/changes/change-9/file?path=docs%2Fimg%2Fa.png');
+    });
+
+    it('drops a query the file URL has no use for', () => {
+      const html = render('![x](img/a.png?raw=true)', doc('README.md'));
+      expect(imgSrc(html)).toBe(fileUrl('img/a.png'));
+    });
+
+    it('decodes before resolving, so a space is encoded once', () => {
+      const html = render('![x](<my pics/a b.png>)', doc('README.md'));
+      expect(imgSrc(html)).toBe(fileUrl('my pics/a b.png'));
+    });
+
+    it('leaves an absolute URL alone', () => {
+      const html = render('![x](https://example.com/x.png)', doc('README.md'));
+      expect(imgSrc(html)).toBe('https://example.com/x.png');
+    });
+
+    it('refuses a ../ that climbs out of the checkout, and never fetches it', () => {
+      const html = render(
+        '![chunk split](../../../crates/lucidos-app/x.png)',
+        doc('docs/plans/2026-09-26-entry-chunk-first-paint-split.md'),
+      );
+      const img = imgOf(html);
+      expect(img.hasAttribute('src')).toBe(false);
+      expect(img.hasAttribute('data-load-failed')).toBe(true);
+      expect(html).toContain('Image not available: chunk split');
+      expect(html).toContain('<code>../../../crates/lucidos-app/x.png</code>');
+      // The notice sits in the image's own wrapper, where a failed load puts it.
+      expect(img.parentElement?.className).toBe('image-scroll-wrapper');
+    });
+
+    it('refuses an encoded climb, however it is spelled', () => {
+      for (const src of ['%2e%2e/%2e%2e/x.png', 'a/%2e%2e%2f%2e%2e%2f..%2fx.png', '..%5c..%5cx.png']) {
+        expect(imgOf(render(`<img src="${src}">`, doc('docs/x.md'))).hasAttribute('src')).toBe(false);
+      }
+    });
+
+    it('refuses a malformed escape rather than guessing', () => {
+      expect(imgOf(render('<img src="img/%zz.png">', doc('docs/x.md'))).hasAttribute('src')).toBe(false);
+    });
+  });
+
+  describe('in a workspace document', () => {
+    const doc = { kind: 'workspace', path: 'artifacts/reports/weekly.md' } as const;
+    const render = (md: string) => renderMarkdown(md, { cache: false, document: doc });
+
+    it('keeps a source naming a workspace directory root-relative', () => {
+      expect(imgSrc(render('![x](artifacts/screenshots/hero.png)'))).toBe('/myws/data/artifacts/screenshots/hero.png');
+    });
+
+    it('resolves a sibling and a ../ against the document folder', () => {
+      expect(imgSrc(render('![x](pic.png)'))).toBe('/myws/data/artifacts/reports/pic.png');
+      expect(imgSrc(render('![x](./charts/a.png?v=2)'))).toBe('/myws/data/artifacts/reports/charts/a.png?v=2');
+      expect(imgSrc(render('![x](../img/pic.png)'))).toBe('/myws/data/artifacts/img/pic.png');
+    });
+
+    it('refuses a source that climbs out of the data root', () => {
+      const html = render('![x](../../../etc/passwd)');
+      expect(html).not.toContain('/data/');
+      expect(html).toContain('data-load-failed');
+    });
+
+    it('refuses a climb that starts at a workspace directory', () => {
+      expect(render('![x](artifacts/../../etc/passwd)')).toContain('data-load-failed');
+    });
   });
 
   /** A size hint lets the browser reserve the picture's box before its bytes

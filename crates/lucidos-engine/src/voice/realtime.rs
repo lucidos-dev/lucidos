@@ -32,13 +32,6 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// it never leaves the engine (the plan's decision 3).
 const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
 
-/// What turns the caller's audio into text when nothing named one.
-///
-/// The workspace's own choice arrives on [`SessionOpening::transcriber`], and
-/// the catalog default is what fills it. This is the last resort under both, so
-/// an empty opening still transcribes rather than opening a mute call.
-const TRANSCRIBE_MODEL: &str = "gpt-4o-mini-transcribe";
-
 /// The one transcriber that spells its language pin as an array.
 ///
 /// A constant, because `transcription()` branches on this id and the picker in
@@ -301,9 +294,13 @@ fn function(name: &str, description: &str, argument: Option<(&str, &str)>) -> Va
 /// reads `languages`, an array of codes. Every other model reads the singular
 /// `language`. The provider refuses a payload holding both, so this writes
 /// exactly one of them. An unresolved language still writes neither.
+///
+/// The workspace's choice arrives on [`SessionOpening::transcriber`]. An empty
+/// one falls back to the catalog default, so it still transcribes rather than
+/// opening a mute call.
 fn transcription(opening: &SessionOpening) -> Value {
     let model = match opening.transcriber.trim() {
-        "" => TRANSCRIBE_MODEL,
+        "" => crate::core::prefs::MODEL_VOICE_TRANSCRIBER.default_text(),
         named => named,
     };
     let mut config = json!({ "model": model });

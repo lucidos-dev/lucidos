@@ -24,6 +24,28 @@ fn guard_drop_removes_from_map() {
     assert!(!token.is_cancelled());
 }
 
+/// A turn keeps the computer awake for as long as its guard lives. A turn
+/// whose future is cancelled drops the guard, and with it the hold.
+#[tokio::test]
+async fn a_turn_keeps_the_computer_awake_until_its_guard_drops() {
+    let threads = make_threads();
+    let tid = Uuid::new_v4();
+    let label = tid.to_string();
+    let (_token, _injection_rx, guard) = register(&threads, tid);
+    assert!(crate::core::keep_awake::is_held(&label));
+
+    let turn = tokio::spawn(async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+    });
+    turn.abort();
+    let _ = turn.await;
+    assert!(
+        !crate::core::keep_awake::is_held(&label),
+        "a cancelled turn leaked its hold"
+    );
+}
+
 #[test]
 fn guard_drop_does_not_cancel_token() {
     let threads = make_threads();

@@ -10,7 +10,7 @@ import { Disclosure } from '../shared/Disclosure';
  *  Presentation only. It takes the switch position and gives back the press,
  *  because the two blocks above it decide differently. `ProviderBlock` derives
  *  its position from `/health`, which lags a press and needs a held override.
- *  `TypeSafeJudgmentSettings` derives its own from a credential and a
+ *  `SystemOneProviderFrame` derives its own from a credential and a
  *  preference, both of which move with the press. One frame keeps the two rows
  *  looking and behaving the same without pretending they know the same things.
  */

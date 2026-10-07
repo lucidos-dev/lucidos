@@ -7,10 +7,11 @@ import {
   renderChannelSection,
   renderEngineExplainerSection,
   renderExecutorSection,
-  renderInitiatorRow,
   renderOriginSection,
+  originPopoverHasContent,
 } from './MessageRoutePanel';
-import { appsList, repositories } from '../../store/store';
+import { formatMessageTimestamp } from '../../utils/formatTime';
+import { appsList, contextViewer, repositories } from '../../store/store';
 import { devices } from '../../store/actions/devices';
 import { pairedDevices } from '../../store/actions/pairedDevices';
 import type { EngineReason, Exchange, StoredEvent, ThreadMeta } from '../../store/thread-events';
@@ -536,6 +537,30 @@ describe('executorExtras', () => {
     const extras = executorExtras(exchange, events);
     expect(extras.contextTokens).toBe(12345);
     expect(extras.contextTrimmed).toBe(true);
+    // A legacy row has no snapshot behind it, so there is nothing to open.
+    expect(extras.contextCapture).toBeUndefined();
+  });
+
+  it('carries the turn\u2019s last capture, so the Context row can open it', () => {
+    const userEvent = stamp(0, { type: 'MessageReceived', text: 'go' });
+    const first = stamp(1, {
+      type: 'ContextCaptured', producer: 'claude_code', model: 'claude-sonnet-5',
+      context_window: 1_000_000, sections: [], estimated_total_tokens: 438_000,
+    });
+    const last = {
+      ...stamp(2, {
+        type: 'ContextCaptured', producer: 'claude_code', model: 'claude-sonnet-5',
+        context_window: 1_000_000, sections: [], estimated_total_tokens: 439_000,
+      }),
+      _eventId: 'evt-last',
+    } as StoredEvent;
+    const exchange: Exchange = { userEvent, userSeq: 1, steps: [{ seq: 2, event: first }, { seq: 3, event: last }] };
+    const events = new Map<number, StoredEvent>([[1, userEvent], [2, first], [3, last]]);
+
+    const extras = executorExtras(exchange, events);
+    expect(extras.contextTokens).toBe(439_000);
+    expect(extras.contextCapture?.estimated_total_tokens).toBe(439_000);
+    expect(extras.contextCapture?.event_id).toBe('evt-last');
   });
 });
 
@@ -713,7 +738,7 @@ describe('renderOriginSection', () => {
       created: '2026-09-24T06:13:01Z',
     };
     const read = JSON.stringify(renderOriginSection(
-      exch(message), undefined, () => undefined, undefined, 'claude-code', '2026-09-24T06:19:30Z',
+      exch(message), undefined, () => undefined, undefined, '2026-09-24T06:19:30Z',
     ));
     expect(read).toContain('"Sent"');
     expect(read).toContain('"Read"');
@@ -956,64 +981,66 @@ describe('plugin seeds name what the engine acted on', () => {
   });
 });
 
-describe('renderInitiatorRow', () => {
-  it('discloses Claude Code as the asker for UserQuestionAsked', () => {
-    const node = renderInitiatorRow({
-      type: 'UserQuestionAsked',
-      tool_use_id: 'tu',
-      cc_session_id: 's',
-      question: 'q',
-      options: [],
-    });
-    const s = JSON.stringify(node);
-    expect(s).toContain('Asked by');
-    expect(s).toContain('Claude Code');
+// The chip on a question or permission card already names the agent that
+// asked, so the popover must never only repeat it. It opens once someone
+// answered, and says when and where.
+describe('a question or permission card popover', () => {
+  const question: StoredEvent = { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'q', options: [] };
+  const answer = (kind: 'Selected' | 'Canceled', actor = true): StoredEvent => ({
+    type: 'UserQuestionAnswered', tool_use_id: 'tu-1',
+    answer: kind === 'Selected' ? { kind, option_id: 'a' } : { kind },
+    created: '2026-10-06T17:22:00Z',
+    ...(actor ? { actor: { kind: 'device', device_id: 'd1' } } : {}),
+  } as StoredEvent);
+  const permission: StoredEvent = {
+    type: 'CodingAgentPermissionRequest', request_id: 'r1', tool_use_id: 'tu', tool_name: 'Edit', input: {}, summary: 's',
+  };
+  const verdict: StoredEvent = {
+    type: 'CodingAgentPermissionResolved', request_id: 'r1', allowed: true,
+    created: '2026-10-06T17:23:00Z', actor: { kind: 'device', device_id: 'd1' },
+  } as StoredEvent;
+
+  it('does not open while the question waits for an answer', () => {
+    expect(originPopoverHasContent(exch(question))).toBe(false);
+    expect(originPopoverHasContent(exch(permission))).toBe(false);
+    expect(originPopoverHasContent(exch({ type: 'McpConsentRequested', tool: 'fs.read', args: {} }))).toBe(false);
   });
 
-  it('discloses Claude Code asking permission for CodingAgentPermissionRequest', () => {
-    const node = renderInitiatorRow({
-      type: 'CodingAgentPermissionRequest',
-      request_id: 'r1',
-      tool_use_id: 'tu',
-      tool_name: 'Edit',
-      input: {},
-      summary: 's',
-    });
-    const s = JSON.stringify(node);
-    expect(s).toContain('Asked by');
-    expect(s).toContain('Claude Code, asking your permission');
+  it('does not open for a question nobody answered, even if it was settled', () => {
+    expect(originPopoverHasContent(exch(question, [{ seq: 2, event: answer('Canceled') }]))).toBe(false);
+    expect(originPopoverHasContent(exch(question, [{ seq: 2, event: answer('Selected', false) }]))).toBe(false);
   });
 
-  it('names Codex, not Claude Code, on a Codex thread', () => {
-    const permission = renderInitiatorRow({
-      type: 'CodingAgentPermissionRequest',
-      request_id: 'r1',
-      tool_use_id: 'tu',
-      tool_name: 'Edit',
-      input: {},
-      summary: 's',
-    }, 'codex');
-    const question = renderInitiatorRow({
-      type: 'UserQuestionAsked',
-      tool_use_id: 'tu',
-      cc_session_id: 's',
-      question: 'q',
-      options: [],
-    }, 'codex');
-    expect(JSON.stringify(permission)).toContain('Codex, asking your permission');
-    expect(JSON.stringify(question)).toContain('Codex');
-    expect(JSON.stringify(question)).not.toContain('Claude Code');
+  it('opens once answered, and names when and on which device', () => {
+    seedDevice('d1', 'My iPhone');
+    const answered = exch(question, [{ seq: 2, event: answer('Selected') }]);
+    expect(originPopoverHasContent(answered)).toBe(true);
+    const s = JSON.stringify(renderOriginSection(answered, undefined, () => undefined));
+    expect(s).toContain('"Answered"');
+    expect(s).toContain(formatMessageTimestamp('2026-10-06T17:22:00Z'));
+    expect(s).toContain('Answered on');
+    expect(s).toContain('My iPhone');
   });
 
-  it('discloses Lucidos as the asker for McpConsentRequested', () => {
-    const node = renderInitiatorRow({ type: 'McpConsentRequested', tool: 'fs.read', args: {} });
-    expect(JSON.stringify(node)).toContain('Lucidos, asking before a tool is first used');
+  it('names when a permission was decided', () => {
+    seedDevice('d1', 'My iPhone');
+    const decided = exch(permission, [{ seq: 2, event: verdict }]);
+    expect(originPopoverHasContent(decided)).toBe(true);
+    const s = JSON.stringify(renderOriginSection(decided, undefined, () => undefined));
+    expect(s).toContain('"Decided"');
+    expect(s).toContain(formatMessageTimestamp('2026-10-06T17:23:00Z'));
+    expect(s).toContain('Decided on');
   });
 
-  it('returns null for non-divider event types (their initiator is implied)', () => {
-    expect(renderInitiatorRow({ type: 'MessageReceived', text: 'hi', mode: 'human' })).toBeNull();
-    expect(renderInitiatorRow({ type: 'TriggerStarted', trigger_id: 't' })).toBeNull();
-    expect(renderInitiatorRow({ type: 'ChangeApplied', change_id: 'c1' })).toBeNull();
+  it('never repeats the asker the chip already names', () => {
+    seedDevice('d1', 'My iPhone');
+    const s = JSON.stringify(renderOriginSection(exch(question, [{ seq: 2, event: answer('Selected') }]), undefined, () => undefined));
+    expect(s).not.toContain('Asked by');
+    expect(s).not.toContain('Lucidos Agent');
+  });
+
+  it('leaves every other turn\'s popover alone', () => {
+    expect(originPopoverHasContent(exch({ type: 'MessageReceived', text: 'hi', mode: 'human' }))).toBe(true);
   });
 });
 
@@ -1083,10 +1110,19 @@ describe('route rows contribute exactly two grid cells', () => {
     expectTwoCellRows(section({ type: 'ContinuationStarted', branch: '' }), 1);
     expectTwoCellRows(section({ type: 'ResponseAborted', cause: 'engine_shutdown' }), 1);
     expectTwoCellRows(section({ type: 'ResponseCanceled', cause: 'user_stop' }), 1);
-    expectTwoCellRows(section({
-      type: 'CodingAgentPermissionRequest',
-      request_id: 'r1', tool_use_id: 'tu', tool_name: 'Bash', input: {}, summary: 'ls',
-    }), 1);
+    expectTwoCellRows(renderOriginSection(exch(
+      {
+        type: 'CodingAgentPermissionRequest',
+        request_id: 'r1', tool_use_id: 'tu', tool_name: 'Bash', input: {}, summary: 'ls',
+      },
+      [{
+        seq: 2,
+        event: {
+          type: 'CodingAgentPermissionResolved', request_id: 'r1', allowed: true,
+          created: '2026-10-06T17:23:00Z', actor: { kind: 'device', device_id: 'd1' },
+        } as StoredEvent,
+      }],
+    ), undefined, () => undefined), 2);
   });
 
   it('holds for a trigger origin (its rows are a fragment, not a wrapper div)', () => {
@@ -1151,6 +1187,44 @@ describe('route rows contribute exactly two grid cells', () => {
       renderExecutorSection(exchange, events, meta, 'claude-opus-5[1m]', 'xhigh'),
       6,
     );
+  });
+});
+
+describe('the Context row opens what the turn\u2019s last call was sent', () => {
+  afterEach(() => { contextViewer.value = null; });
+
+  const created = '2026-08-10T12:00:00.000Z';
+  const userEvent: StoredEvent = { type: 'MessageReceived', text: 'go', created };
+  const contextCell = (step: StoredEvent): VNode<{ children?: ComponentChildren }> => {
+    const exchange: Exchange = { userEvent, userSeq: 1, steps: [{ seq: 2, event: step }] };
+    const events = new Map<number, StoredEvent>([[1, userEvent], [2, step]]);
+    const cells = routeRowCells(renderExecutorSection(exchange, events, {} as ThreadMeta), 'Context');
+    expect(cells, 'no Context row rendered').not.toBeNull();
+    return cells![1] as VNode<{ children?: ComponentChildren }>;
+  };
+  const buttonIn = (cell: VNode<{ children?: ComponentChildren }>) =>
+    renderedChildren(cell.props?.children).find(
+      (c): c is VNode<{ class?: string; onClick?: () => void }> =>
+        typeof c === 'object' && (c as VNode).type === 'button',
+    );
+
+  it('is a link that opens the context viewer on the last capture', () => {
+    const cell = contextCell({
+      type: 'ContextCaptured', producer: 'claude_code', model: 'claude-sonnet-5',
+      context_window: 1_000_000, sections: [], estimated_total_tokens: 356_429, created,
+    } as StoredEvent);
+    const link = buttonIn(cell);
+    expect(link?.props.class).toBe('accent-link');
+
+    link!.props.onClick!();
+    expect(contextViewer.value?.snapshot.estimated_total_tokens).toBe(356_429);
+  });
+
+  it('stays plain text on a legacy row with no snapshot', () => {
+    const cell = contextCell({
+      type: 'ThoughtStreamed', text: '...', context_tokens: 12_345, created,
+    } as StoredEvent);
+    expect(buttonIn(cell)).toBeUndefined();
   });
 });
 

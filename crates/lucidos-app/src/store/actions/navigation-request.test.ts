@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from '@lucidos/sdk';
-import { SETTINGS_SUBVIEW_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay } from '../store';
+import { SETTINGS_SUBVIEW_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay, repositories } from '../store';
 
 // Spy on showToast but keep the rest of the store real — navigation-request.ts
 // reads the nav lists + settingsSubviewLabel at module load to build its
@@ -62,6 +62,10 @@ vi.mock('../../components/chat/promptFocus', () => ({ focusPromptNow }));
 // covered in repositories-nav.test.ts.
 const openEncodedRepoFilePreview = vi.fn((path: string) => path.startsWith('repo:'));
 vi.mock('./repositories', () => ({ openEncodedRepoFilePreview }));
+
+// What `openRepoFileLink` re-reads when its cached list cannot match a name.
+const { refreshRepositories } = vi.hoisted(() => ({ refreshRepositories: vi.fn(async () => {}) }));
+vi.mock('./repositoriesLoader', () => ({ refreshRepositories }));
 
 const { handleNavigationRequest, describeNavTarget } = await import('./navigation-request');
 
@@ -193,6 +197,44 @@ describe('handleNavigationRequest — file target', () => {
     expect(openFilePreview).not.toHaveBeenCalled();
   });
 
+  // A navigate stored before the engine resolved names, such as a notification
+  // tap, can still name its repository. Opened as written, the viewer read the
+  // name as a uuid and failed with "UUID parsing failed".
+  describe('a repository named by its name', () => {
+    afterEach(() => {
+      repositories.value = { status: 'not-loaded' };
+    });
+
+    it('opens the file under the repository id, line and all', () => {
+      repositories.value = { status: 'loaded', data: [{ id: REPO_ID, name: 'example-repo', path: '/src/example' }] };
+      handleNavigationRequest({ target: 'file', file_path: 'repo:example-repo:file#main:docs/x.md', line: 7 });
+      expect(openEncodedRepoFilePreview).toHaveBeenCalledWith(`repo:${REPO_ID}:file#main:docs/x.md`);
+      expect(openEncodedRepoFilePreview).not.toHaveBeenCalledWith(expect.stringContaining('example-repo'));
+      expect(selectedLines.value).toEqual({ start: 7, end: 7 });
+    });
+
+    it('resolves a name on a cold launch, before the repository list has loaded', async () => {
+      refreshRepositories.mockImplementationOnce(async () => {
+        repositories.value = { status: 'loaded', data: [{ id: REPO_ID, name: 'example-repo', path: '/src/example' }] };
+      });
+      await handleNavigationRequest({ target: 'file', file_path: 'repo:example-repo:file:docs/x.md' });
+      expect(openEncodedRepoFilePreview).toHaveBeenCalledWith(`repo:${REPO_ID}:file:docs/x.md`);
+    });
+
+    it('opens a uuid as written while the list is still loading', () => {
+      handleNavigationRequest({ target: 'file', file_path: ENCODED });
+      expect(refreshRepositories).not.toHaveBeenCalled();
+      expect(openEncodedRepoFilePreview).toHaveBeenCalledWith(ENCODED);
+    });
+
+    it('opens a known id as written', () => {
+      repositories.value = { status: 'loaded', data: [{ id: REPO_ID, name: 'example-repo', path: '/src/example' }] };
+      handleNavigationRequest({ target: 'file', file_path: ENCODED });
+      expect(openEncodedRepoFilePreview).toHaveBeenCalledTimes(1);
+      expect(openEncodedRepoFilePreview).toHaveBeenCalledWith(ENCODED);
+    });
+  });
+
   it('toasts and opens nothing when file_path is missing', () => {
     handleNavigationRequest({ target: 'file' });
     expect(openFilePreview).not.toHaveBeenCalled();
@@ -301,7 +343,7 @@ describe('handleNavigationRequest: file target at a line', () => {
     ['a PDF', 'artifacts/report.pdf'],
     ['an image', 'artifacts/chart.png'],
     ['a video', 'artifacts/clip.mp4'],
-    ['a repo diff', 'repo:repo-1:diff#change-7:src/main.rs'],
+    ['a repo diff', 'repo:3f9c1b2e-0d44-4a71-9f6d-2e5b8c7a1d03:diff#change-7:src/main.rs'],
   ])('opens %s at the top, selecting nothing', (_label, filePath) => {
     handleNavigationRequest({ target: 'file', file_path: filePath, line: 5 });
 
@@ -312,13 +354,13 @@ describe('handleNavigationRequest: file target at a line', () => {
   });
 
   it('still selects in a repo file opened in file mode', () => {
-    handleNavigationRequest({ target: 'file', file_path: 'repo:repo-1:file:src/main.rs', line: 5 });
+    handleNavigationRequest({ target: 'file', file_path: 'repo:3f9c1b2e-0d44-4a71-9f6d-2e5b8c7a1d03:file:src/main.rs', line: 5 });
 
     expect(selectedLines.value).toEqual({ start: 5, end: 5 });
   });
 
   it('selects in an extensionless file, which is textual by default', () => {
-    handleNavigationRequest({ target: 'file', file_path: 'repo:repo-1:file:Makefile', line: 5 });
+    handleNavigationRequest({ target: 'file', file_path: 'repo:3f9c1b2e-0d44-4a71-9f6d-2e5b8c7a1d03:file:Makefile', line: 5 });
 
     expect(selectedLines.value).toEqual({ start: 5, end: 5 });
   });

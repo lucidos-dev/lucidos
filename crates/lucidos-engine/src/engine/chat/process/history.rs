@@ -7,7 +7,7 @@
 //! `get_thread_events`, so a turn cannot read another conversation. Cross-thread
 //! continuity is long-term memory's job.
 
-use crate::core::events::{image_handle, ImageRef};
+use crate::core::events::walk_thread_image_handles;
 use crate::engine::context::{
     format_history_content, format_history_steps, format_image_refs, HISTORY_COMPRESS_THRESHOLD,
     HISTORY_MSG_TRUNCATE, HISTORY_OLDER_UNCOVERED_TURNS, HISTORY_OLDER_USER_BUDGET,
@@ -43,6 +43,36 @@ pub(super) fn speaker_label(m: &crate::core::store::SessionMessage) -> &str {
     }
 }
 
+/// Each message's 0-based start in the thread's image walk, matched by handle.
+///
+/// The walk is what `thread:N` resolves against, so a position read off it is
+/// the right one by construction. A message whose images the walk lacks gets
+/// `None` and leaves the cursor where it was, so it cannot shift the messages
+/// after it. The cursor only moves forward, which keeps a repeated picture
+/// (one handle) taking each of its own slots in turn.
+pub(super) fn locate_message_images(
+    messages: &[crate::core::store::SessionMessage],
+    walk: &[String],
+) -> Vec<Option<usize>> {
+    let mut cursor = 0;
+    messages
+        .iter()
+        .map(|m| {
+            let handles = m.image_handles.as_slice();
+            if handles.is_empty() {
+                return None;
+            }
+            let found = walk
+                .get(cursor..)?
+                .windows(handles.len())
+                .position(|window| window == handles)
+                .map(|offset| cursor + offset)?;
+            cursor = found + handles.len();
+            Some(found)
+        })
+        .collect()
+}
+
 /// Result of [`LucidosEngine::load_chat_history`]: everything derived from the
 /// single per-thread events fetch that the rest of the turn consumes.
 pub(super) struct ChatHistoryLoad {
@@ -63,6 +93,30 @@ pub(super) struct ChatHistoryLoad {
 }
 
 impl LucidosEngine {
+    /// The thread's loaded knowhow docs, replayed from its events after a
+    /// restart emptied the in-memory set.
+    async fn thread_loaded_knowhow(&self, thread_id: Uuid) -> Vec<LoadedKnowhow> {
+        if self.loaded_knowhow.needs_replay(thread_id).await {
+            match self
+                .event_store
+                .get_thread_events(&thread_id.to_string())
+                .await
+            {
+                Ok(events) => {
+                    self.loaded_knowhow
+                        .recover_for_thread(thread_id, &events)
+                        .await
+                }
+                Err(e) => log!(
+                    "[Chat] Could not replay the loaded knowhow of {}: {}",
+                    thread_id,
+                    e
+                ),
+            }
+        }
+        self.loaded_knowhow.for_thread(thread_id).await
+    }
+
     /// Load conversation history + resume tool blocks + loaded knowhow for a
     /// chat turn. Verbatim extraction of the inline block from
     /// `process_message_with_steps_internal`.
@@ -76,11 +130,14 @@ impl LucidosEngine {
         // image ages below sit in the message prefix, which the prompt cache
         // keys on. So they are derived, never read off the wall clock.
         turn_started_at: chrono::DateTime<Utc>,
-        // ADR 0109: the conversation summariser is off under the context mode.
-        // The model writes notes as it goes, so the older region is already
-        // compressed by the party that knew what mattered.
-        context_mode: super::context_mode::ContextMode,
+        // The turn's gates. Two shape the history:
+        // - ADR 0109: the conversation summariser is off under the context
+        //   mode, whose notes already compress the older region.
+        // - ADR 0362: under the Tree memory module the thread memory view
+        //   carries this thread's past, so neither history nor summariser runs.
+        gates: &crate::llm::ToolCapabilities,
     ) -> ChatHistoryLoad {
+        let context_mode = super::context_mode::ContextMode::from_capabilities(gates);
         // Two turn shapes carry no conversation history, and both render the
         // same empty load (ADR 0124). A trigger has no conversation. A send
         // with no thread id has no history of its own, and it must not borrow
@@ -92,6 +149,15 @@ impl LucidosEngine {
             return ChatHistoryLoad {
                 resume_tool_blocks: Vec::new(),
                 loaded_knowhow_docs: Vec::new(),
+                history_context: String::new(),
+                conversation_summary: user_message.to_string(),
+                history_image_hashes: Vec::new(),
+            };
+        }
+        if gates.memory_tree {
+            return ChatHistoryLoad {
+                resume_tool_blocks: Vec::new(),
+                loaded_knowhow_docs: self.thread_loaded_knowhow(thread_id).await,
                 history_context: String::new(),
                 conversation_summary: user_message.to_string(),
                 history_image_hashes: Vec::new(),
@@ -152,7 +218,11 @@ impl LucidosEngine {
                         );
                     resume_tool_blocks = blocks;
                     resume_skip_ids = skip_ids;
-                    Ok(crate::core::store::build_session_messages(&events))
+                    let image_walk = walk_thread_image_handles(&events);
+                    Ok((
+                        self.event_store.build_messages_now(&events).await,
+                        image_walk,
+                    ))
                 }
                 Err(e) => {
                     log!(
@@ -165,7 +235,7 @@ impl LucidosEngine {
             };
 
             match messages_result {
-                Ok(messages) => {
+                Ok((messages, image_walk)) => {
                     // All messages except the one we just appended (last one)
                     let all_prior: Vec<_> = if messages
                         .last()
@@ -201,23 +271,10 @@ impl LucidosEngine {
                             .collect()
                     };
 
-                    // Pre-compute thread image indices per message so history annotations
-                    // can include thread:N references (e.g. "[attached image (thread:3)]").
-                    // This counts ALL images (user + generated) in sequential order to match
-                    // the thread:N numbering used by walk_thread_images.
-                    let msg_image_starts: Vec<usize> = {
-                        let mut starts = Vec::with_capacity(all_prior.len());
-                        let mut idx: usize = 0;
-                        for m in all_prior.iter() {
-                            starts.push(idx);
-                            if m.role == "user" {
-                                idx += m.user_image_hashes.len();
-                            } else {
-                                idx += m.images.len();
-                            }
-                        }
-                        starts
-                    };
+                    // Where each message's images sit in the resolver's own
+                    // walk, so the history's thread:N is the one the tools
+                    // resolve (e.g. "[attached image (thread:3, img-…)]").
+                    let image_starts = locate_message_images(&all_prior, &image_walk);
 
                     // Bodies of currently-loaded knowhow docs — used to strip
                     // verbatim repeats from `[CONVERSATION HISTORY]`. The
@@ -234,10 +291,10 @@ impl LucidosEngine {
                     // Format a message for history context with tiered truncation.
                     // - Last HISTORY_VERBATIM_TAIL messages: fully verbatim (only 15K safety net)
                     // - Earlier messages: user messages verbatim, assistant messages compacted to ~1500 chars
-                    // `msg_idx` indexes into `all_prior` to look up `image_data_included`.
+                    // `msg_idx` indexes into `all_prior`, `image_starts` and
+                    // `image_data_included`.
                     let format_history_msg = |m: &crate::core::store::SessionMessage,
                                               is_verbatim: bool,
-                                              img_start: usize,
                                               msg_idx: usize|
                      -> String {
                         let role = speaker_label(m);
@@ -247,8 +304,9 @@ impl LucidosEngine {
                             is_verbatim,
                             &loaded_knowhow_bodies,
                         );
-                        // Determine image kind: user-attached (with staleness tracking) or generated
-                        let (label, n, stale_note) = if !m.user_image_hashes.is_empty() {
+                        let n = m.image_handles.len();
+                        // User-attached (with staleness tracking) or generated
+                        let (label, stale_note) = if m.role == "user" {
                             let included =
                                 image_data_included.get(msg_idx).copied().unwrap_or(false);
                             let stale = if !included {
@@ -256,11 +314,9 @@ impl LucidosEngine {
                             } else {
                                 ""
                             };
-                            ("attached", m.user_image_hashes.len(), stale)
-                        } else if !m.images.is_empty() {
-                            ("generated", m.images.len(), "")
+                            ("attached", stale)
                         } else {
-                            ("", 0, "")
+                            ("generated", "")
                         };
                         let image_note = if n == 0 {
                             // No image data, but if a description survived, show it as text context
@@ -270,21 +326,7 @@ impl LucidosEngine {
                                 .unwrap_or_default()
                         } else {
                             let age = format_relative_age(turn_started_at - m.created_at);
-                            // Handles for USER images only, because their
-                            // hashes ARE what `walk_thread_image_refs` reads
-                            // for a `MessageReceived`. An assistant message's
-                            // `images` is not that faithful:
-                            // `build_session_messages` fills it from
-                            // `ResponseGenerated.payload.images` OR from
-                            // accumulated `browser_screenshot` artifact PATHS.
-                            // The walker reads neither of those second ones,
-                            // so a handle from a path would name nothing.
-                            let handles: Vec<String> = m
-                                .user_image_hashes
-                                .iter()
-                                .map(|h| image_handle(ImageRef::BlobHash(h)))
-                                .collect();
-                            let range = format_image_refs(img_start, n, &handles);
+                            let range = format_image_refs(image_starts[msg_idx], &m.image_handles);
                             let count_prefix = if n <= 1 {
                                 format!("{} image", label)
                             } else {
@@ -314,21 +356,14 @@ impl LucidosEngine {
                     };
 
                     // Format messages with tiered truncation based on position.
-                    // `idx_offset` is the index into both msg_image_starts and image_data_included.
+                    // `idx_offset` is where `msgs` starts in `all_prior`.
                     let format_tiered = |msgs: &[crate::core::store::SessionMessage],
                                          idx_offset: usize|
                      -> Vec<String> {
                         let tail_start = msgs.len().saturating_sub(HISTORY_VERBATIM_TAIL);
                         msgs.iter()
                             .enumerate()
-                            .map(|(i, m)| {
-                                format_history_msg(
-                                    m,
-                                    i >= tail_start,
-                                    msg_image_starts[idx_offset + i],
-                                    idx_offset + i,
-                                )
-                            })
+                            .map(|(i, m)| format_history_msg(m, i >= tail_start, idx_offset + i))
                             .collect()
                     };
 
@@ -360,7 +395,6 @@ impl LucidosEngine {
                             self.spawn_conversation_summary_refresh(
                                 thread_id,
                                 older,
-                                &msg_image_starts,
                                 &format_history_msg,
                                 boundary,
                             )
@@ -368,12 +402,7 @@ impl LucidosEngine {
                         }
 
                         let covered = plan.covered();
-                        let older_region = render_older_region(
-                            older,
-                            &msg_image_starts,
-                            covered,
-                            &format_history_msg,
-                        );
+                        let older_region = render_older_region(older, covered, &format_history_msg);
 
                         let recent_turns = format_tiered(recent, split_point);
 
@@ -453,18 +482,14 @@ impl LucidosEngine {
         &self,
         thread_id: Uuid,
         older: &[crate::core::store::SessionMessage],
-        msg_image_starts: &[usize],
         format_msg: &F,
         // The newest turn this paragraph will cover, from
         // `SummaryPlan::refresh_boundary`. Resolving it before the call is what
         // stops a turn buying a paragraph with nowhere to cache it.
         boundary: Uuid,
     ) where
-        F: Fn(&crate::core::store::SessionMessage, bool, usize, usize) -> String,
+        F: Fn(&crate::core::store::SessionMessage, bool, usize) -> String,
     {
-        let Some(extractor) = self.extractor.as_ref() else {
-            return;
-        };
         let Some(in_flight) = SummaryInFlight::claim(&self.summarizing_threads, thread_id) else {
             return;
         };
@@ -475,30 +500,15 @@ impl LucidosEngine {
             .iter()
             .enumerate()
             .filter(|(_, m)| m.role == "assistant")
-            .map(|(i, m)| format_msg(m, false, msg_image_starts[i], i))
+            .map(|(i, m)| format_msg(m, false, i))
             .collect();
         let covered_count = turns.len();
         let body = turns.join("\n");
 
         let purpose = crate::engine::ContextPurpose::ConversationSummary;
-        let call = crate::engine::aux_purpose::AuxCall::resolve(&self.pool, purpose).await;
-        let provider = match extractor.provider_for_model(call.model(), call.attempt_timeout()) {
-            Ok(provider) => provider,
-            Err(e) => {
-                log!(
-                    "[Chat] Failed to build conversation-summary provider: {}",
-                    e
-                );
-                return;
-            }
-        };
-        // The provider that will actually run, so the recorded name cannot
-        // drift from the model the call hits.
-        let recorded_model = if crate::engine::aux_purpose::is_extractor_default(call.model()) {
-            provider.default_model().to_string()
-        } else {
-            call.model().to_string()
-        };
+        let call = self.aux_call(purpose).await;
+        let provider = call.provider();
+        let recorded_model = call.model().to_string();
         let capture = crate::engine::AuxCapture::new(&self.event_bus, thread_id, purpose);
         let bus = self.event_bus.clone();
         let effort = call.reasoning().map(str::to_string);
@@ -509,11 +519,11 @@ impl LucidosEngine {
             let _in_flight = in_flight;
             // Under the purpose's whole-call deadline. The task is detached,
             // so nothing else would ever stop it.
-            let summarized = crate::memory::MemoryExtractor::summarize_conversation(
+            let summarized = crate::memory::summarize_conversation(
                 provider.as_ref(),
                 &body,
                 effort.as_deref(),
-                Some(&capture),
+                &capture,
             );
             let Some(text) = summarize_or_none(summarized, covered_count, deadline).await else {
                 return;
@@ -675,12 +685,11 @@ impl SummaryPlan {
 /// failing.
 pub(super) fn render_older_region<F>(
     older: &[crate::core::store::SessionMessage],
-    msg_image_starts: &[usize],
     covered: Option<CoveredSummary<'_>>,
     format_msg: &F,
 ) -> String
 where
-    F: Fn(&crate::core::store::SessionMessage, bool, usize, usize) -> String,
+    F: Fn(&crate::core::store::SessionMessage, bool, usize) -> String,
 {
     let is_covered = |i: usize| covered.is_some_and(|c| i <= c.boundary);
     let first_covered = (0..older.len()).find(|&i| older[i].role == "assistant" && is_covered(i));
@@ -731,7 +740,7 @@ where
             keep_assistant[i]
         };
         if keep {
-            lines.push(format_msg(msg, false, msg_image_starts[i], i));
+            lines.push(format_msg(msg, false, i));
         }
     }
     lines.join("\n")

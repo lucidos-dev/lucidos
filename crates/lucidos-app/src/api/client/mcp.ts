@@ -67,12 +67,37 @@ export interface McpCostTotals {
   disabled_tokens: number;
 }
 
+/** The tools of one running server the MCP tool ceiling leaves out, by wire name. */
+export interface McpDroppedTools {
+  server_id: string;
+  tools: string[];
+}
+
+/** The running servers against the request budget, in chars, the unit the
+ *  request packer budgets in. */
+export interface McpBudget {
+  /** What a whole request may carry: system prompt, tools and messages. */
+  request_chars: number;
+  /** The part of it every running server's tools may take together. */
+  mcp_ceiling_chars: number;
+  /** What a request really carries once the ceiling applies. Below the
+   *  totals' offered figures exactly when something is dropped. */
+  sent_tools: number;
+  sent_chars: number;
+  sent_tokens: number;
+  /** What the running servers lose to that ceiling right now. */
+  dropped: McpDroppedTools[];
+  /** One line once the tools are past or near the ceiling. */
+  warning: string | null;
+}
+
 export interface McpServersResponse {
   servers: McpServerStatus[];
   totals: McpCostTotals;
   /** The resolved chat model, which is whose window `context_window` is. */
   model: string;
   context_window: number;
+  budget: McpBudget;
 }
 
 export function fetchMcpServers(): Promise<McpServersResponse> {

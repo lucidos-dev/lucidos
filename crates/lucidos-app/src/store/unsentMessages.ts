@@ -2,6 +2,7 @@ import { signal } from '@preact/signals';
 import type { ChatRequestBody } from '../api/types';
 import type { ComposeMode, ServerDraft } from './actions/compose';
 import { forgetUnsentMessageRecord } from './unsentMessageRecords';
+import type { SendFailure } from './actions/sendRetry';
 
 /** Which kind of send this was, which decides what is owed once the engine
  *  takes or refuses it (`settleAcceptedSend`, `restoreRefusedSend`). Plain
@@ -28,6 +29,11 @@ export interface UnsentMessage {
   /** Retries that also got no answer. */
   failedRetries: number;
   settlement: SendSettlement;
+  /** What the last send's quiet retries ended on. Absent for one restored
+   *  after a reload, which this page never tried. */
+  failure?: SendFailure;
+  /** The question card the text was typed to answer, by tool-use id. */
+  answersQuestion?: string;
 }
 
 /** Keyed by the send's client event id, which is also the starter id of the

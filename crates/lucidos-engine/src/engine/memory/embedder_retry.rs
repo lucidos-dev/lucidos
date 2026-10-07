@@ -205,12 +205,14 @@ impl LucidosEngine {
                 };
                 let load_engine = Arc::clone(&engine);
                 let workspace = engine.workspace_path().to_path_buf();
+                let runtime = tokio::runtime::Handle::current();
                 // Download and ONNX load share one blocking thread. Splitting
                 // the fetch out of `with_model` is what buys byte progress:
                 // fastembed offers no hook, so the files are pulled first (with
                 // one) and `with_model` then finds them local. The two
                 // legacy-cache steps are blocking filesystem work too, so they
-                // belong on this thread rather than the runtime's.
+                // belong on this thread rather than the runtime's. The fetch
+                // itself is async and deadline-bounded, so it always returns.
                 //
                 // `None` means a peer holds the lock: the cache is not complete,
                 // so there is nothing to load yet and `with_model` would only
@@ -224,7 +226,7 @@ impl LucidosEngine {
                     // instead of everyone re-downloading the same model.
                     seed_shared_cache_from_legacy(&workspace, &active_cache);
 
-                    let outcome = ensure_model_cached(&id, &reporter)?;
+                    let outcome = runtime.block_on(ensure_model_cached(&id, &reporter))?;
                     if outcome == CacheOutcome::PeerDownloading {
                         return Ok(None);
                     }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   clampToOffered,
+  EFFORT_LADDER,
   decodePair,
   filterModelRows,
   encodePair,
@@ -115,13 +116,12 @@ describe('tiersOf', () => {
 
 describe('lucidosTiers', () => {
   it('uses the registry answer when there is one', () => {
-    expect(lucidosTiers('muse-glimmer:30b-mlx', ['none', 'low', 'medium', 'high']))
+    expect(lucidosTiers(['none', 'low', 'medium', 'high']))
       .toEqual(['none', 'low', 'medium', 'high']);
   });
 
-  it('falls back to the id-shape heuristic before the registry loads', () => {
-    expect(lucidosTiers('gpt-5.4')).not.toContain('max');
-    expect(lucidosTiers('claude-opus-5')).toContain('xhigh');
+  it('offers the whole ladder before the registry loads', () => {
+    expect(lucidosTiers()).toEqual(EFFORT_LADDER);
   });
 });
 

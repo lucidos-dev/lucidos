@@ -4,12 +4,13 @@ import { eventStreamTargets, openEventStream, type EventStreamTargets } from '@l
 import { getEventStream, setEventStream } from './event-stream';
 import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
 import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
-import { findChangeById, memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, recommendedCleanupProgress, diskUsageVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, recommendedCleanupProgress, diskUsageVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { describeRecommendedCleanupOutcome } from '../../utils/recommendedCleanup';
 import { isFormRequest } from '../thread-events/thread-event-types';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { settleDeliveredUnsentMessage } from './sendSettlement';
+import { noteImageLanded } from '../landedImages';
 import type { ThreadChannel } from '../store';
 import { handleNotificationSSE, loadUnreadNotifications } from './notifications';
 import { dropDeletedThreads } from './threads-drop';
@@ -59,7 +60,7 @@ import {
   refreshLlmConfigured,
   PROVIDER_PREFERENCE_KEYS,
 } from './entityReferences';
-import { refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale } from './thread-loading';
+import { refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale, loadAllThreads } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
 import { applyRemoteCompose, pendingComposePuts, hasUnsentLocalDraft, clearSupersededDraft, noteComposeEpoch } from './compose';
 import type { ComposeSelectionOverride } from '../composeSelections';
@@ -71,7 +72,8 @@ import { errorDetail } from '../../utils/errorDetail';
 import { routeThreadNavigation, type NavigationActor } from './navigation-request';
 import { openBackupSettings } from './menu';
 import { applyEmbeddingModelStatus } from './backgroundActivity';
-import type { EmbeddingModelStatus } from '../../api/types';
+import { applyTreeBackfillFrame, readyAfterCompleted, treeBackfillOfProgress } from './treeBackfill';
+import type { BackfillProgress, EmbeddingModelStatus } from '../../api/types';
 
 /** Keyed so a second failure replaces the first instead of stacking, and so the
  *  tap can dismiss the toast it just acted on. */
@@ -489,6 +491,14 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // Thread is guaranteed to exist after the skeleton block above.
   const thread = map.get(threadId)!;
 
+  // The event itself names the home thread, and the aggregate carries no such
+  // flag. Without this, an SSE-born Home would sit in a section as an
+  // ordinary thread until the next list read.
+  if (event.type === 'HomeThreadCreated' && !thread.meta.home) {
+    thread.meta.home = true;
+    metaChanged = true;
+  }
+
   // Update thread meta from lifecycle events
   if ((event.type === 'ThreadTitleGenerated' || event.type === 'ThreadTitleRenamed') && 'title' in event) {
     thread.meta.title = event.title;
@@ -533,6 +543,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   const handled = handleEvent(map, threadId, seq, event, created, eventId, aggregate);
   if (handled.metaChanged) metaChanged = true;
   if (handled.retiredUnsentEventId) settleDeliveredUnsentMessage(handled.retiredUnsentEventId);
+  if (event.type === 'ImageUploaded') noteImageLanded(threadId, event.hash);
   if (event.type === 'QueuedMessageRemoved') {
     const key = queuedMessageRemovalKey(threadId, event.removed_message_id);
     if (removingQueuedMessageIds.value.has(key)) {
@@ -840,6 +851,8 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // its own here: the rows went with the family.
       handleNotificationSSE();
       void loadThreadQueue();
+      // A delete purges the family's summary trees in the same transaction.
+      summaryTreesVersion.value++;
       break;
     }
 
@@ -917,6 +930,11 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // not spend a request on it.
       if (String(data.key ?? '') === 'response_styles') {
         responseStylesVersion.value++;
+      }
+      // This switch brings Home back or hides it. So the list re-reads now,
+      // and the Home entries find the thread without waiting for a change.
+      if (String(data.key ?? '') === 'home_thread_enabled') {
+        void loadAllThreads();
       }
       break;
     // The `set_language` and `set_timezone` chat-agent tools write the
@@ -1011,6 +1029,22 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       }
       break;
     }
+
+    case 'TreeBackfillProgressed':
+      applyTreeBackfillFrame(treeBackfillOfProgress(data.progress as BackfillProgress));
+      break;
+
+    case 'TreeBackfillCompleted':
+      applyTreeBackfillFrame(readyAfterCompleted());
+      summaryTreesVersion.value++;
+      break;
+
+    case 'TreeBackfillReset':
+      // Only a switch to Classic clears the flag, so the module is off now. A
+      // set flag means the trees were built, so the backfill had started.
+      applyTreeBackfillFrame({ state: 'off', started: true });
+      summaryTreesVersion.value++;
+      break;
 
     case 'EmbeddingModelStatusChanged': {
       // Transient frame from the engine's background embedding-model loader:
@@ -1448,36 +1482,22 @@ function handleTransientSideEffects(
       const e = event as { cc_thread_id: string; title: string };
       const map = threadMap.value;
 
-      // Move pendingUserMessages from the current focused thread to the CC thread.
-      // The user typed in the original thread, but the message should appear in the CC thread.
-      const currentThread = focusedThreadId.value ? map.get(focusedThreadId.value) : null;
-      const currentThreadId = focusedThreadId.value;
-      const userMessages = currentThread?.pendingUserMessages.length ? [...currentThread.pendingUserMessages] : [];
-      const movedMessages = userMessages.length > 0;
-      if (currentThread) {
-        currentThread.pendingUserMessages = [];
-      }
-
-      // Create the CC thread with proper title and source
-      // Inherit initiator from parent — if parent is system-initiated, CC sub-thread is too
+      // Only an agent's `run_coding_agent` spawn emits this, on the new thread.
+      // Its prompt is the agent's. A pending row on the focused thread is a
+      // message the user sent to THAT thread, so it stays there.
+      // An agent-sent first message makes the engine store `system`.
       if (!map.has(e.cc_thread_id)) {
         map.set(e.cc_thread_id, makeOptimisticThreadState({
           id: e.cc_thread_id,
           title: e.title,
           channel: 'claude_code',
-          initiator: currentThread?.meta.initiator ?? 'user',
+          initiator: 'system',
           eventsLoaded: false,
-          pendingUserMessages: userMessages,
         }));
       }
       flushThreadMap();  // Immediate — user needs to see the new thread now
-      // `handleThreadEvent`'s bottom bump covers only the thread the event
-      // ARRIVED on, and the transient-event path above it returns first. So
-      // fire the per-thread bumps here, for both threads whose
-      // pendingUserMessages just changed. Without them, the originating thread
-      // keeps painting the just-moved 'Requesting' row, and the new CC thread
-      // renders no seeded pendingUserMessages until its first real event.
-      if (movedMessages && currentThreadId) bumpThreadEvents(currentThreadId);
+      // The transient-event path in `handleThreadEvent` returns before its
+      // bottom bump, so the new thread's own bump fires here.
       bumpThreadEvents(e.cc_thread_id);
       break;
     }

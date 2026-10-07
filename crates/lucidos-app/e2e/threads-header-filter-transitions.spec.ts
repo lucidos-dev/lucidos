@@ -3,11 +3,12 @@ import { test, expect, type Page } from './fixtures';
 import { assertHealthy, navigateToApp, openThreadDrawer, isMobileViewport } from './helpers';
 import { clearAllThreads, psql, seedThreadRow } from './db-helpers';
 
-// The threads Filter's fades. The Threads/Filters swap dips through the pane
-// background: the navigation cover rises over the leaving view, holds while the
-// views swap, and clears off the arriving one. The pane title switches word at
-// once, with no fade. The Filter button's glyph and badge are button feedback,
-// on --duration-fast.
+// The threads Filter's fades. Every swap of what the drawer shows dips through
+// the pane background: the navigation cover rises over the leaving view, holds
+// while the views swap, and clears off the arriving one. That covers Threads to
+// Filters and back, and a status change from "See all statuses". The pane title
+// switches word at once, with no fade. The Filter button's glyph and badge are
+// button feedback, on --duration-fast.
 // Unsuffixed, so it runs on desktop Chromium, phone Chromium and iPhone WebKit.
 //
 // Most tests slow every animation tenfold through the Animation speed slider,
@@ -25,6 +26,10 @@ interface Frame {
   panel: boolean;
   panelVisible: boolean;
   listVisible: boolean;
+  /** The drawing of the leaving list a status change holds over the pane. */
+  drawing: boolean;
+  drawingVisible: boolean;
+  drawingText: string;
   glyph: Record<string, number>;
   titleText: string;
   titleOpacity: number;
@@ -52,6 +57,7 @@ async function installProbe(page: Page): Promise<void> {
     const fx = {
       cover: () => q(`${sel.drawer} > .thread-filter-cover`),
       veil: () => q(`${sel.drawer} > .nav-cover`),
+      drawing: () => q(`${sel.drawer} > .thread-view-drawing`),
       button: () => q(`${sel.header} button[aria-label="Filter threads"]`),
       title: () => q(`${sel.header} ${sel.title}`),
       read() {
@@ -61,12 +67,16 @@ async function installProbe(page: Page): Promise<void> {
         const panel = cover?.querySelector('.thread-filter-panel');
         const list = q(`${sel.drawer} .thread-drawer-list`);
         const title = fx.title();
+        const drawing = fx.drawing();
         return {
           veil: opacity(fx.veil()),
           coverVisible: !!cover && getComputedStyle(cover).visibility === 'visible',
           panel: !!panel,
           panelVisible: !!panel && getComputedStyle(panel).visibility === 'visible',
           listVisible: !!list && getComputedStyle(list).visibility === 'visible',
+          drawing: !!drawing,
+          drawingVisible: !!drawing && getComputedStyle(drawing).visibility === 'visible',
+          drawingText: drawing?.textContent ?? '',
           glyph: layers(button?.querySelector('.filter-glyph')),
           titleText: title?.textContent ?? '',
           titleOpacity: opacity(title),
@@ -93,6 +103,13 @@ async function installProbe(page: Page): Promise<void> {
         return false;
       },
       toggle: () => fx.button()!.click(),
+      /** The "See all statuses" link under a status view's rows or empty state. */
+      clickSeeAll() {
+        const links = Array.from(document.querySelectorAll<HTMLElement>(`${sel.drawer} .thread-drawer-list .accent-link`));
+        const link = links.find(l => l.textContent === 'See all statuses');
+        if (!link) throw new Error('no "See all statuses" link');
+        link.click();
+      },
       /** A row in the panel, by its visible label. */
       clickPanelRow(label: string) {
         const rows = Array.from(fx.cover()!.querySelectorAll<HTMLElement>('.drawer-view-option, .thread-filter-option'));
@@ -106,8 +123,9 @@ async function installProbe(page: Page): Promise<void> {
   }, selectors(page));
 }
 
-async function open(page: Page, { slow = true } = {}): Promise<void> {
+async function open(page: Page, { slow = true, view }: { slow?: boolean; view?: string } = {}): Promise<void> {
   await installProbe(page);
+  if (view) await page.addInitScript((v) => localStorage.setItem('lucidos-alt-view', v), view);
   if (slow) {
     await page.addInitScript((pos) => localStorage.setItem('lucidos-animation-speed-slider', pos), SLOWEST);
   }
@@ -278,12 +296,129 @@ test.describe('Threads Filter fades', () => {
     settledOn(frames, 'review');
 
     await run('toggle');
-    frames = await run('Running');
-    expect(crossfaded(frames, 'review', 'running'), 'status to status did not fade').toBe(true);
+    frames = await run('In flight');
+    expect(crossfaded(frames, 'review', 'in-flight'), 'status to status did not fade').toBe(true);
     await run('toggle');
     frames = await run('All statuses');
-    expect(crossfaded(frames, 'running', 'all'), 'status back to the funnel did not fade').toBe(true);
+    expect(crossfaded(frames, 'in-flight', 'all'), 'status back to the funnel did not fade').toBe(true);
     settledOn(frames, 'all');
+  });
+
+  // "See all statuses" changes only the status. It must play the dip a panel row
+  // plays: the leaving list stays on screen (as a drawing) until the midpoint,
+  // and the arriving list shows only under the opaque cover.
+  const linkCases = [
+    { name: 'under the rows', view: 'attention', glyph: 'attention', seedFailed: true, leavingText: 'filter-link-dip' },
+    { name: 'in an empty view', view: 'review', glyph: 'review', seedFailed: false, leavingText: 'Nothing to review' },
+  ];
+  for (const c of linkCases) {
+    test(`"See all statuses" ${c.name} dips like a panel row`, async ({ page }) => {
+      if (c.seedFailed) {
+        psql(seedThreadRow({ id: randomUUID(), title: 'filter-link-dip', now: new Date().toISOString(), status: 'failed', archiveState: 'inbox' }));
+      }
+      await open(page, { view: c.view });
+      await expect(page.locator(`${selectors(page).drawer} .thread-drawer-list .accent-link`)).toHaveText('See all statuses');
+      const frames = await page.evaluate(async (ms) => {
+        const fx = (window as unknown as { __fx: any }).__fx;
+        fx.clickSeeAll();
+        return fx.sample(ms);
+      }, SLOW_FADE_MS) as Frame[];
+
+      const shows = (f: Frame) => (f.drawingVisible ? 'leaving' : 'arriving');
+      for (const [i, f] of frames.entries()) {
+        expect(f.panelVisible, `frame ${i}: the panel showed`).toBe(false);
+        expect(f.titleText, `frame ${i}: the title changed`).toBe('Threads');
+        expect(f.titleOpacity, `frame ${i}: the title faded`).toBe(1);
+      }
+      // It starts over the leaving list, drawn as it was, under a clear cover.
+      expect(shows(frames[0]), 'the leaving list went before the dip').toBe('leaving');
+      expect(frames[0].drawingText, 'the drawing is not the leaving list').toContain(c.leavingText);
+      expect(frames[0].veil, 'the cover started opaque').toBeLessThan(0.2);
+      // One swap, under an opaque cover.
+      const swap = frames.findIndex(f => shows(f) === 'arriving');
+      expect(swap, 'the arriving list never showed').toBeGreaterThan(0);
+      expect(frames.slice(swap).every(f => shows(f) === 'arriving'), 'the drawing came back').toBe(true);
+      expect(frames[swap - 1].veil, 'the leaving list went under a thin cover').toBeGreaterThan(0.9);
+      expect(frames[swap].veil, 'the arriving list showed under a thin cover').toBeGreaterThan(0.9);
+      // The same shape as a panel swap: rise, hold, fall, unmount.
+      const rising = frames.slice(0, swap);
+      const falling = frames.slice(swap).filter(f => f.veil >= 0);
+      expect(rising.filter(f => mid(f.veil)).length, 'the leaving list never faded out').toBeGreaterThan(5);
+      expect(falling.filter(f => mid(f.veil)).length, 'the arriving list never faded in').toBeGreaterThan(5);
+      for (let i = 1; i < rising.length; i++) {
+        expect(rising[i].veil, `frame ${i}: the cover fell before the swap`).toBeGreaterThanOrEqual(rising[i - 1].veil - 0.01);
+      }
+      for (let i = 1; i < falling.length; i++) {
+        expect(falling[i].veil, `frame ${swap + i}: the cover rose after the swap`).toBeLessThanOrEqual(falling[i - 1].veil + 0.01);
+      }
+      expect(frames.at(-1)!.veil, 'the cover outlived its fuse').toBe(-1);
+      expect(frames.at(-1)!.drawing, 'the drawing outlived its fuse').toBe(false);
+      // The glyph crossfades from the status to the funnel, as on a panel pick.
+      expect(frames.some(f => mid(f.glyph[c.glyph]) && mid(f.glyph.all)), 'the glyph did not crossfade').toBe(true);
+      expect(frames.at(-1)!.glyph.all).toBe(1);
+    });
+  }
+
+  test('a tap mid-dip lands on neither list', async ({ page }) => {
+    await open(page, { view: 'review' });
+    const result = await page.evaluate(async () => {
+      const fx = (window as unknown as { __fx: any }).__fx;
+      fx.clickSeeAll();
+      await fx.until((f: Frame) => f.veil > 0.3 && f.drawingVisible);
+      const drawing = fx.drawing() as HTMLElement;
+      const list = fx.cover().parentElement.querySelector('.thread-drawer-list') as HTMLElement;
+      const box = drawing.getBoundingClientRect();
+      // The empty state's link sits near the top: aim at it.
+      const link = drawing.querySelector('.accent-link')!.getBoundingClientRect();
+      const points = [[box.left + box.width / 2, box.top + box.height / 2], [link.left + link.width / 2, link.top + link.height / 2]];
+      const hits = points.map(([x, y]) => document.elementFromPoint(x, y));
+      return {
+        onScreen: fx.read().drawingVisible,
+        contentInert: (drawing.firstElementChild as HTMLElement).inert,
+        onFrame: hits.every(h => h === drawing),
+        onList: hits.some(h => !!h && list.contains(h)),
+      };
+    });
+    expect(result.onScreen, 'the check missed the dip').toBe(true);
+    expect(result.contentInert, 'the drawn list takes input').toBe(true);
+    expect(result.onFrame, 'a tap missed the drawing frame').toBe(true);
+    expect(result.onList, 'a tap reached the arriving list before it showed').toBe(false);
+  });
+
+  test('opening the panel mid-dip holds the drawing to the new midpoint, with no flash', async ({ page }) => {
+    await open(page, { view: 'review' });
+    const result = await page.evaluate(async (ms) => {
+      const fx = (window as unknown as { __fx: any }).__fx;
+      fx.clickSeeAll();
+      await fx.until((f: Frame) => f.veil > 0.4 && f.drawingVisible);
+      fx.toggle();
+      return fx.sample(ms);
+    }, SLOW_FADE_MS) as Frame[];
+    const shows = (f: Frame) => (f.panelVisible ? 'filters' : f.drawingVisible ? 'leaving' : 'list');
+    expect(result[0].veil, 'the new dip did not start from its beginning').toBeLessThan(0.2);
+    for (const [i, f] of result.entries()) {
+      expect(shows(f), `frame ${i}: the list hidden under the drawing flashed`).not.toBe('list');
+    }
+    const swap = result.findIndex(f => shows(f) === 'filters');
+    expect(swap, 'the panel never showed').toBeGreaterThan(0);
+    expect(result[swap].veil, 'the panel showed under a thin cover').toBeGreaterThan(0.9);
+    expect(result.at(-1)!.titleText).toBe('Filters');
+  });
+
+  test('"See all statuses" with motion reduced swaps at once', async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await open(page, { slow: false, view: 'review' });
+    const after = await page.evaluate(async () => {
+      const fx = (window as unknown as { __fx: any }).__fx;
+      fx.clickSeeAll();
+      await new Promise(r => requestAnimationFrame(r));
+      await new Promise(r => requestAnimationFrame(r));
+      return fx.read();
+    }) as Frame;
+    expect(after.drawingVisible, 'the drawing is drawn under reduced motion').toBe(false);
+    expect(after.veil).toBeLessThanOrEqual(0);
+    expect(after.listVisible).toBe(true);
+    expect(after.glyph.all).toBe(1);
   });
 
   test('the funnel rim is painted once: the wrapper carries the translucency', async ({ page }) => {

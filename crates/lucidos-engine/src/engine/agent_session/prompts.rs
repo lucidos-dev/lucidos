@@ -221,17 +221,22 @@ const BUILD_SLOT_RULE: &str = "\n\nHEAVY BUILDS TAKE A BUILD SLOT: Sessions run 
 /// concurrent sessions share `/tmp` and a fixed name truncates another
 /// session's log.
 ///
-/// The subagent arm exists because Claude Code runs an `Agent` launch in the
-/// background by default. Facing "do not end the turn" with no named wait, one
-/// session improvised a filler subagent and then a fabricated question. Naming
-/// `run_in_background: false` is what removes the incentive. Models still
-/// ended turns on a background subagent, so `lucidos cc-agent-guard` now
-/// refuses one.
+/// Claude Code runs with its background tasks switched off (ADR 0358). Its
+/// tool results promised a notification that the turn-end teardown never
+/// lets arrive, and models believed them over this rule. So `run_in_background`
+/// is gone from `Bash` and `Agent`, and passing it fails validation. The rule
+/// must never tell the model to pass it, not even as `false`.
+///
+/// The subagent arm stays because a fan-out is still a wait. Facing "do not
+/// end the turn" with no named wait, one session improvised a filler subagent
+/// and then a fabricated question.
 const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN: When your turn \
     ends (you go idle), the Lucidos engine terminates your whole process group: you and every \
-    process you spawned. A command started with `run_in_background` (or `&` / `nohup` / any \
-    detached job) is therefore KILLED the instant you end the turn, and nothing re-invokes you \
-    when it would have finished. There is no blocking wait tool for background work either. Use \
+    process you spawned. A job you detach (`&`, `nohup`, any detached job) is therefore KILLED \
+    the instant you end the turn, and nothing re-invokes you when it would have finished. Under \
+    Claude Code, Lucidos switches background mode OFF: the `Bash` and `Agent` tools have no \
+    `run_in_background` parameter, passing one fails, and a command that outruns its timeout is \
+    killed rather than moved to the background. Use \
     one of two shapes. FOREGROUND, for anything that surely fits in 10 minutes: set the timeout \
     EXPLICITLY to its maximum (Claude Code's Bash tool takes `timeout: 600000`; its 120000 ms \
     DEFAULT silently cuts a long build off at 2 minutes). Overrunning that ceiling kills the \
@@ -245,11 +250,10 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
     If it prints `unwatched`, nothing will wake you: stop the task and run the command in the \
     foreground. REDIRECT a chatty command's output to a log file (`<cmd> > /tmp/$(basename \
     \"$PWD\").log 2>&1`) and `tail` it, so a long log never floods your context. SUBAGENTS ARE \
-    BACKGROUND WORK TOO: under Claude Code the `Agent` tool runs one in the BACKGROUND BY DEFAULT, \
-    and its report never reaches you if your turn ends first, because the subagent dies with your \
-    process group. Launch every subagent with `run_in_background: false`, which blocks and hands \
-    you the report inline. Lucidos refuses an `Agent` call without it. A fan-out still costs ONE wait: put every `Agent` call \
-    in a single assistant message and they run in parallel. NEVER improvise a stall instead: a \
+    BACKGROUND WORK TOO: a subagent dies with your process group, so its report must come back \
+    inside the turn. Under Claude Code every `Agent` call blocks and hands you the report inline. \
+    A fan-out still costs ONE wait: put every `Agent` call in a single assistant message and they \
+    run in parallel. NEVER improvise a stall instead: a \
     filler subagent, a sleep loop, or a fabricated question to hold the turn open. Those waste the \
     turn, and a fabricated question also parks the thread on a card the user must clear.";
 
@@ -1204,6 +1208,15 @@ pub(crate) fn build_merge_prompt(
 mod tests {
     use super::*;
 
+    /// Only the chat card has a `message` field. A coding agent told to use it
+    /// would write a field its card tool drops.
+    #[test]
+    fn coding_agent_card_rules_never_name_the_chat_message_field() {
+        for rule in [ASK_USER_QUESTION_RULE, CODEX_ASK_USER_QUESTION_RULE] {
+            assert!(!rule.contains("`message`"), "{rule}");
+        }
+    }
+
     /// The Lucidos-source merge prompt gates the merge on `/harden`, which picks
     /// the suites for what changed. A fixed `make test` beside it ran the Rust
     /// suite for a CSS-only merge, after `/harden` had already tested it.
@@ -1512,12 +1525,9 @@ mod tests {
     #[test]
     fn coding_agent_prompts_warn_background_processes_die_at_turn_end() {
         // A coding-agent session is a per-turn subprocess: at idle the engine
-        // tears down its whole process group, so a `run_in_background` job left
-        // running as the turn ends is killed, and nothing wakes the agent when
-        // it would have finished (only the chat agent's `run_bash_background`
-        // has that wake path). Without this guidance the agent trusts its native
-        // Bash-tool "runs across turns, re-invokes you" contract and loops — the
-        // real DMG-build thread restarted the build three times and never
+        // tears down its whole process group, so a detached job still running
+        // as the turn ends is killed, and nothing wakes the agent. Without this
+        // guidance a DMG-build thread restarted its build three times and never
         // produced an artifact. Every chat-style prompt must carry the warning;
         // the merge-conflict prompt (no builds) deliberately omits it.
         let cases: &[(&str, String)] = &[
@@ -1564,14 +1574,17 @@ mod tests {
                 // A long log re-read into context is the other cost, so the
                 // redirect stays. Pinned by its instruction, not the example.
                 "REDIRECT a chatty command's output to a log file",
-                // A subagent is background work, and Claude Code's `Agent` tool
-                // runs one in the background by DEFAULT. Without this arm the
-                // rule reads as Bash-only, and that gap once produced a filler
-                // subagent and then a fabricated question. Pin the default that
-                // removes the incentive, the one-message fan-out that keeps it
-                // cheap, and the ban on improvising a stall.
+                // Claude Code runs with background mode off (ADR 0358). The
+                // model must learn that a timeout kills, not that it waits.
+                "background mode OFF",
+                "killed rather than moved to the background",
+                // A subagent is background work. Without this arm the rule
+                // reads as Bash-only, and that gap once produced a filler
+                // subagent and then a fabricated question. Pin the blocking
+                // call, the one-message fan-out that keeps it cheap, and the
+                // ban on improvising a stall.
                 "SUBAGENTS ARE BACKGROUND WORK TOO",
-                "`run_in_background: false`",
+                "every `Agent` call blocks",
                 "single assistant message",
                 "NEVER improvise a stall",
                 "fabricated question",
@@ -1579,6 +1592,14 @@ mod tests {
                 assert!(
                     prompt.contains(needle),
                     "{label} must warn that background processes die at turn end (`{needle}`)",
+                );
+            }
+            // With background mode off, Claude Code rejects the parameter even
+            // as `false`, so a prompt asking for it breaks every call.
+            for banned in ["run_in_background: false", "run_in_background: true"] {
+                assert!(
+                    !prompt.contains(banned),
+                    "{label} must not ask for `{banned}`: the parameter no longer exists",
                 );
             }
         }

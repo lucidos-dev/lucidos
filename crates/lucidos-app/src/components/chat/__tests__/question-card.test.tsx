@@ -196,6 +196,26 @@ describe('AnsweredBody: the custom answer wears the user bubble', () => {
     expect(text).toContain('and also this');
   });
 
+  // The user's own words render as markdown, like a message they send.
+  // A pasted fence printed its backticks and lost the code block.
+  it('renders the typed answer as markdown, so a fence becomes a code block', () => {
+    const host = document.createElement('div');
+    render(
+      <AnsweredBody
+        toolUseId="tool-1"
+        question="q"
+        options={[]}
+        multiSelect={false}
+        resolved={{ kind: 'FreeText', text: 'Here:\n\n```\n{"a": 1}\n```' }}
+      />,
+      host,
+    );
+    const bubble = host.querySelector('.user-bubble');
+    expect(bubble?.querySelector('pre code')?.textContent).toBe('{"a": 1}');
+    expect(bubble?.textContent).not.toContain('```');
+    render(null, host);
+  });
+
   it('renders no freetext block at all when the answer carries no text', () => {
     const text = vnodeToText(AnsweredBody({
       toolUseId: 'tool-1',

@@ -4,6 +4,7 @@
 use super::{AnthropicAuth, AnthropicProvider};
 use crate::llm::anthropic_wire::{build_claude_request, parse_claude_stream, WireTarget};
 use crate::llm::provider::{LlmResponse, Message, TokenCallback, ToolDefinition};
+use crate::llm::ModelSelection;
 
 /// Body API version sent as an HTTP header on the direct API (Vertex sends its
 /// own value in the body instead). Shared with the `web_search` backend in
@@ -45,11 +46,12 @@ impl AnthropicProvider {
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
-        model: &str,
+        selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
-        reasoning_effort: Option<&str>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let model = selection.model.unwrap_or(&self.model);
+        let reasoning_effort = selection.reasoning_effort;
         let messages_url = format!("{}/messages", crate::llm::ANTHROPIC_API_BASE_URL);
 
         let (request, request_betas) = build_claude_request(
@@ -84,7 +86,14 @@ impl AnthropicProvider {
             }
             let builder = builder.json(&request);
 
-            let resp = match crate::llm::send_streaming_request(builder, model, attempt).await {
+            let resp = match crate::llm::send_streaming_request(
+                builder,
+                model,
+                attempt,
+                selection.attempt_timeout,
+            )
+            .await
+            {
                 crate::llm::StreamSend::Got(r) => r,
                 crate::llm::StreamSend::Retry => continue,
                 crate::llm::StreamSend::Failed(e) => return Err(e),

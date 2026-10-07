@@ -26,6 +26,20 @@ pub(super) struct MemorySourceQuery {
     commit: Option<String>,
 }
 
+/// A memory list page's `LIMIT` and `OFFSET` from the query string: 50 a page
+/// by default, at most 200, never negative.
+fn page_bounds(limit: Option<i64>, offset: Option<i64>) -> (i64, i64) {
+    // `clamp`, not `min`: both values are bound straight into `LIMIT $1 OFFSET
+    // $2`, and Postgres rejects a negative one, so `?limit=-1` would be a 500
+    // rather than an empty page. Every sibling list endpoint clamps
+    // (`changes.rs`, `notifications.rs`, `history.rs`). Limit floors at 1
+    // because no memory list has a count-only caller.
+    (
+        limit.unwrap_or(50).clamp(1, 200),
+        offset.unwrap_or(0).max(0),
+    )
+}
+
 pub(super) async fn get_memory_stats(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -56,15 +70,7 @@ pub(super) async fn get_memory_entries(
         StatusCode::NOT_FOUND,
         "Memory index not available".to_string(),
     ))?;
-    // `clamp`, not `min`: both values are bound straight into `LIMIT $1 OFFSET
-    // $2`, and Postgres rejects a negative one, so `?limit=-1` came back as a
-    // 500 rather than an empty page. The upper bound alone covered only half of
-    // the same hostile-query-string case the `has_more` comment below names.
-    // Every sibling list endpoint clamps (`changes.rs`, `notifications.rs`,
-    // `history.rs`); limit floors at 1 rather than 0 because this route has no
-    // count-only caller.
-    let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let offset = query.offset.unwrap_or(0).max(0);
+    let (limit, offset) = page_bounds(query.limit, query.offset);
     let source_type = query.source_type.as_deref();
     let sort = query.sort.as_deref();
     let importance_levels: Option<Vec<&str>> = query
@@ -278,6 +284,78 @@ pub(super) async fn get_embedding_model_status(
     Json(state.embedder.status())
 }
 
+/// Where the Tree memory module's backfill has got. The live signal is the
+/// `TreeBackfill*` SSE frames; this is the snapshot a page opens on.
+pub(super) async fn get_tree_backfill(
+    State(state): State<AppState>,
+) -> Result<Json<crate::engine::summary_tree::TreeBackfill>, ApiError> {
+    crate::engine::summary_tree::tree_backfill(&state.engine)
+        .await
+        .map(Json)
+        .map_err(|e| ApiError::internal(format!("Could not read the Tree backfill: {e}")))
+}
+
+/// What a Tree backfill of this workspace would cost: calls, tokens, time,
+/// and a price per compactor model. Read before the user confirms Tree.
+pub(super) async fn get_tree_backfill_estimate(
+    State(state): State<AppState>,
+) -> Result<Json<crate::engine::summary_tree::TreeBackfillEstimate>, ApiError> {
+    crate::engine::summary_tree::tree_backfill_estimate(&state.engine)
+        .await
+        .map(Json)
+        .map_err(ApiError::db)
+}
+
+#[derive(Deserialize)]
+pub(super) struct SummaryTreeQuery {
+    thread: Option<Uuid>,
+}
+
+/// `GET /api/v1/memory/tree?thread=<uuid>`: the top of a summary tree, the
+/// workspace's with no `thread`. A browser opens its lines with
+/// `/api/v1/recall/zoom`.
+pub(super) async fn get_summary_tree(
+    State(state): State<AppState>,
+    Query(query): Query<SummaryTreeQuery>,
+) -> Result<Json<crate::engine::summary_tree::recall::TreeTop>, ApiError> {
+    use crate::engine::summary_tree::SummaryScope;
+    let scope = query
+        .thread
+        .map_or(SummaryScope::Workspace, SummaryScope::Thread);
+    crate::engine::summary_tree::recall::top(state.engine.pool(), scope)
+        .await
+        .map(Json)
+        .map_err(|e| ApiError::bad_request(format!("Could not read the summary tree: {e}")))
+}
+
+#[derive(Deserialize)]
+pub(super) struct SummaryTreeThreadsQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// `GET /api/v1/memory/tree/threads`: the threads with summary trees, the most
+/// recently active first, paged like `/api/v1/memory/entries`.
+pub(super) async fn get_summary_tree_threads(
+    State(state): State<AppState>,
+    Query(query): Query<SummaryTreeThreadsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::engine::summary_tree::store;
+    let (limit, offset) = page_bounds(query.limit, query.offset);
+    let pool = state.engine.pool();
+    let (threads, total) = tokio::try_join!(
+        store::tree_threads(pool, limit, offset),
+        store::in_scope_thread_count(pool),
+    )
+    .map_err(ApiError::db)?;
+    let total = total as i64;
+    Ok(Json(serde_json::json!({
+        "threads": threads,
+        "total": total,
+        "has_more": offset.saturating_add(limit) < total,
+    })))
+}
+
 /// Routes for the `/memory/*` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -288,6 +366,13 @@ pub(super) fn router() -> Router<AppState> {
         .route(
             "/memory/embedding-model-status",
             get(get_embedding_model_status),
+        )
+        .route("/memory/tree", get(get_summary_tree))
+        .route("/memory/tree/threads", get(get_summary_tree_threads))
+        .route("/memory/tree-backfill", get(get_tree_backfill))
+        .route(
+            "/memory/tree-backfill/estimate",
+            get(get_tree_backfill_estimate),
         )
         .route(
             "/memory/rebuild",

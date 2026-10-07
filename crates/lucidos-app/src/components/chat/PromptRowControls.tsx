@@ -7,6 +7,7 @@ import { renderHeaderAction, type HeaderActionSpec } from '../layout/headerActio
 import { FollowLiveEdgeIcon } from '../shared/icons';
 import { callToggleAction } from './CallToggle';
 import { pressCallToggle } from '../../store/voice';
+import { callIsOffered } from '../../voice/callOffer';
 import { resolveCodingAgent } from '../../store/composeSelections';
 import { effectiveCodingAgentBackend } from './promptToggleMode';
 import { CodingAgentControlMenu } from './CodingAgentControlMenu';
@@ -82,9 +83,10 @@ export function PromptRowControls({
 export function promptRowToggles(
   codingAgent: CodingAgent | null,
   composeContext: boolean,
+  thread: ThreadState | undefined,
 ): { row: HeaderActionSpec[]; fold: HeaderActionSpec[] } {
   const follow = followLiveEdgeAction(composeContext);
-  const call = callToggleAction(codingAgent === null);
+  const call = callToggleAction(callIsOffered(thread, codingAgent));
   return {
     row: call ? [follow, call] : [follow],
     fold: call ? [call, follow] : [follow],
@@ -125,6 +127,7 @@ export function followLiveEdgeAction(composeContext: boolean): HeaderActionSpec 
     // The row paints each toggle from its own `data-role`, so this asks for the
     // bare `active` those rules select on rather than the header's frame.
     activeClass: 'active',
+    keepsFocus: true,
     onClick: () => setFollowLiveEdge(!followOn),
   };
 }
@@ -151,5 +154,5 @@ export function toggleFollowLiveEdge(): void {
 export function pressCallToggleIfShown(): void {
   const thread = focusedThread();
   const codingAgent = effectiveCodingAgentBackend(thread, resolveCodingAgent(focusedThreadId.value));
-  if (callToggleAction(codingAgent === null)) pressCallToggle();
+  if (callToggleAction(callIsOffered(thread, codingAgent))) pressCallToggle();
 }

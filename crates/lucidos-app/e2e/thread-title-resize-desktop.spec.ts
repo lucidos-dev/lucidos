@@ -31,15 +31,17 @@ function isTitleOneLine(page: import('@playwright/test').Page) {
  *  its OWN box (the precondition for text-overflow to fire at all) and what
  *  `text-overflow` computes to. A hard clip reads as `overflows: false` no
  *  matter how much title is missing, because the box was sized to the text and
- *  an ancestor did the cutting. */
+ *  an ancestor did the cutting. The truncating box is the inner text span,
+ *  whose corners must stay square so the clip never shaves the first glyph. */
 function titleTruncation(page: import('@playwright/test').Page) {
   return page.evaluate(() => {
-    const el = Array.from(document.querySelectorAll('.thread-view-header .thread-title'))
+    const el = Array.from(document.querySelectorAll('.thread-view-header .thread-title-text'))
       .find((e) => e.getBoundingClientRect().width > 0) as HTMLElement;
     const header = el.closest('.thread-view-header') as HTMLElement;
     return {
       overflows: el.scrollWidth > el.clientWidth + 1,
       textOverflow: getComputedStyle(el).textOverflow,
+      clipRadius: getComputedStyle(el).borderTopLeftRadius,
       visibleWidth: el.clientWidth,
       // The row itself must never overflow: the title shrinks, it doesn't push.
       headerOverflow: header.scrollWidth - header.clientWidth,
@@ -135,6 +137,7 @@ test.describe('Thread title: desktop resize', () => {
     const narrow = await titleTruncation(page);
     expect(narrow.overflows, 'the title overflows its own box, so text-overflow applies').toBe(true);
     expect(narrow.textOverflow, 'the overflow renders as an ellipsis, not a hard clip').toBe('ellipsis');
+    expect(narrow.clipRadius, 'the clip is square, so it never shaves the first glyph').toBe('0px');
     expect(narrow.headerOverflow, 'the title shrinks rather than pushing the row wider')
       .toBeLessThanOrEqual(1);
 

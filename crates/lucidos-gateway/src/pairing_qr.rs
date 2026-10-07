@@ -26,9 +26,8 @@ const MAX_ORIGIN_LEN: usize = 255;
 
 /// The URL parameter carrying the code to the pairing screen.
 ///
-/// Its counterpart is `PAIR_CODE_PARAM` in
-/// `crates/lucidos-app/src/utils/pairingCodeSeed.ts`, which reads it and then
-/// strips it from the address bar.
+/// `crates/lucidos-app/src/utils/pairingCodeSeed.ts` reads it from the generated
+/// `gateway-constants.ts`, then strips it from the address bar.
 pub const PAIR_PARAM: &str = "pair";
 
 /// The pairing code a query string carries, or `None`.

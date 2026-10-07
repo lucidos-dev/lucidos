@@ -50,6 +50,7 @@ function releaseCheckOf(
 // graph) into a unit test.
 const storeSignals = vi.hoisted(() => ({
   latestTauriAppVersion: { value: null as string | null },
+  clientOfferedRelease: { value: null as string | null },
   latestTauriAppNotes: { value: null as string | null },
   appUpdateCheckError: { value: null as string | null },
   appUpdateCheckInFlight: { value: false },
@@ -93,17 +94,19 @@ vi.mock('../../api/client/control', () => ({
   getGatewayStatus: mocks.getGatewayStatus,
   requestUpdateRelay: mocks.requestUpdateRelay,
 }));
-vi.mock('../../utils/tauri', () => ({
+vi.mock('../../utils/tauri', async (importOriginal) => ({
   checkAppUpdate: mocks.checkAppUpdate,
   installAppUpdateAndRestart: mocks.installAppUpdateAndRestart,
   cancelAppUpdate: mocks.cancelAppUpdate,
   listen: mocks.listen,
-  APP_UPDATE_PROGRESS_EVENT: 'app-update-progress',
+  APP_UPDATE_PROGRESS_EVENT:
+    (await importOriginal<typeof import('../../utils/tauri')>()).APP_UPDATE_PROGRESS_EVENT,
 }));
 vi.mock('../store', () => ({
   showToast: mocks.showToast,
   removeToast: mocks.removeToast,
   latestTauriAppVersion: storeSignals.latestTauriAppVersion,
+  clientOfferedRelease: storeSignals.clientOfferedRelease,
   latestTauriAppNotes: storeSignals.latestTauriAppNotes,
   appUpdateCheckError: storeSignals.appUpdateCheckError,
   appUpdateCheckInFlight: storeSignals.appUpdateCheckInFlight,
@@ -172,6 +175,7 @@ beforeEach(() => {
     return Promise.resolve(() => {});
   });
   storeSignals.latestTauriAppVersion.value = null;
+  storeSignals.clientOfferedRelease.value = null;
   storeSignals.latestTauriAppNotes.value = null;
   storeSignals.appUpdateCheckError.value = null;
   storeSignals.appUpdateCheckInFlight.value = false;
@@ -186,6 +190,7 @@ beforeEach(() => {
   storeSignals.settingsScrollTarget.value = null;
   storeSignals.lucidosRelease.value = null;
   delete (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__;
+  delete (globalThis as { __LUCIDOS_APP_RELEASE__?: string }).__LUCIDOS_APP_RELEASE__;
 });
 
 afterEach(() => {
@@ -479,7 +484,7 @@ describe('checkAppUpdateViaClient', () => {
   it("keeps the offered release's notes beside the version they describe", async () => {
     mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25', '### Added\n\n- a thing'));
     await checkAppUpdateViaClient();
-    expect(storeSignals.latestTauriAppVersion.value).toBe('2026.6.25');
+    expect(storeSignals.clientOfferedRelease.value).toBe('2026.6.25');
     expect(storeSignals.latestTauriAppNotes.value).toBe('### Added\n\n- a thing');
   });
 
@@ -527,7 +532,7 @@ describe('checkAppUpdateViaClient', () => {
     await checkAppUpdateViaClient();
     mocks.checkAppUpdate.mockResolvedValue(null);
     await checkAppUpdateViaClient();
-    expect(storeSignals.latestTauriAppVersion.value).toBe(null);
+    expect(storeSignals.clientOfferedRelease.value).toBe(null);
     expect(storeSignals.latestTauriAppNotes.value).toBe(null);
   });
 
@@ -542,7 +547,7 @@ describe('checkAppUpdateViaClient', () => {
   it('records the available version for the persistent System surface', async () => {
     mocks.checkAppUpdate.mockResolvedValue(offer('0.16.0'));
     await checkAppUpdateViaClient();
-    expect(storeSignals.latestTauriAppVersion.value).toBe('0.16.0');
+    expect(storeSignals.clientOfferedRelease.value).toBe('0.16.0');
     expect(storeSignals.appUpdateCheckError.value).toBeNull();
   });
 
@@ -555,27 +560,27 @@ describe('checkAppUpdateViaClient', () => {
     expect(mocks.showToast).not.toHaveBeenCalled();
   });
 
-  // In a Tauri DEV client `check_app_update` is a no-op returning null, which is
-  // indistinguishable from "up to date". Assigning that null blindly would wipe
-  // the version connection.ts reads from the engine's /health — dev's only
-  // source — and the two would fight on every poll.
-  it('does not clobber a version it did not set', async () => {
-    mocks.checkAppUpdate.mockResolvedValue(null);
-    await checkAppUpdateViaClient(); // relinquish ownership if an earlier case took it
+  // The engine's `/health` writes the checkout's build id, dev's only source,
+  // and the client check writes a release. Each kind keeps its own signal, so
+  // neither writer can clobber the other.
+  it("never touches the engine's build id", async () => {
     storeSignals.latestTauriAppVersion.value = '2026.07.03.0'; // as if from /health
+    mocks.checkAppUpdate.mockResolvedValue(offer('0.16.0'));
+    await checkAppUpdateViaClient();
+    mocks.checkAppUpdate.mockResolvedValue(null);
     await checkAppUpdateViaClient();
     expect(storeSignals.latestTauriAppVersion.value).toBe('2026.07.03.0');
   });
 
-  it('does clear the version it set once the update is gone', async () => {
+  it('clears the release it offered once the update is gone', async () => {
     mocks.checkAppUpdate.mockResolvedValue(offer('0.16.0'));
     await checkAppUpdateViaClient();
-    expect(storeSignals.latestTauriAppVersion.value).toBe('0.16.0');
+    expect(storeSignals.clientOfferedRelease.value).toBe('0.16.0');
 
     mocks.checkAppUpdate.mockReset();
     mocks.checkAppUpdate.mockResolvedValue(null);
     await checkAppUpdateViaClient();
-    expect(storeSignals.latestTauriAppVersion.value).toBeNull();
+    expect(storeSignals.clientOfferedRelease.value).toBeNull();
   });
 
   it('clears a previous error once a check succeeds again', async () => {
@@ -587,7 +592,7 @@ describe('checkAppUpdateViaClient', () => {
     mocks.checkAppUpdate.mockResolvedValue(null);
     await checkAppUpdateViaClient();
     expect(storeSignals.appUpdateCheckError.value).toBeNull();
-    expect(storeSignals.latestTauriAppVersion.value).toBeNull();
+    expect(storeSignals.clientOfferedRelease.value).toBeNull();
   });
 });
 
@@ -925,7 +930,7 @@ describe('checkForUpdatesNow', () => {
   // The incident, exactly: a current DMG client, an ancient `install.sh`
   // gateway holding port 5252, and a check that answered about the CLIENT.
   it('never answers "up to date" while an older install serves this workspace', async () => {
-    (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__ = '0.36.0';
+    (globalThis as { __LUCIDOS_APP_RELEASE__?: string }).__LUCIDOS_APP_RELEASE__ = '0.36.0';
     storeSignals.lucidosRelease.value = '0.26.2';
     storeSignals.releaseCheck.value = null; // a gateway too old to carry the field
 
@@ -938,7 +943,7 @@ describe('checkForUpdatesNow', () => {
   // The client updater still answers when the engine is not behind. Anything
   // else would strand every ordinary install on a check it cannot run.
   it('still asks the client updater when the engine is current', async () => {
-    (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__ = '0.36.0';
+    (globalThis as { __LUCIDOS_APP_RELEASE__?: string }).__LUCIDOS_APP_RELEASE__ = '0.36.0';
     storeSignals.lucidosRelease.value = '0.36.0';
     storeSignals.releaseCheck.value = null;
     mocks.checkAppUpdate.mockResolvedValue(null);
@@ -950,7 +955,7 @@ describe('checkForUpdatesNow', () => {
 
 describe('shadowedEngine', () => {
   it('reports only an engine OLDER than the app asking', () => {
-    (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__ = '0.36.0';
+    (globalThis as { __LUCIDOS_APP_RELEASE__?: string }).__LUCIDOS_APP_RELEASE__ = '0.36.0';
 
     storeSignals.lucidosRelease.value = '0.26.2';
     expect(shadowedEngine()).toEqual({ engine: '0.26.2', client: '0.36.0' });
@@ -965,13 +970,22 @@ describe('shadowedEngine', () => {
     expect(shadowedEngine()).toBeNull();
   });
 
+  // The client build id is a CalVer stamp, and every release reads as older
+  // than one. Comparing it put an "older Lucidos" notice on every DMG client.
+  it('compares the release, never the client build id', () => {
+    (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__ = '2026.10.03.0';
+    (globalThis as { __LUCIDOS_APP_RELEASE__?: string }).__LUCIDOS_APP_RELEASE__ = '0.36.0';
+    storeSignals.lucidosRelease.value = '0.36.0';
+    expect(shadowedEngine()).toBeNull();
+  });
+
   // A browser or PWA session has a build id rather than a release, so it has
   // nothing to compare and must conclude nothing.
   it('concludes nothing without both versions', () => {
     storeSignals.lucidosRelease.value = '0.26.2';
     expect(shadowedEngine()).toBeNull();
 
-    (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__ = '0.36.0';
+    (globalThis as { __LUCIDOS_APP_RELEASE__?: string }).__LUCIDOS_APP_RELEASE__ = '0.36.0';
     storeSignals.lucidosRelease.value = null;
     expect(shadowedEngine()).toBeNull();
   });
@@ -1326,11 +1340,23 @@ describe('packagedUpdateVersion', () => {
     expect(packagedUpdateVersion()).toBe('9.1.0');
   });
 
-  it('falls back to the client check while the gateway announces nothing', () => {
+  // A packaged client carries a CalVer build id AND a release. The updater's
+  // offer is a release, and against the build id no release ever reads newer.
+  it("falls back to the client updater's release while the gateway announces nothing", () => {
     storeSignals.releaseCheck.value = null;
-    storeSignals.latestTauriAppVersion.value = '1.3.0';
-    window.__LUCIDOS_APP_VERSION__ = '1.2.3';
+    storeSignals.clientOfferedRelease.value = '1.3.0';
+    window.__LUCIDOS_APP_VERSION__ = '2026.10.03.0';
+    window.__LUCIDOS_APP_RELEASE__ = '1.2.3';
     expect(packagedUpdateVersion()).toBe('1.3.0');
+  });
+
+  // Dev: the engine reports the checkout's build id, compared with the client's.
+  it("falls back to the checkout's build id in a dev client", () => {
+    storeSignals.releaseCheck.value = null;
+    storeSignals.latestTauriAppVersion.value = '2026.10.03.2';
+    window.__LUCIDOS_APP_VERSION__ = '2026.10.03.1';
+    window.__LUCIDOS_APP_RELEASE__ = '1.2.3';
+    expect(packagedUpdateVersion()).toBe('2026.10.03.2');
   });
 
   it('offers nothing when the gateway says the install is current', () => {

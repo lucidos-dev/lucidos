@@ -301,6 +301,7 @@ fn per_token_streaming_names_match_the_predicate() {
         ThreadEvent::CodingAgentTextStreamed {
             text: String::new(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            parent_tool_use_id: None,
         },
         ThreadEvent::CodingAgentThoughtStreamed {
             text: String::new(),
@@ -854,6 +855,18 @@ fn a_system_event_name_is_refused() {
         assert!(
             validate_emittable_event_type(name).is_err(),
             "{name} should be rejected as reserved",
+        );
+    }
+}
+
+/// A frame the SSE route writes itself is refused too. A forged `Lagged`
+/// would make every connected client resync on an app's say-so.
+#[test]
+fn a_route_frame_name_is_refused() {
+    for name in crate::api::ROUTE_FRAMES {
+        assert!(
+            validate_emittable_event_type(name).is_err(),
+            "{name} should be rejected as a route frame",
         );
     }
 }

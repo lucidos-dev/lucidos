@@ -14,6 +14,9 @@
  * here, and `reserved_type_names_match_event_type` guards that const against
  * the enum. So a new `SystemEvent` variant reaches this test with no step in
  * between.
+ *
+ * The reverse direction holds too: every arm names a frame the engine sends.
+ * An arm for a renamed or invented name never fires, and nothing else says so.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -22,14 +25,23 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
+import ts from 'typescript';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(here, '../../../../..');
 
 const SYSTEM_EVENT_RS = 'crates/lucidos-engine/src/engine/event_bus_system_event.rs';
+/** The SSE route. It writes a few transport frames itself, such as `Lagged`. */
+const SSE_ROUTE_RS = 'crates/lucidos-engine/src/api/history.rs';
 
-/** The two SSE dispatchers. Every `case '…':` in them is a handled frame. */
-const DISPATCHERS = ['thread-sync.ts', 'entityReferences.ts'];
+/** The two SSE dispatchers: the function that switches on a frame's `type`.
+ *  Every `case '…':` of that switch is a handled frame. Other switches in the
+ *  same file dispatch on something else, such as a `ThreadEvent` variant. */
+const DISPATCHERS = [
+  { file: 'thread-sync.ts', fn: 'handleGlobalEvent' },
+  { file: 'entityReferences.ts', fn: 'processSSEForReferences' },
+];
+const DISPATCHER_FILES = DISPATCHERS.map((d) => d.file).join(' or ');
 
 /** A frame that drives no UI state, and why. Each entry is a decision, so the
  *  next reader re-decides rather than re-discovers. Adding a row is the way to
@@ -72,6 +84,9 @@ const NO_UI_STATE: Record<string, string> = {
     + 'boot re-reads its state anyway',
   ProxyModulesReloaded:
     'the proxy signer modules were reloaded in the engine. They have no page',
+  WebhookDeliveriesSleptThrough:
+    'a timeline record that this computer slept with a webhook on, for a '
+    + 'trigger to read. ADR 0367 keeps it off the Webhooks page and the bar',
 };
 
 function read(path: string): string {
@@ -87,18 +102,44 @@ function reservedTypeNames(): string[] {
   return [...block[1].matchAll(/"([A-Za-z0-9_]+)"/g)].map((m) => m[1]);
 }
 
-/** Every `case '…':` label in the two dispatchers. */
+/** The frame types the SSE route writes itself: its `*_FRAME` consts. */
+function sseRouteFrameNames(): string[] {
+  return [...read(SSE_ROUTE_RS).matchAll(/const [A-Z_]+_FRAME: &str = "([A-Za-z0-9_]+)"/g)].map(
+    (m) => m[1],
+  );
+}
+
+/** The case labels of the switch on `type` at the top of a dispatcher. A
+ *  nested switch has its own clauses, so its labels are not collected. */
+function dispatchCaseLabels(file: string, fn: string): string[] {
+  const path = resolve(here, file);
+  const ast = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
+  const decl = ast.statements.find(
+    (s): s is ts.FunctionDeclaration => ts.isFunctionDeclaration(s) && s.name?.text === fn,
+  );
+  const dispatch = decl?.body?.statements.find(
+    (s): s is ts.SwitchStatement =>
+      ts.isSwitchStatement(s) && ts.isIdentifier(s.expression) && s.expression.text === 'type',
+  );
+  if (!dispatch) throw new Error(`no \`switch (type)\` at the top of ${fn} in ${file}`);
+  return dispatch.caseBlock.clauses
+    .filter(ts.isCaseClause)
+    .map((clause) => {
+      if (!ts.isStringLiteral(clause.expression)) {
+        throw new Error(`${file}: a ${fn} case label is not a string literal`);
+      }
+      return clause.expression.text;
+    });
+}
+
+/** Every case label of the two dispatch switches. */
 function handledTypeNames(): Set<string> {
-  const handled = new Set<string>();
-  for (const file of DISPATCHERS) {
-    const src = readFileSync(resolve(here, file), 'utf8');
-    for (const m of src.matchAll(/case '([A-Za-z0-9_]+)':/g)) handled.add(m[1]);
-  }
-  return handled;
+  return new Set(DISPATCHERS.flatMap(({ file, fn }) => dispatchCaseLabels(file, fn)));
 }
 
 describe('every SystemEvent is answered or written down', () => {
   const reserved = reservedTypeNames();
+  const routeFrames = sseRouteFrameNames();
   const handled = handledTypeNames();
 
   it('reads a plausible list of wire names out of the Rust source', () => {
@@ -106,7 +147,18 @@ describe('every SystemEvent is answered or written down', () => {
     // pass while checking nothing at all.
     expect(reserved.length).toBeGreaterThan(50);
     expect(reserved).toContain('TriggerUpdated');
+    expect(routeFrames).toContain('Lagged');
     expect(handled.size).toBeGreaterThan(30);
+  });
+
+  it('answers no frame the engine never sends', () => {
+    const sent = new Set([...reserved, ...routeFrames]);
+    const phantoms = [...handled].filter((name) => !sent.has(name));
+    expect(
+      phantoms,
+      `These arms in ${DISPATCHER_FILES} name no frame the `
+      + `engine sends, so they never fire. Fix the name or drop the arm: ${phantoms.join(', ')}`,
+    ).toEqual([]);
   });
 
   it('leaves no frame unanswered and unexplained', () => {
@@ -114,7 +166,7 @@ describe('every SystemEvent is answered or written down', () => {
     expect(
       orphans,
       'These frames reach the browser and nothing reads them. Give each one an '
-      + `arm in ${DISPATCHERS.join(' or ')}, or a row in NO_UI_STATE saying what `
+      + `arm in ${DISPATCHER_FILES}, or a row in NO_UI_STATE saying what `
       + `state it does not touch: ${orphans.join(', ')}`,
     ).toEqual([]);
   });

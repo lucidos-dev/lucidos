@@ -312,8 +312,7 @@ pub(crate) const IMAGE_DESCRIPTION_PROMPT: &str = "Describe the image and transc
 /// Generate a brief description of user-attached images using Flash.
 /// Standalone function so it can be spawned into a background task.
 ///
-/// `capture` records the call for token accounting. Its request size counts
-/// the encoded image bytes, which is what the provider actually charged for.
+/// `capture` makes the call and records it for token accounting.
 pub(super) async fn describe_images(
     provider: &dyn crate::llm::provider::LlmProvider,
     images: &[crate::api::ChatImage],
@@ -321,20 +320,19 @@ pub(super) async fn describe_images(
     // `gemini_generation_config` reads as `high`, so a caption was paying for
     // the model's deepest thinking.
     reasoning_effort: Option<&str>,
-    capture: Option<&crate::engine::AuxCapture>,
+    capture: &crate::engine::AuxCapture,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use crate::llm::provider::{ContentBlock, Message, MessageContent};
 
     let mut blocks: Vec<ContentBlock> = vec![ContentBlock::Text {
         text: IMAGE_DESCRIPTION_PROMPT.to_string(),
     }];
-    let mut request_chars = IMAGE_DESCRIPTION_PROMPT.chars().count();
     for img in images {
         // Fit each image to the LLM size target (compress only if over) so the
         // description pass can't trip the provider's per-image limit either.
-        let fitted = img.clone().fit_for_llm();
-        request_chars += fitted.base64.len();
-        blocks.push(super::images::image_content_block(fitted));
+        blocks.push(super::images::image_content_block(
+            img.clone().fit_for_llm(),
+        ));
     }
 
     let messages = vec![Message {
@@ -342,8 +340,9 @@ pub(super) async fn describe_images(
         content: MessageContent::Blocks(blocks),
     }];
 
-    let response = provider
+    let response = capture
         .chat(
+            provider,
             messages,
             vec![],
             crate::llm::ModelSelection::default().with_effort(reasoning_effort),
@@ -351,11 +350,6 @@ pub(super) async fn describe_images(
             None,
         )
         .await?;
-    if let Some(capture) = capture {
-        capture
-            .record(provider.default_model(), request_chars, &response)
-            .await;
-    }
     response
         .content
         .ok_or_else(|| "No description returned".into())

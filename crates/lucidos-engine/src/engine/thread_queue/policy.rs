@@ -88,7 +88,15 @@ pub struct CapacityPolicy {
     /// A spawn does not consume a hop, so this counts trigger fires and not
     /// tasks. See [`DEFAULT_MAX_EVENT_TRIGGER_DEPTH`] for why it is 5.
     pub max_event_trigger_depth: u32,
+    /// How many *live children* one thread may have at the same time. A child
+    /// that finishes frees its slot. `run_thread` is refused at this count,
+    /// and a follow-up never is. Not a pool cap: it is read by the recursion
+    /// guard, not by admission.
+    pub max_concurrent_children_per_thread: usize,
 }
+
+/// Default for [`CapacityPolicy::max_concurrent_children_per_thread`].
+pub const DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD: usize = 10;
 
 /// Default ceiling for [`CapacityPolicy::max_event_trigger_depth`].
 ///
@@ -113,7 +121,33 @@ impl Default for CapacityPolicy {
             reserved_background: 8,
             overflow: OverflowPolicy::DropOldest,
             max_event_trigger_depth: DEFAULT_MAX_EVENT_TRIGGER_DEPTH,
+            max_concurrent_children_per_thread: DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD,
         }
+    }
+}
+
+impl CapacityPolicy {
+    /// Why this policy cannot be stored, or `None` when it can. The HTTP route
+    /// and the agent's `update_policy` both refuse through this.
+    ///
+    /// Concurrency caps of 0 are legal and mean "hold". These three are not:
+    /// - `max_queued_per_trigger` at 0 overflows every fire at once, which
+    ///   under `drop-oldest` degrades to an unbounded queue.
+    /// - `max_event_trigger_depth` at 0 stops every chain at its first hop,
+    ///   so no event trigger fires again.
+    /// - `max_concurrent_children_per_thread` at 0 refuses every `run_thread`
+    ///   with advice to wait for a child that can never exist.
+    pub fn invalid_reason(&self) -> Option<&'static str> {
+        if self.max_queued_per_trigger == 0 {
+            return Some("max_queued_per_trigger must be at least 1");
+        }
+        if self.max_event_trigger_depth == 0 {
+            return Some("max_event_trigger_depth must be at least 1");
+        }
+        if self.max_concurrent_children_per_thread == 0 {
+            return Some("max_concurrent_children_per_thread must be at least 1");
+        }
+        None
     }
 }
 
@@ -257,6 +291,32 @@ mod tests {
 
     fn policy() -> CapacityPolicy {
         CapacityPolicy::default()
+    }
+
+    /// A `CapacityPolicyChanged` stored before the field existed must read
+    /// the default, not 0, which would refuse every `run_thread`.
+    #[test]
+    fn a_policy_stored_before_the_child_cap_reads_the_default() {
+        let stored = serde_json::json!({ "max_concurrent_total": 4 });
+        let read: CapacityPolicy = serde_json::from_value(stored).unwrap();
+        assert_eq!(read.max_concurrent_total, 4);
+        assert_eq!(
+            read.max_concurrent_children_per_thread,
+            DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD
+        );
+    }
+
+    #[test]
+    fn a_child_cap_of_zero_cannot_be_stored() {
+        assert_eq!(policy().invalid_reason(), None);
+        let zero = CapacityPolicy {
+            max_concurrent_children_per_thread: 0,
+            ..policy()
+        };
+        assert_eq!(
+            zero.invalid_reason(),
+            Some("max_concurrent_children_per_thread must be at least 1")
+        );
     }
 
     #[test]

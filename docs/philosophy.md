@@ -306,8 +306,34 @@ The bill arrives in the other direction and we pay it knowingly. A PWA on iOS
 gets less than a native app does, particularly around push and background work,
 and the workarounds in
 [notifications](https://github.com/lucidos-dev/lucidos/blob/main/system-knowhow/notifications.md)
-are the receipt. A second, native client would close that gap and spend the
-reason any of this is ours.
+are the receipt.
+
+A thin native shell closes most of that gap without a second client. It is the
+same build in the platform's webview, with native code only for the push and
+background-work gaps already named above. That is the shim this principle
+already allows, and an iOS shell is on the roadmap. A second, native client
+would close the gap too, and spend the reason any of this is ours.
+
+**The bill is real, but ownership is not the only thing it buys.** The same
+choice is also the better product, for two reasons that would hold even if
+nothing here were open.
+
+The first is feature parity. One build means a feature reaches the phone, the
+Mac and the browser on the same day, and behaves the same on each. A native
+client per platform is a second implementation of every feature. A second
+implementation lags, drops an edge case, or reads a setting its own way. The
+parity that principle 3 enforces between the prompt and the apps would then have
+to hold between clients too. Nothing generates that for free.
+
+The second is familiarity, and it is the easier of the two to reach, because it
+comes from the shared build and not from discipline. A person who learns Lucidos
+at the desk already knows it on the phone: the same words, the same panes, the
+same place for each thing. Native clients trade that for each platform's
+conventions, and every platform pulls its copy a different way.
+
+The apps a person builds make the point sharper. They are HTML, so a native
+client would still host them in a webview. The person would then meet two kinds
+of screen inside one product.
 
 **5. What a person makes travels; what they accumulate does not.** This is the
 mission's "travels matters as much as stays", and the reason the two halves come

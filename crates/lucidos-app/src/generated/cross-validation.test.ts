@@ -8,8 +8,8 @@
 // from the Rust implementation.
 
 import { describe, it, expect } from 'vitest';
-import { availableThreadActions, displaySection, threadIsDeletable, THREAD_STATUSES } from './thread-lifecycle';
-import type { ThreadType, ThreadStatus, ArchiveState, Action, DisplaySection } from './thread-lifecycle';
+import { actionBlocker, availableThreadActions, displaySection, ownBlocker, OWN_BLOCKER_PRIORITY, THREAD_STATUSES } from './thread-lifecycle';
+import type { ThreadType, ThreadStatus, ArchiveState, Action, DisplaySection, OwnBlocker } from './thread-lifecycle';
 import fixture from './cross-validation-fixture.json';
 
 interface AvailableThreadActionsCase {
@@ -24,18 +24,24 @@ interface DisplaySectionCase {
   expected: string;
 }
 
-interface ThreadIsDeletableCase {
-  fn: 'threadIsDeletable';
-  args: [string, string, boolean, boolean, boolean];
-  expected: boolean;
+interface OwnBlockerCase {
+  fn: 'ownBlocker';
+  args: [string, string, string, boolean, boolean];
+  expected: string | null;
 }
 
-type TestCase = AvailableThreadActionsCase | DisplaySectionCase | ThreadIsDeletableCase;
+interface ActionBlockerCase {
+  fn: 'actionBlocker';
+  args: [string | null, boolean, string | null];
+  expected: string;
+}
+
+type TestCase = AvailableThreadActionsCase | DisplaySectionCase | OwnBlockerCase | ActionBlockerCase;
 
 // Meta-test: every generated function with logic (not just data lookups) must have
 // cross-validation cases in the fixture. If you add a new function to generate_typescript()
 // that has branching logic, add it to this set AND to generate_cross_validation_fixture().
-const FUNCTIONS_REQUIRING_CROSS_VALIDATION = new Set(['availableThreadActions', 'displaySection', 'threadIsDeletable']);
+const FUNCTIONS_REQUIRING_CROSS_VALIDATION = new Set(['availableThreadActions', 'displaySection', 'ownBlocker', 'actionBlocker']);
 
 // (section, isSaved) pairs a thread can hold: inbox unpinned, inbox pinned and
 // archived unpinned. A pinned thread is never archived (ADR 0312), so the
@@ -104,29 +110,44 @@ describe('Cross-validation: generated TS matches Rust', () => {
     }
   });
 
-  describe('threadIsDeletable', () => {
-    const deletableCases = cases.filter((c): c is ThreadIsDeletableCase => c.fn === 'threadIsDeletable');
+  describe('ownBlocker', () => {
+    const ownCases = cases.filter((c): c is OwnBlockerCase => c.fn === 'ownBlocker');
 
-    it(`has exhaustive coverage (${deletableCases.length} cases)`, () => {
-      // 2 threadTypes × N statuses × 2 pending × 2 externalRepo ×
-      // 2 descendantsBlock. No section dimension: delete is offered in the
-      // Archive section too, which is the predicate's whole point.
-      expect(deletableCases.length).toBe(2 * THREAD_STATUSES.length * 2 ** 3);
+    it(`has exhaustive coverage (${ownCases.length} cases)`, () => {
+      // 2 threadTypes × N statuses × 2 sections × 2 pending × 2 externalRepo.
+      expect(ownCases.length).toBe(2 * THREAD_STATUSES.length * 2 ** 3);
     });
 
-    for (const tc of deletableCases) {
-      const [threadType, status, pending, externalRepo, descendantsBlock] = tc.args;
-      const label = `(${threadType}, ${status}, pending=${pending}, external=${externalRepo}, blocked=${descendantsBlock})`;
+    for (const tc of ownCases) {
+      const [threadType, status, section, pending, externalRepo] = tc.args;
+      const label = `(${threadType}, ${status}, ${section}, pending=${pending}, external=${externalRepo})`;
 
       it(`${label} → ${tc.expected}`, () => {
-        const result = threadIsDeletable(
+        const result = ownBlocker(
           threadType as ThreadType,
           status as ThreadStatus,
+          section as ArchiveState,
           pending,
           externalRepo,
-          descendantsBlock,
         );
         expect(result).toBe(tc.expected);
+      });
+    }
+  });
+
+  describe('actionBlocker', () => {
+    const actionCases = cases.filter((c): c is ActionBlockerCase => c.fn === 'actionBlocker');
+
+    it(`has exhaustive coverage (${actionCases.length} cases)`, () => {
+      // (own blockers + none) × 2 isHome × (own blockers + none).
+      const ownOrNone = OWN_BLOCKER_PRIORITY.length + 1;
+      expect(actionCases.length).toBe(ownOrNone * 2 * ownOrNone);
+    });
+
+    for (const tc of actionCases) {
+      const [own, isHome, descendant] = tc.args;
+      it(`(${own}, home=${isHome}, ${descendant}) → ${tc.expected}`, () => {
+        expect(actionBlocker(own as OwnBlocker | null, isHome, descendant as OwnBlocker | null)).toBe(tc.expected);
       });
     }
   });

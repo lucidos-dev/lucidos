@@ -10,7 +10,7 @@ import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useScrollObservers, renderExchanges, ScrollControls } from './CreateThreadView';
 import { StoppedChildNotice } from './StoppedChildNotice';
 import { sideQuestionsFor } from '../../store/sideQuestions';
-import { threadVisualStatus } from '../shared/ThreadStatusIcon';
+import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { ThreadTitleMenu, ThreadTitlePin } from './ThreadTitle';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, exchangeKey, exchangeResponseEvents, hasContentEvents, turnBodyFolded, type Exchange } from '../../store/thread-events';
@@ -36,6 +36,8 @@ import { readRenderPhaseTotals } from '../../utils/renderPhaseTimers';
 import { reportThreadRenderProbe } from '../../utils/threadRenderProbe';
 import { postClientLog } from '../../utils/liveness';
 import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
+import { FindBar } from '../shared/FindBar';
+import { transcriptRenderRequest } from '../../store/actions/transcript-find';
 
 /** Only sample a grouping fold this slow (ms) — keeps cheap incremental folds
  *  (streaming tokens) out of the perf log; we only want the expensive full
@@ -329,8 +331,11 @@ export function locateReadingTarget(
         const holds = ex.userEvent._eventId === target.id
             || ex.steps.some(({ event }) => event._eventId === target.id);
         if (!holds) continue;
+        // A sub-agent's step is drawn inside its agent's row, so that row is its place.
+        const names = (s: { call_event_id?: string; result_event_id?: string }) =>
+            s.call_event_id === target.id || s.result_event_id === target.id;
         const row = exchangeResponseEvents(ex, false, true).findIndex(
-            (r) => r.type === 'step' && (r.call_event_id === target.id || r.result_event_id === target.id),
+            (r) => r.type === 'step' && (names(r) || !!r.children?.some(names)),
         );
         return { index: i, row: Math.max(0, row) };
     }
@@ -693,7 +698,7 @@ export function ThreadView() {
     const animating = promptAnimating.value;
     // Fallback: if loadThreadEvents failed (e.g. iOS Safari PWA resume),
     // still render any events delivered via SSE. Also count pending user
-    // messages — CodingAgentThreadSpawned transfers them before DB events load.
+    // messages, the optimistic rows a send adds before its events load.
     const eventCount = eventThread?.events.size ?? 0;
     const pendingCount = eventThread?.pendingUserMessages.length ?? 0;
     const hasPending = pendingCount > 0;
@@ -943,6 +948,19 @@ export function ThreadView() {
         storeRenderAll(threadId);
         bumpWin(n => n + 1);
     }, [threadId, deepLinkRenderAll.value]);
+
+    // The find bar stepped to a turn the window does not draw yet. Move the
+    // floor down to it, whole, and the find bar scrolls to the match itself.
+    const renderRequest = transcriptRenderRequest.value;
+    useEffect(() => {
+        if (!threadId || renderRequest?.threadId !== threadId) return;
+        const index = exchanges.findIndex((ex) => exchangeKey(ex) === renderRequest.key);
+        if (index < 0) return;
+        const now = currentEdge(threadId, exchanges, exchangeCosts, rowsDrawnAt);
+        if (index > now.exchange || (index === now.exchange && now.rowsHidden === 0)) return;
+        storeEdge(threadId, { exchange: index, rowsHidden: 0 }, exchanges);
+        bumpWin(n => n + 1);
+    }, [threadId, renderRequest, exchanges]);
 
     // The window says draw everything, so the history has to BE everything. A
     // long thread opens on one page, and the linked event is usually older.
@@ -1953,6 +1971,7 @@ export function ThreadView() {
     return (
         <div class="thread-view">
             <DesktopThreadTitleBar threadId={eventThread.meta.id} />
+            <FindBar key="find" surface="thread" scope={`thread:${eventThread.meta.id}`} placeholder="Find in thread" />
             {/* `has-scroll-indicator` is what licenses the CSS to hide the
                 native scrollbar on this scroller: the suppression is scoped to
                 a wrap that actually carries a replacement, so a transcript can

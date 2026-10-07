@@ -268,7 +268,7 @@ describe('starter-event fallback on a trigger exchange', () => {
       type: 'TriggerStarted',
       trigger_id: 'trg-1',
       trigger_name: 'Email triage',
-      model: 'claude-opus-5',
+      model: 'claude-opus-5[1m]',
       reasoning_effort: 'high',
       created: '2026-01-01T00:00:01Z',
     }],
@@ -279,7 +279,7 @@ describe('starter-event fallback on a trigger exchange', () => {
   it('shows the fire\'s model and effort while the response is still streaming', () => {
     const exchanges = groupIntoExchanges(eventsMap(FIRING));
     expect(exchanges).toHaveLength(1);
-    expect(exchangeResponseModel(exchanges[0])).toBe('claude-opus-5');
+    expect(exchangeResponseModel(exchanges[0])).toBe('claude-opus-5[1m]');
     expect(exchangeReasoningEffort(exchanges[0])).toBe('high');
   });
 

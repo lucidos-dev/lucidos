@@ -15,15 +15,11 @@
 //! [`view`] returns every visible notice, plus the id of the next one owed.
 
 use crate::core::preferences::PreferenceStore;
+use crate::core::prefs;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::OnceLock;
-
-/// Where a workspace keeps its cursor. Workspace-global and silent: answering
-/// on one device settles it on every device, and the resolve announces on its
-/// own. See `core::preference_catalog::SILENT_PREF_KEYS`.
-pub const CURSOR_PREF_KEY: &str = "release_notice_cursor";
 
 /// The authored notices as of this build. Read that file's own header before
 /// adding one: its order is load-bearing.
@@ -151,7 +147,7 @@ pub fn running_release() -> Result<Version, String> {
 /// is unavailable, so a shipped install never takes this arm. And a notice
 /// deliberately floored further out stays held back, because one patch is all
 /// this adds.
-fn reported_release(release: &str, dirty: bool) -> Result<Version, String> {
+pub(crate) fn reported_release(release: &str, dirty: bool) -> Result<Version, String> {
     let mut version =
         Version::parse(release).map_err(|e| format!("{release} is not semver: {e}"))?;
     if dirty {
@@ -270,13 +266,7 @@ pub fn advanced_cursor(
 /// list. That is the recoverable direction, and it is loud: the alternative
 /// swallows an instruction and says nothing.
 pub async fn stored_cursor(pool: &PgPool) -> Option<String> {
-    match PreferenceStore::get(pool, CURSOR_PREF_KEY).await {
-        Ok(cursor) => cursor,
-        Err(e) => {
-            crate::log!("[ReleaseNotices] could not read the cursor: {e}");
-            None
-        }
-    }
+    prefs::RELEASE_NOTICE_CURSOR.stored(pool).await
 }
 
 /// Place a workspace in the sequence, on the first boot that finds it outside.
@@ -312,9 +302,13 @@ async fn place_workspace(pool: &PgPool, notices: &[ReleaseNotice], running: &Ver
         return;
     }
     let has_threads =
-        match sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM thread_summaries)")
-            .fetch_one(pool)
-            .await
+        // The home thread does not count: boot creates it in every workspace,
+        // so it says nothing about whether this one was ever used (ADR 0362).
+        match sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM thread_summaries WHERE NOT is_home)",
+        )
+        .fetch_one(pool)
+        .await
         {
             Ok(has_threads) => has_threads,
             Err(e) => {
@@ -333,7 +327,7 @@ async fn place_workspace(pool: &PgPool, notices: &[ReleaseNotice], running: &Ver
     let Some(stamp) = fresh_workspace_stamp(notices, running) else {
         return;
     };
-    match PreferenceStore::set_silent(pool, CURSOR_PREF_KEY, &stamp).await {
+    match PreferenceStore::set_silent(pool, prefs::RELEASE_NOTICE_CURSOR.key(), &stamp).await {
         Ok(()) => crate::log!("[ReleaseNotices] stamped a fresh workspace at {stamp}"),
         Err(e) => crate::log!("[ReleaseNotices] could not stamp the workspace: {e}"),
     }
@@ -356,11 +350,11 @@ pub async fn resolve(
     running: &Version,
     id: &str,
 ) -> Result<bool, sqlx::Error> {
-    let cursor = PreferenceStore::get(pool, CURSOR_PREF_KEY).await?;
+    let cursor = prefs::RELEASE_NOTICE_CURSOR.try_stored(pool).await?;
     let Some(next) = advanced_cursor(notices, running, cursor.as_deref(), id) else {
         return Ok(false);
     };
-    PreferenceStore::set_silent(pool, CURSOR_PREF_KEY, &next).await?;
+    PreferenceStore::set_silent(pool, prefs::RELEASE_NOTICE_CURSOR.key(), &next).await?;
     Ok(true)
 }
 
@@ -797,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn a_used_workspace_with_an_unplaceable_cursor_owes_everything_again() {
         let (pool, db_name) = setup_test_db().await;
-        PreferenceStore::set_silent(&pool, CURSOR_PREF_KEY, "gone")
+        PreferenceStore::set_silent(&pool, prefs::RELEASE_NOTICE_CURSOR.key(), "gone")
             .await
             .expect("the cursor key must be writable without announcing");
         add_a_thread(&pool).await;
@@ -839,7 +833,7 @@ mod tests {
     async fn the_repair_clears_a_stamp_a_used_workspace_never_answered() {
         let (pool, db_name) = setup_test_db().await;
         add_a_thread(&pool).await;
-        PreferenceStore::set_silent(&pool, CURSOR_PREF_KEY, "b")
+        PreferenceStore::set_silent(&pool, prefs::RELEASE_NOTICE_CURSOR.key(), "b")
             .await
             .expect("the cursor key must be writable without announcing");
 
@@ -858,7 +852,7 @@ mod tests {
     async fn the_repair_keeps_a_cursor_the_user_answered() {
         let (pool, db_name) = setup_test_db().await;
         add_a_thread(&pool).await;
-        PreferenceStore::set_silent(&pool, CURSOR_PREF_KEY, "b")
+        PreferenceStore::set_silent(&pool, prefs::RELEASE_NOTICE_CURSOR.key(), "b")
             .await
             .expect("the cursor key must be writable without announcing");
         add_an_answer_event(&pool).await;
@@ -874,7 +868,7 @@ mod tests {
     #[tokio::test]
     async fn the_repair_keeps_a_fresh_workspaces_stamp() {
         let (pool, db_name) = setup_test_db().await;
-        PreferenceStore::set_silent(&pool, CURSOR_PREF_KEY, "c")
+        PreferenceStore::set_silent(&pool, prefs::RELEASE_NOTICE_CURSOR.key(), "c")
             .await
             .expect("the cursor key must be writable without announcing");
 

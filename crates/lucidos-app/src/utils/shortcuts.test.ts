@@ -157,9 +157,13 @@ describe('the toggle shortcuts', () => {
     ['toggleThreadFilter', '⌃⇧U'],
     ['searchThreads', '⌃⇧K'],
     ['toggleMenuDrawer', '⌃⇧X'],
-    ['refreshPanel', '⌃⇧P'],
   ] as const)('%s defaults to %s on a Mac', (id, display) => {
     expect(formatBinding(shortcutDef(id).defaultBinding, true)).toBe(display);
+  });
+
+  it('refreshes the content pane on the browser reload chord', () => {
+    expect(formatBinding(shortcutDef('refreshPanel').defaultBinding, true)).toBe('⌘R');
+    expect(formatBinding(shortcutDef('refreshPanel').defaultBinding, false)).toBe('Ctrl+R');
   });
 
   it('marks Apply and the voice call, and nothing else, host-only', () => {

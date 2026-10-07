@@ -4,6 +4,7 @@ import { isReducedMotion } from '../../utils/motion';
 // The LEAF breadcrumb module, not `utils/liveness`, which re-exports it behind
 // a `store` import this module deliberately avoids (see `parseNavigatedTurn`).
 import { postClientLog } from '../../utils/clientLog';
+import { markBoot } from '../../utils/bootTiming';
 import { USER_SCROLL_WINDOW_MS, nowMs } from '../../utils/scrollActivity';
 import { isMobile } from '../../utils/viewport';
 import { isImageRetryPending } from '../../utils/markdownImageRetry';
@@ -330,7 +331,7 @@ export function onRebasedScroll(listener: (el: HTMLElement, kind: NavScrollKind)
  *  The counterpart of `markNavigationScroll` for a navigation that does not
  *  write `scrollTop` itself: it calls `scrollIntoView` and lets the platform
  *  pick the offset: `choiceCardNav`'s arrow-key step, and a key or a focus
- *  landing on a control inside the transcript. Both
+ *  landing on a control inside the transcript that is not wholly in view. Both
  *  signals that would otherwise catch it are blind here. Nothing stamps a
  *  position, and the keydown lands on the choice BUTTON rather than on the
  *  transcript, so no gesture is recorded either.
@@ -705,8 +706,20 @@ type LandingAim = (el: HTMLElement, target: HTMLElement) => void;
  *  or re-arms, and lapses after `LANDING_ADDRESSABLE_MS`. */
 let _rideArrival: { resolveTurn: TurnResolver; at: number } | null = null;
 
-/** TWO deadlines, because a landing can be waiting for two different things and
- *  they are not the same length.
+/** A card submit, an answer or a permission decision, that the engine has not
+ *  yet confirmed. Its reaction waits for `followConfirmedCard`, so nobody moves
+ *  while the pick spins (ADR 0080 § Amendment: a card submit lands once
+ *  confirmed). Lapses after `LANDING_ROUND_TRIP_MS`. */
+let _cardAwaitingConfirm: { cardId: string; resolveTurn: TurnResolver; at: number } | null = null;
+
+/** The window after a hold ends in which a NEW question card still lands the
+ *  reader. A coding agent's next question in one tool call can arrive a few
+ *  milliseconds after the row that ended the hold. `seen` is the card already
+ *  in view when the hold ended. */
+let _nextCardWatch: { seen: string | null; at: number } | null = null;
+
+/** THREE deadlines, because a landing can be waiting for three different
+ *  things and they are not the same length.
  *
  *  Before its turn has a box the landing has NOTHING to show, so it gives up
  *  quickly. That is the second and later queued follow-ups, folded into a
@@ -714,22 +727,32 @@ let _rideArrival: { resolveTurn: TurnResolver; at: number } | null = null;
  *  and costs the reader their NEXT submit, which `followSubmit` swallows while
  *  a landing is in hand.
  *
- *  Once the turn HAS a box the landing is waiting for the agent, and that wait
- *  is seconds. What reaches the end of it is a turn that draws no ROW: a dead
- *  request, a turn the reader has collapsed, and a coding-agent turn running
- *  tool calls with the step log switched off. None of those grows much, so the
- *  reader is barely moved while it runs.
+ *  A ROUND TRIP is seconds: a card submit waiting for its confirm, and a cancel
+ *  waiting for the boundary it draws.
+ *
+ *  Once the turn HAS a box, a hold waits for the AGENT, and that can take tens
+ *  of seconds. A coding agent resuming on a cold cache took 7 to 14 seconds to
+ *  write after an answer, and the round-trip budget dropped every one. What
+ *  reaches the end is a turn that draws no ROW: a dead request, a turn the
+ *  reader has collapsed, and a coding-agent turn running tool calls with the
+ *  step log switched off. None of those grows much, so the reader is barely
+ *  moved while it runs, and their own scroll ends it at once.
  *
  *  Lapsing never falls back to the live edge: a submit arms nothing, so there
  *  is no ride to honour. Without these the hold would sit forever. */
 const LANDING_ADDRESSABLE_MS = 1000;
-const LANDING_HOLD_MS = 8000;
+const LANDING_ROUND_TRIP_MS = 8000;
+const LANDING_AGENT_START_MS = 60_000;
 
 /** What the AGENT has drawn into this turn: the rows inside its response body,
- *  its Thinking step and its text among them. Counting rows rather than reading
+ *  its text and its tool rows among them. Counting rows rather than reading
  *  the status is what makes one signal serve every hold. A send's turn
  *  starts empty. A card's turn already holds whatever the agent said before it
  *  asked, so only the CHANGE is common to both.
+ *
+ *  A Thinking row is NOT one. It is the agent holding control, drawn the moment
+ *  an answer resumes it, and its reply can come many seconds later. Counted,
+ *  it ended the hold at once and the reply landed under the composer.
  *
  *  The rows, and NOT `.response-body`'s own children. Those are the SECTION
  *  wrappers `responseBody` produces, one per `section_break`, and a resuming
@@ -741,7 +764,7 @@ const LANDING_HOLD_MS = 8000;
  *  steps is one Disclosure, and a new step joins the run already there. The
  *  hidden-step hairline is chrome, not something the agent drew. */
 export const DRAWN_ROW_SELECTOR = '.response-content > :not(.disclosure), '
-  + '.response-content > .disclosure > .disclosure-body > :not(.response-elision)';
+  + '.response-content > .disclosure > .disclosure-body > :not(.response-elision):not([data-thinking-row])';
 
 function drawnRows(turn: HTMLElement): number {
   if (typeof turn.querySelectorAll !== 'function') return 0;
@@ -915,8 +938,7 @@ function armFollowOn(el: HTMLElement | null) {
   // the only way to arm over a waiting landing is the reader pressing the
   // chevron, which supersedes it. Everything downstream (the growth branch, the
   // cancel in `onScroll`) may therefore assume at most one of the two.
-  _pendingLanding = null;
-  _rideArrival = null;
+  forgetSubmits();
   if (!wasArmed) for (const listener of _followRideListeners) listener();
 }
 
@@ -1095,12 +1117,20 @@ function leaveTheRide(next: 'off' | 'parked') {
   if (_heldAnim) cancelScrollAnim();
   _follow.value = next;
   holdPosition(null);
-  _pendingLanding = null;
-  _rideArrival = null;
+  forgetSubmits();
 }
 
-/** Cancel a submit's LANDING: drop one still waiting for its turn to render, and
- *  stop one already gliding. The landing's half of what `stopFollowingBottom`
+/** Drop every submit still waiting to move the reader: a landing, a rider's
+ *  arrival, a card submit awaiting its confirm, and the watch for a next card. */
+function forgetSubmits() {
+  _pendingLanding = null;
+  _rideArrival = null;
+  _cardAwaitingConfirm = null;
+  _nextCardWatch = null;
+}
+
+/** Cancel a submit's LANDING: drop every submit still waiting, and stop a
+ *  landing already gliding. The landing's half of what `stopFollowingBottom`
  *  does, for the reader who has no follow to retire.
  *
  *  Only the landing's OWN tween. A ride's glide is the standing follow's motion
@@ -1109,7 +1139,7 @@ function leaveTheRide(next: 'off' | 'parked') {
  *  such as a shrink clamping the reader down. */
 function cancelLanding() {
   if (landingGlideInFlight()) cancelScrollAnim();
-  _pendingLanding = null;
+  forgetSubmits();
 }
 
 /** Is the tween in flight the LANDING's own glide, as opposed to a RIDE's or a
@@ -1120,26 +1150,28 @@ function landingGlideInFlight(): boolean {
   return _heldAnim && _heldAnimTarget === 'landing';
 }
 
-/** Retire a landing that has outlived its deadline, which of the two above
- *  depending on whether its turn ever got a box. Called from the two places a
- *  lapse can be noticed: the growth branch, and the next submit. Neither alone
- *  is enough, because the deadline is wall-clock and the growth branch only
- *  runs when something grows. */
+/** Retire a landing that has outlived its deadline, which of the three above
+ *  depending on what it is waiting for. Called from the two places a lapse can
+ *  be noticed: the growth branch, and the next submit. Neither alone is
+ *  enough, because the deadline is wall-clock and the growth branch only runs
+ *  when something grows. */
 function dropLapsedLanding(): void {
   if (!_pendingLanding) return;
   // A landing that never HOLDS waits on a round trip, not on a box that may
-  // never come, so it gets the long budget too. A Stop is the case. The engine
-  // only notifies the agent and waits for its answer, allowing seconds before
-  // it escalates, and the boundary renders at the end of that.
-  const waiting = _pendingLanding.on || !_pendingLanding.holds;
-  const deadline = waiting ? LANDING_HOLD_MS : LANDING_ADDRESSABLE_MS;
+  // never come. A Stop is the case. The engine only notifies the agent and
+  // waits for its answer, allowing seconds before it escalates, and the
+  // boundary renders at the end of that.
+  const deadline = _pendingLanding.on ? LANDING_AGENT_START_MS
+    : _pendingLanding.holds ? LANDING_ADDRESSABLE_MS : LANDING_ROUND_TRIP_MS;
   if (nowMs() - _pendingLanding.at >= deadline) _pendingLanding = null;
 }
 
-/** Is a submit's landing in flight, in either of its two phases: held open for
- *  its turn, or gliding to the live edge. */
+/** Is a submit's landing in flight, in any of its phases: a card submit awaiting
+ *  its confirm, held open for its turn, gliding to the live edge, or watching
+ *  for a next card. */
 function landingInFlight(): boolean {
-  return _pendingLanding !== null || landingGlideInFlight();
+  return _cardAwaitingConfirm !== null || _pendingLanding !== null
+    || landingGlideInFlight() || _nextCardWatch !== null;
 }
 
 /** Carry the held stamp onto a scroll THE APP just wrote to hold the reader on
@@ -1308,6 +1340,13 @@ function stampGesture(el: HTMLElement) {
   _gestureAt = nowMs();
 }
 
+/** A submit is a newer act than any movement before it, so the window closes.
+ *  The coast of a flick made just before the tap is not the reader leaving the
+ *  submit's glide. A real move after it stamps again. A held scrollbar stays. */
+function retireGesture() {
+  _gestureAt = -Infinity;
+}
+
 /** Did the reader move `el` themselves, counting the coast after a flick?
  *
  *  Freshness answers for movement, since a finger or a wheel keeps re-stamping.
@@ -1332,6 +1371,16 @@ function readerGestureActive(el: HTMLElement): boolean {
 export function readerGestureSince(el: HTMLElement, since: number): boolean {
   if (_scrollbarHoldEl === el) return true;
   return _gestureEl === el && _gestureAt > since;
+}
+
+/** Does `node`'s box lie wholly inside `container`'s? Then focusing it reveals
+ *  nothing. A node with no box reads as not in view. */
+function liesInFullView(node: Node | null, container: HTMLElement): boolean {
+  const box = node as HTMLElement | null;
+  if (typeof box?.getBoundingClientRect !== 'function') return false;
+  const r = box.getBoundingClientRect();
+  const c = container.getBoundingClientRect();
+  return r.height > 0 && r.top >= c.top && r.bottom <= c.bottom && r.left >= c.left && r.right <= c.right;
 }
 
 /** Keys that scroll a focused container. The transcript is `tabindex=0`, so it
@@ -1470,10 +1519,16 @@ function attachReaderGestures(el: HTMLElement): () => void {
    *
    *  Focus on a control outside an arrival's target is the reader moving
    *  on, so the hold lets go. Focus inside the target keeps it, as does pane
-   *  focus on the container itself, which scrolls nothing. */
+   *  focus on the container itself, which scrolls nothing.
+   *
+   *  Only a focus the browser will REVEAL is marked. A tap focuses a control
+   *  already in full view, and the container itself scrolls nothing. Marked,
+   *  the next platform clamp read as a placement, and on a phone that clamp
+   *  follows every answer. */
   const onFocusIn = (e: FocusEvent) => {
     const to = e.target as Node | null;
     if (_arrivalHold && to !== el && !_arrivalHold.target.contains(to)) _arrivalHold = null;
+    if (to === el || liesInFullView(to, el)) return;
     markRevealScroll(el);
   };
 
@@ -1608,12 +1663,25 @@ const DEAD_QUESTION_CLASSES = ['question-body-answered', 'question-body-terminat
  *  landing. `cardTurn` could not resolve that card either, so nothing here can
  *  recover it without a marker that survives the fold. */
 function answerableQuestionId(el: HTMLElement): string | null {
+  return answerableQuestionBody(el)?.getAttribute?.('data-tool-use-id') ?? null;
+}
+
+/** The body of the card `answerableQuestionId` names, or null. */
+function answerableQuestionBody(el: HTMLElement): HTMLElement | null {
   if (typeof el.querySelectorAll !== 'function') return null;
   const bodies = el.querySelectorAll<HTMLElement>('.question-body');
   const newest = bodies[bodies.length - 1];
   if (!newest) return null;
   if (DEAD_QUESTION_CLASSES.some((c) => newest.classList?.contains(c))) return null;
-  return newest.getAttribute?.('data-tool-use-id') ?? null;
+  return newest;
+}
+
+/** Has the agent asked the reader something new, in a turn other than `turn`?
+ *  A question opens a turn of its own, so the turn a hold watches never draws
+ *  it. Asking is the agent's opening act as much as a drawn row is. */
+function asksAgain(el: HTMLElement, turn: HTMLElement): boolean {
+  const body = answerableQuestionBody(el);
+  return body !== null && body.closest?.(TURN_SELECTOR) !== turn;
 }
 
 /** Fallback clearance when the computed `scroll-margin-top` is unavailable (the
@@ -1797,6 +1865,11 @@ function followSubmit(resolveTurn: TurnResolver, holds = true, aim?: LandingAim)
   // A submit sends the reader to the live edge, so an arrival hold would pull
   // them back to the event they have just acted on.
   _arrivalHold = null;
+  // Otherwise a flick's iOS coast parks a rider again mid-glide. Reported.
+  retireGesture();
+  // This submit is newer than a card submit still sending, or a hold now over.
+  _cardAwaitingConfirm = null;
+  _nextCardWatch = null;
   const el = resolveTarget();
   if (!el) return;
   if (_follow.value !== 'off') {
@@ -1829,8 +1902,8 @@ function followSubmit(resolveTurn: TurnResolver, holds = true, aim?: LandingAim)
   // draws nothing must not swallow the reader's next submit for the backstop.
   //
   // A ONE-SHOT never keeps it. It has no twin call to protect, and it waits on
-  // the long budget. The floor would cost the reader their next landing for
-  // all of it.
+  // a round trip. The floor would cost the reader their next landing for all of
+  // it.
   if (_pendingLanding?.holds && !_pendingLanding.on) return;
   holdPosition(el);
   // Installed FIRST and then run, rather than tried and then installed. A card
@@ -1888,11 +1961,15 @@ function landsOnCard(bodySelector: string, attr: string, value: string): TurnRes
  *  UNLESS a question is open, where the send IS that card's answer and lands on
  *  the card. The engine routes typed text to the pending question as a
  *  `FreeText` answer, emitting no `MessageReceived`. So what the reader
- *  submitted renders as the card's own typed-answer block, and the optimistic
- *  row is torn down when that answer lands. Against a local engine it is torn
- *  down inside the frame it was inserted in. Waiting for it therefore waited for
- *  a turn that never got a box: the landing lapsed and the reader never saw
- *  their own answer. Reported.
+ *  submitted renders as the card's own typed-answer block from the send on,
+ *  not as a row of its own. Waiting for a row waited for a turn that never got
+ *  a box: the landing lapsed and the reader never saw their own answer.
+ *  Reported.
+ *
+ *  A typed answer lands AT ONCE, unlike a picked option, which waits for its
+ *  confirm. Its spinner sits on the "Your answer" label under the options,
+ *  often below the fold. The landing shows it while it spins, then holds for
+ *  the agent's first row through however long the confirm takes. Reported.
  *
  *  Called by the two send sites, `store/actions/chat.ts`'s `addPendingMessage`
  *  and `PromptInput`'s `submit`; see `followSubmit` on why two calls are one
@@ -1901,22 +1978,22 @@ function landsOnCard(bodySelector: string, attr: string, value: string): TurnRes
 export function followSentMessage(): void {
   const el = resolveTarget();
   const answering = el ? answerableQuestionId(el) : null;
-  if (answering) {
-    followAnsweredQuestion(answering);
-    return;
-  }
-  followSubmit(awaitsNewTurn(lastUserTurn));
+  followSubmit(answering ? landsOnQuestionCard(answering) : awaitsNewTurn(lastUserTurn));
 }
 
-/** The reader submitted an answer to the question card `toolUseId`. The card is
- *  on screen already, so this landing needs none of the send's deferral.
+/** The reader picked an answer on the question card `toolUseId`. It moves
+ *  nobody until the engine confirms it (`followCardOnceConfirmed`).
  *
- *  All THREE ways to answer arrive here. `QuestionCard`'s single-select option
- *  tap and `PromptInput`'s multi-select Submit call it directly. Typing into the
- *  composer is a send, and `followSentMessage` routes it here for the reason
- *  given there. */
+ *  Two of the three ways to answer arrive here: `QuestionCard`'s single-select
+ *  option tap and `PromptInput`'s multi-select Submit. The picked option spins
+ *  where the reader tapped it. A typed answer is the third, and lands at once
+ *  (`followSentMessage`). */
 export function followAnsweredQuestion(toolUseId: string): void {
-  followSubmit(landsOnCard('.question-body', 'data-tool-use-id', toolUseId));
+  followCardOnceConfirmed(toolUseId, landsOnQuestionCard(toolUseId));
+}
+
+function landsOnQuestionCard(toolUseId: string): TurnResolver {
+  return landsOnCard('.question-body', 'data-tool-use-id', toolUseId);
 }
 
 /** The reader decided the permission card `requestId`, on any of the three
@@ -1925,9 +2002,36 @@ export function followAnsweredQuestion(toolUseId: string): void {
  *  `usePermissionDecide`, so all three inherit this from one call site.
  *
  *  A submit like the others, because from the reader's side they are all the
- *  same act. The card is on screen already, so like the answer it glides now. */
+ *  same act. Like an answer, it moves nobody until the engine confirms it. */
 export function followResolvedPermission(requestId: string): void {
-  followSubmit(landsOnCard('.permission-body', 'data-request-id', requestId));
+  followCardOnceConfirmed(requestId, landsOnCard('.permission-body', 'data-request-id', requestId));
+}
+
+/** Defer a card submit's reaction until the engine confirms it. The picked
+ *  button spins until then, and the reader asked for the scroll to wait for
+ *  it: a glide under a spinner moves on before the app knows the submit
+ *  arrived. Reported. */
+function followCardOnceConfirmed(cardId: string, resolveTurn: TurnResolver): void {
+  // The tap is newer than any movement before it, as in `followSubmit`.
+  retireGesture();
+  // An earlier landing still in hand would move the reader before the confirm.
+  cancelLanding();
+  _cardAwaitingConfirm = { cardId, resolveTurn, at: nowMs() };
+  // The stamp `onScroll` cancels against, so a reader who scrolls during the
+  // wait keeps their place.
+  holdPosition(resolveTarget());
+}
+
+/** The engine confirmed the submit on the card `cardId`, a tool-use id or a
+ *  request id, so its spinner gives way to the mark. Runs the reaction
+ *  `followCardOnceConfirmed` deferred, if the reader just submitted on that
+ *  card. Every resolved card calls it on mount, and the rest move nobody. */
+export function followConfirmedCard(cardId: string): void {
+  const awaiting = _cardAwaitingConfirm;
+  if (awaiting?.cardId !== cardId) return;
+  _cardAwaitingConfirm = null;
+  if (nowMs() - awaiting.at >= LANDING_ROUND_TRIP_MS) return;
+  followSubmit(awaiting.resolveTurn);
 }
 
 /** The reader pressed Continue on an aborted turn, asking the agent to pick the
@@ -1975,12 +2079,7 @@ export function followCanceledTurn(toolUseId?: string): void {
   // continuation the same way. The caller passes the id only while the thread
   // really is awaiting an answer, since `findLatestPendingQuestion` has no
   // liveness term of its own.
-  followSubmit(
-    toolUseId
-      ? landsOnCard('.question-body', 'data-tool-use-id', toolUseId)
-      : awaitsNewTurn(lastTurn),
-    false,
-  );
+  followSubmit(toolUseId ? landsOnQuestionCard(toolUseId) : awaitsNewTurn(lastTurn), false);
 }
 
 /** The reader is asking a side question. Called BEFORE the ask, like a send,
@@ -2056,7 +2155,7 @@ function landAtLiveEdge(el: HTMLElement, freeze = false): void {
  *  round after it, so the two paths cannot answer differently.
  *
  *  Nothing to land on yet means the turn has no box, and the landing waits it
- *  out on the shorter of the two deadlines. The aim writes nothing when there
+ *  out on the shortest deadline. The aim writes nothing when there
  *  is nowhere to go, so a round costs a reader at the bottom no motion at all.
  *
  *  FOUR ways it lets go, and only the first is what a submit is FOR. The turn
@@ -2100,9 +2199,26 @@ function honourLanding(el: HTMLElement): void {
   // DECIDED before it aims, so the ending round can aim differently. Its glide
   // freezes, resting the reader where the agent's first row put them rather
   // than chasing the next one into the same tween.
-  const ending = turnIsQueued(turn) || drawnRows(turn) !== drawnAtSubmit;
+  const ending = turnIsQueued(turn) || drawnRows(turn) !== drawnAtSubmit || asksAgain(el, turn);
   landAtLiveEdge(el, ending);
-  if (ending) _pendingLanding = null;
+  if (!ending) return;
+  _pendingLanding = null;
+  _nextCardWatch = { seen: answerableQuestionId(el), at: nowMs() };
+}
+
+/** Land the reader on a question card that arrived just after their hold ended,
+ *  and report whether it did. A frozen glide still in flight is re-aimed rather
+ *  than restarted, so its easing carries on. */
+function landOnNextCard(el: HTMLElement): boolean {
+  const watch = _nextCardWatch;
+  if (!watch) return false;
+  if (nowMs() - watch.at >= LANDING_ADDRESSABLE_MS) { _nextCardWatch = null; return false; }
+  const card = answerableQuestionId(el);
+  if (card === null || card === watch.seen) return false;
+  _nextCardWatch = null;
+  if (landingGlideInFlight()) _heldGlideFrozenTop = liveEdgeTop(el);
+  else landAtLiveEdge(el, true);
+  return true;
 }
 
 /** THE FOLLOW'S PROMISE: one write and one rule, reaching the reader through
@@ -2166,6 +2282,8 @@ function honourGrowth(el: HTMLElement): void {
     honourLanding(el);
     return;
   }
+  // The landing's own afterglow, under the same tween rule.
+  if ((_scrollAnimRaf === null || landingGlideInFlight()) && landOnNextCard(el)) return;
   if (holdTheArrival(el)) return;
   if (wakeParkedRide(el)) return;
   if (glideToSubmittedTurn(el)) return;
@@ -2925,6 +3043,7 @@ function scrollToSelectorAndPulse(
   ) => {
     if (reported) return;
     reported = true;
+    if (outcome === 'landed' || outcome === 'landed-after-wait') markBoot('landed');
     let visible = 0;
     for (let i = 0; i < matches.length; i++) if (isElementVisible(matches[i])) visible++;
     postClientLog('deeplink', 'outcome', {
@@ -3724,13 +3843,15 @@ export function makeScrollObservers(el: HTMLElement) {
   // the stamp, so `tookOver` is false for it. Off the edge alone is not it
   // either, because a shrink clamps the reader down while they stay on it.
   //
-  // The LANDING takes only the moved term, deliberately. A reader who flicks
-  // down to the live edge mid-glide has gone where the landing is not taking
-  // them. A landing answers a submit made a moment ago, so whether the agent has
-  // got going yet says nothing about whether the reader wants it.
+  // The LANDING ends on the reader's own move alone, with no edge term. A
+  // reader who flicks down to the live edge mid-glide has gone where the
+  // landing is not taking them. A platform move ends nothing: closing the
+  // keyboard after a phone submit is one, and the landing still owes the reply.
+  // An ANCHOR write is no placement here: it carries the landing's stamp, so a
+  // move it reads as off that stamp is WebKit's keyboard offset landing late.
   function onScroll() {
     if (!isElementVisible(el)) return;
-    // All five are questions about the scroll being HANDLED, so all five are
+    // All six are questions about the scroll being HANDLED, so all six are
     // read before anything below can write over the answer, and each once. The
     // gesture and placement windows are wall-clock, and a second read could
     // land the other side of an edge.
@@ -3738,12 +3859,14 @@ export function makeScrollObservers(el: HTMLElement) {
     const tookOver = !isWhereWeHeldIt(el);
     const gesture = readerGestureActive(el);
     const placement = isPlacementScroll(el);
+    const anchored = isAnchorScroll(el);
     const whereWePutIt = isWhereWeLastScrolledIt(el);
     forgetNavigationStamp(el);
     // The gesture window reaches back past the arrival, so the arrival's own
     // write reads as a gesture too. That write leaves the container where it
     // put it. A scroll that finds it anywhere else is the reader.
     if (gesture && !whereWePutIt) _arrivalHold = null;
+    const readerMoved = tookOver && (gesture || (placement && !anchored));
     if (_follow.value === 'riding') {
       if (scrollLeavesTheRide(atEdge, tookOver, gesture, placement)) leaveTheRideByScroll();
       else if (!atEdge && tookOver) keepTheLiveEdge(el);
@@ -3751,7 +3874,9 @@ export function makeScrollObservers(el: HTMLElement) {
       // Back on the edge by their OWN scroll: ride again from here. A clamp
       // after a shrink puts them there too, and that is not them asking.
       if (atEdge && (gesture || placement)) unparkTheRide(el);
-    } else if (tookOver && landingInFlight()) {
+      // A card submit still sending is the one a parked reader can hold.
+      else if (readerMoved && landingInFlight()) cancelLanding();
+    } else if (readerMoved && landingInFlight()) {
       cancelLanding();
     }
     // Reconciled AFTER the correction above, and re-measured rather than reusing

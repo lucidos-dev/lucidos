@@ -21,6 +21,7 @@ function row(over: Partial<MarketplacePlugin>): MarketplacePlugin {
     content: [],
     categories: [],
     files_count: 1,
+    engine_compatible: true,
     status: 'available',
     ...over,
   };

@@ -693,7 +693,31 @@ fn generate_ts() -> String {
         let quoted: Vec<String> = chunk.iter().map(|n| format!("'{n}'")).collect();
         out.push_str(&format!("  {},\n", quoted.join(", ")));
     }
-    out.push_str("];\n");
+    out.push_str("];\n\n// The engine's caps on a theme value, from core/themes.\n");
+    let caps = [
+        ("MAX_MIX_DEPTH", grammar::MAX_MIX_DEPTH.to_string()),
+        (
+            "MAX_VALUE_LENGTH",
+            super::super::MAX_VALUE_LENGTH.to_string(),
+        ),
+        (
+            "MAX_RESOLVED_TOKENS",
+            super::super::MAX_RESOLVED_TOKENS.to_string(),
+        ),
+        ("MAX_SHADOW_PX", super::super::MAX_SHADOW_PX.to_string()),
+        ("PX_PER_REM", super::super::PX_PER_REM.to_string()),
+    ];
+    for (name, value) in caps {
+        out.push_str(&format!("export const {name} = {value};\n"));
+    }
+    let functions: Vec<String> = super::super::SHADOW_COLOUR_FUNCTIONS
+        .iter()
+        .map(|f| format!("'{f}'"))
+        .collect();
+    out.push_str(&format!(
+        "export const SHADOW_COLOUR_FUNCTIONS: readonly string[] = [{}];\n",
+        functions.join(", ")
+    ));
     out
 }
 

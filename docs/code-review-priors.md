@@ -15,6 +15,16 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **A model added to the Claude thinking gate thinks at the chat default when a
+  call names no effort.** A reviewer reports a call passing
+  `ModelSelection::default()` (a file summary, a memory check) suddenly
+  spending a `high` budget on the newly added model. But `thinking_config` in
+  `llm/anthropic_wire.rs` resolves a missing effort to the
+  `chat_reasoning_effort` default for every thinking model, Sonnet 4.6
+  included. Those calls run on the provider's default model, so the new model
+  joins the same contract rather than changing it. Re-flag only if a missing
+  effort stops meaning the chat default.
+
 - **A side question recomputes its repo directory grants rather than copying
   the session's.** A reviewer reports privilege escalation: an agent edits
   `.claude/settings.json` and its side question gains an `--add-dir`. But a side
@@ -113,8 +123,9 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 - **A `voice_resident_sections` read error opens the call with NO sections, and
   that is the deliberate direction.** A reviewer sees `enabled_sections` return `vec![]` on `Err` and cites the
-  unknown-is-not-a-no rule. Or they note that `voice::mod::read_pref` reads an
-  error as unset for every other voice key.
+  unknown-is-not-a-no rule. Or they note that every other voice key reads
+  through a handle's total `read` (`core/preferences.rs`), which turns an
+  error into the catalog default.
 
   Neither direction destroys anything, so that rule does not decide it. The
   choice is between handing the talker context the reader deliberately turned
@@ -130,8 +141,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   empty preference as unset and reach for the catalog default. That reads as
   overriding a user who deliberately blanked the key. Codex flagged it as P1.
 
-  There was never such a switch. `aux_purpose::read_set` collapses a blank value
-  to unset for every purpose, so the preference layer has no
+  There was never such a switch. A preference handle's read collapses a blank
+  value to unset for every key (`nonblank` in `core/preferences.rs`), so the preference layer has no
   missing-versus-blank distinction to preserve. `PrefValue::Text` rejects an
   empty value, so the agent cannot write one. Neither the catalog entry nor
   `system-knowhow/preferences.md` calls blanking a disable.
@@ -140,7 +151,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `provider_for` checks straight after the model. `voice-call-desktop.spec.ts`
   used to blank the model to force a refusal, and flips that switch instead.
 
-  Re-flag if `read_set` grows a missing-versus-blank distinction, or if a doc
+  Re-flag if the handle reads grow a missing-versus-blank distinction, or if a doc
   starts describing an empty model as a disable.
 
 - **Permission grants living under `<workspace>/.lucidos/` being agent-writable
@@ -227,7 +238,12 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   there is no update verb. The report is honest about it, because
   `describe_subscriptions` names every event type it ended. Re-flag only if a
   wait stops being one-shot, or if the surface grows a way to narrow one.
-  (ADR 0059 § Alternatives; `event_wait/agent_surface.rs`.)
+  (ADR 0059 § Alternatives; `event_wait/agent_surface.rs`.) One narrowing is
+  deliberate: a thread stopping one of several tasks an ENGINE-armed wait
+  covers replaces that wait with an engine wait over the rest, keeping its
+  watermark. The engine is that wait's caller, so 0059's objection does not
+  apply. A model-armed wait still ends whole (ADR 0369;
+  `event_wait/background_task.rs` `plan_stand_down`).
 
 - **`graceful_kill_child_process_group`'s SIGTERM→sleep→SIGKILL does NOT race
   pid recycling.** The function (`runtime/spawn_env.rs`) signals a process
@@ -1093,18 +1109,17 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if `talker_said` gains a guard of its own, which would make the
   inner one genuinely dead.
 
-- **`judgment::select::typesafe_switch` is collapsed with opposite defaults by
-  its two callers, and both are deliberate.** It returns `Option<bool>`, so
+- **`judgment::select::provider_switch` is collapsed with opposite defaults by
+  its callers, and both are deliberate.** It returns `Option<bool>`, so
   each site names its own fallback where a reviewer can see it. That is the
   idiom `.claude/rules/rust.md` sets for a probe that could not run.
 
-  `jev_for` takes `unwrap_or(false)`, which looks wrong beside
+  `system_one_for` takes `unwrap_or(false)`, which looks wrong beside
   `provider_build::read_provider_switches` answering `true` on the same class
   of failed read. The defaults are opposite because the fallbacks are. For one
   of the six, `false` DROPS a configured provider and the workspace may be
-  unable to answer at all. For a judgment site, `false` runs the rubric prompt
-  it has always run, and the module header states that rule ("every doubt
-  resolves to `chat`").
+  unable to answer at all. For a judgment site, `false` asks its chat model,
+  and the module header states that rule ("every doubt resolves to `chat`").
 
   `judgment_available` takes `unwrap_or(true)`, inverting its own file's rule,
   and that is the second half of the same reasoning. It gates the `judge` tool,
@@ -1113,7 +1128,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `read_turn_capabilities` says never to do on an unknown. An absent key still
   closes it, so an unknown never opens the gate alone (ADR 0223).
 
-  Re-flag only if a judgment site loses its chat path, or if the tool gains
+  Re-flag only if a judgment site loses its chat model, or if the tool gains
   one. Either would move a default rather than merely look like it should.
 
 - **`change_action_refusal` reporting a thread watching an event as
@@ -1146,9 +1161,9 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   thread without a restart. That path would then have to re-take the verdict.
 
 - **`AuxModelSource` collapsing to `Option` at every production call site is
-  the point, not dead structure.** A reviewer sees `resolve_selection` and
-  `AuxCall::defaults` both call `.prefs()`, treating `Turn`, `BackendPinned`
-  and `AgentModel` alike. The enum then reads as an `Option` with extra steps.
+  the point, not dead structure.** A reviewer sees `resolve_selection` treat
+  `Turn`, `BackendPinned` and `AgentModel` alike in one match arm, and
+  `.prefs()` survive only in tests. The enum then reads as an `Option` with extra steps.
   Its consumer is the invariant test, not the resolver:
   `every_purpose_owns_exactly_one_model_preference` matches every arm with no
   wildcard, so a purpose reading no model preference has to name WHICH kind of
@@ -1168,27 +1183,13 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if a provider starts returning usage on its error path, which
   would give such a row something to carry.
 
-- **`UNRECORDED` being empty, plus a test asserting it is empty, is not a dead
-  filter.** A reviewer sees `const UNRECORDED: &[(&str, &str)] = &[]` in
-  `engine/aux_capture.rs`, a filter that removes nothing, and a second test
-  whose whole body is `assert!(UNRECORDED.is_empty())`. Both are deliberate:
-  the table is the audit's escape hatch, and writing the current count down is
-  what makes adding a row a decision somebody has to defend. Deleting the
-  emptiness test is easier than earning a row, which is the shape intended.
+- **A metered call wrapped in a timeout does not lose its row.** A reviewer
+  sees `tokio::time::timeout(deadline, capture.chat(...))` and reports that
+  the deadline also covers the record. It does, but the record cannot be cut
+  short: `AuxCapture::emit` runs it as its own task and only awaits it, so a
+  caller the timeout drops leaves it running (ADR 0381).
 
-  Re-flag if a row ever lands without a reason beside it, never for the
-  emptiness itself.
-
-- **`MODEL_CALL_SHAPES` over-matching any method named `chat`, `ask` or
-  `generate` is the chosen trade.** A reviewer notices the audit's bare
-  substrings hit `voice`'s own `self.ask(session, open)`, which opens a
-  decision card and calls no model. A false hit is loud and costs a reader a
-  minute; a miss is spend nobody sees, which is the failure the audit exists
-  for. The failure message names both ways out, and `UNWALKED` takes a file
-  whose name only looks like a provider method.
-
-  Re-flag with a tighter matcher that still catches a call through a fresh
-  local binding. That is the shape a receiver-aware check tends to miss.
+  Re-flag if the emit stops being spawned.
 
 - **An enum whose every variant is `#[cfg]`-gated out still compiles.** The
   gateway's `slowness::pressure::PressureReading` gates `MacOs` and `Linux`
@@ -1210,6 +1211,17 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   matches on those lists only, because keyword matching on `wrong_fact` deleted
   facts the user never corrected. Re-flag only with a real row that has neither
   list. (`engine/memory/correction.rs`.)
+
+- **Text search ranks only the lines it collected before its cap.** A reviewer
+  reports that a better-ranked line in an unscanned file can be left out once
+  the 5,000-line cap is hit. That is the contract. The scan reads the newest
+  files first and stops at one shared line budget, which also bounds its
+  memory.
+
+  The response then says `truncated`, and the Text tab asks the reader to
+  refine the query. A true top 5,000 would need a full scan with a bounded heap
+  on every keystroke. Re-flag only if the Text tab stops saying it was cut.
+  (`engine/text_search.rs`, ADR 0383.)
 
 ## Desktop client (Tauri, macOS)
 
@@ -1289,6 +1301,15 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **`refreshChangesState()` never rejects, so awaiting it needs no `try`.** A
+  reviewer reports an unguarded `await` that strands the caller's error path
+  when both fetch attempts fail. But the function's last `.catch` swallows a
+  transport or abort error and turns any other into a `failed` `Loadable` plus
+  a toast. It never rethrows. A caller tells a read that did not land by
+  comparing `changes.value` before and after (`endClaudeCodeAndApply` in
+  `store/actions/chat-claude-code.ts`). Re-flag only if that last `.catch`
+  starts rethrowing.
 
 - **A send's unsent message record is queued, not awaited, before its POST.**
   A reviewer reports that a reload before the IndexedDB write commits loses the
@@ -1440,25 +1461,17 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `styles/section-header.css`, and `styles/__tests__/badge-glyph-centring.test.ts`
   pins each one. Re-flagging needs a site whose box may genuinely shrink.
 
-- **`answerThreadQuestion`'s retry can report `false` for an answer that
-  landed, and that trade is deliberate.** A reviewer sees
-  `mutatingFetchIdempotent` on the answer POST and observes that a transport
-  `TypeError` does not prove the request never left the device. Lose the
-  response alone and the retry meets the documented duplicate 409. The client
-  returns `false`, and the UI toasts a failure for an answer that worked. Codex
-  flagged it as P1 on the branch that added the retry.
+- **An answer's 409 on a retry counts as sent, and that trade is deliberate.**
+  The quiet retries (`withQuietRetries`) re-post an answer whose attempt got no
+  reply. If that attempt did land, the retry meets the documented duplicate 409
+  (`answer_question_idempotent_409_on_duplicate`). `answerThreadQuestion`
+  therefore reads a 409 on any attempt after the first as landed, and raises no
+  toast.
 
-  The trade is the one every sibling mutation already makes. `stopClaudeCode`,
-  `cancelChat`, `ensureThreadStarted`, `deleteThread` and the compose PUT all
-  retry the same way, under the rule `mutatingFetchIdempotent` states: the
-  handler must be safe to observe twice. This one is, and the API e2e
-  `answer_question_idempotent_409_on_duplicate` pins it.
-
-  What the retry buys is the reported failure. Over a stale iOS PWA connection
-  the answer was lost on EVERY tap, and the agent stayed blocked until the user
-  tapped again. What it costs is a rarer mismatch that heals itself: the
-  persisted `UserQuestionAnswered` arrives over SSE a moment later, and
-  `QuestionBody`'s drain effect clears the restored picks.
+  A reviewer may object that the 409 could also mean another device answered
+  first. Either way the question is no longer waiting, and the persisted
+  `UserQuestionAnswered` arrives over SSE a moment later and shows what was
+  recorded. A first-attempt 409 still toasts "no longer waiting".
 
   Re-flag only with a way to tell the two 409s apart that costs no engine-side
   submission id, or with evidence the handler stopped being idempotent.
@@ -2038,8 +2051,6 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   the same holds for the `console.warn`-only handlers in
   `store/actions/native-push.ts`. Re-flag only if `invoke` stops feeding
   `recordIpcOutcome`. (ADR 0028.)
-- **`clearStalePendingMessages` bumps inside its mutation guard** — when the
-  filter removes nothing, nothing was mutated, so no bump is owed.
 - **`appFilters` / `repoFilters` / `triggerFilters` returning `[]` until
   loaded is deliberate** (documented at each site): filter *options* would
   mislabel as "(deleted)" without the registry; this is not Loadable
@@ -3126,7 +3137,31 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   there. Re-flag only with a fine-pointer device that shows an on-screen
   keyboard.
 
+- **An unread Tree backfill state opens the confirm on purpose.** In
+  `MemoryModuleSection.tsx`, `choose('tree')` asks `treeBackfillStarted()`. A
+  reviewer objects that a click before the read lands, or after it fails,
+  shows a returning user the first-time confirm. That is plan
+  invariant I4: unknown reads as never started, because the confirm is the
+  side that never spends money unasked. Re-flag only if skipping the confirm
+  stops costing money, or the read becomes synchronous.
+  (`store/actions/treeBackfill.ts`,
+  `docs/plans/2026-10-07-tree-memory-settings-polish.md`.)
+
 ## Scripts (bash)
+
+- **`scripts/lib/prose_scan.sh` measures sentence LENGTH on colon-split
+  units, not on terminator-split sentences.** A reviewer reads a comment with
+  one colon and a long run of words before the next period. They count it as
+  one sentence against the 25-word cap in `.claude/rules/prose.md`, and flag
+  it. `flush_para()`'s length pass splits on `/[.!?:]+/`, not `/[.!?]+/` (the
+  pass used for the paragraph's sentence COUNT). The reason: a colon stands
+  in for an em dash here (`.claude/rules/em-dashes.md`), so each half of a
+  colon-joined pair is its own measurable unit.
+
+  `./scripts/check-prose.sh` is the deterministic source of truth, and it
+  already ran clean on the cited lines. Re-run it rather than hand-counting
+  the whole sentence. Re-flag only a colon-split half over 25 words, or an
+  actual `check-prose.sh` hit.
 
 - **Several positional test filters after `--` are valid libtest input.** A
   reviewer sees `./scripts/test-engine.sh -- -- runtime::codex::driver_tests
@@ -4445,3 +4480,24 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   row with that shape exists, and the transient `CredentialPromptRequested` left
   none either. Re-flag only with evidence of a real `{ provider }` row.
   (`engine/thread_events/event.rs`, ADR 0275.)
+
+- **The child cap's check-then-spawn is not a race within one parent's
+  response.** A reviewer reads `check_thread_recursion_guard` counting live
+  children and then `thread_queue.submit` as a window two concurrent
+  `run_thread` calls can both pass. They cannot both be in flight from one
+  response: only the read tools in `PARALLEL_SAFE_TOOLS`
+  (`engine/agentic_loop/helpers.rs`) run beside each other, and `run_thread`
+  is not one. Each spawn writes its child row (the eager `MessageReceived` in
+  `prepare`) or its queued `thread_queue` row before the next call counts.
+  Re-flag only if `run_thread` joins that list, or one parent can run two
+  responses at once. (`engine/chat/recursion_guard.rs`, ADR 0380.)
+
+- **A set-aside change has no `thread_unsettled` to honour.** A reviewer reads
+  the Changes panel's set-aside row, or the thread banner's Discard, gating on
+  the client's `threadUnsettled(thread)` and asks for the change-level
+  `thread_unsettled` flag instead. That flag lives in `PendingThreadState`,
+  inside `ChangeState::Pending`, and `enrich_pending_state` fills it for
+  pending changes only. A `ChangeState::SetAside` change serializes without
+  it, so on a set-aside change it always reads absent. Re-flag only if the
+  engine starts sending thread state on set-aside changes.
+  (`core/changes.rs`, `store/store.ts`.)

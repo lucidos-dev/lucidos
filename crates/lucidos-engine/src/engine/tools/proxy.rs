@@ -17,9 +17,11 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 
 impl LucidosEngine {
+    /// `thread_id` anchors the cost row of a model call the proxy forwards.
     pub(crate) async fn execute_proxy_tool(
         &self,
         args: &serde_json::Value,
+        thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let name = match args.get("name").and_then(|v| v.as_str()) {
             Some(n) if !n.is_empty() => n,
@@ -72,6 +74,7 @@ impl LucidosEngine {
             None,
             headers,
             body,
+            Some(thread_id),
         )
         .await
         {

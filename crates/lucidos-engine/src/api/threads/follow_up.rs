@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use crate::api::error::ApiError;
 use crate::api::AppState;
-use crate::engine::{ChildFollowUpError, FollowUpAck, FollowUpDelivery};
+use crate::engine::{ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpReach};
 
 /// Body of a follow-up request.
 ///
@@ -70,6 +70,9 @@ pub(in crate::api) struct FollowUpRequest {
 #[derive(Debug, Serialize)]
 pub(in crate::api) struct FollowUpResponse {
     child_thread_id: Uuid,
+    /// `own-child` | `home`. Only an own child's outcome comes back as a card.
+    /// `home` is the home thread reaching a thread that is not its child.
+    reach: FollowUpReach,
     /// The child's human-meaningful handle. Callers name the child by this and
     /// never by uuid: no screen in Lucidos is labelled with a uuid.
     child_title: String,
@@ -99,6 +102,7 @@ impl From<FollowUpAck> for FollowUpResponse {
     fn from(ack: FollowUpAck) -> Self {
         Self {
             child_thread_id: ack.child_thread_id,
+            reach: ack.reach,
             child_title: ack.child_title,
             delivered_to: delivered_to_wire(ack.delivered_to),
             detail: ack.delivered_to.describe(),

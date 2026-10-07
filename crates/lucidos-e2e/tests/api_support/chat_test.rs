@@ -89,24 +89,31 @@ async fn chat_empty_message_is_rejected() {
     let client = user_client().await;
     let url = format!("{}/api/v1/chat/stream", base_url());
 
-    let body = serde_json::json!({
-        "message": "",
-        "mode": "human",
-    });
+    // A create with nothing to say is refused before any thread exists, for a
+    // human send and for a spawn (`lucidos spawn-thread --to`) alike. A stored
+    // image whose blob is missing is dropped, so it is not something to say.
+    let missing_blob = "0".repeat(64);
+    for body in [
+        serde_json::json!({ "message": "", "mode": "human" }),
+        serde_json::json!({ "message": "  \n", "mode": "agent", "caller_workspace": "elsewhere" }),
+        serde_json::json!({ "message": "", "mode": "human", "image_hashes": [missing_blob] }),
+    ] {
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .expect("Request failed");
 
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .expect("Request failed");
-
-    // Empty message should be rejected (400) or handled gracefully (not 500)
-    let status = resp.status().as_u16();
-    assert!(
-        status == 400 || status == 200,
-        "Empty message should return 400 or 200, got {status}"
-    );
+        assert_eq!(resp.status().as_u16(), 400, "body: {body}");
+        let err: serde_json::Value = resp.json().await.expect("standard error body");
+        assert!(
+            err["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("no thread was created")),
+            "says nothing was created: {err}"
+        );
+    }
 }
 
 /// Refactor regression: POST /api/v1/chat/stream used to hardcode parent_thread_id=NULL
@@ -429,8 +436,15 @@ async fn chat_stream_accepts_large_image_payload() {
     let client = user_client().await;
     let url = format!("{}/api/v1/chat/stream", base_url());
 
-    // 5 MiB of base64 — well above axum's 2 MiB default, well below our 100 MiB cap.
-    let large_base64 = "A".repeat(5 * 1024 * 1024);
+    // About 5 MiB of base64: above axum's 2 MiB default, below our 100 MiB cap.
+    // The bytes open with the PNG signature, since the server sniffs every
+    // inline image and refuses anything that is not one with a 415.
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.resize(4 * 1024 * 1024, 0);
+    let large_base64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&png)
+    };
     let body = serde_json::json!({
         "message": "ignore — body limit regression test",
         "mode": "human",

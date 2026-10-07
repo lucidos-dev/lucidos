@@ -154,7 +154,7 @@ impl LucidosEngine {
         // `Trigger` channel to gate `IrreversibleDanger` commands.
         trigger_side_effect_grant: &[crate::engine::command_guard::SideEffectCategory],
         // This turn's resolved per-turn tool-call cap (the `max_tool_calls`
-        // preference, defaulting to `DEFAULT_MAX_TOOL_CALLS`). Passed in rather
+        // preference, defaulting to its catalog default). Passed in rather
         // than read here so the caller reads it ONCE and hands the same number
         // to the system-prompt builder: the prompt states this cap to the model,
         // and a prompt that names a different number than the loop enforces is
@@ -190,15 +190,13 @@ impl LucidosEngine {
         // (no DB cost on the common off path). `command_guard_ctx` carries the
         // per-response judge-verdict cache so a re-emitted identical command
         // doesn't re-pay the LLM call.
-        let command_guard_enabled = crate::core::PreferenceStore::command_guard(&self.pool).await?;
-        let (command_guard_judge_enabled, command_judge_model) = if command_guard_enabled {
-            (
-                crate::core::PreferenceStore::command_guard_judge(&self.pool).await?,
-                crate::core::PreferenceStore::command_judge_model(&self.pool).await,
-            )
-        } else {
-            (false, String::new())
-        };
+        let command_guard_enabled = crate::core::prefs::COMMAND_GUARD
+            .try_read(&self.pool)
+            .await?;
+        let command_guard_judge_enabled = command_guard_enabled
+            && crate::core::prefs::COMMAND_GUARD_JUDGE
+                .try_read(&self.pool)
+                .await?;
         let mut command_guard_judge_cache: std::collections::HashMap<
             String,
             crate::engine::command_guard::JudgedClassification,
@@ -403,8 +401,19 @@ impl LucidosEngine {
             if tools.mcp_generation() != self.mcp_manager.tool_surface_generation() {
                 let before = tools.defs().len();
                 let before_servers = tools.mcp_server_ids();
-                tools.refresh_mcp(self.mcp_manager.tool_surface().await);
-                mcp_correction = mcp_surface_correction(&before_servers, &tools.mcp_server_ids());
+                let before_notice = tools.mcp_dropped_notice().map(str::to_owned);
+                tools.refresh_mcp(
+                    self.mcp_manager
+                        .tool_surface(tools.mcp_char_ceiling())
+                        .await,
+                );
+                mcp_correction = [
+                    mcp_surface_correction(&before_servers, &tools.mcp_server_ids()),
+                    mcp_dropped_correction(before_notice.as_deref(), tools.mcp_dropped_notice()),
+                ]
+                .into_iter()
+                .flatten()
+                .reduce(|servers, dropped| format!("{servers}\n{dropped}"));
                 // The schemas and the messages share one window, so a bigger
                 // array has to leave the trimmer less room. Recomputed from
                 // the fixed total rather than nudged, so it cannot drift.
@@ -727,6 +736,28 @@ impl LucidosEngine {
 
             let call_tools = tools.defs().to_vec();
 
+            // Read per round, never per turn: a question card can hold this
+            // turn open for hours, and the user may flip the switch meanwhile.
+            let capture_body = match crate::core::prefs::CAPTURE_CONTEXT
+                .try_read(&self.pool)
+                .await
+            {
+                Ok(on) => on,
+                Err(e) => {
+                    ensure_failure_terminator_emitted(
+                        &self.event_bus,
+                        &self.pool,
+                        thread_id,
+                        origin_id,
+                        response_channel,
+                        &e.to_string(),
+                    )
+                    .await;
+                    *terminator_settled = true;
+                    return Err(e.into());
+                }
+            };
+
             // Race LLM call against cancel token so stop button works immediately.
             // Scoped for the prompt-cache probe, which reads the correlation off
             // the task rather than through the provider trait (see
@@ -737,7 +768,10 @@ impl LucidosEngine {
                     turn_id: origin_id,
                     round: rounds,
                 },
-                provider.chat(
+                crate::engine::model_call::turn_chat(
+                    &self.event_bus,
+                    thread_id,
+                    provider.as_ref(),
                     messages.clone(),
                     call_tools,
                     selection,
@@ -747,10 +781,10 @@ impl LucidosEngine {
             );
             let cancel_future = cancel_token.cancelled();
 
-            let response = tokio::select! {
+            let (response, turn_capture) = tokio::select! {
                 result = llm_future => {
                     match result {
-                        Ok(r) => r,
+                        Ok(answered) => answered,
                         Err(e) => {
                             self.event_bus.emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
@@ -866,12 +900,7 @@ impl LucidosEngine {
             // The body it fills is what the loop actually sent: assistant text
             // plus tool I/O. The section also reports the array's real size,
             // which the delta above deliberately does not.
-            let conversation = conversation_section(
-                messages,
-                bundled_total,
-                context_chars,
-                capture_seed.capture_body,
-            );
+            let conversation = conversation_section(messages, bundled_total, context_chars);
             // Tool schemas are part of every request and the trim budget already
             // subtracts them, so the reported total must include them too —
             // otherwise the Context Viewer under-reports what was actually sent.
@@ -891,22 +920,12 @@ impl LucidosEngine {
                 role: crate::engine::ContextRole::System,
                 group: None,
             };
-            let iter_sections: Vec<_> = capture_sections
-                .iter()
-                .cloned()
-                .chain(std::iter::once(tool_definitions))
-                .chain(std::iter::once(conversation))
-                .collect();
-            let usage = response
-                .input_tokens
-                .map(|input_tokens| crate::engine::ApiUsage {
-                    input_tokens,
-                    output_tokens: response.output_tokens.unwrap_or(0),
-                    cache_read_tokens: response.cache_read_tokens.unwrap_or(0),
-                    cache_creation_tokens: response.cache_creation_tokens.unwrap_or(0),
-                    // Chat providers report one blended total per direction.
-                    modality: None,
-                });
+            let iter_sections = round_capture_sections(
+                &capture_sections,
+                [tool_definitions, conversation],
+                capture_body,
+            );
+            let usage = turn_capture.usage();
             // Calibration breadcrumb for the chars/token ratio baked into
             // `estimate_tokens_from_chars`. This line is what retuned it from
             // 1.5 to the measured 2.5: 12,069 captures gave p01 2.28, p50 2.60,
@@ -1038,27 +1057,26 @@ impl LucidosEngine {
                     .emit_or_log(summary, "[AgenticLoop] ThoughtStreamed (held-back round)")
                     .await;
             }
-            self.event_bus
-                .emit_or_log(
-                    crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ContextCaptured {
-                            producer: crate::engine::ContextProducer::MainLlm,
-                            model: capture_seed.model.to_string(),
-                            context_window: capture_window,
-                            sections: iter_sections,
-                            tools: tools.names().to_vec(),
-                            estimated_total_tokens,
-                            usage,
-                            trimmed,
-                            trim_passes: trim_passes.clone(),
-                            purpose: crate::engine::ContextPurpose::Turn,
-                            reconstructed: false,
-                        },
-                        meta: meta.clone(),
-                    },
-                    "[AgenticLoop] ContextCaptured",
-                )
+            turn_capture
+                .finish(meta.clone(), |usage| {
+                    crate::engine::thread_events::ThreadEvent::ContextCaptured {
+                        producer: crate::engine::ContextProducer::MainLlm,
+                        model: capture_seed.model.to_string(),
+                        context_window: capture_window,
+                        sections: iter_sections,
+                        tools: tools.names().to_vec(),
+                        estimated_total_tokens,
+                        usage,
+                        trimmed,
+                        trim_passes: trim_passes.clone(),
+                        purpose: crate::engine::ContextPurpose::Turn,
+                        reconstructed: false,
+                        parent_tool_use_id: None,
+                        api_call_id: None,
+                        reasoning_effort: None,
+                        duration_ms: None,
+                    }
+                })
                 .await;
 
             // Post-response repair (argument text): the model sometimes
@@ -1310,8 +1328,7 @@ impl LucidosEngine {
 
                 // Force a re-ask: the previous iteration's `ask_user_question`
                 // call errored (typically the model dropped the required
-                // `question` field and put the text in the optional `header`
-                // chip), and the model has now returned a prose answer instead
+                // `question` field), and the model has now returned a prose answer instead
                 // of re-calling the tool — collapsing the clickable question
                 // card into a typed-reply menu the user can't tap. The schema
                 // marks `question` required and the runtime check already
@@ -1431,6 +1448,7 @@ impl LucidosEngine {
                         draft_in_history = true;
                     }
                     let appended = append_injected_prompts_to_messages(
+                        self.workspace_path(),
                         &self.event_bus,
                         thread_id,
                         &meta,
@@ -2052,6 +2070,7 @@ impl LucidosEngine {
                             .arguments
                             .get("questions")
                             .unwrap_or(&serde_json::Value::Null),
+                        crate::engine::agent_question::card_message(&tool_call.arguments),
                         Some(round),
                     )
                     .await
@@ -2140,7 +2159,6 @@ impl LucidosEngine {
                 let mut command_guard_ctx = crate::engine::command_permission::CommandGuardCtx {
                     enabled: command_guard_enabled,
                     judge_enabled: command_guard_judge_enabled,
-                    judge_model: &command_judge_model,
                     judge_cache: &mut command_guard_judge_cache,
                     trigger_grant: trigger_side_effect_grant,
                 };
@@ -2650,6 +2668,7 @@ impl LucidosEngine {
                 let injected_prompts =
                     filter_removed_queued_prompts(&self.pool, thread_id, injected_prompts).await;
                 let appended = append_injected_prompts_to_messages(
+                    self.workspace_path(),
                     &self.event_bus,
                     thread_id,
                     &meta,

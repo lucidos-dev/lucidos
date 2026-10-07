@@ -83,6 +83,23 @@ pub fn is_build_output_path(data_relative: &str) -> bool {
 pub fn list_searchable_data_files(
     workspace_path: &Path,
 ) -> Result<Vec<(String, PathBuf)>, std::io::Error> {
+    walk_data_files(workspace_path, false)
+}
+
+/// [`list_searchable_data_files`] without build output, the same set as
+/// filtering it by [`is_build_output_path`]. Vendored directories are pruned
+/// during the walk rather than filtered after it, since they often hold most
+/// of a workspace's files.
+pub fn list_user_data_files(
+    workspace_path: &Path,
+) -> Result<Vec<(String, PathBuf)>, std::io::Error> {
+    walk_data_files(workspace_path, true)
+}
+
+fn walk_data_files(
+    workspace_path: &Path,
+    skip_build_output: bool,
+) -> Result<Vec<(String, PathBuf)>, std::io::Error> {
     let data_path = workspace_path.join("data");
     let mut out = Vec::new();
     if !data_path.exists() {
@@ -92,15 +109,20 @@ pub fn list_searchable_data_files(
         dir: &Path,
         base: &Path,
         prefix: &str,
+        skip_build_output: bool,
         out: &mut Vec<(String, PathBuf)>,
     ) -> Result<(), std::io::Error> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let ft = entry.file_type()?;
             let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
             if ft.is_dir() {
-                walk(&path, base, prefix, out)?;
-            } else if ft.is_file() {
+                if !(skip_build_output && VENDORED_DIR_NAMES.contains(&name.as_ref())) {
+                    walk(&path, base, prefix, skip_build_output, out)?;
+                }
+            } else if ft.is_file() && !(skip_build_output && is_build_output_file(&name)) {
                 if let Ok(rel) = path.strip_prefix(base) {
                     out.push((format!("{}/{}", prefix, rel.to_string_lossy()), path));
                 }
@@ -112,7 +134,7 @@ pub fn list_searchable_data_files(
     for sub in BROWSEABLE_DATA_SUBDIRS {
         let dir = data_path.join(sub);
         if dir.exists() {
-            walk(&dir, &dir, sub, &mut out)?;
+            walk(&dir, &dir, sub, skip_build_output, &mut out)?;
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -148,7 +170,11 @@ pub enum WriteAnnouncement {
     /// The default. `ArtifactCreated` or `ArtifactUpdated`, decided from whether
     /// the file existed before this write. `source` labels who wrote it
     /// (`"http_request"`, `"run_python"`, …) or `None` for a plain write.
-    Entity { source: Option<String> },
+    /// `writer_thread_id` is the thread whose turn wrote it, when one did.
+    Entity {
+        source: Option<String>,
+        writer_thread_id: Option<uuid::Uuid>,
+    },
     /// The caller emits a RICHER event that stands in for the entity event on
     /// this write, and the entity event must be suppressed rather than added.
     ///
@@ -281,7 +307,11 @@ impl ArtifactManager {
         let existed = self.artifact_exists(relative_path);
         self.write_artifact(relative_path, content)?;
         let commit_sha = self.commit(relative_path, message).await?;
-        if let WriteAnnouncement::Entity { source } = announcement {
+        if let WriteAnnouncement::Entity {
+            source,
+            writer_thread_id,
+        } = announcement
+        {
             event_bus
                 .emit_or_log(
                     BusEvent::System(SystemEvent::artifact_change(
@@ -289,6 +319,7 @@ impl ArtifactManager {
                         relative_path.to_string(),
                         commit_sha.clone(),
                         source,
+                        writer_thread_id,
                     )),
                     "[Artifacts] artifact write",
                 )
@@ -822,6 +853,45 @@ mod tests {
     }
 
     #[test]
+    fn the_user_walk_is_the_full_walk_without_build_output() {
+        let dir = tempdir().unwrap();
+        for rel in [
+            "artifacts/notes.md",
+            "artifacts/build/report.md",
+            "apps/demo/index.html",
+            "apps/demo/node_modules/pkg/index.js",
+            "apps/demo/web/dist/bundle.js",
+            "apps/demo/scripts/tool.py",
+            "apps/demo/scripts/tool.cpython-312.pyc",
+            "knowhow/out",
+            "triggers/t/trigger.json",
+            "config/apis.json",
+        ] {
+            let path = dir.path().join("data").join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "x").unwrap();
+        }
+        let filtered: Vec<_> = list_searchable_data_files(dir.path())
+            .unwrap()
+            .into_iter()
+            .filter(|(rel, _)| !is_build_output_path(rel))
+            .collect();
+        let pruned = list_user_data_files(dir.path()).unwrap();
+        assert_eq!(pruned, filtered);
+        let paths: Vec<_> = pruned.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "apps/demo/index.html",
+                "apps/demo/scripts/tool.py",
+                "artifacts/notes.md",
+                "knowhow/out",
+                "triggers/t/trigger.json",
+            ]
+        );
+    }
+
+    #[test]
     fn test_write_and_read_artifact() {
         let dir = tempdir().unwrap();
         let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
@@ -938,7 +1008,10 @@ mod tests {
                 "notes.md",
                 "one",
                 "Write notes",
-                WriteAnnouncement::Entity { source: None },
+                WriteAnnouncement::Entity {
+                    source: None,
+                    writer_thread_id: None,
+                },
             )
             .await
             .unwrap();
@@ -950,6 +1023,7 @@ mod tests {
                 "Rewrite notes",
                 WriteAnnouncement::Entity {
                     source: Some("run_python".to_string()),
+                    writer_thread_id: None,
                 },
             )
             .await

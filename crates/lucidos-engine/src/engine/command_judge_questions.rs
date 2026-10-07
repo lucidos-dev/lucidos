@@ -1,12 +1,13 @@
 //! The command guard's classification as two typed Choice questions.
 //!
-//! The Jev half of [`super::command_judge`]. Two things move out of the prompt
-//! and into code here, and both are the point of the exercise.
+//! What [`super::command_judge`] asks every judgment provider. Two things live
+//! in code here rather than in a prompt, and both are the point.
 //!
 //! **The tie-break is a threshold.** ADR 0002 says pick the danger lane when
-//! unsure, and pick irreversible when unsure between the danger lanes. The
-//! rubric prompt states that as an instruction a model may or may not follow.
-//! Given a distribution, [`read`] applies it in Rust, and a test pins it.
+//! unsure, and pick irreversible when unsure between the danger lanes. Given a
+//! distribution, [`read`] applies that in Rust, and a test pins it. A chat
+//! model's distribution is less calibrated than a System One model's. So the
+//! rule stays here and not in its instructions (ADR 0363).
 //!
 //! **The category rides along speculatively.** It only matters for the
 //! irreversible lane. Asking it in the same request costs one round trip
@@ -18,7 +19,7 @@
 use serde_json::{json, Value};
 
 use super::command_guard::{JudgeInput, RiskLane, SideEffectCategory};
-use super::command_judge::{parse_category, JudgeVerdict};
+use super::command_judge::JudgeVerdict;
 use crate::llm::judgment::{Answers, ChoiceAnswer, Question};
 use crate::llm::tool_names as tn;
 
@@ -55,10 +56,10 @@ pub(crate) const REVERSIBLE_MIN_PROBABILITY: f64 = 0.7;
 /// than three do. A majority on one category is the bar.
 pub(crate) const CATEGORY_MIN_PROBABILITY: f64 = 0.5;
 
-/// What the model reads, with the command redacted as the chat path redacts it.
+/// What the model reads, with the command redacted.
 ///
 /// **The redaction is not optional and not a detail.** This text leaves the
-/// machine for a third party, and a `run_bash` body routinely carries a
+/// machine for the judge's provider, and a `run_bash` body routinely carries a
 /// database URL. A password is not a risk signal, so nothing about the verdict
 /// depends on keeping it.
 pub(crate) fn state(input: &JudgeInput) -> Value {
@@ -186,6 +187,18 @@ pub(crate) fn read_lane(answer: &ChoiceAnswer) -> RiskLane {
     }
 }
 
+/// The category an option name stands for. Every name [`questions`] offers
+/// maps to its own variant, and anything else is `Other`.
+fn parse_category(option: &str) -> SideEffectCategory {
+    match option {
+        "email" => SideEffectCategory::Email,
+        "external_api" => SideEffectCategory::ExternalApi,
+        "cloud_cli" => SideEffectCategory::CloudCli,
+        "out_of_workspace_destruction" => SideEffectCategory::OutOfWorkspaceDestruction,
+        _ => SideEffectCategory::Other,
+    }
+}
+
 /// The side-effect category, or `Other` when the answer did not settle on one.
 ///
 /// Reads the chosen option's own probability against
@@ -201,8 +214,7 @@ pub(crate) fn read_category(answer: &ChoiceAnswer) -> SideEffectCategory {
 
 /// Turn the answers into a verdict.
 ///
-/// A missing lane answer is [`JudgeVerdict::uncertain`], the same *ask* the
-/// chat path produces for a response it cannot read.
+/// A missing lane answer is [`JudgeVerdict::uncertain`]: *ask* (I13).
 pub(crate) fn read(answers: &Answers) -> JudgeVerdict {
     let Some(lane_answer) = answers.choice(LANE) else {
         return JudgeVerdict::uncertain();
@@ -222,10 +234,10 @@ pub(crate) fn read(answers: &Answers) -> JudgeVerdict {
     }
 }
 
-/// The card sentence, derived in code because Jev writes no prose.
+/// The card sentence, derived in code because a judgment carries no prose.
 ///
-/// The chat path keeps the model's own sentence. This one is built from the
-/// lane and the category, so the same command always reads the same way.
+/// Built from the lane and the category, so the same command always reads the
+/// same way on every provider.
 fn summary(lane: RiskLane, category: Option<SideEffectCategory>) -> String {
     match lane {
         RiskLane::Safe => "Runs a command with no irreversible side-effect.".to_string(),
@@ -245,7 +257,7 @@ fn summary(lane: RiskLane, category: Option<SideEffectCategory>) -> String {
 /// says how close the verdict was to the other lanes.
 fn distribution(answer: &ChoiceAnswer) -> String {
     format!(
-        "jev: safe {:.2}, reversible {:.2}, irreversible {:.2} (confidence {:.2})",
+        "safe {:.2}, reversible {:.2}, irreversible {:.2} (confidence {:.2})",
         answer.probability(SAFE),
         answer.probability(REVERSIBLE),
         answer.probability(IRREVERSIBLE),

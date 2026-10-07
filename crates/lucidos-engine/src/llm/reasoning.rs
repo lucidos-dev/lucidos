@@ -33,7 +33,11 @@
 //!   `xhigh` and `max` onto the same `"high"` level, so offering the top two
 //!   would show tiers that send an identical request.
 //! - **OpenAI**: GPT-5.6 (Sol / Terra / Luna) and GPT-6 Astra accept a distinct
-//!   `max`; earlier families top out at `xhigh`.
+//!   `max`; earlier families top out at `xhigh`. GPT-6.1 Sol accepts `low`
+//!   through `max`, with no `none`.
+//! - **Models that always reason** ([`always_reasons`]): GPT-6.1 Sol and Gemini
+//!   3.8 Flash have no `none` on any route. Vertex answers 400 to Gemini 3.8
+//!   Flash's `minimal`, and OpenAI documents no `none` for GPT-6.1 Sol.
 //! - **OpenRouter / xAI / Local**: a server other than OpenAI's sits behind
 //!   these, so only the tiers universal to the OpenAI-compatible wire format
 //!   are offered. `xhigh` is OpenAI-proprietary and is never sent. xAI accepts
@@ -62,8 +66,8 @@ pub const EFFORT_LADDER: &[&str] = &["none", "low", "medium", "high", "xhigh", "
 
 /// Claude on the adaptive-thinking path, and GPT-5.6: every tier is distinct.
 const ALL_TIERS: &[&str] = EFFORT_LADDER;
-/// Claude models that always think (Opus 5.5, Fable 5.x): `none` is not a tier
-/// they have, so a stored `none` snaps to `low`.
+/// Claude models that always think (Opus 5.5, Fable 5.x), and GPT-6.1 Sol on
+/// OpenAI: `none` is not a tier they have, so a stored `none` snaps to `low`.
 const LOW_THROUGH_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// Claude on the `budget_tokens` path: `xhigh` is deliberately not offered.
 const NO_XHIGH: &[&str] = &["none", "low", "medium", "high", "max"];
@@ -72,8 +76,8 @@ const THROUGH_XHIGH: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 /// Gemini, OpenRouter, xAI and local servers: nothing above `high` is distinct
 /// (Gemini) or universally accepted (the OpenAI-compatible third parties).
 const THROUGH_HIGH: &[&str] = &["none", "low", "medium", "high"];
-/// An always-thinking Claude model behind OpenRouter: its conservative set,
-/// less the `none` the model cannot honour.
+/// An always-thinking model behind OpenRouter, or Gemini 3.8 Flash on Vertex:
+/// the conservative set, less the `none` the model cannot honour.
 const LOW_THROUGH_HIGH: &[&str] = &["low", "medium", "high"];
 /// Ox Alpha on the keyless free tier: the only three levels it accepts. It
 /// always reasons, so `none` is a 400 rather than a way to switch thinking off.
@@ -91,6 +95,17 @@ const OX_ALPHA_FREE: &str = "x-preview-f-free";
 /// stays a per-family fact, never a guess from the id's shape.
 const GPT_6_ASTRA: &str = "gpt-6-astra";
 
+/// Models with no way to switch reasoning off, by their first-party id. An
+/// OpenRouter id carries a vendor prefix (`openai/gpt-6.1-sol`), which
+/// [`always_reasons`] strips.
+const ALWAYS_REASONING: &[&str] = &["gpt-6.1-sol", "gemini-3.8-flash"];
+
+/// Whether `model` rejects every request that asks for no reasoning.
+pub(crate) fn always_reasons(model: &str) -> bool {
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    ALWAYS_REASONING.contains(&bare)
+}
+
 /// The tiers `model` supports when served by `provider`.
 ///
 /// The Vertex arm asks [`VertexProvider::is_claude_model`] rather than
@@ -102,12 +117,16 @@ pub fn supported_efforts(provider: ProviderKind, model: &str) -> &'static [&'sta
         ProviderKind::Vertex => {
             if VertexProvider::is_claude_model(model) {
                 claude_tiers(model)
+            } else if always_reasons(model) {
+                LOW_THROUGH_HIGH
             } else {
                 THROUGH_HIGH
             }
         }
         ProviderKind::OpenAi => {
-            if model.starts_with("gpt-5.6") || model == GPT_6_ASTRA {
+            if always_reasons(model) {
+                LOW_THROUGH_MAX
+            } else if model.starts_with("gpt-5.6") || model == GPT_6_ASTRA {
                 ALL_TIERS
             } else {
                 THROUGH_XHIGH
@@ -122,7 +141,9 @@ pub fn supported_efforts(provider: ProviderKind, model: &str) -> &'static [&'sta
         }
         // OpenRouter can front Claude under its own id (`anthropic/claude-opus-5-5`),
         // which the substring match in `thinking_mode` still recognises.
-        ProviderKind::OpenRouter if thinking_mode(model) == Some(ThinkingMode::AlwaysOn) => {
+        ProviderKind::OpenRouter
+            if thinking_mode(model) == Some(ThinkingMode::AlwaysOn) || always_reasons(model) =>
+        {
             LOW_THROUGH_HIGH
         }
         ProviderKind::OpenRouter | ProviderKind::XAi | ProviderKind::Local => THROUGH_HIGH,
@@ -238,12 +259,19 @@ mod tests {
                 "{adaptive} is adaptive and should offer every tier"
             );
         }
-        for budget in ["claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-5"] {
-            assert_eq!(
-                supported_efforts(ProviderKind::Vertex, budget),
-                NO_XHIGH,
-                "{budget} is on the budget path"
-            );
+        for budget in [
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+        ] {
+            for provider in [ProviderKind::Vertex, ProviderKind::Anthropic] {
+                assert_eq!(
+                    supported_efforts(provider, budget),
+                    NO_XHIGH,
+                    "{budget} is on the budget path"
+                );
+            }
         }
         // Fable is served by the direct Anthropic provider, and always thinks.
         // Every generation of it, since the adaptive gate matches the family.
@@ -289,6 +317,39 @@ mod tests {
             assert_eq!(
                 supported_efforts(ProviderKind::Vertex, gemini),
                 THROUGH_HIGH
+            );
+        }
+    }
+
+    /// Gemini 3.8 Flash and GPT-6.1 Sol reject a request for no reasoning, so
+    /// no route offers `none`, and a stored `none` is sent as `low`. Before,
+    /// both inherited a family set that offered `none`, and the request failed.
+    #[test]
+    fn a_model_that_always_reasons_is_never_offered_none() {
+        let routes = [
+            (ProviderKind::Vertex, "gemini-3.8-flash", LOW_THROUGH_HIGH),
+            (
+                ProviderKind::OpenRouter,
+                "google/gemini-3.8-flash",
+                LOW_THROUGH_HIGH,
+            ),
+            (ProviderKind::OpenAi, "gpt-6.1-sol", LOW_THROUGH_MAX),
+            (
+                ProviderKind::OpenRouter,
+                "openai/gpt-6.1-sol",
+                LOW_THROUGH_HIGH,
+            ),
+        ];
+        for (provider, model, tiers) in routes {
+            assert_eq!(
+                supported_efforts(provider, model),
+                tiers,
+                "{model} on {provider:?}"
+            );
+            assert_eq!(
+                clamp_effort("none", provider, model),
+                Some("low"),
+                "{model} on {provider:?}"
             );
         }
     }

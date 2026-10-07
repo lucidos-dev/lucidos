@@ -38,6 +38,7 @@ pub(super) fn text_search_sql() -> String {
         "btrim(regexp_replace(COALESCE(s.title, s.first_message, ''), '\\s+', ' ', 'g'))";
     // Joins `best_scores b` against `thread_summaries s`, so the alias is `s`.
     let thread_cols_prefixed = thread_cols("s");
+    let home_visible = home_visible_sql("s");
 
     // Message text: the long tokens find candidate threads through the trigram
     // index. The short tokens are then checked only on those threads' messages.
@@ -92,9 +93,19 @@ pub(super) fn text_search_sql() -> String {
         ) \
         SELECT {thread_cols_prefixed}, b.score \
         FROM best_scores b JOIN thread_summaries s ON s.thread_id = b.thread_id \
+        WHERE {home_visible} \
         ORDER BY {shown_title} ILIKE $5 DESC, {shown_title} ILIKE $4 DESC, \
                  b.score DESC, s.last_activity DESC LIMIT $2",
     )
+}
+
+/// One message event a text search matched.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MessageMatch {
+    pub event_id: uuid::Uuid,
+    pub thread_id: uuid::Uuid,
+    pub created: chrono::DateTime<chrono::Utc>,
+    pub text: String,
 }
 
 impl EventStore {
@@ -161,6 +172,52 @@ impl EventStore {
             .collect()
     }
 
+    /// The newest message events holding every token of `query`, case
+    /// insensitive. The long tokens go through the trigram index; the short
+    /// ones are checked on the rows it finds. A query with no token of 3
+    /// characters is refused, since no index could serve it.
+    pub async fn search_message_events(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<MessageMatch>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut distinct: Vec<&str> = Vec::new();
+        for token in query.split_whitespace() {
+            if !distinct.contains(&token) {
+                distinct.push(token);
+            }
+        }
+        let (long, short): (Vec<&str>, Vec<&str>) = distinct.iter().partition(|t| is_indexable(t));
+        if long.is_empty() {
+            return Err(format!(
+                "search needs a word of {MIN_INDEXED_TOKEN_CHARS} or more letters"
+            )
+            .into());
+        }
+        let long_patterns: Vec<String> = long.iter().map(|t| contains_pattern(t)).collect();
+        let short_patterns: Vec<String> = short.iter().map(|t| contains_pattern(t)).collect();
+        // A hidden home thread stays out, as it does from thread search.
+        let home_visible = home_visible_sql("h");
+        let sql = format!(
+            "SELECT e.id AS event_id, e.thread_id, e.created, {MESSAGE_TEXT} AS text \
+             FROM events e CROSS JOIN unnest($1::text[]) AS t(pattern) \
+             WHERE {IS_MESSAGE} AND {MESSAGE_TEXT} ILIKE t.pattern \
+               AND NOT EXISTS (SELECT 1 FROM thread_summaries h \
+                               WHERE h.thread_id = e.thread_id AND NOT {home_visible}) \
+               AND NOT EXISTS (SELECT 1 FROM unnest($3::text[]) AS s(pattern) \
+                               WHERE {MESSAGE_TEXT} NOT ILIKE s.pattern) \
+             GROUP BY e.id \
+             HAVING COUNT(DISTINCT t.pattern) = cardinality($1::text[]) \
+             ORDER BY e.created DESC LIMIT $2"
+        );
+        Ok(sqlx::query_as::<_, MessageMatch>(&sql)
+            .bind(&long_patterns)
+            .bind(limit)
+            .bind(&short_patterns)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     /// Search threads semantically using memory_entries vector search.
     /// Accepts event IDs paired with their similarity scores.
     pub async fn search_threads_by_memory(
@@ -220,8 +277,9 @@ impl EventStore {
         // happen to return it. `thread_uuids` is already bounded by the
         // caller's SEMANTIC_CANDIDATE_LIMIT.
         let sql = format!(
-            "SELECT {} FROM thread_summaries t WHERE t.thread_id = ANY($1::uuid[])",
+            "SELECT {} FROM thread_summaries t WHERE t.thread_id = ANY($1::uuid[]) AND {}",
             THREAD_COLS.as_str(),
+            home_visible_sql("t"),
         );
         let rows = sqlx::query_as::<_, ThreadRow>(&sql)
             .bind(&thread_uuids)

@@ -14,14 +14,17 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
+import { signal } from '@preact/signals';
 import { act } from 'preact/test-utils';
 import { ThreadFilterCover } from '../ThreadFilterCover';
+import type { LeavingDrawing } from '../LeavingViewDrawing';
 import { threadFilterPanelOpen, openThreadFilterPanel, closeThreadFilterPanel } from '../../../store/threadFilterPanel';
 import { overlayStack } from '../../../store/overlayStack';
 import { filterButtonState } from '../../layout/ThreadFilterPanel';
 
 describe('the filter panel swaps under a navigation cover, and the signal leads', () => {
   let host: HTMLElement;
+  const leaving = signal<LeavingDrawing | null>(null);
   const cover = () => host.querySelector('.thread-filter-cover') as HTMLElement;
   const panel = () => host.querySelector('.thread-filter-panel');
   const navCover = () => host.querySelector('.nav-cover');
@@ -34,7 +37,7 @@ describe('the filter panel swaps under a navigation cover, and the signal leads'
     closeThreadFilterPanel();
     host = document.createElement('div');
     document.body.appendChild(host);
-    act(() => { render(<ThreadFilterCover paneVisible />, host); });
+    act(() => { render(<ThreadFilterCover paneVisible leaving={leaving} />, host); });
   });
 
   afterEach(() => {
@@ -112,7 +115,7 @@ describe('the filter panel swaps under a navigation cover, and the signal leads'
 
   it('stays open but inert on a collapsed drawer, so its controls take no focus', () => {
     act(() => { openThreadFilterPanel(); });
-    act(() => { render(<ThreadFilterCover paneVisible={false} />, host); });
+    act(() => { render(<ThreadFilterCover paneVisible={false} leaving={leaving} />, host); });
     expect(cover().hasAttribute('data-open')).toBe(true);
     expect(cover().hasAttribute('inert')).toBe(true);
   });

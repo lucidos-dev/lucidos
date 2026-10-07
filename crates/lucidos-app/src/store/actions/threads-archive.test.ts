@@ -34,7 +34,7 @@ import { putComposeOnThread } from '../../api/client';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { _resetComposeDraftsForTesting, draftPresentThreadIds, getDraft } from '../composeDrafts';
-import { ALL_CHANNELS, archivingThreadIds, confirmState, drawerView, focusedThreadId, generatedTitleIds, getThreadDisplaySection, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
+import { ALL_CHANNELS, archivingThreadIds, confirmState, setDrawerView, focusedThreadId, generatedTitleIds, getThreadDisplaySection, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
 import { upsertThread } from './thread-loading';
 import { handleThreadEvent } from './thread-sync';
 import { ARCHIVE_PINNED_CONFIRM, focusThread, handleArchiveThread, subscriptionsStoppedByArchive } from './threads';
@@ -94,7 +94,7 @@ beforeEach(() => {
   selectedAppIds.value = new Set();
   // Reset the drawer view + search so the post-archive focus picker defaults to
   // the full Current list unless a test opts into an alternate view.
-  drawerView.value = 'all';
+  setDrawerView('all');
   threadSearchQuery.value = '';
   threadSearchResults.value = { status: 'not-loaded' };
   localStorage.removeItem('lucidos-focused-thread');
@@ -467,7 +467,7 @@ describe('handleArchiveThread — active drawer view', () => {
       meta: { id: 'a3', title: 'Attention 3', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    drawerView.value = 'attention';
+    setDrawerView('attention');
     focusThread('a1');
 
     await handleArchiveThread('a1');
@@ -490,12 +490,58 @@ describe('handleArchiveThread — active drawer view', () => {
       meta: { id: 'r3', title: 'Review 3', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    drawerView.value = 'review';
+    setDrawerView('review');
     focusThread('r1');
 
     await handleArchiveThread('r1');
 
     expect(focusedThreadId.value).toBe('r3');
+  });
+
+  it('lands on a Review thread when the archived thread already left the review view', async () => {
+    // r1 was applied, so it has no change left and is no longer a review row.
+    // The user archives it from the thread pane while the review view is open.
+    // The next focus must still come from the review view, not the compose view.
+    const map = new Map<string, ThreadState>();
+    map.set('r1', makeThreadState('r1', {
+      meta: { id: 'r1', title: 'Applied', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'idle', codingAgentProposed: false, messageCount: 1, section: 'inbox' },
+    }));
+    map.set('a2', makeThreadState('a2', {
+      meta: { id: 'a2', title: 'Attention 2', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
+    }));
+    map.set('r3', makeThreadState('r3', {
+      meta: { id: 'r3', title: 'Review 3', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+    }));
+    threadMap.value = map;
+    setDrawerView('review');
+    focusThread('r1');
+
+    await handleArchiveThread('r1');
+
+    expect(focusedThreadId.value).toBe('r3');
+  });
+
+  it('walks the In flight view in its nested order, sub-threads under their parent', async () => {
+    // Rendered: p1, then its sub-thread c, then x. Recency alone would put c
+    // first (c, p1, x). Archiving x, the last row, must land on the row drawn
+    // above it, c, which only the nested order gives.
+    const map = new Map<string, ThreadState>();
+    map.set('p1', makeThreadState('p1', {
+      meta: { id: 'p1', title: 'Parent', channel: 'claude_code', updatedAt: '2026-01-01T00:00:04Z', status: 'idle', activeChildrenCount: 1, messageCount: 1, section: 'inbox' },
+    }));
+    map.set('c', makeThreadState('c', {
+      meta: { id: 'c', title: 'Sub-thread', channel: 'claude_code', updatedAt: '2026-01-01T00:00:05Z', status: 'running', parentThreadId: 'p1', messageCount: 1, section: 'inbox' },
+    }));
+    map.set('x', makeThreadState('x', {
+      meta: { id: 'x', title: 'Running', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'running', messageCount: 1, section: 'inbox' },
+    }));
+    threadMap.value = map;
+    setDrawerView('in-flight');
+    focusThread('x');
+
+    await handleArchiveThread('x');
+
+    expect(focusedThreadId.value).toBe('c');
   });
 
   it('falls back to the thread above within the attention view', async () => {
@@ -509,12 +555,37 @@ describe('handleArchiveThread — active drawer view', () => {
       meta: { id: 'a2', title: 'Attention 2', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    drawerView.value = 'attention';
+    setDrawerView('attention');
     focusThread('a2');
 
     await handleArchiveThread('a2');
 
     expect(focusedThreadId.value).toBe('a1');
+  });
+
+  it('lands on the row below when the archived thread was stopped out of the attention view first', async () => {
+    // A thread waiting on a question offers Archive only once it is stopped,
+    // and stopping it idles it out of Needs attention. Its place in the list
+    // when it was opened still decides where the focus goes.
+    const waiting = (id: string, at: string) => makeThreadState(id, {
+      meta: { id, title: id, channel: 'claude_code', updatedAt: at, status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
+    });
+    threadMap.value = new Map([
+      ['a1', waiting('a1', '2026-01-01T00:00:03Z')],
+      ['a2', waiting('a2', '2026-01-01T00:00:02Z')],
+      ['a3', waiting('a3', '2026-01-01T00:00:01Z')],
+    ]);
+    setDrawerView('attention');
+    focusThread('a2');
+
+    const stopped = new Map(threadMap.value);
+    const a2 = stopped.get('a2')!;
+    stopped.set('a2', { ...a2, meta: { ...a2.meta, status: 'idle' } });
+    threadMap.value = stopped;
+
+    await handleArchiveThread('a2');
+
+    expect(focusedThreadId.value).toBe('a3');
   });
 
   it('unfocuses when the attention view has no other thread (a Current-only thread is not offered)', async () => {
@@ -526,7 +597,7 @@ describe('handleArchiveThread — active drawer view', () => {
       meta: { id: 'c2', title: 'Current only', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    drawerView.value = 'attention';
+    setDrawerView('attention');
     focusThread('a1');
 
     await handleArchiveThread('a1');
@@ -545,7 +616,7 @@ describe('handleArchiveThread — active drawer view', () => {
     threadMap.value = map;
     // A search query overrides drawerView (mirrors ThreadDrawer's activeView):
     // the next focus follows the result order, not the Current section.
-    drawerView.value = 'all';
+    setDrawerView('all');
     threadSearchQuery.value = 'foo';
     threadSearchResults.value = {
       status: 'loaded',
@@ -1152,39 +1223,32 @@ describe('handleArchiveThread — 409 error toasts', () => {
     return toasts.value.find(t => t.type === 'error')?.message;
   }
 
-  it('formats descendants_blocking (single busy sub-thread) as actionable text', async () => {
+  it("words a sub-thread blocker in the menu's words, and offers to show it", async () => {
+    // ADR 0378: the refusal names its blocker, so the toast says what the menu says.
     const { ApiError } = await import('../../api/client');
     seedReviewThread();
     const message = await archiveAndGetToast(new ApiError(409, 'descendants_blocking', {
       reason: 'descendants_blocking',
+      blocker: 'descendant_running',
       blocking: [{ thread_id: 'child', status: 'running', has_pending_changes: false }],
     }));
-    expect(message).toBe("Can't archive yet — a sub-thread is still busy");
+    expect(message).toBe('A sub-thread is still running.');
+    const toast = toasts.value.find(t => t.type === 'error');
+    expect(toast?.title).toBe("Can't archive yet");
+    expect(toast?.action?.label).toBe('Show sub-thread');
   });
 
-  it('formats descendants_blocking (multiple busy sub-threads) with the count', async () => {
-    const { ApiError } = await import('../../api/client');
-    seedReviewThread();
-    const message = await archiveAndGetToast(new ApiError(409, 'descendants_blocking', {
-      reason: 'descendants_blocking',
-      blocking: [
-        { thread_id: 'child-1', status: 'running', has_pending_changes: false },
-        { thread_id: 'child-2', status: 'waiting', has_pending_changes: true },
-        { thread_id: 'child-3', status: 'running', has_pending_changes: false },
-      ],
-    }));
-    expect(message).toBe("Can't archive yet — 3 sub-threads are still busy");
-  });
-
-  it('formats parent_not_archivable with running parent', async () => {
+  it("words the thread's own blocker without a sub-thread to show", async () => {
     const { ApiError } = await import('../../api/client');
     seedReviewThread();
     const message = await archiveAndGetToast(new ApiError(409, 'parent_not_archivable', {
       reason: 'parent_not_archivable',
+      blocker: 'running',
       parent_status: 'running',
       has_pending_changes: false,
     }));
-    expect(message).toBe("Can't archive yet — this thread is still running");
+    expect(message).toBe('This thread is still running. Stop it first.');
+    expect(toasts.value.find(t => t.type === 'error')?.action).toBeUndefined();
   });
 
   it('archiving an already-archived thread is idempotent success, not a 409 toast', async () => {
@@ -1278,8 +1342,9 @@ describe('handleArchiveThread — 409 error toasts', () => {
     seedReviewThread();
     const message = await archiveAndGetToast(new ApiError(409, 'parent_has_pending_changes', {
       reason: 'parent_has_pending_changes',
+      blocker: 'pending_change',
     }));
-    expect(message).toBe("Can't archive — apply or discard the pending change first");
+    expect(message).toBe('Apply or discard the pending change first.');
   });
 
   it('falls back to the generic message for non-ApiError failures', async () => {

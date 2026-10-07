@@ -13,8 +13,12 @@ declare global {
         currentWebview?: { label?: string };
       };
     };
-    /** Injected by the Tauri app on page load: CalVer version at build time. */
+    /** Injected by the Tauri app on page load: the client build id, a CalVer
+     *  stamp. Never compare it against a release. */
     __LUCIDOS_APP_VERSION__?: string;
+    /** Injected by the Tauri app on page load: the Lucidos release it was
+     *  built as. Compare THIS against an engine's or a gateway's release. */
+    __LUCIDOS_APP_RELEASE__?: string;
   }
 }
 

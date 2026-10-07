@@ -48,8 +48,9 @@ impl EventStore {
     /// 'archived')` splits the exactly-two-valued `ArchiveState` cleanly), so inbox
     /// rows never consume the archive budget.
     ///
-    /// The outer `WHERE` has exactly two clauses — unbounded inbox + the contiguous
-    /// archived window — and NO out-of-window bypass. An archived thread is NEVER
+    /// The outer `WHERE` has exactly two clauses, unbounded inbox + the contiguous
+    /// archived window, plus the hidden home thread filter. There is NO
+    /// out-of-window bypass. An archived thread is NEVER
     /// injected ahead of its `created_at` position; archived `failed` /
     /// `waiting_for_user_answer` threads reach the drawer purely via
     /// `get_older_threads` pagination, at their true date (so the Archive pile stays
@@ -78,12 +79,14 @@ impl EventStore {
                 FROM thread_summaries \
                 WHERE has_response = TRUE OR status = ANY($1) OR coding_agent_proposed = TRUE\
             ) t \
-            WHERE t.archive_state = '{inbox}' \
-               OR (t.archive_state = '{archived}' AND t.rn <= $2) \
+            WHERE (t.archive_state = '{inbox}' \
+               OR (t.archive_state = '{archived}' AND t.rn <= $2)) \
+              AND {home_visible} \
             ORDER BY t.last_user_action DESC",
             cols = THREAD_COLS.as_str(),
             archived = ArchiveState::Archived.as_str(),
             inbox = ArchiveState::Inbox.as_str(),
+            home_visible = home_visible_sql("t"),
         );
         let rows = sqlx::query_as::<_, ThreadRow>(&sql)
             .bind(&active_statuses[..])

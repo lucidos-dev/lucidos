@@ -148,7 +148,7 @@ describe('restoreUnsentMessages', () => {
 
   it('settles a message the engine already has, with no card', async () => {
     threadMap.value = new Map([['t-first', thread('t-first')]]);
-    patchComposeSelection('t-first', { model: 'claude-opus-5' });
+    patchComposeSelection('t-first', { model: 'claude-sonnet-5' });
     engineRow('t-first', 1, 'landed', '2026-10-03T08:00:01.000Z', 'e-1');
     await seed(record('e-1', { threadId: 't-first', settlement: { kind: 'first-send', mode: 'lucidos' } }));
 
@@ -300,7 +300,7 @@ describe('a first send restored on a thread the engine still has composing', () 
 
   it('a refused Retry rolls the draft back with its picks', async () => {
     engineHasDraft('the whole mess');
-    patchComposeSelection('t-first', { model: 'claude-opus-5' });
+    patchComposeSelection('t-first', { model: 'claude-sonnet-5' });
     await seed(firstSend({ text: 'the whole mess', imageHashes: [] }));
     await restoreUnsentMessages();
     mockedSubmitChat.mockRejectedValueOnce(new ApiError(409, 'locked'));
@@ -309,7 +309,7 @@ describe('a first send restored on a thread the engine still has composing', () 
 
     expect(threadMap.value.get('t-first')!.meta.state).toBe('composing');
     expect(getDraft('t-first').text).toBe('the whole message');
-    expect(getComposeSelectionOverride('t-first').model).toBe('claude-opus-5');
+    expect(getComposeSelectionOverride('t-first').model).toBe('claude-sonnet-5');
   });
 });
 

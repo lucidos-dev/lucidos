@@ -863,6 +863,146 @@ test_project_runs_spec_matches_the_playwright_config() {
     fi
 }
 
+# ── e2e_browser_projects / e2e_browser_lock_projects ──────────────────
+test_browser_projects_match_the_playwright_config() {
+    echo "test: e2e_browser_projects names every project playwright.config.ts defines"
+    local config ours theirs
+    config="$(cd "$SCRIPT_DIR/../.." && pwd)/crates/lucidos-app/playwright.config.ts"
+    theirs="$(sed -n "s/^      name: '\\([^']*\\)',\$/\\1/p" "$config" | sort | paste -sd, -)"
+    ours="$(e2e_browser_projects | sort | paste -sd, -)"
+    if [ -n "$theirs" ] && [ "$ours" = "$theirs" ]; then
+        pass "the shell list and the config agree ($ours)"
+    else
+        fail "shell lists '$ours', playwright.config.ts defines '$theirs'"
+    fi
+    if [ "$(e2e_browser_projects --no-webkit | paste -sd, -)" = "chromium,mobile" ]; then
+        pass "--no-webkit drops mobile-webkit"
+    else
+        fail "--no-webkit kept the wrong set: $(e2e_browser_projects --no-webkit | paste -sd, -)"
+    fi
+}
+
+test_lock_projects_follow_the_arguments() {
+    echo "test: e2e_browser_lock_projects declares the projects the run will exercise"
+    local got
+    _check_lock_projects() {
+        got="$(e2e_browser_lock_projects "$@")"
+        if [ "$got" = "$EXPECT" ]; then pass "$WHY → $got"; else fail "$WHY: expected '$EXPECT', got '$got'"; fi
+    }
+    EXPECT="chromium,mobile,mobile-webkit" WHY="no flags" _check_lock_projects "" "" ""
+    EXPECT="chromium,mobile" WHY="--no-webkit" _check_lock_projects "" 1 ""
+    EXPECT="mobile-webkit" WHY="--webkit" _check_lock_projects 1 "" ""
+    EXPECT="mobile" WHY="--project=mobile" _check_lock_projects "" "" "" --project=mobile --grep x
+    EXPECT="chromium,mobile" WHY="--project twice, split form" \
+        _check_lock_projects "" "" "" --project chromium --project mobile
+    EXPECT="chromium,mobile-webkit" WHY="one split --project takes every value up to the next flag" \
+        _check_lock_projects "" "" "" --project chromium mobile-webkit --grep x
+    EXPECT="mobile,mobile-webkit" WHY="-f on a mobile-only spec" \
+        _check_lock_projects "" "" "composer-row-fit-mobile.spec.ts"
+    EXPECT="chromium" WHY="-f on a desktop-only spec" \
+        _check_lock_projects "" "" "app-frame-can-copy-desktop.spec.ts"
+    unset -f _check_lock_projects
+}
+
+# ── report_e2e_mem_top_deltas ─────────────────────────────────────────
+# Pins the reporter's wire format: formatMemLine in
+# crates/lucidos-app/e2e/memSampleReporter.ts writes these keys, and the
+# test below checks it still does.
+_mem_line() {
+    printf '2026-10-07T04:30:00.000Z\tproject=%s\tspec=%s\ttitle=t\tretry=0\tstatus=passed\tduration_ms=1\tpages=1\tlimit=1000\tdelta=%s\twebkit_gpu=1\twebkit_gpu_rss_kb=2\n' "$1" "$2" "$3"
+}
+
+test_mem_sample_env_follows_the_run_id() {
+    echo "test: export_e2e_mem_sample_env puts the mirror under \$HOME, named for the run"
+    # Read back through printenv: the Playwright child sees only what is exported.
+    local with without
+    HOME="$SANDBOX/home" LUCIDOS_E2E_RUN_ID="123-45-abc" export_e2e_mem_sample_env /x/full
+    with="$(printenv LUCIDOS_E2E_MEM_LOG)|$(printenv LUCIDOS_E2E_MEM_MIRROR)"
+    local token
+    token="$(printenv LUCIDOS_E2E_WEBKIT_PATH_TOKEN)"
+    LUCIDOS_E2E_RUN_ID="" export_e2e_mem_sample_env /x
+    without="$(printenv LUCIDOS_E2E_MEM_LOG)|$(printenv LUCIDOS_E2E_MEM_MIRROR)"
+    unset LUCIDOS_E2E_MEM_LOG LUCIDOS_E2E_MEM_MIRROR LUCIDOS_E2E_WEBKIT_PATH_TOKEN
+    if [ "$with" = "/x/full/mem-samples.log|$SANDBOX/home/.lucidos/e2e-mem/123-45-abc.log" ]; then
+        pass "log under the output root, mirror under \$HOME named for the run"
+    else
+        fail "wrong paths with a run id: $with"
+    fi
+    if [ "$without" = "/x/mem-samples.log|" ]; then
+        pass "no run id, no mirror"
+    else
+        fail "wrong paths without a run id: $without"
+    fi
+    if [ -n "$token" ] && [ "$token" = "$(_reaper_match)" ]; then
+        pass "the GPU count uses the WebKit reaper's own path token ($token)"
+    else
+        fail "exported token '$token' is not the reaper's '$(_reaper_match)'"
+    fi
+}
+
+test_mem_top_deltas_groups_and_ranks() {
+    echo "test: report_e2e_mem_top_deltas sums by project and spec, largest first"
+    local log="$SANDBOX/mem.log" out="$SANDBOX/mem.out" i
+    {
+        _mem_line mobile-webkit chat.spec.ts 300
+        _mem_line mobile-webkit chat.spec.ts 200
+        _mem_line chromium chat.spec.ts 400
+        _mem_line mobile-webkit phone-probe.spec.ts 900
+        _mem_line mobile-webkit drain.spec.ts -50
+        _mem_line mobile-webkit unknown.spec.ts '?'
+        for i in 1 2 3 4 5 6 7 8 9 10; do _mem_line mobile "small-$i.spec.ts" "$i"; done
+    } > "$log"
+    report_e2e_mem_top_deltas "$log" > "$out"
+
+    local rows
+    rows="$(grep -E '^ +-?[0-9]+ ' "$out")"
+    if [ "$(printf '%s\n' "$rows" | wc -l | tr -d ' ')" = 10 ]; then
+        pass "prints ten rows"
+    else
+        fail "expected ten rows:"; cat "$out"
+    fi
+    if printf '%s\n' "$rows" | head -1 | grep -qE '^ +900 +90\.0% +1 +mobile-webkit +phone-probe\.spec\.ts$'; then
+        pass "the largest delta leads, with its share of the limit"
+    else
+        fail "wrong first row:"; cat "$out"
+    fi
+    if printf '%s\n' "$rows" | sed -n 2p | grep -qE '^ +500 +50\.0% +2 +mobile-webkit +chat\.spec\.ts$'; then
+        pass "one spec's tests on one project are summed, apart from other projects"
+    else
+        fail "wrong second row:"; cat "$out"
+    fi
+    if grep -q 'unknown.spec.ts' "$out"; then
+        fail "a line with an unknown delta was ranked"
+    else
+        pass "an unknown delta is left out"
+    fi
+    if grep -q "per-test log: $log" "$out"; then
+        pass "names the log"
+    else
+        fail "did not say where the log is"; cat "$out"
+    fi
+}
+
+test_mem_line_keys_match_the_reporter() {
+    echo "test: every key report_e2e_mem_top_deltas reads is one the reporter writes"
+    local reporter key
+    reporter="$(cd "$SCRIPT_DIR/../.." && pwd)/crates/lucidos-app/e2e/memSampleReporter.ts"
+    for key in project spec delta limit; do
+        if grep -q "\`$key=\\\${" "$reporter"; then
+            pass "the reporter writes $key="
+        else
+            fail "formatMemLine in $reporter no longer writes '$key='"
+        fi
+    done
+}
+
+test_mem_top_deltas_is_silent_without_a_log() {
+    echo "test: report_e2e_mem_top_deltas prints nothing when no samples were written"
+    local out
+    out="$(report_e2e_mem_top_deltas "$SANDBOX/no-such.log")"
+    if [ -z "$out" ]; then pass "silent"; else fail "printed: $out"; fi
+}
+
 # ── summarise_playwright_log / report_playwright_totals ───────────────
 # A project runs in chunks and prints a summary per invocation, so its own
 # verdict exists only if the harness adds them up. These pin the adding up and
@@ -1209,6 +1349,12 @@ test_playwright_filter_does_not_match_a_longer_sibling
 test_every_mobile_webkit_spec_filter_selects_exactly_one_file
 test_project_runs_spec_mirrors_test_ignore
 test_project_runs_spec_matches_the_playwright_config
+test_browser_projects_match_the_playwright_config
+test_lock_projects_follow_the_arguments
+test_mem_sample_env_follows_the_run_id
+test_mem_line_keys_match_the_reporter
+test_mem_top_deltas_groups_and_ranks
+test_mem_top_deltas_is_silent_without_a_log
 test_prune_removes_empty_dir
 test_prune_removes_dir_with_dangling_gitdir
 test_prune_keeps_live_worktree

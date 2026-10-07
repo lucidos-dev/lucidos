@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import {
-  BROAD_ALLOW_INEFFECTIVE,
   DEFAULT_PERMISSION_CHOICE,
   inputTouchesProtectedPath,
   narrowPattern,
@@ -21,23 +20,6 @@ describe('DEFAULT_PERMISSION_CHOICE', () => {
     // choice always carries a visible focus ring, per the choice-card contract
     // in choiceCardNav.ts. Changing this value is a security-relevant decision.
     expect(DEFAULT_PERMISSION_CHOICE).toBe('allow');
-  });
-});
-
-describe('BROAD_ALLOW_INEFFECTIVE', () => {
-  it('contains the tools whose bare allowlist entry is silently ignored by CC', () => {
-    // Mirror of the engine-side BROAD_ALLOW_INEFFECTIVE constant in
-    // claude_code.rs. If this test fails, update both sides together.
-    // Edit/Write/NotebookEdit: acceptEdits mode routes them through the
-    // permission prompt for protected paths regardless of --allowedTools.
-    // ExitPlanMode: CC always routes plan-mode exit through the permission
-    // prompt so the user can review the plan before approving.
-    expect([...BROAD_ALLOW_INEFFECTIVE].sort()).toEqual([
-      'Edit',
-      'ExitPlanMode',
-      'NotebookEdit',
-      'Write',
-    ]);
   });
 });
 

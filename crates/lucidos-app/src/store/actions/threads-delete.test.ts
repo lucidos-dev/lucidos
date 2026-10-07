@@ -22,6 +22,7 @@ function preflight(over: Partial<DeletePreflight> = {}): DeletePreflight {
     thread_count: 1,
     sub_thread_titles: [],
     memory_count: 0,
+    summary_rebuild_count: 0,
     has_unapplied_branch_work: false,
     has_applied_changes: false,
     backups_present: false,
@@ -41,6 +42,11 @@ const CONDITIONAL_LINES: {
     label: 'what Lucidos learned',
     on: { memory_count: 3 },
     phrase: 'forget what it learned here',
+  },
+  {
+    label: 'summaries to rebuild',
+    on: { summary_rebuild_count: 12 },
+    phrase: 'rebuild 12 summary tree lines',
   },
   {
     label: 'unapplied branch work',
@@ -76,6 +82,7 @@ describe('deleteConfirmation', () => {
     const all = deleteConfirmation(
       preflight({
         memory_count: 9,
+        summary_rebuild_count: 12,
         has_unapplied_branch_work: true,
         has_applied_changes: true,
         backups_present: true,
@@ -170,68 +177,6 @@ describe('formatDeleteErrorToast', () => {
   it('names the owner-only refusal rather than showing a bare 403', () => {
     const refusal = new ApiError(403, 'forbidden', { reason: 'not_the_owners_device' });
     expect(formatDeleteErrorToast(refusal)).toBe('Only a signed-in device can delete a thread.');
-  });
-
-  it('names the one blocker and what it is doing', () => {
-    const one = new ApiError(409, 'conflict', {
-      reason: 'descendants_blocking',
-      blocking: [{ thread_id: 'a', title: 'Pump curves', reason: 'running' }],
-    });
-    expect(formatDeleteErrorToast(one, 'target')).toBe(
-      `Can't delete yet, "Pump curves" is still running`,
-    );
-  });
-
-  it('says THIS thread when the only blocker is the target itself', () => {
-    // The engine's blocking list covers the whole family. Reporting the target
-    // as a sub-thread told a childless thread one of its sub-threads was busy.
-    const itself = new ApiError(409, 'conflict', {
-      reason: 'descendants_blocking',
-      blocking: [{ thread_id: 'target', title: 'Mine', reason: 'agent_session_live' }],
-    });
-    expect(formatDeleteErrorToast(itself, 'target')).toBe(
-      "Can't delete, this thread still has a coding agent running",
-    );
-  });
-
-  it('falls back to counting when more than one member blocks', () => {
-    const many = new ApiError(409, 'conflict', {
-      reason: 'descendants_blocking',
-      blocking: [
-        { thread_id: 'a', reason: 'running' },
-        { thread_id: 'b', reason: 'agent_session_live' },
-      ],
-    });
-    expect(formatDeleteErrorToast(many, 'target')).toContain(
-      '2 threads in this family are still busy',
-    );
-  });
-
-  it('says busy for a reason it does not recognise', () => {
-    const unknown = new ApiError(409, 'conflict', {
-      reason: 'descendants_blocking',
-      blocking: [{ thread_id: 'a', reason: 'something_new' }],
-    });
-    expect(formatDeleteErrorToast(unknown, 'target')).toContain('a sub-thread is still busy');
-  });
-
-  it('tells a parked thread apart from a running one', () => {
-    const parked = new ApiError(409, 'conflict', {
-      reason: 'parent_not_deletable',
-      parent_status: 'waiting_for_user_answer',
-    });
-    expect(formatDeleteErrorToast(parked)).toContain('waiting for your answer');
-
-    const running = new ApiError(409, 'conflict', {
-      reason: 'parent_not_deletable',
-      parent_status: 'running',
-    });
-    expect(formatDeleteErrorToast(running)).toContain('still running');
-  });
-
-  it('points a pending change at Apply or Discard', () => {
-    const pending = new ApiError(409, 'conflict', { reason: 'parent_has_pending_changes' });
-    expect(formatDeleteErrorToast(pending)).toContain('apply or discard the pending change');
   });
 
   it('falls back to the error detail for anything unstructured', () => {

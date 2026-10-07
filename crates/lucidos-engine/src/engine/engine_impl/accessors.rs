@@ -265,6 +265,11 @@ impl LucidosEngine {
         &self.app_manager
     }
 
+    /// The Tree memory module's compactor handle.
+    pub(crate) fn summary_tree(&self) -> &crate::engine::summary_tree::Runtime {
+        &self.summary_tree
+    }
+
     /// Get the shared database connection pool
     pub fn pool(&self) -> &sqlx::PgPool {
         &self.pool
@@ -403,6 +408,21 @@ impl LucidosEngine {
     /// provider pin against a model's routes.
     pub(crate) fn model_registry(&self) -> &crate::llm::ModelRegistry {
         &self.model_registry
+    }
+
+    /// One *auxiliary model call* for `purpose`, resolved against the router
+    /// installed right now, so a credential added at runtime moves it.
+    pub(crate) async fn aux_call(
+        &self,
+        purpose: crate::engine::ContextPurpose,
+    ) -> crate::engine::aux_purpose::AuxCall {
+        crate::engine::aux_purpose::AuxCall::resolve(
+            &self.pool,
+            &self.model_registry,
+            self.current_provider(),
+            purpose,
+        )
+        .await
     }
 
     /// Context window (tokens) for `model`: the window declared on the *route*

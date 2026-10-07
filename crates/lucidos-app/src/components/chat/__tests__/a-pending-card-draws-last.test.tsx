@@ -108,6 +108,7 @@ function statusOf(node: VNode<Record<string, unknown>>): string {
   return exchangeStatus(
     p.exchange as Exchange, '', p.isLast as boolean, p.hasPriorActive as boolean,
     p.threadIsCC as boolean, p.threadIdle as boolean, p.threadAwaitingAnswer as boolean,
+    p.behindOpenQuestion as boolean,
   );
 }
 
@@ -126,6 +127,24 @@ describe('a card awaiting the user draws last', () => {
     const [, callback, card] = collectExchangeNodes(nodes);
     expect(statusOf(callback)).toBe('held');
     expect(statusOf(card)).toBe('awaiting-answer');
+  });
+
+  it('holds every callback behind the card, not only the newest', () => {
+    threadMap.value = new Map([['t1', makeThread('waiting_for_user_answer')]]);
+    const second: Exchange = { ...CALLBACK, userSeq: 5, userEvent: { ...CALLBACK.userEvent, _eventId: 'ctc-2' } };
+    const nodes = renderExchanges([ASKING_TURN, question(), CALLBACK, second], 't1', '');
+    const [, older, newer, card] = collectExchangeNodes(nodes);
+    expect(statusOf(older)).toBe('held');
+    expect(statusOf(newer)).toBe('held');
+    expect(statusOf(card)).toBe('awaiting-answer');
+  });
+
+  it('marks nothing before the card as behind it', () => {
+    threadMap.value = new Map([['t1', makeThread('waiting_for_user_answer')]]);
+    const nodes = renderExchanges([ASKING_TURN, question(), CALLBACK, QUEUED], 't1', '');
+    const behind = collectExchangeNodes(nodes).map(n => n.props.behindOpenQuestion);
+    // Drawn order: the asking turn, the callback, the pinned card, the queued group.
+    expect(behind).toEqual([false, true, false, false]);
   });
 
   it('keeps the queued group below the pinned card', () => {

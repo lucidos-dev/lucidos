@@ -163,6 +163,11 @@ reason.
 
 ### Both a count and a clock, because either alone fails a real hook
 
+**Amended by [ADR 0365](0365-a-burst-is-not-an-outage.md):** for a hook that is
+on, the clock now reads the span of the refusals, first to last, not the run's
+age to now. A burst followed by silence is not an outage. The disabled clock is
+unchanged.
+
 This hook's traffic has two shapes at once. One workflow run delivers three
 times in quick succession (`requested`, `in_progress`, `completed`), and the
 hook can then be quiet for days: only `install-smoke` carries a `schedule:`

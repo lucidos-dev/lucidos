@@ -699,6 +699,23 @@ async fn stamp_accepted(state: &AppState, hook: &Webhook) {
     }
 }
 
+/// The secret a hook's HMAC check verifies against, or `None` when the hook
+/// signs nothing or its credential is gone.
+///
+/// A failed read is an `Err`, never `None`. `webhooks::verify` reads `None` as
+/// a missing credential and refuses the delivery for it.
+async fn signing_secret(
+    pool: &sqlx::PgPool,
+    hmac: Option<&HmacConfig>,
+) -> Result<Option<String>, sqlx::Error> {
+    let Some(cfg) = hmac else {
+        return Ok(None);
+    };
+    Ok(CredentialStore::get(pool, &cfg.credential)
+        .await?
+        .map(|c| c.auth_value))
+}
+
 /// `POST /api/v1/webhooks/:id/deliver`: verify a delivery, then emit its event.
 ///
 /// The body arrives as [`Bytes`] rather than `Json`, which is the whole point.
@@ -709,8 +726,9 @@ async fn stamp_accepted(state: &AppState, hook: &Webhook) {
 /// refused. "Arrived and was refused" and "never arrived" look identical from
 /// the events table, and have completely different causes.
 ///
-/// Two outcomes stamp neither. An engine that could not emit says nothing about
-/// the sender, and the probe's own refusal is skipped on purpose.
+/// Three outcomes stamp neither. An engine that could not emit, or could not
+/// read the signing credential, says nothing about the sender. The probe's own
+/// refusal is skipped on purpose.
 async fn deliver(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -749,15 +767,18 @@ async fn deliver(
         return refused();
     };
 
-    let secret = match hook.hmac.as_ref() {
-        Some(cfg) => match CredentialStore::get(&state.pool, &cfg.credential).await {
-            Ok(found) => found.map(|c| c.auth_value),
-            Err(e) => {
-                crate::log!("[Webhook] '{}' credential lookup failed: {e}", hook.name);
-                None
-            }
-        },
-        None => None,
+    let secret = match signing_secret(&state.pool, hook.hmac.as_ref()).await {
+        Ok(secret) => secret,
+        // Unknown, so not stamped: a refusal would tell the page the
+        // credential is missing and send the sender a 401 it must not retry.
+        Err(e) => {
+            crate::log!("[Webhook] '{}' credential lookup failed: {e}", hook.name);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal error" })),
+            )
+                .into_response();
+        }
     };
 
     let presented = PresentedDelivery {
@@ -1165,6 +1186,29 @@ mod tests {
             );
         }
         map
+    }
+
+    /// A credential read that failed is unknown, not missing. Reading it as
+    /// missing refused a possibly authentic delivery with a 401 and told the
+    /// page the credential did not exist.
+    #[tokio::test]
+    async fn a_failed_credential_read_is_an_error_and_not_a_missing_secret() {
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .connect_lazy("postgres://test@127.0.0.1:1/none")
+            .unwrap();
+
+        assert!(
+            signing_secret(&unreachable, Some(&hmac_signed_with("X-Signature")))
+                .await
+                .is_err(),
+            "a lookup that could not run must not answer None"
+        );
+        assert_eq!(
+            signing_secret(&unreachable, None).await.unwrap(),
+            None,
+            "a hook that signs nothing reads no credential"
+        );
     }
 
     #[test]

@@ -71,27 +71,16 @@ pub(super) async fn drop_thread_queue_entry(
 /// with defaults); the full resulting policy is returned. Persisted via
 /// `CapacityPolicyChanged`, so it survives restarts.
 ///
-/// Concurrency caps of 0 are legal and mean "hold" — `max_concurrent_total: 0`
-/// pauses ALL background admission (the queue accumulates until the cap is
-/// raised). Two fields must be ≥ 1. `max_queued_per_trigger` at 0 would make
-/// every trigger fire overflow instantly, which under `drop-oldest` (nothing
-/// older to drop) silently degrades to an unbounded queue.
-/// `max_event_trigger_depth` at 0 would cap every chain at its first hop, so
-/// no event trigger would ever fire again.
+/// Concurrency caps of 0 are legal and mean "hold": `max_concurrent_total: 0`
+/// pauses ALL background admission until the cap is raised. The fields that
+/// must be at least 1 are listed in `CapacityPolicy::invalid_reason`.
 pub(super) async fn update_capacity_policy(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(policy): Json<CapacityPolicy>,
 ) -> Result<Json<CapacityPolicy>, ApiError> {
-    if policy.max_queued_per_trigger == 0 {
-        return Err(ApiError::bad_request(
-            "max_queued_per_trigger must be at least 1",
-        ));
-    }
-    if policy.max_event_trigger_depth == 0 {
-        return Err(ApiError::bad_request(
-            "max_event_trigger_depth must be at least 1",
-        ));
+    if let Some(reason) = policy.invalid_reason() {
+        return Err(ApiError::bad_request(reason));
     }
     let actor = super::actor::user_actor(&headers, None);
     state

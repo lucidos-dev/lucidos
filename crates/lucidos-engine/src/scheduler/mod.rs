@@ -26,7 +26,7 @@ pub use notifications::{Notification, NotificationStore};
 pub use push::{PushSubscription, PushSubscriptionStore};
 
 use crate::api::SharedEngine;
-use crate::core::PreferenceStore;
+use crate::core::{prefs, PreferenceStore};
 use crate::engine::event_bus::EventBus;
 use crate::triggers::{
     replay_trigger_events, replay_trigger_group_events, TriggerConfig, TriggerEventRow,
@@ -880,8 +880,8 @@ impl SchedulerManager {
                                 // the scheduler) or the HTTP handler. Idempotent
                                 // with the handler's own direct call.
                                 SystemEvent::PreferencesChanged { key, .. }
-                                    if key == crate::core::backup::PREF_BACKUP_SCHEDULE
-                                        || key == crate::core::backup::PREF_BACKUP_PROVIDER =>
+                                    if key == prefs::BACKUP_SCHEDULE.key()
+                                        || key == prefs::BACKUP_PROVIDER.key() =>
                                 {
                                     reload_backup_schedule(
                                         &backup_runner,
@@ -966,7 +966,8 @@ impl SchedulerManager {
         provider: &str,
         actor: Option<crate::engine::thread_events::MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use crate::core::backup::{PREF_BACKUP_PROVIDER, PREF_BACKUP_SCHEDULE};
+        let schedule_key = prefs::BACKUP_SCHEDULE.key();
+        let provider_key = prefs::BACKUP_PROVIDER.key();
 
         match cron {
             Some(expr) => {
@@ -975,10 +976,8 @@ impl SchedulerManager {
                     .map_err(|e| format!("Invalid cron expression '{}': {}", expr, e))?;
 
                 let bus = &self.engine.event_bus;
-                PreferenceStore::set(&self.pool, bus, PREF_BACKUP_SCHEDULE, expr, actor.clone())
-                    .await?;
-                PreferenceStore::set(&self.pool, bus, PREF_BACKUP_PROVIDER, provider, actor)
-                    .await?;
+                PreferenceStore::set(&self.pool, bus, schedule_key, expr, actor.clone()).await?;
+                PreferenceStore::set(&self.pool, bus, provider_key, provider, actor).await?;
 
                 arm_backup_runner(
                     &self.backup_runner,
@@ -998,10 +997,8 @@ impl SchedulerManager {
                 // Dropbox while backups were manual-only kept whatever the
                 // preference happened to hold.
                 let bus = &self.engine.event_bus;
-                PreferenceStore::set(&self.pool, bus, PREF_BACKUP_SCHEDULE, "off", actor.clone())
-                    .await?;
-                PreferenceStore::set(&self.pool, bus, PREF_BACKUP_PROVIDER, provider, actor)
-                    .await?;
+                PreferenceStore::set(&self.pool, bus, schedule_key, "off", actor.clone()).await?;
+                PreferenceStore::set(&self.pool, bus, provider_key, provider, actor).await?;
                 stop_backup_runner(&self.backup_runner);
                 log!("[Scheduler] Backup schedule disabled");
             }
@@ -1232,9 +1229,9 @@ pub(crate) async fn reload_backup_schedule(
     shutdown_flag: &Arc<AtomicBool>,
     pool: &PgPool,
 ) {
-    use crate::core::backup::{is_schedule_active, PREF_BACKUP_PROVIDER, PREF_BACKUP_SCHEDULE};
+    use crate::core::backup::is_schedule_active;
 
-    let read_schedule = PreferenceStore::get(pool, PREF_BACKUP_SCHEDULE).await;
+    let read_schedule = prefs::BACKUP_SCHEDULE.try_stored(pool).await;
     if let Err(e) = &read_schedule {
         // A preference read that could not run is UNKNOWN, not "the user turned
         // backups off". It still falls through to the disabled branch below, so
@@ -1242,7 +1239,7 @@ pub(crate) async fn reload_backup_schedule(
         log!(
             "[Scheduler] Could not read {}, treating the backup schedule as \
              disabled for this reload: {}",
-            PREF_BACKUP_SCHEDULE,
+            prefs::BACKUP_SCHEDULE.key(),
             e
         );
     }
@@ -1254,12 +1251,12 @@ pub(crate) async fn reload_backup_schedule(
             return;
         }
     };
-    let read_provider = PreferenceStore::get(pool, PREF_BACKUP_PROVIDER).await;
+    let read_provider = prefs::BACKUP_PROVIDER.try_stored(pool).await;
     if let Err(e) = &read_provider {
         log!(
             "[Scheduler] Could not read {}, so the backup runner stays disarmed \
              for this reload: {}",
-            PREF_BACKUP_PROVIDER,
+            prefs::BACKUP_PROVIDER.key(),
             e
         );
     }

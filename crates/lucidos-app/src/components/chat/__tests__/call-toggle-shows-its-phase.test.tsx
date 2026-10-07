@@ -32,7 +32,7 @@ let host: HTMLDivElement;
 /** Rendered inside `act`, so the dwell timer is armed by the time a test
  *  advances the clock. */
 function mount(phase: CallPhase, extra: Partial<CallState> = {}): void {
-  preferences.value = { status: 'loaded', data: { voice_enabled: 'true' } };
+  preferences.value = { status: 'loaded', data: { voice_enabled: 'true', home_thread_enabled: 'true' } };
   voiceCall.value = { ...CALL_IDLE, phase, threadId: 't', ...extra };
   act(() => {
     render(<CallToggle />, host);

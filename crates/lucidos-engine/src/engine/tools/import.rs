@@ -87,15 +87,13 @@ fn walk_dir(
         let relative_str = relative.to_string_lossy();
 
         let is_default_excluded = default_excludes.iter().any(|pattern| {
-            if pattern.contains("**") {
-                let prefix = pattern.trim_end_matches("/**");
-                relative_str.starts_with(prefix)
-            } else if pattern.starts_with("*.") {
-                let ext = pattern.trim_start_matches("*.");
-                path.extension().is_some_and(|e| e.to_string_lossy() == ext)
-            } else {
-                relative_str == *pattern || relative_str.starts_with(&format!("{}/", pattern))
+            if let Some(ext) = pattern.strip_prefix("*.") {
+                return path.extension().is_some_and(|e| e.to_string_lossy() == ext);
             }
+            // A whole path component only: `.git/**` must not swallow
+            // `.github/`, and `build/**` must not swallow `build.rs`.
+            let dir = pattern.trim_end_matches("/**");
+            relative_str == dir || relative_str.starts_with(&format!("{dir}/"))
         });
 
         if is_default_excluded {
@@ -312,6 +310,7 @@ impl LucidosEngine {
                                     source_detail: source_path.into(),
                                     commit_hash: commit_sha.clone(),
                                     summary: Some(summary.clone()),
+                                    writer_thread_id: Some(thread_id),
                                 }))
                                 .await?;
                             let short_sha = &commit_sha[..commit_sha.floor_char_boundary(7)];
@@ -344,6 +343,7 @@ impl LucidosEngine {
                         source_detail: source_path.into(),
                         commit_hash: commit_sha.clone(),
                         summary: summary.clone(),
+                        writer_thread_id: Some(thread_id),
                     }))
                     .await?;
 
@@ -661,6 +661,8 @@ impl LucidosEngine {
                 source_detail: source.to_string_lossy().to_string(),
                 commit_hash: commit_sha.clone(),
                 summary: None,
+                // An upload from the UI, which no thread's turn made.
+                writer_thread_id: None,
             }))
             .await?;
 
@@ -701,6 +703,45 @@ mod tests {
         .expect("walk");
         imported_files.sort();
         (imported_files, skipped)
+    }
+
+    /// A `dir/**` default exclude used to match by raw string prefix, so
+    /// `.git/**` silently dropped `.github/` and `.gitignore`, and `build/**`
+    /// dropped `build.rs`.
+    #[test]
+    fn a_dir_default_exclude_skips_only_that_directory() {
+        let d = tempfile::tempdir().unwrap();
+        for dir in [".git", ".github/workflows", "build"] {
+            std::fs::create_dir_all(d.path().join(dir)).unwrap();
+        }
+        for file in [".git/HEAD", ".github/workflows/ci.yml", ".gitignore"] {
+            std::fs::write(d.path().join(file), "x").unwrap();
+        }
+        std::fs::write(d.path().join("build/out.txt"), "x").unwrap();
+        std::fs::write(d.path().join("build.rs"), "fn main() {}").unwrap();
+
+        let (mut imported, mut skipped, mut bytes) = (0usize, 0usize, 0u64);
+        let (mut collected, mut files) = (Vec::new(), Vec::new());
+        walk_dir(
+            d.path(),
+            d.path(),
+            "imported/x",
+            &[],
+            &[],
+            &[".git/**", "build/**"],
+            &mut collected,
+            &mut files,
+            &mut imported,
+            &mut skipped,
+            &mut bytes,
+        )
+        .expect("walk");
+        files.sort();
+        assert_eq!(
+            files,
+            vec![".github/workflows/ci.yml", ".gitignore", "build.rs"]
+        );
+        assert_eq!(skipped, 2, "only .git/ and build/ are skipped");
     }
 
     fn tree() -> tempfile::TempDir {

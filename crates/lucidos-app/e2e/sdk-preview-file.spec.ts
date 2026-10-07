@@ -249,10 +249,9 @@ test.describe('SDK lucidos.ui.previewFile: a file preview over the app', () => {
       // rendered for the content view; the app pane being on screen is not the
       // same thing as the header showing that pane's actions.
       await ensureMobileView(page, 'content');
-      // A phone's app-UI header carries three context actions (refresh, open
-      // in a tab, fullscreen), which fold whole into the `⋯` menu. Desktop
-      // leads its row with Refresh, so the two left ride the row when there is
-      // room. `clickHeaderAction` finds the toggle in either placement.
+      // A phone's app-UI header folds every context action into the `⋯` menu.
+      // Desktop leads its row with Refresh, and the rest ride the row while
+      // there is room. `clickHeaderAction` finds the toggle in either placement.
       await clickHeaderAction(page, '.app-fullscreen');
       const panel = page.locator('[data-role="app-ui-panel"]:visible');
       await expect(async () => {

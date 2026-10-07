@@ -4,6 +4,13 @@ import { ENGINE_LABEL, RESPONSE_CANCELED_SUMMARY, continuationStartedSummary, re
 import { CC_ACTIVITY_EVENTS } from './thread-meta';
 import type { ActorMode, SequencedEvent, StoredEvent, ThreadEvent, ThreadInitiator } from './thread-event-types';
 
+/** A typed answer to a question card that the engine has not confirmed. It is
+ *  either still sending, or its POST got no answer and it waits for a Retry
+ *  (`unsentEventId` names the unsent message). */
+export type TypedAnswer =
+  | { state: 'sending'; text: string; image_hashes: string[] }
+  | { state: 'unsent'; text: string; image_hashes: string[]; unsentEventId: string };
+
 export type Exchange = {
   userEvent: StoredEvent;
   userSeq: number;
@@ -60,6 +67,9 @@ export type Exchange = {
    *  the agent to read it. It takes no steps meanwhile and renders in the
    *  bottom queue. See `docs/plans/2026-09-24-unread-coding-agent-messages-queue.md`. */
   awaitingRead?: true;
+  /** On a question divider: the answer the user typed into the composer, not
+   *  yet confirmed by the engine. Written by `foldedExchanges` on a clone. */
+  typedAnswer?: TypedAnswer;
   /** True on the delivered copy of a message the engine held behind an open
    *  question or permission card (ADR 0256). Its header says it waited. */
   releasedFromHold?: true;
@@ -127,19 +137,19 @@ export function exchangeKey(exchange: Exchange): string {
 /** The narrowed `UserQuestionAnswered` variant — exposed so call sites that
  *  walk an Exchange's steps can read the question's resolution (answer + actor)
  *  without redeclaring the shape. */
-export type AnsweredQuestion = Extract<ThreadEvent, { type: 'UserQuestionAnswered' }>;
+export type AnsweredQuestion = Extract<StoredEvent, { type: 'UserQuestionAnswered' }>;
 
 /** The narrowed `CodingAgentPermissionResolved` variant — same purpose as
  *  `AnsweredQuestion`, for permission-prompt resolutions. */
-export type ResolvedPermission = Extract<ThreadEvent, { type: 'CodingAgentPermissionResolved' }>;
+export type ResolvedPermission = Extract<StoredEvent, { type: 'CodingAgentPermissionResolved' }>;
 
 /** The narrowed `CommandPermissionResolved` variant (ADR 0002) — the chat
  *  command-guard counterpart of `ResolvedPermission`. */
-export type ResolvedCommandPermission = Extract<ThreadEvent, { type: 'CommandPermissionResolved' }>;
+export type ResolvedCommandPermission = Extract<StoredEvent, { type: 'CommandPermissionResolved' }>;
 
 /** The narrowed `McpPermissionResolved` variant — the chat MCP counterpart of
  *  `ResolvedPermission`. */
-export type ResolvedMcpPermission = Extract<ThreadEvent, { type: 'McpPermissionResolved' }>;
+export type ResolvedMcpPermission = Extract<StoredEvent, { type: 'McpPermissionResolved' }>;
 
 /** Find the matching `UserQuestionAnswered` step in a divider exchange.
  *  Returns the typed event (with `answer` narrowed and the optional `actor`
@@ -189,6 +199,16 @@ export function findMcpPermissionResolution(
 // ---------------------------------------------------------------------------
 // Exchange-level derived data — standalone functions on Exchange.
 // ---------------------------------------------------------------------------
+
+/** Which boundaries the reader owns, and so draw the right-aligned bubble.
+ *
+ *  Two events, one act. A caller's utterance is a `SpokenMessageReceived` when
+ *  the talker answered it alone and a `MessageReceived` when it delegated. The
+ *  reader said the same thing either way, so both read the same way. The
+ *  transcript draws these as bubbles, and its find bar searches them. */
+export function isUserBubbleEvent(userEvent: { type: string }): boolean {
+  return userEvent.type === 'MessageReceived' || userEvent.type === 'SpokenMessageReceived';
+}
 
 /** Derive the user message text from an exchange. */
 export function exchangeUserMessage(exchange: Exchange): string {
@@ -323,9 +343,7 @@ const STATIC_MODEL_LABELS: Record<string, string> = Object.fromEntries([
   ['gpt-5.2-codex', 'GPT-5.2 Codex'],
   ['gpt-5.3-codex-spark', 'Codex Spark'],
   ['claude-opus-4-1', 'Opus 4.1'],
-  ['claude-opus-5[1m]', 'Opus 5 (1M)'],
   ['claude-opus-4-8[1m]', 'Opus 4.8 (1M)'],
-  ['claude-opus-5', 'Opus 5'],
   ['claude-opus-4-8', 'Opus 4.8'],
   // The `@default` spellings the chat registry used to carry. They still reach
   // the transcript from two places the re-spell deliberately left alone: the
@@ -409,13 +427,30 @@ export function exchangeHasCCContent(exchange: Exchange): boolean {
   return exchange.steps.some(({ event }) => CC_ACTIVITY_EVENTS.has(event.type));
 }
 
-/** Build the response text by concatenating all TextStreamed/CodingAgentTextStreamed events. */
+/** Read `parent_tool_use_id` from a coding-agent step or capture payload: the
+ *  `Agent` call whose sub-agent produced it. `undefined` for the session's own. */
+export function parentToolUseIdOf(event: { type: string }): string | undefined {
+  return (event as { parent_tool_use_id?: string }).parent_tool_use_id || undefined;
+}
+
+/** Read `api_call_id` from a coding-agent step or capture payload: the API
+ *  call that produced it. `undefined` from Codex and on older rows. */
+export function apiCallIdOf(event: { type: string }): string | undefined {
+  return (event as { api_call_id?: string }).api_call_id || undefined;
+}
+
+/** Streamed text that is the agent's own reply. A sub-agent's narration rides
+ *  the same event, tagged with its `Agent` call, and is never the reply. */
+export function isAgentReplyText(event: { type: string }): boolean {
+  return event.type === 'TextStreamed'
+    || (event.type === 'CodingAgentTextStreamed' && !parentToolUseIdOf(event));
+}
+
+/** Build the response text by concatenating the agent's reply text. */
 export function exchangeResponseText(exchange: Exchange): string {
   let text = '';
   for (const { event } of exchange.steps) {
-    if (event.type === 'TextStreamed' || event.type === 'CodingAgentTextStreamed') {
-      text += (event as { text: string }).text;
-    }
+    if (isAgentReplyText(event)) text += (event as { text: string }).text;
   }
   return text;
 }

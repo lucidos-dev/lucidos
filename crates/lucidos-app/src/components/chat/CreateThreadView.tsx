@@ -229,6 +229,7 @@ export function renderExchanges(
     });
   }
   const pinnedIndices = new Set(pinnedOrder);
+  const openCardIdx = pinnedOrder.length > 0 ? pinnedOrder[pinnedOrder.length - 1] : -1;
 
   const renderOne = (ex: Exchange, i: number, pausedBy?: StoredEvent): VNode => {
     // The active exchange plays the 'last' role (gets the stream, reads
@@ -271,6 +272,7 @@ export function renderExchanges(
         threadCodingAgent={threadCodingAgent}
         threadIdle={threadIdle}
         threadAwaitingAnswer={threadAwaitingAnswer}
+        behindOpenQuestion={openCardIdx >= 0 && i > openCardIdx && !isQueued}
         threadCanceling={threadCanceling}
         rowsHidden={i === renderFromIndex && !pinnedIndices.has(i) ? floorRowsHidden : 0}
         proposedChangeDesc={proposedSeed?.description}

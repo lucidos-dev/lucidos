@@ -151,22 +151,10 @@ impl LlmProvider for AnthropicProvider {
         selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
+        _call: crate::llm::metered::CallToken,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let ModelSelection {
-            model: model_override,
-            reasoning_effort,
-            ..
-        } = selection;
-        let model = model_override.unwrap_or(&self.model);
-        self.chat_anthropic(
-            messages,
-            tools,
-            model,
-            system_prompt,
-            on_token,
-            reasoning_effort,
-        )
-        .await
+        self.chat_anthropic(messages, tools, selection, system_prompt, on_token)
+            .await
     }
 }
 

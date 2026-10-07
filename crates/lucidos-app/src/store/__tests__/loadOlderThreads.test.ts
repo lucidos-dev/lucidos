@@ -54,7 +54,10 @@ function summary(over: Partial<ThreadSummary> & { thread_id: string; created_at:
   };
 }
 
+/** An archived row already in the map, as the Archive pagination cursor reads
+ *  it. A caller wanting an inbox row overrides the section afterwards. */
 function loaded(thread: ThreadState, updatedAt: string): ThreadState {
+  thread.meta.section = 'archived';
   thread.meta.updatedAt = updatedAt;
   // The Archive pagination cursor keys on created_at (matching the display
   // sort), so set it to the recency this helper simulates. lastUserAction is set

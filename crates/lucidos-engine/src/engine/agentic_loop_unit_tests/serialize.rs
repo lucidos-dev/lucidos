@@ -66,7 +66,7 @@ mod serialize_messages_for_capture_tests {
 
 /// The one section whose two sizes disagree, and the reason both exist.
 mod conversation_section_tests {
-    use super::super::conversation_section;
+    use super::super::{conversation_section, round_capture_sections};
     use crate::llm::{Message, MessageContent};
 
     fn turn() -> Vec<Message> {
@@ -87,7 +87,7 @@ mod conversation_section_tests {
     /// bundle twice against the headline estimate.
     #[test]
     fn the_delta_is_what_the_loop_added_and_never_the_whole_array() {
-        let section = conversation_section(&turn(), 900, 1_500, false);
+        let section = conversation_section(&turn(), 900, 1_500);
         assert_eq!(section.budget_delta_chars, 600);
         let real = section.content_chars.expect("measured on every round");
         assert!(
@@ -101,7 +101,7 @@ mod conversation_section_tests {
     /// and the region size is unaffected by that floor.
     #[test]
     fn a_delta_floors_at_zero_while_the_region_keeps_its_size() {
-        let section = conversation_section(&turn(), 5_000, 1_500, false);
+        let section = conversation_section(&turn(), 5_000, 1_500);
         assert_eq!(section.budget_delta_chars, 0);
         assert!(section.content_chars.expect("measured") > 1_000);
     }
@@ -110,11 +110,43 @@ mod conversation_section_tests {
     /// number that says how big the region was.
     #[test]
     fn dropping_the_body_leaves_the_region_size_alone() {
-        let with_body = conversation_section(&turn(), 900, 1_500, true);
-        let without = conversation_section(&turn(), 900, 1_500, false);
-        assert!(with_body.content.is_some());
-        assert!(without.content.is_none());
-        assert_eq!(with_body.content_chars, without.content_chars);
+        let section = conversation_section(&turn(), 900, 1_500);
+        let with_body = round_capture_sections(&[], [section.clone()], true);
+        let without = round_capture_sections(&[], [section], false);
+        assert!(with_body[0].content.is_some());
+        assert!(without[0].content.is_none());
+        assert_eq!(with_body[0].content_chars, without[0].content_chars);
+        assert_eq!(
+            with_body[0].budget_delta_chars,
+            without[0].budget_delta_chars
+        );
+    }
+
+    /// The switch as read for the round decides every row, the turn's seed
+    /// included. A turn that waited on a question and resumes after the user
+    /// turned capture on records bodies from its next round.
+    #[test]
+    fn the_round_switch_decides_the_seed_rows_too() {
+        let seed = vec![crate::engine::ContextSection {
+            name: "Long-term Memory".to_string(),
+            content: Some("remembered".to_string()),
+            budget_delta_chars: 10,
+            content_chars: Some(10),
+            role: crate::engine::ContextRole::User,
+            group: Some("Memory & history".to_string()),
+        }];
+        let conversation = conversation_section(&turn(), 900, 1_500);
+
+        let off = round_capture_sections(&seed, [conversation.clone()], false);
+        assert!(off.iter().all(|s| s.content.is_none()));
+        assert_eq!(off[0].content_chars, Some(10));
+
+        let on = round_capture_sections(&seed, [conversation], true);
+        assert_eq!(on[0].content.as_deref(), Some("remembered"));
+        assert!(
+            on[1].content.is_some(),
+            "the Conversation row keeps its body"
+        );
     }
 
     /// Truncation is the same decision at a different size. A body cut head
@@ -131,7 +163,7 @@ mod conversation_section_tests {
             role: "user".to_string(),
             content: MessageContent::Text("C".repeat(30_000)),
         }];
-        let section = conversation_section(&long, 0, 30_000, true);
+        let section = conversation_section(&long, 0, 30_000);
         let body = section.content.as_ref().expect("body captured");
         let real = section.content_chars.expect("measured");
         assert!(real > 30_000, "the array is bigger than the cap");

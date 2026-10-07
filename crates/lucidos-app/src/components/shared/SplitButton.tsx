@@ -1,4 +1,4 @@
-import type { ComponentChildren } from 'preact';
+import type { ComponentChildren, JSX } from 'preact';
 import { useRef } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
 import { Overlay } from './Overlay';
@@ -53,6 +53,11 @@ export interface SplitButtonProps {
    *  did-the-finger-stay-on-the-button half, so a press sliding off Apply would
    *  merge a branch. Diff only opens a view. See `touchActivated`. */
   primaryTouchActivate?: boolean;
+  /** Press handlers for the primary face, such as the composer's hold. The
+   *  host's own `onPrimary` decides what the release that ends a hold does.
+   *  They take presses even while `primaryDisabled`, so the face then reads
+   *  disabled through `aria-disabled`: a native disabled button gets none. */
+  primaryPressHandlers?: JSX.HTMLAttributes<HTMLButtonElement>;
   /** Full class for the caret button — usually identical to primaryClassName. */
   caretClassName: string;
   caretAriaLabel: string;
@@ -74,17 +79,20 @@ export function SplitButton(props: SplitButtonProps) {
   // A disabled button dispatches no click. WebKit still dispatches touch events
   // on it, so the disabled state has to gate the touch path by hand.
   const primaryActivate = useTouchActivated(
-    () => props.onPrimary(),
+    () => { if (!props.primaryDisabled) props.onPrimary(); },
     !!props.primaryTouchActivate && !props.primaryDisabled,
   );
   const { attrs } = props;
+  const pressableWhileDisabled = props.primaryPressHandlers !== undefined;
   return (
     <div data-row-item {...attrs} class={`split-button${open.value ? ' open' : ''}`}>
       <button
         class={`${props.primaryClassName} split-button-primary protected-surface`}
         data-tooltip={props.primaryTooltip}
         aria-label={props.primaryAriaLabel}
-        disabled={props.primaryDisabled}
+        disabled={props.primaryDisabled && !pressableWhileDisabled}
+        aria-disabled={props.primaryDisabled && pressableWhileDisabled ? 'true' : undefined}
+        {...props.primaryPressHandlers}
         onTouchStart={primaryActivate.onTouchStart}
         onTouchMove={primaryActivate.onTouchMove}
         onTouchCancel={primaryActivate.onTouchCancel}

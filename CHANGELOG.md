@@ -1,5 +1,99 @@
 # Changelog
 
+## v0.47.0 — 2026-10-07
+
+### Added
+- The Tree memory module. Each turn gets a memory view of the whole workspace and one of its own thread, and the agent can `recall` any line down to the exact message. Choose it under Settings > Memory: a confirm shows the compactor model and an estimate of calls, cost and time, and a progress bar follows the backfill to Ready. The estimate gives two times: when the tree is usable, and when it is complete. The default compactor model follows the providers you have set up: GPT-6.1 Sol, then Gemini 3.8 Flash, then Sonnet 5.5, else the chat model. Each one runs at the low tier. Classic stays the default.
+- On a Mac, Lucidos keeps the computer awake while work runs: a turn, a coding agent, a background task, a queued thread or a backup. Closing the lid or choosing Sleep still wins.
+- Copy path in the file preview toolbar copies the file's full location on disk.
+- Right-click inside a file preview for its actions menu. Over a selection or a link the system menu shows as before.
+- Alt+Up and Alt+Down (Option on a Mac) open the previous or next thread in the drawer's current list. In a text field Option+Arrow still moves the caret. Both are rebindable.
+- Plugins can require a Lucidos version. Install and Update are disabled when this Lucidos cannot run the plugin, with the reason on the row. A plugin with no requirement shows a No version requirement chip.
+- `lucidos spawn-thread --image` attaches images to the new thread.
+- The command guard and query classification can use TypeSafe Jev, Cloudflare Clef, Clef-flash or your own System One endpoint. Settings > Models > Providers gains rows for Cloudflare Workers AI and a custom endpoint.
+- Notifications that name a Settings page link to it. Agents and apps can link one with `settings:<view>`.
+- In a coding-agent thread, a sub-agent's steps fold under its Agent step. Folded, a running sub-agent shows its latest step on one line, and a finished one shows Done with its outcome mark.
+- Hover a link in a markdown preview to see where it goes: the resolved file, the heading, or the full URL.
+- Apps can keep data with `lucidos.storage`, which works like `localStorage` and is kept apart per app. Deleting an app clears its storage on that device.
+- A question card can carry the agent's message. It shows in full above the card.
+- Each model has a Reads images flag. Toggle it with the image icon on its row under Settings > Models, or in the Add Model form. Image description runs only on a model that reads images, and its picker lists only those.
+- An archived thread offers Move to Current in its menu and its composer row. It brings its sub-threads back too.
+- Cmd+F (Ctrl+F elsewhere) opens a find bar on the focused pane: an app, a text preview (source, Markdown, CSV, slides, diff or HTML) or the thread. It highlights each match and steps through them. In a thread it searches every message, older history included, and opens the turn that holds each match. Find in thread is also in the thread title menu.
+- Search Everywhere has a Text category that searches the contents of workspace files. A hit opens the file at its line.
+- With Tree memory on, Settings > System > Memory shows the summary trees: the workspace tree or any thread's, opened one level at a time down to the exact message.
+- Experimental, off by default: a home thread for each workspace. Turn it on under Settings > Appearance & Behavior > Experimental. It cannot be archived or deleted, and it is where voice calls run. Open it from the Home button at the left of the desktop thread header, or from the Lucidos menu on a phone.
+
+### Changed
+- A send, a tapped answer and a side question retry quietly on a short failure. Only when every attempt fails does Not sent appear, on the message or on the picked option, with Retry.
+- A typed answer that was not sent stays on its question card, and a reload brings it back there.
+- The drawer's Running view is now In flight. It also lists threads waiting on an event or on their sub-threads.
+- A message held behind an open question dims and says the agent reads it after your answer.
+- Popovers glide from one step to the next.
+- Voice calls run in the home thread only, so Voice needs the home thread switched on.
+- An agent answers a permission card only in its own threads. Elsewhere it needs your standing instruction, and no agent ever presses Always allow.
+- Running MCP servers share a fixed part of each request, and the conversation keeps the rest.
+- Button rows put the main action on the right.
+- Holding Send, Submit, Stop or Cancel, or pressing the Side question shortcut, turns on side-question mode and keeps your draft in the box.
+- Folders in the Files tree show a chevron that turns as the folder opens.
+- The chip on a question or permission card opens its popover once the card is answered, and the popover says when and from which device.
+- The privacy policy has a section on the lucidos.dev website and blog, also on docs.lucidos.dev.
+- Background tasks such as titles, memory and the command guard run on the providers you have set up, so they work without Vertex. Each background model picker offers every model, with the recommended ones first.
+- A blocked Archive or Delete stays in the thread menu, dimmed, with its reason. When sub-threads block it, the menu lists each one, strongest blocker first, and a tap opens it. A refused archive or delete toasts the same reason.
+- Archive all says why it kept each thread, in the menu's words.
+- A set-aside thread's Bring back is a split button with Discard behind it.
+- The Context figure in a turn's popup opens the context viewer. In a coding-agent thread, every step of one API call shows that call's context figure.
+- The sub-thread limit counts only live sub-threads, and you set it in the Thread Queue policy.
+- Usage and cost are recorded for every model call, background tasks and proxied calls included.
+- The Tree backfill runs many more calls at once and backs off on a rate limit.
+- On a Mac, Cmd+R refreshes the content pane. In a browser, Cmd+Shift+R still reloads the whole app.
+- The desktop content header shows its action buttons while they fit, and folds them into the overflow menu one at a time as the pane narrows.
+
+### Fixed
+- Typed answers and side questions render as markdown.
+- A stalled send shows Not sent after 20 seconds, and an unsent message no longer takes a turn from the one that is running.
+- An open thread catches up after the computer wakes, even when the first refresh fails.
+- A push tap on iPhone no longer flashes the blue splash screen.
+- Badge counts sit centred and round in every theme, Safari included.
+- Google Drive backups retry opening the upload with a fresh token, and say when the computer slept.
+- The webhook ingress check no longer reports an outage when the computer slept or after one short burst of refusals.
+- The command guard reads quoting the way the shell does, so a quoted path is no longer mistaken for a parent directory.
+- What's New shows a date for every release.
+- Child reports show each change's current status, and mark a change that was deleted.
+- Archiving a thread from Review lands on the next Review row.
+- A divider press that does not move no longer resizes the panes.
+- The embedding model download has time limits and follows redirects only on its own host.
+- A workspace name too long for its database is refused.
+- A health check that fails while the installed app is in the background no longer turns the connection red.
+- Relative links and heading anchors work in markdown previews, repo files included, and images load from the document's own folder.
+- A Send tapped right after a coding-agent menu pick sends the message.
+- A first message shows as in flight while its thread starts.
+- A Claude turn that ends without the tool call it announced is retried.
+- An Always allow on a command wrapped in `timeout` or a similar wrapper no longer allows every program behind that wrapper.
+- A write through a dangling symlink in a worktree is no longer auto-allowed, and a command with no readable program no longer offers Allow for this thread.
+- The local token and paired devices are no longer copied into the git history of `~/.lucidos`. Existing objects are made owner-only.
+- Deleting a thread never deletes a branch its coding agent checked out.
+- Reverting an applied change works when its range holds a merge of main.
+- Backup health reads only this workspace's archives in a shared backup folder.
+- Images sent while the agent works reach it labelled, and a failed turn keeps the images it made.
+- Stopping its own background task no longer wakes a thread.
+- Haiku 4.5 runs at the reasoning tier you pick.
+- An image whose file extension does not match its contents reaches the model with its real type.
+- A picture the agent draws before a question card, such as a mockup, now reaches you. It shows in the card's message.
+- Apply as they settle waits while a running thread's change is still incomplete, and after a Stop it waits until the turn ends.
+- A fresh install knows its models from the first start, so routing and pickers work before any model is edited.
+- A coding-agent worktree whose checkout fails is removed, so a later session cannot commit the deletion of every file.
+- A coding-agent follow-up cut off by a crash keeps its abort panel and Continue.
+- A proxy entry aimed at a local Lucidos engine is refused, so a proxied request can never act as the app.
+- An agent whose earlier sub-threads have all finished can start new ones.
+- Archiving a sub-thread moves its parent out of Current when nothing else keeps it there.
+- Archive moves to the next row, even when the thread already left the list.
+- A new thread with no text and no image is refused before the thread exists.
+- A source install whose dependency install was cut off reinstalls on the next start.
+- In the Changes panel, a click beside the commits fold opens the thread.
+- source-map-js is updated for GHSA-68fv-2mgg-jv7q.
+
+### Removed
+- Search Everywhere tabs no longer show hit counts.
 ## v0.46.1 - 2026-10-03
 
 ### Added
@@ -164,7 +258,7 @@
 - The file preview shows a load error when a repository image cannot be read.
 - On mobile, the repo diff preview scrolls the content pane, so the header hides as you scroll.
 - On mobile, a PDF in the diff preview keeps its full height.
-## v0.44.0
+## v0.44.0 — 2026-09-30
 
 ### Added
 - Set a pending change aside and bring it back later. Set aside keeps it out of Review and Apply All. It works from the Changes panel and from the thread.
@@ -198,7 +292,7 @@
 - Desktop asks before opening a local file or folder with the OS opener.
 - Plugin updates stop when the merge baselines cannot be read.
 - Dependency update: undici 7.29.0 to 7.30.0 (10 high advisories).
-## v0.43.0
+## v0.43.0 — 2026-09-29
 
 ### Added
 - New keyboard shortcuts: search files (Cmd+P), Settings (Cmd+,), keyboard shortcuts (Cmd+/), notifications (Cmd+Shift+I), focus the newest toast (Cmd+Shift+N), focus the composer (Shift+Esc), stop the running thread (Cmd+.), copy the last response (Cmd+Shift+C) and rename the thread (F2). Search everywhere moves to Cmd+K. You can rebind all of them.
@@ -234,7 +328,7 @@
 - A headless install (launchd or systemd) gets your login-shell environment, so version-manager tools and keys exported in your profile reach every engine and coding agent.
 - A question card keeps its paragraphs and lists apart, and only the closing question is bold.
 - A withdrawn coding-agent message stays gone after a Stop.
-## v0.42.1
+## v0.42.1 — 2026-09-28
 
 ### Changed
 - Settings > Appearance shows every theme in a carousel. Chips filter it by family, and chevrons page through it. On a phone it shows one card at a time, with its neighbours peeking in.
@@ -248,7 +342,7 @@
 - On an iPhone, opening the agent menu or the model picker keeps the keyboard up.
 - Thread rows in the drawer line up when one label wraps to two lines, with less space under the title.
 - The file picker for installing a workspace font follows your theme.
-## v0.42.0
+## v0.42.0 — 2026-09-28
 
 ### Added
 - Ask a side question in a coding-agent thread with `/btw <question>`. Claude Code answers on a card at the end of the thread while its turn keeps running. The answer is not saved, and Codex threads do not offer it.
@@ -271,7 +365,7 @@
 - A coding-agent session that a trigger started asks you for permission once you have answered or written in its thread.
 - An unfolding section lands without a jump.
 - Wrapped thread titles in the drawer have more line spacing.
-## v0.41.1
+## v0.41.1 — 2026-09-28
 
 ### Fixed
 - A theme with a block caret shows the block caret in the macOS app, Safari, Firefox and on iPhone. The caret follows the text, and it hides while you select text or type with an input method.

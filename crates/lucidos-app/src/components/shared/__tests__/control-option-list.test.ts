@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { wrapHighlight, selectedOptionIndex } from '../ControlOptionList';
+import { wrapHighlight, selectedOptionIndex, sectionHeadingAt } from '../ControlOptionList';
 import { offeredControlCommands } from '../../chat/CodingAgentControlMenu';
 
 describe('wrapHighlight', () => {
@@ -63,5 +63,21 @@ describe('offeredControlCommands', () => {
     const freeText = { subtype: 'set_something', label: 'Something', params: [{ key: 'mode' }] };
     expect(offeredControlCommands([...COMMANDS, freeText]).map((c) => c.subtype))
       .toEqual(['set_model', 'set_output_style']);
+  });
+});
+
+describe('sectionHeadingAt', () => {
+  const rows = [
+    { value: 'a', label: 'A', section: 'Recommended' },
+    { value: 'b', label: 'B', section: 'Recommended' },
+    { value: 'c', label: 'C', section: 'Other models' },
+  ];
+
+  it('heads each run once, where it begins', () => {
+    expect(rows.map((_, i) => sectionHeadingAt(rows, i))).toEqual(['Recommended', null, 'Other models']);
+  });
+
+  it('heads nothing in a list without sections', () => {
+    expect(sectionHeadingAt([{ value: 'a', label: 'A' }], 0)).toBeNull();
   });
 });

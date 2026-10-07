@@ -17,7 +17,7 @@ const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
 
 describe('PromptInput upload send queue', () => {
   it('queues submit while uploads are in flight before dispatchSend can run', () => {
-    const fn = promptSource.match(/async function submit\(asSideQuestion = false\)[\s\S]*?\n  \}/);
+    const fn = promptSource.match(/async function submit\(\)[\s\S]*?\n  \}/);
     expect(fn, 'submit() not found').not.toBeNull();
     const body = fn![0];
     expect(body).toMatch(/if\s*\(\s*threadId\s*&&\s*uploadInFlight\s*\)\s*\{[\s\S]*?queueUploadSend\(threadId/);
@@ -66,7 +66,7 @@ describe('PromptInput upload send queue', () => {
   // An image that failed to upload would be left out of the message without a
   // word. The refusal sits ahead of every queue and dispatch in submit.
   it('refuses a send while an image is failed, before any queue or dispatch', () => {
-    const fn = promptSource.match(/async function submit\(asSideQuestion = false\)[\s\S]*?\n  \}/);
+    const fn = promptSource.match(/async function submit\(\)[\s\S]*?\n  \}/);
     const body = fn![0];
     const refusal = body.search(/if \(threadId && uploadsGate\(threadId\) === 'failed'\) \{\s*markUploadBlockedSend\(threadId\);\s*return;/);
     expect(refusal).toBeGreaterThan(-1);

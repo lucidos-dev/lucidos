@@ -2,7 +2,7 @@ import { connectionStatus, databaseReachable, dismissToast, removeToast, showToa
 import { checkHealth } from '../../api/client';
 import type { HealthInfo } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
-import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearThreadFetchGuards, markLoadedThreadsStale } from './thread-loading';
+import { loadAllThreads, loadThreadEvents, refreshThreadEvents, retryStaleOpenThreadEvents, clearThreadFetchGuards, markLoadedThreadsStale } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
 import { runWithConcurrency } from '../../utils/concurrentPool';
 import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_FAILURE_TOAST_KEY } from './chat-changes';
@@ -17,6 +17,7 @@ import { isNewerVersion } from '../../utils/version';
 import { syncClientUpdateFromBuild } from './client-update';
 import { gatewayPickerHref } from '../../utils/basePath';
 import { postClientLog } from '../../utils/clientLog';
+import { watchPageAway } from '../../utils/pageVisit';
 
 /** True once we've been connected at least once (distinguishes initial connect from reconnect). */
 let hasEverConnected = false;
@@ -433,8 +434,15 @@ export function checkConnection(): Promise<boolean> {
   return connectionCheckInFlight;
 }
 
+/** The watch the previous probe started. Every probe re-arms it, so it tells
+ *  the next probe whether the page went away in between. */
+let awaySinceLastProbe = watchPageAway();
+
 async function runConnectionCheck(): Promise<boolean> {
   const wasConnected = connectionStatus.value === 'connected';
+  const firstSinceReturn = awaySinceLastProbe();
+  const awayDuringProbe = watchPageAway();
+  awaySinceLastProbe = awayDuringProbe;
   const healthResult = await checkHealth();
   const health = healthResult.status === 'loaded' ? healthResult.data : null;
   let connected = health !== null;
@@ -453,7 +461,9 @@ async function runConnectionCheck(): Promise<boolean> {
   // "down" for hours and we'd still display connected).
   const healthOk = connected;
   if (!connected && wasConnected) {
-    consecutiveFailures++;
+    // iOS cuts a hidden page's network, so the counter skips a failure across
+    // a hide. The probes the user can see still catch a real outage.
+    if (!awayDuringProbe()) consecutiveFailures++;
     if (consecutiveFailures <= MAX_SUPPRESSED_FAILURES) {
       connected = true;
     }
@@ -471,10 +481,11 @@ async function runConnectionCheck(): Promise<boolean> {
   // When disconnected, require multiple consecutive successes before showing connected.
   // Prevents red→green flicker when the engine flaps during restarts.
   // Skip hysteresis when started_at changed — a new started_at is a definitive signal
-  // the engine genuinely restarted, so reconnect immediately.
+  // the engine genuinely restarted, so reconnect immediately. Skip it too on the
+  // first probe after the user returns: they are looking, and the link answered.
   const prevStartedAt = engineStartedAt.value;
   const engineJustRestarted = health && prevStartedAt && health.started_at !== prevStartedAt;
-  if (connected && !wasConnected && hasEverConnected && !engineJustRestarted) {
+  if (connected && !wasConnected && hasEverConnected && !engineJustRestarted && !firstSinceReturn) {
     consecutiveSuccesses++;
     if (consecutiveSuccesses < MIN_RECONNECT_SUCCESSES) {
       connected = false;
@@ -544,9 +555,8 @@ async function runConnectionCheck(): Promise<boolean> {
     // `'unknown'` is the engine's sentinel for "couldn't read it", not a version.
     // It is what EVERY packaged install reports: the engine derives this field by
     // reading `crates/lucidos-app/VERSION` under `paths::repo_root()`, and a
-    // packaged install has no repo root. Storing the sentinel would both render as
-    // a bogus "(latest: unknown)" and clobber the real answer the packaged
-    // updater writes here (see store/actions/app-update.ts).
+    // packaged install has no repo root. Storing the sentinel would render as a
+    // bogus "(latest: unknown)".
     if (health.latest_tauri_app_version && health.latest_tauri_app_version !== 'unknown') {
       latestTauriAppVersion.value = health.latest_tauri_app_version;
       const appVersion = window.__LUCIDOS_APP_VERSION__;
@@ -559,7 +569,8 @@ async function runConnectionCheck(): Promise<boolean> {
   // Ensure SSE is connected when the engine is available.
   // Skip thread loads during restart — they'd fail and show error toasts.
   // runResumeSync() will handle all loads after the restart completes.
-  if (connected && !engineRestarting.value) {
+  // Gate on the probe itself: a suppressed failure only keeps the dot green.
+  if (connected && healthOk && !engineRestarting.value) {
     connectThreadEvents();
     // Retry thread list load if initial load failed — prevents permanent
     // blank screen when startup loadAllThreads hit a transient error.
@@ -573,14 +584,21 @@ async function runConnectionCheck(): Promise<boolean> {
       // swallow is just the rejection-tracker silencer.
       loadAllThreads().catch(() => {});
     }
-    // Recovery for focused thread with eventsLoaded=true but 0 events:
-    // loadThreadEvents may have completed before the backend committed events.
-    // Capped at MAX_EMPTY_REFRESHES to avoid polling indefinitely for
-    // legitimately empty threads. Resets when focused thread changes.
     const focusedId = focusedThreadId.value;
     if (focusedId) {
+      // The open thread is still behind: a sync point marked it, and no
+      // catch-up has landed since. On an iOS wake that catch-up can die in
+      // transport while the thread-list read beside it lands. The header then
+      // shows the new status over a transcript that stops short of it. Retry on
+      // every tick. The landed one clears the mark and makes this a no-op.
+      const catchingUp = retryStaleOpenThreadEvents(focusedId);
+      // Recovery for focused thread with eventsLoaded=true but 0 events:
+      // loadThreadEvents may have completed before the backend committed events.
+      // Capped at MAX_EMPTY_REFRESHES to avoid polling indefinitely for
+      // legitimately empty threads. Resets when focused thread changes.
+      // Skipped, uncounted, on a tick the catch-up above already covers.
       const ft = threadMap.value.get(focusedId);
-      if (ft && ft.eventsLoaded && ft.events.size === 0 && ft.pendingUserMessages.length === 0) {
+      if (!catchingUp && ft && ft.eventsLoaded && ft.events.size === 0 && ft.pendingUserMessages.length === 0) {
         // refreshThreadEvents owns its own reporting: a verdict reaches the
         // user through its single keyed card, and a transient rejection is
         // deliberately silent (the connection dot owns a sustained outage).

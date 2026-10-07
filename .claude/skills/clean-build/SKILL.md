@@ -93,7 +93,7 @@ nearly reported PASSED on a failing run.
 - If you must pipe for live tailing, use zsh's `${pipestatus[1]}` (or
   bash's `${PIPESTATUS[0]}`) and echo it after the pipeline. Print it
   on its own line so the harness summary cannot mask it.
-- When the Bash tool's `run_in_background: true` returns its summary,
+- When a backgrounded build reports its summary,
   cross-check by reading the captured log for `^error` / `^warning`
   lines — those are the source of truth for clippy/cargo. Vite and tsc
   use different prefixes; `grep -iE "(error|warning)"` catches both.
@@ -146,11 +146,14 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted on 2026-10-02.
-`too_many_arguments` gained one site, `dispatch_resolved` in
-`api/proxy.rs`, documented like its neighbours. Every other Rust category
-was unchanged, and the cfg_attr grep printed nothing. `@ts-expect-error`
-rose 12 with the test suite. The ten `eslint-disable` sites were unchanged.
+The currently-accepted categories, re-counted on 2026-10-07. The cfg_attr
+grep found one new silencer, on the test-only `label` field of
+`summary_tree/compactor_models.rs`. That run moved the labels into the test
+that reads them, and the grep now prints nothing again.
+
+Every Rust `#[allow]` category was unchanged. `@ts-expect-error` fell 3 with
+the test suite, in one fewer `*.test.ts` file. The ten `eslint-disable` sites
+were unchanged.
 
 **The first grep and the bare-allow audit both print one false hit.** It is
 `git_ops_tests/branch_queries.rs`, where `#[allow(dead_code)]` sits inside
@@ -162,7 +165,7 @@ silencers from the gateway's slowness watcher, which the first grep above
 had missed. The cfg_attr grep now covers that form.
 Anything not on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 82 sites across 51 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 83 sites across 51 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -170,9 +173,9 @@ Anything not on this list is fair game to remove and re-fix:
   the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
-  One of the 82 shares an attribute with `format_in_format_args`, which is
+  One of the 83 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
-  reports 81 across 50 files. Both numbers here count the shared attribute.
+  reports 82 across 50 files. Both numbers here count the shared attribute.
 - **`#[allow(dead_code)]`**, 4 sites: the `SpawnTrigger` taxonomy enum
   (`agent_session/spawn_dispatcher.rs`, one attribute on the enum) and test
   scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
@@ -194,10 +197,11 @@ Anything not on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 851 sites across 294 files, every one of them
-  test-only code: 281 `*.test.ts`, eleven `*.test.tsx`
+  `@types/node` in project**, 878 sites across 303 files, every one of them
+  test-only code: 289 `*.test.ts`, twelve `*.test.tsx`
   (`components/changes/__tests__/bulk-row-layout.test.tsx`,
   `components/chat/__tests__/question-card.test.tsx`,
+  `components/chat/__tests__/typed-answer-spins-on-its-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
   `components/chat/__tests__/the-bubble-pulses-before-the-words.test.tsx`,
@@ -319,9 +323,15 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
 - **Phase 4's entry chunk is no longer an exception.** It sat at 857.58 kB
   against its 600 kB ceiling until 2026-09-26, when the first-paint split
   took it to 488 kB (ADR 0288). It regrew to 600.23 kB in a week, and
-  2026-10-03 took it to 509.13 kB (ADR 0353). The entry chunk is the data
-  layer and startup. The UI is the shell chunk, loaded beside it under the
-  boot splash.
+  2026-10-03 took it to 509.13 kB (ADR 0353). By 2026-10-05 it was 553.36 kB:
+  the store imported the drawer's family graph, which pulled the whole icon
+  set in through `ThreadStatusIcon.tsx`. Splitting out
+  `components/shared/threadVisualStatus.ts` took it to 523.35 kB. On
+  2026-10-07 it measured 537.38 kB, 89.6 % of the budget, 2.6 kB from the
+  warning.
+
+  The entry chunk is the data layer and startup. The UI is the shell chunk,
+  loaded beside it under the boot splash.
 
   `entryChunkBudget` (`crates/lucidos-app/vite/entryChunkBudget.ts`) FAILS a
   single-shot `vite build` whose entry chunk passes `chunkSizeWarningLimit`,

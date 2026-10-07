@@ -449,3 +449,90 @@ completion probe.
 than rejected on merit. ADR 0087 kept it as the only instrument that sees an
 unplanted regression, and never ran one. The capture is a cheaper answer to a
 narrower question, and a human read remains available to anyone who wants it.
+
+## Amendment, 2026-10-05: an arm is a context mode and a memory module
+
+ADR 0362 makes memory a module, Classic or Tree, and gates the Tree default
+on this benchmark. So decision 15's "an arm is a context-mode configuration
+and stays one" no longer holds. An arm now has two dimensions, and one run
+can measure both modules on the same tasks, interleaved.
+
+- **Classic arms keep everything.** `control` and `lean` keep their names,
+  their seeded preferences, their result rows and their database names, byte
+  for byte. ADR 0362's invariant I2 asks that of a Classic workspace, and the
+  harness holds itself to the same.
+- **Tree arms are `control-tree` and `lean-tree`.** Each seeds one extra row,
+  `memory_module = tree`, which the seed digest excludes beside the mode's
+  three.
+- **A Tree arm is scored only on the Tree path.** The engine runs Classic
+  until a workspace's backfill completes. So the harness waits for the
+  engine's own `tree_ready` before the first task, and checks it before every
+  task. A Tree thread that recalled memory aborts the repeat, like a missing
+  panel does (decision 13).
+- **A Tree arm waits for its compactor between tasks.** A Classic arm's
+  memory work lands inside the settle wait. The compactor can outrun it, so
+  the harness waits for `summary_tree::caught_up` and records the answer on
+  the thread row.
+- **The classifier void compares arms on one module only.** A Tree turn
+  never runs memory recall, so Tree and Classic differing on it is the module.
+- **The report counts every model call per arm, by purpose.** It reads the
+  whole arm database, so compactor calls that landed after a thread settled
+  still count.
+- **Repeats stop at 99,999.** `control-tree` is five bytes longer than
+  `control`, and five fewer repeat digits keep every label at its old length.
+- **Wall time spans the agent's own rounds.** It used to span every capture on
+  the thread, auxiliary ones included. A Tree arm's compactor writes onto the
+  thread while the harness waits for it, so that span billed the wait to the
+  agent. Every arm runs the new rule, so arms within one run stay comparable.
+
+## Amendment, 2026-10-05: a repeat resumes at a task boundary
+
+A coding-agent background task stops after an hour, and one repeat of the
+whole task set runs longer. Splitting the set with `--tasks` does not help.
+T01 to T12 build on each other in one workspace, and every `run` reseeds its
+arms first.
+
+- **`run --stop-after <task>` ends an invocation after that task.** The same
+  command with a later task, or none, continues the repeat. It skips the
+  seed and boots the arm engines on the workspaces the last invocation left.
+- **A task is reached once every arm has its completion row.** The pair
+  verdict writes those last. The resume rebuilds each arm's failed set from
+  the reached tasks' thread rows, so upstream voiding works as in one run.
+- **The resume refuses a repeat cut off inside a task**, and never re-runs it. Its
+  workspaces hold half a task. Re-running from the seed would append a second
+  copy of every earlier row to the file. Rows land only once a task ends, so
+  the resume also refuses when an arm already holds a thread carrying the next
+  task's marker.
+- **The resume refuses a workspace that lost the last thread this run drove.**
+  Workspaces carry the run label, not the run id, so another run under the
+  same label reseeds them.
+- **Each continuation restarts the engines.** In-memory caches and the
+  provider's prompt cache start cold. Both arms pay it at the same task, so
+  the comparison holds, but a chunked run's cost is not one run's cost.
+
+## Amendment, 2026-10-05: a refused turn is re-posted
+
+Run `classic-vs-tree-4` lost Classic's T10 and T12 to provider refusals. The
+Vertex safety classifier withheld a whole reply on benign build-health work.
+The engine wrote `ResponseFailed` with `stop_reason: refusal`, and the thread
+settled `failed`. A refusal says nothing about the memory module under test,
+so the harness now handles it like an empty completion.
+
+- **The driver re-posts a turn that failed on a refusal with no output.** It
+  reads the turn's `ResponseFailed` events and matches the engine's own text
+  for that case. A reply the classifier cut off partway showed text, so it is
+  not re-posted.
+- **The refusal is read apart from "produced nothing".** Every refusal in run
+  4 came on the round after a tool result, so its turn had tool calls.
+- **Both faults share one budget of two re-posts per turn.** After that, a
+  refused thread keeps its `failed` status, as before. An empty one is still
+  voided.
+- **Every refused attempt and every re-post is counted on the thread row**, as
+  `refusals` and `refusal_retries`. Rows written before this read as zero.
+- **The report prints refusals per arm and per task.** A recovered refusal
+  leaves a finished thread and no other trace, so this line is what keeps it
+  visible. Every arm gets a line, so a zero is a measurement.
+
+A re-post sends the same prompt into a thread that may already hold the
+turn's partial work. Both arms run the same rule, so the comparison holds. A
+recovered turn costs more than a clean one, and its thread row carries that.

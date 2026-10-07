@@ -604,3 +604,113 @@ async fn post_blob_returns_quickly_even_when_pregeneration_is_slow() {
         "POST /blobs took {elapsed:?} — preview pre-generation must not block the response"
     );
 }
+
+fn chat_url() -> String {
+    format!("{}/api/v1/chat/stream", base_url())
+}
+
+fn inline_image(bytes: &[u8]) -> serde_json::Value {
+    use base64::Engine as _;
+    json!({ "base64": base64::engine::general_purpose::STANDARD.encode(bytes) })
+}
+
+/// An inline image on `/chat/stream` is refused exactly as an upload of the
+/// same bytes is, and before any thread exists. A caller that cannot upload
+/// first, such as `lucidos spawn-thread --image`, sends images this way.
+#[tokio::test]
+async fn chat_stream_refuses_an_inline_tiff_like_an_upload_and_starts_nothing() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
+    let thread_id = Uuid::new_v4();
+    let mut tiff = vec![0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    tiff.resize(64, 0);
+
+    let resp = client
+        .post(chat_url())
+        .json(&json!({
+            "message": "what is in this image?",
+            "mode": "human",
+            "thread_id": thread_id,
+            "new_thread": true,
+            "images": [inline_image(&png_bytes()), inline_image(&tiff)],
+        }))
+        .send()
+        .await
+        .expect("POST /chat/stream failed");
+    assert_eq!(resp.status(), 415, "a TIFF is outside the allowlist");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("TIFF"),
+        "the 415 names the format, got: {error}"
+    );
+
+    let (rows,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query");
+    assert_eq!(rows, 0, "a refused image must not leave a thread behind");
+}
+
+/// The engine sniffs an inline image, as it sniffs an upload, so the message
+/// records the stored blob and never the client's mislabel.
+#[tokio::test]
+async fn chat_stream_stores_an_inline_image_under_its_sniffed_format() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
+    let thread_id = Uuid::new_v4();
+    let bytes = png_bytes();
+    let expected_hash = sha256_hex(&bytes);
+    let mut image = inline_image(&bytes);
+    image["mime_type"] = json!("image/jpeg");
+
+    let resp = client
+        .post(chat_url())
+        .json(&json!({
+            "message": "what is in this image?",
+            "mode": "human",
+            "thread_id": thread_id,
+            "new_thread": true,
+            "images": [image],
+        }))
+        .send()
+        .await
+        .expect("POST /chat/stream failed");
+    assert_eq!(resp.status(), 200, "a PNG is accepted, whatever its label");
+
+    let blob_path = workspace_path()
+        .join("data/blobs")
+        .join(&expected_hash[..2])
+        .join(format!("{expected_hash}.png"));
+    assert!(
+        blob_path.exists(),
+        "stored as a PNG at {}",
+        blob_path.display()
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT payload FROM events WHERE event_type = 'MessageReceived' AND thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query");
+        if let Some((payload,)) = row {
+            assert_eq!(payload["user_image_hashes"], json!([expected_hash]));
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "MessageReceived never landed for {thread_id}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}

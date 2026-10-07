@@ -28,6 +28,9 @@
 // one constant, which `api/client/_core.ts` only re-exports from here anyway.
 // Same reasoning as `utils/clientLog.ts`, which stays a leaf for it.
 import { API } from './basePath';
+// The buffer cap is the engine's batch cap. When flushes fail (offline), the
+// OLDEST samples beyond it drop, and a full-buffer flush is never refused for length.
+import { CLIENT_LOG_MAX_BATCH } from '@lucidos/engine-constants';
 
 interface PerfSample {
   message: string;
@@ -39,11 +42,6 @@ interface PerfSample {
 const FLUSH_SIZE = 20;
 /** Periodic flush so low-volume samples still reach the log within ~10s. */
 const FLUSH_INTERVAL_MS = 10_000;
-/** Hard buffer cap — when flushes fail (offline), drop the OLDEST beyond this so
- *  the buffer can't grow without bound. Matches the backend batch cap
- *  (`CLIENT_LOG_MAX_BATCH` in `api/internal.rs`) so a full-buffer flush is never
- *  rejected for length; a drift just yields a 400 that fire-and-forget swallows. */
-const HARD_CAP = 100;
 
 let buffer: PerfSample[] = [];
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -184,7 +182,7 @@ export function recordPerfSample(message: string, data: Record<string, unknown>)
   if (!perfRecordingOn()) return;
   try {
     buffer.push({ message, data });
-    if (buffer.length > HARD_CAP) buffer = trimToCap(buffer, HARD_CAP);
+    if (buffer.length > CLIENT_LOG_MAX_BATCH) buffer = trimToCap(buffer, CLIENT_LOG_MAX_BATCH);
     ensureTimer();
     if (buffer.length >= FLUSH_SIZE) flushPerfQueue();
   } catch {
@@ -194,11 +192,11 @@ export function recordPerfSample(message: string, data: Record<string, unknown>)
 
 /** Re-buffer a failed flush's samples (ahead of any that arrived meanwhile) so a
  *  transient offline / engine-restart window doesn't silently drop them; bounded
- *  by HARD_CAP (drops the oldest under sustained failure). Only network failures
+ *  by CLIENT_LOG_MAX_BATCH (drops the oldest under sustained failure). Only network failures
  *  re-buffer — a 4xx means the server rejected the batch, so retrying it can't
  *  help and the samples are dropped. */
 function requeueFailed(failed: PerfSample[]): void {
-  buffer = trimToCap([...failed, ...buffer], HARD_CAP);
+  buffer = trimToCap([...failed, ...buffer], CLIENT_LOG_MAX_BATCH);
 }
 
 /** Flush the buffered samples as one batched request. `keepalive` is set for the

@@ -1,14 +1,13 @@
 //! Cache-warming downloader for the embedding model, with real byte progress.
 //!
 //! `fastembed` exposes no progress hook: `InitOptions::with_show_download_progress`
-//! only drives an indicatif bar on stderr, which no UI can read. The `hf-hub`
-//! crate underneath it does (`ApiRepo::download_with_progress` plus the
-//! [`Progress`] trait), so the engine fetches the model files ITSELF into
-//! fastembed's own cache layout and then lets
+//! only drives an indicatif bar on stderr, which no UI can read. So the engine
+//! fetches the model files ITSELF into fastembed's own cache layout and then
+//! lets
 //! [`FastEmbedProvider::with_model`](super::fastembed::FastEmbedProvider::with_model)
 //! load them warm.
 //!
-//! Two properties make that safe, and both are load-bearing:
+//! Three properties make that safe, and all are load-bearing:
 //!
 //! * **Same layout.** Everything here mirrors fastembed's `pull_from_hf`
 //!   verbatim: `HF_HOME` overrides `FASTEMBED_CACHE_DIR` overrides
@@ -22,15 +21,27 @@
 //!   object is built, through the same `Cache::repo().get()` lookup
 //!   `ApiRepo::get` performs, so a warm cache makes ZERO network requests and an
 //!   offline machine still brings memory online.
+//! * **Bounded.** Every connect and every read has a deadline ([`HubTimings`]).
+//!   `hf-hub`'s own client has none and offers no knob, so a proxy that
+//!   accepts the connection and then sends nothing blocked the load forever.
+//!   The UI then claimed a retry that never came, and the blocked thread kept
+//!   the blob lock, so no later attempt could take over.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fastembed::TextEmbedding;
-use hf_hub::api::sync::{ApiBuilder, ApiError};
+use futures::StreamExt;
 use hf_hub::api::Progress;
-use hf_hub::Cache;
+use hf_hub::{Cache, Repo};
+use reqwest::header::{
+    HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_RANGE, ETAG, LOCATION, RANGE, USER_AGENT,
+};
+use reqwest::StatusCode;
+use tokio::io::AsyncWriteExt;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// fastembed's own default when `FASTEMBED_CACHE_DIR` is unset
 /// (`fastembed::common::DEFAULT_CACHE_DIR`, relative to the process CWD).
@@ -54,14 +65,54 @@ const TOKENIZER_FILES: &[&str] = &[
     "tokenizer_config.json",
 ];
 
-/// Minimum wall-clock gap between two emitted frames. `hf-hub` calls
+/// Minimum wall-clock gap between two emitted frames. The download calls
 /// [`Progress::update`] once per read chunk, which is thousands of times a
 /// second; every frame becomes an SSE broadcast, so it has to be throttled.
 const FRAME_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How many times a held blob lock is tried before the pass reports
+/// [`CacheOutcome::PeerDownloading`]. Matches `hf_hub::api::sync::lock_file`
+/// (one try plus five retries), so both downloaders give up on a peer alike.
+const LOCK_ATTEMPTS: u32 = 6;
+
+/// Relative redirects followed while asking the hub for a file's metadata. The
+/// hub uses one or two; the cap only stops a redirect loop.
+const MAX_HUB_REDIRECTS: usize = 10;
+
+/// Response headers the hub answers a resolve request with.
+const HEADER_REPO_COMMIT: &str = "x-repo-commit";
+const HEADER_LINKED_ETAG: &str = "x-linked-etag";
+
+/// Suffix of a blob still being written and of its lock file. Both are
+/// `hf-hub`'s, so a partial file either downloader left behind resumes, and the
+/// two lock each other out.
+const PARTIAL_EXTENSION: &str = "part";
+const LOCK_EXTENSION: &str = "lock";
+
+/// The deadlines on every hub request.
+///
+/// There is deliberately no deadline on a whole download: the ONNX file is
+/// hundreds of MB, and a slow but live link must be allowed to finish. A
+/// stalled link is caught by `read` instead, which bounds each silence.
+#[derive(Clone, Copy, Debug)]
+struct HubTimings {
+    /// TCP plus TLS handshake, per connection.
+    connect: Duration,
+    /// Longest gap between two reads, headers included.
+    read: Duration,
+    /// Pause between two tries of a held blob lock.
+    lock_retry: Duration,
+}
+
+const HUB_TIMINGS: HubTimings = HubTimings {
+    connect: Duration::from_secs(30),
+    read: Duration::from_secs(60),
+    lock_retry: Duration::from_secs(1),
+};
+
 /// One throttled byte-progress reading, aggregated across every file in the
-/// download. `total_bytes` is what is KNOWN so far: `hf-hub` reveals a file's
-/// size only when that file starts, so the total grows as the set is worked
+/// download. `total_bytes` is what is KNOWN so far: a file's size is learned
+/// only when that file starts, so the total grows as the set is worked
 /// through. [`should_emit`] is what keeps that from walking the fraction
 /// backwards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,9 +194,9 @@ fn should_emit(
 
 /// Running byte totals across the whole file set.
 ///
-/// `hf-hub`'s callback contract is per-file and repeatable: `init` is called
-/// again for each `download_from` attempt (a retry re-inits and then re-advances
-/// with `update(resume_offset)`), and `finish` lands once, on the attempt that
+/// The [`Progress`] contract is per-file and repeatable: `init` may be called
+/// again for one file (a resumed download re-inits and then re-advances with
+/// `update(resume_offset)`), and `finish` lands once, on the attempt that
 /// completed. So `init` RESETS the in-flight file rather than accumulating, and
 /// only `finish` folds it into the completed total.
 #[derive(Default)]
@@ -182,10 +233,11 @@ impl DownloadState {
     }
 }
 
-/// Per-file `hf-hub` callback. `download_with_progress` takes its `Progress` by
-/// value, so one of these is handed over per file while the accumulated state
-/// stays behind in the caller. Single-threaded by construction (the whole
-/// download runs inside one blocking call), hence `RefCell` rather than a lock.
+/// Per-file progress callback, on `hf-hub`'s [`Progress`] trait. The fetch
+/// takes it by value, so one of these is handed over per file while the
+/// accumulated state stays behind in the caller. Single-threaded by
+/// construction (the files are fetched one after another on one task), hence
+/// `RefCell` rather than a lock.
 struct ProgressHandle<'a> {
     state: &'a RefCell<DownloadState>,
     observer: &'a dyn ModelDownloadObserver,
@@ -350,17 +402,353 @@ fn required_files(model_file: &str, additional_files: &[String]) -> Vec<String> 
     files
 }
 
-/// What one file's `hf-hub` result means for the pass.
+/// The hub access token `hf-hub` would send: `~/.cache/huggingface/token`,
+/// written by `huggingface-cli login`. The default models are public, so this
+/// only matters for a rate-limited or gated hub, and its absence is normal.
+fn hub_token() -> Option<String> {
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    Cache::new(PathBuf::from(home).join(".cache/huggingface/hub")).token()
+}
+
+/// One file as fetched by [`Hub::fetch_file`].
+#[derive(Debug, PartialEq, Eq)]
+enum FileFetch {
+    /// The file is in the cache now.
+    Cached,
+    /// Another process holds this lock file on the blob.
+    PeerHoldsLock(PathBuf),
+}
+
+/// What the hub says about one file before any of its bytes are read.
+#[derive(Debug)]
+struct FileMetadata {
+    /// The commit the revision resolved to, which names the snapshot.
+    commit: String,
+    /// The content hash, which names the blob.
+    etag: String,
+    size: u64,
+}
+
+/// A response header as text, or an error naming which one is missing.
+fn header<'a>(response: &'a reqwest::Response, name: &str) -> Result<&'a str, BoxError> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            format!(
+                "{} answered without a usable '{name}' header",
+                response.url()
+            )
+            .into()
+        })
+}
+
+/// A hub-supplied name that becomes a path component under the cache. A hash
+/// is all it ever is. Anything else (a `/`, a `..`, a dot that
+/// `with_extension` would cut) is refused, so nothing lands outside the repo.
+fn cache_component(kind: &str, value: &str) -> Result<String, BoxError> {
+    let clean = value.trim().replace('"', "");
+    if clean.is_empty() || !clean.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(format!("the hub sent an unusable {kind}: {value:?}").into());
+    }
+    Ok(clean)
+}
+
+/// The total after the slash in `Content-Range: bytes 0-0/<total>`.
+fn content_range_total(response: &reqwest::Response) -> Result<u64, BoxError> {
+    let range = header(response, CONTENT_RANGE.as_str())?;
+    range
+        .rsplit('/')
+        .next()
+        .and_then(|total| total.parse().ok())
+        .ok_or_else(|| {
+            format!(
+                "{} sent an unreadable Content-Range: {range}",
+                response.url()
+            )
+            .into()
+        })
+}
+
+/// A transport error with its causes. reqwest's own text stops at the top
+/// level ("error decoding response body"), which hides the timeout under it.
+fn transport_error(e: reqwest::Error) -> BoxError {
+    let mut message = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message.into()
+}
+
+/// Take the blob's lock, or `None` if another process keeps it through every
+/// try. Released when the returned file is dropped, which is what lets a
+/// failed or cancelled fetch hand the blob to the next attempt.
+async fn lock_blob(lock_path: &Path, retry: Duration) -> Result<Option<std::fs::File>, BoxError> {
+    let file = std::fs::File::create(lock_path)?;
+    for attempt in 1..=LOCK_ATTEMPTS {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        if attempt < LOCK_ATTEMPTS {
+            tokio::time::sleep(retry).await;
+        }
+    }
+    Ok(None)
+}
+
+/// Point `snapshots/<commit>/<file>` at the blob with a relative symlink, as
+/// `hf-hub` does, so the cache stays valid wherever it is moved.
+fn link_snapshot(repo_dir: &Path, metadata: &FileMetadata, file: &str) -> Result<(), BoxError> {
+    let pointer = repo_dir.join("snapshots").join(&metadata.commit).join(file);
+    if let Some(parent) = pointer.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // One `..` for the commit directory, one for `snapshots`, and one for each
+    // directory inside the file's own name.
+    let mut target = PathBuf::new();
+    for _ in 0..=Path::new(file).components().count() {
+        target.push("..");
+    }
+    target.push("blobs");
+    target.push(&metadata.etag);
+    // A link left by an interrupted earlier pass may dangle, which `exists`
+    // reads as absent, so it is replaced rather than trusted.
+    if pointer.symlink_metadata().is_ok() {
+        if pointer.exists() {
+            return Ok(());
+        }
+        std::fs::remove_file(&pointer)?;
+    }
+    std::os::unix::fs::symlink(target, &pointer)?;
+    Ok(())
+}
+
+/// The engine's client for the model hub, writing `hf-hub`'s cache layout.
+struct Hub {
+    endpoint: String,
+    /// Follows no redirects, so the hub's own headers can be read.
+    no_redirect: reqwest::Client,
+    /// Follows redirects to the CDN the bytes are served from. reqwest drops
+    /// the `Authorization` header when a redirect changes host.
+    follow: reqwest::Client,
+    lock_retry: Duration,
+}
+
+impl Hub {
+    fn new(endpoint: String, timings: HubTimings) -> Result<Self, BoxError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static(concat!("lucidos/", env!("CARGO_PKG_VERSION"))),
+        );
+        if let Some(token) = hub_token() {
+            let mut value = HeaderValue::from_str(&format!("Bearer {token}"))?;
+            value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, value);
+        }
+        // Native TLS, as `hf-hub`'s client used: it trusts the system's CA
+        // store, which is where a corporate TLS-inspecting proxy's root lives.
+        let client = |redirects: reqwest::redirect::Policy| {
+            reqwest::Client::builder()
+                .use_native_tls()
+                .default_headers(headers.clone())
+                .connect_timeout(timings.connect)
+                .read_timeout(timings.read)
+                .redirect(redirects)
+                .build()
+        };
+        Ok(Self {
+            endpoint,
+            no_redirect: client(reqwest::redirect::Policy::none())?,
+            follow: client(reqwest::redirect::Policy::default())?,
+            lock_retry: timings.lock_retry,
+        })
+    }
+
+    /// Where a file of `repo` resolves on this hub.
+    fn url(&self, repo: &Repo, file: &str) -> String {
+        format!(
+            "{}/{}/resolve/{}/{file}",
+            self.endpoint,
+            repo.url(),
+            repo.url_revision()
+        )
+    }
+
+    /// Ask for the first byte and read the answer's headers, exactly as
+    /// `hf-hub` does. Redirects that stay on the hub's origin are followed; the
+    /// first other answer carries the commit and the etag. When that answer is
+    /// a redirect to the CDN, the size comes from following it.
+    async fn metadata(&self, url: &str) -> Result<FileMetadata, BoxError> {
+        let mut current = reqwest::Url::parse(url)?;
+        let mut response = None;
+        for _ in 0..=MAX_HUB_REDIRECTS {
+            let answer = self
+                .no_redirect
+                .get(current.clone())
+                .header(RANGE, "bytes=0-0")
+                .send()
+                .await
+                .map_err(transport_error)?;
+            // Judged on the joined URL, not the header's shape: a
+            // protocol-relative `//other.host/...` parses as relative too, and
+            // following it here would send the token to that host.
+            let same_origin = answer
+                .status()
+                .is_redirection()
+                .then(|| answer.headers().get(LOCATION))
+                .flatten()
+                .and_then(|l| l.to_str().ok())
+                .and_then(|l| current.join(l).ok())
+                .filter(|next| next.origin() == current.origin());
+            match same_origin {
+                Some(next) => current = next,
+                None => {
+                    response = Some(answer);
+                    break;
+                }
+            }
+        }
+        let response = response.ok_or_else(|| format!("{url} redirected too many times"))?;
+        let status = response.status();
+        if !status.is_success() && !status.is_redirection() {
+            return Err(format!("{url} answered HTTP {status}").into());
+        }
+        let etag = match response.headers().get(HEADER_LINKED_ETAG) {
+            Some(_) => header(&response, HEADER_LINKED_ETAG)?,
+            None => header(&response, ETAG.as_str())?,
+        };
+        let etag = cache_component("etag", etag)?;
+        let commit = cache_component("commit", header(&response, HEADER_REPO_COMMIT)?)?;
+        let size = if status.is_redirection() {
+            let sized = self
+                .follow
+                .get(current)
+                .header(RANGE, "bytes=0-0")
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(transport_error)?;
+            content_range_total(&sized)?
+        } else {
+            content_range_total(&response)?
+        };
+        Ok(FileMetadata { commit, etag, size })
+    }
+
+    /// Stream the file into `partial`, resuming from whatever it already holds.
+    async fn download(
+        &self,
+        url: &str,
+        partial: &Path,
+        size: u64,
+        file: &str,
+        mut progress: impl Progress,
+    ) -> Result<(), BoxError> {
+        let mut out = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(partial)
+            .await?;
+        let mut written = out.metadata().await?.len();
+        if written > size {
+            out.set_len(0).await?;
+            written = 0;
+        }
+        progress.init(size as usize, file);
+        if written < size {
+            let response = self
+                .follow
+                .get(url)
+                .header(RANGE, format!("bytes={written}-"))
+                .send()
+                .await
+                .map_err(transport_error)?;
+            match response.status() {
+                StatusCode::PARTIAL_CONTENT => {}
+                // The server ignored the range and is sending the whole file.
+                StatusCode::OK => {
+                    out.set_len(0).await?;
+                    written = 0;
+                }
+                status => return Err(format!("{url} answered HTTP {status}").into()),
+            }
+            progress.update(written as usize);
+            let mut body = response.bytes_stream();
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.map_err(transport_error)?;
+                out.write_all(&chunk).await?;
+                written += chunk.len() as u64;
+                progress.update(chunk.len());
+            }
+            out.flush().await?;
+            if written != size {
+                return Err(format!(
+                    "the connection for {url} ended after {written} of {size} bytes"
+                )
+                .into());
+            }
+        } else {
+            progress.update(written as usize);
+        }
+        progress.finish();
+        Ok(())
+    }
+
+    /// Fetch one file of `repo` into the cache at `cache_root`, laid out as
+    /// `hf-hub` lays it out: `blobs/<etag>`, a `snapshots/<commit>/<file>`
+    /// link to it, and `refs/<revision>` naming the commit.
+    async fn fetch_file(
+        &self,
+        cache_root: &Path,
+        repo: &Repo,
+        file: &str,
+        progress: impl Progress,
+    ) -> Result<FileFetch, BoxError> {
+        let url = self.url(repo, file);
+        let metadata = self.metadata(&url).await?;
+        let repo_dir = cache_root.join(repo.folder_name());
+        let blob = repo_dir.join("blobs").join(&metadata.etag);
+        std::fs::create_dir_all(repo_dir.join("blobs"))?;
+
+        let lock_path = blob.with_extension(LOCK_EXTENSION);
+        let Some(lock) = lock_blob(&lock_path, self.lock_retry).await? else {
+            return Ok(FileFetch::PeerHoldsLock(lock_path));
+        };
+        // Blobs are named by content, so one a peer finished between this
+        // pass's cache probe and its lock is already the right bytes.
+        if !blob.exists() {
+            let partial = blob.with_extension(PARTIAL_EXTENSION);
+            self.download(&url, &partial, metadata.size, file, progress)
+                .await?;
+            std::fs::rename(&partial, &blob)?;
+        }
+        drop(lock);
+
+        link_snapshot(&repo_dir, &metadata, file)?;
+        Cache::new(cache_root.to_path_buf())
+            .repo(repo.clone())
+            .create_ref(&metadata.commit)?;
+        Ok(FileFetch::Cached)
+    }
+}
+
+/// What one file's fetch means for the pass.
 ///
-/// The split that matters is lock contention versus everything else.
-/// `download_with_progress` takes an exclusive lock on the blob for the WHOLE
-/// download and a waiter gives up after five one-second tries
-/// (`hf_hub::api::sync::lock_file`), which is nothing against a
-/// multi-hundred-MB file. So on a shared cache a parallel cold start has exactly
-/// one winner, and every other engine lands here within seconds. Treating that
-/// as a fetch failure would back each loser off for minutes and tell its user
-/// memory was degraded, for a download that is proceeding normally one process
-/// over.
+/// The split that matters is lock contention versus everything else. A fetch
+/// holds an exclusive lock on the blob for the WHOLE download. A waiter gives
+/// up after [`LOCK_ATTEMPTS`] one-second tries, which is nothing against a
+/// multi-hundred-MB file. So on a shared cache a parallel cold start has
+/// exactly one winner, and every other engine lands here within seconds.
+/// Treating that as a fetch failure would back each loser off for minutes. It
+/// would also tell its user memory was degraded, while the download proceeds
+/// normally one process over.
 ///
 /// Anything else keeps the treatment it had: wrapped so it stays fetch-class
 /// (see the two notes below) and therefore retried with backoff.
@@ -370,11 +758,11 @@ fn required_files(model_file: &str, additional_files: &[String]) -> Vec<String> 
 fn classify_download(
     model_id: &str,
     file: &str,
-    result: Result<PathBuf, ApiError>,
-) -> Result<CacheOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    result: Result<FileFetch, BoxError>,
+) -> Result<CacheOutcome, BoxError> {
     match result {
-        Ok(_) => Ok(CacheOutcome::Downloaded),
-        Err(ApiError::LockAcquisition(lock)) => {
+        Ok(FileFetch::Cached) => Ok(CacheOutcome::Downloaded),
+        Ok(FileFetch::PeerHoldsLock(lock)) => {
             log!(
                 @Memory,
                 "Another process is already fetching '{}' into the shared model cache (lock: {}); \
@@ -409,20 +797,20 @@ fn classify_download(
 /// (so a warm boot can stay silent) and whether the cache is actually complete
 /// (it is not, if a peer holds the lock).
 ///
-/// Blocking: call from `spawn_blocking`. Only the *download* happens here; the
-/// ONNX session is still built by `FastEmbedProvider::with_model`, which then
-/// finds everything local.
-pub fn ensure_model_cached(
+/// Only the *download* happens here; the ONNX session is still built by
+/// `FastEmbedProvider::with_model`, which then finds everything local. Every
+/// request is bounded by [`HUB_TIMINGS`], so this always returns.
+pub async fn ensure_model_cached(
     model_id: &str,
     observer: &dyn ModelDownloadObserver,
-) -> Result<CacheOutcome, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<CacheOutcome, BoxError> {
     let (model, _dimensions) = super::fastembed::resolve_model(model_id)?;
     let info = TextEmbedding::get_model_info(&model)?;
     let files = required_files(&info.model_file, &info.additional_files);
     let dir = cache_dir();
 
     // Local-first probe, using the same lookup `ApiRepo::get` performs. Done
-    // BEFORE any `ApiBuilder`, so a fully warm cache touches the network zero
+    // BEFORE the hub client is built, so a fully warm cache touches the network zero
     // times rather than paying a metadata request per file.
     let cache_repo = Cache::new(dir.clone()).model(info.model_code.clone());
     let missing: Vec<&String> = files
@@ -441,24 +829,22 @@ pub fn ensure_model_cached(
         dir.display()
     );
 
-    let api = ApiBuilder::new()
-        .with_cache_dir(dir)
-        .with_endpoint(endpoint())
-        // Our observer IS the progress reporting; hf-hub's own indicatif bar
-        // would just scribble on the engine log.
-        .with_progress(false)
-        .build()?;
-    let repo = api.model(info.model_code.clone());
+    let hub = Hub::new(endpoint(), HUB_TIMINGS)?;
+    let repo = Repo::model(info.model_code.clone());
 
     let state = RefCell::new(DownloadState::default());
     for file in missing {
-        let fetched = repo.download_with_progress(
-            file,
-            ProgressHandle {
-                state: &state,
-                observer,
-            },
-        );
+        let fetched = hub
+            .fetch_file(
+                &dir,
+                &repo,
+                file,
+                ProgressHandle {
+                    state: &state,
+                    observer,
+                },
+            )
+            .await;
         // The peer case leaves WITHOUT a terminal frame, deliberately: this pass
         // did not complete the set, and reporting 100% for a cache that is still
         // missing files would be a lie the next pass has to walk back.
@@ -767,7 +1153,7 @@ mod tests {
         let locked = classify_download(
             DEFAULT_MODEL_FOR_TESTS,
             "onnx/model.onnx",
-            Err(ApiError::LockAcquisition(PathBuf::from(
+            Ok(FileFetch::PeerHoldsLock(PathBuf::from(
                 "/cache/blobs/abc.lock",
             ))),
         )
@@ -782,7 +1168,7 @@ mod tests {
         let err = classify_download(
             DEFAULT_MODEL_FOR_TESTS,
             "onnx/model.onnx",
-            Err(ApiError::InvalidResume),
+            Err("operation timed out".into()),
         )
         .expect_err("a real fetch failure must stay an error");
         assert!(
@@ -801,11 +1187,261 @@ mod tests {
             classify_download(
                 DEFAULT_MODEL_FOR_TESTS,
                 "tokenizer.json",
-                Ok(PathBuf::from("/cache/snapshots/deadbeef/tokenizer.json"))
+                Ok(FileFetch::Cached)
             )
             .expect("a completed download is not an error"),
             CacheOutcome::Downloaded
         );
+    }
+
+    const FAKE_REPO: &str = "example-org/tiny-model";
+    const FAKE_COMMIT: &str = "c0ffee";
+    const FAKE_ETAG: &str = "abc123";
+    const FAKE_BLOB_LEN: usize = 1000;
+
+    fn fake_blob() -> Vec<u8> {
+        (0..FAKE_BLOB_LEN).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// How the fake hub answers a body request.
+    #[derive(Clone, Copy)]
+    enum FakeBody {
+        Whole,
+        /// Send this many bytes, then keep the connection open in silence: a
+        /// proxy that blackholes the rest.
+        StallAfter(usize),
+    }
+
+    /// A one-file hub on loopback, speaking just enough HTTP/1.1. The metadata
+    /// probe (`Range: bytes=0-0`) gets the hub's headers, and any other request
+    /// gets the blob from its range start, per `body`.
+    async fn fake_hub(body: FakeBody) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve_fake_hub(stream, body));
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn serve_fake_hub(stream: tokio::net::TcpStream, body: FakeBody) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut stream = BufReader::new(stream);
+        let blob = fake_blob();
+        loop {
+            let mut range = None;
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let line = line.trim_end().to_ascii_lowercase();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("range: bytes=") {
+                    range = Some(value.to_string());
+                }
+            }
+            let out = stream.get_mut();
+            if range.as_deref() == Some("0-0") {
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\n{HEADER_REPO_COMMIT}: {FAKE_COMMIT}\r\n\
+                     etag: \"{FAKE_ETAG}\"\r\ncontent-range: bytes 0-0/{FAKE_BLOB_LEN}\r\n\
+                     content-length: 1\r\n\r\n"
+                );
+                let _ = out.write_all(head.as_bytes()).await;
+                let _ = out.write_all(&blob[..1]).await;
+                continue;
+            }
+            let start: usize = range
+                .as_deref()
+                .and_then(|r| r.split('-').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let rest = &blob[start..];
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes {start}-{}/{FAKE_BLOB_LEN}\r\n\
+                 content-length: {}\r\n\r\n",
+                FAKE_BLOB_LEN - 1,
+                rest.len()
+            );
+            let _ = out.write_all(head.as_bytes()).await;
+            match body {
+                FakeBody::Whole => {
+                    let _ = out.write_all(rest).await;
+                }
+                FakeBody::StallAfter(sent) => {
+                    let _ = out.write_all(&rest[..sent]).await;
+                    let _ = out.flush().await;
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+
+    /// Fetch the fake repo's `file` into `cache`, with `read` as the silence
+    /// deadline and a lock retry short enough for a test.
+    async fn fetch_fake(
+        cache: &Path,
+        endpoint: String,
+        read: Duration,
+        file: &str,
+        observer: &dyn ModelDownloadObserver,
+    ) -> Result<FileFetch, BoxError> {
+        let timings = HubTimings {
+            connect: Duration::from_secs(5),
+            read,
+            lock_retry: Duration::from_millis(10),
+        };
+        let hub = Hub::new(endpoint, timings).expect("build hub client");
+        let state = RefCell::new(DownloadState::default());
+        hub.fetch_file(
+            cache,
+            &Repo::model(FAKE_REPO.to_string()),
+            file,
+            ProgressHandle {
+                state: &state,
+                observer,
+            },
+        )
+        .await
+    }
+
+    fn fake_blobs_dir(cache: &Path) -> PathBuf {
+        cache
+            .join(Repo::model(FAKE_REPO.to_string()).folder_name())
+            .join("blobs")
+    }
+
+    /// The regression the deadlines exist for: a proxy that starts the body and
+    /// then goes silent. Without a read deadline this fetch never returns. The
+    /// loader then never counts a failed attempt, and the UI sits on its last
+    /// progress frame for the life of the process.
+    ///
+    /// The lock half matters as much. A fetch stuck holding the blob lock made
+    /// every later attempt read it as a peer download, forever.
+    #[tokio::test]
+    async fn a_body_that_goes_silent_fails_fetch_class_and_frees_the_blob() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let endpoint = fake_hub(FakeBody::StallAfter(100)).await;
+        let observer = RecordingObserver::default();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            fetch_fake(
+                cache.path(),
+                endpoint,
+                Duration::from_millis(300),
+                "onnx/model.onnx",
+                &observer,
+            ),
+        )
+        .await
+        .expect("the fetch hung on a silent connection instead of timing out");
+
+        let err = classify_download(DEFAULT_MODEL_FOR_TESTS, "onnx/model.onnx", result)
+            .expect_err("a stalled download must fail");
+        assert!(
+            super::super::fastembed::is_model_fetch_failure(err.as_ref()),
+            "a stall must stay fetch-class so the loader retries: {err}"
+        );
+        assert!(
+            !observer.frames().is_empty(),
+            "the download reported progress before it stalled"
+        );
+        let lock = std::fs::File::create(
+            fake_blobs_dir(cache.path()).join(format!("{FAKE_ETAG}.{LOCK_EXTENSION}")),
+        )
+        .expect("open lock file");
+        lock.try_lock()
+            .expect("a failed fetch must release the blob lock for the next attempt");
+    }
+
+    /// The layout invariant against `hf-hub`'s own reader, which is what
+    /// fastembed loads through: the file must be found by `CacheRepo::get`,
+    /// through a nested name, with the bytes the hub sent.
+    #[tokio::test]
+    async fn a_fetched_file_is_where_hf_hubs_cache_lookup_finds_it() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let endpoint = fake_hub(FakeBody::Whole).await;
+        let observer = RecordingObserver::default();
+
+        let fetched = fetch_fake(
+            cache.path(),
+            endpoint,
+            Duration::from_secs(5),
+            "onnx/model.onnx",
+            &observer,
+        )
+        .await
+        .expect("fetch from the fake hub");
+        assert_eq!(fetched, FileFetch::Cached);
+
+        let found = Cache::new(cache.path().to_path_buf())
+            .model(FAKE_REPO.to_string())
+            .get("onnx/model.onnx")
+            .expect("hf-hub's cache lookup must find the fetched file");
+        assert_eq!(std::fs::read(found).expect("read cached file"), fake_blob());
+    }
+
+    /// A partial blob left by an earlier, interrupted pass is continued from
+    /// its end rather than fetched again.
+    #[tokio::test]
+    async fn a_partial_blob_resumes_where_it_stopped() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let blobs = fake_blobs_dir(cache.path());
+        std::fs::create_dir_all(&blobs).expect("blobs dir");
+        std::fs::write(
+            blobs.join(format!("{FAKE_ETAG}.{PARTIAL_EXTENSION}")),
+            &fake_blob()[..400],
+        )
+        .expect("seed partial blob");
+        let endpoint = fake_hub(FakeBody::Whole).await;
+        let observer = RecordingObserver::default();
+
+        fetch_fake(
+            cache.path(),
+            endpoint,
+            Duration::from_secs(5),
+            "tokenizer.json",
+            &observer,
+        )
+        .await
+        .expect("resume from the fake hub");
+
+        assert_eq!(
+            std::fs::read(blobs.join(FAKE_ETAG)).expect("read blob"),
+            fake_blob()
+        );
+    }
+
+    /// A lock some other holder keeps is a peer's download, not a failure.
+    #[tokio::test]
+    async fn a_blob_locked_elsewhere_is_reported_as_a_peer() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let blobs = fake_blobs_dir(cache.path());
+        std::fs::create_dir_all(&blobs).expect("blobs dir");
+        let lock_path = blobs.join(format!("{FAKE_ETAG}.{LOCK_EXTENSION}"));
+        let held = std::fs::File::create(&lock_path).expect("create lock file");
+        held.try_lock().expect("take the lock first");
+        let endpoint = fake_hub(FakeBody::Whole).await;
+        let observer = RecordingObserver::default();
+
+        let fetched = fetch_fake(
+            cache.path(),
+            endpoint,
+            Duration::from_secs(5),
+            "onnx/model.onnx",
+            &observer,
+        )
+        .await
+        .expect("a held lock is not an error");
+        assert_eq!(fetched, FileFetch::PeerHoldsLock(lock_path));
     }
 
     /// The shared location: an explicit `XDG_CACHE_HOME` wins, else
@@ -977,9 +1613,13 @@ mod tests {
         use super::super::provider::EmbeddingProvider;
         use super::super::FastEmbedProvider;
 
+        // The env tests in this module repoint the cache while they run, which
+        // would send this download into their temporary directories.
+        let _guard = env_lock();
         let model_id = model_id_from_env();
         let observer = RecordingObserver::default();
-        let outcome = match ensure_model_cached(&model_id, &observer) {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let outcome = match runtime.block_on(ensure_model_cached(&model_id, &observer)) {
             Ok(outcome) => outcome,
             // Same resilience contract as `shared_embedder()`: a HuggingFace
             // outage skips, it never reds the suite. A non-fetch error is a
@@ -1045,7 +1685,9 @@ mod tests {
         // ...and with everything present, a second pass is a pure no-op.
         let second = RecordingObserver::default();
         assert_eq!(
-            ensure_model_cached(&model_id, &second).expect("warm pass must not fail"),
+            runtime
+                .block_on(ensure_model_cached(&model_id, &second))
+                .expect("warm pass must not fail"),
             CacheOutcome::AlreadyCached,
             "a warm cache must report nothing fetched"
         );

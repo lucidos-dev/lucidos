@@ -90,11 +90,11 @@ impl SpokenLanguage {
 
 /// This workspace's spoken language, or `None` when Locale is on Auto.
 ///
-/// A read error reads as unset, for the reason `read_pref` gives: a session
-/// that will not open over one unreachable row is worse than one that guesses
-/// the language.
+/// A read error reads as unset: a session that will not open over one
+/// unreachable row is worse than one that guesses the language.
 pub async fn for_workspace(pool: &PgPool) -> Option<SpokenLanguage> {
-    super::read_pref(pool, "language")
+    crate::core::prefs::LANGUAGE
+        .read(pool)
         .await
         .as_deref()
         .and_then(SpokenLanguage::resolve)

@@ -25,7 +25,9 @@ import {
   threadMap,
 } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
-import { collectThreadFamily } from './threads';
+import { blockedRefusal, blockerFromMembers } from './blockerCopy';
+import { collectThreadFamily } from './threadFamily';
+import { showBlockedToast } from './threads';
 import { resolveThreadActions } from './threadActions';
 import { dropDeletedThreads } from './threads-drop';
 
@@ -72,6 +74,12 @@ export function deleteConfirmation(
       + 'it keeps only one copy.',
     );
   }
+  if (preflight.summary_rebuild_count > 0) {
+    const n = preflight.summary_rebuild_count;
+    const summaries = n === 1 ? '1 summary tree line' : `${n} summary tree lines`;
+    const calls = n === 1 ? '1 background model call' : `${n} background model calls`;
+    paragraphs.push(`Lucidos will rebuild ${summaries} this thread fed into, which costs about ${calls}.`);
+  }
   if (preflight.has_unapplied_branch_work) {
     paragraphs.push("Work on this thread's branch that you never applied goes too.");
   }
@@ -104,56 +112,23 @@ export function deleteConfirmation(
   return { title, message: paragraphs.join('\n\n'), details };
 }
 
-/** What a blocking member's `reason` slug means, as the tail of a sentence. */
-const BLOCKER_PHRASE: Record<string, string> = {
-  running: 'is still running',
-  waiting_for_user_answer: 'is waiting for your answer',
-  pending_change: 'has a pending change to apply or discard',
-  agent_session_live: 'still has a coding agent running',
-};
+/** The title of a refused delete's toast. */
+const DELETE_REFUSED = "Can't delete yet";
 
-/** What the user is told when the engine refuses the cascade.
- *
- *  The 409 body is the shape archive answers with, and the reasons overlap, so
- *  a bare "409" (empty `statusText`, no `body.error`) would tell them nothing.
- *
- *  `target` is what makes a one-blocker refusal honest. The engine's `blocking`
- *  list covers the whole family, the target included. Reporting every entry as
- *  a sub-thread told a childless thread one of its sub-threads was busy.
- */
-export function formatDeleteErrorToast(err: unknown, target?: string): string {
-  if (err instanceof ApiError && err.body && typeof err.body === 'object') {
-    const body = err.body as Record<string, unknown>;
-    if (err.httpCode === 403 || err.httpCode === 401) {
-      return 'Only a signed-in device can delete a thread.';
-    }
-    if (body.reason === 'descendants_blocking') {
-      const blocking = (Array.isArray(body.blocking) ? body.blocking : []) as {
-        thread_id?: string;
-        title?: string | null;
-        reason?: string;
-      }[];
-      if (blocking.length > 1) {
-        return `Can't delete yet, ${blocking.length} threads in this family are still busy`;
-      }
-      const only = blocking[0];
-      const phrase = BLOCKER_PHRASE[only?.reason ?? ''] ?? 'is still busy';
-      if (only?.thread_id && only.thread_id === target) {
-        return `Can't delete, this thread ${phrase}`;
-      }
-      const named = only?.title?.trim();
-      return named
-        ? `Can't delete yet, "${named}" ${phrase}`
-        : `Can't delete yet, a sub-thread ${phrase}`;
-    }
-    if (body.reason === 'parent_not_deletable') {
-      return body.parent_status === 'waiting_for_user_answer'
-        ? "Can't delete, this thread is waiting for your answer"
-        : "Can't delete, this thread is still running";
-    }
-    if (body.reason === 'parent_has_pending_changes') {
-      return "Can't delete, apply or discard the pending change first";
-    }
+/** Tell the user why the delete failed. A cascade refusal names its blocker
+ *  (ADR 0378); the owner gate and anything unstructured need their own words. */
+export function showDeleteError(err: unknown, threadId: string): void {
+  const refusal = blockedRefusal(err, threadId);
+  if (refusal) {
+    showBlockedToast(DELETE_REFUSED, refusal);
+    return;
+  }
+  showToast(formatDeleteErrorToast(err), 'error');
+}
+
+export function formatDeleteErrorToast(err: unknown): string {
+  if (err instanceof ApiError && (err.httpCode === 403 || err.httpCode === 401)) {
+    return 'Only a signed-in device can delete a thread.';
   }
   return `Failed to delete thread: ${errorDetail(err)}`;
 }
@@ -171,16 +146,13 @@ export async function handleDeleteThread(threadId: string): Promise<void> {
   try {
     preflight = await deletePreflight(threadId);
   } catch (e) {
-    showToast(formatDeleteErrorToast(e, threadId), 'error');
+    showDeleteError(e, threadId);
     return;
   }
 
-  if (preflight.blocked_by.length > 0) {
-    const refusal = new ApiError(409, 'blocked', {
-      reason: 'descendants_blocking',
-      blocking: preflight.blocked_by,
-    });
-    showToast(formatDeleteErrorToast(refusal, threadId), 'error');
+  const blocked = blockerFromMembers(preflight.blocked_by, threadId);
+  if (blocked) {
+    showBlockedToast(DELETE_REFUSED, blocked);
     return;
   }
 
@@ -220,6 +192,6 @@ export async function handleDeleteThread(threadId: string): Promise<void> {
     const result = await deleteThreadFamily(threadId);
     dropDeletedThreads(result.deleted.length > 0 ? result.deleted : [...family]);
   } catch (e) {
-    showToast(formatDeleteErrorToast(e, threadId), 'error');
+    showDeleteError(e, threadId);
   }
 }

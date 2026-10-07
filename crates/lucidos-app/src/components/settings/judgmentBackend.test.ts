@@ -1,22 +1,25 @@
+import { FLAG_OFF_VALUES, FLAG_ON_VALUES } from '@lucidos/preference-catalog';
 import { describe, it, expect } from 'vitest';
 import {
   CHAT,
-  JEV,
-  JEV_MODEL_LABEL,
-  JEV_MODEL_VALUE,
   JUDGMENT_MODEL_KEY,
   JUDGMENT_PREFERENCE_KEY,
   JUDGMENT_REASONING_KEY,
-  jevConsumers,
-  jevRowOffered,
+  SYSTEM_ONE_ENDPOINTS,
   judgmentModelChoices,
   judgmentPickWrites,
   judgmentSelectedEffort,
   judgmentSelectedModel,
   judgmentSelectionCaveat,
-  typeSafeKeyStored,
-  typeSafeSwitchedOff,
-  wantsJev,
+  offeredEndpoints,
+  pickedEndpoint,
+  systemOneConfigured,
+  systemOneConsumers,
+  systemOneSwitchedOff,
+  workersAiAccount,
+  workersAiScope,
+  type SystemOneEndpointSpec,
+  type SystemOneProviderId,
 } from './judgmentBackend';
 import type { ModelChoice } from '../../store/modelSelection';
 import type { AuthType, CredentialInfo, Loadable } from '../../store/types';
@@ -32,27 +35,39 @@ function cred(service_name: string, auth_type: AuthType = 'api_key'): Credential
   } as CredentialInfo;
 }
 
-function loaded(data: CredentialInfo[]): Loadable<CredentialInfo[]> {
+function loaded<T>(data: T): Loadable<T> {
   return { status: 'loaded', data };
 }
 
-describe('wantsJev', () => {
-  /** The same two words the engine's `wants_jev` matches. Drift here shows a
-   *  switch position the engine does not act on. */
-  it('accepts only the word jev, forgiving case and space', () => {
-    expect(wantsJev('jev')).toBe(true);
-    expect(wantsJev('  JEV  ')).toBe(true);
-    expect(wantsJev('Jev')).toBe(true);
+const NO_PREFS = loaded<Record<string, string>>({});
+
+function endpoint(id: SystemOneEndpointSpec['id']): SystemOneEndpointSpec {
+  const found = SYSTEM_ONE_ENDPOINTS.find((e) => e.id === id);
+  if (!found) throw new Error(`no endpoint ${id}`);
+  return found;
+}
+
+describe('pickedEndpoint', () => {
+  /** The same ids the engine's `SystemOneEndpoint::from_id` matches. Drift here
+   *  shows a backend the engine does not act on. */
+  it('reads every row id, forgiving case and space', () => {
+    expect(pickedEndpoint('jev')?.id).toBe('jev');
+    expect(pickedEndpoint('  JEV  ')?.id).toBe('jev');
+    expect(pickedEndpoint('clef')?.id).toBe('clef');
+    expect(pickedEndpoint('Clef-Flash')?.id).toBe('clef-flash');
+    expect(pickedEndpoint('custom')?.id).toBe('custom');
   });
 
   it('reads every other value as chat', () => {
-    expect(wantsJev('chat')).toBe(false);
-    expect(wantsJev('')).toBe(false);
-    expect(wantsJev('   ')).toBe(false);
-    expect(wantsJev('jevvy')).toBe(false);
-    expect(wantsJev('typesafe')).toBe(false);
-    expect(wantsJev(undefined)).toBe(false);
-    expect(wantsJev(null)).toBe(false);
+    for (const value of ['chat', '', '   ', 'jevvy', 'typesafe', undefined, null]) {
+      expect(pickedEndpoint(value), String(value)).toBeNull();
+    }
+  });
+
+  /** Each row's picker value is distinct, so a pick names exactly one row. */
+  it('gives every row its own picker value', () => {
+    const values = SYSTEM_ONE_ENDPOINTS.map((e) => e.choice.value);
+    expect(new Set(values).size).toBe(values.length);
   });
 });
 
@@ -65,8 +80,6 @@ describe('JUDGMENT_PREFERENCE_KEY', () => {
       .toBe('judgment_query_classification');
   });
 
-  /** Each site's chat path runs its own *model selection*. Sharing one pair
-   *  across both would move the command guard's judge from a Models page. */
   it('pairs each site with its own model and reasoning keys', () => {
     expect(JUDGMENT_MODEL_KEY['command-guard']).toBe('model_command_judge');
     expect(JUDGMENT_REASONING_KEY['command-guard']).toBe('reasoning_command_judge');
@@ -76,187 +89,197 @@ describe('JUDGMENT_PREFERENCE_KEY', () => {
   });
 });
 
-describe('typeSafeKeyStored', () => {
-  it('sees a stored typesafe credential', () => {
-    expect(typeSafeKeyStored(loaded([cred('typesafe')]))).toBe(true);
+describe('systemOneConfigured', () => {
+  it('sees a stored key for TypeSafe and Cloudflare', () => {
+    expect(systemOneConfigured('typesafe', loaded([cred('typesafe')]), NO_PREFS)).toBe(true);
+    expect(systemOneConfigured('cloudflare-workers-ai', loaded([cred('cloudflare-workers-ai')]), NO_PREFS))
+      .toBe(true);
+    expect(systemOneConfigured('cloudflare-workers-ai', loaded([cred('typesafe')]), NO_PREFS))
+      .toBe(false);
   });
 
-  it('is false for another service, or while credentials are loading', () => {
-    expect(typeSafeKeyStored(loaded([cred('openai')]))).toBe(false);
-    expect(typeSafeKeyStored(loaded([]))).toBe(false);
-    expect(typeSafeKeyStored({ status: 'loading' })).toBe(false);
+  it('is false while credentials load, or for an oauth_client row of the same name', () => {
+    expect(systemOneConfigured('typesafe', { status: 'loading' }, NO_PREFS)).toBe(false);
+    expect(systemOneConfigured('typesafe', loaded([cred('typesafe', 'oauth_client')]), NO_PREFS))
+      .toBe(false);
   });
 
-  /** An OAuth client registration may share the name. Counting one would
-   *  promise a key the engine never reads. */
-  it('ignores an oauth_client row of the same name', () => {
-    expect(typeSafeKeyStored(loaded([cred('typesafe', 'oauth_client')]))).toBe(false);
+  /** A self-hosted model often takes no key, so the URL and model set it up.
+   *  The engine refuses a row with no model, so the page must not offer one. */
+  it('reads the custom endpoint as set up by its URL and model, no key needed', () => {
+    const url = 'http://localhost:8000/v1/systemone';
+    const both = loaded({ system_one_custom_url: url, system_one_custom_model: 'kev' });
+    expect(systemOneConfigured('system-one-custom', loaded([]), both)).toBe(true);
+    expect(systemOneConfigured('system-one-custom', loaded([]), loaded({ system_one_custom_url: url })))
+      .toBe(false);
+    expect(systemOneConfigured('system-one-custom', loaded([cred('system-one-custom')]), NO_PREFS))
+      .toBe(false);
   });
 });
 
-describe('typeSafeSwitchedOff', () => {
-  const stored = (value?: string) => typeSafeSwitchedOff({
-    status: 'loaded',
-    data: value === undefined ? {} : { provider_enabled_typesafe: value },
-  });
+describe('systemOneSwitchedOff', () => {
+  const stored = (provider: SystemOneProviderId, key: string, value?: string) =>
+    systemOneSwitchedOff(loaded(value === undefined ? {} : { [key]: value }), provider);
 
-  /** Absent means on, the rule every `provider_enabled_*` key follows. Reading
-   *  unset as off would switch Jev dark on every workspace already using it. */
+  /** Absent means on, the rule every `provider_enabled_*` key follows. */
   it('is false while unset, set to true, or still loading', () => {
-    expect(stored()).toBe(false);
-    expect(stored('true')).toBe(false);
-    expect(typeSafeSwitchedOff({ status: 'loading' })).toBe(false);
+    expect(stored('typesafe', 'provider_enabled_typesafe')).toBe(false);
+    expect(stored('typesafe', 'provider_enabled_typesafe', 'true')).toBe(false);
+    expect(systemOneSwitchedOff({ status: 'loading' }, 'typesafe')).toBe(false);
   });
 
-  it('is true once the switch says false', () => {
-    expect(stored('false')).toBe(true);
-  });
-
-  /** The engine's `reads_as_false` takes four spellings, and nothing corrects
-   *  this side: TypeSafe has no `/health` row. A value only the engine calls
-   *  off would draw the row live while it ran chat. */
-  it('reads every spelling the engine reads as off', () => {
-    for (const value of ['0', 'no', 'off', 'OFF', '  false  ']) {
-      expect(stored(value), `${value} must read as off`).toBe(true);
+  /** The engine's `prefs::parse_flag` takes every spelling in
+   *  `FLAG_OFF_VALUES`, in any case and padding, and nothing corrects this
+   *  side: a System One provider has no `/health` row. */
+  it('reads every spelling the engine reads as off, on each provider’s own key', () => {
+    for (const spelled of FLAG_OFF_VALUES) {
+      for (const value of [spelled, spelled.toUpperCase(), `  ${spelled}  `]) {
+        expect(stored('typesafe', 'provider_enabled_typesafe', value), value).toBe(true);
+      }
     }
-  });
-
-  it('still reads an unrecognized word as on, like the engine', () => {
-    expect(stored('nope')).toBe(false);
-    expect(stored('')).toBe(false);
+    for (const value of FLAG_ON_VALUES) {
+      expect(stored('typesafe', 'provider_enabled_typesafe', value), value).toBe(false);
+    }
+    expect(stored('cloudflare-workers-ai', 'provider_enabled_cloudflare_workers_ai', 'false')).toBe(true);
+    expect(stored('system-one-custom', 'provider_enabled_system_one_custom', 'false')).toBe(true);
+    expect(stored('cloudflare-workers-ai', 'provider_enabled_typesafe', 'false')).toBe(false);
   });
 });
 
-describe('jevConsumers', () => {
-  const none: Loadable<Record<string, string>> = { status: 'loaded', data: {} };
-
+describe('systemOneConsumers', () => {
   /** The tool has no preference of its own: a stored key IS its condition
-   *  (ADR 0223). So it is listed where no classification has moved at all. */
-  it('lists the judge tool on a key alone, ahead of any site', () => {
-    expect(jevConsumers(none, true)).toEqual(['The agent’s judge tool']);
+   *  (ADR 0223). So it is listed where no site has moved at all. */
+  it('lists the judge tool for TypeSafe on a key alone, ahead of any site', () => {
+    expect(systemOneConsumers('typesafe', NO_PREFS, true)).toEqual(['The agent’s judge tool']);
+    expect(systemOneConsumers('typesafe', NO_PREFS, false)).toEqual([]);
   });
 
-  /** Without a key the fold is open only because the user pressed to peek at
-   *  the fields. Nothing is running, so nothing may be named. */
-  it('names nothing at all with no key stored', () => {
-    expect(jevConsumers(none, false)).toEqual([]);
+  it('never lists the judge tool for another provider', () => {
+    expect(systemOneConsumers('cloudflare-workers-ai', NO_PREFS, true)).toEqual([]);
   });
 
-  it('adds each site that has been switched over', () => {
-    const both: Loadable<Record<string, string>> = {
-      status: 'loaded',
-      data: { judgment_command_guard: JEV, judgment_query_classification: JEV },
-    };
-    expect(jevConsumers(both, true)).toEqual([
-      'The agent’s judge tool',
-      'Command guard',
-      'Query classification',
-    ]);
+  it('names each site picked on that provider, and only those', () => {
+    const prefs = loaded({ judgment_command_guard: 'clef-flash', judgment_query_classification: 'jev' });
+    expect(systemOneConsumers('cloudflare-workers-ai', prefs, true)).toEqual(['Command guard']);
+    expect(systemOneConsumers('typesafe', prefs, true))
+      .toEqual(['The agent’s judge tool', 'Query classification']);
   });
 });
 
-describe('jevRowOffered', () => {
-  /** ADR 0220's no-change promise, seen from the picker. A workspace with no
-   *  TypeSafe key must see exactly the models it saw before Jev existed. */
-  it('is absent with no key stored', () => {
-    expect(jevRowOffered({ onJev: false, keyStored: false, typeSafeOff: false })).toBe(false);
+describe('offeredEndpoints', () => {
+  const ids = (args: Parameters<typeof offeredEndpoints>[0]) =>
+    offeredEndpoints(args).map((e) => e.id);
+
+  /** ADR 0363's no-change promise, seen from the picker. A workspace with no
+   *  System One provider set up sees exactly the models it saw before. */
+  it('offers nothing with no provider set up', () => {
+    expect(ids({ picked: null, configured: () => false, switchedOff: () => false })).toEqual([]);
   });
 
-  it('appears once a key is stored and the provider is on', () => {
-    expect(jevRowOffered({ onJev: false, keyStored: true, typeSafeOff: false })).toBe(true);
+  it('offers every row of each provider that is set up and on', () => {
+    expect(ids({
+      picked: null,
+      configured: (p) => p === 'cloudflare-workers-ai',
+      switchedOff: () => false,
+    })).toEqual(['clef', 'clef-flash']);
   });
 
-  /** A switched-off provider offers no models, the same way an unconfigured
-   *  one offers none. */
-  it('is absent while TypeSafe is switched off', () => {
-    expect(jevRowOffered({ onJev: false, keyStored: true, typeSafeOff: true })).toBe(false);
+  it('offers no row of a switched-off provider', () => {
+    expect(ids({ picked: null, configured: () => true, switchedOff: (p) => p === 'typesafe' }))
+      .toEqual(['clef', 'clef-flash', 'custom']);
   });
 
-  /** The engine falls back to the launch environment, which this page cannot
-   *  see. Without the row, such a workspace renders a selection it can never
-   *  change. */
-  it('is offered to a site already on Jev with no stored key', () => {
-    expect(jevRowOffered({ onJev: true, keyStored: false, typeSafeOff: false })).toBe(true);
-  });
-
-  /** Same reason, one layer up: the selection is still Jev, so there has to be
-   *  a way off it even with the provider parked. */
-  it('is offered to a site already on Jev while TypeSafe is switched off', () => {
-    expect(jevRowOffered({ onJev: true, keyStored: true, typeSafeOff: true })).toBe(true);
+  /** The engine reads `TYPESAFE_API_KEY`, which this page cannot see. Without
+   *  the row, such a workspace renders a selection it can never change. */
+  it('always offers the row the site is on', () => {
+    expect(ids({ picked: endpoint('jev'), configured: () => false, switchedOff: () => true }))
+      .toEqual(['jev']);
   });
 });
 
 describe('judgmentModelChoices', () => {
   const base: ModelChoice[] = [
-    { value: 'claude-haiku-4-5', label: 'Haiku 4.5', reasoningEfforts: ['none', 'low'] },
+    { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', reasoningEfforts: ['none', 'low'] },
   ];
 
-  it('leaves the model list untouched when Jev is not offered', () => {
-    expect(judgmentModelChoices(base, false)).toEqual(base);
+  it('leaves the model list untouched when nothing is offered', () => {
+    expect(judgmentModelChoices(base, [])).toEqual(base);
   });
 
-  /** Last, after the chat models, and with no tiers: picking it is one step,
+  /** Last, after the chat models, and with no tiers: picking one is one step,
    *  exactly as an image model is. */
-  it('appends the Jev row with no reasoning tiers', () => {
-    const rows = judgmentModelChoices(base, true);
-    expect(rows).toHaveLength(2);
-    expect(rows[1]).toMatchObject({
-      value: JEV_MODEL_VALUE,
-      label: JEV_MODEL_LABEL,
-      reasoningEfforts: [],
-    });
+  it('appends each offered row with no reasoning tiers', () => {
+    const rows = judgmentModelChoices(base, [endpoint('jev'), endpoint('clef')]);
+    expect(rows).toHaveLength(3);
+    expect(rows[1]).toMatchObject({ label: 'TypeSafe (Jev)', reasoningEfforts: [] });
+    expect(rows[2]).toMatchObject({ label: 'Cloudflare Clef', reasoningEfforts: [] });
   });
 });
 
 describe('judgmentSelectedModel', () => {
-  it('shows the Jev row while the site runs on Jev', () => {
-    expect(judgmentSelectedModel(true, 'claude-haiku-4-5')).toBe(JEV_MODEL_VALUE);
-    expect(judgmentSelectedEffort(true, 'none')).toBeNull();
+  it('shows the picked row while the site runs on it', () => {
+    expect(judgmentSelectedModel(endpoint('clef'), 'claude-haiku-4-5-20251001'))
+      .toBe(endpoint('clef').choice.value);
+    expect(judgmentSelectedEffort(endpoint('clef'), 'none')).toBeNull();
   });
 
   it('shows the stored chat pair otherwise', () => {
-    expect(judgmentSelectedModel(false, 'claude-haiku-4-5')).toBe('claude-haiku-4-5');
-    expect(judgmentSelectedEffort(false, 'none')).toBe('none');
+    expect(judgmentSelectedModel(null, 'claude-haiku-4-5-20251001')).toBe('claude-haiku-4-5-20251001');
+    expect(judgmentSelectedEffort(null, 'none')).toBe('none');
   });
 });
 
 describe('judgmentPickWrites', () => {
-  /** Both halves, because the site may have been on Jev. Writing the model
-   *  alone would leave the engine on Jev under a field showing Haiku. */
+  /** Both halves, because the site may have been on a System One row. Writing
+   *  the model alone would leave the engine there under a field showing Haiku. */
   it('moves the backend back to chat and writes the pair', () => {
-    expect(judgmentPickWrites({ model: 'claude-haiku-4-5', reasoningEffort: 'low', provider: null })).toEqual({
+    expect(judgmentPickWrites({ model: 'claude-haiku-4-5-20251001', reasoningEffort: 'low', provider: null })).toEqual({
       judgment: CHAT,
-      selection: { model: 'claude-haiku-4-5', reasoningEffort: 'low', provider: null },
+      selection: { model: 'claude-haiku-4-5-20251001', reasoningEffort: 'low', provider: null },
     });
   });
 
-  /** The stored model is what switching back restores, so a Jev pick must not
-   *  touch it. */
-  it('writes only the judgment key when Jev is picked', () => {
-    expect(judgmentPickWrites({ model: JEV_MODEL_VALUE, reasoningEffort: null, provider: null })).toEqual({
-      judgment: JEV,
-      selection: null,
-    });
-  });
-
-  it('writes only the two literals the engine reads', () => {
-    const chat = judgmentPickWrites({ model: 'gemini-3.5-flash', reasoningEffort: null, provider: null });
-    expect(wantsJev(chat.judgment)).toBe(false);
-    expect(wantsJev(judgmentPickWrites({ model: JEV_MODEL_VALUE, reasoningEffort: null, provider: null }).judgment))
-      .toBe(true);
+  /** The stored model is what switching back restores, so a System One pick
+   *  must not touch it. Each writes the id the engine reads. */
+  it('writes only the row id for a System One pick', () => {
+    for (const e of SYSTEM_ONE_ENDPOINTS) {
+      const writes = judgmentPickWrites({ model: e.choice.value, reasoningEffort: null, provider: null });
+      expect(writes).toEqual({ judgment: e.id, selection: null });
+      expect(pickedEndpoint(writes.judgment)?.id).toBe(e.id);
+    }
   });
 });
 
 describe('judgmentSelectionCaveat', () => {
-  /** `jev_for` returns nothing while the master switch is off, so a field
-   *  reading Jev with nothing said would be claiming a backend nothing runs. */
-  it('says so when the selection is Jev and TypeSafe is off', () => {
-    expect(judgmentSelectionCaveat(true, true)).toContain('Models → Providers');
+  /** The engine runs chat while the provider is off, so a field reading the row
+   *  with nothing said would claim a backend nothing runs. */
+  it('names the switched-off provider of the picked row', () => {
+    const caveat = judgmentSelectionCaveat(endpoint('clef-flash'), true);
+    expect(caveat).toContain('Cloudflare Workers AI');
+    expect(caveat).toContain('Models → Providers');
   });
 
   it('is silent in every other combination', () => {
-    expect(judgmentSelectionCaveat(true, false)).toBeNull();
-    expect(judgmentSelectionCaveat(false, true)).toBeNull();
-    expect(judgmentSelectionCaveat(false, false)).toBeNull();
+    expect(judgmentSelectionCaveat(endpoint('jev'), false)).toBeNull();
+    expect(judgmentSelectionCaveat(null, true)).toBeNull();
+    expect(judgmentSelectionCaveat(null, false)).toBeNull();
+  });
+});
+
+describe('workersAiScope', () => {
+  /** The engine's `workers_ai_url` reads the account back out of this URL. */
+  it('builds the scope the engine reads the account from', () => {
+    expect(workersAiScope(' abc123 '))
+      .toBe('https://api.cloudflare.com/client/v4/accounts/abc123/ai');
+    expect(workersAiAccount(workersAiScope('abc123') ?? undefined)).toBe('abc123');
+  });
+
+  /** The token is sent wherever the scope points, so only a plain id passes. */
+  it('refuses an id the engine would refuse', () => {
+    for (const id of ['', 'abc/../x', 'abc 123', 'abc-123']) {
+      expect(workersAiScope(id), id).toBeNull();
+    }
+    expect(workersAiAccount('https://evil.example/client/v4/accounts/abc/ai')).toBeNull();
+    expect(workersAiAccount(undefined)).toBeNull();
   });
 });

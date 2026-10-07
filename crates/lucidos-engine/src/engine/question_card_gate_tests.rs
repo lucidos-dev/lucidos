@@ -8,9 +8,11 @@ fn since(last_input: LastInput) -> SinceLastInput {
         spoke: false,
         unreported_tool_calls: 0,
         refused: false,
+        artifact_refused: false,
         words: String::new(),
-        saved_pictures: Vec::new(),
+        saved_artifacts: Vec::new(),
         round_was_notes: false,
+        card_has_message: false,
     }
 }
 
@@ -420,7 +422,7 @@ fn only_notes_comes_before_pointing_above() {
 }
 
 #[test]
-fn the_only_notes_refusal_quotes_the_note_and_offers_a_reply() {
+fn the_only_notes_refusal_quotes_the_note_and_moves_the_reply_onto_the_card() {
     let text = Refusal::OnlyNotes {
         reply: TYPED_REPLY.to_string(),
         words: format!(" {REFUND_NOTE}\n"),
@@ -428,10 +430,23 @@ fn the_only_notes_refusal_quotes_the_note_and_offers_a_reply() {
     .text();
     assert!(text.starts_with(REFUSAL_MARKER));
     assert!(text.contains(&format!("\"{REFUND_NOTE}\"")));
-    assert!(text.contains("end your turn with no card"));
-    assert!(text.contains("on the card itself"));
+    assert!(text.contains(&format!("on the card itself, {CARD_MESSAGE_HINT}")));
     assert!(text.contains("unchanged"));
     assert!(!text.contains('\u{2014}'));
+}
+
+/// Users often type a new request into a card instead of answering it. The
+/// agent must still ask its questions about that request.
+#[test]
+fn the_only_notes_refusal_keeps_the_question() {
+    let text = Refusal::OnlyNotes {
+        reply: "I also want to use it on days without the sauna".to_string(),
+        words: REFUND_NOTE.to_string(),
+    }
+    .text();
+    assert!(text.contains("Then send your card again"));
+    assert!(text.contains("Never end your turn without it"));
+    assert!(!text.contains("no card"));
 }
 
 /// The incident: "The user typed you a reply" read as a new message. So the
@@ -535,7 +550,7 @@ fn saved_mockup(words: &str) -> SinceLastInput {
     SinceLastInput {
         spoke: true,
         words: words.to_string(),
-        saved_pictures: vec![MOCKUP.to_string()],
+        saved_artifacts: vec![MOCKUP.to_string()],
         ..since(message())
     }
 }
@@ -557,7 +572,7 @@ fn a_card_after_a_saved_picture_nobody_saw_is_refused() {
     let card = card_text(&incident_approval_card(None));
     assert_eq!(
         should_refuse(&saved_mockup(INCIDENT_SUMMARY), &card),
-        Some(Refusal::PictureNotShown {
+        Some(Refusal::ArtifactNotShown {
             paths: vec![MOCKUP.to_string()]
         })
     );
@@ -605,7 +620,7 @@ fn a_picture_carrying_a_size_hint_passes() {
     let other_file = format!("![Backup]({MOCKUP}x#10x10)");
     assert!(matches!(
         should_refuse(&saved_mockup(&other_file), ""),
-        Some(Refusal::PictureNotShown { .. })
+        Some(Refusal::ArtifactNotShown { .. })
     ));
 }
 
@@ -620,7 +635,7 @@ fn a_bare_path_a_link_or_another_file_is_not_the_picture() {
         assert!(
             matches!(
                 should_refuse(&saved_mockup(&words), ""),
-                Some(Refusal::PictureNotShown { .. })
+                Some(Refusal::ArtifactNotShown { .. })
             ),
             "{words}"
         );
@@ -631,13 +646,36 @@ fn a_bare_path_a_link_or_another_file_is_not_the_picture() {
 fn a_picture_refusal_is_sent_once_per_input() {
     let s = SinceLastInput {
         refused: true,
+        artifact_refused: true,
         ..saved_mockup(INCIDENT_SUMMARY)
     };
     assert_eq!(should_refuse(&s, ""), None);
 }
 
-/// The one refusal per input goes to the picture. Spent on owing words, it
-/// let the retry through without the picture: the second incident.
+/// The third incident: the card showed the picture, a refusal for owing
+/// words followed, and the agent's retry dropped the picture.
+#[test]
+fn a_retry_that_drops_a_picture_is_refused_after_another_refusal() {
+    let s = SinceLastInput {
+        refused: true,
+        ..saved_mockup(INCIDENT_SUMMARY)
+    };
+    assert_eq!(
+        should_refuse(&s, &card_text(&incident_approval_card(None))),
+        Some(Refusal::ArtifactNotShown {
+            paths: vec![MOCKUP.to_string()]
+        })
+    );
+    let preview = format!("![Mockup]({MOCKUP})");
+    assert_eq!(
+        should_refuse(&s, &card_text(&incident_approval_card(Some(&preview)))),
+        None,
+        "a retry that keeps the picture passes"
+    );
+}
+
+/// The first refusal for an input goes to the picture. Spent on owing words,
+/// it let the retry through without the picture: the second incident.
 #[test]
 fn a_missing_picture_comes_before_owing_words() {
     for s in [
@@ -654,7 +692,7 @@ fn a_missing_picture_comes_before_owing_words() {
     ] {
         assert_eq!(
             should_refuse(&s, ""),
-            Some(Refusal::PictureNotShown {
+            Some(Refusal::ArtifactNotShown {
                 paths: vec![MOCKUP.to_string()]
             })
         );
@@ -665,13 +703,13 @@ fn a_missing_picture_comes_before_owing_words() {
 fn a_missing_picture_comes_before_pointing_above() {
     assert!(matches!(
         should_refuse(&saved_mockup(INCIDENT_SUMMARY), POINTS_ABOVE),
-        Some(Refusal::PictureNotShown { .. })
+        Some(Refusal::ArtifactNotShown { .. })
     ));
 }
 
 #[test]
-fn the_picture_refusal_names_the_path_and_the_card() {
-    let text = Refusal::PictureNotShown {
+fn the_artifact_refusal_names_the_path_and_the_card() {
+    let text = Refusal::ArtifactNotShown {
         paths: vec![MOCKUP.to_string(), "artifacts/b.png".to_string()],
     }
     .text();
@@ -681,6 +719,8 @@ fn the_picture_refusal_names_the_path_and_the_card() {
     assert!(text.contains("ON the card"));
     assert!(text.contains("`preview` if your tool has one"));
     assert!(text.contains("its own picture of only that option"));
+    assert!(text.contains("`[...](...)` link to any other file"));
+    assert!(text.contains("an option shows a link as plain text"));
     // It outranks owing words, so it carries both of that refusal's asks.
     assert!(text.contains("answer it in plain prose"));
     assert!(text.contains("say what you found"));
@@ -689,20 +729,273 @@ fn the_picture_refusal_names_the_path_and_the_card() {
 }
 
 #[test]
-fn only_pictures_saved_as_artifacts_count() {
+fn only_files_saved_as_artifacts_count() {
+    for path in [
+        "artifacts/design/a.png",
+        "artifacts/notes.md",
+        "artifacts/explainer.html",
+    ] {
+        assert!(is_shown_artifact(path), "{path}");
+    }
+    for path in ["apps/habit-tracker/icon.png", "knowhow/diagram.svg"] {
+        assert!(!is_shown_artifact(path), "{path}");
+    }
+}
+
+#[test]
+fn only_picture_extensions_need_the_image_form() {
     for name in ["a.png", "a.JPG", "a.jpeg", "a.gif", "a.svg", "a.webp"] {
-        let path = format!("artifacts/design/{name}");
-        assert!(is_shown_picture(&path), "{path}");
+        assert!(is_picture(&format!("artifacts/design/{name}")), "{name}");
     }
     for path in [
         "artifacts/notes.md",
         "artifacts/png-notes.md",
         "artifacts/png",
-        "apps/habit-tracker/icon.png",
-        "knowhow/diagram.svg",
     ] {
-        assert!(!is_shown_picture(path), "{path}");
+        assert!(!is_picture(path), "{path}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// A card after a page nobody linked
+// ---------------------------------------------------------------------------
+
+const EXPLAINER: &str = "artifacts/tree-memory-corrections.html";
+
+/// The summary Claude Code showed in the incident, in place of a reply that
+/// held the link to the explainer.
+const EXPLAINER_SUMMARY: &str = "I've put together a one-page overview covering the log and \
+     tree approach, plus two glossary definitions included below.";
+
+fn saved_explainer(words: &str) -> SinceLastInput {
+    SinceLastInput {
+        spoke: true,
+        words: words.to_string(),
+        saved_artifacts: vec![EXPLAINER.to_string()],
+        ..since(typed())
+    }
+}
+
+fn explainer_link() -> String {
+    format!("[tree-memory-corrections.html]({EXPLAINER})")
+}
+
+/// The incident's card. `question_link` and `preview` go where named.
+fn glossary_card(question_link: &str, preview: Option<&str>) -> serde_json::Value {
+    json!([{
+        "question": format!("Add this entry to docs/glossary.md?\n\n**Workspace anchor**: a line in a thread memory view.\n{question_link}"),
+        "header": "Glossary",
+        "multiSelect": false,
+        "options": [
+            {"label": "Add as proposed", "description": "Goes in beside Memory view.", "preview": preview},
+            {"label": "Skip, not a real term", "description": "Describe it inside the entry."}
+        ]
+    }])
+}
+
+#[test]
+fn a_card_after_a_saved_page_nobody_linked_is_refused() {
+    assert_eq!(
+        should_refuse(
+            &saved_explainer(EXPLAINER_SUMMARY),
+            &card_text(&glossary_card("", None))
+        ),
+        Some(Refusal::ArtifactNotShown {
+            paths: vec![EXPLAINER.to_string()]
+        })
+    );
+}
+
+#[test]
+fn a_page_linked_in_the_words_or_the_question_passes() {
+    for shown in [explainer_link(), format!("[Explainer](<data/{EXPLAINER}>)")] {
+        assert_eq!(should_refuse(&saved_explainer(&shown), ""), None, "{shown}");
+    }
+    let card = card_text(&glossary_card(&explainer_link(), None));
+    assert_eq!(
+        should_refuse(&saved_explainer(EXPLAINER_SUMMARY), &card),
+        None
+    );
+}
+
+/// An option renders inside a button, which shows a link as its label alone.
+#[test]
+fn a_page_linked_only_in_an_option_is_refused() {
+    let link = explainer_link();
+    let card = card_text(&glossary_card("", Some(&link)));
+    assert!(matches!(
+        should_refuse(&saved_explainer(EXPLAINER_SUMMARY), &card),
+        Some(Refusal::ArtifactNotShown { .. })
+    ));
+}
+
+#[test]
+fn an_option_keeps_its_pictures_and_loses_its_link_targets() {
+    assert_eq!(
+        without_link_targets("see [the page](artifacts/a.html) and ![it](artifacts/a.png) too"),
+        "see [the page] and ![it](artifacts/a.png) too"
+    );
+    assert_eq!(without_link_targets("[cut](artifacts/a.html"), "[cut]");
+    assert_eq!(without_link_targets("no markdown"), "no markdown");
+}
+
+/// Markdown ends a bare target at a space, so only the bracketed form opens.
+#[test]
+fn a_page_with_a_space_needs_the_bracketed_link() {
+    let s = |words: &str| SinceLastInput {
+        saved_artifacts: vec!["artifacts/quarterly report.html".to_string()],
+        ..saved_explainer(words)
+    };
+    let bracketed = "[report](<artifacts/quarterly report.html>)";
+    assert_eq!(should_refuse(&s(bracketed), ""), None);
+    let bare = "[report](artifacts/quarterly report.html)";
+    assert!(matches!(
+        should_refuse(&s(bare), ""),
+        Some(Refusal::ArtifactNotShown { .. })
+    ));
+}
+
+#[test]
+fn a_bare_path_or_an_image_line_does_not_link_a_page() {
+    for words in [
+        format!("I saved it to {EXPLAINER}."),
+        format!("[Old](other.html) then {EXPLAINER}"),
+        format!("![Explainer]({EXPLAINER})"),
+    ] {
+        assert!(
+            matches!(
+                should_refuse(&saved_explainer(&words), ""),
+                Some(Refusal::ArtifactNotShown { .. })
+            ),
+            "{words}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A card whose question carries the report
+// ---------------------------------------------------------------------------
+
+/// A card question in the incident's shape: the findings, the picture, then
+/// the decision. The agent had saved the picture, then asked.
+fn reporting_card(picture: &str) -> serde_json::Value {
+    let findings = "- The hold opens a different menu from each button. ".repeat(10);
+    json!([{
+        "question": format!(
+            "Here is every state today:\n\n![Today]({picture})\n\nWhat differs:\n{findings}\nShould I build the proposal?"
+        ),
+        "header": "Unify",
+        "multiSelect": false,
+        "options": [
+            {"label": "Build the proposal", "description": "One mode for every entry."},
+            {"label": "Only fix the gaps", "description": "Keep today's UI."}
+        ]
+    }])
+}
+
+/// What the gate decides for `questions`, as `refuse_card` folds it.
+fn decide(s: SinceLastInput, questions: &serde_json::Value) -> Option<Refusal> {
+    should_refuse(
+        &s.with_card_question(&longest_card_question(questions)),
+        &card_text(questions),
+    )
+}
+
+/// The incident: the card held the findings and the picture, and a refusal
+/// for owing words made the agent re-send it without either.
+#[test]
+fn a_card_whose_question_carries_the_report_owes_no_words() {
+    let card = reporting_card(MOCKUP);
+    assert!(longest_card_question(&card).chars().count() >= NOTE_SIZED_CHARS);
+    let s = SinceLastInput {
+        unreported_tool_calls: 1,
+        ..saved_mockup("Both render correctly. Storing them so you can see them.")
+    };
+    assert_eq!(decide(s, &card), None);
+}
+
+/// A long card re-sent after a typed reply reads the same as before, so it
+/// answers nothing the user typed.
+#[test]
+fn a_card_question_does_not_answer_a_typed_reply() {
+    assert!(matches!(
+        decide(since(typed()), &reporting_card(MOCKUP)),
+        Some(Refusal::OwesWords { .. })
+    ));
+}
+
+#[test]
+fn a_long_card_question_still_cannot_point_above() {
+    let card = json!([{
+        "question": format!("{} Go with the copy above?", "Some context. ".repeat(50)),
+        "options": [{"label": "Yes"}]
+    }]);
+    assert!(longest_card_question(&card).chars().count() >= NOTE_SIZED_CHARS);
+    let s = SinceLastInput {
+        unreported_tool_calls: 1,
+        ..after_words(INCIDENT_NOTE)
+    };
+    assert!(matches!(
+        decide(s, &card),
+        Some(Refusal::PointsAboveAtNothing { .. })
+    ));
+}
+
+#[test]
+fn several_short_questions_do_not_add_up_to_a_report() {
+    let question = "Which of these approaches should I take for the module? ".repeat(3);
+    let card = json!([
+        {"question": question, "options": [{"label": "A"}]},
+        {"question": question, "options": [{"label": "B"}]},
+        {"question": question, "options": [{"label": "C"}]},
+        {"question": question, "options": [{"label": "D"}]}
+    ]);
+    assert!(4 * question.chars().count() >= NOTE_SIZED_CHARS);
+    let s = SinceLastInput {
+        unreported_tool_calls: 1,
+        ..since(message())
+    };
+    assert!(matches!(decide(s, &card), Some(Refusal::OwesWords { .. })));
+}
+
+#[test]
+fn a_short_card_question_does_not_report_the_work() {
+    let s = SinceLastInput {
+        unreported_tool_calls: 1,
+        ..since(message())
+    };
+    assert!(matches!(
+        decide(s, &incident_approval_card(None)),
+        Some(Refusal::OwesWords { .. })
+    ));
+}
+
+/// The first incident's card: "How do you want to continue?", with the
+/// answer only in the option text.
+#[test]
+fn a_report_only_in_the_options_does_not_count() {
+    let long = "The release holds two fixes and a new setting. ".repeat(15);
+    let card = json!([{
+        "question": "How do you want to continue?",
+        "options": [{"label": "Ship it", "description": long}]
+    }]);
+    assert_eq!(longest_card_question(&card), "How do you want to continue?");
+    let s = SinceLastInput {
+        unreported_tool_calls: 1,
+        ..since(message())
+    };
+    assert!(matches!(decide(s, &card), Some(Refusal::OwesWords { .. })));
+}
+
+#[test]
+fn a_reporting_card_still_needs_the_picture() {
+    let card = reporting_card("artifacts/an-older-picture.png");
+    assert_eq!(
+        decide(saved_mockup(INCIDENT_SUMMARY), &card),
+        Some(Refusal::ArtifactNotShown {
+            paths: vec![MOCKUP.to_string()]
+        })
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -778,7 +1071,7 @@ async fn the_query_reads_what_each_agent_writes() {
     cc_tool(&pool, t, crate::runtime::CC_NATIVE_ASK_USER_QUESTION_TOOL).await;
     cc_tool(&pool, t, "TodoWrite").await;
     assert_eq!(
-        refuse_card(&pool, t, "toolu_next", &json!([]), None).await,
+        refuse_card(&pool, t, "toolu_next", &json!([]), None, None).await,
         Some(Refusal::OwesWords {
             input: LastInput::Typed("is there a difference?".to_string())
         }),
@@ -794,7 +1087,7 @@ async fn the_query_reads_what_each_agent_writes() {
     )
     .await;
     assert!(
-        refuse_card(&pool, t, "toolu_again", &json!([]), None)
+        refuse_card(&pool, t, "toolu_again", &json!([]), None, None)
             .await
             .is_none(),
         "refused once per input"
@@ -817,7 +1110,7 @@ async fn the_query_reads_what_each_agent_writes() {
     )
     .await;
     assert_eq!(
-        refuse_card(&pool, c, "toolu_chat", &json!([]), None).await,
+        refuse_card(&pool, c, "toolu_chat", &json!([]), None, None).await,
         Some(Refusal::OwesWords {
             input: LastInput::Message("what is in .3".to_string())
         }),
@@ -837,7 +1130,7 @@ async fn the_query_reads_what_each_agent_writes() {
     )
     .await;
     assert!(
-        refuse_card(&pool, c, "toolu_chat", &json!([]), None)
+        refuse_card(&pool, c, "toolu_chat", &json!([]), None, None)
             .await
             .is_none(),
         "the report came first"
@@ -850,7 +1143,7 @@ async fn the_query_reads_what_each_agent_writes() {
     )
     .await;
     assert!(
-        refuse_card(&pool, c, "toolu_chat", &json!([]), None)
+        refuse_card(&pool, c, "toolu_chat", &json!([]), None, None)
             .await
             .is_some(),
         "work after the words is unreported"
@@ -871,7 +1164,7 @@ async fn the_query_reads_what_each_agent_writes() {
         json!({ "kind": "Selected", "option_id": "opt-0" }),
     )
     .await;
-    assert!(refuse_card(&pool, p, "toolu_chain", &json!([]), None)
+    assert!(refuse_card(&pool, p, "toolu_chain", &json!([]), None, None)
         .await
         .is_none());
 
@@ -885,7 +1178,7 @@ async fn the_query_reads_what_each_agent_writes() {
     .await;
     cc_tool(&pool, t, "Read").await;
     answered(&pool, t, json!({ "kind": "FreeText", "text": "why?" })).await;
-    assert!(refuse_card(&pool, t, "toolu_shown", &json!([]), None)
+    assert!(refuse_card(&pool, t, "toolu_shown", &json!([]), None, None)
         .await
         .is_none());
 
@@ -919,7 +1212,7 @@ async fn a_result_quoting_the_marker_deep_in_its_output_is_not_a_refusal() {
     )
     .await;
     assert!(
-        refuse_card(&pool, t, "toolu_grep", &json!([]), None)
+        refuse_card(&pool, t, "toolu_grep", &json!([]), None, None)
             .await
             .is_some(),
         "a grep that quotes the marker must not count as a refusal"
@@ -941,7 +1234,7 @@ async fn a_codex_refusal_in_its_mcp_wrapper_counts() {
     )
     .await;
     cc_tool(&pool, t, "Grep").await;
-    assert!(refuse_card(&pool, t, "toolu_codex", &json!([]), None)
+    assert!(refuse_card(&pool, t, "toolu_codex", &json!([]), None, None)
         .await
         .is_some());
     let wrapped =
@@ -954,7 +1247,7 @@ async fn a_codex_refusal_in_its_mcp_wrapper_counts() {
     )
     .await;
     assert!(
-        refuse_card(&pool, t, "toolu_codex", &json!([]), None)
+        refuse_card(&pool, t, "toolu_codex", &json!([]), None, None)
             .await
             .is_none(),
         "refused once per input"
@@ -984,7 +1277,7 @@ async fn the_query_reads_the_words_a_card_points_above_at() {
     cc_text(&pool, t, first).await;
     cc_text(&pool, t, rest).await;
 
-    let refusal = refuse_card(&pool, t, "toolu_above", &incident_card(), None).await;
+    let refusal = refuse_card(&pool, t, "toolu_above", &incident_card(), None, None).await;
     assert_eq!(
         refusal,
         Some(Refusal::PointsAboveAtNothing {
@@ -1001,7 +1294,7 @@ async fn the_query_reads_the_words_a_card_points_above_at() {
     )
     .await;
     assert!(
-        refuse_card(&pool, t, "toolu_above", &incident_card(), None)
+        refuse_card(&pool, t, "toolu_above", &incident_card(), None, None)
             .await
             .is_none(),
         "an unchanged re-send is never refused twice"
@@ -1033,7 +1326,7 @@ async fn data_file_written(pool: &PgPool, saved_by: Uuid, path: &str) {
 
 /// The incident end to end, with a decoy for each save that must not count.
 #[tokio::test]
-async fn the_query_finds_the_pictures_this_thread_saved_since_the_input() {
+async fn the_query_finds_the_artifacts_this_thread_saved_since_the_input() {
     let (pool, db) = setup_test_db().await;
     let t = Uuid::new_v4();
     data_file_written(&pool, t, "artifacts/before-the-input.png").await;
@@ -1047,17 +1340,25 @@ async fn the_query_finds_the_pictures_this_thread_saved_since_the_input() {
     cc_text(&pool, t, "I'll save it so you can see it.").await;
     cc_tool(&pool, t, "Bash").await;
     data_file_written(&pool, t, MOCKUP).await;
-    data_file_written(&pool, t, "artifacts/mockups/notes.md").await;
+    data_file_written(&pool, t, "knowhow/mockups/notes.md").await;
     data_file_written(&pool, Uuid::new_v4(), "artifacts/another-thread.png").await;
     cc_text(&pool, t, INCIDENT_SUMMARY).await;
 
-    let refusal = refuse_card(&pool, t, "toolu_card", &incident_approval_card(None), None).await;
+    let refusal = refuse_card(
+        &pool,
+        t,
+        "toolu_card",
+        &incident_approval_card(None),
+        None,
+        None,
+    )
+    .await;
     assert_eq!(
         refusal,
-        Some(Refusal::PictureNotShown {
+        Some(Refusal::ArtifactNotShown {
             paths: vec![MOCKUP.to_string()]
         }),
-        "only this thread's picture since the input counts"
+        "only this thread's artifact since the input counts"
     );
 
     let preview = format!("![Mockup]({MOCKUP})");
@@ -1067,6 +1368,7 @@ async fn the_query_finds_the_pictures_this_thread_saved_since_the_input() {
             t,
             "toolu_card",
             &incident_approval_card(Some(&preview)),
+            None,
             None
         )
         .await
@@ -1082,9 +1384,16 @@ async fn the_query_finds_the_pictures_this_thread_saved_since_the_input() {
     )
     .await;
     assert!(
-        refuse_card(&pool, t, "toolu_card", &incident_approval_card(None), None)
-            .await
-            .is_none(),
+        refuse_card(
+            &pool,
+            t,
+            "toolu_card",
+            &incident_approval_card(None),
+            None,
+            None
+        )
+        .await
+        .is_none(),
         "an unchanged re-send is never refused twice"
     );
 
@@ -1109,15 +1418,116 @@ async fn a_rendered_mockup_after_a_typed_reply_gets_the_picture_refusal() {
     cc_tool(&pool, t, "Bash").await;
     data_file_written(&pool, t, MOCKUP).await;
 
-    let refusal = refuse_card(&pool, t, "toolu_card", &incident_approval_card(None), None).await;
+    let refusal = refuse_card(
+        &pool,
+        t,
+        "toolu_card",
+        &incident_approval_card(None),
+        None,
+        None,
+    )
+    .await;
     assert_eq!(
         refusal,
-        Some(Refusal::PictureNotShown {
+        Some(Refusal::ArtifactNotShown {
             paths: vec![MOCKUP.to_string()]
         }),
         "the only refusal this input gets must ask for the picture"
     );
 
+    teardown_test_db(&db).await;
+}
+
+/// The third incident end to end: a short note, the save, then a card whose
+/// question held the findings and the picture.
+#[tokio::test]
+async fn the_query_passes_a_card_that_carries_its_report() {
+    let (pool, db) = setup_test_db().await;
+    let t = Uuid::new_v4();
+    insert(
+        &pool,
+        t,
+        "MessageReceived",
+        json!({ "text": "show me and suggest unification", "mode": "human" }),
+    )
+    .await;
+    cc_tool(&pool, t, "Bash").await;
+    cc_text(
+        &pool,
+        t,
+        "Both render correctly. Storing them so you can see them.",
+    )
+    .await;
+    cc_tool(&pool, t, "Bash").await;
+    data_file_written(&pool, t, MOCKUP).await;
+
+    assert_eq!(
+        refuse_card(&pool, t, "toolu_card", &reporting_card(MOCKUP), None, None).await,
+        None
+    );
+    teardown_test_db(&db).await;
+}
+
+/// After a refusal for owing words, the retry dropped the picture the first
+/// card showed. It gets one more refusal, and only one.
+#[tokio::test]
+async fn the_query_refuses_a_retry_that_drops_the_picture_once() {
+    let (pool, db) = setup_test_db().await;
+    let t = Uuid::new_v4();
+    insert(
+        &pool,
+        t,
+        "MessageReceived",
+        json!({ "text": "show me the dot options", "mode": "human" }),
+    )
+    .await;
+    cc_tool(&pool, t, "Bash").await;
+    data_file_written(&pool, t, MOCKUP).await;
+    insert(
+        &pool,
+        t,
+        "CodingAgentToolResult",
+        json!({ "name": "AskUserQuestion", "result": card_refusal() }),
+    )
+    .await;
+    cc_text(&pool, t, INCIDENT_SUMMARY).await;
+
+    let refusal = refuse_card(
+        &pool,
+        t,
+        "toolu_retry",
+        &incident_approval_card(None),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        refusal,
+        Some(Refusal::ArtifactNotShown {
+            paths: vec![MOCKUP.to_string()]
+        })
+    );
+
+    insert(
+        &pool,
+        t,
+        "CodingAgentToolResult",
+        json!({ "name": "AskUserQuestion", "result": refusal.unwrap().text() }),
+    )
+    .await;
+    assert!(
+        refuse_card(
+            &pool,
+            t,
+            "toolu_retry",
+            &incident_approval_card(None),
+            None,
+            None
+        )
+        .await
+        .is_none(),
+        "the picture refusal is never sent twice"
+    );
     teardown_test_db(&db).await;
 }
 
@@ -1140,8 +1550,88 @@ async fn a_query_error_shows_the_card() {
     )
     .await;
     pool.close().await;
-    assert!(refuse_card(&pool, t, "toolu_x", &json!([]), None)
+    assert!(refuse_card(&pool, t, "toolu_x", &json!([]), None, None)
         .await
         .is_none());
     teardown_test_db(&db).await;
+}
+
+// ---------------------------------------------------------------------------
+// A card that carries its own answer in `message`
+// ---------------------------------------------------------------------------
+
+/// The steps the incident's agent drafted and never showed, short enough to
+/// be note-sized.
+const CARD_MESSAGE: &str = "1. Open Web Analytics and press **Manage site**.\n\
+     2. Change the setup choice to **Enable**.\n3. Save.";
+
+#[test]
+fn a_card_message_answers_a_typed_reply_after_a_note() {
+    let s = since(typed())
+        .with_round_text(RoundText::Notes(REFUND_NOTE))
+        .with_card_message(CARD_MESSAGE);
+    assert_eq!(should_refuse(&s, TAP_WHEN_SENT), None);
+}
+
+#[test]
+fn a_card_message_reports_the_tool_work_before_it() {
+    let s = SinceLastInput {
+        unreported_tool_calls: 3,
+        ..since(message())
+    }
+    .with_card_message(CARD_MESSAGE);
+    assert_eq!(should_refuse(&s, ""), None);
+}
+
+#[test]
+fn a_card_may_point_above_at_its_own_message() {
+    let s = since(LastInput::Picked).with_card_message(CARD_MESSAGE);
+    assert_eq!(should_refuse(&s, POINTS_ABOVE), None);
+}
+
+#[test]
+fn a_blank_card_message_changes_nothing() {
+    for input in [typed(), message(), LastInput::Picked] {
+        let base = SinceLastInput {
+            unreported_tool_calls: 1,
+            ..since(input)
+        };
+        let with_blank = base.clone().with_card_message(" \n");
+        assert_eq!(with_blank, base);
+        assert!(should_refuse(&with_blank, POINTS_ABOVE).is_some());
+    }
+}
+
+#[test]
+fn a_card_message_still_has_to_show_a_saved_picture() {
+    let s = saved_mockup("").with_card_message(CARD_MESSAGE);
+    assert!(matches!(
+        should_refuse(&s, ""),
+        Some(Refusal::ArtifactNotShown { .. })
+    ));
+    let shown =
+        saved_mockup("").with_card_message(&format!("{CARD_MESSAGE}\n\n![The mockup]({MOCKUP})"));
+    assert_eq!(should_refuse(&shown, ""), None);
+}
+
+#[test]
+fn every_refusal_names_the_message_field() {
+    let refusals = [
+        Refusal::OwesWords { input: typed() },
+        Refusal::PointsAboveAtNothing {
+            words: INCIDENT_NOTE.to_string(),
+        },
+        Refusal::ArtifactNotShown {
+            paths: vec![MOCKUP.to_string()],
+        },
+        Refusal::OnlyNotes {
+            reply: TYPED_REPLY.to_string(),
+            words: REFUND_NOTE.to_string(),
+        },
+    ];
+    for refusal in refusals {
+        let text = refusal.text();
+        assert!(text.contains(CARD_MESSAGE_HINT), "{text}");
+        assert!(!text.contains('\u{2014}'));
+    }
 }

@@ -6,9 +6,9 @@
  * three claims. It is offered over a real preview. It is a real anchor at the
  * file's own URL. It leaves while the inline editor owns the header.
  *
- * Placement is deliberately not asserted. An HTML artifact's header already
- * carries three context actions, so `alwaysCollapseFrom` folds them all behind
- * `⋯`. Which placement it takes is the layout's business, not this test's.
+ * Placement is deliberately not asserted. An HTML artifact's header carries
+ * several context actions, which fold behind `⋯` when the pane runs out of
+ * room. Which placement it takes is the layout's business, not this test's.
  */
 import { test, expect, type Locator, type Page } from './fixtures';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';

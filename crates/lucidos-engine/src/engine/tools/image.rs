@@ -261,28 +261,13 @@ impl LucidosEngine {
             size
         );
 
-        // Call the provider
-        let input_image_bytes: usize = input_images.iter().map(Vec::len).sum();
-        let result = provider.generate(prompt, input_images, size).await?;
-
-        // Account for the call. OpenAI's image endpoints report tokens and
-        // those are recorded; Imagen prices per image and reports none, so
-        // that row carries no usage. The row exists either way, because an
-        // image the engine paid for must not be missing from the ledger.
-        crate::engine::AuxCapture::new(
+        let result = crate::engine::AuxCapture::new(
             &self.event_bus,
             thread_id,
             crate::engine::ContextPurpose::ImageGen,
         )
-        .record_usage(
-            // The serving model id, not `provider.name()`, which is a display
-            // label ("OpenAI gpt-image-2"). Every other capture site records
-            // the model, and a cost breakdown groups on it.
-            &result.model,
-            prompt.chars().count() + input_image_bytes,
-            crate::engine::aux_capture::usage_from_image(result.input_tokens, result.output_tokens),
-        )
-        .await;
+        .generate(provider.as_ref(), prompt, input_images, size)
+        .await?;
 
         // Compress the result through the same pipeline as user images
         let compressed = ChatImage {
@@ -305,6 +290,7 @@ impl LucidosEngine {
                     &format!("feat: generated image {}", artifact_path),
                     WriteAnnouncement::Entity {
                         source: Some("generate_image".to_string()),
+                        writer_thread_id: Some(thread_id),
                     },
                 )
                 .await?;
@@ -366,6 +352,7 @@ impl LucidosEngine {
                 &format!("feat: save thread image to {}", artifact_path),
                 WriteAnnouncement::Entity {
                     source: Some("save_thread_image".to_string()),
+                    writer_thread_id: Some(thread_id),
                 },
             )
             .await?;

@@ -14,7 +14,7 @@ export const EASING_DISCLOSURE = 'cubic-bezier(0.4, 0, 0.2, 1)';
 export const FADE_REACH = '--disclosure-fade-reach';
 
 const DISCLOSURE_PX_PER_SEC = 1200;
-const DISCLOSURE_MIN_MS = 260;
+export const DISCLOSURE_MIN_MS = 260;
 /** The longest roll, which a caller holding something still across one waits out. */
 export const DISCLOSURE_MAX_MS = 420;
 

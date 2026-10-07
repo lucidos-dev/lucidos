@@ -897,12 +897,14 @@ fn thread_queue_policy_patch_merges_with_current_policy() {
         reserved_background: 4,
         overflow: OverflowPolicy::DropOldest,
         max_event_trigger_depth: 5,
+        max_concurrent_children_per_thread: 10,
     };
 
     let out = merge_thread_queue_policy_patch(
         current.clone(),
         &json!({
             "max_concurrent_coding_agent": 14,
+            "max_concurrent_children_per_thread": 4,
             "overflow": "pause-trigger"
         }),
     )
@@ -914,6 +916,7 @@ fn thread_queue_policy_patch_merges_with_current_policy() {
         current.max_concurrent_event_trigger
     );
     assert_eq!(out.max_concurrent_coding_agent, 14);
+    assert_eq!(out.max_concurrent_children_per_thread, 4);
     assert_eq!(out.overflow, OverflowPolicy::PauseTrigger);
 }
 
@@ -938,6 +941,15 @@ fn thread_queue_policy_patch_rejects_empty_or_bad_fields() {
     assert!(
         matches!(&out, Err(msg) if msg.contains("at least 1")),
         "zero queue cap should error, got: {out:?}"
+    );
+
+    let out = merge_thread_queue_policy_patch(
+        current.clone(),
+        &json!({"max_concurrent_children_per_thread": 0}),
+    );
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("max_concurrent_children_per_thread must be at least 1")),
+        "zero child cap should error, got: {out:?}"
     );
 
     let out = merge_thread_queue_policy_patch(current, &json!({"overflow": "delete-all"}));

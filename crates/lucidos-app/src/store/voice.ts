@@ -6,11 +6,11 @@
  * the devices in `voice/ports.ts`, so this file is the wiring between them and
  * the shell.
  *
- * **A call also ends when the thread stops being one it can run on** (ADR
- * 0165). Moving a draft's destination to a coding agent is the same kind of
- * departure as navigating away, so it takes the same exit. The engine refuses
- * such a thread at two layers. This keeps the caller from talking into a call
- * those layers have already decided against.
+ * **A call also ends when the thread stops being one it can run on**: the
+ * home thread, on the Lucidos Agent (ADR 0362, ADR 0165). That is the same
+ * kind of departure as navigating away, so it takes the same exit. The engine
+ * refuses any other thread at two layers. This keeps the caller from talking
+ * into a call those layers have already decided against.
  *
  * Built through a factory so a test supplies its own devices, its own focus
  * signal and its own thread resolver. The live instance is the last few lines.
@@ -22,6 +22,7 @@ import { awaitThreadStarted, ensureFocusedComposeThread } from './actions/compos
 import { openSettingsSubview } from './actions/menu';
 import { storedVoiceInputDevice } from './actions/preferences';
 import { effectiveCodingAgentBackend } from '../components/chat/promptToggleMode';
+import { callIsOffered } from '../voice/callOffer';
 import { createCallRunner } from '../voice/call';
 import { CALL_IDLE, type CallState } from '../voice/callState';
 import { voiceCall } from './voiceCall';
@@ -187,7 +188,7 @@ export function createVoiceCallStore(deps: VoiceCallDeps): VoiceCallStore {
 /**
  * Whether the focused destination is one a call can run on.
  *
- * The same two calls the prompt row makes, with the same arguments, so the
+ * The same calls the prompt row makes, with the same arguments, so the
  * control the reader sees and the call they placed cannot disagree. Restating
  * the rule instead would be a third copy of it, and a third copy is how they
  * drift.
@@ -199,12 +200,13 @@ export function createVoiceCallStore(deps: VoiceCallDeps): VoiceCallStore {
  * alone. It would the moment a backend of its own can decline a call.
  *
  * It answers for all three shapes: a started thread, a composing draft, and
- * the fresh compose view with a destination picked and no draft yet.
+ * the fresh compose view with a destination picked and no draft yet. Only the
+ * first can be the home thread.
  */
 export const callReachesTheFocusedThread = computed(() => {
   const id = focusedThreadId.value;
   const thread = id ? threadMap.value.get(id) : undefined;
-  return effectiveCodingAgentBackend(thread, resolveCodingAgent(id)) === null;
+  return callIsOffered(thread, effectiveCodingAgentBackend(thread, resolveCodingAgent(id)));
 });
 
 /**
@@ -228,9 +230,8 @@ const live = createVoiceCallStore({
   call: voiceCall,
   ports: browserPorts,
   focused: focusedThreadId,
-  // The focused thread when there is one, active threads included. In the
-  // compose view this allocates the draft and POSTs its row, which is how
-  // voice creates a thread by exactly the path typing uses.
+  // The focused thread, which is the home thread whenever a call is offered
+  // (`callIsOffered`).
   resolveThread: ensureFocusedComposeThread,
   awaitThread: awaitThreadStarted,
   onProblem: reportCallProblem,

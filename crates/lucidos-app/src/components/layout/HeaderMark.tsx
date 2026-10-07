@@ -3,6 +3,7 @@ import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEve
 import type { ConnectionStatus } from '../../store/types';
 import { hasUnreadWhatsNew } from '../../store/actions/whatsNew';
 import { unfocusThread } from '../../store/actions/threads';
+import { homeThreadId, openHomeThread } from '../../store/actions/homeThread';
 import { openWhatsNew } from '../../store/actions/menu';
 import { crossWorkspaceUnreadTotal, refreshOtherWorkspacesUnread } from '../../store/actions/app-badge';
 import { connectionNotice, connectionNoticeSentence, connectionPhrase } from '../../utils/connectionNotice';
@@ -10,7 +11,7 @@ import { lucidosVersionLabel, lucidosVersionTooltip } from '../../utils/lucidosV
 import { composeHandlers } from '../chat/promptFocus';
 import { focusSearchInput } from '../search/searchEverywhereActions';
 import { Overlay } from '../shared/Overlay';
-import { ComposeIcon, SearchIcon, HelpIcon, LucidosMarkIcon } from '../shared/icons';
+import { ComposeIcon, SearchIcon, HelpIcon, HomeIcon, LucidosMarkIcon } from '../shared/icons';
 import { confirmAndStartSetupInterview } from '../shared/setupInterview';
 import { BrandBadge, UnreadBrandBadge, brandBadgeLabel, unreadBadgeLabel } from './BrandBadge';
 import { liveActivityRows } from '../../store/actions/activityRows';
@@ -56,8 +57,30 @@ export function connectionNoticeRow(status: ConnectionStatus, workspace: string 
   );
 }
 
+/** The Lucidos menu's Home row, with its own separator, so it leaves nothing
+ *  behind while the home thread is off. No thread list draws the home thread,
+ *  so on a phone this row is the way to it. A plain click rather than
+ *  `composeHandlers`: opening Home is for reading, so it raises no keyboard. */
+export function HomeMenuGroup({ onClose }: { onClose: () => void }) {
+  if (!homeThreadId.value) return null;
+  return (
+    <>
+      <button
+        type="button"
+        class="brand-menu-item home-thread-btn"
+        role="menuitem"
+        onClick={() => { onClose(); openHomeThread(); }}
+      >
+        <HomeIcon />
+        Home
+      </button>
+      <div class="brand-menu-separator" role="separator" />
+    </>
+  );
+}
+
 /**
- * The Lucidos menu: the work in flight, New thread, Search everywhere,
+ * The Lucidos menu: Home, the work in flight, New thread, Search everywhere,
  * Workspaces, Refresh.
  *
  * A CENTRED MODAL over a dimmed app, not a panel hanging off whatever opened
@@ -79,10 +102,10 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
   open: boolean;
   onClose: () => void;
   anchor: HTMLElement | null;
-  /** The host's own header row already carries New thread, Search everywhere
-   *  and Setup interview as icons, so the menu does not repeat them. True on
-   *  desktop only: no mobile header has room for those three, which is why they
-   *  came into the menu in the first place. What is left is Workspaces and
+  /** The host's own header row already carries Home, New thread, Search
+   *  everywhere and Setup interview as icons, so the menu does not repeat them.
+   *  True on desktop only: no mobile header has room for them, which is why
+   *  they came into the menu in the first place. What is left is Workspaces and
    *  Refresh, the pair the retired workspace switcher owned and the only part of
    *  this menu desktop can reach nowhere else. */
   actionsInRow: boolean;
@@ -172,6 +195,10 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
             in under the user's eyes rather than waiting for the next open. */}
         {connectionNoticeRow(connectionStatus.value, visibleWorkspaceName.value)}
 
+        {/* The first row on a phone. Desktop has the Home icon in its
+            thread header instead (`threadHeaderActions`). */}
+        {!actionsInRow && <HomeMenuGroup onClose={onClose} />}
+
         {/* The work in flight, one row per job, which is what the spinning
             badge on the mark advertises. Above the notifications because it is
             what is happening NOW, and the only place its progress is told.
@@ -179,7 +206,7 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
         <ActivityMenuGroup onClose={onClose} />
 
         {/* Where the unread notifications are, this workspace included. It
-            LEADS the panel because it is the news the mark's badge just
+            leads the panel's news because it is what the mark's badge just
             advertised, and the icon badge before that: a user who opened the
             menu because something said "1" must not have to hunt. Renders
             nothing, separator included, when everything is read. */}
@@ -224,7 +251,8 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
             keyboard roving has to skip past. */}
         <div class="brand-menu-separator" role="separator" />
 
-        {/* The three actions the desktop header carries as icons. Repeating
+        {/* Three of the actions the desktop header carries as icons; Home,
+            the fourth, leads the menu above. Repeating
             them there would make the menu a second copy of the row above it,
             so they render only where the row has no room for them, which is
             both mobile headers. The *setup interview* is one of the three: its
@@ -274,9 +302,9 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
  * connection light, and it opens the menu.
  *
  * `placement` names the header row the mark sits on. That decides how it is
- * DRESSED, and one thing about what it opens: a row that already carries New
- * thread, Search everywhere and Setup interview as icons gets a menu that does
- * not repeat them (see `LucidosMenu`'s `actionsInRow`).
+ * DRESSED, and one thing about what it opens. A row that already carries Home,
+ * New thread, Search everywhere and Setup interview as icons gets a menu
+ * without them (see `LucidosMenu`'s `actionsInRow`).
  *
  * - `cluster` (the mobile thread pane) is the centrepiece of a fixed-width nav
  *   cluster, at the larger tap target, and it is the connection light:

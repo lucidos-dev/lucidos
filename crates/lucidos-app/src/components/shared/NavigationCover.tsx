@@ -19,6 +19,11 @@ export const NAV_COVER_MOTIONS = {
 export type NavCoverMotion = keyof typeof NAV_COVER_MOTIONS;
 const NAV_COVER_SLACK_MS = 50;
 
+/** How long a cover playing `motion` stays mounted. */
+export function navCoverFuseMs(motion: NavCoverMotion): number {
+  return scaledDurationMs(NAV_COVER_MOTIONS[motion].animMs) + NAV_COVER_SLACK_MS;
+}
+
 /** The view that just arrived in a pane, for as long as its cover lasts, or
  *  null. `viewKey` identifies what the pane shows, and each change to a
  *  non-null key is one arrival. The first render is not a navigation, and a
@@ -31,10 +36,7 @@ function useArrivingView(viewKey: string | null, motion: NavCoverMotion): string
     seenKeyRef.current = viewKey;
     if (viewKey === null) { setArriving(null); return; }
     setArriving(viewKey);
-    const fuse = setTimeout(
-      () => setArriving(null),
-      scaledDurationMs(NAV_COVER_MOTIONS[motion].animMs) + NAV_COVER_SLACK_MS,
-    );
+    const fuse = setTimeout(() => setArriving(null), navCoverFuseMs(motion));
     return () => clearTimeout(fuse);
     // A host never changes its motion, so only a new view arms a fuse.
   }, [viewKey]);

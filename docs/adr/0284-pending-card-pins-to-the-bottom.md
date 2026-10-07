@@ -29,7 +29,7 @@ the timeline read in the order things happened to the reader: the callback
 that landed while they were away, then the answer, then the work it started.
 
 The pin is render order only. `exchangeStatus` still reads the fold order, so
-the callback beneath the card still reads "Held until you reply". Handing
+the callback beneath the card still reads as held. Handing
 `current` over is what makes the coding-agent move safe: the continuation
 lands inside the answered card instead of above it.
 
@@ -53,6 +53,6 @@ lands inside the answered card instead of above it.
   be drawn last.
 - **Pin in the fold instead of the render.** Rejected: `isLast` and the `held`
   status read fold position. Moving the card there flips the callback beneath
-  it from "Held until you reply" to a settled state.
+  it from held to a settled state.
 - **Pin questions only.** Rejected: a permission card reads the same label and
   blocks the same way.

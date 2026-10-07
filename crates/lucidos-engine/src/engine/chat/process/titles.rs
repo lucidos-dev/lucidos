@@ -17,9 +17,8 @@ impl LucidosEngine {
     /// title; otherwise the first follow-up of a chat thread kicks off async
     /// LLM title generation.
     ///
-    /// A thread somebody spoke on is the one exception, and it is named by
-    /// `spawn_call_title_generation` instead. The two moments are the same, and
-    /// only the input differs: one message here, the whole exchange there.
+    /// The home thread gets no title here at all, a caller's included. Only
+    /// the user names it (ADR 0362).
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn maybe_emit_titles(
         &self,
@@ -32,6 +31,9 @@ impl LucidosEngine {
         user_message: &str,
         user_images: Option<&[crate::api::ChatImage]>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if crate::engine::home_thread::is_marked_home_thread(&self.pool, thread_id).await? {
+            return Ok(());
+        }
         // Caller-provided title — emit immediately, skip async LLM title generation
         let has_caller_title = if let Some(t) = title {
             let t = t.trim();
@@ -70,73 +72,57 @@ impl LucidosEngine {
 
         // Generate title for follow-up threads (when a thread gets its second message)
         if !is_new_thread && !is_trigger && !has_caller_title {
-            // A thread somebody SPOKE on is named from its whole exchange
-            // rather than from this one message. A spoken sentence leans on
-            // the one before it, so "Yeah, please check" is a whole request
-            // and none of its subject. `spawn_call_title_generation` owns
-            // that thread, and answers false for a thread nobody spoke on.
-            if self.spawn_call_title_generation(thread_id).await {
-                return Ok(());
-            }
-            // The same naming slot the call path takes. Two follow-ups a
-            // second apart would otherwise both read "no title yet" and both
-            // write one, because generating a title is a model call.
+            // Two follow-ups a second apart would otherwise both read "no
+            // title yet" and both write one, because generating a title is a
+            // model call.
             let Some(slot) = self.claim_the_naming_of(thread_id) else {
                 return Ok(());
             };
             // It's a follow-up — generate title if none exists yet
             let event_store = self.event_store.clone();
-            if let Some(ref extractor) = self.extractor {
-                match title_call(&self.pool, extractor).await {
-                    Err(e) => {
-                        log!("[Chat] Failed to build title provider for follow-up: {}", e);
-                    }
-                    Ok(call) => {
-                        let msg = user_message.to_string();
-                        let attached_images = user_images.map_or(0, |i| i.len());
-                        let bus = self.event_bus.clone();
-                        let tid_str = thread_id_str.to_string();
-                        tokio::spawn(async move {
-                            let _slot = slot;
-                            match event_store.thread_has_title(&tid_str).await {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    // Logged, like the sibling arm below. The
-                                    // title still generates, just without the
-                                    // image description.
-                                    let image_desc = match event_store
-                                        .get_thread_first_message(&tid_str)
-                                        .await
-                                    {
-                                        Ok(found) => found.and_then(|(_, desc, _)| desc),
-                                        Err(e) => {
-                                            log!(
-                                                "[Thread] First-message read failed for the title of {}: {}",
-                                                tid_str,
-                                                e
-                                            );
-                                            None
-                                        }
-                                    };
-                                    emit_generated_title(
-                                        &bus,
-                                        &call,
-                                        thread_id,
-                                        &msg,
-                                        image_desc.as_deref(),
-                                        None,
-                                        attached_images,
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    log!("[Thread] Failed to check title existence: {}", e);
-                                }
+            let call = title_call(self).await;
+            let msg = user_message.to_string();
+            let attached_images = user_images.map_or(0, |i| i.len());
+            let pool = self.pool.clone();
+            let bus = self.event_bus.clone();
+            let tid_str = thread_id_str.to_string();
+            tokio::spawn(async move {
+                let _slot = slot;
+                match event_store.thread_has_title(&tid_str).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // Logged, like the sibling arm below. The
+                        // title still generates, just without the
+                        // image description.
+                        let image_desc = match event_store.get_thread_first_message(&tid_str).await
+                        {
+                            Ok(found) => found.and_then(|(_, desc, _)| desc),
+                            Err(e) => {
+                                log!(
+                                    "[Thread] First-message read failed for the title of {}: {}",
+                                    tid_str,
+                                    e
+                                );
+                                None
                             }
-                        });
+                        };
+                        emit_generated_title(
+                            &pool,
+                            &bus,
+                            &call,
+                            thread_id,
+                            &msg,
+                            image_desc.as_deref(),
+                            None,
+                            attached_images,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        log!("[Thread] Failed to check title existence: {}", e);
                     }
                 }
-            }
+            });
         }
 
         Ok(())

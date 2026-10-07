@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::{prefs, PreferenceStore};
 
 impl EventStore {
     /// Recover `trigger_id`/`trigger_name` for trigger-source rows the
@@ -19,7 +20,8 @@ impl EventStore {
     pub async fn backfill_trigger_id_from_events(
         &self,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        if crate::core::PreferenceStore::get(&self.pool, BACKFILL_TRIGGER_ID_FROM_EVENTS_MARKER)
+        if prefs::BACKFILL_TRIGGER_ID_FROM_EVENTS_DONE
+            .try_stored(&self.pool)
             .await?
             .is_some()
         {
@@ -48,9 +50,9 @@ impl EventStore {
         .await?
         .rows_affected() as usize;
 
-        crate::core::PreferenceStore::set_silent(
+        PreferenceStore::set_silent(
             &self.pool,
-            BACKFILL_TRIGGER_ID_FROM_EVENTS_MARKER,
+            prefs::BACKFILL_TRIGGER_ID_FROM_EVENTS_DONE.key(),
             "1",
         )
         .await?;
@@ -72,7 +74,8 @@ impl EventStore {
     pub async fn backfill_trigger_id_v5_to_config_id(
         &self,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        if crate::core::PreferenceStore::get(&self.pool, BACKFILL_TRIGGER_ID_V5_MARKER)
+        if prefs::BACKFILL_TRIGGER_ID_V5_TO_CONFIG_ID_DONE
+            .try_stored(&self.pool)
             .await?
             .is_some()
         {
@@ -112,8 +115,12 @@ impl EventStore {
             .rows_affected() as usize
         };
 
-        crate::core::PreferenceStore::set_silent(&self.pool, BACKFILL_TRIGGER_ID_V5_MARKER, "1")
-            .await?;
+        PreferenceStore::set_silent(
+            &self.pool,
+            prefs::BACKFILL_TRIGGER_ID_V5_TO_CONFIG_ID_DONE.key(),
+            "1",
+        )
+        .await?;
         Ok(updated)
     }
 
@@ -139,7 +146,8 @@ impl EventStore {
     pub async fn backfill_repo_names_from_changes(
         &self,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        if crate::core::PreferenceStore::get(&self.pool, BACKFILL_REPO_NAMES_FROM_CHANGES_MARKER)
+        if prefs::BACKFILL_REPO_NAMES_FROM_CHANGES_DONE
+            .try_stored(&self.pool)
             .await?
             .is_some()
         {
@@ -169,9 +177,9 @@ impl EventStore {
         .await?
         .rows_affected() as usize;
 
-        crate::core::PreferenceStore::set_silent(
+        PreferenceStore::set_silent(
             &self.pool,
-            BACKFILL_REPO_NAMES_FROM_CHANGES_MARKER,
+            prefs::BACKFILL_REPO_NAMES_FROM_CHANGES_DONE.key(),
             "1",
         )
         .await?;
@@ -211,7 +219,8 @@ impl EventStore {
         &self,
         default_repo_det_id: uuid::Uuid,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        if crate::core::PreferenceStore::get(&self.pool, BACKFILL_CC_REPO_ID_DETERMINISTIC_MARKER)
+        if prefs::BACKFILL_CC_REPO_ID_TO_DETERMINISTIC_DONE
+            .try_stored(&self.pool)
             .await?
             .is_some()
         {
@@ -234,9 +243,9 @@ impl EventStore {
         .await?
         .rows_affected() as usize;
 
-        crate::core::PreferenceStore::set_silent(
+        PreferenceStore::set_silent(
             &self.pool,
-            BACKFILL_CC_REPO_ID_DETERMINISTIC_MARKER,
+            prefs::BACKFILL_CC_REPO_ID_TO_DETERMINISTIC_DONE.key(),
             "1",
         )
         .await?;

@@ -7,6 +7,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { render } from 'preact';
 import { MarkdownDocument } from '../MarkdownDocument';
 
+const NOTES = { kind: 'workspace', path: 'artifacts/notes.md' } as const;
+
 const DAILY_NOTE = [
   '---',
   'type: daily-note',
@@ -23,7 +25,7 @@ let host: HTMLElement;
 function mount(content: string): HTMLElement {
   host = document.createElement('div');
   document.body.append(host);
-  render(<MarkdownDocument content={content} />, host);
+  render(<MarkdownDocument content={content} location={NOTES} />, host);
   return host;
 }
 

@@ -30,10 +30,16 @@ pub(crate) enum TriageScope<'a> {
 }
 
 /// The row filter for a root, over `thread_summaries r`.
+///
+/// The home thread is never one: it is never archived, and no drawer section
+/// lists it (ADR 0362). Its sub-threads count as roots instead, as the drawer
+/// shows them.
 const INBOX_ROOT_SQL: &str = "r.archive_state = 'inbox' AND r.state <> 'discarded' \
+     AND NOT r.is_home \
      AND (r.parent_thread_id IS NULL OR NOT EXISTS ( \
          SELECT 1 FROM thread_summaries p \
-         WHERE p.thread_id = r.parent_thread_id AND p.archive_state = 'inbox'))";
+         WHERE p.thread_id = r.parent_thread_id AND p.archive_state = 'inbox' \
+           AND NOT p.is_home))";
 
 /// The row filter for a root, over `thread_summaries t`. The drawer shows a
 /// thread still being composed only when it holds a draft.

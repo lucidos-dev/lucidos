@@ -16,8 +16,7 @@
  * before proxying).
  */
 
-/** The reserved sigil prefixing all gateway-owned paths (`/~/…`). */
-export const SIGIL = '~';
+import { SIGIL } from '../generated/gateway-constants';
 
 /** The literal `<base href>` the server stamped, or `'/'` when absent (no DOM /
  *  unit tests / a server that didn't stamp one). */

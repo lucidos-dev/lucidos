@@ -28,7 +28,7 @@ function input(deviceId: string, label: string): MediaDeviceInfo {
 }
 
 function mount(): void {
-  preferences.value = { status: 'loaded', data: { voice_enabled: 'true' } };
+  preferences.value = { status: 'loaded', data: { voice_enabled: 'true', home_thread_enabled: 'true' } };
   render(<CallToggle />, host);
 }
 
@@ -138,7 +138,7 @@ describe('what the picker offers', () => {
   it('checks the stored choice, and only that one', async () => {
     preferences.value = {
       status: 'loaded',
-      data: { voice_enabled: 'true', voice_input_device: 'mic-b' },
+      data: { voice_enabled: 'true', home_thread_enabled: 'true', voice_input_device: 'mic-b' },
     };
     render(<CallToggle />, host);
     await hold(control());

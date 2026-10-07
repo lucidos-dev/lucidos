@@ -316,7 +316,7 @@ impl LucidosEngine {
         child_terminal_event_id: Option<Uuid>,
         parent_is_coding_agent: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Same formatter `build_session_messages` uses on reload, so the
+        // Same formatter `build_messages_now` uses on reload, so the
         // inflight wake matches what a post-restart resume would project.
         let row = match self
             .event_store
@@ -362,7 +362,11 @@ impl LucidosEngine {
             return Ok(());
         }
 
-        let block = crate::core::store::format_child_thread_completed_block(&row);
+        let statuses = self
+            .event_store
+            .reported_change_statuses(std::slice::from_ref(&row))
+            .await;
+        let block = crate::core::store::format_child_thread_completed_block(&row, &statuses);
 
         let callback_origin = Some(thread_events::MessageOrigin::thread_link_child(
             child_thread_id,
@@ -465,11 +469,6 @@ impl LucidosEngine {
         .await
     }
 
-    /// Get a reference to the memory extractor (for Flash title generation, etc.)
-    pub fn extractor(&self) -> Option<&crate::memory::MemoryExtractor> {
-        self.extractor.as_ref()
-    }
-
     /// Get list of thread IDs with a live processing task (chat loop running).
     /// Does NOT include idle coding-agent sessions, which are tracked via
     /// `thread_summaries.status`.
@@ -529,86 +528,6 @@ impl LucidosEngine {
         Self::drain_orphaned_injections(injection_rx)
     }
 
-    /// How many spoken turns a call's name is built from.
-    ///
-    /// A bound rather than a budget. The rendered exchange is truncated by
-    /// characters after this, like every other title input.
-    const SPOKEN_TURNS_FOR_A_NAME: i64 = 40;
-
-    /// Name a thread from the call on it, unless something already named it.
-    ///
-    /// The one entry point for every site that names a call. Three ask, and
-    /// they differ only in WHEN. The call loop asks on the first caller
-    /// utterance that followed a reply. `api::voice` asks again once the call
-    /// is over, and a delegated turn asks through `maybe_emit_titles`. What a
-    /// call is named from is decided here, so the three cannot drift.
-    ///
-    /// **Returns whether this path owns the thread's naming**, which is the
-    /// other question its callers have. A thread with no call to name is
-    /// handed back, and the chat titler names it from what it does have.
-    ///
-    /// **A call nothing answered is not named here.** One utterance with no
-    /// reply is not a conversation, and the model names it anyway: " So, yeah,
-    /// I think" became "Incomplete Conversation Opener". A title is permanent,
-    /// so declining leaves the caller's own words on screen.
-    pub async fn spawn_call_title_generation(&self, thread_id: uuid::Uuid) -> bool {
-        let turns = match self
-            .event_store
-            .get_thread_spoken_exchange(thread_id, Self::SPOKEN_TURNS_FOR_A_NAME)
-            .await
-        {
-            Ok(turns) => turns,
-            Err(e) => {
-                log!("[Title] Could not read the call on {}: {}", thread_id, e);
-                // Unreadable is not "no call". Claiming the thread keeps the
-                // chat titler off a call it would name from one utterance.
-                return true;
-            }
-        };
-        // One test for both ways out, because they mean the same thing here:
-        // there is no call to name. A thread nobody spoke on has no turns at
-        // all, and a call nothing answered has one voice in it.
-        //
-        // **Handing a one-sided call back is deliberate.** This path declines
-        // to name it, and claiming it as well would leave the thread
-        // unnameable for good: a caller who says one thing into the void and
-        // later TYPES on that thread would get no name from the words they
-        // typed either.
-        if !chat::exchange_has_both_speakers(&turns) {
-            return false;
-        }
-        // Unreadable counts as named, so a failed read never spends a title
-        // call and never overwrites a name that is already there.
-        if self
-            .event_store
-            .thread_has_title(&thread_id.to_string())
-            .await
-            .unwrap_or(true)
-        {
-            return true;
-        }
-        let Some(ref extractor) = self.extractor else {
-            return true;
-        };
-        let call = match chat::title_call(&self.pool, extractor).await {
-            Ok(call) => call,
-            Err(e) => {
-                log!("[Title] Failed to build the provider to name a call: {}", e);
-                return true;
-            }
-        };
-        let Some(slot) = self.claim_the_naming_of(thread_id) else {
-            return true;
-        };
-        let message = chat::spoken_exchange_as_title_input(&turns);
-        let bus = self.event_bus.clone();
-        tokio::spawn(async move {
-            let _slot = slot;
-            chat::emit_generated_title(&bus, &call, thread_id, &message, None, None, 0).await;
-        });
-        true
-    }
-
     /// Take this thread's naming slot, or answer `None` because a name is
     /// already on its way.
     ///
@@ -643,40 +562,34 @@ impl LucidosEngine {
                 return;
             }
         };
-        if let Some(ref extractor) = self.extractor {
-            let call = match chat::title_call(&self.pool, extractor).await {
-                Ok(call) => call,
-                Err(e) => {
-                    log!("[Thread] Failed to build title provider: {}", e);
-                    return;
-                }
-            };
-            let event_store = self.event_store.clone();
-            let bus = self.event_bus.clone();
-            let tid = thread_id.to_string();
-            tokio::spawn(async move {
-                let (first_msg, image_desc, image_count) =
-                    match event_store.get_thread_first_message(&tid).await {
-                        Ok(Some((msg, desc, count))) => (msg, desc, count),
-                        Ok(None) => return,
-                        Err(e) => {
-                            log!("[Thread] Failed to get first message for title: {}", e);
-                            return;
-                        }
-                    };
+        let call = chat::title_call(self).await;
+        let event_store = self.event_store.clone();
+        let pool = self.pool.clone();
+        let bus = self.event_bus.clone();
+        let tid = thread_id.to_string();
+        tokio::spawn(async move {
+            let (first_msg, image_desc, image_count) =
+                match event_store.get_thread_first_message(&tid).await {
+                    Ok(Some((msg, desc, count))) => (msg, desc, count),
+                    Ok(None) => return,
+                    Err(e) => {
+                        log!("[Thread] Failed to get first message for title: {}", e);
+                        return;
+                    }
+                };
 
-                chat::emit_generated_title(
-                    &bus,
-                    &call,
-                    tid_uuid,
-                    &first_msg,
-                    image_desc.as_deref(),
-                    None,
-                    image_count,
-                )
-                .await;
-            });
-        }
+            chat::emit_generated_title(
+                &pool,
+                &bus,
+                &call,
+                tid_uuid,
+                &first_msg,
+                image_desc.as_deref(),
+                None,
+                image_count,
+            )
+            .await;
+        });
     }
 
     /// Cancel all active threads. `actor` is stamped on every handle's

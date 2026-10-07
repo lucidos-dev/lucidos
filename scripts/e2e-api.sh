@@ -3,6 +3,7 @@
 #
 # Usage:
 #   ./scripts/e2e-api.sh [options] [-- cargo test args]
+#   ./scripts/e2e-api.sh --github [options]   # on GitHub's runners, ADR 0382
 #
 # Options:
 #   -f <filter>      Filter tests by name (passed to cargo test as filter)
@@ -17,6 +18,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/e2e_github.sh
+source "$SCRIPT_DIR/lib/e2e_github.sh"
+e2e_github_handoff api "$@"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 source "$SCRIPT_DIR/lib/e2e.sh"

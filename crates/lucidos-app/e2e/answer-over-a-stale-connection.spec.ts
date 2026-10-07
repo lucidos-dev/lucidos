@@ -14,8 +14,8 @@ import { randomUUID } from 'crypto';
  * `route.abort('failed')` reproduces the same rejection shape, the transport
  * `TypeError` that `isTransportError` matches.
  *
- * Two halves, one per test: the client retries the POST once, and when that
- * cannot save it either the user keeps their answer.
+ * Two halves, one per test: the client retries the POST quietly, and when no
+ * attempt saves it the card keeps the answer as Not sent, with a retry icon.
  *
  * Service workers are blocked, following `sdk-iframe-mount.spec.ts`. A
  * controlled page runs every fetch through the worker's own network session in
@@ -107,10 +107,10 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
     }
   });
 
-  // When the retry cannot save it either, the user keeps their answer. The
-  // submit clears the toggles as its send gesture, and the reported failure
+  // When no quiet retry can save it, the user keeps their answer on the card.
+  // The submit clears the toggles as its send gesture, and the reported failure
   // left the card blank.
-  test('a multi-select answer that cannot be sent gives the picks back', async ({ page }) => {
+  test('a multi-select answer that cannot be sent stays on its card as Not sent', async ({ page }) => {
     await assertHealthy(page);
     const seed = seedQuestion({
       title: 'CC Keep Picks E2E',
@@ -120,9 +120,10 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
     });
 
     try {
-      // Both the tap and the client's own retry fail, which is the state the
-      // user was actually in.
-      await page.route(ANSWER_ROUTE, (route) => route.abort('failed'));
+      // The tap and every quiet retry fail, which is the state the user was
+      // actually in.
+      let landing = false;
+      await page.route(ANSWER_ROUTE, (route) => (landing ? route.continue() : route.abort('failed')));
 
       await navigateToApp(page);
       await openThreadDrawer(page);
@@ -144,22 +145,26 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
       await expect(submit).toBeEnabled();
       await submit.click();
 
-      // The card comes back live, still holding both picks, so the retry is one
-      // tap rather than a re-pick.
-      await expect(pendingBody.locator('.question-option[aria-pressed="true"]'))
-        .toHaveCount(2, { timeout: 10_000 });
-      await expect(submit).toBeEnabled();
-
-      // ONE message for one failed tap, and it names the cause. The pair the
-      // user reported said "Please try again" over "unknown error".
-      const errors = page.locator('.toast-error:visible');
-      await expect(errors).toHaveCount(1);
-      await expect(errors.first()).toContainText('the connection dropped');
+      // Once the quiet retries give up, the card still holds both picks, with
+      // Not sent and a retry icon on the first. No toast: the card says it.
+      await expect(pendingBody.locator('.question-option-selected')).toHaveCount(2, { timeout: 30_000 });
+      const notice = pendingBody.locator('.question-unsent-row');
+      await expect(notice).toHaveCount(1);
+      await expect(notice).toContainText('Not sent');
+      await expect(page.locator('.toast-error:visible')).toHaveCount(0);
 
       // Nothing reached the engine, so nothing was recorded.
       expect(
         psql(`SELECT COUNT(*) FROM events WHERE thread_id = '${seed.threadId}' AND event_type = 'UserQuestionAnswered'`),
       ).toBe('0');
+
+      // The retry icon sends the same answer, so nothing is re-picked.
+      landing = true;
+      await notice.locator('button[aria-label="Retry sending your answer"]').click();
+      await expect.poll(
+        () => psql(`SELECT payload->'answer'->'option_ids' FROM events WHERE thread_id = '${seed.threadId}' AND event_type = 'UserQuestionAnswered' AND payload->>'tool_use_id' = '${seed.toolUseId}'`),
+        { intervals: [400], timeout: 10_000 },
+      ).toBe('["opt-0", "opt-2"]');
     } finally {
       await page.unroute(ANSWER_ROUTE);
       cleanup(seed.threadId);

@@ -1,9 +1,12 @@
 use super::super::types::*;
 use super::collect_dismissed_event_ids;
 use super::spoken_merge::{is_one_utterance, join_spoken};
+use crate::core::changes::ChangeStatus;
 use crate::core::EventRow;
 use crate::engine::thread_events::{AgentParticipant, MessageOrigin};
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Who said a spoken row, and under whose label the doer reads it.
 ///
@@ -103,7 +106,7 @@ fn push_spoken(
         created_at: event.created,
         channel: None,
         steps: vec![],
-        images: vec![],
+        image_handles: vec![],
         user_image_hashes: vec![],
         image_description: None,
         completed,
@@ -140,13 +143,67 @@ fn authoring_agent(event: &EventRow) -> Option<AgentParticipant> {
         .cloned()
 }
 
+/// The status each change a child report names has now, keyed by change id.
+///
+/// A report freezes its change list as the child left it. This map is how a
+/// rebuilt report says what became of each change since. `None` means the row
+/// is gone: deleting a thread deletes its changes. An id missing from the map
+/// was not looked up, and reads as the report left it.
+pub type ChangeStatuses = HashMap<Uuid, Option<ChangeStatus>>;
+
+/// Every change id this thread's child reports name: their own and their
+/// sub-threads'.
+pub(crate) fn reported_change_ids(events: &[EventRow]) -> Vec<Uuid> {
+    let parse = |v: &serde_json::Value| v.as_str().and_then(|s| Uuid::parse_str(s).ok());
+    events
+        .iter()
+        .filter(|event| event.event_type == "ChildThreadCompleted")
+        .flat_map(|event| {
+            let own = event
+                .payload
+                .get("pending_change_ids")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(parse);
+            let below = event
+                .payload
+                .get("sub_thread_pending_changes")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.get("change_id").and_then(parse));
+            own.chain(below).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// What became of a reported change since the report, or `None` while it
+/// still waits in Review.
+fn moved_on_since(statuses: &ChangeStatuses, change_id: Uuid) -> Option<&'static str> {
+    match statuses.get(&change_id)? {
+        Some(ChangeStatus::Pending) => None,
+        Some(ChangeStatus::SetAside) => Some("now set aside"),
+        Some(ChangeStatus::Applied) => Some("now applied"),
+        Some(ChangeStatus::Discarded) => Some("now discarded"),
+        Some(ChangeStatus::Reverted) => Some("now reverted"),
+        None => Some("now deleted"),
+    }
+}
+
+/// Follows a report that names a change which moved on since. The child's
+/// summary and the parent's own later turns still call it pending, and the
+/// model repeats them unless the card says otherwise.
+pub(crate) const CHANGES_MOVED_ON_NOTE: &str =
+    "A change marked \"now ...\" left Review after this report and no longer waits for \
+     Apply. Anything in this conversation that calls it pending is out of date.";
+
 /// Format a persisted `ChildThreadCompleted` event row as the `[CHILD THREAD
 /// COMPLETED]` user-channel block the parent LLM sees in its conversation
-/// history. Shared by [`build_session_messages`] (projects every typed
-/// completion at LLM call setup) and the agentic loop's wake-from-child
-/// injection drain (projects a single event inline as the next user
-/// message). Both paths produce identical text.
-pub fn format_child_thread_completed_block(event: &EventRow) -> String {
+/// history. Shared by [`build_session_messages_with`] (projects every typed
+/// completion at LLM call setup) and the fan-in wake (projects a single event
+/// inline as the next user message). Both paths produce identical text.
+pub fn format_child_thread_completed_block(event: &EventRow, statuses: &ChangeStatuses) -> String {
     use crate::engine::thread_events::ChildCompletionStatus;
 
     let child_thread_id = event
@@ -199,9 +256,29 @@ pub fn format_child_thread_completed_block(event: &EventRow) -> String {
     let pending_section = if pending_change_ids.is_empty() {
         "none".to_string()
     } else {
-        pending_change_ids.join(", ")
+        pending_change_ids
+            .iter()
+            .map(|id| {
+                match Uuid::parse_str(id)
+                    .ok()
+                    .and_then(|uuid| moved_on_since(statuses, uuid))
+                {
+                    Some(since) => format!("{id} ({since})"),
+                    None => id.clone(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let sub_thread_section = sub_thread_pending_section(event);
+    let sub_thread_section = sub_thread_pending_section(event, statuses);
+    let any_moved_on = reported_change_ids(std::slice::from_ref(event))
+        .iter()
+        .any(|id| moved_on_since(statuses, *id).is_some());
+    let moved_on_note = if any_moved_on {
+        format!("\n{CHANGES_MOVED_ON_NOTE}")
+    } else {
+        String::new()
+    };
     let title_line = if title.is_empty() {
         String::new()
     } else {
@@ -218,7 +295,7 @@ pub fn format_child_thread_completed_block(event: &EventRow) -> String {
     // original reader and is retired (ADR 0109); the `events` tool's
     // `event_id` argument takes the same form.
     format!(
-        "[CHILD THREAD COMPLETED] {} {}\nevent_id: {}{}\nPending changes: {}{}{}\n\
+        "[CHILD THREAD COMPLETED] {} {}\nevent_id: {}{}\nPending changes: {}{}{}{}\n\
          Note: phrases like \"session can finish\" or \"## Session Summary\" in \
          the summary describe the child subprocess only — if you were following \
          a multi-step procedure, continue with the next step. Otherwise use \
@@ -229,6 +306,7 @@ pub fn format_child_thread_completed_block(event: &EventRow) -> String {
         title_line,
         pending_section,
         sub_thread_section,
+        moved_on_note,
         summary_section
     )
 }
@@ -237,7 +315,7 @@ pub fn format_child_thread_completed_block(event: &EventRow) -> String {
 /// there are none. The `Pending changes:` line above names the child's own
 /// branch only, so without this an orchestrator whose children hold every
 /// change reads "none".
-fn sub_thread_pending_section(event: &EventRow) -> String {
+fn sub_thread_pending_section(event: &EventRow, statuses: &ChangeStatuses) -> String {
     use crate::engine::thread_events::SubThreadPendingChange;
 
     let entries: Vec<SubThreadPendingChange> = event
@@ -252,10 +330,12 @@ fn sub_thread_pending_section(event: &EventRow) -> String {
     let lines: Vec<String> = entries
         .iter()
         .map(|entry| {
-            let state = if entry.thread_unsettled {
-                "still working"
-            } else {
-                "settled"
+            // Once the change has moved on, the sub-thread's state when the
+            // card was sent says nothing about it.
+            let state = match moved_on_since(statuses, entry.change_id) {
+                Some(since) => since,
+                None if entry.thread_unsettled => "still working",
+                None => "settled",
             };
             let title = entry.thread_title.as_deref().unwrap_or(UNTITLED_SUB_THREAD);
             format!(
@@ -332,7 +412,25 @@ pub fn format_child_thread_detached_block(event: &EventRow) -> String {
     )
 }
 
+/// Handles of the thread images `event` adds, by the resolver's own rule.
+fn thread_image_handles_of(event: &EventRow) -> Vec<String> {
+    crate::core::events::thread_image_refs_of(&event.event_type, &event.payload)
+        .into_iter()
+        .map(|(_, image_ref)| crate::core::events::image_handle(image_ref))
+        .collect()
+}
+
+/// [`build_session_messages_with`] with no change statuses, so each child
+/// report reads as the child left it.
+#[cfg(test)]
+pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage> {
+    build_session_messages_with(events, &ChangeStatuses::new())
+}
+
 /// Build session messages from a list of events (pure function, no DB access).
+///
+/// `statuses` says what became of each change a child report names. Load it
+/// with `EventStore::build_messages_now` rather than passing an empty map.
 ///
 /// Interruption semantics:
 /// - `completed: Some(false)` — the response was interrupted by a follow-up user message
@@ -340,10 +438,13 @@ pub fn format_child_thread_detached_block(event: &EventRow) -> String {
 ///   response could complete with `ResponseGenerated`).
 /// - `completed: None` — still in progress or unknown (trailing buffer flush at end of events).
 /// - `completed: Some(true)` — completed normally (`ResponseGenerated` or `ResponseFailed`).
-pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage> {
+pub(crate) fn build_session_messages_with(
+    events: &[EventRow],
+    statuses: &ChangeStatuses,
+) -> Vec<SessionMessage> {
     let mut messages: Vec<SessionMessage> = Vec::new();
     let mut pending_steps: Vec<Step> = Vec::new();
-    let mut pending_images: Vec<String> = Vec::new();
+    let mut pending_image_handles: Vec<String> = Vec::new();
     let mut claude_code_text_buf = String::new();
     let mut claude_code_text_last_ts: Option<DateTime<Utc>> = None;
     let mut text_buf = String::new();
@@ -416,7 +517,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                         created_at,
                         channel: Some("claude_code".to_string()),
                         steps: std::mem::take(&mut pending_steps),
-                        images: std::mem::take(&mut pending_images),
+                        image_handles: std::mem::take(&mut pending_image_handles),
                         user_image_hashes: vec![],
                         image_description: None,
                         completed: Some(false),
@@ -451,7 +552,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                         created_at,
                         channel: None,
                         steps: std::mem::take(&mut pending_steps),
-                        images: std::mem::take(&mut pending_images),
+                        image_handles: std::mem::take(&mut pending_image_handles),
                         user_image_hashes: vec![],
                         image_description: None,
                         completed: Some(false),
@@ -494,7 +595,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     .unwrap_or_default();
 
                 pending_steps.clear();
-                pending_images.clear();
+                pending_image_handles.clear();
                 pending_events.clear();
 
                 // Prefer the typed `ImageDescribed` event (post-refactor) and
@@ -528,7 +629,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     created_at: event.created,
                     channel,
                     steps: vec![],
-                    images: vec![],
+                    image_handles: thread_image_handles_of(event),
                     user_image_hashes,
                     image_description,
                     completed: None,
@@ -703,7 +804,6 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     step.success = success;
                 }
 
-                // Track screenshots for image embedding
                 let tool_name = event
                     .payload
                     .get("name")
@@ -733,13 +833,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     *d = detail;
                 }
 
-                if tool_name == "browser_screenshot" && success {
-                    if let Some(result) = event.payload.get("result").and_then(|v| v.as_str()) {
-                        if let Some(path) = super::super::extract_screenshot_path(result) {
-                            pending_images.push(path);
-                        }
-                    }
-                }
+                pending_image_handles.extend(thread_image_handles_of(event));
             }
             "CodingAgentTextStreamed" | "TextStreamed" => {
                 if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
@@ -878,24 +972,6 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     result_text
                 };
 
-                // Check for images stored in the event payload (new events)
-                let stored_images: Vec<String> = event
-                    .payload
-                    .get("images")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let images = if !stored_images.is_empty() {
-                    stored_images
-                } else {
-                    std::mem::take(&mut pending_images)
-                };
-
                 // Prefer explicit request_event_id from payload; fall back to positional tracking
                 let user_eid = event
                     .payload
@@ -910,7 +986,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     created_at: event.created,
                     channel,
                     steps: std::mem::take(&mut pending_steps),
-                    images,
+                    image_handles: std::mem::take(&mut pending_image_handles),
                     user_image_hashes: vec![],
                     image_description: None,
                     completed: Some(true),
@@ -942,7 +1018,6 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     .map(|s| s.to_string())
                     .or_else(|| current_request_event_id.clone());
 
-                pending_images.clear();
                 // Append the error text as a text event so events-based
                 // rendering shows the error alongside any accumulated steps.
                 let error_content = format!("[ERROR] **Error:** {}", error);
@@ -958,7 +1033,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     created_at: event.created,
                     channel: None,
                     steps: std::mem::take(&mut pending_steps),
-                    images: vec![],
+                    image_handles: std::mem::take(&mut pending_image_handles),
                     user_image_hashes: vec![],
                     image_description: None,
                     completed: Some(true),
@@ -982,7 +1057,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     .to_string();
 
                 pending_steps.clear();
-                pending_images.clear();
+                pending_image_handles.clear();
                 pending_events.clear();
 
                 let channel = event
@@ -1000,7 +1075,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     created_at: event.created,
                     channel,
                     steps: vec![],
-                    images: vec![],
+                    image_handles: vec![],
                     user_image_hashes: vec![],
                     image_description: None,
                     completed: None,
@@ -1036,7 +1111,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                 // its conversation history. Replaces the pre-Phase-4 prose
                 // `[Child thread completed]` UserPromptInjected which used to
                 // arrive on the parent thread carrying the same info.
-                let content = format_child_thread_completed_block(event);
+                let content = format_child_thread_completed_block(event, statuses);
 
                 messages.push(SessionMessage {
                     role: "user".to_string(),
@@ -1044,7 +1119,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     created_at: event.created,
                     channel: None,
                     steps: vec![],
-                    images: vec![],
+                    image_handles: vec![],
                     user_image_hashes: vec![],
                     image_description: None,
                     completed: None,
@@ -1073,7 +1148,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     created_at: event.created,
                     channel: None,
                     steps: vec![],
-                    images: vec![],
+                    image_handles: vec![],
                     user_image_hashes: vec![],
                     image_description: None,
                     completed: None,
@@ -1146,7 +1221,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                         created_at: event.created,
                         channel: None,
                         steps: vec![],
-                        images: vec![],
+                        image_handles: vec![],
                         user_image_hashes: vec![],
                         image_description: None,
                         completed: Some(true),
@@ -1232,7 +1307,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
             created_at,
             channel,
             steps: std::mem::take(&mut pending_steps),
-            images: std::mem::take(&mut pending_images),
+            image_handles: std::mem::take(&mut pending_image_handles),
             user_image_hashes: vec![],
             image_description: None,
             completed: None,

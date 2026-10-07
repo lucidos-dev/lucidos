@@ -411,7 +411,10 @@ impl TriggerConfig {
                     .collect()
             })
             .unwrap_or_default();
-        let timezone = payload["timezone"].as_str().unwrap_or("UTC").to_string();
+        let timezone = payload["timezone"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(crate::triggers::definition::default_timezone);
         let run: TriggerRun = serde_json::from_value(payload["run"].clone())
             .map_err(|e| format!("Invalid run field: {}", e))?;
         let on = parse_event_subscriptions(payload.get("on"));

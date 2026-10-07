@@ -77,11 +77,17 @@ expect_eq "a compiled-in markdown file" "rust" "$(select_for CHANGELOG.md)"
 expect_eq "no compile-inputs file" "" "$(printf '%s\n' CHANGELOG.md | hs_select_suites | tr '\n' ' ')"
 expect_eq "shell" "shell-lint" "$(select_for scripts/foo.sh)"
 expect_eq "Makefile" "shell-lint" "$(select_for Makefile)"
-expect_eq "installer" "shell-lint install" "$(select_for install.sh)"
-for f in uninstall.sh scripts/lib/service.sh scripts/lib/stage_runtime.sh \
+expect_eq "installer" "shell-lint gateway install" "$(select_for install.sh)"
+expect_eq "installer: service.sh" "shell-lint gateway install" "$(select_for scripts/lib/service.sh)"
+for f in uninstall.sh scripts/lib/stage_runtime.sh \
     scripts/lib/headless_tarball.sh scripts/lib/install_common.sh; do
     expect_eq "installer: $f" "shell-lint install" "$(select_for "$f")"
 done
+expect_eq "a script both crates pin" "shell-lint engine-filtered gateway" \
+    "$(select_for scripts/lib/workspace_constants.sh)"
+expect_eq "a script the engine pins" "shell-lint engine-filtered" "$(select_for scripts/status.sh)"
+expect_eq "rust subsumes the gateway pins" "rust install" \
+    "$(select_for install.sh crates/lucidos-gateway/src/a.rs)"
 expect_eq "release script" "shell-lint release" "$(select_for scripts/release.sh)"
 expect_eq "preferences" "rust app-lib ts" "$(select_for crates/lucidos-app/src/store/actions/preferences.ts)"
 expect_eq "proc tree" "shell-lint harden-suites" "$(select_for scripts/lib/proc_tree.sh)"
@@ -118,13 +124,29 @@ expect_eq "locale" "rust app-lib ts" \
     "$(select_for crates/lucidos-app/src/components/settings/LocaleSection.tsx)"
 expect_eq "knowhow" "engine-filtered" "$(select_for system-knowhow/a.md)"
 expect_eq "rust subsumes filters" "rust" "$(select_for system-knowhow/a.md crates/lucidos-engine/src/a.rs)"
-expect_eq "docs only" "" "$(select_for docs/a.md README.md)"
+expect_eq "docs only" "" "$(select_for docs/a.md docs/b.md)"
 
 echo "engine filters"
 expect_eq "knowhow filters" \
-    "always_loaded_context_stays_under_budget system_knowhow_descriptions_stay_routing_sized" \
+    "always_loaded_context_stays_under_budget system_knowhow_descriptions_stay_routing_sized value_pins_tests" \
     "$(printf '%s\n' crates/a.ts system-knowhow/a.md | hs_engine_filters)"
+expect_eq "an engine-pinned script runs the pins alone" "value_pins_tests" \
+    "$(printf '%s\n' scripts/status.sh | hs_engine_filters)"
 expect_eq "no knowhow, no filters" "" "$(printf '%s\n' crates/a.ts | hs_engine_filters)"
+
+echo "pinned paths, scanned from this checkout"
+# Each list must name exactly the non-knowhow files its pin test reads, so a
+# new pin row cannot go unselected.
+pin_test_paths() { # <rust file>
+    grep -o -E '"(scripts/[^"]+|install\.sh|README\.md|crates/[^"]+)"' "$CHECKOUT/$1" | tr -d '"' | sort -u | tr '\n' ' '
+}
+sorted_words() { # <space-separated list>
+    printf '%s\n' "$1" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' '
+}
+expect_eq "HS_GATEWAY_PINNED names what the gateway pins read" "$(sorted_words "$HS_GATEWAY_PINNED")" \
+    "$(pin_test_paths crates/lucidos-gateway/src/value_pins_tests.rs)"
+expect_eq "HS_ENGINE_PINNED names what the engine pins read" "$(sorted_words "$HS_ENGINE_PINNED")" \
+    "$(pin_test_paths crates/lucidos-engine/src/engine/value_pins_tests.rs)"
 
 echo "source includes"
 SRC="$TMP/src"
@@ -159,6 +181,9 @@ expect_has "driver names both modules" \
 printf '%s\n' system-knowhow/a.md > "$TMP/paths"
 expect_has "engine-filtered carries filters" "-- -- always_loaded" \
     "$(HS_STUB_CMD='' hs_suite_command engine-filtered normal "$TMP/paths")"
+expect_eq "gateway runs the gateway crate" "cargo test --locked -p lucidos-gateway" \
+    "$(HS_STUB_CMD='' hs_suite_command gateway normal /dev/null)"
+if hs_is_cargo_suite gateway; then pass "gateway shares the cargo lane"; else fail "gateway shares the cargo lane"; fi
 
 echo "every workspace crate's tests run in a suite"
 # `make lint` compiles every crate's tests and runs none, so each crate needs a

@@ -67,10 +67,11 @@ impl LucidosEngine {
                 .collect::<Vec<_>>()
                 .join("; ");
             out.push_str(&format!(
-                "- {}: \"{}\" | routes: {} | {} | {}\n",
+                "- {}: \"{}\" | routes: {} | {} | {} | {}\n",
                 m.id,
                 m.label,
                 routes,
+                vision_label(m.vision),
                 if m.enabled { "enabled" } else { "disabled" },
                 if m.is_builtin() { "builtin" } else { "user" },
             ));
@@ -127,10 +128,15 @@ impl LucidosEngine {
             Err(e) => return Ok(format!("Error: {e}")),
         };
 
+        let vision = match parse_vision(args) {
+            Ok(vision) => vision,
+            Err(e) => return Ok(e),
+        };
         let fields = ModelFields {
             label: label.to_string(),
             routes,
             preferred_provider: None,
+            vision,
             sort_order,
         };
         match ModelStore::create(&self.pool, &self.event_bus, id, &fields, None).await {
@@ -222,7 +228,7 @@ impl LucidosEngine {
         .await
         {
             Ok(_) => Ok(format!(
-                "[ACTION COMPLETED] Model '{}' updated: routes {}; preferred provider {}.",
+                "[ACTION COMPLETED] Model '{}' updated: routes {}; preferred provider {}; {}.",
                 existing.id,
                 fields
                     .routes
@@ -231,6 +237,7 @@ impl LucidosEngine {
                     .collect::<Vec<_>>()
                     .join(", "),
                 fields.preferred_provider.as_deref().unwrap_or("none"),
+                vision_label(fields.vision),
             )),
             Err(e) => Ok(format!("Error: failed to update model '{id}': {e}")),
         }
@@ -271,6 +278,26 @@ impl LucidosEngine {
     }
 }
 
+/// How a reply names a row's *vision flag*.
+fn vision_label(vision: bool) -> &'static str {
+    match vision {
+        true => "reads images",
+        false => "text only",
+    }
+}
+
+/// Read the optional `vision` argument: absent or null is `false`.
+///
+/// Anything but a boolean is refused rather than read as `false`, which would
+/// quietly add the model as text only.
+fn parse_vision(args: &serde_json::Value) -> Result<bool, String> {
+    match &args["vision"] {
+        serde_json::Value::Null => Ok(false),
+        serde_json::Value::Bool(vision) => Ok(*vision),
+        other => Err(format!("Error: vision must be true or false, not {other}")),
+    }
+}
+
 /// Read the optional `routes` argument: absent or null is `None`.
 ///
 /// A JSON string holding the list is accepted too, since that is how the CLI
@@ -289,7 +316,7 @@ fn parse_routes(args: &serde_json::Value) -> Result<Option<Vec<Route>>, String> 
 
 #[cfg(test)]
 mod tests {
-    use super::parse_routes;
+    use super::{parse_routes, parse_vision};
     use serde_json::json;
 
     #[test]
@@ -316,5 +343,16 @@ mod tests {
         assert!(err.contains("routes is malformed"), "{err}");
         let err = parse_routes(&json!({ "routes": "not json" })).unwrap_err();
         assert!(err.contains("routes is malformed"), "{err}");
+    }
+
+    /// A model added without the flag is text only. A value that is not a
+    /// boolean is refused, never read as text only.
+    #[test]
+    fn parse_vision_defaults_off_and_refuses_a_non_boolean() {
+        assert_eq!(parse_vision(&json!({})), Ok(false));
+        assert_eq!(parse_vision(&json!({ "vision": null })), Ok(false));
+        assert_eq!(parse_vision(&json!({ "vision": true })), Ok(true));
+        let err = parse_vision(&json!({ "vision": "true" })).unwrap_err();
+        assert!(err.contains("vision must be true or false"), "{err}");
     }
 }

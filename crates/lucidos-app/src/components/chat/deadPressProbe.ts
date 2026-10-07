@@ -295,7 +295,7 @@ const STRAY_TOUCH_THROTTLE_MS = 250;
  *  Far beyond any tap, and beyond the long press that reveals a tooltip, so an
  *  ordinary gesture always lifts first. Short enough that the report still
  *  reaches a user who is looking at the screen wondering why nothing happened. */
-const LIFT_DEADLINE_MS = 4000;
+export const LIFT_DEADLINE_MS = 4000;
 
 /** A rect as the log carries it: whole pixels, and only the four edges.
  *
@@ -611,7 +611,7 @@ function noteStrayTouch(t: ProbeTouch, target: Element | null, rowRect: ProbeRec
  *  under one buys nothing a single line does not. */
 let lastCoveredTouchAt = Number.NEGATIVE_INFINITY;
 
-function noteCoveredTouch(t: ProbeTouch, rowRect: ProbeRect | null): void {
+function noteCoveredTouch(t: ProbeTouch, rowRect: ProbeRect | null, cover: string): void {
   const now = Date.now();
   if (now - lastCoveredTouchAt < STRAY_TOUCH_THROTTLE_MS) return;
   lastCoveredTouchAt = now;
@@ -619,7 +619,7 @@ function noteCoveredTouch(t: ProbeTouch, rowRect: ProbeRect | null): void {
     face: 'the row',
     verdict: 'covered',
     movedPx: 0,
-    cover: coverOverShell(),
+    cover,
     ...touchLanding(t, rowRect),
   });
 }
@@ -998,11 +998,34 @@ function coveredOnPurpose(): boolean {
   return coverOverShell() !== '';
 }
 
+/** The cover as it stood when the current gesture's `pointerdown` arrived.
+ *
+ *  WebKit fires `pointerdown` before `touchstart`, and an overlay dismisses on
+ *  the first. So a tap that closes a menu reaches the `touchstart` with the
+ *  cover already gone. Its touch was hit-tested under the cover and went to the
+ *  shell, while Send answers at the point. That is a swallowed dismiss, and it
+ *  read as a dead Send.
+ *
+ *  Valid only while the probe's listener runs before any overlay's. It installs
+ *  at shell startup, and an overlay adds its listener when it opens. */
+let coverAtPointerDown = '';
+
+/** Which cover was over the shell for the press now being dispatched.
+ *
+ *  Consuming, so the reading belongs to one gesture. A `touchstart` with no
+ *  `pointerdown` of its own must not inherit an earlier dismiss's cover, or a
+ *  real dead press would log as covered. */
+function takeCoverForThisPress(): string {
+  const cover = coverOverShell() || coverAtPointerDown;
+  coverAtPointerDown = '';
+  return cover;
+}
+
 /** How often the composer is asked about with no gesture behind it.
  *
  *  Slow on purpose. A wedge persists, so a faster tick buys nothing, and this
  *  runs for the whole life of the page on a phone. */
-const SCHEDULED_CHECK_MS = 3000;
+export const SCHEDULED_CHECK_MS = 3000;
 
 /** How long after the last keystroke the composer counts as waiting for a press.
  *
@@ -1015,7 +1038,7 @@ const SCHEDULED_CHECK_MS = 3000;
  *  every session pays for that. Round 20 cut it to 1000 and reverted: the
  *  scheduled phase was what made the recovery late, not this bound.
  *  `armKeystrokeNudge` answers the phase without touching the gate. */
-const UNTOUCHED_QUIET_MS = 3000;
+export const UNTOUCHED_QUIET_MS = 3000;
 
 /** How long the composer keeps counting as waiting, before the user is taken to
  *  have put the phone down.
@@ -1521,8 +1544,16 @@ export function installDeadPressProbe(): void {
     });
   };
 
+  // A second finger is not a new gesture, so it keeps the first one's reading.
+  document.addEventListener('pointerdown', (e) => {
+    if (e.isPrimary === false) return;
+    coverAtPointerDown = coverOverShell();
+  }, { capture: true, passive: true });
+
   // Capture, so an inert or covered target still reports.
   document.addEventListener('touchstart', (e) => {
+    // Taken before any early return, so no path leaves it for the next touch.
+    const cover = takeCoverForThisPress();
     // A second finger joining a live gesture is neither a new press nor a lost
     // lift. Leave the gesture exactly as it is: its own lift still rules it.
     // Clearing it here stranded the press with no line at all.
@@ -1578,7 +1609,7 @@ export function installDeadPressProbe(): void {
       // Declining to judge is not declining to speak. A touch that reached the
       // row under a cover takes the `covered` line below, which is the state
       // round 11 left indistinguishable from silence.
-      const covered = coveredOnPurpose();
+      const covered = cover !== '';
       // Only the composer's own row is this module's business. A
       // touch counts as the row's when it was DISPATCHED there, or when it
       // landed on the row's painted box.
@@ -1596,7 +1627,7 @@ export function installDeadPressProbe(): void {
       }
       // The press reached the composer and the app itself is holding a cover
       // over it. Nothing below can judge that, so say it instead.
-      if (covered) { noteCoveredTouch(touch, roundRect(rowRect)); return; }
+      if (covered) { noteCoveredTouch(touch, roundRect(rowRect), cover); return; }
       // One layout read per watchable face. Three questions here are about the
       // same boxes: which face the finger was on, the box the line carries, and
       // the distance it missed by. Each used to re-measure them.

@@ -15,6 +15,7 @@ import {
   extractRepoFileTargetFromHref,
   hasUrlScheme,
   browserHandlesHref,
+  extractSettingsViewFromHref,
 } from '../../utils/linkifyPaths';
 
 /** Toast key for the terminal dead-link guard, so tapping the same dead link
@@ -81,7 +82,7 @@ export function handleMarkdownLinkClick(e: MouseEvent, apps: App[], source?: str
   if (navTarget) {
     e.preventDefault();
     const target = navTarget.dataset.navTarget;
-    if (target) handleNavigationRequest({ target });
+    if (target) handleNavigationRequest({ target, settings_view: navTarget.dataset.settingsView });
     return;
   }
 
@@ -118,6 +119,14 @@ export function handleMarkdownLinkClick(e: MouseEvent, apps: App[], source?: str
     if (repoFile) {
       e.preventDefault();
       void openRepoFileLink(repoFile, source);
+      return;
+    }
+    // A Settings page, such as the one a backup notification names. The
+    // router validates the view and toasts one it cannot render.
+    const settingsView = extractSettingsViewFromHref(rawHref);
+    if (settingsView) {
+      e.preventDefault();
+      handleNavigationRequest({ target: 'settings', settings_view: settingsView });
       return;
     }
     const navName = extractNavTargetFromHref(rawHref);

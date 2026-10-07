@@ -70,10 +70,9 @@ struct LabeledSection<'a> {
 ///    matches the actual API request shape (system / prior messages /
 ///    user).
 ///
-/// `capture_body` mirrors the workspace's `capture_context` preference.
-/// When `false`, every row's `content` is `None` and only its name and its
-/// two sizes are persisted. The viewer still renders the budget breakdown,
-/// and event-row storage is not billed for full bodies.
+/// Every row carries its body. The loop drops them per round when the
+/// `capture_context` preference is off (`agentic_loop::round_capture_sections`).
+/// A turn parked on a question then honours a switch flipped while it waited.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_capture_sections(
     system_prompt: &str,
@@ -89,6 +88,7 @@ pub(crate) fn build_capture_sections(
     file_context_section: &str,
     url_context_section: &str,
     mcp_stopped_context: &str,
+    mcp_dropped_notice: &str,
     setup_reminder: &str,
     thread_depth_context: &str,
     todo_list_block: &str,
@@ -96,7 +96,6 @@ pub(crate) fn build_capture_sections(
     tail: &super::turn_tail::TurnTail<'_>,
     loaded_knowhow_docs: &[LoadedKnowhow],
     resume_tool_blocks: &[crate::llm::Message],
-    capture_body: bool,
 ) -> Vec<crate::engine::ContextSection> {
     use crate::engine::context::truncate_head_tail;
     use crate::engine::{ContextRole, ContextSection};
@@ -109,16 +108,13 @@ pub(crate) fn build_capture_sections(
     // handling has to be able to read what was in the context.
     let cap = crate::engine::eval_capture::body_cap(SECTION_PERSIST_MAX);
     let truncate = |content: &str| -> Option<String> {
-        if !capture_body {
-            return None;
-        }
         Some(match cap {
             Some(cap) if content.len() > cap => truncate_head_tail(content, cap),
             _ => content.to_string(),
         })
     };
 
-    let labeled: [LabeledSection; 20] = [
+    let labeled: [LabeledSection; 21] = [
         LabeledSection {
             name: "System Instructions",
             content: system_prompt,
@@ -202,6 +198,12 @@ pub(crate) fn build_capture_sections(
             group: Some("System notices"),
         },
         LabeledSection {
+            name: "MCP Tools Not Sent",
+            content: mcp_dropped_notice,
+            role: ContextRole::User,
+            group: Some("System notices"),
+        },
+        LabeledSection {
             name: "Setup Reminder",
             content: setup_reminder,
             role: ContextRole::User,
@@ -269,7 +271,7 @@ pub(crate) fn build_capture_sections(
     // Phase 5.2: surface every loaded knowhow doc as its own collapsible
     // row so the viewer shows the body in a dedicated section instead of
     // buried inside the User Message blob. Both sizes reflect the full
-    // body so the budget bar stays honest even when capture_body is off.
+    // body so the budget bar stays honest when a round drops the body.
     for doc in loaded_knowhow_docs {
         let chars = doc.body.chars().count();
         capture_sections.push(ContextSection {
@@ -313,7 +315,7 @@ pub(crate) fn build_capture_sections(
             tool_name, args_preview, result_body
         );
         let pair_chars = pair_body.chars().count();
-        // The same cap and the same gate as the static sections above. A
+        // The same cap as the static sections above. A
         // resumed tool pair is a prior turn's work, which is exactly what a
         // two-turn task's replay needs to show.
         capture_sections.push(ContextSection {

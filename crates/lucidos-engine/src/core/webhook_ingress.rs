@@ -203,9 +203,7 @@ pub enum Decision {
 /// families restarts the count, so IPv6 joining IPv4 is debounced on its own
 /// terms rather than inheriting IPv4's strikes.
 ///
-/// Recovery needs positive evidence: every family the declaration named must
-/// have answered this cycle. "Nothing is degraded" is not enough, because a
-/// family nobody could probe reports exactly that.
+/// Recovery follows [`recovers`].
 pub fn decide(
     families: &[FamilyVerdict],
     seen_last_cycle: &[Family],
@@ -219,13 +217,8 @@ pub fn decide(
         1
     };
 
-    if let Some(down) = declared {
-        let all_back = down
-            .iter()
-            .all(|family| verdict_of(families, *family) == Verdict::Healthy);
-        if all_back {
-            return (Decision::Recover, strikes);
-        }
+    if recovers(families, declared) {
+        return (Decision::Recover, strikes);
     }
 
     let already_said = declared == Some(observed.as_slice());
@@ -234,6 +227,21 @@ pub fn decide(
     } else {
         (Decision::Nothing, strikes)
     }
+}
+
+/// Does this reading retract the standing declaration?
+///
+/// Recovery needs positive evidence: every family the declaration named must
+/// have answered this cycle. "Nothing is degraded" is not enough, because a
+/// family nobody could probe reports exactly that.
+///
+/// A round that slept through still recovers on this test. A 401 is an answer,
+/// and sleep can only take answers away.
+pub fn recovers(families: &[FamilyVerdict], declared: Option<&[Family]>) -> bool {
+    declared.is_some_and(|down| {
+        down.iter()
+            .all(|family| verdict_of(families, *family) == Verdict::Healthy)
+    })
 }
 
 #[cfg(test)]

@@ -327,9 +327,8 @@ pub enum ContextPurpose {
     ConversationSummary,
     /// The three yes/no questions in front of memory retrieval.
     ///
-    /// It owns `model_query_classification`, which falls back to `model_memory`
-    /// while unset. Split out for the reason the summariser was, plus one of its
-    /// own. The user can point it at a different BACKEND
+    /// It owns `model_query_classification`, which follows no other key. Split
+    /// out for the reason the summariser was, plus one of its own. The user can point it at a different BACKEND
     /// (`judgment_query_classification`, ADR 0220), and a backend is chosen in
     /// the same control the model is.
     QueryClassification,
@@ -372,6 +371,21 @@ pub enum ContextPurpose {
     /// The *change summary*: one line saying what a change of several commits
     /// does. It owns `model_change_summary`, falling back to the title model.
     ChangeSummary,
+    /// One *compactor* call: a *summary tree* node written from its source
+    /// lines (ADR 0362). It owns `model_summary_compaction`, whose unset
+    /// default is resolved against the configured providers.
+    SummaryCompaction,
+    /// One batch of the recall tool's `find`: a judgment provider judging
+    /// summary lines against a query (ADR 0362). It owns `model_memory_find`,
+    /// which follows no other key.
+    MemoryFind,
+    /// One `web_search` call, on whichever backend answered. Each backend
+    /// fixes its own search model, so it owns no preference.
+    WebSearch,
+    /// One model call an app or script made through the credentialed proxy.
+    /// The caller names the model in its own request, so it owns no
+    /// preference.
+    Proxy,
 }
 
 impl ContextPurpose {
@@ -400,6 +414,10 @@ impl ContextPurpose {
             Self::ArtifactSummary => "Artifact Summary Request",
             Self::SideQuestion => "Side Question Request",
             Self::ChangeSummary => "Change Summary Request",
+            Self::SummaryCompaction => "Summary Compaction Request",
+            Self::MemoryFind => "Memory Find Request",
+            Self::WebSearch => "Web Search Request",
+            Self::Proxy => "Proxied Request",
         }
     }
 }

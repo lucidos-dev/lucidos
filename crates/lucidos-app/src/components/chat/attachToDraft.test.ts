@@ -282,16 +282,14 @@ describe('attachImageToActiveDraft respects cancellation mid-upload', () => {
     const file = makeFakeFile('photo.png', 'image/png');
     const attachPromise = attachImageToActiveDraft(file);
 
-    // Flush microtasks so the byte snapshot (`arrayBuffer()`) resolves — the
-    // pending preview is added after it — and the awaited `awaitThreadStarted`
-    // resolves so `uploadThreadBlob` is invoked (capturing `resolveUpload`).
-    await new Promise((r) => setTimeout(r, 0));
+    // The request leaves once the bytes are read and hashed, capturing
+    // `resolveUpload`.
+    await vi.waitFor(() => expect(uploadThreadBlob).toHaveBeenCalledTimes(1));
 
     // Pending preview is rendered; user sees the image.
     const pendingForThread = pendingUploads.value.get('t-1') ?? [];
     expect(pendingForThread).toHaveLength(1);
     const localId = pendingForThread[0].localId;
-    expect(uploadThreadBlob).toHaveBeenCalledTimes(1);
 
     // User clicks X on the still-uploading preview to cancel.
     removePendingUpload('t-1', localId);

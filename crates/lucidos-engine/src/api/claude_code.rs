@@ -508,22 +508,20 @@ pub(super) struct AgentBinariesResponse {
 pub(super) async fn coding_agent_binaries(
     State(state): State<AppState>,
 ) -> Result<Json<AgentBinariesResponse>, (StatusCode, String)> {
-    let read_override = |key: &'static str| {
+    use crate::core::prefs::{self, Optional, Pref};
+    let read_override = |pref: &'static Pref<Optional>| {
         let pool = state.pool.clone();
         async move {
-            crate::core::PreferenceStore::get(&pool, key)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to read {key}: {e}"),
-                    )
-                })
-                .map(|v| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+            pref.try_read(&pool).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to read {}: {e}", pref.key()),
+                )
+            })
         }
     };
-    let claude_override = read_override(crate::core::PREF_CODING_AGENT_CLAUDE_PATH).await?;
-    let codex_override = read_override(crate::core::PREF_CODING_AGENT_CODEX_PATH).await?;
+    let claude_override = read_override(&prefs::CODING_AGENT_CLAUDE_PATH).await?;
+    let codex_override = read_override(&prefs::CODING_AGENT_CODEX_PATH).await?;
     // Concurrently: each agent's detection now runs `<binary> --version`, so
     // sequencing them would make the section pay both probes back to back.
     let (claude_code, codex) = tokio::join!(

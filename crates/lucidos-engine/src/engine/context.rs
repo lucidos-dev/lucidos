@@ -35,7 +35,7 @@ pub(super) const RESPONSE_TOKEN_RESERVE: usize = 8_000;
 /// drop the original user message in long tool loops even though the model
 /// could easily have held the whole thread. Per-model derivation lets us
 /// actually use the headroom we paid for.
-pub(super) fn agent_context_char_budget(context_window: usize) -> usize {
+pub(crate) fn agent_context_char_budget(context_window: usize) -> usize {
     let usable_tokens = context_window.saturating_sub(RESPONSE_TOKEN_RESERVE);
     // 3/2 = 1.5 chars/token (integer math).
     usable_tokens.saturating_mul(3) / 2
@@ -320,7 +320,9 @@ pub(super) fn estimate_message_chars(message: &Message) -> usize {
                 .iter()
                 .map(|b| match b {
                     // A tail block is text on the wire and is billed as text.
-                    ContentBlock::Text { text } | ContentBlock::EngineTail { text } => text.len(),
+                    ContentBlock::Text { text }
+                    | ContentBlock::EngineTail { text }
+                    | ContentBlock::MemoryView { text } => text.len(),
                     ContentBlock::ToolUse {
                         id, name, input, ..
                     } => id.len() + name.len() + input.to_string().len(),
@@ -1117,18 +1119,16 @@ fn strip_loaded_knowhow_bodies(content: &str, loaded_bodies: &[&str]) -> String 
 /// addressed and does not, which is what lets the model note one and still
 /// resolve it later (ADR 0085 Decision 11).
 ///
-/// `handles` is empty when we cannot state one exactly. The caller decides
-/// that, and `history.rs` records why at the call site.
-pub(crate) fn format_image_refs(img_start: usize, count: usize, handles: &[String]) -> String {
-    let range = if count <= 1 {
-        format!("thread:{}", img_start + 1)
-    } else {
-        format!("thread:{}-thread:{}", img_start + 1, img_start + count)
-    };
-    if handles.is_empty() {
-        return range;
+/// `start` is the 0-based place of the first image in the thread's image walk.
+/// `None` when the walk could not place it, and then only the handles print:
+/// a guessed `thread:N` would name some other picture.
+pub(crate) fn format_image_refs(start: Option<usize>, handles: &[String]) -> String {
+    let handles_text = handles.join(" ");
+    match (start, handles.len()) {
+        (None, _) => handles_text,
+        (Some(s), 0 | 1) => format!("thread:{}, {handles_text}", s + 1),
+        (Some(s), n) => format!("thread:{}-thread:{}, {handles_text}", s + 1, s + n),
     }
-    format!("{range}, {}", handles.join(" "))
 }
 
 /// Bounds runaway tool-loop turns; ~6 typical tool calls fit in well under this.

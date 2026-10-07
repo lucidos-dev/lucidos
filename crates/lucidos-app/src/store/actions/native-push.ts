@@ -19,17 +19,16 @@ import {
   takePendingNativeTaps,
   listen,
 } from '../../utils/tauri';
-import { dispatchDeepLink } from './in-app-notification-toast';
+import { dispatchDeepLink, TOAST_REQUEST_STALE_AFTER_MS } from './in-app-notification-toast';
 import { parseDeepLinkFromSwMessage, type DeepLinkTarget } from './notification-deeplink';
 import { postClientLog } from '../../utils/liveness';
 
 /** Wall-clock budget after which a `NativePushRequested` is too stale to show.
- *  Mirrors `TOAST_REQUEST_STALE_AFTER_MS`: the engine emits this only after the
- *  PresenceCheck resolves, so a frame that flushes seconds late from a
- *  suspended-tab SSE queue would pop a banner long after the moment passed —
- *  drop it (the bell badge, driven by NotificationCreated, still reflects it).
- *  Exported so tests assert against the same constant. */
-export const NATIVE_PUSH_STALE_AFTER_MS = 5000;
+ *  The toast's budget, since both frames come out of the same PresenceCheck.
+ *  A frame that flushes seconds late from a suspended-tab SSE queue would pop a
+ *  banner long after the moment passed, so drop it. The bell badge, driven by
+ *  NotificationCreated, still reflects it. */
+export const NATIVE_PUSH_STALE_AFTER_MS = TOAST_REQUEST_STALE_AFTER_MS;
 
 export interface NativePushRequestedPayload {
   notification_id: string;

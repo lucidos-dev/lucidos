@@ -25,7 +25,8 @@ pub(crate) enum SideQuestionFailure {
     Refused(&'static str),
     /// The ask names an image this workspace never received.
     UnknownImage(String),
-    /// A side question with this id was already asked. The first ask stands.
+    /// A side question with this id is running or was answered. Only a
+    /// failed one may be asked again.
     AlreadyAsked,
     /// Nothing asked with this id on the thread, so there is nothing to dismiss.
     NotAsked,
@@ -198,6 +199,31 @@ async fn was_asked(
     .map_err(|e| SideQuestionFailure::Failed(format!("Could not read the thread: {e}")))
 }
 
+/// Whether an ask under this id may run: never asked, or every ask failed and
+/// none was answered. A retry re-asks under the card's own id, so the card
+/// keeps its place. One still running stays refused.
+async fn may_ask(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    side_question_id: Uuid,
+) -> Result<bool, SideQuestionFailure> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT COUNT(*) FILTER (WHERE event_type = 'SideQuestionAsked')
+              = COUNT(*) FILTER (WHERE event_type = 'SideQuestionFailed')
+            AND COUNT(*) FILTER (WHERE event_type = 'SideQuestionAnswered') = 0
+           FROM events
+          WHERE aggregate = 'thread'
+            AND aggregate_id = $1
+            AND event_type IN ('SideQuestionAsked', 'SideQuestionAnswered', 'SideQuestionFailed')
+            AND payload->>'side_question_id' = $2",
+    )
+    .bind(thread_id.to_string())
+    .bind(side_question_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map_err(|e| SideQuestionFailure::Failed(format!("Could not read the thread: {e}")))
+}
+
 /// Record one side-question event on its thread.
 async fn record(
     bus: &EventBus,
@@ -246,18 +272,16 @@ pub(crate) async fn fail_unsettled_side_questions(
     pool: &sqlx::PgPool,
     bus: &EventBus,
 ) -> Result<usize, sqlx::Error> {
+    // Counted, not matched: a retry asks again under an id whose first ask
+    // already failed, so one settlement does not settle every ask.
     let unsettled: Vec<(String, String)> = sqlx::query_as(
-        "SELECT a.aggregate_id, a.payload->>'side_question_id'
-           FROM events a
-          WHERE a.aggregate = 'thread'
-            AND a.event_type = 'SideQuestionAsked'
-            AND NOT EXISTS (
-                SELECT 1 FROM events s
-                 WHERE s.aggregate = 'thread'
-                   AND s.aggregate_id = a.aggregate_id
-                   AND s.event_type IN ('SideQuestionAnswered', 'SideQuestionFailed')
-                   AND s.payload->>'side_question_id' = a.payload->>'side_question_id'
-            )",
+        "SELECT aggregate_id, payload->>'side_question_id'
+           FROM events
+          WHERE aggregate = 'thread'
+            AND event_type IN ('SideQuestionAsked', 'SideQuestionAnswered', 'SideQuestionFailed')
+          GROUP BY aggregate_id, payload->>'side_question_id'
+         HAVING COUNT(*) FILTER (WHERE event_type = 'SideQuestionAsked')
+              > COUNT(*) FILTER (WHERE event_type <> 'SideQuestionAsked')",
     )
     .fetch_all(pool)
     .await?;
@@ -288,8 +312,8 @@ pub(crate) async fn fail_unsettled_side_questions(
 
 impl LucidosEngine {
     /// Ask a side question and record it: the ask, then its answer or
-    /// failure. A refused thread, an empty question, an unknown image or a
-    /// repeated id records nothing, since no card is owed for them.
+    /// failure. A refused thread, an empty question, an unknown image or an id
+    /// still running or answered records nothing, since no card is owed.
     pub(crate) async fn ask_side_question(
         &self,
         thread_id: Uuid,
@@ -309,9 +333,9 @@ impl LucidosEngine {
         }
         {
             // Held from the check to the record, so two requests with one id
-            // cannot both pass `was_asked`.
+            // cannot both pass `may_ask`.
             let _admission = ASK_ADMISSION.lock().await;
-            if was_asked(self.pool(), thread_id, side_question_id).await? {
+            if !may_ask(self.pool(), thread_id, side_question_id).await? {
                 return Err(SideQuestionFailure::AlreadyAsked);
             }
             let asked = ThreadEvent::SideQuestionAsked {
@@ -480,9 +504,6 @@ impl LucidosEngine {
             _ => self.workspace_path().to_path_buf(),
         };
         let (model, effort) = self.cc_thread_settings(thread_id).await;
-        let preference = |key: &'static str| {
-            crate::core::PreferenceStore::get_nonblank(pool, key, "SideQuestion")
-        };
         let system_prompt = self
             .cc_system_prompts
             .lock()
@@ -504,8 +525,11 @@ impl LucidosEngine {
             effort,
             allowed_tools: crate::engine::claude_code::cc_allowed_tools(&self.grants_dir()),
             user_env,
-            binary_override: preference(crate::core::PREF_CODING_AGENT_CLAUDE_PATH).await,
-            permission_mode: preference(crate::core::PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE)
+            binary_override: crate::core::prefs::CODING_AGENT_CLAUDE_PATH
+                .read(pool)
+                .await,
+            permission_mode: crate::core::prefs::CODING_AGENT_CLAUDE_PERMISSION_MODE
+                .stored(pool)
                 .await,
             additional_directories,
         })

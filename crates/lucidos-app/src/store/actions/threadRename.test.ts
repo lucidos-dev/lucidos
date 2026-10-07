@@ -74,6 +74,13 @@ describe('promptRenameThread', () => {
     expect(message).toContain('Old title');
   });
 
+  it('renames the home thread like any other', async () => {
+    threadMap.value = new Map([[ID, makeThreadState(ID, { meta: { home: true, title: 'Home' } })]]);
+    vi.mocked(showPrompt).mockResolvedValueOnce('Kitchen table');
+    await promptRenameThread(ID);
+    expect(renameThread).toHaveBeenCalledWith(ID, 'Kitchen table');
+  });
+
   it('does nothing for a thread that is not loaded', async () => {
     await promptRenameThread('missing');
     expect(showPrompt).not.toHaveBeenCalled();
@@ -121,6 +128,13 @@ describe('suggestThreadName', () => {
 
   it('does nothing for a draft', async () => {
     threadMap.value = new Map([[ID, makeThreadState(ID, { meta: { state: 'composing' } })]]);
+    await suggestThreadName(ID);
+    expect(suggestTitle).not.toHaveBeenCalled();
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('does nothing for the home thread, which only the user names', async () => {
+    threadMap.value = new Map([[ID, makeThreadState(ID, { meta: { home: true } })]]);
     await suggestThreadName(ID);
     expect(suggestTitle).not.toHaveBeenCalled();
     expect(showToast).not.toHaveBeenCalled();

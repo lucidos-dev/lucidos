@@ -15,6 +15,7 @@ function plugin(overrides: Partial<MarketplacePlugin>): MarketplacePlugin {
     content: ['apps'],
     categories: [],
     files_count: 1,
+    engine_compatible: true,
     status: 'installed',
     app_id: 'p',
     ...overrides,
@@ -39,6 +40,34 @@ describe('resolvePluginInfo', () => {
       plugin({ app_id: undefined }),
     ]);
     expect(map.size).toBe(0);
+  });
+
+  it('does not offer an update this Lucidos cannot install, and says why', () => {
+    const map = resolvePluginInfo([
+      plugin({
+        app_id: 'weather',
+        status: 'update_available',
+        engine_compatible: false,
+        engine_incompatible_reason: 'Needs Lucidos 0.46.1 or later',
+      }),
+    ]);
+    expect(map.get('weather')?.updateAvailable).toBe(false);
+    expect(map.get('weather')?.updateBlockedReason).toBe('Needs Lucidos 0.46.1 or later');
+  });
+
+  it('prefers an installable update over a blocked one across marketplaces', () => {
+    const map = resolvePluginInfo([
+      plugin({
+        app_id: 'weather',
+        marketplace_name: 'A',
+        status: 'update_available',
+        engine_compatible: false,
+        engine_incompatible_reason: 'Needs Lucidos 0.99.0 or later',
+      }),
+      plugin({ app_id: 'weather', marketplace_name: 'B', status: 'update_available' }),
+    ]);
+    expect(map.get('weather')?.updateAvailable).toBe(true);
+    expect(map.get('weather')?.marketplaceName).toBe('B');
   });
 
   it('prefers the update_available entry when an app id spans two marketplaces', () => {

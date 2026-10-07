@@ -5,6 +5,7 @@ import {
   notificationsFilter,
   notificationsHasMore,
   notificationsLoadingMore,
+  type NotificationsFilter,
 } from '../../store/store';
 import {
   viewNotification,
@@ -35,7 +36,7 @@ import { LoadingFade } from '../shared/LoadingFade';
  *  so the invariant is unit-testable (and a future edit can't silently point the
  *  "Unread" tab back at the browse list without failing a test). */
 export function notificationsTabSource(
-  filter: 'all' | 'unread',
+  filter: NotificationsFilter,
   unread: Loadable<Notification[]>,
   all: Loadable<Notification[]>,
 ): Loadable<Notification[]> {

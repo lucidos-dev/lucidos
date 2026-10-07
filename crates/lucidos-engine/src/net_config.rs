@@ -34,11 +34,6 @@ use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-/// The per-workspace engine bind, stored as the `network_bind` preference
-/// (an `INTERNAL` key: set via Settings → Access → Network access, never by the
-/// agent).
-pub const NETWORK_BIND_PREF_KEY: &str = "network_bind";
-
 /// The resolved bind scope for a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindChoice {
@@ -164,7 +159,7 @@ pub fn parse_bind_value(value: &str) -> BindChoice {
 }
 
 fn truthy(value: &str) -> bool {
-    matches!(value.trim(), "1" | "true" | "yes" | "on")
+    crate::core::prefs::env_switch_is_on(value)
 }
 
 /// Validate a user-supplied bind value for the network-config endpoint. Accepts

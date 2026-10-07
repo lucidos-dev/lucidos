@@ -48,6 +48,68 @@
     letter-spacing: normal;
 }
 
+/* ── And where its INK sits across it ─────────────────────────────────────
+ *
+ * Centring places a glyph's advance, and a font may draw the glyph off it.
+ * Fira Code's bold "3" sits 0.027em left of its slot, so at 200% the count on
+ * the mark hugged the left of its pill. `GlyphBadge` measures the text in its
+ * real font and states the gap as `--badge-ink-shift`.
+ *
+ * The text's own span moves, relatively, so only the paint shifts: the pill
+ * keeps its width and the line keeps its centring. */
+.badge-ink {
+    position: relative;
+    left: var(--badge-ink-shift, 0em);
+}
+
+/* ── And where it sits on the pixel grid ACROSS it ────────────────────────
+ *
+ * Chrome snaps a pill's left and right edges to whole CSS pixels, even on a
+ * 2x or 4x screen, but places the glyph at its exact x. So a badge on a
+ * fractional x drew its digit up to half a pixel off the pill's middle. A
+ * quarter-pixel move flipped which side. The drawer's attention count, put on
+ * a half pixel by its own column margin, sat visibly left at 200%.
+ *
+ * `will-change: transform` gives each badge its own compositing layer. Chrome
+ * puts the layer on a whole pixel and draws pill and glyph inside it together.
+ * Measured at eight sub-pixel x positions, the digit's spread drops from 0.75px
+ * to zero. WebKit already snaps both to one device-pixel grid.
+ *
+ * A heavier rule that restates `will-change` keeps `transform` in it.
+ * Measured in Chrome, `opacity` alone leaves the digit drifting at rest. */
+.badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
+.drawer-view-count,
+.section-count-badge,
+.drawer-badge,
+.brand-menu-ws-badge,
+.ws-picker-badge,
+.thread-status-question-badge,
+.app-store-status,
+.app-store-modified-chip,
+.theme-card-badge {
+    will-change: transform;
+}
+
+/* The layer fixes WHERE the pill lands, not how wide it is. A content-sized
+   pill ends on a fraction (32.48px for the section count at 200%), and Chrome
+   rounds that edge alone. The digit then sat a quarter pixel right. So the
+   width rounds UP to a whole pixel, which never clips the content. A badge's
+   own `min-width` still sets the floor, which is why none states a `width`. */
+@supports (width: calc-size(fit-content, size)) {
+    .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
+    .drawer-view-count,
+    .section-count-badge,
+    .drawer-badge,
+    .brand-menu-ws-badge,
+    .ws-picker-badge,
+    .thread-status-question-badge,
+    .app-store-status,
+    .app-store-modified-chip,
+    .theme-card-badge {
+        width: calc-size(fit-content, round(up, size, 1px));
+    }
+}
+
 /* ── And where it sits on the PIXEL GRID ──────────────────────────────────
  *
  * Chrome paints a baseline on a whole CSS pixel, and a pill's edges too, each
@@ -126,4 +188,23 @@
         text-box-trim: none;
         padding-block: 0;
     }
+}
+
+/* ── And its corners ──────────────────────────────────────────────────────
+ *
+ * A badge is a circle, or a pill once its count outgrows one. That holds in
+ * every theme, a square one included: a square count reads as a key cap or a
+ * checkbox, not as a mark on the icon it rides. So the corner is a literal no
+ * radius token reaches, and it lives here alone. A badge rule elsewhere that
+ * set its own corner would hand the shape back to the theme.
+ * `styles/__tests__/radius-token-guard.test.ts` holds both halves. */
+.badge,
+.drawer-badge,
+.section-count-badge,
+.brand-menu-ws-badge,
+.ws-picker-badge,
+.thread-status-question-badge,
+.system-attention-badge,
+.brand-menu-refresh-badge {
+    border-radius: 999px;
 }

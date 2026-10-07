@@ -686,6 +686,7 @@ fn transient_terminal_hint(name: &str) -> Option<&'static str> {
         "RecommendedCleanupProgress" => {
             Some("RecommendedCleanupCompleted or RecommendedCleanupFailed")
         }
+        "TreeBackfillProgressed" => Some("TreeBackfillCompleted"),
         _ => None,
     }
 }
@@ -718,6 +719,12 @@ pub fn validate_emittable_event_type(event_type: &str) -> Result<(), String> {
         return Err(format!(
             "event_type '{event_type}' is reserved for system events and cannot be emitted \
              as a domain event"
+        ));
+    }
+    if crate::api::ROUTE_FRAMES.contains(&event_type) {
+        return Err(format!(
+            "event_type '{event_type}' is a frame the event stream writes itself, so it \
+             cannot be emitted as a domain event"
         ));
     }
     if crate::engine::thread_events::ThreadEvent::is_reserved_type_name(event_type) {

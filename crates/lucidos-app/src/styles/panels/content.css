@@ -300,8 +300,16 @@
     display: none;
 }
 
+/* A column view grows with its content, so its box ends where its content
+   does and the end space below lands after the last element. Pinned to the
+   pane height, a long view overflowed its own box and nothing could follow it.
+   A full-bleed view fills the pane exactly and scrolls inside itself. */
 .content-view.active {
     display: block;
+    min-height: 100%;
+}
+
+.content-view-full-bleed.active {
     height: 100%;
 }
 
@@ -309,12 +317,32 @@
    Notifications) owns the space above its first element, so every view starts
    at the same height. A view's first toolbar or row sets no top spacing of its
    own. The 1rem side gutter stays on each row, so a row's hover wash reaches
-   the column edges.
-   No bottom padding: a full-pane loading skeleton (`FillSkeleton`) sizes
-   itself to the pane's bottom edge, and padding under it would overflow. */
+   the column edges. */
 .content-pane-body > .content-view.active,
 .content-pane-body > .panel-content {
     padding-top: var(--space-md);
+}
+
+/* The end space (docs/glossary.md): every view in the pane keeps room below
+   its last element, clear of the home indicator on a phone.
+   - Default-deny. A view opts out only by being full-bleed (an app, a
+     preview), which fills the pane and scrolls inside itself. A phone's
+     flowing file preview opts back in (mobile.css).
+   - A spacer, not padding, so a view's own padding cannot cancel it, and
+     WebKit honours it at the end of a scroller.
+   - `FillSkeleton` subtracts it, so a full-pane skeleton still fits.
+   Pinned by e2e/content-pane-end-space.spec.ts. */
+.content-pane-body > :not(.content-view-full-bleed)::after {
+    content: '';
+    display: block;
+    flex-shrink: 0;
+    height: var(--pane-end-space);
+}
+
+/* The end space replaces a form's own bottom padding, wrapped in a
+   `LoadingFade` or not. */
+.content-pane-body .inline-form {
+    padding-bottom: 0;
 }
 
 /* Each is one column, capped and centred like the transcript
@@ -374,6 +402,8 @@
 
 .files-toolbar-actions {
     display: flex;
+    /* A view switch, not an action row: it leads the toolbar, as tabs do. */
+    justify-content: flex-start;
     gap: 0.25rem;
 }
 

@@ -294,7 +294,7 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
   it('blurs from inside each touch-activated action', () => {
     // The suppressed click never reaches `installActionBtnBlurListener`, which
     // listens on `click`. So each action has to drop the keyboard itself.
-    const submitFn = promptSource.match(/async function submit\(asSideQuestion = false\)[\s\S]*?\n  \}/);
+    const submitFn = promptSource.match(/async function submit\(\)[\s\S]*?\n  \}/);
     const multiFn = promptSource.match(/async function submitMultiAnswer\(\)[\s\S]*?\n  \}/);
     const diffFn = bannerSource.match(/function DiffButton\([\s\S]*?\n\}/);
     expect(submitFn, 'submit() not found').not.toBeNull();

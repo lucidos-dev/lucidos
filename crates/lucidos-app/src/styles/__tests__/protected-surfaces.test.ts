@@ -156,7 +156,7 @@ describe('every protected surface carries the class', () => {
   it('builds every change-action button on the banner, and each folded row, as one', () => {
     const banner = read('components/chat/WaitingBanner.tsx');
     expect(banner).toMatch(/function protectedButtonClass[\s\S]*PROTECTED_SURFACE/);
-    expect(banner.match(/extraClass: PROTECTED_SURFACE/g)?.length).toBe(3);
+    expect(banner.match(/extraClass: PROTECTED_SURFACE/g)?.length).toBe(4);
     expect(banner).toContain('class={`thread-overflow-item ${PROTECTED_SURFACE}`}');
     expect(banner).not.toMatch(/class=\{?['"`]action-btn action-btn-(confirm|danger)['"`]/);
   });

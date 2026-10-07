@@ -513,27 +513,33 @@ async fn the_former_parent_loses_its_follow_up_authority() {
     teardown_test_db(&db_name).await;
 }
 
-/// A move never buys back a child slot, or it becomes a way round the cap.
+/// A move never buys back a live child's slot, or it becomes a way round the
+/// cap (ADR 0278). Once the moved child finishes, it frees its slot like any
+/// other child.
 #[tokio::test]
-async fn a_moved_child_still_counts_against_the_fan_out_cap() {
-    use super::super::recursion_guard::MAX_CHILDREN_PER_THREAD;
+async fn a_moved_child_counts_against_the_cap_while_it_is_live() {
+    use crate::engine::thread_queue::DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD as CAP;
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
+    let guard = |parent| LucidosEngine::check_thread_recursion_guard(&pool, parent, CAP);
     let parent = spawn(&bus, None, "parent").await;
     let mut children = Vec::new();
-    for i in 0..MAX_CHILDREN_PER_THREAD {
+    for i in 0..CAP {
         children.push(spawn(&bus, Some(parent), &format!("child {i}")).await);
     }
-    assert!(LucidosEngine::check_thread_recursion_guard(&pool, parent)
-        .await
-        .is_err());
+    assert!(guard(parent).await.is_err());
 
     assert!(detach(&bus, parent, children[0]).await.is_some());
     assert!(
-        LucidosEngine::check_thread_recursion_guard(&pool, parent)
-            .await
-            .is_err(),
-        "the slot the moved child used stays used"
+        guard(parent).await.is_err(),
+        "the slot the moved child uses stays used while it runs"
+    );
+
+    finish(&bus, children[0]).await;
+    assert_eq!(
+        guard(parent).await,
+        Ok(1),
+        "a moved child that finished frees its slot"
     );
 
     pool.close().await;

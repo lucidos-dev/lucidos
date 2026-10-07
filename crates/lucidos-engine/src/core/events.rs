@@ -124,39 +124,51 @@ impl HasEventPayload for EventRow {
     }
 }
 
-/// Iterate (index, source, mime, blob_hash_or_inline_base64) for every
-/// image in the thread. The MessageReceived branch yields the hash; the
-/// generated branches yield the inline base64. Shared between the two
-/// public walkers below so the indexing rule lives in one place.
+/// The thread images one event adds, in order, with their source.
+///
+/// The single rule for what counts as a thread image. The walkers below and
+/// the history's message builder both read it, so `thread:N` names the same
+/// picture in the history as in the resolver.
+///
+/// A user upload is a blob hash on `MessageReceived`. A generated image is
+/// inline base64 on its `ToolResult`. A response's own `images` field does
+/// not count: it lists browser screenshot artifact paths, not image bytes.
+pub fn thread_image_refs_of<'a>(
+    event_type: &str,
+    payload: &'a serde_json::Value,
+) -> Vec<(&'static str, ImageRef<'a>)> {
+    let (field, source, image_ref): (_, _, fn(&'a str) -> ImageRef<'a>) = match event_type {
+        "MessageReceived" => ("user_image_hashes", "user", ImageRef::BlobHash),
+        "ToolResult" => ("images", "generated", ImageRef::InlineBase64),
+        _ => return Vec::new(),
+    };
+    payload
+        .get(field)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| (source, image_ref(s)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every image in the thread, in `thread:N` order.
 fn walk_thread_image_refs<E: HasEventPayload>(
     events: &[E],
 ) -> impl Iterator<Item = (&'static str, ImageRef<'_>)> + '_ {
-    events.iter().flat_map(|event| {
-        let payload = event.payload();
-        match event.event_type() {
-            "MessageReceived" => payload
-                .get("user_image_hashes")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(|h| ("user", ImageRef::BlobHash(h)))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
-            "ToolResult" | "ResponseGenerated" | "ResponseCanceled" | "ResponseAborted" => payload
-                .get("images")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(|b64| ("generated", ImageRef::InlineBase64(b64)))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        }
-    })
+    events
+        .iter()
+        .flat_map(|event| thread_image_refs_of(event.event_type(), event.payload()))
+}
+
+/// The handle of every image in the thread, in `thread:N` order: entry `i`
+/// is `thread:{i+1}`. Reads no file.
+pub fn walk_thread_image_handles<E: HasEventPayload>(events: &[E]) -> Vec<String> {
+    walk_thread_image_refs(events)
+        .map(|(_, image_ref)| image_handle(image_ref))
+        .collect()
 }
 
 /// Where one thread image's bytes live: the blob store, keyed by content
@@ -170,9 +182,8 @@ pub enum ImageRef<'a> {
 
 /// Metadata-only walk for endpoints that just need (index, source, mime).
 /// One `metadata` syscall per user image, zero reads. Missing blobs still
-/// occupy an index — the index matches `walk_thread_images` and the
-/// thread:N numbering used by `chat/process/history.rs::msg_image_starts`. The
-/// API serves a 404 for the missing entry.
+/// occupy an index — the index matches `walk_thread_images` and
+/// `walk_thread_image_handles`. The API serves a 404 for the missing entry.
 pub fn walk_thread_images_meta<E: HasEventPayload>(
     workspace: &std::path::Path,
     events: &[E],
@@ -198,7 +209,7 @@ pub fn walk_thread_images_meta<E: HasEventPayload>(
 
 /// Bytes-loading walk for tool resolution and thread-image GET. Missing
 /// blobs yield an entry with empty base64 + the placeholder mime so the
-/// index matches `walk_thread_images_meta` and `msg_image_starts`. A
+/// index matches `walk_thread_images_meta` and `walk_thread_image_handles`. A
 /// callable `thread:N` whose blob is gone reaches the LLM as zero bytes
 /// rather than collapsing the numbering and pointing at the wrong image.
 pub fn walk_thread_images<E: HasEventPayload>(
@@ -234,6 +245,62 @@ pub fn walk_thread_images<E: HasEventPayload>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A response's `images` field lists browser screenshot artifact paths,
+    /// not image bytes. Counted as images, each one took a `thread:N` slot
+    /// that resolved to nothing.
+    #[test]
+    fn a_responses_screenshot_paths_are_not_thread_images() {
+        let events = vec![
+            EventRow::new(
+                "MessageReceived",
+                serde_json::json!({"text": "a", "user_image_hashes": ["aa11"]}),
+            ),
+            EventRow::new(
+                "ResponseGenerated",
+                serde_json::json!({"text": "b", "images": ["screenshots/page_2026.png"]}),
+            ),
+            EventRow::new(
+                "MessageReceived",
+                serde_json::json!({"text": "c", "user_image_hashes": ["bb22"]}),
+            ),
+        ];
+        assert_eq!(
+            walk_thread_image_handles(&events),
+            vec![
+                image_handle(ImageRef::BlobHash("aa11")),
+                image_handle(ImageRef::BlobHash("bb22")),
+            ]
+        );
+    }
+
+    /// A generated image is inline base64 on its `ToolResult`, and it takes a
+    /// slot between the user images either side of it.
+    #[test]
+    fn a_generated_image_takes_its_slot_in_the_walk() {
+        let events = vec![
+            EventRow::new(
+                "MessageReceived",
+                serde_json::json!({"text": "a", "user_image_hashes": ["aa11"]}),
+            ),
+            EventRow::new(
+                "ToolResult",
+                serde_json::json!({"name": "generate_image", "images": ["R0lGODlh"]}),
+            ),
+            EventRow::new(
+                "MessageReceived",
+                serde_json::json!({"text": "c", "user_image_hashes": ["bb22"]}),
+            ),
+        ];
+        assert_eq!(
+            walk_thread_image_handles(&events),
+            vec![
+                image_handle(ImageRef::BlobHash("aa11")),
+                image_handle(ImageRef::InlineBase64("R0lGODlh")),
+                image_handle(ImageRef::BlobHash("bb22")),
+            ]
+        );
+    }
 
     #[test]
     fn test_event_creation() {

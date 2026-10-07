@@ -144,8 +144,8 @@ pub(crate) async fn record_archive_request(
 }
 
 /// The target's row as the ladder reads it:
-/// `(parent_thread_id, state, status, coding_agent_proposed, is_saved)`.
-type TargetRow = (Option<Uuid>, Option<String>, String, bool, bool);
+/// `(parent_thread_id, state, status, coding_agent_proposed, is_saved, is_home)`.
+type TargetRow = (Option<Uuid>, Option<String>, String, bool, bool, bool);
 
 impl crate::engine::LucidosEngine {
     /// Load the target's row and run the ladder. Reads one row and writes
@@ -161,14 +161,14 @@ impl crate::engine::LucidosEngine {
     ) -> Result<AgentArchiveTarget, AgentArchiveError> {
         let caller = caller.ok_or(AgentArchiveError::NoCaller)?;
         let row: Option<TargetRow> = sqlx::query_as(
-            "SELECT parent_thread_id, state, status, coding_agent_proposed, is_saved \
+            "SELECT parent_thread_id, state, status, coding_agent_proposed, is_saved, is_home \
              FROM thread_summaries WHERE thread_id = $1",
         )
         .bind(target)
         .fetch_optional(pool)
         .await
         .map_err(|e| AgentArchiveError::Internal(e.to_string()))?;
-        let Some((parent, state, status, has_pending_changes, is_saved)) = row else {
+        let Some((parent, state, status, has_pending_changes, is_saved, is_home)) = row else {
             return Err(AgentArchiveError::UnknownThread(target));
         };
         let kind = if target == caller {
@@ -180,6 +180,13 @@ impl crate::engine::LucidosEngine {
         };
         if state.as_deref() == Some("discarded") {
             return Err(AgentArchiveError::Discarded(target));
+        }
+        // The home thread never ends (ADR 0362). Refused here too, so its own
+        // agent is told at once rather than recording a request nothing grants.
+        if is_home {
+            return Err(AgentArchiveError::Refused(
+                crate::api::threads::archive::home_thread_rejection(target),
+            ));
         }
         // A pinned thread is the user's to archive, never an agent's (ADR 0312).
         // Refused here too, so a self-archive is told at once instead of

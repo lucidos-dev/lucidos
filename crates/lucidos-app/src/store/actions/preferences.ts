@@ -1,5 +1,5 @@
 import { effect, signal, untracked } from '@preact/signals';
-import { preferences, showToast, removeToast, notificationsFilter, currentModel, reasoningEffort, selectedCodingAgent, clampThreadDrawerWidth, llmConfigured } from '../store';
+import { preferences, showToast, removeToast, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, currentModel, reasoningEffort, selectedCodingAgent, clampThreadDrawerWidth, llmConfigured, type NotificationsFilter } from '../store';
 import type { CodingAgent } from '../../api/types';
 import type { ThreadState } from '../thread-events';
 import { failedIfFresh } from '../types';
@@ -8,7 +8,6 @@ import { resolvedHexColor } from '../../utils/cssColor';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
-import { REASONING_LEVELS, DEFAULT_CHAT_MODEL } from '../models';
 import { clampEffortFor } from './models';
 import { isIOSPwa, isTauri } from '../../utils/platform';
 import { setProseAutocorrect } from '../../utils/noAutofill';
@@ -21,11 +20,10 @@ import {
 } from '../../utils/styleOverrides';
 
 import {
-  DEFAULT_FONT_PREFERENCE, DEFAULT_THEME_EFFECTS, DEFAULT_THEME_ID, DEFAULT_MOTION, DEFAULT_THEME_MODE,
-  EMPTY_THEME, FONT_PREFERENCES, THEME_EFFECTS_PREFS, THEME_EFFECTS_STORAGE_KEY,
-  THEME_KEY, THEME_STORAGE_KEY, MOTION_PREFS,
-  MOTION_STORAGE_KEY, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODES, THEME_MODE_ATTRIBUTE, THEME_MODE_BG,
-  THEME_MODE_KEY, THEME_MODE_STORAGE_KEY, UI_SCALE_DEFAULT, UI_SCALE_STORAGE_KEY,
+  EMPTY_THEME, FONT_PREFERENCES, THEME_EFFECTS_STORAGE_KEY,
+  THEME_KEY, THEME_STORAGE_KEY,
+  MOTION_STORAGE_KEY, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODE_ATTRIBUTE, THEME_MODE_BG,
+  THEME_MODE_KEY, THEME_MODE_STORAGE_KEY, UI_SCALE_STORAGE_KEY,
   FONT_BOLD_ATTRIBUTE, FONT_FAMILY_STORAGE_KEY, WORKSPACE_FONT_STORAGE_KEY,
   clampUiScale, fontBoldMark, isWorkspaceFontId, themeBackground, themeTokenNames, parseResolvedTheme,
   parseUiScale, parseWorkspaceFont, replaceInlineTokens, resolveFont, resolveThemeMode,
@@ -38,17 +36,33 @@ import { dataMountUrl } from '../../api/client';
 import { loadWorkspaceFonts, workspaceFontList } from './workspaceFonts';
 import { motionPreference } from '../../utils/motion';
 import { themeEffectsPreference } from '../../utils/themeEffects';
-import { AUTOCORRECT_STORAGE_KEY, defaultAutocorrect } from '@lucidos/text-entry';
+import { AUTOCORRECT_STORAGE_KEY } from '@lucidos/text-entry';
+import {
+  parseFlag, PREFERENCE_CATALOG, PREF_FONT_FAMILY, PREF_PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI,
+  PREF_PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM, PREF_PROVIDER_ENABLED_TYPESAFE, PREF_SYSTEM_ONE_CUSTOM_MODEL,
+  PREF_SYSTEM_ONE_CUSTOM_URL, PREF_THEME, PREF_UI_SCALE,
+  type PreferenceKey, type PreferenceValues,
+} from '@lucidos/preference-catalog';
+import { VOICE_RESIDENT_SECTIONS } from '@lucidos/engine-constants';
 
 /** Re-exported so the components that already import these from the store keep
  *  one import site. The definitions live in the appearance contract, which is
  *  the single source the two FOUC scripts and the SDK read as well. */
 export type { FontId, FontPreference, ThemeMode } from '@lucidos/appearance';
 export {
-  UI_SCALE_MIN, UI_SCALE_MAX, UI_SCALE_STEP, UI_SCALE_DEFAULT, clampUiScale,
+  UI_SCALE_MIN, UI_SCALE_MAX, UI_SCALE_STEP, clampUiScale,
 } from '@lucidos/appearance';
 
-export type ImageModel = 'auto' | 'imagen-4' | 'gpt-image-1' | 'gpt-image-1.5' | 'gpt-image-2';
+export const UI_SCALE_DEFAULT = Number(PREF_UI_SCALE.fallback);
+
+/** What an unset `theme` means: the stylesheet as shipped, no inline tokens. */
+export const DEFAULT_THEME_ID = PREF_THEME.fallback;
+
+/** What an unset `font-family` means: follow the active theme, which falls back
+ *  to the fallback font when the theme names no font. */
+const DEFAULT_FONT_PREFERENCE: FontPreference = PREF_FONT_FAMILY.fallback;
+
+export type ImageModel = PreferenceValues<'image_model'>;
 
 // The ligature pair, the font stacks and the two defaults live in
 // `@lucidos/appearance` (`packages/lucidos-sdk/src/appearance.ts`), which is the
@@ -79,32 +93,70 @@ export const appearanceVersion = signal(0);
 
 // --- Generic helpers ---
 
-function currentPreference<T extends string>(
-  key: string,
-  validValues: readonly T[],
-  defaultValue: T,
-  localStorageKey?: string,
-): T {
-  if (preferences.value.status === 'loaded') {
-    const raw = preferences.value.data[key];
-    if (raw && (validValues as readonly string[]).includes(raw)) return raw as T;
-  }
-  if (localStorageKey) {
-    const cached = localStorage.getItem(localStorageKey);
-    if (cached && (validValues as readonly string[]).includes(cached)) return cached as T;
-  }
-  return defaultValue;
+/** A catalog entry as `currentPreference` reads it at runtime. */
+interface CatalogEntry {
+  readonly type: string;
+  readonly values?: readonly string[];
+  readonly inherits?: PreferenceKey;
+  readonly fallback: string | null;
 }
 
-const SWITCH_VALUES = ['true', 'false'] as const;
+/** A key `currentPreference` resolves: one with a default, read as a string.
+ *  A number key parses its own value, so it keeps its own reader. */
+type ResolvableKey = {
+  [K in PreferenceKey]: (typeof PREFERENCE_CATALOG)[K] extends {
+    type: 'enum' | 'flag' | 'text';
+    fallback: string;
+  } ? K : never;
+}[PreferenceKey];
+
+/** What a key resolves to: one of its enum values, a flag's two, or text. */
+type ResolvedPreference<K extends ResolvableKey> =
+  (typeof PREFERENCE_CATALOG)[K] extends { values: readonly (infer V)[] } ? V
+    : (typeof PREFERENCE_CATALOG)[K] extends { type: 'flag' } ? 'true' | 'false'
+      : string;
+
+/** A stored switch as the engine reads it: `'true'`, `'false'`, or null for a
+ *  spelling it reads as neither. */
+function flagReading(raw: string): 'true' | 'false' | null {
+  const on = parseFlag(raw);
+  return on === null ? null : on ? 'true' : 'false';
+}
+
+/** `raw` as a value of `key`, or null when the catalog does not accept it. */
+function acceptedValue(key: PreferenceKey, raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const entry: CatalogEntry = PREFERENCE_CATALOG[key];
+  if (entry.values) return entry.values.includes(raw) ? raw : null;
+  if (entry.type === 'flag') return flagReading(raw);
+  const text = raw.trim();
+  return text === '' ? null : text;
+}
+
+/** A preference's value: the stored one, else the device mirror, else the key
+ *  it inherits, else the catalog default. Values and default both come from the
+ *  catalog, so a caller cannot supply a second copy of either. */
+function currentPreference<K extends ResolvableKey>(key: K, localStorageKey?: string): ResolvedPreference<K> {
+  if (preferences.value.status === 'loaded') {
+    const stored = acceptedValue(key, preferences.value.data[key]);
+    if (stored !== null) return stored as ResolvedPreference<K>;
+  }
+  if (localStorageKey) {
+    const cached = acceptedValue(key, localStorage.getItem(localStorageKey));
+    if (cached !== null) return cached as ResolvedPreference<K>;
+  }
+  const entry: CatalogEntry = PREFERENCE_CATALOG[key];
+  if (entry.inherits) return currentPreference(entry.inherits as ResolvableKey) as ResolvedPreference<K>;
+  return entry.fallback as ResolvedPreference<K>;
+}
 
 /** Take a preference's device-local mirror from what the engine just served.
  *  An absent or invalid value CLEARS it rather than leaving it: unset means the
  *  default, and a cache kept there would outlive a reset and keep answering for
  *  a preference nobody holds. */
-function cacheServedValue(key: string, storageKey: string, validValues: readonly string[]): void {
-  const served = preferences.value.status === 'loaded' ? preferences.value.data[key] : undefined;
-  if (served !== undefined && validValues.includes(served)) {
+function cacheServedValue(key: ResolvableKey, storageKey: string): void {
+  const served = acceptedValue(key, preferences.value.status === 'loaded' ? preferences.value.data[key] : undefined);
+  if (served !== null) {
     localStorage.setItem(storageKey, served);
   } else {
     localStorage.removeItem(storageKey);
@@ -734,7 +786,7 @@ export function currentThemeMode(): ThemeMode {
   // localStorage fallback matches the FOUC prevention script in index.html.
   // Covers: backend missing the preference (device_id change, save failure),
   // and the loading window before the API responds.
-  return currentPreference(THEME_MODE_KEY, THEME_MODES, DEFAULT_THEME_MODE, THEME_MODE_STORAGE_KEY);
+  return currentPreference(THEME_MODE_KEY, THEME_MODE_STORAGE_KEY);
 }
 
 export function setThemeMode(mode: ThemeMode): Promise<void> {
@@ -792,8 +844,10 @@ export function currentFontFamily(): FontPreference {
   if (preferences.value.status === 'loaded') {
     const raw = preferences.value.data['font-family'];
     if (isWorkspaceFontId(raw)) return raw;
+    const known = FONT_PREFERENCES.find((font) => font === raw);
+    if (known) return known;
   }
-  return currentPreference('font-family', FONT_PREFERENCES, DEFAULT_FONT_PREFERENCE);
+  return DEFAULT_FONT_PREFERENCE;
 }
 
 // A picked workspace font paints once the list naming it has loaded, and again
@@ -934,7 +988,7 @@ function dropStyleResetParam(): void {
 // --- Image model ---
 
 export function currentImageModel(): ImageModel {
-  return currentPreference('image_model', ['auto', 'imagen-4', 'gpt-image-1', 'gpt-image-1.5', 'gpt-image-2'], 'auto');
+  return currentPreference('image_model');
 }
 
 export function setImageModel(model: ImageModel): Promise<void> {
@@ -943,8 +997,8 @@ export function setImageModel(model: ImageModel): Promise<void> {
 
 // --- Notifications filter ---
 
-export function currentNotificationsFilter(): 'all' | 'unread' {
-  return currentPreference('notifications_filter', ['all', 'unread'], 'all', 'lucidos-notifications-filter');
+export function currentNotificationsFilter(): NotificationsFilter {
+  return currentPreference('notifications_filter', NOTIFICATIONS_FILTER_STORAGE_KEY);
 }
 
 // --- In-app notification toasts ---
@@ -960,12 +1014,9 @@ export function currentNotificationsFilter(): 'all' | 'unread' {
  *  instead, and the served value wins the moment it lands. */
 const NOTIFICATION_TOASTS_KEY = 'lucidos-notification-toasts';
 
-/** Whether a notification may pop a toast over what the user is doing. Only an
- *  explicit `'false'` silences it, so unset behaves as it always has. */
+/** Whether a notification may pop a toast over what the user is doing. */
 export function currentNotificationToasts(): boolean {
-  return currentPreference(
-    'notification_toasts', ['true', 'false'], 'true', NOTIFICATION_TOASTS_KEY,
-  ) === 'true';
+  return currentPreference('notification_toasts', NOTIFICATION_TOASTS_KEY) === 'true';
 }
 
 export function setNotificationToasts(enabled: boolean): Promise<void> {
@@ -978,15 +1029,11 @@ export function setNotificationToasts(enabled: boolean): Promise<void> {
 // --- Autocorrect ---
 
 /** Whether this device's prose fields autocorrect. A stored value wins on any
- *  client; unset falls to the mirror, then to `defaultAutocorrect`, which is
- *  on. The mirror exists for the same reason the toasts switch keeps one: the
- *  composer can take focus before preferences load, and iOS reads the
- *  attribute at focus. */
+ *  client; unset falls to the mirror, then to the catalog default. The mirror
+ *  exists for the same reason the toasts switch keeps one: the composer can
+ *  take focus before preferences load, and iOS reads the attribute at focus. */
 export function currentAutocorrect(): boolean {
-  const fallback = defaultAutocorrect() ? 'true' : 'false';
-  return currentPreference(
-    'autocorrect', ['true', 'false'], fallback, AUTOCORRECT_STORAGE_KEY,
-  ) === 'true';
+  return currentPreference('autocorrect', AUTOCORRECT_STORAGE_KEY) === 'true';
 }
 
 export function setAutocorrect(enabled: boolean): Promise<void> {
@@ -1000,10 +1047,10 @@ export function setAutocorrect(enabled: boolean): Promise<void> {
 // --- Motion ---
 
 /** This device's motion preference. A stored value wins; unset falls to the
- *  mirror, then to `system`, which follows the OS. The mirror is what the boot
- *  script reads, so first paint and this agree. */
+ *  mirror, then to the catalog default. The mirror is what the boot script
+ *  reads, so first paint and this agree. */
 export function currentMotion(): MotionPref {
-  return currentPreference('motion', MOTION_PREFS, DEFAULT_MOTION, MOTION_STORAGE_KEY);
+  return currentPreference('motion', MOTION_STORAGE_KEY);
 }
 
 export function setMotion(pref: MotionPref): Promise<void> {
@@ -1016,9 +1063,9 @@ export function setMotion(pref: MotionPref): Promise<void> {
 // --- Theme effects ---
 
 /** This device's theme-effects preference, resolved like motion: a stored value,
- *  else the mirror the boot script reads, else `system`. */
+ *  else the mirror the boot script reads, else the catalog default. */
 export function currentThemeEffects(): ThemeEffectsPref {
-  return currentPreference('theme-effects', THEME_EFFECTS_PREFS, DEFAULT_THEME_EFFECTS, THEME_EFFECTS_STORAGE_KEY);
+  return currentPreference('theme-effects', THEME_EFFECTS_STORAGE_KEY);
 }
 
 export function setThemeEffects(pref: ThemeEffectsPref): Promise<void> {
@@ -1030,20 +1077,16 @@ export function setThemeEffects(pref: ThemeEffectsPref): Promise<void> {
 
 // --- Chat model & reasoning effort ---
 
-const REASONING_VALUES = REASONING_LEVELS.map(l => l.value);
-
 /** The user's chat model preference. Unlike most preferences this is NOT
  *  validated against a fixed allow-list — the model set is now the DB-backed
  *  registry (user-extensible), and `RoutingProvider` resolves any id (with a
  *  prefix fallback), so any stored non-empty value is honored. */
 export function currentChatModel(): string {
-  if (preferences.value.status !== 'loaded') return DEFAULT_CHAT_MODEL;
-  const v = preferences.value.data['chat_model'];
-  return v && v.trim() ? v : DEFAULT_CHAT_MODEL;
+  return currentPreference('chat_model');
 }
 
 export function currentChatReasoningEffort(): string {
-  return currentPreference('chat_reasoning_effort', REASONING_VALUES, 'high');
+  return currentPreference('chat_reasoning_effort');
 }
 
 /** Persist the chat *model selection*, both halves.
@@ -1067,29 +1110,28 @@ export function setReasoningEffort(effort: string): Promise<void> {
 
 // --- Response style ---
 
-/** The id of the selected *response style*, or `standard` when unset.
+/** The id of the selected *response style*, or Standard when unset.
  *
  *  Deliberately NOT validated against a fixed list, for the reason
  *  `currentChatModel` is not: the user may add styles, so the set is open. An
  *  id nothing defines resolves to Standard in the engine, which is also what
  *  the picker shows for it. */
 export function currentResponseStyle(): string {
-  if (preferences.value.status !== 'loaded') return RESPONSE_STYLE_DEFAULT;
-  const v = preferences.value.data['response_style'];
-  return v && v.trim() ? v.trim() : RESPONSE_STYLE_DEFAULT;
+  return currentPreference('response_style');
 }
-
-/** Mirrors `response_style::STANDARD_ID`: the off switch, which adds nothing. */
-export const RESPONSE_STYLE_DEFAULT = 'standard';
 
 export function setResponseStyle(id: string): Promise<void> {
   return savePreference('response_style', id);
 }
 
-/** The response style's second part. Mirrors `technical_literacy::IDS` in
- *  `core/technical_literacy.rs`, pinned by `technicalLiteracy.mirror.test.ts`. */
-export const TECHNICAL_LITERACY_LEVELS = ['non-technical', 'technical', 'developer'] as const;
-export type TechnicalLiteracy = (typeof TECHNICAL_LITERACY_LEVELS)[number];
+/** The value that clears the level, which is also its default. */
+export const TECHNICAL_LITERACY_NOT_SET = PREFERENCE_CATALOG.technical_literacy.fallback;
+
+/** The response style's second part: every catalog value but the one that
+ *  clears it. */
+export type TechnicalLiteracy = Exclude<PreferenceValues<'technical_literacy'>, typeof TECHNICAL_LITERACY_NOT_SET>;
+export const TECHNICAL_LITERACY_LEVELS: readonly TechnicalLiteracy[] = PREFERENCE_CATALOG.technical_literacy.values
+  .filter((level): level is TechnicalLiteracy => level !== TECHNICAL_LITERACY_NOT_SET);
 
 /** A retired level that reads as `non-technical`, as it does in the engine. */
 const MERGED_EVERYDAY = 'everyday';
@@ -1103,9 +1145,6 @@ export function currentTechnicalLiteracy(): TechnicalLiteracy | null {
   return TECHNICAL_LITERACY_LEVELS.find((level) => level === v) ?? null;
 }
 
-/** The value that clears the level. Mirrors `technical_literacy::NOT_SET_ID`. */
-export const TECHNICAL_LITERACY_NOT_SET = 'not-set';
-
 /** `null` clears the level. */
 export function setTechnicalLiteracy(level: TechnicalLiteracy | null): Promise<void> {
   return savePreference('technical_literacy', level ?? TECHNICAL_LITERACY_NOT_SET);
@@ -1113,25 +1152,16 @@ export function setTechnicalLiteracy(level: TechnicalLiteracy | null): Promise<v
 
 // --- Max tool calls (the per-turn tool-call cap) ---
 
-/** Mirrors `DEFAULT_MAX_TOOL_CALLS` in `core/preferences.rs`. */
-export const MAX_TOOL_CALLS_DEFAULT = 500;
+export const MAX_TOOL_CALLS_DEFAULT = Number(PREFERENCE_CATALOG.max_tool_calls.fallback);
 
-/** Mirrors `MIN_MAX_TOOL_CALLS` in `core/preferences.rs`. There is deliberately
- *  no maximum: a high cap costs the user time and tokens, which is their call to
- *  make. The floor rules out only the value that is broken rather than small,
- *  since the loop checks `iterations > cap` after incrementing and a cap of 0
- *  would end the turn before the first LLM call. */
-export const MAX_TOOL_CALLS_MIN = 1;
+/** The floor rules out only the value that is broken rather than small. The
+ *  loop checks `iterations > cap` after incrementing, so a cap of 0 would end
+ *  the turn before the first LLM call. */
+export const MAX_TOOL_CALLS_MIN = PREFERENCE_CATALOG.max_tool_calls.min;
 
-/** The largest cap the UI will write. This is NOT the policy ceiling the design
- *  deliberately omits, it is the point where JavaScript stops being able to
- *  carry the number: past `Number.MAX_SAFE_INTEGER`, `Number('…')` rounds (and
- *  eventually reaches `Infinity`), so `String(Number(input))` would save a
- *  *different* value than the user typed and the engine would then enforce, or
- *  reject, something else again. Nine quadrillion tool calls is not a cap anyone
- *  reaches; the bound exists so the UI cannot display a value the engine will
- *  not honor. */
-export const MAX_TOOL_CALLS_REPRESENTABLE = Number.MAX_SAFE_INTEGER;
+/** The largest cap the engine accepts. It sits far below
+ *  `Number.MAX_SAFE_INTEGER`, so every cap up to it survives `Number` exactly. */
+export const MAX_TOOL_CALLS_MAX = PREFERENCE_CATALOG.max_tool_calls.max;
 
 /** Roughly how long a turn can run at a given cap, in seconds per tool call.
  *  The LLM round-trip dominates a step: ~15s for a large-context reasoning
@@ -1153,22 +1183,19 @@ export function estimateTurnDuration(maxToolCalls: number): string {
 
 /** The per-turn tool-call cap. Mirrors `PreferenceStore::max_tool_calls` so the
  *  UI never displays a value the engine would not honor: an absent or
- *  unparseable value shows the default, and a parsed value is raised to the
- *  floor. A large value is shown as stored, since there is no ceiling. */
+ *  unparseable value shows the default, and a parsed value is held between
+ *  the catalog bounds. */
 export function currentMaxToolCalls(): number {
   if (preferences.value.status !== 'loaded') return MAX_TOOL_CALLS_DEFAULT;
   const raw = preferences.value.data['max_tool_calls'];
   if (raw == null) return MAX_TOOL_CALLS_DEFAULT;
-  // Integers only, matching the engine's `parse::<usize>()`: it rejects "12.5"
-  // and "-5" outright, where `parseInt` would happily read 12 and -5.
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) return MAX_TOOL_CALLS_DEFAULT;
-  // A value JS cannot carry exactly could only have been written outside this
-  // UI (the CLI, the HTTP API, psql), since `setMaxToolCalls` refuses to write
-  // one. Show the bound rather than a silently rounded number.
-  const parsed = Number(trimmed);
-  if (parsed > MAX_TOOL_CALLS_REPRESENTABLE) return MAX_TOOL_CALLS_REPRESENTABLE;
-  return Math.max(MAX_TOOL_CALLS_MIN, parsed);
+  // The engine's own rule (`Pref<Number>::resolve`): a number inside the
+  // catalog bounds, truncated as the engine casts it; anything else is unset.
+  const parsed = Number(raw.trim());
+  if (raw.trim() === '' || !(parsed >= MAX_TOOL_CALLS_MIN && parsed <= MAX_TOOL_CALLS_MAX)) {
+    return MAX_TOOL_CALLS_DEFAULT;
+  }
+  return Math.trunc(parsed);
 }
 
 export function setMaxToolCalls(maxToolCalls: number): Promise<void> {
@@ -1264,13 +1291,13 @@ async function loadPreferencesAs(mySeq: number): Promise<void> {
     currentModel.value = currentChatModel();
     reasoningEffort.value = clampEffortFor(currentChatReasoningEffort(), currentModel.value);
     notificationsFilter.value = currentNotificationsFilter();
-    cacheServedValue('notification_toasts', NOTIFICATION_TOASTS_KEY, SWITCH_VALUES);
+    cacheServedValue('notification_toasts', NOTIFICATION_TOASTS_KEY);
     // The cache first: a stale mirror would otherwise answer for an unset key.
-    cacheServedValue('autocorrect', AUTOCORRECT_STORAGE_KEY, SWITCH_VALUES);
+    cacheServedValue('autocorrect', AUTOCORRECT_STORAGE_KEY);
     setProseAutocorrect(currentAutocorrect());
-    cacheServedValue('motion', MOTION_STORAGE_KEY, MOTION_PREFS);
+    cacheServedValue('motion', MOTION_STORAGE_KEY);
     motionPreference.value = currentMotion();
-    cacheServedValue('theme-effects', THEME_EFFECTS_STORAGE_KEY, THEME_EFFECTS_PREFS);
+    cacheServedValue('theme-effects', THEME_EFFECTS_STORAGE_KEY);
     themeEffectsPreference.value = currentThemeEffects();
     selectedCodingAgent.value = currentCodingAgentDefault();
     refreshActiveThemeIfChanged();
@@ -1289,11 +1316,8 @@ async function loadPreferencesAs(mySeq: number): Promise<void> {
 
 // --- Vertex AI region ---
 
-export const DEFAULT_VERTEX_REGION = 'europe-west1';
-
 export function currentVertexRegion(): string {
-  if (preferences.value.status !== 'loaded') return DEFAULT_VERTEX_REGION;
-  return preferences.value.data['vertex_region'] || DEFAULT_VERTEX_REGION;
+  return currentPreference('vertex_region');
 }
 
 export function setVertexRegion(region: string): Promise<void> {
@@ -1302,9 +1326,8 @@ export function setVertexRegion(region: string): Promise<void> {
 
 // --- Local OpenAI-compatible provider base URL ---
 
-// Ollama's OpenAI-compatible endpoint. Mirrors DEFAULT_LOCAL_BASE_URL in
-// crates/lucidos-engine/src/core/preferences.rs.
-export const DEFAULT_LOCAL_BASE_URL = 'http://localhost:11434/v1';
+// Ollama's OpenAI-compatible endpoint.
+export const DEFAULT_LOCAL_BASE_URL = PREFERENCE_CATALOG.local_base_url.fallback;
 
 export function currentLocalBaseUrl(): string {
   if (preferences.value.status !== 'loaded') return '';
@@ -1317,12 +1340,10 @@ export function setLocalBaseUrl(url: string): Promise<void> {
 
 // --- OpenCode Free (keyless) ---
 
-/** Whether the keyless OpenCode Free tier is on. Off by default: only an
- *  explicit `'true'` opts in, because turning it on sends prompts anonymously
- *  to a third-party relay. */
+/** Whether the keyless OpenCode Free tier is on. Off by default, because
+ *  turning it on sends prompts anonymously to a third-party relay. */
 export function currentOpenCodeFreeEnabled(): boolean {
-  if (preferences.value.status !== 'loaded') return false;
-  return preferences.value.data['opencode_free_enabled'] === 'true';
+  return currentPreference('opencode_free_enabled') === 'true';
 }
 
 export function setOpenCodeFreeEnabled(enabled: boolean): Promise<void> {
@@ -1361,52 +1382,55 @@ export function setProviderEnabled(
   return savePreference(providerEnabledKey(id), enabled ? 'true' : 'false');
 }
 
-/** The seventh switch on that page, for TypeSafe (Jev).
+/** The master switches over the three System One providers on that page:
+ *  TypeSafe (Jev), Cloudflare Workers AI (Clef and Clef-flash), and a custom
+ *  endpoint.
  *
  *  Same key family and same absent-means-on rule as the six, and deliberately
- *  outside `SwitchableProvider`. Jev answers typed questions rather than
- *  holding a conversation, so it has no `ProviderKind` and never appears in
- *  `/health.configured_providers` (ADR 0220). Nothing keyed on that union may
- *  therefore reach it, which is what keeps the type from admitting it.
+ *  outside `SwitchableProvider`. A System One model answers typed questions
+ *  rather than holding a conversation, so it has no `ProviderKind` and never
+ *  appears in `/health.configured_providers` (ADR 0220). Nothing keyed on that
+ *  union may therefore reach one, which is what keeps the type from admitting
+ *  them.
  *
- *  Read by the engine's `llm::judgment::select::jev_for` on every
- *  classification, so the switch takes effect with no restart. It is the master
- *  switch above the two per-site `judgment_*` preferences: with it off, both
- *  sites run their chat path whatever those two say. */
-export const PROVIDER_ENABLED_TYPESAFE_KEY = 'provider_enabled_typesafe';
+ *  Read by the engine's `llm::judgment::select` on every judgment, so a switch
+ *  takes effect with no restart. Off sends every site picked on that provider
+ *  back to its chat model, whatever the per-site `judgment_*` preference says. */
+export const PROVIDER_ENABLED_TYPESAFE_KEY = PREF_PROVIDER_ENABLED_TYPESAFE.key;
+export const PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI_KEY = PREF_PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI.key;
+export const PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM_KEY = PREF_PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM.key;
 
-/** Every value the engine reads as an explicit off. Mirrors `reads_as_false`
- *  in `llm/provider_build.rs`. */
-const SWITCH_OFF_VALUES = ['0', 'false', 'no', 'off'];
+/** The custom System One endpoint's full request URL and the model it is
+ *  asked for. Read by the engine's `llm::judgment::endpoint`. */
+export const SYSTEM_ONE_CUSTOM_URL_KEY = PREF_SYSTEM_ONE_CUSTOM_URL.key;
+export const SYSTEM_ONE_CUSTOM_MODEL_KEY = PREF_SYSTEM_ONE_CUSTOM_MODEL.key;
 
 /** Whether a stored switch value reads as an explicit off.
  *
  *  Wider than `providerSwitchedOff`'s own check just above, deliberately. The
  *  six are answered by `/health`, which already reflects the engine's parse, so
- *  a spelling only this side misreads is corrected there. TypeSafe has no
- *  `/health` row (ADR 0220), which makes this the sole authority for its
- *  switch position: reading `off` as on would draw the row live while the
- *  engine ran chat. Absent is not off, because absent is the default. */
+ *  a spelling only this side misreads is corrected there. A System One
+ *  provider has no `/health` row (ADR 0220), which makes this the sole
+ *  authority for its switch position: reading `off` as on would draw the row
+ *  live while the engine ran chat. Absent is not off, because absent is the
+ *  default. */
 export function switchValueReadsAsOff(raw: string | undefined): boolean {
-  return raw !== undefined && SWITCH_OFF_VALUES.includes(raw.trim().toLowerCase());
+  return raw !== undefined && flagReading(raw) === 'false';
 }
 
-/** Switch TypeSafe on or off. Off leaves the stored `typesafe` credential
- *  alone, exactly as the six do: the switch parks the provider, and Remove is
- *  what deletes the key. */
-export function setTypeSafeEnabled(enabled: boolean): Promise<void> {
-  return savePreference(PROVIDER_ENABLED_TYPESAFE_KEY, enabled ? 'true' : 'false');
+/** Switch one System One provider on or off, by its switch key. Off leaves
+ *  the stored credential alone, exactly as the six do: the switch parks the
+ *  provider, and Remove is what deletes the key. */
+export function setSystemOneEnabled(switchKey: string, enabled: boolean): Promise<void> {
+  return savePreference(switchKey, enabled ? 'true' : 'false');
 }
 
 // --- Capture context ---
 
-/** Per-step ContextAssembled capture toggle. Defaults to false (off) — the
- *  debugging capture ships dark; only an explicit `'true'` opts in. */
+/** Per-step ContextAssembled capture toggle. The debugging capture ships
+ *  dark. */
 export function currentCaptureContext(): boolean {
-  if (preferences.value.status !== 'loaded') return false;
-  const raw = preferences.value.data['capture_context'];
-  if (raw == null) return false;
-  return raw === 'true';
+  return currentPreference('capture_context') === 'true';
 }
 
 export function setCaptureContext(enabled: boolean): Promise<void> {
@@ -1446,23 +1470,14 @@ export function inAppBrowserAvailable(): boolean {
  *  Safari tab, and all three Tauri branches) opens a new tab / the OS opener
  *  regardless. See `utils/openExternalUrl.ts` for what each mode does and why
  *  the platform forces the choice on us at all. */
-export type ExternalLinkTarget = 'safari' | 'ask' | 'in-app';
+export type ExternalLinkTarget = PreferenceValues<'external_link_target'>;
 
-const EXTERNAL_LINK_TARGETS: readonly ExternalLinkTarget[] = ['safari', 'ask', 'in-app'];
-
-export const DEFAULT_EXTERNAL_LINK_TARGET: ExternalLinkTarget = 'safari';
-
-/** Defaults to `'safari'` (the shipped behaviour) both when unset and while
- *  preferences are still loading, so a link tapped during startup can't fall
- *  into a different mode than the same link tapped a second later. An
- *  unrecognized stored value degrades to the default rather than disabling the
- *  hand-off. */
+/** The default applies both when unset and while preferences are still
+ *  loading. A link tapped during startup then can't fall into a different mode
+ *  than the same link tapped a second later. An unrecognized stored value
+ *  degrades to the default rather than disabling the hand-off. */
 export function currentExternalLinkTarget(): ExternalLinkTarget {
-  if (preferences.value.status !== 'loaded') return DEFAULT_EXTERNAL_LINK_TARGET;
-  const stored = preferences.value.data['external_link_target'];
-  return EXTERNAL_LINK_TARGETS.includes(stored as ExternalLinkTarget)
-    ? stored as ExternalLinkTarget
-    : DEFAULT_EXTERNAL_LINK_TARGET;
+  return currentPreference('external_link_target');
 }
 
 export function setExternalLinkTarget(target: ExternalLinkTarget): Promise<void> {
@@ -1483,11 +1498,10 @@ export function externalLinkTargetConfigurable(): boolean {
 // --- Mobile dynamic bars ---
 
 /** When true, the mobile header and prompt slide away on scroll down and come
- *  back on scroll up (`hooks/useHideOnScroll.ts`). Defaults to false, where
- *  both stay pinned; only an explicit `'true'` turns the bars dynamic. */
+ *  back on scroll up (`hooks/useHideOnScroll.ts`). When false, both stay
+ *  pinned. */
 export function currentMobileDynamicBars(): boolean {
-  if (preferences.value.status !== 'loaded') return false;
-  return preferences.value.data['mobile_dynamic_bars'] === 'true';
+  return currentPreference('mobile_dynamic_bars') === 'true';
 }
 
 export function setMobileDynamicBars(enabled: boolean): Promise<void> {
@@ -1507,6 +1521,7 @@ export type BackgroundModelKey =
   | 'model_memory'
   | 'model_conversation_summary'
   | 'model_query_classification'
+  | 'model_summary_compaction'
   | 'model_command_judge';
 
 /** The reasoning half of each background *model selection*. */
@@ -1517,81 +1532,22 @@ export type BackgroundReasoningKey =
   | 'reasoning_memory'
   | 'reasoning_conversation_summary'
   | 'reasoning_query_classification'
+  | 'reasoning_summary_compaction'
   | 'reasoning_command_judge';
 
-/** Default model for the command-guard judge (Haiku, per ADR 0002). Mirrors the
- *  backend `DEFAULT_COMMAND_JUDGE_MODEL` in `core/preferences.rs`. */
-export const DEFAULT_COMMAND_JUDGE_MODEL = 'claude-haiku-4-5';
-
-/** Per-key default shown when the preference is unset. Most background tasks
- *  default to Gemini Flash; the command-guard judge defaults to Haiku. The
- *  conversation summary and query classification inherit the memory model until
- *  they are set, matching `aux_purpose`'s `model_fallback_key`. */
-const BACKGROUND_MODEL_DEFAULTS: Record<BackgroundModelKey, string> = {
-  model_title: 'gemini-3-flash-preview',
-  model_change_summary: 'gemini-3-flash-preview',
-  model_image_description: 'gemini-3-flash-preview',
-  model_memory: 'gemini-3-flash-preview',
-  model_conversation_summary: 'gemini-3-flash-preview',
-  model_query_classification: 'gemini-3-flash-preview',
-  model_command_judge: DEFAULT_COMMAND_JUDGE_MODEL,
-};
-
-/** The keys that were split out of `model_memory` and inherit it while unset.
- *  Each mirrors an `aux_purpose` entry whose `model_fallback_key` is
- *  `model_memory`; the two lists must agree, or Settings shows a model the
- *  engine is not running. */
-const INHERITS_MEMORY_MODEL: readonly BackgroundModelKey[] = [
-  'model_conversation_summary',
-  'model_query_classification',
-];
-
-/** Per-key effort default. Each mirrors the one `engine::aux_purpose` applies,
- *  and each is the literal its call site hardcoded before the preference
- *  existed. The summary keeps `low` (ADR 0102's measurements say output length
- *  does not track it), and the rest spend nothing on deliberation. */
-const BACKGROUND_REASONING_DEFAULTS: Record<BackgroundReasoningKey, string> = {
-  reasoning_title: 'none',
-  reasoning_change_summary: 'none',
-  reasoning_image_description: 'none',
-  reasoning_memory: 'none',
-  reasoning_conversation_summary: 'low',
-  reasoning_query_classification: 'none',
-  reasoning_command_judge: 'none',
-};
-
-/** The effort keys that inherit `reasoning_memory` while unset, mirroring
- *  `aux_purpose`'s `fallback_key`. Only query classification does. The summary
- *  deliberately does not: its default is `low`, and inheriting would lower it. */
-const INHERITS_MEMORY_REASONING: readonly BackgroundReasoningKey[] = [
-  'reasoning_query_classification',
-];
-
-/** The change summary follows the title pair while unset, mirroring
- *  `aux_purpose`'s fallbacks for `ContextPurpose::ChangeSummary`. */
-const INHERITS_TITLE_MODEL: readonly BackgroundModelKey[] = ['model_change_summary'];
-const INHERITS_TITLE_REASONING: readonly BackgroundReasoningKey[] = ['reasoning_change_summary'];
-
-export function currentBackgroundModel(key: BackgroundModelKey): string {
-  // Split out of another key, so an unset value follows whatever the user
-  // pinned there. The engine resolves the same fallback.
-  const fallback = INHERITS_MEMORY_MODEL.includes(key)
-    ? currentBackgroundModel('model_memory')
-    : INHERITS_TITLE_MODEL.includes(key)
-      ? currentBackgroundModel('model_title')
-      : BACKGROUND_MODEL_DEFAULTS[key];
-  if (preferences.value.status !== 'loaded') return fallback;
-  return preferences.value.data[key] || fallback;
-}
-
-export function currentBackgroundReasoning(key: BackgroundReasoningKey): string {
-  const fallback = INHERITS_MEMORY_REASONING.includes(key)
-    ? currentBackgroundReasoning('reasoning_memory')
-    : INHERITS_TITLE_REASONING.includes(key)
-      ? currentBackgroundReasoning('reasoning_title')
-      : BACKGROUND_REASONING_DEFAULTS[key];
-  if (preferences.value.status !== 'loaded') return fallback;
-  return preferences.value.data[key] || fallback;
+/** A background row's stored *model selection*, each half `null` while unset.
+ *  The engine resolves an unset half, inheritance and the configured providers
+ *  included, and `GET /api/v1/models/background` serves the result
+ *  (`useBackgroundModels`). */
+export function storedBackgroundSelection(
+  modelKey: BackgroundModelKey,
+  reasoningKey: BackgroundReasoningKey,
+): { model: string | null; effort: string | null } {
+  const data = preferences.value.status === 'loaded' ? preferences.value.data : {};
+  return {
+    model: acceptedValue(modelKey, data[modelKey]),
+    effort: acceptedValue(reasoningKey, data[reasoningKey]),
+  };
 }
 
 /** Persist one background *model selection*, both halves.
@@ -1610,31 +1566,39 @@ export async function saveModelSelection(
   if (patch.reasoningEffort !== null) await savePreference(reasoningKey, patch.reasoningEffort);
 }
 
+// --- Memory module ---
+
+/** How a turn gets its past (ADR 0362). Global. */
+export type MemoryModule = PreferenceValues<'memory_module'>;
+
+export function currentMemoryModule(): MemoryModule {
+  return currentPreference('memory_module');
+}
+
+export function setMemoryModule(module: MemoryModule): Promise<void> {
+  return savePreference('memory_module', module);
+}
+
 // --- Compose destination (coding-agent chip + hand-off hint) ---
 
 /** The account default coding agent — the SEED for a fresh compose's backend
  *  chip (via `selectedCodingAgent`, set at `loadPreferences`). Workspace-scoped
- *  (not device-scoped). Default Claude Code — same as the engine's NULL fallback.
+ *  (not device-scoped).
  *  Compose picks are per-draft (see `composeSelections`) and deliberately do NOT
  *  write this back (draft-only), so there is no `setCodingAgentDefault`. */
 export function currentCodingAgentDefault(): CodingAgent {
-  return currentPreference('coding_agent_default', ['claude-code', 'codex'], 'claude-code');
+  return currentPreference('coding_agent_default');
 }
 
-/** The two Claude Code permission modes Lucidos offers. CC has six; the other
- *  four are withheld deliberately (see the engine's `CcPermissionMode`). */
-export const CC_PERMISSION_MODES = ['accept-edits', 'auto'] as const;
-export type CcPermissionMode = (typeof CC_PERMISSION_MODES)[number];
+/** The Claude Code permission modes Lucidos offers. CC has six; the others
+ *  are withheld deliberately (see the engine's `CcPermissionMode`). */
+export const CC_PERMISSION_MODES = PREFERENCE_CATALOG.coding_agent_claude_permission_mode.values;
+export type CcPermissionMode = PreferenceValues<'coding_agent_claude_permission_mode'>;
 
 /** Which of Claude Code's own permission modes coding-agent threads run in.
- *  Workspace-scoped. Defaults to `accept-edits`, the mode every session ran
- *  before the key existed, so the engine's NULL fallback and this agree. */
+ *  Workspace-scoped. */
 export function currentCodingAgentPermissionMode(): CcPermissionMode {
-  return currentPreference(
-    'coding_agent_claude_permission_mode',
-    CC_PERMISSION_MODES,
-    'accept-edits',
-  );
+  return currentPreference('coding_agent_claude_permission_mode');
 }
 
 export function setCodingAgentPermissionMode(mode: CcPermissionMode): Promise<void> {
@@ -1782,12 +1746,10 @@ export function dismissBackupReminder(now: number = Date.now()): Promise<void> {
 
 // --- Command guard (ADR 0002) ---
 
-/** Master toggle for the command guard (the bash/python safety gate). Defaults
- *  to false — the feature ships dark and is enabled per-workspace. Mirrors the
- *  backend `command_guard` preference (`core/preferences.rs`). */
+/** Master toggle for the command guard (the bash/python safety gate). The
+ *  feature ships dark and is enabled per-workspace. */
 export function currentCommandGuard(): boolean {
-  if (preferences.value.status !== 'loaded') return false;
-  return preferences.value.data['command_guard'] === 'true';
+  return currentPreference('command_guard') === 'true';
 }
 
 export function setCommandGuard(enabled: boolean): Promise<void> {
@@ -1795,11 +1757,10 @@ export function setCommandGuard(enabled: boolean): Promise<void> {
 }
 
 /** Sub-toggle for the LLM judge — when off, the guard uses only the static
- *  "dangerous" list for the ask lane. Defaults to true (on when the guard is on).
- *  Only meaningful while the master `command_guard` toggle is on. */
+ *  "dangerous" list for the ask lane. Only meaningful while the master
+ *  `command_guard` toggle is on. */
 export function currentCommandGuardJudge(): boolean {
-  if (preferences.value.status !== 'loaded') return true;
-  return preferences.value.data['command_guard_judge'] !== 'false';
+  return currentPreference('command_guard_judge') === 'true';
 }
 
 export function setCommandGuardJudge(enabled: boolean): Promise<void> {
@@ -1811,26 +1772,39 @@ export function setCommandGuardJudge(enabled: boolean): Promise<void> {
 /**
  * Whether this workspace has voice turned on at all.
  *
- * Off unless somebody opted in, matching the engine's `voice_enabled` default.
- * An unloaded preference set therefore reads OFF, which is the right way round:
- * the call control appears once we know it should, never in the gap before the
- * answer arrives.
+ * An unloaded preference set reads the catalog default, which is off. That is
+ * the right way round: the call control appears once we know it should, never
+ * in the gap before the answer arrives.
  */
 export function voiceEnabled(): boolean {
-  if (preferences.value.status !== 'loaded') return false;
-  return preferences.value.data['voice_enabled'] === 'true';
+  return currentPreference('voice_enabled') === 'true';
 }
 
 export function setVoiceEnabled(enabled: boolean): Promise<void> {
   return savePreference('voice_enabled', enabled ? 'true' : 'false');
 }
 
-/** The speech-to-speech model a *voice session* speaks through. Mirrors the
- *  backend `model_voice_talker` default in `core/preference_catalog.rs`.
- *  Deliberately NOT a chat-model registry row, so it is a typed id rather than
- *  a pick from `backgroundModelChoices()`: a realtime model cannot serve an
- *  ordinary turn and never appears in that registry. */
-export const DEFAULT_VOICE_TALKER_MODEL = 'gpt-realtime-2.1';
+// --- Home thread ---
+
+/**
+ * Whether this workspace has the experimental home thread switched on.
+ *
+ * An unloaded preference set reads the catalog default, which is off, so Home
+ * never flashes into the header before the answer arrives.
+ */
+export function homeThreadEnabled(): boolean {
+  return currentPreference('home_thread_enabled') === 'true';
+}
+
+export function setHomeThreadEnabled(enabled: boolean): Promise<void> {
+  return savePreference('home_thread_enabled', enabled ? 'true' : 'false');
+}
+
+/** The speech-to-speech model a *voice session* speaks through. Deliberately
+ *  NOT a chat-model registry row, so it is a typed id rather than a pick from
+ *  `backgroundModelChoices()`: a realtime model cannot serve an ordinary turn
+ *  and never appears in that registry. */
+export const DEFAULT_VOICE_TALKER_MODEL = PREFERENCE_CATALOG.model_voice_talker.fallback;
 
 /**
  * What is STORED, which is empty until somebody sets it.
@@ -1845,18 +1819,27 @@ export function storedVoiceTalkerModel(): string {
   return preferences.value.data['model_voice_talker'] ?? '';
 }
 
+/** The talker model a call dials: the stored one, else the default. */
+export function currentVoiceTalkerModel(): string {
+  return currentPreference('model_voice_talker');
+}
+
 export function setVoiceTalkerModel(model: string): Promise<void> {
   return savePreference('model_voice_talker', model.trim());
 }
 
 /** The model that turns the caller's speech into text inside the talker's
  *  socket. The second and last model in the voice loop: nothing translates and
- *  nothing summarises. Mirrors the backend `model_voice_transcriber` default. */
-export const DEFAULT_VOICE_TRANSCRIBER_MODEL = 'gpt-4o-mini-transcribe';
+ *  nothing summarises. */
+export const DEFAULT_VOICE_TRANSCRIBER_MODEL = PREFERENCE_CATALOG.model_voice_transcriber.fallback;
 
 export function storedVoiceTranscriberModel(): string {
   if (preferences.value.status !== 'loaded') return '';
   return preferences.value.data['model_voice_transcriber'] ?? '';
+}
+
+export function currentVoiceTranscriberModel(): string {
+  return currentPreference('model_voice_transcriber');
 }
 
 export function setVoiceTranscriberModel(model: string): Promise<void> {
@@ -1864,12 +1847,16 @@ export function setVoiceTranscriberModel(model: string): Promise<void> {
 }
 
 /** The voice a call is spoken in, as the provider's own name for one. Not a
- *  model, and not the language. Mirrors the backend `voice_talker_voice`. */
-export const DEFAULT_VOICE_TALKER_VOICE = 'marin';
+ *  model, and not the language. */
+export const DEFAULT_VOICE_TALKER_VOICE = PREFERENCE_CATALOG.voice_talker_voice.fallback;
 
 export function storedVoiceTalkerVoice(): string {
   if (preferences.value.status !== 'loaded') return '';
   return preferences.value.data['voice_talker_voice'] ?? '';
+}
+
+export function currentVoiceTalkerVoice(): string {
+  return currentPreference('voice_talker_voice');
 }
 
 export function setVoiceTalkerVoice(voice: string): Promise<void> {
@@ -1877,26 +1864,20 @@ export function setVoiceTalkerVoice(voice: string): Promise<void> {
 }
 
 /**
- * One section of the resident block, as the toggles need to draw it.
+ * The sections of the resident block, as the toggles need to draw them.
  *
  * What a call loads before it starts. The talker looks nothing up mid-call, so
  * this block is the whole of what it answers without waiting for the agent.
  *
- * A mirror of `SECTIONS` in `crates/lucidos-engine/src/voice/sections.rs`,
- * which is the registry: the ids, the headings and which ones ship on are all
- * decided there, beside the builders that fill them. A Rust test reads this
- * list and fails if the two drift, the way `voice::language` reads the Locale
- * dropdown.
+ * Generated from `SECTIONS` in `crates/lucidos-engine/src/voice/sections.rs`,
+ * which decides the ids and headings beside the builders that fill them. Which
+ * ones ship on is the catalog default, {@link DEFAULT_VOICE_RESIDENT_SECTIONS}.
  */
-export const VOICE_RESIDENT_SECTIONS: readonly {
-  id: string;
-  title: string;
-  onByDefault: boolean;
-}[] = [
-  { id: 'who-and-where', title: 'Who you are talking to, and when', onByDefault: true },
-  { id: 'this-thread', title: 'This conversation', onByDefault: true },
-  { id: 'workspace-shape', title: 'What this workspace has', onByDefault: true },
-];
+export { VOICE_RESIDENT_SECTIONS };
+
+/** The ids a call opens with while nothing is stored. */
+export const DEFAULT_VOICE_RESIDENT_SECTIONS: readonly string[] =
+  PREFERENCE_CATALOG.voice_resident_sections.fallback.split(',');
 
 /** Write the whole list. Only {@link setVoiceSectionEnabled} calls it: the one
  *  place that knows what turning a single toggle does to the rest. */
@@ -1924,9 +1905,7 @@ export function voiceResidentSelection(): string[] | null {
 /** Is this section in the block a call would open with? */
 export function voiceSectionEnabled(id: string): boolean {
   const selection = voiceResidentSelection();
-  if (selection === null) {
-    return VOICE_RESIDENT_SECTIONS.some((s) => s.id === id && s.onByDefault);
-  }
+  if (selection === null) return DEFAULT_VOICE_RESIDENT_SECTIONS.includes(id);
   return selection.includes(id);
 }
 
@@ -1941,13 +1920,10 @@ export function voiceSectionEnabled(id: string): boolean {
  * one this client does not know, and dropping it would silently turn it off.
  */
 export function setVoiceSectionEnabled(id: string, on: boolean): Promise<void> {
-  const current = new Set(
-    voiceResidentSelection() ??
-      VOICE_RESIDENT_SECTIONS.filter((s) => s.onByDefault).map((s) => s.id),
-  );
+  const current = new Set(voiceResidentSelection() ?? DEFAULT_VOICE_RESIDENT_SECTIONS);
   if (on) current.add(id);
   else current.delete(id);
-  const registry = VOICE_RESIDENT_SECTIONS.map((s) => s.id);
+  const registry: readonly string[] = VOICE_RESIDENT_SECTIONS.map((s) => s.id);
   const ordered = registry.filter((known) => current.has(known));
   const unknown = [...current].filter((held) => !registry.includes(held));
   return setVoiceResidentSections([...ordered, ...unknown].join(','));

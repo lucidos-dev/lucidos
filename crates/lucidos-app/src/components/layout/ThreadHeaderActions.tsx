@@ -1,20 +1,19 @@
 import { useRef } from 'preact/hooks';
 import { llmConfigured, recoveryProgress, searchEverywhereAnchor, searchEverywhereOpen } from '../../store/store';
 import { unfocusThread } from '../../store/actions/threads';
+import { homeThreadId, openHomeThread } from '../../store/actions/homeThread';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { confirmAndStartSetupInterview } from '../shared/setupInterview';
 import { focusSearchInput } from '../search/searchEverywhereActions';
-import { ComposeIcon, HelpIcon, SearchIcon } from '../shared/icons';
-import { CollapsingActions, type HeaderActionSpec } from './headerActions';
+import { ComposeIcon, HelpIcon, HomeIcon, SearchIcon } from '../shared/icons';
+import { CollapsingActions, renderHeaderAction, type HeaderActionSpec } from './headerActions';
 import { useHeaderActionCollapse, type HeaderCollapseTargets } from '../../hooks/useHeaderActionCollapse';
 
 /** The boxes the thread row's collapse is measured against: the region, and the
  *  brand cluster centred on it. The room these actions have is half of what
- *  that cluster leaves, not the region's leftover. Nothing to measure at the
- *  leading end either way: the row's leading control is the drawer toggle,
- *  which is positioned against the header rather than being a member of this
- *  region. Stable identity so the collapse effect's deps do not re-fire every
- *  render. */
+ *  that cluster leaves, not the region's leftover, so the leading end (the
+ *  drawer toggle, and Home) needs no measuring. Stable identity so the collapse
+ *  effect's deps do not re-fire every render. */
 const COLLAPSE_TARGETS: HeaderCollapseTargets = {
   container: '.pane-header-brand',
   centre: '.pane-header-brand-label',
@@ -29,9 +28,10 @@ const COLLAPSE_TARGETS: HeaderCollapseTargets = {
  *  into a ⋯ menu instead of crowding the mark.
  *
  *  Ordered nearest-centre first, which is the end collapse eats from: Setup
- *  interview goes first (a once-or-twice thing), then New thread, and Search
+ *  interview goes first (a once-or-twice thing), then New thread. Search
  *  everywhere is the last one standing at the row's outer edge, where the
- *  pointer already is.
+ *  pointer already is. Home is not one of these: it leads the row instead
+ *  (`ThreadHeaderHomeButton`).
  *
  *  Exported as a pure function so the set and its order are testable without
  *  standing the header up. */
@@ -83,11 +83,33 @@ export function threadHeaderActions(): HeaderActionSpec[] {
   return actions;
 }
 
+/** The Home action, which leads the desktop thread pane's header rather than
+ *  joining the trailing cluster. Home has no row in the thread list, so this is
+ *  the way to it. Present only while the experimental switch is on and the
+ *  thread exists. */
+export function threadHeaderHomeAction(): HeaderActionSpec | null {
+  if (!homeThreadId.value) return null;
+  return {
+    key: 'home',
+    label: 'Home',
+    icon: () => <HomeIcon />,
+    onClick: openHomeThread,
+    extraClass: 'home-thread-btn',
+  };
+}
+
+/** The leading control of the DESKTOP thread pane's header. It never folds:
+ *  the brand cluster's reserve and the pane's floor both count its box. */
+export function ThreadHeaderHomeButton() {
+  const home = threadHeaderHomeAction();
+  return home ? renderHeaderAction(home) : null;
+}
+
 /**
  * The trailing cluster of the DESKTOP thread pane's header.
  *
  * Desktop only: `.desktop-header` is `display: none` under the mobile
- * breakpoint, and neither mobile header carries these three (the phone reaches
+ * breakpoint, and neither mobile header carries these actions (the phone reaches
  * them from the Lucidos menu instead, which is why the menu drops them here).
  *
  * It collapses progressively, the same way the content pane's does and for the

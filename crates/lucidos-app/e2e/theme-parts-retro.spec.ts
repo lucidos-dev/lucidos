@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test, expect, type Page } from './fixtures';
 import {
-  apiRequest, ensureMobileView, gotoWithRetry, isMobileViewport, waitForPaneAtRest, waitForVisibleInput,
+  apiRequest, ensureMobileView, gotoWithRetry, isMobileViewport, shellDeviceId, waitForPaneAtRest, waitForVisibleInput,
 } from './helpers';
 
 // Retro theme parts in a real browser (ADR 0313), on desktop Chromium and
@@ -24,15 +24,6 @@ const fixture = readFileSync(resolve(here, 'themes', 'retro-phosphor.json'), 'ut
 const SCANLINES = '--part-screen-background-image';
 const GREEN = 'rgb(51, 255, 51)';
 
-async function deviceId(page: Page): Promise<string> {
-  let id: string | null = null;
-  await expect.poll(async () => {
-    id = await page.evaluate(() => localStorage.getItem('lucidos-device-id')).catch(() => null);
-    return id;
-  }, { message: 'the shell registered a device' }).toBeTruthy();
-  return id as unknown as string;
-}
-
 /** The shell has booted: the splash is gone and the composer is on screen. */
 async function ready(page: Page) {
   await expect(page.locator('.boot-splash')).toHaveCount(0, { timeout: 30_000 });
@@ -40,7 +31,7 @@ async function ready(page: Page) {
 }
 
 async function setPreference(page: Page, key: string, value: string): Promise<void> {
-  const device = await deviceId(page);
+  const device = await shellDeviceId(page);
   const res = await apiRequest(page).put(`/api/v1/preferences?key=${key}`, { data: { value, device_id: device } });
   expect(res.ok(), `${key}=${value}`).toBe(true);
   expect((await res.json()).success, `${key}=${value}`).toBe(true);

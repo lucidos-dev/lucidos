@@ -1,4 +1,4 @@
-import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateCheckInFlight, appUpdateProgress, lucidosRelease, relayedUpdate, releaseCheck, settingsScrollTarget } from '../store';
+import { showToast, removeToast, clientOfferedRelease, latestTauriAppNotes, appUpdateCheckError, appUpdateCheckInFlight, appUpdateProgress, lucidosRelease, relayedUpdate, releaseCheck, settingsScrollTarget } from '../store';
 import { isNewerVersion } from '../../utils/version';
 import type { ToastAction } from '../types';
 // The READ lives a layer up, where a surface can ask "is there an update?"
@@ -64,13 +64,6 @@ let lastOfferedVersion: string | null = null;
  *  makes a second caller join the first rather than race it: a bare boolean
  *  would let the loser resolve with nothing. See {@link checkForUpdatesNow}. */
 let inFlightCheck: Promise<UpdateCheckVerdict> | null = null;
-/** Whether {@link latestTauriAppVersion} holds a value the CLIENT check wrote.
- *
- *  Gates the clear-on-no-update path so the client check never wipes a value it
- *  did not put there. In a Tauri dev client `check_app_update` returns null,
- *  which is indistinguishable from "up to date". Assigning that null would
- *  clobber the version `connection.ts` reads from the engine's `/health`. */
-let clientOwnsLatestVersion = false;
 
 /** What a check concluded, as the thing the CALLER acts on.
  *
@@ -480,7 +473,7 @@ export function reportUpdateCheck(verdict: UpdateCheckVerdict): void {
  *  Packaged clients only. A browser session has no release of its own to
  *  compare, just a build id, so it can conclude nothing here. */
 export function shadowedEngine(): { engine: string; client: string } | null {
-  const client = typeof window !== 'undefined' ? window.__LUCIDOS_APP_VERSION__ : undefined;
+  const client = typeof window !== 'undefined' ? window.__LUCIDOS_APP_RELEASE__ : undefined;
   const engine = lucidosRelease.value;
   if (!client || !engine) return null;
   return isNewerVersion(client, engine) ? { engine, client } : null;
@@ -525,21 +518,12 @@ export async function checkAppUpdateViaClient(): Promise<UpdateCheckVerdict> {
   }
   appUpdateCheckError.value = null;
   // The notes travel WITH the version, written and cleared on the same branches,
-  // so the two can never end up describing different releases. Clear only what
-  // this path set, see {@link clientOwnsLatestVersion}.
-  if (offer) {
-    latestTauriAppVersion.value = offer.version;
-    latestTauriAppNotes.value = offer.notes;
-    clientOwnsLatestVersion = true;
-    offerAppUpdate(offer.version);
-    return { kind: 'available', version: offer.version };
-  }
-  if (clientOwnsLatestVersion) {
-    latestTauriAppVersion.value = null;
-    latestTauriAppNotes.value = null;
-    clientOwnsLatestVersion = false;
-  }
-  return { kind: 'up-to-date' };
+  // so the two can never end up describing different releases.
+  clientOfferedRelease.value = offer?.version ?? null;
+  latestTauriAppNotes.value = offer?.notes ?? null;
+  if (!offer) return { kind: 'up-to-date' };
+  offerAppUpdate(offer.version);
+  return { kind: 'available', version: offer.version };
 }
 
 /** Can THIS session install the offered update itself?

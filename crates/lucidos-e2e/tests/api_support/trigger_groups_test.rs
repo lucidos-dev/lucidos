@@ -4,6 +4,7 @@
 //! denormalized `member_count` projection.
 
 use crate::support::{base_url, unique_marker, user_client};
+use lucidos_engine::core::prefs;
 use serde_json::json;
 
 async fn create_group(
@@ -167,7 +168,7 @@ async fn unknown_group_id_on_trigger_create_is_rejected() {
     // Make sure timezone is set so create_trigger doesn't reject for that reason.
     let _ = client
         .put(format!("{}/api/v1/preferences", base_url()))
-        .json(&json!({ "key": "timezone", "value": "UTC" }))
+        .json(&json!({ "key": prefs::TIMEZONE.key(), "value": "UTC" }))
         .send()
         .await;
 
@@ -200,7 +201,7 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
     let client = user_client().await;
     let _ = client
         .put(format!("{}/api/v1/preferences", base_url()))
-        .json(&json!({ "key": "timezone", "value": "UTC" }))
+        .json(&json!({ "key": prefs::TIMEZONE.key(), "value": "UTC" }))
         .send()
         .await;
 

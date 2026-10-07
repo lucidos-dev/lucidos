@@ -595,16 +595,11 @@ pub(crate) async fn revert_with_shas(
             Err(e) => Err(format!("Revert error: {}", e).into()),
         }
     } else {
-        match git_cmd(
-            &[
-                "revert",
-                "--no-commit",
-                &format!("{}..{}", pre_sha, post_sha),
-            ],
-            repo_root,
-        )
-        .await
-        {
+        // `git revert pre..post` refuses a range holding a merge commit, and
+        // the `/harden` merge of main (ADR 0345) often sits inside it. So
+        // revert one synthetic commit carrying the range's net diff instead.
+        let squashed = squash_range(repo_root, pre_sha, post_sha).await?;
+        match git_cmd(&["revert", "--no-commit", &squashed], repo_root).await {
             Ok(o) if o.status.success() => {
                 // The reverted content is staged at this point, so a failed
                 // commit leaves the repo root holding it. The user acts on
@@ -623,6 +618,32 @@ pub(crate) async fn revert_with_shas(
             Err(e) => Err(format!("Revert error: {}", e).into()),
         }
     }
+}
+
+/// A dangling commit whose tree is `post_sha`'s and whose only parent is
+/// `pre_sha`. Its diff is the whole `pre..post` range, merges included.
+async fn squash_range(
+    repo_root: &Path,
+    pre_sha: &str,
+    post_sha: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let tree = format!("{post_sha}^{{tree}}");
+    let msg = format!("Squash of {pre_sha}..{post_sha}");
+    let out = git_cmd(
+        &["commit-tree", &tree, "-p", pre_sha, "-m", &msg],
+        repo_root,
+    )
+    .await
+    .map_err(|e| format!("Revert error: cannot squash {pre_sha}..{post_sha}: {e}"))?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || sha.is_empty() {
+        return Err(format!(
+            "Revert error: cannot squash {pre_sha}..{post_sha}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(sha)
 }
 
 #[cfg(test)]

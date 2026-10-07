@@ -1,24 +1,19 @@
 // @vitest-environment jsdom
+import { FLAG_OFF_VALUES, FLAG_ON_VALUES } from './generated/preference-catalog';
 import { describe, it, expect } from 'vitest';
 import {
   defaultAutocorrect, isKeyCodeTextInsertion, isTextEntryField, resolveAutocorrect,
 } from './textEntry';
 
-describe('defaultAutocorrect', () => {
-  it('is on, with no platform to consult', () => {
-    expect(defaultAutocorrect()).toBe(true);
-  });
-});
-
 describe('resolveAutocorrect', () => {
-  it('lets a stored value win on any client', () => {
-    expect(resolveAutocorrect('true')).toBe(true);
-    expect(resolveAutocorrect('false')).toBe(false);
+  it('lets every spelling the engine reads win on any client', () => {
+    for (const raw of FLAG_ON_VALUES) expect(resolveAutocorrect(` ${raw.toUpperCase()} `)).toBe(true);
+    for (const raw of FLAG_OFF_VALUES) expect(resolveAutocorrect(` ${raw.toUpperCase()} `)).toBe(false);
   });
 
-  it('reads anything else as unset, which falls to the default of on', () => {
-    for (const raw of [undefined, null, '', 'off', 'TRUE']) {
-      expect(resolveAutocorrect(raw)).toBe(true);
+  it('reads anything else as unset, which falls to the default', () => {
+    for (const raw of [undefined, null, '', 'maybe']) {
+      expect(resolveAutocorrect(raw)).toBe(defaultAutocorrect());
     }
   });
 });

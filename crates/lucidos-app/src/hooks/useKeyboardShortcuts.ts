@@ -3,7 +3,7 @@ import { unfocusThread } from '../store/actions/threads';
 import { focusPromptNow, openAgentMenu } from '../components/chat/promptFocus';
 import { searchEverywhereOpen, searchEverywhereAnchor, focusedPane, focusedThreadId, toggleExchangeCollapsed, toggleInitiatorCollapsed } from '../store/store';
 import { isTextInput, isThreadTranscript } from '../utils/dom';
-import { dismissTopOverlay, overlayStack } from '../store/overlayStack';
+import { dismissTopOverlay, overlayStack, topPanelOverlay } from '../store/overlayStack';
 import { nativeFullscreenElement } from '../store/appFullscreenHost';
 import { runCloseCascade } from '../store/actions/threadActions';
 import { matchShortcut } from '../store/actions/keybindings';
@@ -12,6 +12,7 @@ import { toggleFollowLiveEdge, pressCallToggleIfShown } from '../components/chat
 import { showFocusedThreadDiff, applyFocusedThreadChange } from '../components/chat/WaitingBanner';
 import { toggleAppFullscreenIfShown, toggleSourceView, toggleLineWrap } from '../components/layout/ContentHeaderActions';
 import { isKnownAppFrame } from '../utils/appFrame';
+import { findAvailable, focusedFindSurface, openFocusedFind } from '../store/actions/find-bar';
 import { adjustUiScale, resetUiScale, scaleModalOpen, dismissScaleModal } from '../components/shared/scaleModalState';
 import { UI_SCALE_STEP } from '../store/actions/preferences';
 import { isMobile } from '../utils/viewport';
@@ -31,7 +32,7 @@ import { handleOverlayTab } from '../components/shared/overlayFocus';
 import { promptRenameThread } from '../store/actions/threadRename';
 import { copyLastResponse } from '../components/chat/copyLastResponse';
 import { promptStopRequested, promptSideQuestionRequested } from '../components/chat/prompt-input-helpers';
-import { seedDrawerHighlight, openHighlightedThreadActions, toggleFocusedThreadFamily } from '../components/drawer/ThreadDrawer';
+import { seedDrawerHighlight, openHighlightedThreadActions, toggleFocusedThreadFamily, stepFocusedThreadInList } from '../components/drawer/ThreadDrawer';
 import { openThreadTitleMenu } from '../components/chat/ThreadTitle';
 import { focusIntoPane, handlePaneTab, reconcilePaneFocus } from '../components/layout/paneFocus';
 import { historyBack, historyForward } from '../store/actions/focused-pane-history';
@@ -138,6 +139,8 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   toggleMenuDrawer,
   historyBack: () => historyBack(),
   historyForward: () => historyForward(),
+  prevThreadInList: () => stepFocusedThreadInList(-1),
+  nextThreadInList: () => stepFocusedThreadInList(1),
   // Step the open notification newer/older when the content pane holds one.
   // Otherwise step the transcript one turn (a .chat-exchange) up/down and land
   // focus in it, so continuous Arrow/Page scrolling follows.
@@ -154,6 +157,7 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   resetPaneLayout,
   refreshPanel: refreshPanelIfLive,
   toggleAppFullscreen: toggleAppFullscreenIfShown,
+  findInView: openFocusedFind,
   toggleSourceView,
   toggleLineWrap,
   zoomIn: () => adjustUiScale(UI_SCALE_STEP),
@@ -242,15 +246,18 @@ export function shouldTypeToFocusPrompt(
 }
 
 /** Whether a Mac text field owns this keydown. There Ctrl with a bare letter
- *  edits text: Ctrl+K deletes to the line end, Ctrl+P moves up a line. So a
- *  shortcut bound to `mod+<letter>` fires on ⌘ in a field, and anywhere else on
- *  either key. Exported for testing, with the platform as a parameter. */
+ *  edits text: Ctrl+K deletes to the line end, Ctrl+P moves up a line. Option
+ *  with an arrow moves the caret by paragraph or word. So a shortcut on either
+ *  chord fires anywhere but a field. Exported for testing, with the platform as
+ *  a parameter. */
 export function isMacTextEditingKey(
   e: Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'key' | 'target'>,
   mac: boolean = isMac,
 ): boolean {
-  return mac && e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey
-    && /^[a-z]$/i.test(e.key) && isTextInput(e.target);
+  if (!mac || e.metaKey || e.shiftKey || !isTextInput(e.target)) return false;
+  const ctrlLetter = e.ctrlKey && !e.altKey && /^[a-z]$/i.test(e.key);
+  const optionArrow = e.altKey && !e.ctrlKey && e.key.startsWith('Arrow');
+  return ctrlLetter || optionArrow;
 }
 
 /** Whether the Escape policy would act: an overlay to close, native fullscreen
@@ -262,14 +269,27 @@ function escapePolicyHasWork(): boolean {
   return active?.hasAttribute?.('data-escape-self') === true;
 }
 
+/** Shortcuts that take their chord only where they apply. Anywhere else the
+ *  key keeps its browser default, so Mod+F opens the browser's own find.
+ *  `inContent` says the keydown came from a frame in the content pane. */
+const CLAIMS_ONLY_WHEN: Partial<Record<ShortcutId, (inContent: boolean) => boolean>> = {
+  // Never under a modal: what it shows is not the pane behind it.
+  findInView: (inContent) => topPanelOverlay() === null
+    && (inContent ? findAvailable('content') : focusedFindSurface() !== null),
+};
+
+function claimsChord(id: ShortcutId, inContent: boolean): boolean {
+  return CLAIMS_ONLY_WHEN[id]?.(inContent) ?? true;
+}
+
 /** Who owns a chord: a shortcut id, `'escape'` for the Escape policy, or `null`
  *  (nobody, so the key keeps its default). A registry chord on Escape (⇧Esc)
  *  yields to the policy while it has work, so one press never does two things.
  *  Shared by the host keydown, app-frame forwards and the PDF preview. */
-export function classifyChord(chord: ChordLike): ShortcutId | 'escape' | null {
+export function classifyChord(chord: ChordLike, inContent = false): ShortcutId | 'escape' | null {
   if (chord.key === 'Escape' && escapePolicyHasWork()) return 'escape';
   const id = matchShortcut(chord);
-  if (id) return id;
+  if (id && claimsChord(id, inContent)) return id;
   if (chord.key === 'Escape') return 'escape';
   return null;
 }
@@ -282,7 +302,7 @@ export function classifyChord(chord: ChordLike): ShortcutId | 'escape' | null {
  *  the wrong state: notably `toggleContentPane` (⌘⇧3) would "focus" the
  *  already-focused pane (a no-op) instead of CLOSING it. Exported for testing. */
 export function dispatchForwardedChord(chord: ChordLike): void {
-  const result = classifyChord(chord);
+  const result = classifyChord(chord, true);
   if (result === null) return;
   // The frame's own script can post this message, so a host-only shortcut
   // (Apply, the voice call) never runs from it.
@@ -314,7 +334,7 @@ export function dispatchForwardedChord(chord: ChordLike): void {
  *  so the preview keeps its own behavior. Returns true when it consumed the
  *  event. Exported for testing. */
 export function dispatchPreviewIframeShortcut(e: KeyboardEvent): boolean {
-  const route = classifyChord(e);
+  const route = classifyChord(e, true);
   if (route !== null && route !== 'escape') {
     e.preventDefault();
     focusedPane.value = 'content';

@@ -727,7 +727,7 @@ describe('tool description from event', () => {
     handleEvent(map, 't', 4, {
       type: 'ContextCaptured',
       producer: 'main_llm',
-      model: 'claude-opus-5',
+      model: 'claude-opus-5[1m]',
       context_window: 1_000_000,
       sections: [],
       tools: [],
@@ -756,7 +756,7 @@ describe('tool description from event', () => {
     handleEvent(map, 't', 3, {
       type: 'ContextCaptured',
       producer: 'main_llm',
-      model: 'claude-opus-5',
+      model: 'claude-opus-5[1m]',
       context_window: 1_000_000,
       sections: [],
       tools: [],
@@ -767,7 +767,7 @@ describe('tool description from event', () => {
         type: 'ContextCaptured',
         producer: 'auxiliary',
         purpose,
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.5-flash',
         context_window: 0,
         sections: [],
         tools: [],
@@ -779,7 +779,7 @@ describe('tool description from event', () => {
     const steps = exchangeSteps(exchanges[0]);
     expect(steps).toHaveLength(1);
     expect(steps[0].contextCapture?.estimated_total_tokens).toBe(69_000);
-    expect(steps[0].contextCapture?.model).toBe('claude-opus-5');
+    expect(steps[0].contextCapture?.model).toBe('claude-opus-5[1m]');
   });
 
   it('a capture with no purpose is a turn, so legacy rows still bind', () => {
@@ -792,7 +792,7 @@ describe('tool description from event', () => {
     handleEvent(map, 't', 3, {
       type: 'ContextCaptured',
       producer: 'main_llm',
-      model: 'claude-opus-5',
+      model: 'claude-opus-5[1m]',
       context_window: 1_000_000,
       sections: [],
       tools: [],

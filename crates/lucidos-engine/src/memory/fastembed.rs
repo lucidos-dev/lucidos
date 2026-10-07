@@ -72,10 +72,9 @@ pub fn is_model_fetch_failure(err: &(dyn std::error::Error + Send + Sync)) -> bo
 }
 
 /// Map a configured model id onto the fastembed variant and its vector width.
-/// `pub(crate)` because `model_download` resolves the same id to find the repo
-/// and file set it has to pre-fetch, and the two must never disagree about
-/// which model an id names.
-pub(crate) fn resolve_model(
+/// `model_download` and the eval's seed generator resolve ids here too, so no
+/// two callers can disagree about which model an id names.
+pub fn resolve_model(
     id: &str,
 ) -> Result<(EmbeddingModel, usize), Box<dyn std::error::Error + Send + Sync>> {
     match id {

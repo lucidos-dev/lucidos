@@ -16,7 +16,7 @@ import { THEME_MODE_ATTRIBUTE, THEME_MODE_STORAGE_KEY } from '../appearance';
  *
  * Covers two gaps the flat background does not: the WKWebView white flash on an
  * iOS PWA cold restart, and the iOS standalone bottom safe-area strip that the
- * fixed `inset: 0` `.boot-splash` element leaves bare.
+ * fixed, viewport-sized `.boot-splash` element leaves bare.
  *
  * THE BASE COLOUR IS THE SEAM COLOUR, not the gradient's end colour. iOS fills
  * that bottom strip with the flat base and never with the gradient image, so the

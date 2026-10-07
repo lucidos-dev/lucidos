@@ -46,6 +46,7 @@ fn fixture_row() -> ThreadRow {
         coding_agent_is_external_repo: false,
         last_revived_at: Some(at("2026-01-02T03:04:09Z")),
         is_saved: true,
+        is_home: false,
         has_response: true,
         parent_thread_id: Some("00000000-0000-0000-0000-000000000002".into()),
         parent_thread_title: Some("Parent".into()),
@@ -142,4 +143,21 @@ fn every_status_and_state_value_keeps_its_wire_text() {
         let json = serde_json::to_value(row_to_thread_aggregate(row).unwrap()).unwrap();
         assert_eq!(json["state"], state.as_str());
     }
+}
+
+/// The home thread's summary carries `"home":true` beside `saved`. Every other
+/// summary omits the key, which is what keeps the bytes above unchanged.
+#[test]
+fn only_the_home_threads_summary_carries_the_home_key() {
+    let summary = EventStore::rows_to_thread_summaries(vec![ThreadRow {
+        is_home: true,
+        ..fixture_row()
+    }])
+    .unwrap()
+    .remove(0);
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(
+        json.contains(r#""saved":true,"home":true,"section""#),
+        "{json}"
+    );
 }

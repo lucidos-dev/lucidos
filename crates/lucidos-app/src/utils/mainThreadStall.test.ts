@@ -4,6 +4,8 @@ import {
   installMainThreadStallProbe,
   _resetMainThreadStallForTesting,
   _stallProbeRunningForTesting,
+  STALL_MS,
+  TICK_MS,
 } from './mainThreadStall';
 import {
   flushPerfQueue,
@@ -23,8 +25,8 @@ describe('stallOf: how late the tick ran', () => {
   });
 
   it('reports AT the threshold, so the bar is inclusive', () => {
-    expect(stallOf(1_150, 1_000).stalled).toBe(true);
-    expect(stallOf(1_149, 1_000).stalled).toBe(false);
+    expect(stallOf(1_000 + STALL_MS, 1_000).stalled).toBe(true);
+    expect(stallOf(1_000 + STALL_MS - 1, 1_000).stalled).toBe(false);
   });
 
   it('floors an early tick at zero, since a negative delay is not a reading', () => {
@@ -151,11 +153,11 @@ describe('the probe follows the perf gate', () => {
     installMainThreadStallProbe();
     expect(_stallProbeRunningForTesting()).toBe(true);
 
-    vi.advanceTimersByTime(250);
+    vi.advanceTimersByTime(TICK_MS);
     expect(_stallProbeRunningForTesting()).toBe(true);
 
     stored = null;
-    vi.advanceTimersByTime(250);
+    vi.advanceTimersByTime(TICK_MS);
     expect(_stallProbeRunningForTesting()).toBe(false);
   });
 
@@ -176,9 +178,9 @@ describe('the probe follows the perf gate', () => {
 
     setVisibility('hidden');
     clock += 120_000;
-    vi.advanceTimersByTime(250);
+    vi.advanceTimersByTime(TICK_MS);
     setVisibility('visible');
-    vi.advanceTimersByTime(250);
+    vi.advanceTimersByTime(TICK_MS);
 
     flushPerfQueue();
     expect(fetchMock).not.toHaveBeenCalled();
@@ -194,8 +196,8 @@ describe('the probe follows the perf gate', () => {
     _setPerfEnabledForTesting(true);
 
     vi.setSystemTime(new Date(Date.now() + 3_600_000));
-    clock += 250; // the monotonic clock advanced by exactly one tick
-    vi.advanceTimersByTime(250);
+    clock += TICK_MS; // the monotonic clock advanced by exactly one tick
+    vi.advanceTimersByTime(TICK_MS);
 
     flushPerfQueue();
     expect(fetchMock).not.toHaveBeenCalled();
@@ -211,14 +213,14 @@ describe('the probe follows the perf gate', () => {
     const advance = (ms: number) => { clock += ms; vi.advanceTimersByTime(ms); };
 
     // A tick that arrives on time says nothing.
-    advance(250);
+    advance(TICK_MS);
     flushPerfQueue();
     expect(fetchMock).not.toHaveBeenCalled();
 
     // Now the thread is blocked: the monotonic clock runs 600ms past the next
     // deadline before the timer gets to run at all.
     clock += 600;
-    advance(250);
+    advance(TICK_MS);
     flushPerfQueue();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const body = JSON.parse((fetchMock.mock.calls[0][1] as { body: string }).body);

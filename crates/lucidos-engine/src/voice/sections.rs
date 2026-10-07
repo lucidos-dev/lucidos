@@ -13,12 +13,9 @@ use std::pin::Pin;
 use chrono::Utc;
 
 use super::decision::{open_on, DecisionKind, OpenDecision};
-use super::{
-    choices_for, clip, fenced_card_text, read_pref, PERMISSION_NEEDS_THEIR_WORDS, READ_ALOUD_CHARS,
-};
-use crate::core::store::{
-    build_session_messages, EventStore, StatusFilter, ThreadSummaryFilters, UNTITLED_THREAD,
-};
+use super::{choices_for, clip, fenced_card_text, PERMISSION_NEEDS_THEIR_WORDS, READ_ALOUD_CHARS};
+use crate::core::prefs;
+use crate::core::store::{EventStore, StatusFilter, ThreadSummaryFilters, UNTITLED_THREAD};
 use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::LucidosEngine;
 use crate::scheduler::NotificationStore;
@@ -35,8 +32,6 @@ pub struct ResidentSection {
     pub id: &'static str,
     /// The heading the talker reads it under.
     pub title: &'static str,
-    /// Whether a workspace that never touched the preference gets it.
-    pub on_by_default: bool,
     pub build: for<'a> fn(&'a LucidosEngine, uuid::Uuid) -> SectionFuture<'a>,
 }
 
@@ -142,23 +137,22 @@ running it now. Waiting means it is stopped until they answer, so it is not \
 running. Both lists date from the moment this call opened, and work finishes \
 while you talk, so ask before you say what is still going.\n";
 
+/// Every section, in block order. The settings toggles read the ids and
+/// titles from the generated `engine-constants.ts`.
 pub const SECTIONS: &[ResidentSection] = &[
     ResidentSection {
         id: "who-and-where",
         title: "Who you are talking to, and when",
-        on_by_default: true,
         build: who_and_where,
     },
     ResidentSection {
         id: "this-thread",
         title: "This conversation",
-        on_by_default: true,
         build: this_thread,
     },
     ResidentSection {
         id: "workspace-shape",
         title: "What this workspace has",
-        on_by_default: true,
         build: workspace_shape,
     },
 ];
@@ -173,7 +167,7 @@ pub const SECTIONS: &[ResidentSection] = &[
 fn who_and_where(engine: &LucidosEngine, _thread_id: uuid::Uuid) -> SectionFuture<'_> {
     Box::pin(async move {
         let pool = engine.pool();
-        let timezone = read_pref(pool, "timezone").await;
+        let timezone = prefs::TIMEZONE.read(pool).await;
 
         let mut out = format!("Workspace: {}\n", engine.workspace_name());
         match &timezone {
@@ -215,8 +209,9 @@ fn this_thread(engine: &LucidosEngine, thread_id: uuid::Uuid) -> SectionFuture<'
     Box::pin(async move {
         let store = engine.event_store();
         // Three independent reads, so they go together. A builder is paid for
-        // in the silence before the talker's first word, so a section making
-        // more than one trip makes them all at once.
+        // in the silence before the talker's first word, so independent trips
+        // are made at once. The change statuses read below needs the events,
+        // and runs only when the window holds a child report.
         let (title, events, open) = tokio::join!(
             store.get_thread_title(thread_id),
             store.get_recent_thread_events(thread_id, THREAD_EVENT_WINDOW),
@@ -229,7 +224,7 @@ fn this_thread(engine: &LucidosEngine, thread_id: uuid::Uuid) -> SectionFuture<'
         }
 
         let events = events?;
-        let messages = build_session_messages(&events);
+        let messages = store.build_messages_now(&events).await;
         let turns = recent_turns(&messages);
         let dropped = earlier_turns_were_dropped(events.len(), messages.len(), turns.len());
         out.push_str(&fenced_record(&turns, dropped));
@@ -334,7 +329,7 @@ fn fenced_record(turns: &[String], earlier_dropped: bool) -> String {
 /// allow a permission. The mid-call note in `voice::call` says the same.
 ///
 /// The turn fold above cannot carry this. A card is not a message, so
-/// `build_session_messages` has no arm for one and never will: the agent
+/// `build_session_messages_with` has no arm for one and never will: the agent
 /// already reads its own tool call and result.
 fn open_decision_block(decision: &OpenDecision) -> String {
     // Exhaustive, so a fourth kind has to decide what the caller hears rather
@@ -540,104 +535,6 @@ mod tests {
     use super::*;
     use crate::engine::thread_events::QuestionOption;
     use crate::test_support::{setup_test_db, teardown_test_db};
-
-    /// The frontend's mirror of this registry, read at compile time. Same reach
-    /// `voice::language` makes for the Locale dropdown.
-    const MIRROR: &str = include_str!("../../../lucidos-app/src/store/actions/preferences.ts");
-
-    /// The toggles are drawn from a TS copy of [`SECTIONS`]. A section added
-    /// here and nowhere else can never be turned off. A title changed here
-    /// leaves the settings screen naming the old one.
-    ///
-    /// `/harden` runs this for a `.ts`-only diff because the `include_str!`
-    /// makes `preferences.ts` a compile input, which selects the Rust suite.
-    #[test]
-    fn the_settings_toggles_mirror_this_registry() {
-        let start = MIRROR
-            .find("export const VOICE_RESIDENT_SECTIONS")
-            .expect("the frontend still declares VOICE_RESIDENT_SECTIONS");
-        let list = &MIRROR[start..];
-        let body = &list[..list.find("];").expect("the list is still closed")];
-
-        // One entry per line, so a reformat that joins them fails loudly here
-        // rather than passing by reading half the list. An entry carries all
-        // three keys, which is what tells it from the type annotation above the
-        // array: that spreads its own `id:` and `onByDefault:` over two lines.
-        let entries: Vec<&str> = body
-            .lines()
-            .filter(|l| l.contains("id:") && l.contains("onByDefault:"))
-            .collect();
-        assert_eq!(
-            entries.len(),
-            SECTIONS.len(),
-            "the mirror lists {} sections and the registry has {}",
-            entries.len(),
-            SECTIONS.len()
-        );
-
-        // Quoted, so the match is EXACT: a bare substring would pass on a
-        // mirror whose title merely contains the registry's, which is the
-        // shortening case the guard exists to catch. Either quote style is
-        // accepted, so a title carrying an apostrophe stays spellable.
-        let written = |key: &str, value: &str| {
-            [
-                format!("{}: '{}'", key, value),
-                format!("{}: \"{}\"", key, value),
-            ]
-        };
-        for (entry, section) in entries.iter().zip(SECTIONS) {
-            assert!(
-                written("id", section.id).iter().any(|w| entry.contains(w)),
-                "the mirror's row {:?} is not '{}'",
-                entry,
-                section.id
-            );
-            assert!(
-                written("title", section.title)
-                    .iter()
-                    .any(|w| entry.contains(w)),
-                "'{}' is titled {:?} here, and something else in the mirror",
-                section.id,
-                section.title
-            );
-            assert!(
-                entry.contains(&format!("onByDefault: {}", section.on_by_default)),
-                "'{}' ships {} here, and the other way in the mirror",
-                section.id,
-                section.on_by_default
-            );
-        }
-    }
-
-    /// The three engine defaults the settings screen renders as the resolved
-    /// current value, mirrored into the same TS module with no other guard.
-    ///
-    /// Drift here is silent and user-visible: change a catalog default and
-    /// Settings keeps showing the old one as what a fresh workspace uses,
-    /// while every call opens on the new one.
-    #[test]
-    fn the_settings_defaults_mirror_the_catalog() {
-        use crate::core::preference_catalog;
-
-        for (key, constant) in [
-            ("model_voice_talker", "DEFAULT_VOICE_TALKER_MODEL"),
-            ("model_voice_transcriber", "DEFAULT_VOICE_TRANSCRIBER_MODEL"),
-            ("voice_talker_voice", "DEFAULT_VOICE_TALKER_VOICE"),
-        ] {
-            let default = preference_catalog::lookup(key)
-                .unwrap_or_else(|| panic!("{} is not in the catalog", key))
-                .default;
-            let declared = format!("export const {} = '{}';", constant, default);
-            assert!(
-                MIRROR.contains(&declared),
-                "the catalog default for {} is {:?}, and the mirror does not \
-                 declare `{}`",
-                key,
-                default,
-                declared
-            );
-        }
-    }
 
     #[test]
     fn an_empty_list_says_none_rather_than_saying_nothing() {
@@ -977,7 +874,7 @@ mod tests {
             created_at: Utc::now(),
             channel: None,
             steps: vec![],
-            images: vec![],
+            image_handles: vec![],
             user_image_hashes: vec![],
             image_description: None,
             completed: None,

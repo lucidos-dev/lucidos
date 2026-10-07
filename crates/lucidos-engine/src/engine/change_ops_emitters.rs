@@ -417,6 +417,7 @@ impl LucidosEngine {
         pre_merge_sha: Option<&str>,
         post_merge_sha: Option<&str>,
         actor: Option<MessageOrigin>,
+        writer_thread_id: Option<Uuid>,
     ) {
         let events = compute_entity_events_for_change_apply(
             self.workspace_path(),
@@ -424,6 +425,7 @@ impl LucidosEngine {
             post_merge_sha,
             files,
             actor,
+            writer_thread_id,
         )
         .await;
         for ev in events {
@@ -590,6 +592,7 @@ pub(crate) async fn compute_entity_events_for_change_apply(
     post_merge_sha: Option<&str>,
     files: &[String],
     actor: Option<MessageOrigin>,
+    writer_thread_id: Option<Uuid>,
 ) -> Vec<SystemEvent> {
     let mut app_ids: BTreeSet<String> = BTreeSet::new();
     let mut artifact_paths: BTreeSet<String> = BTreeSet::new();
@@ -652,11 +655,13 @@ pub(crate) async fn compute_entity_events_for_change_apply(
                 artifact_path: path.clone(),
                 commit: commit.clone(),
                 source: Some("change_apply".to_string()),
+                writer_thread_id,
             }),
             (true, true) => Some(SystemEvent::ArtifactUpdated {
                 artifact_path: path.clone(),
                 commit: commit.clone(),
                 source: Some("change_apply".to_string()),
+                writer_thread_id,
             }),
             (false, true) => Some(SystemEvent::ArtifactDeleted {
                 artifact_path: path.clone(),
@@ -1001,6 +1006,7 @@ mod tests {
                 "data/apps/habit-tracker/index.html".to_string(),
             ],
             None,
+            None,
         )
         .await;
 
@@ -1051,6 +1057,7 @@ mod tests {
             Some(&post_sha),
             &["data/apps/habit-tracker/index.html".to_string()],
             None,
+            None,
         )
         .await;
 
@@ -1091,6 +1098,7 @@ mod tests {
                 "data/apps/going-away/index.html".to_string(),
             ],
             None,
+            None,
         )
         .await;
 
@@ -1120,6 +1128,7 @@ mod tests {
             Some(&post_sha),
             &["data/artifacts/notes.md".to_string()],
             None,
+            None,
         )
         .await;
 
@@ -1129,6 +1138,7 @@ mod tests {
                 artifact_path,
                 commit,
                 source,
+                ..
             } => {
                 assert_eq!(artifact_path, "notes.md");
                 assert_eq!(commit, &post_sha);
@@ -1158,6 +1168,7 @@ mod tests {
                 "README.md".to_string(),
                 "data/triggers/some-trigger/run.md".to_string(),
             ],
+            None,
             None,
         )
         .await;

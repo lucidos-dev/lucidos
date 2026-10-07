@@ -225,17 +225,18 @@ export function Dropdown({
 
   // Focus management while open. `openMenuFocusTarget` holds the policy; this
   // effect applies it. The freeText input keeps its one-frame deferral, since
-  // its own `onFocus` is one of the paths that opens the menu.
+  // its own `onFocus` is one of the paths that opens the menu. A close cancels
+  // the frame, or it would pull a Tab's focus back and reopen the menu.
   useEffect(() => {
     if (!open) return;
     const target = openMenuFocusTarget({
       freeText: !!freeText, searching, positioned: pos !== null, touch: isTouchLayout(),
     });
     if (target === 'input') {
-      requestAnimationFrame(() => {
+      const frame = requestAnimationFrame(() => {
         if (inputRef.current && document.activeElement !== inputRef.current) inputRef.current.focus();
       });
-      return;
+      return () => cancelAnimationFrame(frame);
     }
     const el = target === 'filter' ? filterRef.current : target === 'trigger' ? buttonRef.current : null;
     // preventScroll: the trigger was just activated, so it is already in view,

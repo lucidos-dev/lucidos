@@ -1,6 +1,9 @@
 # 0208: A call is named by its exchange, at the first answered utterance
 
-- **Status**: Accepted
+- **Status**: Superseded by [0362](0362-tree-memory-module-and-the-home-thread.md).
+  Calls run only on the home thread, which never takes an automatic title, so
+  call naming could never name anything. It was removed from the engine. The
+  plan is `docs/plans/2026-10-05-retire-call-naming.md`.
 - **Date**: 2026-09-17
 
 ## Context

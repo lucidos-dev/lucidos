@@ -1,13 +1,15 @@
 import { marked } from 'marked';
 import type { Tokens } from 'marked';
 import DOMPurify from 'dompurify';
-import { lucidos } from '@lucidos/sdk';
 import { BARE_EMAIL_ATTR, CODE_COPY_ATTR, COPY_ICON, COPY_ID_NONCE, escapeHtmlAttr } from './markedConfig';
 import { makeInertBody } from './escapeHtml';
 import { addMarkdownParseMs } from './renderPhaseTimers';
 import { WORKSPACE_ID } from './basePath';
-import { DATA_PATH_PREFIXES } from './dataPathPrefixes';
 import { slugifyWorkspaceName } from './slug';
+import { createHeadingSlugger, HEADING_ID_PREFIX } from './headingSlug';
+import { markImageUnavailable } from './markdownImageFallback';
+import { markdownImageSource, type MarkdownDocumentLocation } from './markdownImageSource';
+import { markdownLinkTooltip } from './markdownLinkTooltip';
 
 /** Real destination for a thread link, so hovering shows where it goes instead
  *  of the `#`-resolves-to-the-current-page URL. Behind the gateway every
@@ -218,14 +220,14 @@ function installUrlSchemeHook(): void {
   urlSchemeHookInstalled = true;
 }
 
-/** DOMPurify's default scheme list plus the five Lucidos schemes.
+/** DOMPurify's default scheme list plus the six Lucidos schemes.
  *
- *  Each of the five is claimed by an extractor that runs AFTER sanitization:
- *  `thread:` below in this file, and `app:`, `trigger:`, `repo:` and `file:` in
- *  `linkifyPaths`. Stripping one here would break every such link, because the
- *  extractor would find no href left to read. */
+ *  Each of the six is claimed by an extractor that runs AFTER sanitization:
+ *  `thread:` below in this file, and `app:`, `trigger:`, `repo:`, `file:` and
+ *  `settings:` in `linkifyPaths`. Stripping one here would break every such
+ *  link, because the extractor would find no href left to read. */
 const ALLOWED_URI_REGEXP =
-  /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|thread|app|trigger|repo|file):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i;
+  /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|thread|app|trigger|repo|file|settings):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i;
 
 const PURIFY_CONFIG = {
   // A raw `<a target="_blank">` in content keeps its new-tab target, which
@@ -395,84 +397,75 @@ function transformTables(html: string): string {
   });
 }
 
-/** The workspace's top-level directories, the only relative image sources that
- *  get rewritten. An allowlist rather than "every relative path": a relative
- *  src that means something else in its own context (an app's own asset) must
- *  not be silently redirected at the workspace.
- *
- *  Derived from `DATA_PATH_PREFIXES`, the single source of truth for the same
- *  list. A hand-kept copy gave a new sub-tree its links but not its images,
- *  and that miss shows up as an `<img>` served the SPA fallback. */
-const WORKSPACE_DATA_DIRS = new Set(DATA_PATH_PREFIXES.map((p) => p.slice(0, -1)));
-
-/** The served `src` for a workspace-relative image source, or `null` when the
- *  source is not ours to resolve.
- *
- *  Workspace files are served under the `/data` mount, so a bare
- *  `artifacts/x.png` resolves against the SPA base instead, which no route
- *  owns: the fallback answers with `index.html` and the `<img>` breaks.
- *  Building the URL through `lucidos.data.url` rather than pasting a prefix
- *  keeps that correct in every topology at once. It resolves the gateway's
- *  `/<slug>` prefix and its absence on a bare engine port, and routes
- *  `system-knowhow/` to the API endpoint serving the engine repo. */
-function workspaceDataImageSrc(src: string): string | null {
-  // A scheme (`https:`, `data:`, `blob:`), a protocol-relative `//host/…`, or an
-  // already-absolute `/path` all address something the browser resolves without
-  // help. Only a bare relative path can be a workspace file.
-  if (/^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith('/')) return null;
-  // A query or fragment is not part of the file name. Splitting it off and
-  // re-attaching it afterwards keeps `?v=2` a query instead of letting the path
-  // encoder fold it into the name and ask for a file called `x.png%3Fv%3D2`.
-  const cut = src.search(/[?#]/);
-  const rawPath = cut === -1 ? src : src.slice(0, cut);
-  const suffix = cut === -1 ? '' : src.slice(cut);
-  // Decode before inspecting, for two reasons. marked percent-encodes the src
-  // and `data.url` encodes each segment again, so a space round-trips to
-  // `%2520` and misses the file. Decoding also turns an obfuscated `%2e%2e`
-  // into the `..` the traversal check below can see.
-  let path: string;
-  try {
-    path = rawPath.split('/').map(decodeURIComponent).join('/');
-  } catch {
-    return null; // Malformed escape: leave the source exactly as authored.
-  }
-  // Re-split AFTER joining, because that is the boundary `data.url`'s encoder
-  // applies. A decoded segment can itself contain a separator. Check the
-  // pre-join segments and `%2e%2e%2f%2e%2e` passes as one innocent-looking
-  // segment. The encoder then splits it back into two real ones, which the
-  // browser normalizes straight out of the mount.
-  const segments = path.split('/');
-  if (!WORKSPACE_DATA_DIRS.has(segments[0])) return null;
-  if (segments.includes('..')) return null;
-  // Plain text, not attribute-ready: `setAttribute` is what writes it, and the
-  // serializer escapes on the way out. Escaping here too would double it.
-  return `${lucidos.data.url(path)}${suffix}`;
-}
-
-/** Point every workspace-relative image at the mount that actually serves it.
+/** Point every image at the URL that actually serves it (`markdownImageSource`),
+ *  or mark it unavailable when its source may not be fetched.
  *
  *  Runs AFTER `sanitizeHtmlFragments`, deliberately: the sanitizer decides
  *  which `src` attributes exist at all, deleting `javascript:` and `data:`
  *  ones outright. So only an attribute that already passed that gate is ever
- *  rewritten, and the sanitizer is never handed a value to re-judge. */
-function rewriteImageSourcesIn(body: HTMLElement): void {
+ *  rewritten, and the sanitizer is never handed a value to re-judge.
+ *
+ *  Runs after `wrapImagesIn`, so a refused image's notice lands in its wrapper. */
+function resolveImageSourcesIn(body: HTMLElement, doc: MarkdownDocumentLocation | undefined): void {
   for (const img of Array.from(body.querySelectorAll('img'))) {
     const src = img.getAttribute('src');
     if (src === null) continue;
-    const rewritten = workspaceDataImageSrc(src);
-    if (rewritten !== null) img.setAttribute('src', rewritten);
+    const verdict = markdownImageSource(src, doc);
+    if (verdict.kind === 'serve') img.setAttribute('src', verdict.src);
+    else if (verdict.kind === 'refuse') markImageUnavailable(img);
   }
 }
 
 /** Point every image at its real source AND wrap it, in one parse. */
-function prepareImages(html: string): string {
-  return inDom(html, ['<img'], prepareImagesIn);
+function prepareImages(html: string, doc: MarkdownDocumentLocation | undefined): string {
+  return inDom(html, ['<img'], (body) => prepareImagesIn(body, doc));
 }
 
-function prepareImagesIn(body: HTMLElement): void {
+function prepareImagesIn(body: HTMLElement, doc?: MarkdownDocumentLocation): void {
   applySizeHintsIn(body);
-  rewriteImageSourcesIn(body);
   wrapImagesIn(body);
+  resolveImageSourcesIn(body, doc);
+}
+
+/** Give every heading GitHub's anchor id, so a `#section` link in the document
+ *  has somewhere to land. A heading whose raw HTML already carries an id keeps
+ *  it. A heading with no slug text (only an emoji) gets none. */
+function stampHeadingIds(html: string): string {
+  return inDom(html, ['<h'], (body) => {
+    const slug = createHeadingSlugger();
+    for (const heading of Array.from(body.querySelectorAll('h1, h2, h3, h4, h5, h6'))) {
+      if (heading.hasAttribute('id')) continue;
+      const text = slug(heading.textContent ?? '');
+      if (text) heading.id = `${HEADING_ID_PREFIX}${text}`;
+    }
+  });
+}
+
+/** Give every link in a rendered DOCUMENT a hover tooltip naming where it
+ *  goes, using the host's own `data-tooltip` layer. That layer reaches it
+ *  because the document renders into the host DOM, never an iframe. Must run
+ *  after `stampHeadingIds`: an in-page anchor's tooltip reads a heading's
+ *  text off the id this just stamped. An author's own markdown `title` moves
+ *  to `data-tooltip-title`, so it keeps showing above the resolved target
+ *  rather than being lost. */
+function stampLinkTooltips(html: string, doc: MarkdownDocumentLocation): string {
+  return inDom(html, ['<a '], (body) => {
+    // Collected once per document, not once per link: an in-page anchor's
+    // lookup only ever reads this list, never the live DOM.
+    const fragmentCandidates = Array.from(body.querySelectorAll('[id], [name]'));
+    for (const anchor of Array.from(body.querySelectorAll('a[href]'))) {
+      const href = anchor.getAttribute('href') ?? '';
+      const title = anchor.getAttribute('title') ?? '';
+      const tooltip = markdownLinkTooltip(href, title, doc, fragmentCandidates);
+      if (!tooltip) continue;
+      anchor.removeAttribute('title');
+      anchor.setAttribute('data-tooltip', tooltip.text);
+      if (tooltip.title) anchor.setAttribute('data-tooltip-title', tooltip.title);
+      // A long press reveals the tooltip on touch; a plain tap still
+      // navigates (packages/lucidos-sdk/src/tooltip.ts).
+      anchor.setAttribute('data-tooltip-longpress', '');
+    }
+  });
 }
 
 /** An *image size hint*: a trailing `#<width>x<height>` on an image source,
@@ -605,14 +598,21 @@ export function unwrapPathEmailAutolinks(html: string): string {
 const MARKDOWN_CACHE_MAX = 400;
 const markdownCache = new Map<string, string>();
 
-export function renderMarkdown(md: string, opts?: { cache?: boolean }): string {
+/** `document` marks the markdown as a file previewed as a document rather than
+ *  a chat message. Its headings get anchor ids, and a relative image resolves
+ *  against its folder (`markdownImageSource`). Chat passes none: a timeline of
+ *  many messages would repeat every id. */
+export function renderMarkdown(md: string, opts?: { cache?: boolean; document?: MarkdownDocumentLocation }): string {
   const useCache = opts?.cache !== false;
+  const doc = opts?.document;
+  // The same text at two locations resolves its images differently.
+  const cacheKey = doc ? `${JSON.stringify(doc)}\u0000${md}` : md;
   if (useCache) {
-    const hit = markdownCache.get(md);
+    const hit = markdownCache.get(cacheKey);
     if (hit !== undefined) {
       // LRU touch: move to most-recently-used.
-      markdownCache.delete(md);
-      markdownCache.set(md, hit);
+      markdownCache.delete(cacheKey);
+      markdownCache.set(cacheKey, hit);
       return hit;
     }
   }
@@ -630,7 +630,8 @@ export function renderMarkdown(md: string, opts?: { cache?: boolean }): string {
     html = postprocessCopyBlocks(html);
     html = sanitizeHtmlFragments(html);
     html = resolveCopyTargets(html, copyTexts);
-    html = prepareImages(html);
+    html = prepareImages(html, doc);
+    if (doc) html = stampHeadingIds(html);
     html = transformTables(html);
     html = spaceUnspacedEmDashes(html);
     // The workspace-qualified form is what the copy-ref button emits.
@@ -642,8 +643,9 @@ export function renderMarkdown(md: string, opts?: { cache?: boolean }): string {
         return `href="${href}" data-thread-id="${threadId}"${wsAttr} class="thread-link"`;
       }
     );
+    if (doc) html = stampLinkTooltips(html, doc);
     if (useCache) {
-      markdownCache.set(md, html);
+      markdownCache.set(cacheKey, html);
       if (markdownCache.size > MARKDOWN_CACHE_MAX) {
         // Evict the least-recently-used (first key in insertion order).
         const oldest = markdownCache.keys().next().value;

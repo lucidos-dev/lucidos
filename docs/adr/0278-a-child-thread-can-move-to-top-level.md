@@ -57,6 +57,11 @@ still delivered.
 plus its `ChildThreadDetached` events. Otherwise a move is a repeatable way
 round the cap of ten.
 
+*Amended 2026-10-06 by [ADR 0380](0380-the-child-cap-counts-live-children.md):*
+the cap now counts live children only. A moved child still counts while it is
+live, joined to its row through the `ChildThreadDetached` event. Once it
+finishes it frees its slot, like any other child.
+
 **A moved coding-agent child asks a human.** `resolve_attend_mode` walks the
 spawn event's `parent_thread_id`, which events never rewrite. The walk now
 stops at a moved thread and answers `Interactive`, so a thread the user cut

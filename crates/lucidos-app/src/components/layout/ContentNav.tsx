@@ -19,6 +19,7 @@ import { MenuIcon, CloseIcon } from '../shared/icons';
 import { CategoryIcon } from '../shared/CategoryIcon';
 import { NavChevron, type NavHistoryItem } from '../shared/NavChevron';
 import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
+import { GlyphBadge } from '../shared/GlyphBadge';
 import { systemAttentionBadge } from '../../store/systemAttentionBadge';
 
 function menuDrawerShown(): boolean {
@@ -57,7 +58,7 @@ export function HamburgerButton() {
     >
       {isOpen ? <CloseIcon /> : <MenuIcon />}
       {changeCount > 0 && (
-        <span class="badge" aria-hidden="true">{changeCount > 99 ? '99+' : changeCount}</span>
+        <GlyphBadge class="badge" aria-hidden="true">{changeCount > 99 ? '99+' : changeCount}</GlyphBadge>
       )}
       <SystemAttentionBadge placement="corner" label={changeCount > 0 ? null : news} />
     </button>

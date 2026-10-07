@@ -37,6 +37,9 @@ source "$WORKSPACE_LIB_DIR/ports.sh"
 # environment with. Pure parsing, no host call, so sourcing it costs nothing.
 # shellcheck source=scripts/lib/proc_env.sh
 source "$WORKSPACE_LIB_DIR/proc_env.sh"
+# The ports, names and paths this file shares with the Rust crates.
+# shellcheck source=scripts/lib/workspace_constants.sh
+source "$WORKSPACE_LIB_DIR/workspace_constants.sh"
 
 # ── path_is_in_cc_worktree ──────────────────────────────────────────────
 # True (exit 0) when $1 lies inside a coding-agent worktree — one of the
@@ -49,7 +52,7 @@ source "$WORKSPACE_LIB_DIR/proc_env.sh"
 # would make the guard fail open exactly when it matters most.
 path_is_in_cc_worktree() {
     case "$1" in
-        */.lucidos/worktrees/*|*/.lucidos/worktrees) return 0 ;;
+        */"$WORKTREES_SUBPATH"/*|*/"$WORKTREES_SUBPATH") return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -345,7 +348,9 @@ resolve_workspace() {
 # Check for TLS certs. Checks .certs/ dir first, then falls back to
 # LUCIDOS_TLS_CERT/KEY env vars (needed in worktrees where .certs/ is gitignored).
 # Sets PROTO, exports LUCIDOS_TLS_CERT/KEY. Persists PROTO= to the ports
-# file so the CLI and cross-workspace callers know the protocol.
+# file so the CLI and cross-workspace callers know the protocol. That is only
+# a first guess: once an engine answers, adopt_engine_scheme or
+# record_engine_scheme replace it with the scheme the engine serves.
 detect_tls() {
     local cert_dir="$PROJECT_DIR/.certs"
     if [ -f "$cert_dir/cert.pem" ] && [ -f "$cert_dir/key.pem" ]; then
@@ -370,8 +375,25 @@ detect_tls() {
 # workspace's database exists. Legacy per-workspace containers/volumes are kept
 # intact; if present and this shared database has not been verified, they are
 # dumped/restored into the shared cluster first.
-shared_pg_container() { echo "${LUCIDOS_SHARED_PG_CONTAINER:-lucidos-pg-shared}"; }
-shared_pg_volume()    { echo "${LUCIDOS_SHARED_PG_VOLUME:-lucidos-pg-data-shared}"; }
+shared_pg_container() { echo "${LUCIDOS_SHARED_PG_CONTAINER:-$SHARED_DOCKER_CONTAINER}"; }
+shared_pg_volume()    { echo "${LUCIDOS_SHARED_PG_VOLUME:-$SHARED_DOCKER_VOLUME}"; }
+
+# A native Postgres already listening on this loopback port replaces the Docker
+# cluster. E2E GitHub mode sets it on macOS runners, which have no Docker.
+external_pg_port() { echo "${LUCIDOS_EXTERNAL_PG_PORT:-}"; }
+
+# shared_pg_psql <db> <psql args...>: psql against the shared cluster, wherever
+# it runs. The one way the e2e path reaches Postgres.
+shared_pg_psql() {
+    local db="$1"; shift
+    local port
+    port="$(external_pg_port)"
+    if [ -n "$port" ]; then
+        PGPASSWORD="$PG_PASSWORD" psql -h 127.0.0.1 -p "$port" -U "$PG_USER" -d "$db" "$@"
+    else
+        docker exec "$(shared_pg_container)" psql -U "$PG_USER" -d "$db" "$@"
+    fi
+}
 
 workspace_database_name() {
     local id
@@ -380,7 +402,7 @@ workspace_database_name() {
 }
 
 workspace_database_url() {
-    echo "postgres://lucidos:lucidos@localhost:$PG_PORT/$(workspace_database_name)"
+    echo "postgres://$PG_USER:$PG_PASSWORD@localhost:$PG_PORT/$(workspace_database_name)"
 }
 
 _shared_pg_ident() {
@@ -400,6 +422,14 @@ _shared_pg_literal() {
 
 setup_postgres() {
     export LUCIDOS_WORKSPACE="$WORKSPACE"
+
+    if [ -n "$(external_pg_port)" ]; then
+        PG_PORT="$(external_pg_port)"
+        export PG_PORT LUCIDOS_PG_PORT="$PG_PORT"
+        _wait_for_external_postgres || return 1
+        _ensure_shared_workspace_database "$(workspace_database_name)" || return 1
+        return 0
+    fi
     export LUCIDOS_PG_PORT="$PG_PORT"
 
     # Re-probe rather than trust the launch preflight. Minutes of building can
@@ -475,32 +505,22 @@ _ensure_shared_postgres_container() {
 
         echo "Starting shared PostgreSQL (port $PG_PORT, container $container)"
         docker volume create "$volume" >/dev/null || return 1
-        # --shm-size=1g: Postgres builds the pgvector HNSW index with parallel
-        # maintenance workers that use POSIX shared memory under /dev/shm. Docker's
-        # 64m default overflows ("could not resize shared memory segment ... No
-        # space left on device") when restoring/migrating a workspace with a
-        # sizeable memory_entries table, aborting the migration and leaving the
-        # workspace stuck on the gateway's "Workspace starting…" page. 1g is a
-        # generous, safe ceiling for a personal machine.
-        #
-        # max_connections=500: this is ONE shared cluster for every workspace on
-        # the machine (ADR 0014 §6/§7), and each engine opens a pool of up to 50
-        # connections (construction.rs). Postgres' default 100 is exhausted by
-        # just two busy workspaces, so a third fails to start with "sorry, too
-        # many clients already". 500 fits ~10 concurrent engines. Keep this in
-        # lockstep with crates/lucidos-gateway/src/postgres.rs.
+        # The gateway starts this same cluster when no script got there first, so
+        # image, credentials and sizing come from workspace_constants.sh. The
+        # gateway's postgres.rs says why the shared memory and connection limits
+        # are raised.
         if ! docker run -d \
             --name "$container" \
             --restart unless-stopped \
-            --shm-size=1g \
+            --shm-size="$PG_SHM_SIZE" \
             -p "127.0.0.1:$PG_PORT:5432" \
-            -e POSTGRES_USER=lucidos \
-            -e POSTGRES_PASSWORD=lucidos \
+            -e POSTGRES_USER="$PG_USER" \
+            -e POSTGRES_PASSWORD="$PG_PASSWORD" \
             -e POSTGRES_DB=postgres \
             -v "$volume:/var/lib/postgresql" \
             --label "lucidos.shared-postgres=true" \
-            pgvector/pgvector:pg18 \
-            postgres -c max_connections=500 >/dev/null; then
+            "$PG_IMAGE" \
+            postgres -c max_connections="$PG_MAX_CONNECTIONS" >/dev/null; then
             # A daemon that died between the probe above and this call is BY FAR
             # the most common reason this fails, and `docker run`'s own message
             # for it names a socket path rather than the condition. Name the
@@ -553,16 +573,15 @@ _ensure_shared_postgres_container() {
 }
 
 _shared_database_exists() {
-    local db="$1" container
-    container="$(shared_pg_container)"
-    docker exec "$container" psql -U lucidos -d postgres -tAc \
+    local db="$1"
+    shared_pg_psql postgres -tAc \
         "SELECT 1 FROM pg_database WHERE datname=$(_shared_pg_literal "$db")" 2>/dev/null | grep -qx 1
 }
 
 _create_shared_database() {
     local db="$1" ident
     ident="$(_shared_pg_ident "$db")" || return 1
-    docker exec "$(shared_pg_container)" psql -U lucidos -d postgres -v ON_ERROR_STOP=1 -c \
+    shared_pg_psql postgres -v ON_ERROR_STOP=1 -c \
         "CREATE DATABASE $ident OWNER lucidos" >/dev/null
 }
 
@@ -570,22 +589,38 @@ _drop_shared_database() {
     local db="$1" ident lit
     ident="$(_shared_pg_ident "$db")" || return 1
     lit="$(_shared_pg_literal "$db")"
-    docker exec "$(shared_pg_container)" psql -U lucidos -d postgres -c \
+    shared_pg_psql postgres -c \
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$lit AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
-    docker exec "$(shared_pg_container)" psql -U lucidos -d postgres -c \
+    shared_pg_psql postgres -c \
         "DROP DATABASE IF EXISTS $ident" >/dev/null
 }
 
 _verify_shared_pg_database() {
     local db="$1"
-    docker exec "$(shared_pg_container)" psql -U lucidos -d "$db" -tAc "SELECT 1" 2>/dev/null | grep -qx 1
+    shared_pg_psql "$db" -tAc "SELECT 1" 2>/dev/null | grep -qx 1
+}
+
+# The caller started the external server, so a short wait covers its startup.
+_wait_for_external_postgres() {
+    echo -n "Waiting for external PostgreSQL on port $(external_pg_port)"
+    for _ in {1..30}; do
+        if shared_pg_psql postgres -tAc "SELECT 1" >/dev/null 2>&1; then
+            echo " ready!"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo ""
+    echo "ERROR: no PostgreSQL answered on LUCIDOS_EXTERNAL_PG_PORT=$(external_pg_port)" >&2
+    return 1
 }
 
 _ensure_shared_workspace_database() {
     local db="$1"
     if _shared_database_exists "$db"; then
         _verify_shared_pg_database "$db" || return 1
-        echo "PostgreSQL shared database ready: $db (container $(shared_pg_container), port $PG_PORT)"
+        echo "PostgreSQL shared database ready: $db (port $PG_PORT)"
         return 0
     fi
     echo "Creating shared PostgreSQL database: $db"
@@ -1909,7 +1944,9 @@ build_or_find_engine() {
     # (ADR 0294).
     echo ""
     echo "Building engine..."
-    run_engine_cargo_build
+    # A caller in an `||` or `if` runs with errexit off, so a failed compile
+    # must fail here, or the uplift fallback below serves a stale binary.
+    run_engine_cargo_build || return 1
     publish_launch_binaries "$uplift_dir" "$launch_dir" || true
 
     # Did this build actually produce a binary for the source on disk now? If
@@ -1924,7 +1961,7 @@ build_or_find_engine() {
     if [ "$state" = "stale" ]; then
         echo "Built engine is not the source now on disk (HEAD moved during the build,"
         echo "or another build clobbered the shared uplift path) — rebuilding once..."
-        run_engine_cargo_build
+        run_engine_cargo_build || return 1
         publish_launch_binaries "$uplift_dir" "$launch_dir" || true
         state="$(published_build_state "$launch_dir/lucidos-engine")"
     fi
@@ -1965,10 +2002,9 @@ build_or_find_engine() {
 #     the gateway is the only network door (ADR 0094). Legacy direct-engine mode
 #     binds it network-wide, because there the engine IS the front. This stays
 #     PER-WORKSPACE so multiple engines coexist.
-#   • GATEWAY_PORT = a FIXED machine-global port (default 5251 in dev, the
-#     gateway's own DEFAULT_GATEWAY_PORT; override with LUCIDOS_DEV_GATEWAY_PORT;
-#     the packaged desktop app keeps the historical 5252, so dev + packaged
-#     coexist out of the box) — NOT the
+#   • GATEWAY_PORT = a FIXED machine-global port (DEFAULT_DEV_GATEWAY_PORT;
+#     override with LUCIDOS_DEV_GATEWAY_PORT). The packaged desktop app keeps
+#     its own port, so dev + packaged coexist out of the box. NOT the
 #     per-workspace API_PORT. There is ONE shared gateway per machine; it binds
 #     this fixed port and serves `/<slug>/` (proxying to each engine) + the
 #     picker at `/~/`. A fixed port is required because every workspace launch
@@ -1978,7 +2014,7 @@ build_or_find_engine() {
 # (the engine's direct port, so the CLI reaches the engine). Exports env vars.
 swap_ports() {
     ENGINE_PORT="$VITE_PORT"
-    GATEWAY_PORT="${LUCIDOS_DEV_GATEWAY_PORT:-5251}"
+    GATEWAY_PORT="${LUCIDOS_DEV_GATEWAY_PORT:-$DEFAULT_DEV_GATEWAY_PORT}"
 
     # The ports file records the engine's direct port — the CLI / cross-workspace
     # callers talk to the engine, not the gateway.
@@ -2035,16 +2071,6 @@ enable_clamshell_prevention() {
     fi
     echo "WARNING: Could not disable clamshell sleep. Lid close will sleep the Mac."
     echo "  Fix: start any workspace from a terminal once to set up passwordless pmset."
-}
-
-# ── start_caffeinate ────────────────────────────────────────────────────
-# Prevent idle/disk sleep while this script runs (-w $$).
-# Clamshell sleep is handled separately by pmset above.
-start_caffeinate() {
-    [ "$(uname)" = "Darwin" ] || return 0   # macOS-only (caffeinate); no-op on Linux/CI
-    # `-w $$` ties it to this shell's lifetime, so there is no pid to track.
-    caffeinate -im -w $$ &
-    enable_clamshell_prevention
 }
 
 # ── Network bind (dev) ───────────────────────────────────────────────────
@@ -2106,11 +2132,14 @@ apply_dev_gateway_bind() {
 # substitution would take the whole launch down. An `if` with no `else` already
 # yields 0; the trailing `return 0` states the contract so a later restructure
 # into an `&&` chain cannot quietly drop it.
+#
+# Both probes take probe_engine_on_port's time budget, because every gateway
+# launch runs this one too.
 engine_health_scheme() { # <port>
-    local port="$1"
-    if curl -sk "https://localhost:$port/api/v1/health" >/dev/null 2>&1; then
+    local port="$1" budget="${LUCIDOS_HEALTH_PROBE_TIMEOUT_S:-2}"
+    if curl -sk --max-time "$budget" "https://localhost:$port/api/v1/health" >/dev/null 2>&1; then
         printf 'https'
-    elif curl -s "http://localhost:$port/api/v1/health" >/dev/null 2>&1; then
+    elif curl -s --max-time "$budget" "http://localhost:$port/api/v1/health" >/dev/null 2>&1; then
         printf 'http'
     fi
     return 0
@@ -2129,12 +2158,32 @@ adopt_engine_scheme() { # <scheme>
     ports_file_set "$WORKSPACE/.lucidos/ports" "PROTO=$PROTO"
 }
 
+# The gateway-mode twin of adopt_engine_scheme. The ports file's PROTO names the
+# engine on API_PORT, which every CLI caller dials. Here $PROTO names the
+# gateway instead: the banner, the window and gateway_curl build on it. The
+# gateway keeps its TLS and strips it from the engines it spawns (ADR 0096).
+#
+# So only the file follows the engine. A reused gateway and engine run neither
+# adopt_engine_scheme nor the gateway's own ports publish, so nothing else
+# corrects the scheme detect_tls derived from .certs/. No answer is no evidence,
+# and then the file keeps what it has.
+record_engine_scheme() {
+    local live_scheme
+    live_scheme="$(engine_health_scheme "$ENGINE_PORT")"
+    if [ -z "$live_scheme" ] || [ "$live_scheme" = "$PROTO" ]; then
+        return 0
+    fi
+    echo "Engine on port $ENGINE_PORT serves $live_scheme. Recording it in the ports file."
+    ports_file_set "$WORKSPACE/.lucidos/ports" "PROTO=$live_scheme"
+}
+
 # How long start_engine lets a dying engine release the port before it calls the
 # port lost. The engine's own graceful-shutdown budget (main.rs).
 ENGINE_DRAIN_WAIT_S=10
 
 # ── start_engine ────────────────────────────────────────────────────────
-# Run engine in background with caffeinate, write PID, wait for health (30s).
+# Run engine in background, write PID, wait for health (30s). The engine holds
+# the Mac awake itself while work runs (ADR 0366), so no caffeinate here.
 # Reuses an existing healthy engine if one is already running for this workspace.
 # Sets ENGINE_PID.
 start_engine() {
@@ -2156,7 +2205,7 @@ start_engine() {
             echo ""
             echo "Reusing existing engine (PID $existing_pid) on port $ENGINE_PORT"
             ENGINE_PID="$existing_pid"
-            start_caffeinate
+            enable_clamshell_prevention
             return
         fi
     fi
@@ -2211,7 +2260,7 @@ start_engine() {
     # Raise FD limit — macOS defaults to 256 which is too low for the engine
     ulimit -n 8192 2>/dev/null
 
-    start_caffeinate
+    enable_clamshell_prevention
 
     # Spawn the supervisor (engine_supervisor.sh:run_supervised) as a
     # backgrounded subshell. It loops the engine binary so an unexpected
@@ -2280,7 +2329,7 @@ start_engine() {
 
 # ── Workspace gateway (ADR 0014) ──────────────────────────────────────────
 # Dev runs ONE machine-global `lucidos-gateway` binary as the user-facing front
-# (on the fixed gateway port, default 5251 in dev — the packaged app keeps 5252).
+# (on DEFAULT_DEV_GATEWAY_PORT; the packaged app keeps its own port).
 # It reverse-proxies /<slug>/ to each
 # workspace's engine (which it spawns + supervises) and serves the workspace
 # picker behind the sigil namespace /~/. The registry, pidfile, and log live
@@ -2320,8 +2369,8 @@ gateway_curl() {
 }
 
 # ── which gateway owns a workspace ──────────────────────────────────────
-# More than one gateway runs on this machine: the dev one on 5251, serving
-# source-checkout workspaces, and the packaged Lucidos.app one on 5252. Each has
+# More than one gateway runs on this machine: the dev one, serving
+# source-checkout workspaces, and the packaged Lucidos.app one. Each has
 # its own registry, and a stop posted to the wrong one reaches a process that
 # has never heard of the workspace. So the port cannot be a constant.
 #
@@ -2520,6 +2569,10 @@ gateway_lists_workspace() {
 # route yet, and `adopt_running_engines` installs one on the next supervise tick.
 # The wait cannot hurry that along: the gateway lazy-starts on a document
 # navigation only, never on the API call this makes.
+#
+# Both branches end on record_engine_scheme. Adopting skips the gateway's spawn,
+# and with it the gateway's ports publish. The restart POST is fire-and-forget,
+# so its branch cannot count on that publish either.
 ensure_workspace_engine_running() {
     local live=""
     if engine_on_port_serves_workspace "$ENGINE_PORT" "$WORKSPACE" \
@@ -2532,6 +2585,7 @@ ensure_workspace_engine_running() {
         echo "Reusing the running engine for '$GATEWAY_WS_ID' on port $ENGINE_PORT"
     fi
     wait_for_workspace_health
+    record_engine_scheme
 }
 
 # Start (or reuse) the ONE shared workspace gateway on the fixed GATEWAY_PORT. It
@@ -2545,7 +2599,7 @@ ensure_workspace_engine_running() {
 # must never `wait` on — its non-tty wait falls back to the pidfile poll).
 start_gateway() {
     GATEWAY_MODE=1
-    # GATEWAY_PORT (fixed, default 5251 in dev) and ENGINE_PORT (=VITE_PORT) are set by
+    # GATEWAY_PORT (fixed, see swap_ports) and ENGINE_PORT (=VITE_PORT) are set by
     # swap_ports. The gateway's data dir / pidfile / log are machine-global.
     local gw_pidfile gw_log
     mkdir -p "$(gateway_data_dir)"
@@ -2599,7 +2653,7 @@ start_gateway() {
            && curl -sk "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/health" >/dev/null 2>&1; then
             echo "Reusing existing gateway (PID $existing) on port $GATEWAY_PORT"
             GATEWAY_PID="$existing"; ENGINE_SUPERVISOR_PID=""
-            start_caffeinate
+            enable_clamshell_prevention
             ensure_workspace_engine_running
             return
         fi
@@ -2614,7 +2668,7 @@ start_gateway() {
         fi
     fi
     ulimit -n 8192 2>/dev/null
-    start_caffeinate
+    enable_clamshell_prevention
 
     # Safety net: ensure GATEWAY_PORT is free before binding. kill_stale_processes
     # already SIGUSR1'd + reaped a prior gateway on a `-b`; this clears a wedged or
@@ -2941,8 +2995,7 @@ _resolve_npm_install_root() {
 
 # ── _deps_fingerprint ──────────────────────────────────────────────────
 # Content fingerprint of the inputs that decide an npm install at this root:
-# every package.json in the tree (heavy/irrelevant dirs pruned) plus the
-# root lockfile. Content-only by design — unlike an mtime comparison, a
+# every package.json `_deps_manifest_files` lists, plus the root lockfile. Content-only by design — unlike an mtime comparison, a
 # no-op rewrite (a git checkout, `git worktree add`, or a CC change apply
 # rewrites package.json and bumps its mtime without changing a byte) yields
 # an identical fingerprint, so it can't trigger a spurious reinstall that
@@ -2951,18 +3004,31 @@ _resolve_npm_install_root() {
 _deps_fingerprint() {
     local root="$1"
     {
-        find "$root" \
-            \( -name node_modules -o -name .git -o -name target \
-               -o -name .lucidos -o -name dist \) -prune \
-            -o -name package.json -print 2>/dev/null \
-            | LC_ALL=C sort | while IFS= read -r f; do cat "$f"; done
+        _deps_manifest_files "$root" \
+            | LC_ALL=C sort | while IFS= read -r f; do cat "$root/$f" 2>/dev/null; done
         [ -f "$root/package-lock.json" ] && cat "$root/package-lock.json"
     } | cksum
 }
 
+# _deps_manifest_files ROOT: every package.json the install reads, relative to
+# ROOT. In a git checkout, ask git: a nested checkout under ROOT (a coding
+# agent's `.claude/worktrees/<name>`) holds another tree's manifests, never this
+# install's. Engine worktrees share main's stamp, so both must count alike.
+_deps_manifest_files() {
+    local root="$1"
+    if [ "$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$root" && pwd -P)" ]; then
+        git -C "$root" ls-files --cached --others --exclude-standard -- ':(glob)**/package.json'
+        return
+    fi
+    (cd "$root" && find . \
+        \( -name node_modules -o -name .git -o -name target \
+           -o -name .lucidos -o -name dist \) -prune \
+        -o -name package.json -print 2>/dev/null) | sed 's|^\./||'
+}
+
 # ── ensure_npm_deps ───────────────────────────────────────────────────
-# Run npm install if node_modules is missing or the dependency fingerprint
-# changed (see _deps_fingerprint — content, not mtime). Refuses if any other
+# Run npm install if node_modules is missing or incomplete (no npm install
+# marker), or the dependency fingerprint changed (see _deps_fingerprint — content, not mtime). Refuses if any other
 # workspace has a running frontend dev server inside THIS project
 # ($PROJECT_DIR) — npm workspaces hoists deps to one shared node_modules
 # tree, so mutating it under a running Vite silently corrupts its in-memory
@@ -2988,6 +3054,11 @@ ensure_npm_deps() {
 
     if [ ! -d "$install_root/node_modules" ]; then
         needs_install="node_modules missing"
+    elif [ ! -f "$install_root/node_modules/.package-lock.json" ]; then
+        # npm writes this marker at the end of an install, so its absence is one
+        # that never finished, such as an `npm ci` killed mid-wipe. Stamping it
+        # as current would trust a tree with packages missing.
+        needs_install="node_modules incomplete"
     elif [ ! -f "$stamp" ]; then
         # node_modules exists but predates this fingerprint scheme (installed by
         # an older script, or `npm install` run directly). Trust it as current

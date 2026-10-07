@@ -1,28 +1,30 @@
 /**
- * Tests for the needs-attention, review, and running view filter helpers.
+ * Tests for the needs-attention, review, and in-flight view filter helpers.
  *
- * The drawer view selector splits threads into flat single-section views:
+ * The drawer view selector splits threads into single-section views:
  *   - "Needs attention" — every Current/Saved thread where the agent is stuck
  *     waiting on the user: awaiting an answer/permission (waiting_for_user_answer)
  *     or a failed turn. Ordered by review tier (User Q / permission ahead of a
  *     failed turn), then most-recent-first within each tier.
  *   - "Review" — every Current/Saved thread carrying a change ready to apply
  *     (codingAgentProposed, Apply offered). Most-recent-first.
- *   - "Running" — every Current/Saved thread actively working on a response
- *     (effective status `running`). Most-recent-first.
+ *   - "In flight" — every Current/Saved thread whose status dot reads Running
+ *     or Waiting: a running turn, its own event wait, or unfinished sub-threads.
+ *     Roots most-recent-first, each sub-thread nested under its parent.
  * All views bypass the channel/trigger/repo filters and the lifecycle section
  * grouping. The predicates (`threadNeedsAttention` / `threadInReview` /
- * `threadIsRunning`) are shared with the selector badge counts
- * (`attentionThreadCount` / `reviewThreadCount` / `runningThreadCount`) so the
+ * `threadIsInFlight`) are shared with the selector badge counts
+ * (`attentionThreadCount` / `reviewThreadCount` / `inFlightThreadCount`) so the
  * counts and the filtered lists can never disagree. A failed thread with a
  * proposed change surfaces in both needs-attention and review. One awaiting an
  * answer is needs-attention only, since the open question withholds Apply.
- * Running is mutually exclusive with both (they exclude `running`).
+ * In flight is mutually exclusive with both.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { attentionThreads, reviewThreads, runningThreads } from './ThreadDrawer';
-import { attentionThreadCount, reviewThreadCount, runningThreadCount, threadNeedsAttention, threadInReview, threadIsRunning, threadMap } from '../../store/store';
+import { attentionThreads, reviewThreads, inFlightThreads, inFlightThreadCount, inFlightHasRunning, threadIsInFlight } from './ThreadDrawer';
+import type { NestedThread } from './ThreadDrawer';
+import { attentionThreadCount, reviewThreadCount, threadNeedsAttention, threadInReview, threadMap } from '../../store/store';
 import type { ThreadState, ThreadMeta, ThreadStatus } from '../../store/thread-events';
 import type { ArchiveState } from '../../generated/thread-lifecycle';
 
@@ -35,6 +37,10 @@ type ThreadOpts = {
     state?: ThreadMeta['state'];
     updatedAt?: string;
     liveEventWaitCount?: number;
+    activeChildrenCount?: number;
+    waitingChildrenCount?: number;
+    parentThreadId?: string;
+    isStoppedChild?: boolean;
 };
 
 function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
@@ -50,8 +56,9 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         summaryVersion: 0,
         messageCount: 1,
         section: opts.section ?? 'inbox',
-        activeChildrenCount: 0,
-        totalChildrenCount: 0,
+        activeChildrenCount: opts.activeChildrenCount ?? 0,
+        waitingChildrenCount: opts.waitingChildrenCount ?? 0,
+        totalChildrenCount: (opts.activeChildrenCount ?? 0) + (opts.waitingChildrenCount ?? 0),
         blockingDescendantCount: 0,
         attentionDescendantCount: 0,
         codingAgentHasDiff: false,
@@ -64,6 +71,8 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         latestTodoList: null,
         liveEventWaitCount: opts.liveEventWaitCount ?? 0,
         liveEventWaits: [],
+        parentThreadId: opts.parentThreadId,
+        isStoppedChild: opts.isStoppedChild,
     };
     return {
         meta,
@@ -82,6 +91,14 @@ function asMap(threads: ThreadState[]): Map<string, ThreadState> {
 
 function ids(list: ThreadState[]): string[] {
     return list.map(t => t.meta.id);
+}
+
+function shape(list: NestedThread[]): [string, number][] {
+    return list.map(n => [n.thread.meta.id, n.depth]);
+}
+
+function rootIds(list: NestedThread[]): string[] {
+    return list.map(n => n.thread.meta.id);
 }
 
 beforeEach(() => {
@@ -233,79 +250,189 @@ describe('reviewThreads', () => {
     });
 });
 
-describe('runningThreads', () => {
+describe('inFlightThreads', () => {
     it('includes a Current thread actively working', () => {
         const running = makeThread('a', { section: 'inbox', status: 'running' });
-        expect(ids(runningThreads(asMap([running])))).toEqual(['a']);
+        expect(rootIds(inFlightThreads(asMap([running])))).toEqual(['a']);
     });
 
     it('includes a Saved thread actively working', () => {
         const saved = makeThread('a', { saved: true, status: 'running' });
-        expect(ids(runningThreads(asMap([saved])))).toEqual(['a']);
+        expect(rootIds(inFlightThreads(asMap([saved])))).toEqual(['a']);
     });
 
     it('includes a thread that is running with a proposed change', () => {
-        // A running thread routes to Current regardless of a pending change; it
-        // belongs in Running (its change is not yet ready to apply, so it is NOT
-        // in Review until the turn idles).
+        // Its change is not ready to apply until the turn idles, so it is NOT
+        // in Review yet.
         const runningProposed = makeThread('a', { section: 'inbox', status: 'running', codingAgentProposed: true });
-        expect(ids(runningThreads(asMap([runningProposed])))).toEqual(['a']);
+        expect(rootIds(inFlightThreads(asMap([runningProposed])))).toEqual(['a']);
     });
 
-    it('excludes idle / waiting / failed threads', () => {
+    it('includes a thread parked on its own event wait', () => {
+        const parked = makeThread('a', { liveEventWaitCount: 1 });
+        expect(rootIds(inFlightThreads(asMap([parked])))).toEqual(['a']);
+    });
+
+    it('includes a thread parked on an event wait with a proposed change', () => {
+        // Review leaves it out, since the change is not final. It must land here.
+        const parked = makeThread('a', { codingAgentProposed: true, liveEventWaitCount: 1 });
+        expect(rootIds(inFlightThreads(asMap([parked])))).toEqual(['a']);
+    });
+
+    it('includes a parent waiting on a working sub-thread', () => {
+        const parent = makeThread('a', { activeChildrenCount: 1 });
+        expect(rootIds(inFlightThreads(asMap([parent])))).toEqual(['a']);
+    });
+
+    it('includes a parent waiting on a sub-thread asleep on its own event wait', () => {
+        const parent = makeThread('a', { waitingChildrenCount: 1 });
+        expect(rootIds(inFlightThreads(asMap([parent])))).toEqual(['a']);
+    });
+
+    it('excludes a parent whose change is ready and that waits only on sub-threads', () => {
+        // Its dot reads Changes to review and it offers Apply, so it is Review's.
+        const parent = makeThread('a', { codingAgentProposed: true, activeChildrenCount: 1 });
+        expect(inFlightThreads(asMap([parent]))).toEqual([]);
+        expect(threadInReview(parent)).toBe(true);
+    });
+
+    it('excludes idle / question / failed / paused threads', () => {
         const idle = makeThread('a', { status: 'idle' });
-        const waiting = makeThread('b', { status: 'waiting_for_user_answer' });
+        const question = makeThread('b', { status: 'waiting_for_user_answer' });
         const failed = makeThread('c', { status: 'failed' });
-        expect(runningThreads(asMap([idle, waiting, failed]))).toEqual([]);
+        const paused = makeThread('d', { status: 'paused' });
+        expect(inFlightThreads(asMap([idle, question, failed, paused]))).toEqual([]);
     });
 
-    it('excludes composing and discarded threads', () => {
+    it('excludes a question or failure even while an event wait is live', () => {
+        // The dot reads the turn's own state first, and Needs attention owns it.
+        const question = makeThread('a', { status: 'waiting_for_user_answer', liveEventWaitCount: 1 });
+        const failed = makeThread('b', { status: 'failed', liveEventWaitCount: 1 });
+        expect(inFlightThreads(asMap([question, failed]))).toEqual([]);
+    });
+
+    it('excludes a stopped sub-thread, which needs the user', () => {
+        const stopped = makeThread('a', { isStoppedChild: true, activeChildrenCount: 1 });
+        expect(inFlightThreads(asMap([stopped]))).toEqual([]);
+        expect(threadNeedsAttention(stopped)).toBe(true);
+    });
+
+    it('excludes composing, discarded and archived threads', () => {
         const composing = makeThread('a', { state: 'composing', status: 'running' });
         const discarded = makeThread('b', { state: 'discarded', status: 'running' });
-        expect(runningThreads(asMap([composing, discarded]))).toEqual([]);
+        const archived = makeThread('c', { section: 'archived', liveEventWaitCount: 1 });
+        expect(inFlightThreads(asMap([composing, discarded, archived]))).toEqual([]);
     });
 
-    it('sorts most-recent-first', () => {
+    it('sorts roots most-recent-first', () => {
         const old = makeThread('old', { status: 'running', updatedAt: '2026-05-01T00:00:00Z' });
-        const fresh = makeThread('fresh', { status: 'running', updatedAt: '2026-05-04T00:00:00Z' });
-        const mid = makeThread('mid', { status: 'running', updatedAt: '2026-05-02T00:00:00Z' });
-        expect(ids(runningThreads(asMap([old, fresh, mid])))).toEqual(['fresh', 'mid', 'old']);
+        const fresh = makeThread('fresh', { liveEventWaitCount: 1, updatedAt: '2026-05-04T00:00:00Z' });
+        const mid = makeThread('mid', { activeChildrenCount: 1, updatedAt: '2026-05-02T00:00:00Z' });
+        expect(rootIds(inFlightThreads(asMap([old, fresh, mid])))).toEqual(['fresh', 'mid', 'old']);
+    });
+
+    it('nests each sub-thread under its in-flight parent', () => {
+        const parent = makeThread('parent', { activeChildrenCount: 2, updatedAt: '2026-05-01T00:00:00Z' });
+        const working = makeThread('working', { status: 'running', parentThreadId: 'parent', updatedAt: '2026-05-03T00:00:00Z' });
+        const parked = makeThread('parked', { liveEventWaitCount: 1, parentThreadId: 'parent', updatedAt: '2026-05-02T00:00:00Z' });
+        const other = makeThread('other', { status: 'running', updatedAt: '2026-05-04T00:00:00Z' });
+        expect(shape(inFlightThreads(asMap([parent, working, parked, other])))).toEqual([
+            ['other', 0],
+            ['parent', 0],
+            ['working', 1],
+            ['parked', 1],
+        ]);
+    });
+
+    it('renders a sub-thread at root level when its parent is not in flight', () => {
+        // The parent waits on the user, so it is in Needs attention instead.
+        const parent = makeThread('parent', { status: 'waiting_for_user_answer' });
+        const child = makeThread('child', { status: 'running', parentThreadId: 'parent' });
+        expect(shape(inFlightThreads(asMap([parent, child])))).toEqual([['child', 0]]);
     });
 });
 
-describe('runningThreadCount mirrors runningThreads', () => {
+describe('inFlightThreadCount mirrors inFlightThreads', () => {
     it('counts exactly the threads the list would render', () => {
         const threads = [
             makeThread('running-1', { status: 'running' }),
             makeThread('running-2', { status: 'running', codingAgentProposed: true }),
-            makeThread('waiting', { status: 'waiting_for_user_answer' }), // attention, not running
-            makeThread('proposed', { codingAgentProposed: true }),        // review, not running
+            makeThread('parked', { liveEventWaitCount: 1 }),
+            makeThread('parent', { activeChildrenCount: 1 }),
+            makeThread('waiting', { status: 'waiting_for_user_answer' }), // attention, not in flight
+            makeThread('proposed', { codingAgentProposed: true }),        // review, not in flight
             makeThread('idle', { status: 'idle' }),                       // excluded
         ];
         threadMap.value = asMap(threads);
-        expect(runningThreadCount.value).toBe(2);
-        expect(runningThreadCount.value).toBe(runningThreads(threadMap.value).length);
+        expect(inFlightThreadCount.value).toBe(4);
+        expect(inFlightThreadCount.value).toBe(inFlightThreads(threadMap.value).length);
     });
 
-    it('is zero when nothing is running', () => {
+    it('is zero when nothing is in flight', () => {
         threadMap.value = asMap([makeThread('a', { status: 'idle' })]);
-        expect(runningThreadCount.value).toBe(0);
+        expect(inFlightThreadCount.value).toBe(0);
     });
 });
 
-describe('threadIsRunning', () => {
-    it('is true for a running thread', () => {
-        expect(threadIsRunning(makeThread('a', { status: 'running' }))).toBe(true);
+describe('threadIsInFlight', () => {
+    it('is true for a running thread and a parked one', () => {
+        expect(threadIsInFlight(makeThread('a', { status: 'running' }))).toBe(true);
+        expect(threadIsInFlight(makeThread('b', { liveEventWaitCount: 1 }))).toBe(true);
     });
 
-    it('is false for idle / waiting / failed threads', () => {
-        expect(threadIsRunning(makeThread('a', { status: 'idle' }))).toBe(false);
-        expect(threadIsRunning(makeThread('b', { status: 'waiting_for_user_answer' }))).toBe(false);
-        expect(threadIsRunning(makeThread('c', { status: 'failed' }))).toBe(false);
+    it('is false for idle / question / failed threads', () => {
+        expect(threadIsInFlight(makeThread('a', { status: 'idle' }))).toBe(false);
+        expect(threadIsInFlight(makeThread('b', { status: 'waiting_for_user_answer' }))).toBe(false);
+        expect(threadIsInFlight(makeThread('c', { status: 'failed' }))).toBe(false);
     });
 
     it('is false for a composing thread even when its status is running', () => {
-        expect(threadIsRunning(makeThread('a', { state: 'composing', status: 'running' }))).toBe(false);
+        expect(threadIsInFlight(makeThread('a', { state: 'composing', status: 'running' }))).toBe(false);
+    });
+});
+
+describe('inFlightHasRunning', () => {
+    it('is true while a row is running', () => {
+        const rows = inFlightThreads(asMap([
+            makeThread('parked', { liveEventWaitCount: 1 }),
+            makeThread('running', { status: 'running' }),
+        ]));
+        expect(inFlightHasRunning(rows)).toBe(true);
+    });
+
+    it('is false when every row is parked on a wait', () => {
+        const rows = inFlightThreads(asMap([
+            makeThread('parked', { liveEventWaitCount: 1 }),
+            makeThread('parent', { activeChildrenCount: 1 }),
+        ]));
+        expect(inFlightHasRunning(rows)).toBe(false);
+    });
+});
+
+describe('the three status views never claim the same thread', () => {
+    it('keeps Needs attention, Review and In flight disjoint', () => {
+        const threads = [
+            makeThread('running', { status: 'running' }),
+            makeThread('running-proposed', { status: 'running', codingAgentProposed: true }),
+            makeThread('parked', { liveEventWaitCount: 1 }),
+            makeThread('parked-proposed', { liveEventWaitCount: 1, codingAgentProposed: true }),
+            makeThread('parent', { activeChildrenCount: 1 }),
+            makeThread('parent-proposed', { activeChildrenCount: 1, codingAgentProposed: true }),
+            makeThread('question', { status: 'waiting_for_user_answer', liveEventWaitCount: 1 }),
+            makeThread('failed', { status: 'failed', activeChildrenCount: 1 }),
+            makeThread('stopped', { isStoppedChild: true, waitingChildrenCount: 1 }),
+            makeThread('proposed', { codingAgentProposed: true }),
+            makeThread('paused', { status: 'paused', liveEventWaitCount: 1 }),
+        ];
+        const map = asMap(threads);
+        const attention = new Set(ids(attentionThreads(map)));
+        const review = new Set(ids(reviewThreads(map)));
+        const inFlight = rootIds(inFlightThreads(map));
+        for (const id of inFlight) {
+            expect(attention.has(id), `${id} is in attention too`).toBe(false);
+            expect(review.has(id), `${id} is in review too`).toBe(false);
+        }
+        expect(inFlight.sort()).toEqual(['parent', 'parked', 'parked-proposed', 'running', 'running-proposed']);
     });
 });
 

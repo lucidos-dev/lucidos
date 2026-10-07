@@ -47,13 +47,24 @@
 //!   can be killed is a subscription that guarantees nothing, so the expiry is
 //!   the latest watchdog deadline among the covered tasks plus a margin,
 //!   clamped to the ordinary ceiling.
+//!
+//! # The way back down: a thread's own stop is not news
+//!
+//! A thread that stops a task already knows it stopped. So the stop first
+//! stands down the issuing thread's waits on that task, and only then signals
+//! it. The killed completion then matches nothing there (ADR 0369). The
+//! task's owner still hears about a stop someone else issued. Discard,
+//! Archive and a timeout deliver as before.
 
 use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
 use super::register::MAX_LIVE_WAITS_PER_THREAD;
+use super::{LiveWait, LiveWaits};
 use crate::core::event_subscription::EventSubscription;
-use crate::engine::tools::bash_background::RunningTaskHandle;
+use crate::engine::event_bus::EventBus;
+use crate::engine::thread_events::EventWaitCancelCause;
+use crate::engine::tools::bash_background::{BackgroundBashRegistry, RunningTaskHandle};
 use crate::engine::LucidosEngine;
 
 /// The event a background task's completion lands as.
@@ -102,11 +113,10 @@ impl LucidosEngine {
         // Cheapest possible early-out first: an in-memory map scan behind a
         // mutex. The overwhelming majority of turns own no background work at
         // all, and everything below this line costs at least one database
-        // round trip. `MAX(sequence)` in particular is a parallel sequential
-        // scan (no standalone index on the column), measured at ~300 ms over
-        // 2.8M events, and paying that on every chat turn to answer a question
-        // the registry answers for free would be a worse regression than the
-        // stall this fixes.
+        // round trip. The watermark read runs `MAX(sequence)`, a parallel
+        // sequential scan (no standalone index on the column), measured at
+        // ~300 ms over 2.8M events. Paying that on every chat turn, for an
+        // answer the registry gives for free, would cost more than the stall.
         if !self.bash_background.has_running_for_thread(thread_id).await {
             return Vec::new();
         }
@@ -145,7 +155,7 @@ impl LucidosEngine {
             .iter()
             .filter(|h| {
                 live.iter()
-                    .any(|w| wait_covers_task(&w.on, &h.task_id, thread_id))
+                    .any(|w| wait_covers_task(&w.on, &h.task_id, Some(thread_id)))
             })
             .map(|h| h.task_id.clone())
             .collect();
@@ -190,13 +200,13 @@ impl LucidosEngine {
             .collect();
         let timeout_secs = timeout_for(uncovered, Utc::now());
 
-        let tool_use_id = format!("{ENGINE_TOOL_USE_PREFIX}:{}", Uuid::new_v4());
         // The watermark read at the top, NOT a fresh one: every task in
-        // `uncovered` was unfinished after that read, so each completion is
-        // guaranteed to land above it and be reachable by the catch-up scan.
+        // `uncovered` was unfinished after that read. Its completion is emitted
+        // later, and a committed horizon is below any append that starts after
+        // it, so the catch-up scan can reach the completion.
         let wait = self.build_wait_at(
             thread_id,
-            &tool_use_id,
+            &engine_tool_use_id(),
             on,
             &armed_reason(uncovered),
             timeout_secs,
@@ -258,10 +268,11 @@ pub(super) fn plan_wait<'a>(
 ) -> ArmingPlan<'a> {
     let uncovered: Vec<&RunningTaskHandle> = running
         .iter()
+        .filter(|h| !h.stop_requested)
         .filter(|h| {
             !live
                 .iter()
-                .any(|w| wait_covers_task(&w.on, &h.task_id, thread_id))
+                .any(|w| wait_covers_task(&w.on, &h.task_id, Some(thread_id)))
         })
         .collect();
     if uncovered.is_empty() {
@@ -298,17 +309,324 @@ pub(super) fn plan_wait<'a>(
 /// Whether a live wait would already fire on this task's completion.
 ///
 /// Runs the dispatcher's own predicate against the *matchable payload* the
-/// event will carry, the thread id included, so "covered" means the wait
-/// genuinely fires rather than merely looking similar. An unconditioned `BackgroundBashCompleted` entry therefore
-/// counts as covering every task, which is correct: it will fire on the first
-/// of them.
-fn wait_covers_task(on: &[EventSubscription], task_id: &str, thread_id: Uuid) -> bool {
-    let payload = crate::core::event_subscription::matchable_payload(
+/// event will carry, the owning thread's id included, so "covered" means the
+/// wait genuinely fires rather than merely looking similar. An unconditioned
+/// `BackgroundBashCompleted` entry therefore covers every task, which is
+/// correct: it will fire on the first of them.
+fn wait_covers_task(on: &[EventSubscription], task_id: &str, owner: Option<Uuid>) -> bool {
+    EventSubscription::any_matches(
+        on,
+        BACKGROUND_BASH_COMPLETED,
+        &completion_payload(task_id, owner),
+    )
+}
+
+/// The matchable view of a task's eventual `BackgroundBashCompleted`, as far
+/// as the coverage questions here need it: its `task_id` and its owner.
+fn completion_payload(task_id: &str, owner: Option<Uuid>) -> serde_json::Value {
+    crate::core::event_subscription::matchable_payload(
         BACKGROUND_BASH_COMPLETED,
         serde_json::json!({ "task_id": task_id }),
-        Some(thread_id),
-    );
-    EventSubscription::any_matches(on, BACKGROUND_BASH_COMPLETED, &payload)
+        owner,
+    )
+}
+
+/// The matchable view of the completion a stop produces: killed by us, so
+/// neither timed out nor abandoned. A wait conditioned on those fields fires
+/// on it, so the stand-down must see them too. Exit code and signal stay out,
+/// because a trap decides them.
+fn stopped_completion_payload(task_id: &str, owner: Option<Uuid>) -> serde_json::Value {
+    crate::core::event_subscription::matchable_payload(
+        BACKGROUND_BASH_COMPLETED,
+        serde_json::json!({
+            "task_id": task_id,
+            "killed": true,
+            "timed_out": false,
+            "abandoned": false,
+        }),
+        owner,
+    )
+}
+
+/// A fresh id for a wait the engine arms. See [`ENGINE_TOOL_USE_PREFIX`].
+fn engine_tool_use_id() -> String {
+    format!("{ENGINE_TOOL_USE_PREFIX}:{}", Uuid::new_v4())
+}
+
+/// Whether the engine armed this wait, rather than a model.
+fn is_engine_armed(wait: &LiveWait) -> bool {
+    wait.tool_use_id
+        .strip_prefix(ENGINE_TOOL_USE_PREFIX)
+        .is_some_and(|rest| rest.starts_with(':'))
+}
+
+/// What standing a wait down over one stopped task does to it.
+#[derive(Debug, PartialEq)]
+pub(super) enum StandDown {
+    /// Every entry fires on the stopped task, so nothing is left to watch.
+    End,
+    /// A wait the model armed, which also watched something else. It ends
+    /// whole and the stop names it: ADR 0059 never narrows a model's wait.
+    EndWithOthers,
+    /// A wait the engine armed over other tasks too. It is replaced by an
+    /// engine wait over these entries, the rest of its own `on` list.
+    Narrow(Vec<EventSubscription>),
+}
+
+/// Decide what a stop of `task_id` does to one wait on the stopping thread.
+/// `None` when the wait never fires on that task.
+///
+/// The engine may narrow its OWN wait because it wrote the `on` list and the
+/// reason, and it re-arms that wait every turn anyway.
+pub(super) fn plan_stand_down(
+    wait: &LiveWait,
+    task_id: &str,
+    owner: Option<Uuid>,
+) -> Option<StandDown> {
+    let payload = stopped_completion_payload(task_id, owner);
+    let (watching, rest): (Vec<EventSubscription>, Vec<EventSubscription>) = wait
+        .on
+        .iter()
+        .cloned()
+        .partition(|entry| entry.matches(BACKGROUND_BASH_COMPLETED, &payload));
+    if watching.is_empty() {
+        None
+    } else if rest.is_empty() {
+        Some(StandDown::End)
+    } else if is_engine_armed(wait) {
+        Some(StandDown::Narrow(rest))
+    } else {
+        Some(StandDown::EndWithOthers)
+    }
+}
+
+/// What stopping one background task did, for the caller to report.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoppedTask {
+    pub(crate) task_id: String,
+    /// The task by its description, or its command, as the waiting row named it.
+    pub(crate) label: String,
+    /// Reasons of model-armed waits that watched more than this task and
+    /// ended whole. The agent may want to re-arm the rest.
+    pub(crate) ended_with_others: Vec<String>,
+}
+
+/// A stop and its stand-down, before the engine runs the replacements'
+/// catch-up scans.
+#[derive(Debug)]
+pub(super) struct StopOutcome {
+    pub(super) stopped: StoppedTask,
+    /// Engine waits armed in place of ones that also covered other tasks.
+    /// Each still owes its catch-up scan, which needs the engine.
+    pub(super) replacements: Vec<LiveWait>,
+}
+
+/// Stop one background task on behalf of `issuer`, standing down the issuer's
+/// waits on it first. `None` when the task is not running, or a stop is
+/// already on its way.
+///
+/// The order is the whole point: take the stop, stand down, THEN signal. A
+/// completion emitted before the stand-down would wake the issuer. A free
+/// function over the three stores so it is testable without an engine.
+pub(super) async fn stop_and_stand_down(
+    registry: &BackgroundBashRegistry,
+    bus: &EventBus,
+    live_waits: &LiveWaits,
+    issuer: Uuid,
+    task_id: &str,
+) -> Option<StopOutcome> {
+    let stop = registry.begin_stop(task_id).await?;
+    let owner = stop.owner();
+    let running = match owner {
+        Some(owner) => registry.running_for_thread(owner).await,
+        None => Vec::new(),
+    };
+    let label = running
+        .iter()
+        .find(|h| h.task_id == task_id)
+        .map(task_label)
+        .unwrap_or_else(|| format!("background task {task_id}"));
+
+    let mut outcome = StopOutcome {
+        stopped: StoppedTask {
+            task_id: task_id.to_string(),
+            label,
+            ended_with_others: Vec::new(),
+        },
+        replacements: Vec::new(),
+    };
+    for live in live_waits.for_thread(issuer).await {
+        let Some(plan) = plan_stand_down(&live, task_id, owner) else {
+            continue;
+        };
+        // Out of the cache first, so it cannot resolve on anything while the
+        // replacement is written. A wait that resolved meanwhile is gone.
+        let Some(wait) = live_waits.take(live.wait_id).await else {
+            continue;
+        };
+        let mut replacement_id = None;
+        match plan {
+            StandDown::End => {}
+            StandDown::EndWithOthers => outcome.stopped.ended_with_others.push(wait.reason.clone()),
+            StandDown::Narrow(rest) => {
+                let replacement = narrowed(&wait, rest, &running, owner);
+                // The replacement commits BEFORE the cancel, so a waiting
+                // child never reads as finished in between (ADR 0254).
+                if let Err(e) = super::register::persist_wait(bus, live_waits, &replacement).await {
+                    crate::log!(
+                        "[EventWait] Could not narrow wait {} on thread {issuer}: {e}. It stays \
+                         live, so the stopped task's completion will still reach it.",
+                        wait.wait_id,
+                    );
+                    live_waits.insert(wait).await;
+                    continue;
+                }
+                replacement_id = Some(replacement.wait_id);
+                outcome.replacements.push(replacement);
+            }
+        }
+        if let Err(e) =
+            super::emit_cancel(bus, &wait, EventWaitCancelCause::AgentStandDown, None).await
+        {
+            // Nothing was written, so the wait is still live in the store and
+            // goes back in the cache. The stopped task will then reach it.
+            crate::log!(
+                "[EventWait] Stand-down of wait {} on thread {issuer} failed: {e}. Re-arming it.",
+                wait.wait_id,
+            );
+            // The old wait covers the remaining tasks again, so its
+            // replacement must go, or one completion would be delivered twice.
+            if let Some(id) = replacement_id {
+                outcome.replacements.retain(|r| r.wait_id != id);
+                withdraw(bus, live_waits, id).await;
+            }
+            live_waits.insert(wait).await;
+        }
+    }
+    stop.send();
+    Some(outcome)
+}
+
+/// Cancel a replacement wait whose original could not be stood down. A
+/// replacement that already resolved is gone, and so is the risk.
+async fn withdraw(bus: &EventBus, live_waits: &LiveWaits, wait_id: Uuid) {
+    let Some(replacement) = live_waits.take(wait_id).await else {
+        return;
+    };
+    if let Err(e) = super::emit_cancel(
+        bus,
+        &replacement,
+        EventWaitCancelCause::AgentStandDown,
+        None,
+    )
+    .await
+    {
+        crate::log!(
+            "[EventWait] Could not withdraw replacement wait {wait_id}: {e}. It and the \
+             original both stay live, so a remaining task may be delivered twice.",
+        );
+        live_waits.insert(replacement).await;
+    }
+}
+
+/// The engine wait that replaces `old` once one of its tasks was stopped.
+///
+/// Keeps `old`'s watermark, so its catch-up scan reaches any completion of the
+/// remaining tasks since `old` was armed: nothing landing in between is lost.
+/// Keeps its deadline too, which already covered the remaining tasks.
+fn narrowed(
+    old: &LiveWait,
+    on: Vec<EventSubscription>,
+    running: &[RunningTaskHandle],
+    owner: Option<Uuid>,
+) -> LiveWait {
+    let still: Vec<&RunningTaskHandle> = running
+        .iter()
+        .filter(|h| wait_covers_task(&on, &h.task_id, owner))
+        .collect();
+    let reason = if still.is_empty() {
+        old.reason.clone()
+    } else {
+        armed_reason(&still)
+    };
+    LiveWait {
+        wait_id: Uuid::new_v4(),
+        thread_id: old.thread_id,
+        tool_use_id: engine_tool_use_id(),
+        on,
+        reason,
+        armed_at: Utc::now(),
+        expires_at: old.expires_at,
+        watermark: old.watermark,
+    }
+}
+
+impl LucidosEngine {
+    /// Stop one background task for `issuer`, so that its completion does not
+    /// re-open `issuer`. See [`stop_and_stand_down`].
+    pub(crate) async fn stop_background_task_as(
+        &self,
+        issuer: Uuid,
+        task_id: &str,
+    ) -> Option<StoppedTask> {
+        let outcome = stop_and_stand_down(
+            &self.bash_background,
+            &self.event_bus,
+            &self.live_waits,
+            issuer,
+            task_id,
+        )
+        .await?;
+        for replacement in &outcome.replacements {
+            self.catch_up_event_wait(replacement).await;
+        }
+        Some(outcome.stopped)
+    }
+
+    /// Stop every running background task of `thread_id`, as the thread
+    /// itself. See [`stop_all_and_stand_down`].
+    pub(crate) async fn stop_background_tasks_of(&self, thread_id: Uuid) -> Vec<StoppedTask> {
+        let outcomes = stop_all_and_stand_down(
+            &self.bash_background,
+            &self.event_bus,
+            &self.live_waits,
+            thread_id,
+        )
+        .await;
+        let mut stopped = Vec::with_capacity(outcomes.len());
+        for outcome in outcomes {
+            for replacement in &outcome.replacements {
+                self.catch_up_event_wait(replacement).await;
+            }
+            stopped.push(outcome.stopped);
+        }
+        stopped
+    }
+}
+
+/// Stop every running background task of `thread_id` that nobody is already
+/// stopping, each through [`stop_and_stand_down`] as the thread itself.
+///
+/// For `lucidos hardened mark`. The marker certifies the branch, so a task
+/// still running started before it and cannot change the verdict.
+pub(super) async fn stop_all_and_stand_down(
+    registry: &BackgroundBashRegistry,
+    bus: &EventBus,
+    live_waits: &LiveWaits,
+    thread_id: Uuid,
+) -> Vec<StopOutcome> {
+    let mut outcomes = Vec::new();
+    for task in registry.running_for_thread(thread_id).await {
+        if task.stop_requested {
+            continue;
+        }
+        if let Some(outcome) =
+            stop_and_stand_down(registry, bus, live_waits, thread_id, &task.task_id).await
+        {
+            outcomes.push(outcome);
+        }
+    }
+    outcomes
 }
 
 /// What the user reads on the wait's transcript row, after `Waiting for `. So
@@ -381,3 +699,7 @@ fn timeout_for(tasks: &[&RunningTaskHandle], now: DateTime<Utc>) -> i64 {
 #[cfg(test)]
 #[path = "background_task_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "background_task_stop_tests.rs"]
+mod stop_tests;

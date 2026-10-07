@@ -29,7 +29,7 @@
 import { useEffect, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import {
-  PAIRING_CODE_LENGTH,
+  PAIRING_CODE_DIGITS,
   takePairingCodeFromUrl,
   takeUnspentPairingCodeFromUrl,
 } from '../../utils/pairingCodeSeed';
@@ -356,7 +356,7 @@ export interface CodeSlot {
  * pasted around the digits. Dropping it beats refusing the paste.
  */
 export function digitsOnly(raw: string): string {
-  return raw.replace(/\D/g, '').slice(0, PAIRING_CODE_LENGTH);
+  return raw.replace(/\D/g, '').slice(0, PAIRING_CODE_DIGITS);
 }
 
 /**
@@ -397,7 +397,7 @@ function caretToEnd(e: Event) {
  * Pure, so the whole affordance is testable: how many boxes, which digit is in
  * which, and where the caret sits at every length from empty to full.
  */
-export function codeSlots(code: string, length = PAIRING_CODE_LENGTH): CodeSlot[] {
+export function codeSlots(code: string, length = PAIRING_CODE_DIGITS): CodeSlot[] {
   const cursor = Math.min(code.length, length - 1);
   return Array.from({ length }, (_, i) => ({
     digit: code[i] ?? '',
@@ -674,7 +674,7 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
         <button
           class="pairing-submit"
           type="submit"
-          disabled={busy || code.length < PAIRING_CODE_LENGTH}
+          disabled={busy || code.length < PAIRING_CODE_DIGITS}
         >
           {busy ? 'Pairing…' : 'Pair'}
         </button>

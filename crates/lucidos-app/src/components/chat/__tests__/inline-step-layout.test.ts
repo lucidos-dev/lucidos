@@ -137,9 +137,15 @@ describe('inline step layout (CSS regression)', () => {
     it('the slot is a fixed box, sized against the row and not the root', () => {
       const widths = iconRules.map(r => r.props.get('width')).filter(Boolean);
       expect(widths).toHaveLength(1);
+      // The width is the named mark column, which the sub-agent fold shares.
+      const named = /^var\((--[\w-]+)\)$/.exec(widths[0] ?? '')?.[1];
+      const declared = named
+        ? cssRules(css).map(r => r.props.get(named)).filter(Boolean)
+        : [widths[0]];
+      expect(declared).toHaveLength(1);
       // `em`, not `rem`: the box has to match the mark the ROW renders, and the
       // row sets its own font-size rather than inheriting the root's.
-      expect(widths[0]).toMatch(/^\d*\.?\d+em$/);
+      expect(declared[0]).toMatch(/^\d*\.?\d+em$/);
       // A `min-width` would let a wide glyph push the description instead, which
       // is the raggedness the fixed box exists to remove.
       expect(iconRules.some(r => r.props.has('min-width'))).toBe(false);

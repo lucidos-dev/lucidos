@@ -167,6 +167,7 @@ impl LlmProvider for RoutingProvider {
         selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
+        call: crate::llm::metered::CallToken,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let model = selection.model.unwrap_or(&self.default_model);
         let route = self.route_for(model, selection.provider)?;
@@ -179,9 +180,10 @@ impl LlmProvider for RoutingProvider {
         // The leaf serves ONE backend, so it is handed the resolved route: its
         // own wire id, and the effort snapped onto what that backend accepts.
         let resolved = ModelSelection::model(&route.wire_id)
-            .with_effort(self.effort_for_route(&route, selection.reasoning_effort));
+            .with_effort(self.effort_for_route(&route, selection.reasoning_effort))
+            .with_attempt_timeout(selection.attempt_timeout);
         provider
-            .chat(messages, tools, resolved, system_prompt, on_token)
+            .chat(messages, tools, resolved, system_prompt, on_token, call)
             .await
     }
 
@@ -330,6 +332,7 @@ mod tests {
                     RouteEntry::new(ProviderKind::Anthropic, "claude-opus-5"),
                 ],
                 preferred: None,
+                vision: false,
             },
         )])));
         let router = RoutingProvider::new(
@@ -377,11 +380,68 @@ mod tests {
             resolved.as_selection(),
             None,
             None,
+            crate::llm::metered::CallToken::for_test(),
         ));
         let Err(err) = refused else {
             panic!("a turn pinned to an unconfigured backend must refuse");
         };
         assert!(err.to_string().contains("Vertex AI"), "{err}");
+    }
+
+    /// An auxiliary call's attempt cap crosses the router and bounds the leaf's
+    /// request. The backend accepts and never answers, so without the cap each
+    /// attempt would wait out the 120s header bound.
+    #[tokio::test]
+    async fn the_attempt_cap_crosses_the_router_to_the_leaf() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let local = OpenAiProvider::new_with_base_url(
+            String::new(),
+            "local-model".to_string(),
+            &format!("http://{addr}/v1"),
+            Vec::new(),
+            true,
+        )
+        .expect("build the local provider");
+        let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([(
+            "local-model".to_string(),
+            ModelRouting::single(ProviderKind::Local, "local-model"),
+        )])));
+        let router = RoutingProvider::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(local),
+            registry,
+            "local-model".to_string(),
+        );
+        let cap = std::time::Duration::from_millis(100);
+        let call = router.chat(
+            vec![],
+            vec![],
+            ModelSelection::model("local-model").with_attempt_timeout(Some(cap)),
+            None,
+            None,
+            crate::llm::metered::CallToken::for_test(),
+        );
+        // Every attempt is capped, so the call ends after the retries' backoff.
+        let backoff: std::time::Duration = (1..=crate::llm::MAX_RETRIES)
+            .map(|attempt| crate::llm::retry_delay(attempt, 1))
+            .sum();
+        let bound = backoff + std::time::Duration::from_secs(10);
+        let outcome = tokio::time::timeout(bound, call)
+            .await
+            .expect("each attempt must end at the cap, not the header bound");
+        assert!(outcome.is_err(), "the backend never answers");
     }
 
     /// The wire carries the ROUTE's id, not the row's. That is what lets a row
@@ -396,6 +456,7 @@ mod tests {
                     "anthropic/claude-opus-5-5",
                 )],
                 preferred: None,
+                vision: false,
             },
         )])));
         let router = RoutingProvider::new(

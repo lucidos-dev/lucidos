@@ -95,6 +95,46 @@ test_fingerprint_moves_when_the_lock_moves() {
     fi
 }
 
+test_fingerprint_ignores_a_nested_checkout() {
+    echo "test: a nested git checkout's package.json does not move the fingerprint"
+    # A coding agent's worktree under .claude/worktrees/ is another tree.
+    local root before after
+    root="$(mktemp -d)"
+    git -C "$root" init -q
+    printf '{"name":"t","workspaces":["a"]}' > "$root/package.json"
+    mkdir -p "$root/a"
+    printf '{"name":"a"}' > "$root/a/package.json"
+    printf '{"lockfileVersion":3}' > "$root/package-lock.json"
+    before="$(
+        PROJECT_DIR="$PROJECT_ROOT" bash -c \
+        'source "$PROJECT_DIR/scripts/lib/workspace.sh"; _deps_fingerprint "$1"' _ "$root"
+    )"
+    mkdir -p "$root/nested"
+    git -C "$root/nested" init -q
+    printf '{"name":"nested","dependencies":{"x":"1"}}' > "$root/nested/package.json"
+    after="$(
+        PROJECT_DIR="$PROJECT_ROOT" bash -c \
+        'source "$PROJECT_DIR/scripts/lib/workspace.sh"; _deps_fingerprint "$1"' _ "$root"
+    )"
+    printf '{"name":"a","dependencies":{"y":"1"}}' > "$root/a/package.json"
+    local member_edit
+    member_edit="$(
+        PROJECT_DIR="$PROJECT_ROOT" bash -c \
+        'source "$PROJECT_DIR/scripts/lib/workspace.sh"; _deps_fingerprint "$1"' _ "$root"
+    )"
+    rm -rf "$root"
+    if [ "$before" = "$after" ]; then
+        pass "nested checkout ignored"
+    else
+        fail "a nested checkout moved the fingerprint: $before -> $after"
+    fi
+    if [ "$after" != "$member_edit" ]; then
+        pass "an untracked member edit still moves it"
+    else
+        fail "a member package.json edit did not move the fingerprint"
+    fi
+}
+
 test_stamp_path_lives_in_the_install_root() {
     echo "test: the stamp sits under the install root's node_modules"
     local root stamp
@@ -220,6 +260,7 @@ test_a_dead_pid_is_not_a_conflict() {
 echo "deps-state.sh:"
 test_fingerprint_is_the_librarys_own_answer
 test_fingerprint_moves_when_the_lock_moves
+test_fingerprint_ignores_a_nested_checkout
 test_stamp_path_lives_in_the_install_root
 test_no_markers_means_safe_to_install
 test_the_build_watch_is_not_a_dev_server

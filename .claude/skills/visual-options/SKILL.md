@@ -1,6 +1,6 @@
 ---
 name: visual-options
-description: Use BEFORE the first edit of a look-and-feel change to the Lucidos UI ("doesn't look great", "sleeken", "restyle", "misplaced", "too big", spacing, colour, layout). Show rendered options for approval first. A simple choice goes as pictures on the question card, a complex one as a live preview. Covers rendering in the real app and theme.
+description: Use BEFORE the first question or edit about a Lucidos UI change that involves judgement. That is a look-and-feel change ("doesn't look great", "restyle", "misplaced", "too big", spacing, colour, layout). It is also a fix that adds or moves a visual element: a spinner, a status, an icon, a button row. Show rendered options for approval first. A simple choice goes as pictures on the question card, a complex one as a live preview. Covers rendering in the real app and theme.
 ---
 
 # Visual options before visual edits
@@ -13,10 +13,18 @@ rendered options they approve. It never starts with an edit.
 - **Applies**: any change to how the UI looks where more than one answer is
   reasonable. That covers restyling, spacing, colour, type, layout, and a new
   visual element.
+- **A behaviour fix counts when it changes what is drawn.** Adding a spinner,
+  a status word, an icon or a button row involves judgement, even when the bug
+  is about data flow. This skill was once skipped exactly that way: a
+  typed-answer fix shipped a new spinner and header state nobody had seen.
 - **Skip the options** when the user gave an exact spec ("make it 2px", "use
   `--accent`"). Skip them too when the fix has one correct answer, like a
   clipped label. Say you skipped them and why. The approval gate under
   "Approval before verification" still applies.
+- **It starts at the first question, not the first edit.** A card asking
+  which way to fix a UI problem is already a visual choice. Text-only options
+  there make the user ask for pictures. That happened when a held-row fix
+  first offered three directions in words alone.
 - **Every expand and collapse animates**, through `<Disclosure>`: options may
   differ in how it looks, never in whether it moves (`.claude/rules/frontend.md`
   § Every Expand and Collapse Rolls).

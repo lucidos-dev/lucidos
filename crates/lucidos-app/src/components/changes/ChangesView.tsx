@@ -1,6 +1,6 @@
 import { useRef, useCallback, useEffect } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
-import { changes, appliedChanges, setAsideChanges, changeIsReady, findChangeById, threadMap, effectiveThreadStatus, isMidTurn, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, applyAllBatch, applyPhases, showConfirm, standingApplyThreadIds, collapsedChangesSectionIds, toggleChangesSectionCollapsed, type ApplyAllBatch, type ApplyPhase, type ApplyPhaseReading } from '../../store/store';
+import { changes, appliedChanges, setAsideChanges, changeIsReady, findChangeById, threadMap, threadUnsettled, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, applyAllBatch, applyPhases, showConfirm, standingApplyThreadIds, collapsedChangesSectionIds, toggleChangesSectionCollapsed, type ApplyAllBatch, type ApplyPhase, type ApplyPhaseReading } from '../../store/store';
 import { applyPhaseOf, isBatchMember } from '../../store/actions/applyProgress';
 import { applySingleChange, discardSingleChange, setAsideSingleChange, bringBackSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, armStandingApplies, disarmStandingApplies, refreshChangesState, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
 import { APPLY_INCOMPLETE_CONFIRM } from '../../store/actions/threadActions';
@@ -9,6 +9,7 @@ import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatFileCount } from '../../utils/formatFileCount';
+import { isInteractiveTarget } from '../../utils/dom';
 import { useDelayedFlag, useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { LoadableError } from '../shared/LoadableError';
@@ -31,8 +32,12 @@ function ChangeHeadline({ change }: { change: Change }) {
     <>
       <span class="title change-description">{changeHeadline(change)}</span>
       {commits.length > 1 && (
-        // The row opens its thread on click, so the fold keeps its own clicks.
-        <div class="change-row-commits" onClick={(e) => e.stopPropagation()}>
+        // The row opens its thread on click, so the fold toggle keeps its own.
+        // Only the toggle: this block spans the row, and the rest opens the thread.
+        <div
+          class="change-row-commits"
+          onClick={(e) => { if (isInteractiveTarget(e.target)) e.stopPropagation(); }}
+        >
           <EventRowFoldView label={`${commits.length} commits`} body={<CommitList commits={commits} />} />
         </div>
       )}
@@ -321,7 +326,7 @@ export const BRING_BACK_ROW_TIP =
   'Return this change to pending, where it can be applied or discarded.';
 
 /** A set-aside change's row: its headline, and the ways back or out. Discard
- *  is withheld while its thread works, since the engine refuses it then. */
+ *  is withheld while its thread is unsettled, since the engine refuses it then. */
 function SetAsideRow({ change, markerClass, busy, onBringBack, onDiscard }: {
   change: Change;
   markerClass: string | undefined;
@@ -330,7 +335,7 @@ function SetAsideRow({ change, markerClass, busy, onBringBack, onDiscard }: {
   onDiscard: () => void;
 }) {
   const thread = change.thread_id ? threadMap.value.get(change.thread_id) : undefined;
-  const threadWorking = !!thread && isMidTurn(effectiveThreadStatus(thread));
+  const unsettled = !!thread && threadUnsettled(thread);
   return (
     <div
       class={rowClass(!!change.thread_id, markerClass)}
@@ -358,7 +363,7 @@ function SetAsideRow({ change, markerClass, busy, onBringBack, onDiscard }: {
             onPrimary={onBringBack}
             caretClassName="action-btn"
             caretAriaLabel="More set-aside actions"
-            menuItems={threadWorking || busy ? [] : [{
+            menuItems={unsettled || busy ? [] : [{
               key: 'discard',
               label: 'Discard',
               className: 'action-btn action-btn-danger',

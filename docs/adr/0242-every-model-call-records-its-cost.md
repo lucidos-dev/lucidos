@@ -163,3 +163,15 @@ Phase 4.5 beside the other deterministic gates. Rejected because the check needs
 the crate's own notion of which traits are providers, and a cargo test already
 runs on every Rust diff. A shell script scanning Rust for trait methods would
 drift from the traits it scans for.
+
+## Amendment, 2026-10-07: one model call service, and a thread for every row
+
+[ADR 0381](0381-one-model-call-service-records-every-call.md) replaces the
+per-file audit with a compile-time lock. Each billable provider method takes
+a `CallToken` that only `llm::metered` mints, so every call goes through the
+*model call service* in `engine::model_call`, which records it.
+
+The audit had passed while the compactor dropped its artifact calls: its file
+mentioned `AuxCapture`, but `AuxCapture::for_thread(None)` emitted nothing. A
+call no thread caused now records on the home thread. The threadless cost
+event this ADR drafted stays rejected, now on the merits as well.

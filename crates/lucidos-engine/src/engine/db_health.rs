@@ -50,8 +50,8 @@ use super::LucidosEngine;
 /// so a recovery surfaces within about one client tick of actually happening.
 const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Ceiling on one probe. Comfortably under the frontend's 3s `checkHealth`
-/// deadline and the gateway's 5s health client, though neither waits on this one
+/// Ceiling on one probe. Comfortably under the frontend's `HEALTH_PROBE_TIMEOUT_MS`
+/// and the gateway's `build_health_client` timeout, though neither waits on this one
 /// (property 1 above). It exists so a wedged connection cannot stall the ticker.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 

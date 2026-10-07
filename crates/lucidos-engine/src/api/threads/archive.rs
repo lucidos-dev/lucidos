@@ -21,13 +21,13 @@ use crate::engine::agent_question::{
     answer_pending_question, lookup_pending_question_tool_use_id, AnswerResult,
 };
 use crate::engine::thread_events::{ActorMode, AnswerKind, MessageOrigin};
-use crate::engine::thread_lifecycle::{LifecycleViolation, ThreadStatus};
+use crate::engine::thread_lifecycle::{ArchiveState, Blocker, LifecycleViolation, ThreadStatus};
 use crate::engine::{AgentArchiveAck, AgentArchiveError, LucidosEngine};
 
 use super::extract_thread_uuid;
 use super::family::{
-    classify_family, external_repo_pending, load_family, not_yet_archived, FamilyDecision,
-    FamilyRow, FamilyVerb,
+    classify_family, external_repo_pending, load_family, not_yet_archived, with_blocker,
+    FamilyDecision, FamilyRow, FamilyVerb, HOME_THREAD,
 };
 
 /// Map a reach refusal into this handler's `{reason, message}` body, the same
@@ -109,10 +109,13 @@ pub(crate) fn rejection_text((_, body): &ArchiveRejection) -> String {
 /// The Archive route's refusal for a thread waiting on the user (ADR 0259),
 /// for a caller that checks before any family is locked.
 pub(crate) fn waiting_rejection(thread_id: Uuid, has_pending_changes: bool) -> ArchiveRejection {
-    let mut body = super::family::parent_blocked_body(
-        FamilyVerb::Archive,
-        ThreadStatus::WaitingForUserAnswer.as_str(),
-        has_pending_changes,
+    let mut body = with_blocker(
+        super::family::parent_blocked_body(
+            FamilyVerb::Archive,
+            ThreadStatus::WaitingForUserAnswer.as_str(),
+            has_pending_changes,
+        ),
+        Blocker::Question,
     );
     body["message"] = gate_refusal_message(&body, thread_id).into();
     (StatusCode::CONFLICT, axum::Json(body))
@@ -141,11 +144,22 @@ pub(crate) fn pinned_rejection(thread_id: Uuid) -> ArchiveRejection {
     )
 }
 
+/// The refusal an agent gets for the home thread (ADR 0362): the family
+/// gate's own body and words, so the tool and the route say the same thing.
+pub(crate) fn home_thread_rejection(thread_id: Uuid) -> ArchiveRejection {
+    let mut body = with_blocker(serde_json::json!({ "reason": HOME_THREAD }), Blocker::Home);
+    body["message"] = gate_refusal_message(&body, thread_id).into();
+    (StatusCode::CONFLICT, axum::Json(body))
+}
+
 /// The family gate's refusal in words, for the `message` beside its slug.
 fn gate_refusal_message(body: &serde_json::Value, thread_id: Uuid) -> String {
     let field = |key: &str| body.get(key).and_then(|v| v.as_str());
     match field("reason") {
         Some("thread_not_found") => format!("No thread {thread_id} exists in this workspace."),
+        Some(HOME_THREAD) => format!(
+            "Thread {thread_id} is the home thread. It never ends, so it cannot be archived."
+        ),
         Some("parent_not_archivable")
             if field("parent_status") == Some(ThreadStatus::WaitingForUserAnswer.as_str()) =>
         {
@@ -391,6 +405,9 @@ pub(crate) async fn archive_family(
         body["message"] = gate_refusal_message(&body, thread_uuid).into();
         return Err((status, axum::Json(body)));
     }
+    let target_was_archived = family
+        .iter()
+        .any(|r| r.thread_id == thread_uuid && r.archive_state_enum() == ArchiveState::Archived);
     let leave_pinned = pinned == PinnedMembers::LeaveOpen
         || actor.as_ref().is_some_and(|a| a.mode() == ActorMode::Agent);
     let plan = match plan_cascade(&family, thread_uuid, leave_pinned) {
@@ -567,6 +584,17 @@ pub(crate) async fn archive_family(
         }
     }
 
+    // A target already stored archived sits in Current only while a count says
+    // something under it is live. The gate just found nothing live, so recount:
+    // a drifted count then lets the thread go to Archive now (ADR 0378).
+    if target_was_archived {
+        engine
+            .event_bus
+            .recount_family_counts(thread_uuid)
+            .await
+            .map_err(internal_json)?;
+    }
+
     // Archiving a child that still owes its parent a card settles it: a
     // stopped child (ADR 0252) or a waiting one (ADR 0254). Only the thread
     // the caller archived: a descendant caught in this cascade owes its parent
@@ -615,6 +643,7 @@ mod tests {
             coding_agent_proposed: false,
             coding_agent_is_external_repo: false,
             is_saved,
+            is_home: false,
         }
     }
 
@@ -660,6 +689,7 @@ mod tests {
             coding_agent_proposed: false,
             coding_agent_is_external_repo: false,
             is_saved: false,
+            is_home: false,
         };
         let FamilyDecision::Reject { status, mut body } =
             classify_family(&[row], thread_id, FamilyVerb::Archive)

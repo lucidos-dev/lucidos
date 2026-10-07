@@ -93,3 +93,50 @@ fn only_confirmed_ids_that_are_still_safe_are_archived() {
     assert_eq!(reason(archived.facts.thread_id), "it is already archived");
     assert_eq!(reason(gone), "it no longer exists");
 }
+
+/// Each id that changed since the confirm carries a slug the client words as
+/// the confirm does, naming the refusal that fired.
+#[test]
+fn a_changed_id_carries_the_slug_of_its_refusal() {
+    let now_asking = row(|f| f.has_pending_question = true);
+    let now_running = row(|f| f.status = ThreadStatus::Running);
+    let now_pinned = row(|f| f.is_pinned = true);
+    let mut archived = row(|_| {});
+    archived.section = "archived".into();
+    let gone = Uuid::new_v4();
+    let rows = vec![
+        now_asking.clone(),
+        now_running.clone(),
+        now_pinned.clone(),
+        archived.clone(),
+    ];
+    let confirmed = [
+        now_asking.facts.thread_id,
+        now_running.facts.thread_id,
+        now_pinned.facts.thread_id,
+        archived.facts.thread_id,
+        gone,
+    ];
+
+    let (_, kept) = still_safe(&rows, &confirmed);
+    let slugs: Vec<&str> = kept.iter().map(|k| k.slug).collect();
+    assert_eq!(slugs, ["question", "busy", "pinned", "archived", "gone"]);
+}
+
+/// A family the cascade refused is counted by its blocker, a sub-thread's
+/// included; anything else it refuses is still working.
+#[test]
+fn a_refused_cascade_is_counted_by_its_blocker() {
+    use crate::engine::thread_lifecycle::Blocker;
+    let slug = |b: Blocker| refusal_kept_slug(&serde_json::json!({ "blocker": b.as_str() }));
+    assert_eq!(slug(Blocker::DescendantQuestion), "question");
+    assert_eq!(slug(Blocker::PendingChange), "pending_change");
+    assert_eq!(slug(Blocker::DescendantRunning), "busy");
+    let reason = |r: &str| refusal_kept_slug(&serde_json::json!({ "reason": r }));
+    assert_eq!(reason("thread_not_found"), "gone");
+    assert_eq!(
+        reason(crate::api::threads::archive::THREAD_PINNED),
+        "pinned"
+    );
+    assert_eq!(reason("apply_in_progress"), "busy");
+}

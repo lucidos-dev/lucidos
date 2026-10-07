@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 // `retrySrc` resolves a src against the page origin, so it needs a real one.
 import { describe, it, expect } from 'vitest';
-import { isRetryableImageSrc, retrySrc, retryDelayMs, MAX_ATTEMPTS } from './imageRetry';
+import {
+  isRetryableImageSrc, retrySrc, retryDelayMs, MAX_ATTEMPTS, BASE_DELAY_MS, MAX_DELAY_MS,
+} from './imageRetry';
 
 // Root cause: a bare <img> that fails a transient load never re-fetches. The
 // element stays broken while tapping to open it creates a fresh one that
@@ -54,10 +56,10 @@ describe('retrySrc', () => {
 
 describe('retryDelayMs', () => {
   it('backs off exponentially and caps', () => {
-    expect(retryDelayMs(0)).toBe(800);
-    expect(retryDelayMs(1)).toBe(1600);
-    expect(retryDelayMs(2)).toBe(3200);
+    expect(retryDelayMs(0)).toBe(BASE_DELAY_MS);
+    expect(retryDelayMs(1)).toBe(BASE_DELAY_MS * 2);
+    expect(retryDelayMs(2)).toBe(BASE_DELAY_MS * 4);
     // Capped well before MAX_ATTEMPTS exhausts.
-    expect(retryDelayMs(MAX_ATTEMPTS)).toBe(15000);
+    expect(retryDelayMs(MAX_ATTEMPTS)).toBe(MAX_DELAY_MS);
   });
 });

@@ -199,7 +199,7 @@ pub async fn task_start_time(
 ///
 /// An abandoned task reports no status, via `TaskOutcome::as_reported`, which
 /// is the one place that rule lives.
-pub(super) fn completion_event(task_id: String, record: CompletionRecord) -> ThreadEvent {
+pub(crate) fn completion_event(task_id: String, record: CompletionRecord) -> ThreadEvent {
     let stderr = super::bash::finalize_drain(&record.stderr, record.stderr_dropped);
     let outcome = record.outcome.as_reported(record.abandoned);
     ThreadEvent::BackgroundBashCompleted {

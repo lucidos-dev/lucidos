@@ -232,6 +232,38 @@ pub(crate) fn thread_target_is_addressable(
         || caller_workspace_present
 }
 
+/// Why a create with no text and no image is refused.
+pub(crate) const NOTHING_TO_START_THE_THREAD_WITH: &str = "\
+    Nothing to start the thread with: the message has no text and no image, so no thread was \
+    created. A spawner that builds the message from a file should check the file exists first.";
+
+/// Whether a thread with this `thread_summaries.state` has had its first send.
+/// No row and a draft both have not.
+pub(crate) fn thread_has_started(state: Option<&str>) -> bool {
+    state.is_some_and(|s| s != ThreadState::Composing.as_str())
+}
+
+/// Refuse to create a thread from a request that carries nothing to say.
+///
+/// Neither agent starts a turn without input, so such a thread is dead on
+/// arrival. Refusing before the thread is created hands the error to the caller,
+/// instead of a link to a thread that only says the reply failed. A draft's
+/// first send is a create too. A follow-up on a thread that has already started
+/// is the agents' to judge (ADR 0376).
+///
+/// `images` are the RESOLVED images: a stored hash whose blob is missing is
+/// dropped before any agent sees it, so it cannot count as input.
+pub(crate) fn require_input_to_create(
+    has_started: bool,
+    message: &str,
+    images: &[ChatImage],
+) -> Result<(), ApiError> {
+    if has_started || !images.is_empty() || !message.trim().is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(NOTHING_TO_START_THE_THREAD_WITH))
+}
+
 /// Announce every orphan in `batch` as `UserPromptInjected`, anchored on the
 /// batch's first message (the turn the re-process runs under).
 ///
@@ -832,6 +864,11 @@ pub(super) async fn chat_submit(
             return Err(ApiError::not_found(unknown_thread_message(tid)));
         }
     }
+    let has_started = thread_has_started(
+        existing_thread_row
+            .as_ref()
+            .map(|(state, ..)| state.as_str()),
+    );
 
     // Subprocess gate: see `subprocess_chat_legitimate` for the matrix, and
     // `subprocess_gate_applies` for when `caller_workspace` skips it.
@@ -958,16 +995,23 @@ pub(super) async fn chat_submit(
         request.repo_file_context.as_ref(),
     );
     let url_ctx = request.url_context;
-    // Resolve `image_hashes` to ChatImage by reading and base64-encoding the
-    // blobs once per send. Mutually exclusive with the legacy `images` body.
-    // Both carry the image at original resolution: the fit-to-model-size step
-    // happens at the LLM boundary via `ChatImage::fit_for_llm`, so compression
-    // lives in exactly one place.
-    // Keep the caller-supplied hashes. The Thread Queue branch below persists
-    // hashes, never inline base64, and by that point both wire fields have
-    // been consumed here.
-    let supplied_image_hashes = request.image_hashes.take();
-    let chat_images = if let Some(hashes) = &supplied_image_hashes {
+    // Every image reaches the blob store before anything reads it. Inline
+    // `images` are stored exactly as an upload is. So one sniff, one allowlist
+    // and one refusal cover both wire fields, and a refusal lands before
+    // anything has started. `image_hashes` wins when a caller sends both.
+    //
+    // The hashes then resolve to ChatImage, at original resolution and with
+    // the sniffed mime. `ChatImage::fit_for_llm` fits them at the LLM
+    // boundary, so compression lives in exactly one place. The Thread Queue
+    // branch below persists these hashes, never inline base64.
+    let supplied_image_hashes = match (request.image_hashes.take(), request.images.take()) {
+        (Some(hashes), _) => Some(hashes),
+        (None, Some(images)) => {
+            Some(super::blobs::store_inline_images(state.engine.workspace_path(), images).await?)
+        }
+        (None, None) => None,
+    };
+    let chat_images = supplied_image_hashes.as_ref().map(|hashes| {
         let mut resolved = Vec::with_capacity(hashes.len());
         for hash in hashes {
             match crate::core::blobs::read_blob_as_base64(state.engine.workspace_path(), hash) {
@@ -981,10 +1025,13 @@ pub(super) async fn chat_submit(
                 ),
             }
         }
-        Some(resolved)
-    } else {
-        request.images.take()
-    };
+        resolved
+    });
+    require_input_to_create(
+        has_started,
+        &message,
+        chat_images.as_deref().unwrap_or_default(),
+    )?;
     let use_coding_agent = request.use_coding_agent;
     let cc_model = request.cc_model;
     let coding_agent = request.coding_agent;
@@ -1268,15 +1315,9 @@ pub(super) async fn chat_submit(
     // run immediately: user-initiated chat preempts (ADR 0007, refined by 0008).
     if mode != ActorMode::Human && !thread_exists {
         let queue_thread_id = thread_id.unwrap_or_else(Uuid::new_v4);
-        // Persist images as content-addressed blobs — queue requests never
-        // carry inline base64 (the request is persisted in the event payload).
-        // The wire fields were consumed into `chat_images` above, so reuse the
-        // supplied hashes, else re-derive hashes from the resolved images
-        // (content-addressed, so re-persisting is idempotent).
-        let image_hashes = match supplied_image_hashes {
-            Some(hashes) => hashes,
-            None => state.engine.queued_image_hashes(chat_images.as_deref()),
-        };
+        // Queue requests never carry inline base64, because the request is
+        // persisted in the event payload. Every image is a stored blob by now.
+        let image_hashes = supplied_image_hashes.unwrap_or_default();
         let response_event_id = event_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());

@@ -5,9 +5,9 @@ import type { ThreadSection, ThreadState } from '../thread-events';
 import { deepLinkAnchorInThread, describeWaitSubscription } from '../thread-events';
 import type { ConfirmDetailGroup, ConfirmDetails } from '../types';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, attentionThreads, reviewThreads, runningThreads, draftThreads } from '../../components/drawer/family-graph';
+import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, attentionThreads, reviewThreads, inFlightThreads, draftThreads } from '../../components/drawer/family-graph';
 import type { FamilyGraph } from '../../components/drawer/family-graph';
-import { saveThread, unsaveThread, archiveThread, type ArchiveSkippedMember } from '../../api/threads';
+import { saveThread, unsaveThread, archiveThread, unarchiveThreads, type ArchiveSkippedMember } from '../../api/threads';
 import { ApiError, putComposeOnThread } from '../../api/client';
 import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, sectionMutatedAt, threadEventsStillArriving } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
@@ -18,6 +18,8 @@ import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { markThreadOpenStart } from '../../utils/threadOpenMarks';
 import { errorDetail } from '../../utils/errorDetail';
 import { pruneRecents } from './entityReferences';
+import { BLOCKER_REASON, blockedRefusal, type BlockedRefusal } from './blockerCopy';
+import { collectThreadFamily } from './threadFamily';
 
 // ---------------------------------------------------------------------------
 // Thread CRUD
@@ -74,6 +76,7 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // retires at its own optimistic focus instead.
   if (!wasFocused) stopFollowingBottom();
   setFocusedThread(threadId);
+  rememberOpenedViewRows(threadId);
   resetCodingAgentPendingPreferences();
   // Focusing a thread does NOT position its transcript. `useScrollMemory` owns
   // that: a saved position is restored, and a thread with none opens at the top
@@ -331,6 +334,7 @@ export function focusThreadOrBootstrap(threadId: string, options?: FocusThreadOp
  *    drawer there. See `FocusThreadOptions.revealPane`. */
 export function unfocusThread(opts?: { revealPane?: boolean }): void {
   setFocusedThread(null);
+  openedViewRows = null;
   revealOnFocus.value = false;
   resetCodingAgentPendingPreferences();
   // Same rule as `focusThread`'s retire, for the surface it forgot: the compose
@@ -350,34 +354,31 @@ export function unfocusThread(opts?: { revealPane?: boolean }): void {
 // Saved without canceling it. Confirm before unsave so a stray click doesn't
 // cost the parking spot.
 
-/** Translate a failed `archiveThread` call into a user-facing toast string.
- *  The engine returns a structured 409 body (`reason`, `parent_status`,
- *  `blocking`) for the cascade-gate rejections — without the formatter the
- *  toast falls back to `"409"` (empty `statusText`, no `body.error`), which
- *  tells the user nothing actionable. */
+/** Why the engine refused an exit, in the thread menu's words (ADR 0378). The
+ *  action opens the sub-thread that holds it back. */
+export function showBlockedToast(title: string, refusal: BlockedRefusal): void {
+  const subThreadId = refusal.subThreadId;
+  showToast(BLOCKER_REASON[refusal.blocker], 'error', {
+    title,
+    action: subThreadId ? { label: 'Show sub-thread', onClick: () => focusThread(subThreadId) } : undefined,
+  });
+}
+
+/** Tell the user why `archiveThread` failed. A cascade refusal names its
+ *  blocker; anything else needs its own words, or a bare "409" would tell the
+ *  user nothing. */
+export function showArchiveError(err: unknown, threadId: string): void {
+  const refusal = blockedRefusal(err, threadId);
+  if (refusal) {
+    showBlockedToast("Can't archive yet", refusal);
+    return;
+  }
+  showToast(formatArchiveErrorToast(err), 'error');
+}
+
 function formatArchiveErrorToast(err: unknown): string {
   if (err instanceof ApiError && err.httpCode === 409 && err.body && typeof err.body === 'object') {
     const body = err.body as Record<string, unknown>;
-    if (body.reason === 'descendants_blocking') {
-      const blocking = Array.isArray(body.blocking) ? body.blocking : [];
-      const n = blocking.length;
-      if (n === 1) return "Can't archive yet — a sub-thread is still busy";
-      if (n > 1) return `Can't archive yet — ${n} sub-threads are still busy`;
-      return "Can't archive yet — a sub-thread is still busy";
-    }
-    if (body.reason === 'parent_not_archivable') {
-      // Archive is idempotent: an already-archived target is a no-op success
-      // (200), not a 409. So this reason means the thread is running or waiting
-      // on a question. See `classify_family` in
-      // crates/lucidos-engine/src/api/threads/family.rs.
-      if (body.parent_status === 'waiting_for_user_answer') {
-        return "Can't archive yet: this thread is waiting for your answer";
-      }
-      return "Can't archive yet — this thread is still running";
-    }
-    if (body.reason === 'parent_has_pending_changes') {
-      return "Can't archive — apply or discard the pending change first";
-    }
     // An apply or Discard holds the thread's session. The engine's message
     // names which, and says when to try again.
     if (CHANGE_CLAIM_REFUSALS.has(String(body.reason)) && typeof body.message === 'string') {
@@ -487,12 +488,12 @@ function visibleThreadsAndGraph(): { visible: ThreadState[]; graph: FamilyGraph 
 /** The visible thread ids of the drawer view the user is *currently looking at*,
  *  in the same order the drawer renders them. The post-archive focus walks this
  *  so "next" is the next visible row in whatever view is active — the next
- *  Needs-attention row when the attention view is open, the next Review/Running
+ *  Needs-attention row when the attention view is open, the next Review/In flight
  *  row, the next filtered Current row in the default view — instead of always
  *  jumping into Current. Mirrors `ThreadDrawer`'s `activeView` resolution: a live
  *  search query overrides the selected view; otherwise `drawerView` decides.
  *
- *  The alternate views (attention/review/running/drafts) deliberately bypass the
+ *  The alternate views (attention/review/in-flight/drafts) deliberately bypass the
  *  channel/trigger/repo/app filter — exactly as the drawer renders them — so the
  *  next focus matches what's on screen. Only the default `all` view is
  *  filter-aware, walking the visible Current section (`orderedCurrentForReview`)
@@ -507,7 +508,7 @@ function orderedVisibleThreadIds(): string[] {
   switch (drawerView.value) {
     case 'attention': return attentionThreads(map).map(t => t.meta.id);
     case 'review':    return reviewThreads(map).map(t => t.meta.id);
-    case 'running':   return runningThreads(map).map(t => t.meta.id);
+    case 'in-flight': return inFlightThreads(map).map(n => n.thread.meta.id);
     case 'drafts':    return draftThreads(map).map(t => t.meta.id);
     case 'all':
     default: {
@@ -517,47 +518,55 @@ function orderedVisibleThreadIds(): string[] {
   }
 }
 
+/** Which drawer view `orderedVisibleThreadIds` walks: a live search, or the
+ *  selected view. */
+function activeViewKey(): string {
+  const query = threadSearchQuery.value.trim();
+  return query.length > 0 ? `search:${query}` : drawerView.value;
+}
+
+/** The active view's rows as they stood when the focused thread was opened.
+ *  A thread often leaves its view before it is archived: stopping a question
+ *  leaves Needs attention, applying a change leaves Review. Its row in this
+ *  snapshot is the position the archive hand-off falls back on. */
+let openedViewRows: { threadId: string; view: string; ids: string[] } | null = null;
+
+function rememberOpenedViewRows(threadId: string): void {
+  const ids = orderedVisibleThreadIds();
+  // Re-focusing a thread that already left its view keeps its last position.
+  if (!ids.includes(threadId) && openedViewRows?.threadId === threadId) return;
+  openedViewRows = { threadId, view: activeViewKey(), ids };
+}
+
+/** The rows below `idx`, nearest first, then the rows above it, nearest first. */
+function neighboursOf(ids: readonly string[], idx: number): string[] {
+  return [...ids.slice(idx + 1), ...ids.slice(0, idx).reverse()];
+}
+
 /** Ordered list of visible thread ids to consider as the next focus when the
  *  user archives `aroundId` — closest below first, then closest above — within
  *  the currently active drawer view (`orderedVisibleThreadIds`). Snapshotted
  *  BEFORE the optimistic flip so the position anchor survives the cascade
- *  dropping `aroundId` (and its descendants) out of the view. */
+ *  dropping `aroundId` (and its descendants) out of the view.
+ *
+ *  A thread that already left the view takes its position from when it was
+ *  opened (`openedViewRows`), keeping only rows still visible. With no
+ *  position at all, the view's own rows are the candidates, top first. */
 export function visibleCandidatesAround(aroundId: string): string[] {
   const ordered = orderedVisibleThreadIds();
   const idx = ordered.indexOf(aroundId);
-  if (idx < 0) return [];
-  const result: string[] = [];
-  for (let i = idx + 1; i < ordered.length; i++) result.push(ordered[i]);
-  for (let i = idx - 1; i >= 0; i--) result.push(ordered[i]);
-  return result;
+  if (idx >= 0) return neighboursOf(ordered, idx);
+  const opened = openedViewRows;
+  const openedIdx = opened?.threadId === aroundId && opened.view === activeViewKey()
+    ? opened.ids.indexOf(aroundId)
+    : -1;
+  if (!opened || openedIdx < 0) return ordered;
+  const visible = new Set(ordered);
+  const nearest = neighboursOf(opened.ids, openedIdx).filter(id => visible.has(id));
+  const placed = new Set(nearest);
+  return [...nearest, ...ordered.filter(id => !placed.has(id))];
 }
 
-/** Walk parentThreadId from every thread in the map to collect the target +
- *  every transitive descendant. Mirrors the backend cascade scope, which
- *  archive and delete share, so an optimistic flip covers the whole family in
- *  one stroke.
- *
- *  Exported for delete, which needs the same set for a harsher reason: archive
- *  flips a column on each member and delete removes the rows. */
-export function collectThreadFamily(rootId: string): Set<string> {
-  const childrenByParent = new Map<string, string[]>();
-  for (const t of threadMap.value.values()) {
-    const p = t.meta.parentThreadId;
-    if (!p) continue;
-    const bucket = childrenByParent.get(p);
-    if (bucket) bucket.push(t.meta.id); else childrenByParent.set(p, [t.meta.id]);
-  }
-  const seen = new Set<string>();
-  const stack: string[] = [rootId];
-  while (stack.length > 0) {
-    const id = stack.pop()!;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    const kids = childrenByParent.get(id);
-    if (kids) stack.push(...kids);
-  }
-  return seen;
-}
 
 /** What archiving this cascade would stop, for the confirm to name.
  *
@@ -638,6 +647,16 @@ function discardThreadDraft(threadId: string): void {
     setDraft(threadId, restore);
     showToast(`Couldn't discard draft: ${errorDetail(e)}`, 'error');
   });
+}
+
+/** Move an archived thread, and the sub-threads Archive took with it, back to
+ *  Current. The `ThreadUnarchived` frames move the rows. */
+export async function handleUnarchiveThread(threadId: string): Promise<void> {
+  try {
+    await unarchiveThreads([threadId], { withSubThreads: true });
+  } catch (e) {
+    showToast(`Could not move the thread to Current: ${errorDetail(e)}`, 'error');
+  }
 }
 
 /** The confirm before archiving a pinned thread, which unpins it. */
@@ -820,7 +839,7 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     if (stillOnAutoFocus && restored.has(threadId)) {
       focusThread(threadId, { revealPane: false });
     }
-    showToast(formatArchiveErrorToast(e), 'error');
+    showArchiveError(e, threadId);
   } finally {
     const next = new Set(archivingThreadIds.value);
     for (const tid of cascade) next.delete(tid);

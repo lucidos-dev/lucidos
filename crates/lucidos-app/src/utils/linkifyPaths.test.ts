@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, extractRepoFileTargetFromHref, browserHandlesHref, _resetLinkifyCacheForTesting, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, extractSettingsViewFromHref, extractRepoFileTargetFromHref, browserHandlesHref, _resetLinkifyCacheForTesting, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
 import { DATA_PATH_PREFIXES } from './dataPathPrefixes';
 
 describe('DATA_PATH_PREFIXES', () => {
@@ -230,6 +230,41 @@ describe('extractTriggerIdFromHref', () => {
     ['', null],
   ])('returns null for %s', (href, expected) => {
     expect(extractTriggerIdFromHref(href)).toBe(expected);
+  });
+});
+
+// An engine notification links the Settings page its tap opens, such as
+// `[Settings → System → Backup](settings:backup)`.
+describe('extractSettingsViewFromHref', () => {
+  it.each([
+    ['settings:backup', 'backup'],
+    ['settings:disk-usage', 'disk-usage'],
+    ['settings:accounts/', 'accounts'],
+  ])('extracts %s -> %s', (href, expected) => {
+    expect(extractSettingsViewFromHref(href)).toBe(expected);
+  });
+
+  it.each([
+    // The Settings HOME keeps its panel routing.
+    ['settings', null],
+    ['data/settings', null],
+    // Empty view, a sub-path, and other owners.
+    ['settings:', null],
+    ['settings:backup/key', null],
+    ['settings:backup?x=1', null],
+    ['settingsx:backup', null],
+    ['app:settings', null],
+    ['https://example.com/settings:backup', null],
+  ])('returns null for %s', (href, expected) => {
+    expect(extractSettingsViewFromHref(href)).toBe(expected);
+  });
+
+  it('rewrites to a nav-link carrying the view', () => {
+    const html = linkifyPaths('<a href="settings:backup">Settings → System → Backup</a>', [], []);
+    expect(html).toContain('class="nav-link"');
+    expect(html).toContain('data-nav-target="settings"');
+    expect(html).toContain('data-settings-view="backup"');
+    expect(html).not.toContain('settings:backup');
   });
 });
 

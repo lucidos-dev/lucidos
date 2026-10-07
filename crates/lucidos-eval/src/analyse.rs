@@ -305,13 +305,53 @@ pub struct PairCensus {
     pub effective: usize,
 }
 
-/// Turns the model ended with nothing, and what the re-posts recovered.
+/// Turns that carried one fault, and what the re-posts recovered.
+///
+/// The turns are attempts and the recovery counts are threads, because that is
+/// what each is honestly known at. A thread carries one status, so it recovered
+/// or it did not; a turn can be attempted three times.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct EmptyCompletions {
+pub struct RepostTally {
     pub turns: i64,
     pub retries: i64,
     pub recovered_threads: usize,
     pub unrecovered_threads: usize,
+}
+
+impl RepostTally {
+    /// Fold in one thread's faulted attempts and the re-posts they cost.
+    ///
+    /// Recovery is `finished()`, never "the status is not the fault's own". A
+    /// re-post that then timed out recovered nothing.
+    fn add(&mut self, thread: &ThreadRow, turns: i64, retries: i64) {
+        self.turns += turns;
+        self.retries += retries;
+        if turns == 0 {
+            return;
+        }
+        match thread.finished() {
+            true => self.recovered_threads += 1,
+            false => self.unrecovered_threads += 1,
+        }
+    }
+}
+
+/// One arm's turns refused with no output, in total and per task.
+///
+/// Per arm because a refusal voids nothing on the other arm, so the pair
+/// census cannot show it. A recovered refusal leaves no other trace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArmRefusals {
+    pub arm: Arm,
+    pub total: RepostTally,
+    /// Only the tasks that had a refusal, in fixture order.
+    pub by_task: Vec<TaskRefusals>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskRefusals {
+    pub task: String,
+    pub tally: RepostTally,
 }
 
 /// Two configurations side by side, in differences rather than ratios.
@@ -355,7 +395,10 @@ pub struct Analysis {
     /// Populated only when a run carried two arms at one window.
     pub comparisons: Vec<Comparison>,
     pub pairs: PairCensus,
-    pub empty_completions: EmptyCompletions,
+    pub empty_completions: RepostTally,
+    /// One entry per arm that ran, refusal or not, so a zero is a measurement.
+    #[serde(default)]
+    pub refusals: Vec<ArmRefusals>,
     /// What each pooled run named its arm workspaces after, deduplicated.
     ///
     /// The report prints these so an operator can find the databases again.
@@ -459,6 +502,7 @@ pub fn analyse(rows: &[ResultRow]) -> Fallible<Analysis> {
             },
         ),
         empty_completions: empty_completions(&threads),
+        refusals: refusals(&threads, &task_order),
         run_labels: runs
             .iter()
             .map(|run| run.run_label.clone())
@@ -706,12 +750,8 @@ fn utilisation(context_window: i64, threads: &[&ThreadRow]) -> Utilisation {
     }
 }
 
-fn task_rows(
-    threads: &[&ThreadRow],
-    probes: &[&ProbeRow],
-    completions: &[&CompletionRow],
-    task_order: &[String],
-) -> Vec<TaskRow> {
+/// The fixture's task order, then any task a pooled run added, in row order.
+fn ordered_tasks(threads: &[&ThreadRow], task_order: &[String]) -> Vec<String> {
     let mut ordered: Vec<String> = task_order.to_vec();
     for thread in threads {
         if !ordered.contains(&thread.task) {
@@ -719,6 +759,15 @@ fn task_rows(
         }
     }
     ordered
+}
+
+fn task_rows(
+    threads: &[&ThreadRow],
+    probes: &[&ProbeRow],
+    completions: &[&CompletionRow],
+    task_order: &[String],
+) -> Vec<TaskRow> {
+    ordered_tasks(threads, task_order)
         .into_iter()
         .filter_map(|task| {
             let mine: Vec<&&ThreadRow> = threads.iter().filter(|t| t.task == task).collect();
@@ -865,27 +914,44 @@ fn comparisons(
 }
 
 /// Every turn that came back with nothing, and what became of its thread.
-///
-/// The turns are attempts and the recovery counts are threads, because that is
-/// what each is honestly known at. A thread carries one status, so it recovered
-/// or it did not; a turn can be attempted three times.
-///
-/// Recovery is `finished()`, never "the status is not `empty-completion`". A
-/// re-post that then timed out recovered nothing.
-fn empty_completions(threads: &[&ThreadRow]) -> EmptyCompletions {
-    let mut summary = EmptyCompletions::default();
+fn empty_completions(threads: &[&ThreadRow]) -> RepostTally {
+    let mut summary = RepostTally::default();
     for thread in threads {
-        summary.turns += thread.empty_completions;
-        summary.retries += thread.empty_retries;
-        if thread.empty_completions == 0 {
-            continue;
-        }
-        match thread.finished() {
-            true => summary.recovered_threads += 1,
-            false => summary.unrecovered_threads += 1,
-        }
+        summary.add(thread, thread.empty_completions, thread.empty_retries);
     }
     summary
+}
+
+/// Every turn refused with no output, by arm and task, and what became of it.
+fn refusals(threads: &[&ThreadRow], task_order: &[String]) -> Vec<ArmRefusals> {
+    let mut by_arm: BTreeMap<Arm, (RepostTally, BTreeMap<&str, RepostTally>)> = BTreeMap::new();
+    for thread in threads {
+        let (total, by_task) = by_arm.entry(thread.arm).or_default();
+        total.add(thread, thread.refusals, thread.refusal_retries);
+        by_task.entry(thread.task.as_str()).or_default().add(
+            thread,
+            thread.refusals,
+            thread.refusal_retries,
+        );
+    }
+    let ordered = ordered_tasks(threads, task_order);
+    by_arm
+        .into_iter()
+        .map(|(arm, (total, by_task))| ArmRefusals {
+            arm,
+            total,
+            by_task: ordered
+                .iter()
+                .filter_map(|task| {
+                    let tally = by_task.get(task.as_str())?;
+                    (tally.turns > 0).then(|| TaskRefusals {
+                        task: task.clone(),
+                        tally: tally.clone(),
+                    })
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// I6: every run row in the analysis has to agree on what was measured.
@@ -1002,11 +1068,16 @@ pub fn pair_key(run_id: &str, repeat: u32, task: &str) -> PairKey {
 ///
 /// Both arms skipping is agreement, and is kept. An arm missing entirely is not
 /// a disagreement either: one arm cannot disagree with nothing.
+///
+/// Only arms on one memory module are compared. A Tree turn never runs memory
+/// recall, so Tree and Classic differing on it is the module, not the
+/// classifier.
 pub fn retrieval_disagreed(by_arm: &BTreeMap<Arm, bool>) -> bool {
-    matches!(
-        (by_arm.get(&Arm::Control), by_arm.get(&Arm::Lean)),
-        (Some(control), Some(lean)) if control != lean
-    )
+    by_arm.iter().any(|(arm, recalled)| {
+        by_arm
+            .iter()
+            .any(|(other, theirs)| other.memory == arm.memory && theirs != recalled)
+    })
 }
 
 /// Whether a turn came back with nothing in either arm of one pair.
@@ -1044,14 +1115,13 @@ pub fn classifier_voided_pairs(threads: &[&ThreadRow]) -> BTreeSet<PairKey> {
 
 /// Whether the arms disagreed about delivering one task of one repeat.
 ///
-/// Both arms have to have been scored on it. A void is not a disagreement, and
+/// Two arms have to have been scored on it. A void is not a disagreement, and
 /// one arm cannot disagree with nothing.
 pub fn completion_diverged(by_arm: &BTreeMap<Arm, CompletionOutcome>) -> bool {
-    matches!(
-        (by_arm.get(&Arm::Control), by_arm.get(&Arm::Lean)),
-        (Some(control), Some(lean))
-            if control.is_scored() && lean.is_scored() && control != lean
-    )
+    let mut scored = by_arm.values().filter(|outcome| outcome.is_scored());
+    scored
+        .next()
+        .is_some_and(|first| scored.any(|other| other != first))
 }
 
 /// Every pair one arm delivered and the other did not.
@@ -1241,7 +1311,10 @@ mod tests {
             context_window: spec.window,
             empty_completions: 0,
             empty_retries: 0,
+            refusals: 0,
+            refusal_retries: 0,
             followup_sequence: None,
+            compaction_caught_up: None,
         })
     }
 
@@ -1256,7 +1329,7 @@ mod tests {
     fn one_thread(usd: f64) -> Thread {
         Thread {
             run_id: "r1",
-            arm: Arm::Lean,
+            arm: Arm::LEAN,
             task: "T01",
             rounds: 4,
             usd,
@@ -1354,10 +1427,10 @@ mod tests {
     /// beside one.
     #[test]
     fn the_comparison_carries_the_document_deltas() {
-        let mut rows = vec![run_row("r1", 200_000, vec![Arm::Control, Arm::Lean])];
+        let mut rows = vec![run_row("r1", 200_000, vec![Arm::CONTROL, Arm::LEAN])];
         let mut at = 1_767_225_600;
         for task in ["T01", "T02"] {
-            for arm in [Arm::Control, Arm::Lean] {
+            for arm in [Arm::CONTROL, Arm::LEAN] {
                 let mut thread = thread_row(Thread {
                     run_id: "r1",
                     arm,
@@ -1372,7 +1445,7 @@ mod tests {
                     row.started = Some(Utc.timestamp_opt(at, 0).unwrap());
                     row.thread_id = uuid::Uuid::from_u128(at as u128);
                     let (writes, beside, held) = match arm {
-                        Arm::Lean => (1, 1, 3),
+                        Arm::LEAN => (1, 1, 3),
                         _ => (2, 0, 0),
                     };
                     row.document_writes = writes;
@@ -1395,17 +1468,17 @@ mod tests {
                 .map(|result| result.document.clone())
                 .unwrap_or_else(|| panic!("no {arm:?} configuration"))
         };
-        assert_eq!(axis(Arm::Control).writes, 4);
-        assert_eq!(axis(Arm::Control).beside_a_call.rate, 0.0);
-        assert_eq!(axis(Arm::Lean).writes, 2);
-        assert_eq!(axis(Arm::Lean).beside_a_call.rate, 1.0);
-        assert_eq!(axis(Arm::Lean).items_held_open, 6);
+        assert_eq!(axis(Arm::CONTROL).writes, 4);
+        assert_eq!(axis(Arm::CONTROL).beside_a_call.rate, 0.0);
+        assert_eq!(axis(Arm::LEAN).writes, 2);
+        assert_eq!(axis(Arm::LEAN).beside_a_call.rate, 1.0);
+        assert_eq!(axis(Arm::LEAN).items_held_open, 6);
 
         let comparison = &analysis.comparisons[0];
         // A delta is right minus left, and which arm lands on which side is
         // the enum's ordering rather than this test's business.
         let toward_lean = match comparison.right.arm {
-            Arm::Lean => 1,
+            Arm::LEAN => 1,
             _ => -1,
         };
         assert_eq!(comparison.document_writes, -2 * toward_lean);
@@ -1440,10 +1513,10 @@ mod tests {
     /// One arm, one window: the shape ADR 0110 makes the default.
     fn one_configuration() -> Vec<ResultRow> {
         vec![
-            run_row("r1", 200_000, vec![Arm::Lean]),
+            run_row("r1", 200_000, vec![Arm::LEAN]),
             thread_row(Thread {
                 run_id: "r1",
-                arm: Arm::Lean,
+                arm: Arm::LEAN,
                 task: "T01",
                 rounds: 4,
                 usd: 2.0,
@@ -1453,7 +1526,7 @@ mod tests {
             }),
             thread_row(Thread {
                 run_id: "r1",
-                arm: Arm::Lean,
+                arm: Arm::LEAN,
                 task: "T02",
                 rounds: 8,
                 usd: 6.0,
@@ -1461,10 +1534,10 @@ mod tests {
                 window: 200_000,
                 trimmed: 3,
             }),
-            probe_row("r1", Arm::Lean, "T02", "P02.1", Outcome::Pass),
-            probe_row("r1", Arm::Lean, "T02", "P02.2", Outcome::LostSilent),
-            completion_row("r1", Arm::Lean, "T01", CompletionOutcome::Pass),
-            completion_row("r1", Arm::Lean, "T02", CompletionOutcome::Pass),
+            probe_row("r1", Arm::LEAN, "T02", "P02.1", Outcome::Pass),
+            probe_row("r1", Arm::LEAN, "T02", "P02.2", Outcome::LostSilent),
+            completion_row("r1", Arm::LEAN, "T01", CompletionOutcome::Pass),
+            completion_row("r1", Arm::LEAN, "T02", CompletionOutcome::Pass),
         ]
     }
 
@@ -1477,7 +1550,7 @@ mod tests {
         assert!(analysis.sweeps.is_empty());
 
         let result = &analysis.configurations[0];
-        assert_eq!(result.configuration.arm, Arm::Lean);
+        assert_eq!(result.configuration.arm, Arm::LEAN);
         assert_eq!(result.configuration.context_window, 200_000);
         assert_eq!(result.quality.delivery, Rate::of(2, 2));
         assert_eq!(result.quality.fidelity, Rate::of(1, 2));
@@ -1507,10 +1580,10 @@ mod tests {
     #[test]
     fn the_failure_split_names_how_each_probe_failed() {
         let mut rows = one_configuration();
-        rows.push(probe_row("r1", Arm::Lean, "T02", "P02.3", Outcome::Asked));
+        rows.push(probe_row("r1", Arm::LEAN, "T02", "P02.3", Outcome::Asked));
         rows.push(probe_row(
             "r1",
-            Arm::Lean,
+            Arm::LEAN,
             "T02",
             "P02.4",
             Outcome::LostLoud,
@@ -1526,10 +1599,10 @@ mod tests {
     fn two_windows() -> Vec<ResultRow> {
         let mut rows = one_configuration();
         rows.extend([
-            run_row("r2", 96_000, vec![Arm::Lean]),
+            run_row("r2", 96_000, vec![Arm::LEAN]),
             thread_row(Thread {
                 run_id: "r2",
-                arm: Arm::Lean,
+                arm: Arm::LEAN,
                 task: "T01",
                 rounds: 5,
                 usd: 2.5,
@@ -1539,7 +1612,7 @@ mod tests {
             }),
             thread_row(Thread {
                 run_id: "r2",
-                arm: Arm::Lean,
+                arm: Arm::LEAN,
                 task: "T02",
                 rounds: 11,
                 usd: 7.0,
@@ -1547,10 +1620,10 @@ mod tests {
                 window: 96_000,
                 trimmed: 6,
             }),
-            probe_row("r2", Arm::Lean, "T02", "P02.1", Outcome::Pass),
-            probe_row("r2", Arm::Lean, "T02", "P02.2", Outcome::LostSilent),
-            completion_row("r2", Arm::Lean, "T01", CompletionOutcome::Pass),
-            completion_row("r2", Arm::Lean, "T02", CompletionOutcome::Pass),
+            probe_row("r2", Arm::LEAN, "T02", "P02.1", Outcome::Pass),
+            probe_row("r2", Arm::LEAN, "T02", "P02.2", Outcome::LostSilent),
+            completion_row("r2", Arm::LEAN, "T01", CompletionOutcome::Pass),
+            completion_row("r2", Arm::LEAN, "T02", CompletionOutcome::Pass),
         ]);
         rows
     }
@@ -1594,10 +1667,10 @@ mod tests {
     /// `check_arms_interleave` refuse the whole analysis.
     #[test]
     fn two_arms_at_one_window_are_compared_and_not_swept() {
-        let mut rows = vec![run_row("r1", 200_000, vec![Arm::Control, Arm::Lean])];
+        let mut rows = vec![run_row("r1", 200_000, vec![Arm::CONTROL, Arm::LEAN])];
         let mut at = 1_767_225_600;
         for task in ["T01", "T02"] {
-            for arm in [Arm::Control, Arm::Lean] {
+            for arm in [Arm::CONTROL, Arm::LEAN] {
                 let mut thread = thread_row(Thread {
                     run_id: "r1",
                     arm,
@@ -1698,10 +1771,10 @@ mod tests {
     #[test]
     fn a_single_arm_run_is_not_failed_by_a_two_arm_run_beside_it() {
         let mut rows = one_configuration();
-        rows.push(run_row("r2", 200_000, vec![Arm::Control, Arm::Lean]));
+        rows.push(run_row("r2", 200_000, vec![Arm::CONTROL, Arm::LEAN]));
         let mut at = 1_767_312_000;
         for task in ["T01", "T02"] {
-            for arm in [Arm::Control, Arm::Lean] {
+            for arm in [Arm::CONTROL, Arm::LEAN] {
                 let mut thread = thread_row(Thread {
                     run_id: "r2",
                     arm,
@@ -1742,7 +1815,7 @@ mod tests {
             empty_retries: 2,
             ..match thread_row(Thread {
                 run_id: "r1",
-                arm: Arm::Lean,
+                arm: Arm::LEAN,
                 task: "T01",
                 rounds: 1,
                 usd: 0.0,
@@ -1762,16 +1835,94 @@ mod tests {
         assert_eq!(summary.turns, 2);
     }
 
+    /// A thread row for one arm and task, carrying refusals and a status.
+    fn refused(arm: Arm, task: &'static str, refusals: i64, status: &str) -> ThreadRow {
+        ThreadRow {
+            status: status.into(),
+            refusals,
+            refusal_retries: refusals.min(2),
+            ..thread(Thread {
+                arm,
+                task,
+                ..one_thread(0.0)
+            })
+        }
+    }
+
+    /// A refusal a re-post recovered still shows, under its arm and its task.
+    /// One that never recovered shows beside it, and an arm with none reads
+    /// zero rather than going missing.
+    #[test]
+    fn refusals_are_counted_per_arm_and_per_task_recovered_or_not() {
+        let rows = [
+            refused(Arm::LEAN, "T09", 1, "idle"),
+            refused(Arm::LEAN, "T13", 3, "failed"),
+            refused(Arm::LEAN, "T01", 0, "idle"),
+            refused(Arm::LEAN_TREE, "T09", 0, "idle"),
+        ];
+        let threads: Vec<&ThreadRow> = rows.iter().collect();
+        let order = ["T01", "T09", "T13"].map(String::from);
+        let by_arm = refusals(&threads, &order);
+
+        assert_eq!(by_arm.len(), 2, "every arm that ran gets an entry");
+        let lean = by_arm.iter().find(|a| a.arm == Arm::LEAN).unwrap();
+        assert_eq!(
+            lean.total,
+            RepostTally {
+                turns: 4,
+                retries: 3,
+                recovered_threads: 1,
+                unrecovered_threads: 1,
+            }
+        );
+        let tasks: Vec<&str> = lean.by_task.iter().map(|t| t.task.as_str()).collect();
+        assert_eq!(tasks, ["T09", "T13"], "only tasks with a refusal, in order");
+        assert_eq!(lean.by_task[0].tally.recovered_threads, 1);
+        assert_eq!(lean.by_task[1].tally.unrecovered_threads, 1);
+
+        let tree = by_arm.iter().find(|a| a.arm == Arm::LEAN_TREE).unwrap();
+        assert_eq!(tree.total, RepostTally::default());
+        assert!(tree.by_task.is_empty());
+    }
+
+    /// The whole analysis carries a recovered refusal through to the report.
+    /// The thread finished, so nothing else in the analysis would show it.
+    #[test]
+    fn a_recovered_refusal_reaches_the_analysis() {
+        let mut rows = one_configuration();
+        for row in rows.iter_mut() {
+            if let ResultRow::Thread(thread) = row {
+                if thread.task == "T02" {
+                    thread.refusals = 1;
+                    thread.refusal_retries = 1;
+                }
+            }
+        }
+        let analysis = analyse(&rows).unwrap();
+        assert_eq!(analysis.refusals.len(), 1);
+        let lean = &analysis.refusals[0];
+        assert_eq!((lean.total.turns, lean.total.recovered_threads), (1, 1));
+        assert_eq!(lean.by_task[0].task, "T02");
+        assert_eq!(analysis.pairs.upstream_failure, 0);
+    }
+
+    /// A refusal voids nothing, so it never touches the empty-completion count.
+    #[test]
+    fn a_refusal_is_never_counted_as_an_empty_completion() {
+        let row = refused(Arm::LEAN, "T09", 1, "idle");
+        assert_eq!(empty_completions(&[&row]), RepostTally::default());
+    }
+
     /// One empty arm voids the pair, whichever arm it is, and even when the
     /// other arm never ran. A disagreement needs two opinions; this needs one
     /// thread that never started the task.
     #[test]
     fn one_empty_arm_voids_the_pair_whichever_arm_it_is() {
-        for arm in Arm::BOTH {
+        for arm in Arm::ALL {
             let by_arm: BTreeMap<Arm, bool> = [(arm, true)].into_iter().collect();
             assert!(empty_completion_voided(&by_arm), "{arm} alone must void it");
         }
-        let neither: BTreeMap<Arm, bool> = Arm::BOTH.into_iter().map(|arm| (arm, false)).collect();
+        let neither: BTreeMap<Arm, bool> = Arm::ALL.into_iter().map(|arm| (arm, false)).collect();
         assert!(!empty_completion_voided(&neither));
         assert!(!empty_completion_voided(&BTreeMap::new()));
     }
@@ -1782,7 +1933,7 @@ mod tests {
     #[test]
     fn arms_that_disagree_on_retrieval_void_that_pair() {
         let pair = |control: Option<bool>, lean: Option<bool>| -> BTreeMap<Arm, bool> {
-            [(Arm::Control, control), (Arm::Lean, lean)]
+            [(Arm::CONTROL, control), (Arm::LEAN, lean)]
                 .into_iter()
                 .filter_map(|(arm, value)| value.map(|value| (arm, value)))
                 .collect()
@@ -1795,13 +1946,45 @@ mod tests {
         assert!(!retrieval_disagreed(&pair(Some(true), None)));
     }
 
+    /// A Tree turn never runs memory recall, so Classic recalling beside it
+    /// is the module and voids nothing. Two Classic arms still disagree with a
+    /// Tree arm beside them.
+    #[test]
+    fn retrieval_is_compared_within_one_memory_module_only() {
+        let classic_and_tree: BTreeMap<Arm, bool> = [(Arm::LEAN, true), (Arm::LEAN_TREE, false)]
+            .into_iter()
+            .collect();
+        assert!(!retrieval_disagreed(&classic_and_tree));
+        let three: BTreeMap<Arm, bool> = [
+            (Arm::CONTROL, true),
+            (Arm::LEAN, false),
+            (Arm::LEAN_TREE, false),
+        ]
+        .into_iter()
+        .collect();
+        assert!(retrieval_disagreed(&three));
+    }
+
+    /// Delivery compares across modules: a Tree arm that failed where Classic
+    /// delivered is a divergence like any other.
+    #[test]
+    fn a_tree_arm_can_diverge_from_its_classic_twin() {
+        let by_arm: BTreeMap<Arm, CompletionOutcome> = [
+            (Arm::LEAN, CompletionOutcome::Pass),
+            (Arm::LEAN_TREE, CompletionOutcome::Fail),
+        ]
+        .into_iter()
+        .collect();
+        assert!(completion_diverged(&by_arm));
+    }
+
     /// A task one arm delivered and the other did not is a divergence. A void
     /// is not: the arms did not both answer, so there is nothing to disagree
     /// about.
     #[test]
     fn a_task_one_arm_delivered_and_the_other_did_not_is_a_divergence() {
         let pair = |control, lean| -> BTreeMap<Arm, CompletionOutcome> {
-            [(Arm::Control, control), (Arm::Lean, lean)]
+            [(Arm::CONTROL, control), (Arm::LEAN, lean)]
                 .into_iter()
                 .collect()
         };
@@ -1825,9 +2008,9 @@ mod tests {
     /// threads far apart in time. Provider drift then lands on one arm alone.
     #[test]
     fn one_arm_running_the_whole_sequence_first_fails_the_interleave_check() {
-        let mut rows = vec![run_row("r1", 200_000, vec![Arm::Control, Arm::Lean])];
+        let mut rows = vec![run_row("r1", 200_000, vec![Arm::CONTROL, Arm::LEAN])];
         let mut at = 1_767_225_600;
-        for arm in [Arm::Control, Arm::Lean] {
+        for arm in [Arm::CONTROL, Arm::LEAN] {
             for task in ["T01", "T02"] {
                 let mut thread = thread_row(Thread {
                     run_id: "r1",
@@ -1857,11 +2040,11 @@ mod tests {
     #[test]
     fn two_arms_from_separate_runs_are_flagged_as_not_interleaved() {
         let mut rows = one_configuration();
-        rows.push(run_row("r2", 200_000, vec![Arm::Control]));
+        rows.push(run_row("r2", 200_000, vec![Arm::CONTROL]));
         for task in ["T01", "T02"] {
             rows.push(thread_row(Thread {
                 run_id: "r2",
-                arm: Arm::Control,
+                arm: Arm::CONTROL,
                 task,
                 rounds: 5,
                 usd: 3.0,
@@ -1871,11 +2054,11 @@ mod tests {
             }));
             rows.push(completion_row(
                 "r2",
-                Arm::Control,
+                Arm::CONTROL,
                 task,
                 CompletionOutcome::Pass,
             ));
-            rows.push(probe_row("r2", Arm::Control, task, "P.1", Outcome::Pass));
+            rows.push(probe_row("r2", Arm::CONTROL, task, "P.1", Outcome::Pass));
         }
         let analysis = analyse(&rows).unwrap();
         assert_eq!(analysis.comparisons.len(), 1);

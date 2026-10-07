@@ -43,6 +43,11 @@ let installed = false;
  *  bit: a hide sets it and fires the hide side, a wake clears it and fires the
  *  wake side, and an event that would not change it fires nothing. */
 let away = false;
+/** Hides seen since install, so `watchPageAway` can tell a hide it slept
+ *  through. Bumped only on a real change of the away bit. */
+let hides = 0;
+/** Set once a probe watches, so the listeners outlive the last subscriber. */
+let watched = false;
 
 function fire(listeners: Set<Listener>): void {
   // Copied, so a listener that unsubscribes itself (or a sibling) mid-fire
@@ -53,6 +58,7 @@ function fire(listeners: Set<Listener>): void {
 function goAway(): void {
   if (away) return;
   away = true;
+  hides += 1;
   fire(hideListeners);
 }
 
@@ -95,7 +101,7 @@ function install(): void {
 }
 
 function uninstallIfIdle(): void {
-  if (!installed || wakeListeners.size > 0 || hideListeners.size > 0) return;
+  if (!installed || watched || wakeListeners.size > 0 || hideListeners.size > 0) return;
   installed = false;
   boundDoc?.removeEventListener('visibilitychange', onVisibilityChange);
   boundWin?.removeEventListener('pagehide', goAway);
@@ -128,12 +134,25 @@ export function onPageHide(cb: Listener): () => void {
   return subscribe(hideListeners, cb);
 }
 
+/** Start watching whether the page goes away. The returned check reads true
+ *  when the page was away at the start, is away now, or went away in between.
+ *  iOS freezes a hidden PWA and cuts its network, so a probe that fails across
+ *  a hide says nothing about the thing it probed. */
+export function watchPageAway(): () => boolean {
+  watched = true;
+  install();
+  const awayAtStart = away;
+  const hidesAtStart = hides;
+  return () => awayAtStart || away || hides !== hidesAtStart;
+}
+
 /** Reset every listener and the away bit. Test-only: the module is a singleton
  *  over real `document` / `window` listeners, so a suite that leaves either
  *  behind leaks into the next one. */
 export function _resetPageVisitForTesting(): void {
   wakeListeners.clear();
   hideListeners.clear();
+  watched = false;
   uninstallIfIdle();
   away = false;
 }

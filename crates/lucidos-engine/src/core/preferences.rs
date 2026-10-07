@@ -2,158 +2,11 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::core::preference_catalog::{
+    self as prefs, Flag, Number, Optional, Pref, PrefDefault, PrefSpec, Text,
+};
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
-
-// Background model preference keys. Each is half of a *model selection*: the
-// paired `reasoning_*` key below carries the effort. The pairing is resolved
-// per `ContextPurpose` in `engine::aux_purpose`.
-pub const PREF_MODEL_TITLE: &str = "model_title";
-pub const PREF_MODEL_IMAGE_DESCRIPTION: &str = "model_image_description";
-/// Model the *change summary* is written by. Falls back to [`PREF_MODEL_TITLE`]
-/// while unset: both write one line naming a piece of work.
-pub const PREF_MODEL_CHANGE_SUMMARY: &str = "model_change_summary";
-/// Model for fact extraction.
-///
-/// It used to cover history summarisation and query classification too. Both
-/// have their own key now, [`PREF_MODEL_CONVERSATION_SUMMARY`] and
-/// [`PREF_MODEL_QUERY_CLASSIFICATION`], and both fall back to this one while
-/// unset. So a workspace that pinned a model here keeps running all three on it.
-pub const PREF_MODEL_MEMORY: &str = "model_memory";
-/// Model the *conversation summary* is written by, split out of
-/// [`PREF_MODEL_MEMORY`] so the summariser can be named, found and tuned.
-pub const PREF_MODEL_CONVERSATION_SUMMARY: &str = "model_conversation_summary";
-/// Model *query classification* runs on, split out of [`PREF_MODEL_MEMORY`] for
-/// the reason the summariser was: a call the user can choose a backend for needs
-/// a row of its own to choose it in.
-pub const PREF_MODEL_QUERY_CLASSIFICATION: &str = "model_query_classification";
-/// Model the *command guard*'s LLM *judge* uses to classify the ambiguous
-/// middle (ADR 0002, Phase 3). Configurable so a workspace can trade
-/// accuracy/cost; defaults to [`DEFAULT_COMMAND_JUDGE_MODEL`] when unset.
-pub const PREF_MODEL_COMMAND_JUDGE: &str = "model_command_judge";
-
-/// Which backend answers the *command guard*'s classification: `chat` or `jev`.
-///
-/// `chat` is the default and the unset value, and it runs
-/// [`PREF_MODEL_COMMAND_JUDGE`] on the rubric prompt exactly as it always has.
-/// `jev` sends two typed Choice questions to TypeSafe instead, and applies the
-/// safe/danger tie-break in Rust. Read by `llm::judgment::select`, which turns
-/// any other value, and any read failure, into `chat`.
-pub const PREF_JUDGMENT_COMMAND_GUARD: &str = "judgment_command_guard";
-
-/// Which backend answers *query classification*: `chat` or `jev`.
-///
-/// The sibling of [`PREF_JUDGMENT_COMMAND_GUARD`], with the same two values and
-/// the same default. Separate keys because a safety gate and memory retrieval
-/// deserve separate decisions. `chat` runs
-/// [`PREF_MODEL_QUERY_CLASSIFICATION`].
-pub const PREF_JUDGMENT_QUERY_CLASSIFICATION: &str = "judgment_query_classification";
-
-/// The rented *talker* a *voice session* speaks through (ADR 0149).
-///
-/// A bare model id, and deliberately NOT a chat-model registry row: the
-/// registry serves `RoutingProvider`, which speaks HTTP and cannot serve a
-/// model that holds a socket open.
-pub const PREF_MODEL_VOICE_TALKER: &str = "model_voice_talker";
-
-/// The model turning the caller's speech into text, inside the talker's socket.
-///
-/// The second model in the voice loop, and the only other one: nothing
-/// translates and nothing summarises. Resolved in `voice::build`, which says
-/// why it reads no `ContextPurpose`.
-pub const PREF_MODEL_VOICE_TRANSCRIBER: &str = "model_voice_transcriber";
-
-/// The voice the talker speaks in. A provider's own name for one, not a model.
-pub const PREF_VOICE_TALKER_VOICE: &str = "voice_talker_voice";
-
-/// Which resident-block sections a *voice session* opens with, comma separated.
-///
-/// The block is what voice can answer with no wait, so which sections are in it
-/// is a product choice rather than tuning. Unset means the built-in default
-/// set; see `voice::resident`.
-pub const PREF_VOICE_RESIDENT_SECTIONS: &str = "voice_resident_sections";
-
-// The reasoning-effort half of each background *model selection*. Every one
-// defaults to the effort its call site used to hardcode, so splitting the knob
-// out changed nothing on the day it shipped. The single exception is image
-// description: see `engine::aux_purpose`.
-pub const PREF_REASONING_TITLE: &str = "reasoning_title";
-pub const PREF_REASONING_IMAGE_DESCRIPTION: &str = "reasoning_image_description";
-/// Effort the *change summary* runs at. Falls back to [`PREF_REASONING_TITLE`].
-pub const PREF_REASONING_CHANGE_SUMMARY: &str = "reasoning_change_summary";
-pub const PREF_REASONING_MEMORY: &str = "reasoning_memory";
-pub const PREF_REASONING_CONVERSATION_SUMMARY: &str = "reasoning_conversation_summary";
-/// Effort *query classification* runs at, the other half of
-/// [`PREF_MODEL_QUERY_CLASSIFICATION`]. It answers three yes/no questions, so
-/// its default spends nothing, exactly as [`PREF_REASONING_MEMORY`] does.
-pub const PREF_REASONING_QUERY_CLASSIFICATION: &str = "reasoning_query_classification";
-/// Effort the command-guard judge runs at. Internal like its model sibling: the
-/// agent must not tune its own safety gate.
-pub const PREF_REASONING_COMMAND_JUDGE: &str = "reasoning_command_judge";
-
-/// Default model for the command-guard judge — a cheap, fast model (Haiku) per
-/// ADR 0002. Mirrored on the frontend in
-/// `crates/lucidos-app/src/store/actions/preferences.ts`
-/// (`DEFAULT_COMMAND_JUDGE_MODEL`).
-pub const DEFAULT_COMMAND_JUDGE_MODEL: &str = "claude-haiku-4-5";
-
-/// Default effort for the command-guard judge. It returns a short JSON verdict,
-/// so it buys nothing from deliberation. It also sits in front of every
-/// ambiguous command, so a waiting user pays the latency.
-pub const DEFAULT_COMMAND_JUDGE_REASONING: &str = "none";
-
-// Chat preference keys (also written by frontend Settings UI)
-pub const PREF_CHAT_MODEL: &str = "chat_model";
-pub const PREF_CHAT_REASONING_EFFORT: &str = "chat_reasoning_effort";
-
-/// Which *response style* chat and trigger answers come back in: the id of a
-/// row in the *style library*. Unset means `standard`, which adds nothing.
-pub const PREF_RESPONSE_STYLE: &str = "response_style";
-
-/// The *style library* itself, as one JSON array of `{id, label, instruction}`.
-///
-/// Holds only what the user changed. The shipped styles live in
-/// `core::response_style`, and an entry here whose id matches one overrides it.
-/// Deleting that entry restores the shipped text.
-pub const PREF_RESPONSE_STYLES: &str = "response_styles";
-
-/// The response style's second part: how technical the words are. One of
-/// `core::technical_literacy::IDS`. Unset adds nothing.
-pub const PREF_TECHNICAL_LITERACY: &str = "technical_literacy";
-
-// Coding-agent binary path overrides (also written by frontend Settings UI).
-// Unset = auto-detect (probe list → PATH); a set path wins outright and a
-// wrong one fails the spawn naming the key (see
-// `runtime::spawn_env::resolve_binary_override`).
-pub const PREF_CODING_AGENT_CLAUDE_PATH: &str = "coding_agent_claude_path";
-pub const PREF_CODING_AGENT_CODEX_PATH: &str = "coding_agent_codex_path";
-
-// Which of Claude Code's own permission modes its threads run in. Unset =
-// `accept-edits`, the mode every session ran before this existed. Claude Code
-// only; resolved by `runtime::claude_code::resolve_permission_mode`.
-pub const PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE: &str = "coding_agent_claude_permission_mode";
-
-/// Default chat model when neither user preference nor `LUCIDOS_MODEL` env is set.
-/// Mirrored on the frontend in `crates/lucidos-app/src/store/models.ts`.
-pub const DEFAULT_CHAT_MODEL: &str = "claude-opus-5";
-
-// Vertex AI configuration
-pub const PREF_VERTEX_REGION: &str = "vertex_region";
-
-/// Region used when neither the `vertex_region` preference nor the
-/// `VERTEX_REGION` env var is set. Mirrored on the frontend in
-/// `crates/lucidos-app/src/store/actions/preferences.ts`.
-pub const DEFAULT_VERTEX_REGION: &str = "europe-west1";
-
-// Local OpenAI-compatible provider base URL (also written by frontend Settings
-// UI). Points the `local` provider at Ollama / LM Studio / vLLM / llama.cpp.
-pub const PREF_LOCAL_BASE_URL: &str = "local_base_url";
-
-/// Default base URL for the `local` provider when neither the `local_base_url`
-/// preference nor the `LUCIDOS_LOCAL_BASE_URL` env var is set — Ollama's
-/// OpenAI-compatible endpoint. Mirrored on the frontend in
-/// `crates/lucidos-app/src/components/settings/LocalProviderSettings.tsx`.
-pub const DEFAULT_LOCAL_BASE_URL: &str = "http://localhost:11434/v1";
 
 /// Why `url` cannot be the `local_base_url` preference, or `None` when it can.
 ///
@@ -169,8 +22,9 @@ pub fn local_base_url_rejection(url: &str) -> Option<String> {
     let url = url.trim();
     let refuse = |why: &str| {
         Some(format!(
-            "local_base_url '{url}' {why}. Use an address on this machine or your own \
-             network, such as {DEFAULT_LOCAL_BASE_URL}"
+            "{} '{url}' {why}. Use an address on this machine or your own network, such as {}",
+            prefs::LOCAL_BASE_URL.key(),
+            prefs::LOCAL_BASE_URL.default_text()
         ))
     };
     let Ok(parsed) = reqwest::Url::parse(url) else {
@@ -223,110 +77,6 @@ fn name_is_on_own_network(host: &str) -> bool {
             .any(|suffix| host.ends_with(suffix))
 }
 
-// How long the engine proxy waits on one upstream request, in seconds. An
-// `apis.json` entry's own `timeout_secs` wins over it (`api::proxy_timeout`).
-pub const PREF_PROXY_TIMEOUT_SECS: &str = "proxy_timeout_secs";
-
-// The keyless OpenCode Free tier, off unless the user turns it on (also written
-// by frontend Settings UI). A preference rather than a credential because there
-// is no secret: the relay serves the free models anonymously.
-pub const PREF_OPENCODE_FREE_ENABLED: &str = "opencode_free_enabled";
-
-// Per-provider enable switches, written by Settings → Models → Providers.
-//
-// ABSENT MEANS ENABLED. A provider still builds from its credential or its env
-// var, and only an explicit "false" holds it back. So a workspace that never
-// touched a switch resolves the identical provider set. The switch leaves the
-// credential alone: turning a provider off is how a user parks a key they still
-// want stored.
-//
-// OpenCode Free is deliberately not in this family. It is opt-IN by ADR 0104
-// and keeps `opencode_free_enabled`, whose absence means OFF.
-pub const PREF_PROVIDER_ENABLED_VERTEX: &str = "provider_enabled_vertex";
-pub const PREF_PROVIDER_ENABLED_ANTHROPIC: &str = "provider_enabled_anthropic";
-pub const PREF_PROVIDER_ENABLED_OPENAI: &str = "provider_enabled_openai";
-pub const PREF_PROVIDER_ENABLED_OPENROUTER: &str = "provider_enabled_openrouter";
-pub const PREF_PROVIDER_ENABLED_XAI: &str = "provider_enabled_xai";
-pub const PREF_PROVIDER_ENABLED_LOCAL: &str = "provider_enabled_local";
-
-/// The master switch over TypeSafe's Jev, in the same family and with the same
-/// absent-means-enabled rule as the six above.
-///
-/// Deliberately NOT one of them. Jev holds no conversation, so it has no
-/// `ProviderKind` and never reaches `llm::provider_build` (ADR 0220). It is
-/// read per call by `llm::judgment::select::jev_for`, which returns `None`
-/// while the switch is off, so both classification sites run their chat path.
-/// Off leaves the `typesafe` credential alone.
-pub const PREF_PROVIDER_ENABLED_TYPESAFE: &str = "provider_enabled_typesafe";
-
-// Image generation model (also written by frontend Settings UI)
-pub const PREF_IMAGE_MODEL: &str = "image_model";
-
-// When off, ContextCaptured still fires per LLM call but section
-// bodies are dropped. Only the name and the two sizes survive. Defaults
-// to "true" to preserve historical behavior.
-pub(crate) const PREF_CAPTURE_CONTEXT: &str = "capture_context";
-
-// Master toggle for the *command guard* (ADR 0002): the pre-dispatch safety
-// gate over the Lucidos Agent's bash/python tools. Off by default — the feature
-// ships dark and is enabled per-workspace. See `engine::command_guard`.
-pub(crate) const PREF_COMMAND_GUARD: &str = "command_guard";
-
-// Master toggle for voice, the whole feature. Off by default: voice is
-// experimental, it spends on a rented talker, and every spoken turn runs an
-// ordinary agent turn. A workspace opts in. See `voice::`.
-pub const PREF_VOICE_ENABLED: &str = "voice_enabled";
-
-// Sub-toggle for the command-guard *judge* (ADR 0002, Phase 3). When the guard
-// is on, the LLM judge classifies the ambiguous middle (everything the static
-// fast-path doesn't settle). Default on; set to "false" to fall back to the
-// static "dangerous" list for the ask lane (the documented reopen path — accept
-// more misses, pay no per-command LLM cost/latency). Only consulted when the
-// master `command_guard` toggle is on.
-pub(crate) const PREF_COMMAND_GUARD_JUDGE: &str = "command_guard_judge";
-
-/// The *self-curated context mode*, a workspace-wide opt-in. Off by default:
-/// the mode ships dark, and ADR 0087's eval decides whether it ever graduates.
-/// Read once per turn by `LucidosEngine::read_turn_capabilities`, so every
-/// thread in the workspace assembles its prompt the same way.
-///
-/// Tracked as a temporary measure with a removal condition. See
-/// `docs/temporary-measures.md`.
-pub const PREF_SELF_CURATED_CONTEXT_MODE: &str = "self_curated_context_mode";
-
-/// How old a tool result must be before a sweep may take it, in rounds.
-pub const PREF_SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS: &str =
-    "self_curated_context_expire_after_rounds";
-
-/// How often the sweep runs, in rounds.
-pub const PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS: &str =
-    "self_curated_context_sweep_every_rounds";
-
-/// How many tool calls the Lucidos Agent may make in a single turn (chat and
-/// trigger alike) before the agentic loop stops with its `[ENGINE-LIMIT]`
-/// terminator. Human-only: it is in `preference_catalog::INTERNAL_KEYS`, since
-/// the cap is the backstop over the agent's own loop and the agent must not be
-/// able to raise it. Changed in Settings, Models, Chat & triggers.
-pub const PREF_MAX_TOOL_CALLS: &str = "max_tool_calls";
-
-/// The per-turn tool-call cap when `max_tool_calls` is unset. Was the hardcoded
-/// `MAX_ITERATIONS` before the cap became configurable, and keeps that value so
-/// an untouched workspace behaves exactly as before.
-pub const DEFAULT_MAX_TOOL_CALLS: usize = 500;
-
-/// The floor [`PreferenceStore::max_tool_calls`] applies. There is deliberately
-/// no ceiling: a high cap costs the user time and tokens, which is their call to
-/// make. The floor is not a restriction either, it rules out the one value that
-/// is broken rather than merely small. The loop checks `iterations > cap` after
-/// incrementing, so a cap of `0` fires the backstop before the first LLM call
-/// and the turn produces nothing but the limit message.
-///
-/// A cap below 5 does pre-empt the generic circuit breaker (which warns at 3
-/// consecutive identical failures and breaks at 5) and `MAX_QUESTION_REASK`, so
-/// a stuck turn ends with `[ENGINE-LIMIT]` instead of a breaker message. That is
-/// the honest consequence of asking for a tiny cap, not a reason to refuse one.
-pub const MIN_MAX_TOOL_CALLS: usize = 1;
-
 /// Store for managing user preferences in the database.
 ///
 /// **Announcing is the default, and the silent door is guarded.**
@@ -334,7 +84,7 @@ pub const MIN_MAX_TOOL_CALLS: usize = 1;
 /// `PreferencesChanged` from inside the write path; the raw row writes are
 /// private to this module. [`Self::set_silent`] exists for the handful of keys
 /// that are engine bookkeeping rather than settings, and it REJECTS any key
-/// absent from `preference_catalog::SILENT_PREF_KEYS`, so it cannot be used to
+/// that is not a `PrefAccess::Engine` catalog spec, so it cannot be used to
 /// write a user-visible preference quietly.
 ///
 /// That inversion matters here more than for the other stores, because
@@ -375,6 +125,8 @@ impl ResolvedModelSelection {
                 .provider
                 .as_deref()
                 .and_then(crate::llm::model_registry::ProviderKind::from_name),
+            // A turn: never capped, so a long valid stream runs to its end.
+            attempt_timeout: None,
         }
     }
 }
@@ -443,8 +195,11 @@ impl PreferenceStore {
         Ok(())
     }
 
-    /// Get a global preference by key (device_id IS NULL)
-    pub async fn get(pool: &PgPool, key: &str) -> Result<Option<String>, sqlx::Error> {
+    /// Get a global preference by key (device_id IS NULL).
+    ///
+    /// **Private on purpose**: a reader goes through a typed [`Pref`] handle,
+    /// which resolves an unset key to its catalog default.
+    async fn get(pool: &PgPool, key: &str) -> Result<Option<String>, sqlx::Error> {
         let result = sqlx::query_scalar::<_, String>(
             "SELECT value FROM preferences WHERE key = $1 AND device_id IS NULL",
         )
@@ -455,22 +210,9 @@ impl PreferenceStore {
         Ok(result)
     }
 
-    /// A global preference trimmed, with a blank value read as unset. A failed
-    /// read is logged under `label` and also reads as unset, for a caller that
-    /// then falls back to its default.
-    pub async fn get_nonblank(pool: &PgPool, key: &str, label: &str) -> Option<String> {
-        Self::get(pool, key)
-            .await
-            .unwrap_or_else(|e| {
-                log!("[{}] Failed to load {} preference: {}", label, key, e);
-                None
-            })
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    }
-
-    /// Get a preference for a specific device, falling back to the global value
-    pub async fn get_for_device(
+    /// Get a preference for a specific device, falling back to the global value.
+    /// Private for the same reason as [`Self::get`].
+    async fn get_for_device(
         pool: &PgPool,
         key: &str,
         device_id: &str,
@@ -588,11 +330,11 @@ impl PreferenceStore {
     /// Write a preference key that is engine bookkeeping rather than a setting,
     /// without announcing.
     ///
-    /// **Rejects any key not listed in
-    /// [`preference_catalog::SILENT_PREF_KEYS`]**, which is what stops this
-    /// from becoming the easy way to skip an announcement. Reach for
-    /// [`Self::set`] for anything a user can see; if a genuinely internal key
-    /// is missing from the list, add it there with its reason.
+    /// **Rejects any key that is not a `PrefAccess::Engine` catalog spec**
+    /// (`preference_catalog::is_silent_key`), which is what stops this from
+    /// becoming the easy way to skip an announcement. Reach for [`Self::set`]
+    /// for anything a user can see. A genuinely internal key takes an `Engine`
+    /// spec with its reason.
     pub async fn set_silent(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
         if !crate::core::preference_catalog::is_silent_key(key) {
             // A protocol violation by the caller, not a database failure. sqlx's
@@ -600,8 +342,8 @@ impl PreferenceStore {
             // message: the alternative is a second error type for one call site.
             return Err(sqlx::Error::Protocol(format!(
                 "'{key}' is not an engine-internal preference key, so it must be written through \
-                 PreferenceStore::set (which announces PreferencesChanged). Add it to \
-                 SILENT_PREF_KEYS with a reason if it really is internal state."
+                 PreferenceStore::set (which announces PreferencesChanged). Give it a \
+                 PrefAccess::Engine catalog spec with a reason if it really is internal state."
             )));
         }
         Self::set_row(pool, key, value).await
@@ -627,92 +369,7 @@ impl PreferenceStore {
             .await;
     }
 
-    /// Check if a global preference exists
-    pub async fn exists(pool: &PgPool, key: &str) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM preferences WHERE key = $1 AND device_id IS NULL)",
-        )
-        .bind(key)
-        .fetch_one(pool)
-        .await?;
-
-        Ok(result)
-    }
-
-    /// Read the per-step context-capture toggle. Returns `Ok(false)` when
-    /// unset — the debugging capture ships dark and is enabled per-workspace;
-    /// set the preference to `"true"` to opt in. DB errors propagate as `Err`
-    /// so callers can surface a real failure instead of silently defaulting.
-    pub async fn capture_context(pool: &PgPool) -> Result<bool, sqlx::Error> {
-        Self::get(pool, PREF_CAPTURE_CONTEXT)
-            .await
-            .map(|opt| opt.map(|v| v == "true").unwrap_or(false))
-    }
-
-    /// Read the *command guard* toggle (ADR 0002). The command guard is a
-    /// pre-dispatch safety gate over the Lucidos Agent's bash/python tools.
-    /// Returns `Ok(false)` when unset — the feature ships dark and is enabled
-    /// per-workspace. DB errors propagate as `Err` so a real failure surfaces
-    /// rather than silently disabling the guard.
-    pub async fn command_guard(pool: &PgPool) -> Result<bool, sqlx::Error> {
-        Self::get(pool, PREF_COMMAND_GUARD)
-            .await
-            .map(|opt| opt.map(|v| v == "true").unwrap_or(false))
-    }
-
-    /// Read the master voice toggle.
-    ///
-    /// Total by construction, and the direction is deliberate. An absent row and
-    /// an unreadable one both resolve OFF, which is what an experiment nobody
-    /// opted into should do. Resolving ON would open a paid rented talker on a
-    /// transient database error (`.claude/rules/rust.md`).
-    pub async fn voice_enabled(pool: &PgPool) -> bool {
-        match Self::get(pool, PREF_VOICE_ENABLED).await {
-            Ok(value) => value.as_deref() == Some("true"),
-            Err(e) => {
-                log!("[Voice] Could not read {}: {}", PREF_VOICE_ENABLED, e);
-                false
-            }
-        }
-    }
-
-    /// Read the command-guard *judge* sub-toggle (ADR 0002, Phase 3). Returns
-    /// `Ok(true)` when unset — when the master guard is on, the judge is the
-    /// real classifier by default; set the preference to `"false"` to fall back
-    /// to the static dangerous list. DB errors propagate as `Err`. Only
-    /// meaningful when [`command_guard`](Self::command_guard) is on.
-    pub async fn command_guard_judge(pool: &PgPool) -> Result<bool, sqlx::Error> {
-        Self::get(pool, PREF_COMMAND_GUARD_JUDGE)
-            .await
-            .map(|opt| opt.map(|v| v != "false").unwrap_or(true))
-    }
-
-    /// Read the *self-curated context mode* toggle.
-    ///
-    /// Total by construction, and the direction is the point. An absent row and
-    /// an unreadable one both resolve OFF, because OFF is today's behaviour.
-    /// Resolving ON would drop long-term memory and the conversation history
-    /// out of a thread nobody opted in, on a transient database error
-    /// (`.claude/rules/rust.md`).
-    pub async fn self_curated_context_mode(pool: &PgPool) -> bool {
-        match Self::get(pool, PREF_SELF_CURATED_CONTEXT_MODE).await {
-            Ok(value) => value.as_deref() == Some("true"),
-            Err(e) => {
-                log!(
-                    "[Preferences] Failed to read {}: {}. Leaving the self-curated context mode off",
-                    PREF_SELF_CURATED_CONTEXT_MODE,
-                    e
-                );
-                false
-            }
-        }
-    }
-
-    /// When results leave, as this workspace has it set.
-    ///
-    /// Both numbers are provisional, so they live beside the mode's own key
-    /// rather than in the binary. An unreadable row falls back to the default,
-    /// which is the behaviour the prompt describes.
+    /// The pair of numbers that schedules the self-curated context sweep.
     ///
     /// Returns the schedule itself rather than a pair of bare `usize`. The two
     /// numbers are adjacent and interchangeable to the compiler. A
@@ -722,155 +379,36 @@ impl PreferenceStore {
         pool: &PgPool,
     ) -> crate::engine::SweepSchedule {
         crate::engine::SweepSchedule::new(
-            Self::rounds_pref(
-                pool,
-                PREF_SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS,
-                crate::engine::DEFAULT_EXPIRE_AFTER_ROUNDS,
-            )
-            .await,
-            Self::rounds_pref(
-                pool,
-                PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS,
-                crate::engine::DEFAULT_SWEEP_EVERY_ROUNDS,
-            )
-            .await,
+            prefs::SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS
+                .read(pool)
+                .await
+                .round() as usize,
+            prefs::SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS
+                .read(pool)
+                .await
+                .round() as usize,
         )
     }
 
-    /// A round count from a preference row, or the default.
-    ///
-    /// Parsed as `f64` and rounded, matching what the catalog validates
-    /// (`PrefValue::Number`). It accepts `"20.0"` there. An integer-only parse
-    /// here would store that value, show it in Settings, and sweep at the
-    /// default anyway. A value that will not parse says so, rather than falling
-    /// back in silence.
-    async fn rounds_pref(pool: &PgPool, key: &str, fallback: usize) -> usize {
-        match Self::get(pool, key).await {
-            Ok(Some(raw)) => match raw.trim().parse::<f64>() {
-                Ok(n) if n >= 1.0 && n.is_finite() => n.round() as usize,
-                _ => {
-                    log!(
-                        "[Preferences] {} is not a round count ({:?}). Using {}",
-                        key,
-                        raw,
-                        fallback
-                    );
-                    fallback
-                }
-            },
-            Ok(None) => fallback,
-            Err(e) => {
-                log!(
-                    "[Preferences] Failed to read {}: {}. Using {}",
-                    key,
-                    e,
-                    fallback
-                );
-                fallback
-            }
-        }
-    }
-
-    /// The model the command-guard judge runs on, defaulting to
-    /// [`DEFAULT_COMMAND_JUDGE_MODEL`] (Haiku) when unset. DB errors are logged
-    /// and treated as unset — the judge falls back to the default model rather
-    /// than failing the whole classification.
-    pub async fn command_judge_model(pool: &PgPool) -> String {
-        match Self::get(pool, PREF_MODEL_COMMAND_JUDGE).await {
-            Ok(Some(m)) if !m.trim().is_empty() => m,
-            Ok(_) => DEFAULT_COMMAND_JUDGE_MODEL.to_string(),
-            Err(e) => {
-                log!(
-                    "[Preferences] Failed to read {}: {} — using default judge model",
-                    PREF_MODEL_COMMAND_JUDGE,
-                    e
-                );
-                DEFAULT_COMMAND_JUDGE_MODEL.to_string()
-            }
-        }
-    }
-
-    /// The effort the command-guard judge runs at, the other half of its
-    /// *model selection*. Defaults to `none`: the judge answers with a short
-    /// JSON verdict, and it sits in front of every ambiguous command the agent
-    /// runs. Total in the same way [`Self::command_judge_model`] is.
-    pub async fn command_judge_reasoning(pool: &PgPool) -> String {
-        match Self::get(pool, PREF_REASONING_COMMAND_JUDGE).await {
-            Ok(Some(e)) if !e.trim().is_empty() => e,
-            Ok(_) => DEFAULT_COMMAND_JUDGE_REASONING.to_string(),
-            Err(e) => {
-                log!(
-                    "[Preferences] Failed to read {}: {}. Using the default judge effort",
-                    PREF_REASONING_COMMAND_JUDGE,
-                    e
-                );
-                DEFAULT_COMMAND_JUDGE_REASONING.to_string()
-            }
-        }
-    }
-
-    /// Resolve the per-turn tool-call cap for one turn.
-    ///
-    /// Total by construction: this is the loop's runaway backstop, and refusing
-    /// to run a turn because a preference row is malformed is strictly worse
-    /// than running it at the default. So an absent row, an unparseable value,
-    /// and a DB error all resolve to [`DEFAULT_MAX_TOOL_CALLS`] (the error is
-    /// logged, matching [`Self::command_judge_model`]), and a parsed value is
-    /// raised to [`MIN_MAX_TOOL_CALLS`] if it is below it.
-    ///
-    /// A large value is honored as written. There is no ceiling on purpose:
-    /// see [`MIN_MAX_TOOL_CALLS`] for why the floor is the only clamp.
+    /// The per-turn tool-call cap for one turn. Total, because it is the
+    /// loop's runaway backstop: an absent, unparseable or unreadable row runs
+    /// the turn at the catalog default rather than refusing it.
     pub async fn max_tool_calls(pool: &PgPool) -> usize {
-        let raw = match Self::get(pool, PREF_MAX_TOOL_CALLS).await {
-            Ok(Some(v)) => v,
-            Ok(None) => return DEFAULT_MAX_TOOL_CALLS,
-            Err(e) => {
-                log!(
-                    "[Preferences] Failed to read {}: {}. Using the default cap of {}",
-                    PREF_MAX_TOOL_CALLS,
-                    e,
-                    DEFAULT_MAX_TOOL_CALLS
-                );
-                return DEFAULT_MAX_TOOL_CALLS;
-            }
-        };
-        // Parsing as usize rejects a negative outright, which is what we want:
-        // "-5" is not a smaller cap, it is not a cap at all, so it falls back to
-        // the default rather than silently becoming the floor.
-        match raw.trim().parse::<usize>() {
-            Ok(n) => n.max(MIN_MAX_TOOL_CALLS),
-            Err(_) => {
-                log!(
-                    "[Preferences] {} is not a number ({:?}). Using the default cap of {}",
-                    PREF_MAX_TOOL_CALLS,
-                    raw,
-                    DEFAULT_MAX_TOOL_CALLS
-                );
-                DEFAULT_MAX_TOOL_CALLS
-            }
-        }
+        prefs::MAX_TOOL_CALLS.read(pool).await as usize
     }
 
-    /// Read the user's chat model + reasoning effort preferences for code
-    /// paths that originate a chat without an explicit user request
-    /// (spawn_thread, process_trigger). DB errors are logged and treated as
-    /// "unset" — callers fall back to the engine default.
-    pub async fn user_chat_settings(pool: &PgPool) -> (Option<String>, Option<String>) {
-        let model = Self::get(pool, PREF_CHAT_MODEL).await.unwrap_or_else(|e| {
-            log!("[Preferences] Failed to read {}: {}", PREF_CHAT_MODEL, e);
-            None
-        });
-        let effort = Self::get(pool, PREF_CHAT_REASONING_EFFORT)
-            .await
-            .unwrap_or_else(|e| {
-                log!(
-                    "[Preferences] Failed to read {}: {}",
-                    PREF_CHAT_REASONING_EFFORT,
-                    e
-                );
-                None
-            });
-        (model, effort)
+    /// The account's chat model and reasoning effort, for code paths that start
+    /// a chat without an explicit user request (spawn_thread, process_trigger).
+    ///
+    /// The model is `None` while unset, because the provider layers
+    /// `LUCIDOS_MODEL` over the catalog default at boot. The effort always
+    /// resolves, to the catalog default while unset, so every route runs a
+    /// fresh thread at the same effort.
+    pub async fn user_chat_settings(pool: &PgPool) -> (Option<String>, String) {
+        (
+            prefs::CHAT_MODEL.stored(pool).await,
+            prefs::CHAT_REASONING_EFFORT.read(pool).await,
+        )
     }
 
     /// Read the model + reasoning effort a thread last ran with — the values
@@ -1028,9 +566,179 @@ impl PreferenceStore {
         let (pref_model, pref_effort) = Self::user_chat_settings(pool).await;
         ResolvedModelSelection {
             model: model.or(pref_model),
-            reasoning_effort: effort.or(pref_effort),
+            reasoning_effort: effort.or(Some(pref_effort)),
             provider,
         }
+    }
+}
+
+/// Logs a failed read, for a handle read that then falls back to its default.
+fn log_read_failure(key: &str, e: &sqlx::Error) {
+    log!(
+        "[Preferences] Failed to read {}: {}. Using its default",
+        key,
+        e
+    );
+}
+
+/// A stored value trimmed, with a blank one read as unset.
+fn nonblank(stored: Option<String>) -> Option<String> {
+    stored
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+impl<K> Pref<K> {
+    /// The stored global row, untouched. `Ok(None)` when no row exists.
+    pub async fn try_stored(&self, pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
+        PreferenceStore::get(pool, self.key()).await
+    }
+
+    /// [`Self::try_stored`], with a failed read logged and read as unset.
+    pub async fn stored(&self, pool: &PgPool) -> Option<String> {
+        self.try_stored(pool).await.unwrap_or_else(|e| {
+            log_read_failure(self.key(), &e);
+            None
+        })
+    }
+
+    /// The stored row for `device_id`, else the global one.
+    pub async fn try_stored_for_device(
+        &self,
+        pool: &PgPool,
+        device_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        PreferenceStore::get_for_device(pool, self.key(), device_id).await
+    }
+}
+
+impl Pref<Flag> {
+    /// `stored` read as a switch, or the default when absent or neither on nor
+    /// off.
+    pub fn resolve(&self, stored: Option<&str>) -> bool {
+        stored
+            .and_then(prefs::parse_flag)
+            .unwrap_or_else(|| self.default_flag())
+    }
+
+    pub async fn try_read(&self, pool: &PgPool) -> Result<bool, sqlx::Error> {
+        Ok(self.resolve(self.try_stored(pool).await?.as_deref()))
+    }
+
+    /// Total: a failed read is logged and resolves to the default.
+    pub async fn read(&self, pool: &PgPool) -> bool {
+        self.resolve(self.stored(pool).await.as_deref())
+    }
+}
+
+impl Pref<Number> {
+    /// `stored` parsed, or the default when it is absent, not a number, or
+    /// outside the spec's bounds. An out-of-range value is not a setting at
+    /// all, so it reads as unset like any other value the catalog refuses.
+    pub fn resolve(&self, stored: Option<&str>) -> f64 {
+        let (min, max) = self.bounds();
+        stored
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|n| (min..=max).contains(n))
+            .unwrap_or_else(|| self.default_number())
+    }
+
+    pub async fn try_read(&self, pool: &PgPool) -> Result<f64, sqlx::Error> {
+        Ok(self.resolve(self.try_stored(pool).await?.as_deref()))
+    }
+
+    /// Total: a failed read is logged and resolves to the default.
+    pub async fn read(&self, pool: &PgPool) -> f64 {
+        self.resolve(self.stored(pool).await.as_deref())
+    }
+}
+
+/// `spec`'s value: the stored row when it is valid, else its default,
+/// following an inherited default to the spec that holds the value.
+async fn resolve_text(pool: &PgPool, spec: &PrefSpec) -> Result<String, sqlx::Error> {
+    let stored = nonblank(PreferenceStore::get(pool, spec.key).await?)
+        .filter(|v| prefs::validate(spec, v).is_ok());
+    if let Some(value) = stored {
+        return Ok(value);
+    }
+    match spec.default {
+        PrefDefault::Value(value) => Ok(value.to_string()),
+        PrefDefault::Inherits(other) => Box::pin(resolve_text(pool, other)).await,
+        PrefDefault::Unset(_) => {
+            unreachable!("a text handle's default chain ends in a value")
+        }
+    }
+}
+
+impl Pref<Text> {
+    /// `stored` when it is a valid value, else the default. Only for a spec
+    /// whose default is a value: an inherited default needs the database, so
+    /// it goes through [`Self::try_read`].
+    pub fn resolve(&self, stored: Option<&str>) -> String {
+        stored
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && prefs::validate(&self.spec, v).is_ok())
+            .unwrap_or_else(|| self.default_text())
+            .to_string()
+    }
+
+    pub async fn try_read(&self, pool: &PgPool) -> Result<String, sqlx::Error> {
+        resolve_text(pool, &self.spec).await
+    }
+
+    /// Total: a failed read is logged and resolves to the default.
+    pub async fn read(&self, pool: &PgPool) -> String {
+        self.try_read(pool).await.unwrap_or_else(|e| {
+            log_read_failure(self.key(), &e);
+            self.default_text().to_string()
+        })
+    }
+
+    /// The first value stored along the inheritance chain, without the
+    /// chain's final default. For a reader whose unset case means something
+    /// other than that default: an unset background model resolves against
+    /// the configured providers (`engine::aux_purpose`).
+    pub async fn stored_or_inherited(&self, pool: &PgPool) -> Option<String> {
+        let mut spec = &self.spec;
+        loop {
+            let stored = PreferenceStore::get(pool, spec.key)
+                .await
+                .unwrap_or_else(|e| {
+                    log_read_failure(spec.key, &e);
+                    None
+                });
+            if let Some(value) = nonblank(stored) {
+                return Some(value);
+            }
+            match spec.default {
+                PrefDefault::Inherits(other) => spec = other,
+                PrefDefault::Value(_) | PrefDefault::Unset(_) => return None,
+            }
+        }
+    }
+
+    /// The device's value, else the global one, else the default.
+    pub async fn read_for_device(&self, pool: &PgPool, device_id: &str) -> String {
+        let stored = self
+            .try_stored_for_device(pool, device_id)
+            .await
+            .unwrap_or_else(|e| {
+                log_read_failure(self.key(), &e);
+                None
+            });
+        self.resolve(stored.as_deref())
+    }
+}
+
+impl Pref<Optional> {
+    /// The stored value trimmed, `None` while unset or blank.
+    pub async fn try_read(&self, pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
+        Ok(nonblank(self.try_stored(pool).await?))
+    }
+
+    /// Total: a failed read is logged and reads as unset.
+    pub async fn read(&self, pool: &PgPool) -> Option<String> {
+        nonblank(self.stored(pool).await)
     }
 }
 
@@ -1044,7 +752,7 @@ mod tests {
     #[test]
     fn a_local_base_url_on_this_machine_or_own_network_is_accepted() {
         for url in [
-            DEFAULT_LOCAL_BASE_URL,
+            prefs::LOCAL_BASE_URL.default_text(),
             "http://127.0.0.1:1234/v1",
             "http://[::1]:8080/v1",
             "http://0.0.0.0:11434/v1",
@@ -1080,7 +788,7 @@ mod tests {
             "not a url",
         ] {
             let reason = local_base_url_rejection(url).unwrap_or_else(|| panic!("{url} passed"));
-            assert!(reason.contains("local_base_url"), "{reason}");
+            assert!(reason.contains(prefs::LOCAL_BASE_URL.key()), "{reason}");
         }
     }
 
@@ -1114,28 +822,32 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
 
-        PreferenceStore::set(&pool, &bus, "theme-mode", "dark", None)
+        PreferenceStore::set(&pool, &bus, prefs::THEME_MODE.key(), "dark", None)
             .await
             .unwrap();
         assert_eq!(emitted(&pool, "PreferencesChanged").await, 1);
 
-        PreferenceStore::set(&pool, &bus, "theme-mode", "dark", None)
+        PreferenceStore::set(&pool, &bus, prefs::THEME_MODE.key(), "dark", None)
             .await
             .unwrap();
         assert_eq!(emitted(&pool, "PreferencesChanged").await, 2);
 
-        PreferenceStore::set_for_device(&pool, &bus, "theme-mode", "light", "d1", None)
+        PreferenceStore::set_for_device(&pool, &bus, prefs::THEME_MODE.key(), "light", "d1", None)
             .await
             .unwrap();
         assert_eq!(emitted(&pool, "PreferencesChanged").await, 3);
 
-        assert!(PreferenceStore::delete(&pool, &bus, "theme-mode", None)
-            .await
-            .unwrap());
+        assert!(
+            PreferenceStore::delete(&pool, &bus, prefs::THEME_MODE.key(), None)
+                .await
+                .unwrap()
+        );
         assert_eq!(emitted(&pool, "PreferencesChanged").await, 4);
-        assert!(!PreferenceStore::delete(&pool, &bus, "theme-mode", None)
-            .await
-            .unwrap());
+        assert!(
+            !PreferenceStore::delete(&pool, &bus, prefs::THEME_MODE.key(), None)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             emitted(&pool, "PreferencesChanged").await,
             4,
@@ -1198,13 +910,16 @@ mod tests {
                 .unwrap()
             }
         };
-        assert_eq!(value("theme-mode", None).await.as_deref(), Some("dark"));
         assert_eq!(
-            value("theme-mode", Some("d1")).await.as_deref(),
+            value(prefs::THEME_MODE.key(), None).await.as_deref(),
+            Some("dark")
+        );
+        assert_eq!(
+            value(prefs::THEME_MODE.key(), Some("d1")).await.as_deref(),
             Some("light")
         );
         assert_eq!(
-            value("theme-mode", Some("d2")).await.as_deref(),
+            value(prefs::THEME_MODE.key(), Some("d2")).await.as_deref(),
             Some("system"),
             "a row already under the new key wins"
         );
@@ -1216,15 +931,17 @@ mod tests {
             "no mode lands under the new key"
         );
         assert_eq!(
-            value("theme-effects", Some("d1")).await.as_deref(),
+            value(prefs::THEME_EFFECTS.key(), Some("d1"))
+                .await
+                .as_deref(),
             Some("reduce")
         );
         assert_eq!(
-            value("font-family", Some("d1")).await.as_deref(),
+            value(prefs::FONT_FAMILY.key(), Some("d1")).await.as_deref(),
             Some("theme")
         );
         assert_eq!(
-            value("font-family", Some("d2")).await.as_deref(),
+            value(prefs::FONT_FAMILY.key(), Some("d2")).await.as_deref(),
             Some("inter")
         );
         let left: i64 = sqlx::query_scalar(
@@ -1302,11 +1019,13 @@ mod tests {
     async fn set_silent_writes_internal_keys_and_refuses_real_preferences() {
         let (pool, db_name) = setup_test_db().await;
 
-        PreferenceStore::set_silent(&pool, "vapid_keys", "{}")
+        PreferenceStore::set_silent(&pool, prefs::VAPID_KEYS.key(), "{}")
             .await
             .expect("a listed internal key writes");
         assert_eq!(
-            PreferenceStore::get(&pool, "vapid_keys").await.unwrap(),
+            PreferenceStore::get(&pool, prefs::VAPID_KEYS.key())
+                .await
+                .unwrap(),
             Some("{}".to_string())
         );
         assert_eq!(
@@ -1315,13 +1034,15 @@ mod tests {
             "an internal key is not a setting and must not announce"
         );
 
-        let refused = PreferenceStore::set_silent(&pool, "theme-mode", "dark").await;
+        let refused = PreferenceStore::set_silent(&pool, prefs::THEME_MODE.key(), "dark").await;
         assert!(
             refused.is_err(),
             "a user-visible preference must not be writable through the silent door"
         );
         assert_eq!(
-            PreferenceStore::get(&pool, "theme-mode").await.unwrap(),
+            PreferenceStore::get(&pool, prefs::THEME_MODE.key())
+                .await
+                .unwrap(),
             None,
             "the refusal must happen before the write, not after"
         );
@@ -1330,12 +1051,53 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
+    /// On an empty table every read is the catalog's default, and nothing
+    /// else: a text handle follows an inherited default to its source, and an
+    /// optional handle reads as unset.
     #[tokio::test]
-    async fn user_chat_settings_returns_none_when_unset() {
+    async fn every_handle_reads_its_catalog_default_on_an_empty_table() {
+        use crate::core::preference_catalog::{PrefValue, CATALOG};
+        let (pool, db_name) = setup_test_db().await;
+        for spec in CATALOG {
+            let text_shaped = !matches!(spec.value, PrefValue::Bool | PrefValue::Number { .. });
+            match spec.default {
+                PrefDefault::Unset(_) => {
+                    assert_eq!(PreferenceStore::get(&pool, spec.key).await.unwrap(), None);
+                }
+                PrefDefault::Value(_) | PrefDefault::Inherits(_) if text_shaped => {
+                    assert_eq!(
+                        Some(resolve_text(&pool, spec).await.unwrap().as_str()),
+                        spec.default_value(),
+                        "{}",
+                        spec.key
+                    );
+                }
+                PrefDefault::Value(_) | PrefDefault::Inherits(_) => {}
+            }
+        }
+        assert_eq!(
+            prefs::COMMAND_GUARD.read(&pool).await,
+            prefs::COMMAND_GUARD.default_flag()
+        );
+        assert_eq!(
+            prefs::PROVIDER_ENABLED_VERTEX.read(&pool).await,
+            prefs::PROVIDER_ENABLED_VERTEX.default_flag()
+        );
+        assert_eq!(
+            prefs::BACKUP_RETENTION.read(&pool).await,
+            prefs::BACKUP_RETENTION.default_number()
+        );
+        assert_eq!(prefs::LANGUAGE.read(&pool).await, None);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn user_chat_settings_resolves_an_unset_effort_to_the_catalog_default() {
         let (pool, db_name) = setup_test_db().await;
         let (model, effort) = PreferenceStore::user_chat_settings(&pool).await;
         assert_eq!(model, None);
-        assert_eq!(effort, None);
+        assert_eq!(effort, prefs::CHAT_REASONING_EFFORT.default_text());
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1343,7 +1105,7 @@ mod tests {
     #[tokio::test]
     async fn capture_context_defaults_to_false_when_unset() {
         let (pool, db_name) = setup_test_db().await;
-        assert!(!PreferenceStore::capture_context(&pool).await.unwrap());
+        assert!(!prefs::CAPTURE_CONTEXT.try_read(&pool).await.unwrap());
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1351,10 +1113,10 @@ mod tests {
     #[tokio::test]
     async fn capture_context_returns_false_when_disabled() {
         let (pool, db_name) = setup_test_db().await;
-        crate::test_support::seed_preference(&pool, PREF_CAPTURE_CONTEXT, "false")
+        crate::test_support::seed_preference(&pool, prefs::CAPTURE_CONTEXT.key(), "false")
             .await
             .unwrap();
-        assert!(!PreferenceStore::capture_context(&pool).await.unwrap());
+        assert!(!prefs::CAPTURE_CONTEXT.try_read(&pool).await.unwrap());
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1362,10 +1124,10 @@ mod tests {
     #[tokio::test]
     async fn capture_context_returns_true_when_explicitly_true() {
         let (pool, db_name) = setup_test_db().await;
-        crate::test_support::seed_preference(&pool, PREF_CAPTURE_CONTEXT, "true")
+        crate::test_support::seed_preference(&pool, prefs::CAPTURE_CONTEXT.key(), "true")
             .await
             .unwrap();
-        assert!(PreferenceStore::capture_context(&pool).await.unwrap());
+        assert!(prefs::CAPTURE_CONTEXT.try_read(&pool).await.unwrap());
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1377,13 +1139,13 @@ mod tests {
     #[tokio::test]
     async fn capture_context_distinguishes_error_from_unset() {
         let (unset_pool, unset_db) = setup_test_db().await;
-        let unset_result = PreferenceStore::capture_context(&unset_pool).await;
+        let unset_result = prefs::CAPTURE_CONTEXT.try_read(&unset_pool).await;
         unset_pool.close().await;
         teardown_test_db(&unset_db).await;
 
         let (err_pool, err_db) = setup_test_db().await;
         err_pool.close().await;
-        let err_result = PreferenceStore::capture_context(&err_pool).await;
+        let err_result = prefs::CAPTURE_CONTEXT.try_read(&err_pool).await;
         teardown_test_db(&err_db).await;
 
         assert_eq!(
@@ -1409,11 +1171,12 @@ mod tests {
     #[tokio::test]
     async fn max_tool_calls_resolves_every_input_to_a_usable_cap() {
         let (pool, db_name) = setup_test_db().await;
+        let default = prefs::MAX_TOOL_CALLS.default_number() as usize;
 
         assert_eq!(
             PreferenceStore::max_tool_calls(&pool).await,
-            DEFAULT_MAX_TOOL_CALLS,
-            "an untouched workspace must keep the pre-setting behavior"
+            prefs::MAX_TOOL_CALLS.default_number() as usize,
+            "an untouched workspace runs at the catalog default"
         );
 
         for (stored, expected, why) in [
@@ -1422,22 +1185,22 @@ mod tests {
             (
                 "1000000",
                 1_000_000,
-                "there is no ceiling: a huge cap is the user's call to make",
+                "a huge cap inside the catalog bound is the user's call to make",
             ),
             (
                 "0",
-                MIN_MAX_TOOL_CALLS,
-                "0 would fire the backstop before the first LLM call, so it is raised to the floor",
+                default,
+                "0 is below the catalog floor, so it reads as unset rather than firing the backstop before the first LLM call",
             ),
             (
                 "-5",
-                DEFAULT_MAX_TOOL_CALLS,
+                default,
                 "a negative is not a cap at all, so it falls back rather than becoming the floor",
             ),
-            ("abc", DEFAULT_MAX_TOOL_CALLS, "garbage falls back"),
-            ("", DEFAULT_MAX_TOOL_CALLS, "an empty value falls back"),
+            ("abc", default, "garbage falls back"),
+            ("", default, "an empty value falls back"),
         ] {
-            crate::test_support::seed_preference(&pool, PREF_MAX_TOOL_CALLS, stored)
+            crate::test_support::seed_preference(&pool, prefs::MAX_TOOL_CALLS.key(), stored)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1464,7 +1227,7 @@ mod tests {
 
         assert_eq!(
             PreferenceStore::max_tool_calls(&pool).await,
-            DEFAULT_MAX_TOOL_CALLS
+            prefs::MAX_TOOL_CALLS.default_number() as usize
         );
 
         teardown_test_db(&db_name).await;
@@ -1473,24 +1236,24 @@ mod tests {
     #[tokio::test]
     async fn user_chat_settings_returns_stored_values() {
         let (pool, db_name) = setup_test_db().await;
-        crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "claude-opus-4-7[1m]")
+        crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "claude-opus-4-7[1m]")
             .await
             .unwrap();
-        crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "max")
+        crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "max")
             .await
             .unwrap();
         let (model, effort) = PreferenceStore::user_chat_settings(&pool).await;
         assert_eq!(model.as_deref(), Some("claude-opus-4-7[1m]"));
-        assert_eq!(effort.as_deref(), Some("max"));
+        assert_eq!(effort, "max");
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
 
     async fn seed_chat_prefs(pool: &PgPool, model: &str, effort: &str) {
-        crate::test_support::seed_preference(pool, PREF_CHAT_MODEL, model)
+        crate::test_support::seed_preference(pool, prefs::CHAT_MODEL.key(), model)
             .await
             .unwrap();
-        crate::test_support::seed_preference(pool, PREF_CHAT_REASONING_EFFORT, effort)
+        crate::test_support::seed_preference(pool, prefs::CHAT_REASONING_EFFORT.key(), effort)
             .await
             .unwrap();
     }
@@ -1549,7 +1312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_chat_overrides_returns_none_when_no_caller_no_prefs() {
+    async fn resolve_chat_overrides_falls_to_the_catalog_effort_when_nothing_is_set() {
         let (pool, db_name) = setup_test_db().await;
         let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
@@ -1559,7 +1322,10 @@ mod tests {
         )
         .await;
         assert_eq!(resolved.model, None);
-        assert_eq!(resolved.reasoning_effort, None);
+        assert_eq!(
+            resolved.reasoning_effort.as_deref(),
+            Some(prefs::CHAT_REASONING_EFFORT.default_text())
+        );
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1673,7 +1439,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_for_thread_reuses_thread_value_over_preference() {
         let (pool, db_name) = setup_test_db().await;
-        seed_chat_prefs(&pool, "pref-model", "pref-effort").await;
+        seed_chat_prefs(&pool, "pref-model", "low").await;
         let tid = Uuid::new_v4();
         insert_message_received(&pool, tid, Some("thread-model"), Some("thread-effort")).await;
         let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
@@ -1711,7 +1477,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_for_thread_falls_back_to_preference_without_thread_record() {
         let (pool, db_name) = setup_test_db().await;
-        seed_chat_prefs(&pool, "pref-model", "pref-effort").await;
+        seed_chat_prefs(&pool, "pref-model", "low").await;
         // A brand-new thread (no messages) → account preference.
         let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
@@ -1721,7 +1487,7 @@ mod tests {
         )
         .await;
         assert_eq!(resolved.model.as_deref(), Some("pref-model"));
-        assert_eq!(resolved.reasoning_effort.as_deref(), Some("pref-effort"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
         // Thread-less resolve behaves the same (caller override → preference).
         let threadless = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
@@ -1732,7 +1498,7 @@ mod tests {
         .await;
         let (m2, e2) = (threadless.model, threadless.reasoning_effort);
         assert_eq!(m2.as_deref(), Some("pref-model"));
-        assert_eq!(e2.as_deref(), Some("pref-effort"));
+        assert_eq!(e2.as_deref(), Some("low"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

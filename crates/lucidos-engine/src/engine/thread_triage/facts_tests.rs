@@ -208,3 +208,26 @@ async fn an_empty_composing_thread_is_not_a_root() {
 
     teardown_test_db(&db).await;
 }
+
+/// The home thread is never a triage root, so neither triage nor Archive all
+/// offers to put it away. Its sub-threads stand as roots of their own, the way
+/// the drawer shows them (ADR 0362).
+#[tokio::test]
+async fn the_home_thread_is_not_a_root_and_its_sub_threads_are() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .unwrap();
+    let child = spawn(&bus, Some(home)).await;
+    settle(&pool, child, "archive_state = 'inbox'").await;
+
+    let rows = load(&pool, TriageScope::Inbox { except: None })
+        .await
+        .unwrap();
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.facts.thread_id).collect();
+    assert!(!ids.contains(&home));
+    assert!(ids.contains(&child));
+
+    teardown_test_db(&db).await;
+}

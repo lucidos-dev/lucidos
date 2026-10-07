@@ -8,9 +8,9 @@ import { Disclosure } from '../shared/Disclosure';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import { ChevronDownIcon, ChevronRightIcon } from '../shared/icons';
+import { ChevronDownIcon, ChevronRightIcon, ImageIcon } from '../shared/icons';
 import {
-  setModelEnabled, deleteModel, submitNewModel, hasConfiguredRoute, resolvedRoute,
+  setModelEnabled, setModelVision, deleteModel, submitNewModel, hasConfiguredRoute, resolvedRoute,
 } from '../../store/actions/models';
 import { formatContextWindow } from '../../utils/formatTokens';
 import { ModelRoutesEditor } from './ModelRoutesEditor';
@@ -96,6 +96,18 @@ function modelMeta(m: ModelInfo, editorOpen: boolean, editing?: RouteEditing) {
           not set up
         </span>
       )}
+      {/* The *vision flag*. Image description offers and runs only models
+          that read images, so this is where a wrong seed gets fixed. */}
+      <button
+        type="button"
+        class="icon-btn model-vision-toggle"
+        aria-pressed={m.vision}
+        aria-label={`${m.label} reads images`}
+        data-tooltip={m.vision ? 'Reads images' : 'Text only. Tap if it reads images'}
+        onClick={() => void setModelVision(m.id, !m.vision)}
+      >
+        <ImageIcon />
+      </button>
       {editing && (
         <button
           class="action-btn"
@@ -168,14 +180,16 @@ export function ModelsManager() {
   const [label, setLabel] = useState('');
   const [provider, setProvider] = useState('anthropic');
   const [contextWindow, setContextWindow] = useState('');
+  const [vision, setVision] = useState(false);
 
   async function add() {
-    const ok = await submitNewModel(id, label, provider, contextWindow);
+    const ok = await submitNewModel(id, label, provider, contextWindow, vision);
     if (ok) {
       setId('');
       setLabel('');
       setProvider('anthropic');
       setContextWindow('');
+      setVision(false);
       setAdding(false);
     }
   }
@@ -242,6 +256,18 @@ export function ModelsManager() {
                     no rule for OpenRouter, xAI, Gemini, or local models, so they are
                     treated as 200k however large they really are.
                   </span>
+                </div>
+                <div class="settings-row">
+                  <span class="settings-row-label">Reads images</span>
+                  <label class="toggle-switch">
+                    <input
+                      type="checkbox"
+                      checked={vision}
+                      aria-label="The new model reads images"
+                      onChange={(e) => setVision((e.currentTarget as HTMLInputElement).checked)}
+                    />
+                    <span class="toggle-slider" />
+                  </label>
                 </div>
                 <div class="settings-row">
                   <span class="settings-row-label" />

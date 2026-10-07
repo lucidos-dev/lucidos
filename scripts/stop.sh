@@ -56,8 +56,8 @@ stop_workspace() {
     # To stop the gateway itself: kill $(cat "$(gateway_pidfile)").
     #
     # WHICH gateway comes out of the engine we are about to stop, never from a
-    # constant: the dev gateway on 5251 and the packaged Lucidos.app one on 5252
-    # own different workspaces. A packaged workspace's stop used to go to 5251,
+    # constant: the dev gateway and the packaged Lucidos.app one own different
+    # workspaces. A packaged workspace's stop used to go to the dev gateway,
     # a process that has never heard of it, leaving only the SIGUSR1 below to
     # run and the packaged supervisor free to respawn what it had stopped.
     local gw_pid gw_port gw_source slug status
@@ -71,7 +71,7 @@ stop_workspace() {
         # only bother when it is up. Its answer is now discriminating: a
         # workspace it does not own is a 404 rather than a 202.
         gw_source="the dev default, no port read from the engine"
-        gw_port="${LUCIDOS_DEV_GATEWAY_PORT:-5251}"
+        gw_port="${LUCIDOS_DEV_GATEWAY_PORT:-$DEFAULT_DEV_GATEWAY_PORT}"
         gw_pid="$(cat "$(gateway_pidfile)" 2>/dev/null || true)"
         if [ -z "$gw_pid" ] || ! kill -0 "$gw_pid" 2>/dev/null; then
             gw_port=""

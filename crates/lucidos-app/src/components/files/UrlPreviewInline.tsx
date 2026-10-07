@@ -175,7 +175,7 @@ export function UrlPreviewInline({ url, layout }: Props) {
   // we can do without a native webview). Tauri mode uses an overlay native webview.
   if (!isTauri()) {
     return (
-      <div class="url-preview-inline">
+      <div class="url-preview-inline content-view-full-bleed">
         <iframe
           src={url}
           class="url-preview-frame"
@@ -190,7 +190,7 @@ export function UrlPreviewInline({ url, layout }: Props) {
   }
 
   return (
-    <div class="url-preview-inline">
+    <div class="url-preview-inline content-view-full-bleed">
       <div ref={containerRef} class="url-preview-frame" />
     </div>
   );

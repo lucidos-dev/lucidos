@@ -18,18 +18,19 @@
  * `PairingGate` calls it for the value. Whichever runs first does the work.
  */
 
-/** URL parameter carrying the pairing code. Its counterpart is `PAIR_PARAM` in
- *  `crates/lucidos-gateway/src/pairing_qr.rs`, which writes it. */
-export const PAIR_CODE_PARAM = 'pair';
+import { PAIR_PARAM, PAIRING_CODE_DIGITS } from '../generated/gateway-constants';
 
-/** How many decimal digits the gateway mints (`PAIRING_CODE_DIGITS` in
- *  `crates/lucidos-gateway/src/auth.rs`). The pairing form draws one box per
- *  digit from this, so both readings of "how long is a code" come from here. */
-export const PAIRING_CODE_LENGTH = 8;
+/** URL parameter carrying the pairing code. The gateway writes it. */
+export { PAIR_PARAM };
+
+/** How many decimal digits the gateway mints. The pairing form draws one box
+ *  per digit from this, so both readings of "how long is a code" come from the
+ *  gateway. */
+export { PAIRING_CODE_DIGITS };
 
 /** Exactly what the gateway mints. Anything else is dropped rather than sent,
  *  since the only thing a malformed code can do is fail. */
-const CODE_RE = new RegExp(`^\\d{${PAIRING_CODE_LENGTH}}$`);
+const CODE_RE = new RegExp(`^\\d{${PAIRING_CODE_DIGITS}}$`);
 
 /** Is this exactly a minted code? The one grammar, so a code arriving from the
  *  URL, a paste or a camera is judged by the same rule. */
@@ -44,7 +45,7 @@ export function isPairingCode(value: string): boolean {
 export function pairingCodeToAdopt(search: string): string | null {
   let raw: string | null;
   try {
-    raw = new URLSearchParams(search).get(PAIR_CODE_PARAM);
+    raw = new URLSearchParams(search).get(PAIR_PARAM);
   } catch {
     return null;
   }
@@ -73,8 +74,8 @@ export function takePairingCodeFromUrl(): string | null {
   }
   taken = pairingCodeToAdopt(window.location.search);
   const url = new URL(window.location.href);
-  if (url.searchParams.has(PAIR_CODE_PARAM)) {
-    url.searchParams.delete(PAIR_CODE_PARAM);
+  if (url.searchParams.has(PAIR_PARAM)) {
+    url.searchParams.delete(PAIR_PARAM);
     window.history.replaceState(null, '', url.toString());
   }
   return taken;

@@ -83,7 +83,7 @@ const QUEUE = {
     max_concurrent_total: 4, max_concurrent_event_trigger: 2, max_concurrent_cron: 2,
     max_concurrent_sub_thread: 2, max_concurrent_coding_agent: 2, max_concurrent_per_trigger: 1,
     max_queued_per_trigger: 10, reserved_background: 1, max_event_trigger_depth: 5,
-    overflow: 'drop-oldest',
+    max_concurrent_children_per_thread: 10, overflow: 'drop-oldest',
   },
 };
 

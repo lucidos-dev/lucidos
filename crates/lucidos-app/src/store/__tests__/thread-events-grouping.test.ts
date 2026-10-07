@@ -775,6 +775,26 @@ describe('continuableAbortIndex', () => {
     const exchanges = groupIntoExchanges(events);
     expect(continuableAbortIndex(exchanges)).toBeNull();
   });
+
+  // A coding-agent session stamps one request_event_id on every turn's
+  // terminal. So an earlier turn's ResponseGenerated shares its id with a
+  // follow-up's crash abort, and that match is no rerun-in-place.
+  it('offers Continue on a crash-aborted coding-agent follow-up', () => {
+    const cc = { channel: 'claude_code', request_event_id: 'req-1' };
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'one', channel: 'claude_code' }],
+      [2, { type: 'ResponseGenerated', text: 'done', ...cc } as ThreadEvent],
+      [3, { type: 'MessageReceived', text: 'two', channel: 'claude_code' }],
+      [4, { type: 'ResponseAborted', cause: 'recovery_after_restart', actor: { kind: 'system' }, ...cc } as ThreadEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map(ex => ex.userEvent.type)).toEqual([
+      'MessageReceived',
+      'MessageReceived',
+      'ResponseAborted',
+    ]);
+    expect(continuableAbortIndex(exchanges)).toBe(2);
+  });
 });
 
 describe('abortPromisesAutoResume', () => {

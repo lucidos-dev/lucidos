@@ -15,6 +15,12 @@
     background: var(--bg-primary);
 }
 
+/* The pseudo-fullscreen exit button is pinned over the find bar's right end,
+   so the bar keeps its footprint clear (--fullscreen-exit-reserve, below). */
+.app-ui-fullscreen .find-bar {
+    padding-right: calc(var(--fullscreen-exit-reserve) + var(--space-sm));
+}
+
 /* Opaque theme surface over a frame that has nothing to show yet, crossfaded
    out on the frame's `load`. Without it the iOS PWA flashes WHITE on every app
    open: WKWebView paints the frame's base canvas white, and both things that
@@ -94,6 +100,13 @@
    Not --z-tooltip: that put the panel over every overlay, which is what made an
    app's previewFile / confirm / prompt / toast invisible. */
 .app-ui-inline.app-ui-fullscreen {
+    /* The exit button's geometry, read by the button and by whatever must keep
+       clear of it. The reserve is its footprint in from the content edge. */
+    --fullscreen-exit-inset: 0.5rem;
+    --fullscreen-exit-pad: 0.25rem;
+    --fullscreen-exit-border: 1px;
+    --fullscreen-exit-reserve: calc(var(--fullscreen-exit-inset) + var(--icon-size-sm)
+        + 2 * (var(--fullscreen-exit-pad) + var(--fullscreen-exit-border)));
     position: fixed;
     top: 0;
     left: 0;
@@ -134,8 +147,9 @@
 
 .pseudo-fullscreen-exit {
     position: absolute;
-    top: calc(var(--safe-area-top) + 0.5rem);
-    right: calc(var(--safe-area-right) + 0.5rem);
+    top: calc(var(--safe-area-top) + var(--fullscreen-exit-inset));
+    right: calc(var(--safe-area-right) + var(--fullscreen-exit-inset));
+    padding: var(--fullscreen-exit-pad);
     /* Above the `.edge-swipe-zone` guards this overlay also carries, which
        rank 1: the right strip is 1.25rem wide and the button sits 0.5rem in,
        so they overlap. At equal z-index the winner would be whichever renders
@@ -143,7 +157,7 @@
        which a phone has not got. */
     z-index: 2;
     background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
+    border: var(--fullscreen-exit-border) solid var(--border-color);
     border-radius: calc(var(--radius-control) * 0.75);
     opacity: 0.7;
     transition: opacity var(--duration-fast);
@@ -395,6 +409,8 @@
 .file-editor-actions {
     position: relative;
     display: flex;
+    /* .file-editor-toolbar already places the cluster at its right end. */
+    justify-content: flex-end;
 }
 
 /* Inert is instant; looking inert waits for the delay gate. A save goes out and

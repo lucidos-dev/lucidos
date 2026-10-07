@@ -841,6 +841,13 @@ impl EventBus {
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
+                // The status write above can take this thread out of the
+                // in-flight set, so its parent recounts, as on any terminal. A
+                // paused child kept its place on the count, expecting a resume
+                // the archive ends. Without this the parent stayed in Current.
+                if let Some(pid) = reconcile_parent_active_children_count(tx, thread_id).await? {
+                    extra_ancestors.push(pid);
+                }
                 Vec::new()
             }
             ThreadEvent::ThreadStarted { mode, .. } => {
@@ -863,6 +870,22 @@ impl EventBus {
                 .bind(thread_id)
                 .bind(mode)
                 .bind(source)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            ThreadEvent::HomeThreadCreated => {
+                // No `ON CONFLICT`, on purpose. A second home thread hits the
+                // partial unique index. The error rolls this event back with
+                // the row, so the log never records two homes.
+                sqlx::query(&format!(
+                    r#"INSERT INTO thread_summaries
+                        (thread_id, title, initiator, source, created_at, last_activity,
+                         message_count, state, status, is_home)
+                       VALUES ($1, $2, 'user', 'chat', NOW(), NOW(), 0, 'active', {IDLE}, TRUE)"#
+                ))
+                .bind(thread_id)
+                .bind(crate::engine::home_thread::HOME_THREAD_TITLE)
                 .execute(&mut **tx)
                 .await?;
                 Vec::new()

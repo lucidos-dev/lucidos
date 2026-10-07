@@ -1,6 +1,6 @@
 # 0224: TypeSafe Jev is picked as a model at its two call sites, not by a switch beside one
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by [ADR 0363](0363-any-system-one-endpoint-and-a-chat-judgment-provider.md): pickers list any System One endpoint
 - **Date**: 2026-09-19
 
 ## Context

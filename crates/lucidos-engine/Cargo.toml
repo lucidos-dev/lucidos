@@ -45,7 +45,10 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 # absolute path and crashes under the hardened-runtime macOS app. See the direct
 # `openssl` dep below — together they vendor every OpenSSL path crate-wide.
 git2 = { version = "0.20", features = ["vendored-openssl"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
+# `native-tls` adds nothing to the tree, since `default-tls` is already on
+# through other crates. It unlocks `ClientBuilder::use_native_tls`, which the
+# embedding-model downloader calls to trust the system CA store as hf-hub did.
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls", "native-tls"] }
 axum = { version = "0.7", features = ["macros", "multipart", "ws"] }
 # Outbound WebSocket client, for the voice talker. axum's `ws` feature serves a
 # socket; nothing here dialled one until voice needed to. Already in the tree
@@ -54,11 +57,12 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "compression-gzip", "compression-br"] }
 fastembed = "4"
-# Direct dep ONLY so `memory/model_download.rs` can drive the embedding-model
-# download itself with a byte-progress callback (fastembed exposes no hook, just
-# an indicatif bar on stderr). It MUST resolve to the same version fastembed
-# does: the two share the on-disk cache layout, and a split would make fastembed
-# re-download everything we just fetched. Features mirror what fastembed's
+# Direct dep ONLY for the cache layout fastembed reads. `memory/model_download.rs`
+# downloads the model itself, for byte progress and deadlines, and writes and
+# probes that layout through this crate. It
+# MUST resolve to the same version fastembed does: the two share the on-disk
+# cache layout, and a split would make fastembed re-download everything we
+# just fetched. Features mirror what fastembed's
 # default `online` feature turns on (`hf-hub/ureq` + `hf-hub/native-tls`), so the
 # feature union is unchanged.
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
@@ -77,6 +81,7 @@ kamadak-exif = "0.6"
 urlencoding = "2.1.3"
 chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
 regex = "1"
+rayon = "1"
 dotenvy = "0.15"
 web-push = "0.11"
 # NOT used directly in code — declared only to enable `openssl-sys/vendored`, which

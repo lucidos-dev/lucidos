@@ -1,8 +1,17 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { searchEverywhereOpen, searchEverywhereAnchor, appsList, artifacts, triggers, settingsScrollTarget, focusedPane } from '../../store/store';
 import { Overlay } from '../shared/Overlay';
-import { searchEverywhere, type SearchCategory, type SearchResultItem, type ServerSearchCategory } from '../../api/client';
+import {
+  searchEverywhere,
+  searchText,
+  type SearchCategory,
+  type SearchResultItem,
+  type ServerSearchCategory,
+  type TextSearchMode,
+  type TextSearchResponse,
+} from '../../api/client';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
+import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
 import { openSettingsSubview, switchMenuItem } from '../../store/actions/menu';
@@ -21,13 +30,24 @@ import { SearchField } from '../shared/SearchField';
 import { CategoryIcon } from '../shared/CategoryIcon';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
 import { getMenuSearchResults, findMenuSearchEntry } from './menuIndex';
-import { OVERVIEW_LIMIT, rankedSections, tabAccessibleName, tabHits, type TabHits } from './searchSections';
+import {
+  ALL_TAB_LIMIT,
+  isTextHit,
+  rankedSections,
+  tabAccessibleName,
+  tabHits,
+  textHitItem,
+  type PaletteItem,
+  type TabHits,
+  type TextHitItem,
+} from './searchSections';
 import './SearchEverywhere.css';
 
 const CATEGORIES: { id: SearchCategory; label: string }[] = [
   { id: 'all', label: 'All' },
   { id: 'apps', label: 'Apps' },
   { id: 'files', label: 'Files' },
+  { id: 'text', label: 'Text' },
   { id: 'settings', label: 'Settings' },
   { id: 'threads', label: 'Threads' },
   { id: 'triggers', label: 'Triggers' },
@@ -37,19 +57,31 @@ const CATEGORIES: { id: SearchCategory; label: string }[] = [
   { id: 'menu', label: 'Menu' },
 ];
 
+/** The All tab's label before a query is typed. */
+const RECENT_LABEL = 'Recent';
+
 type LocalCategory = 'settings' | 'menu';
 type ServerSection = Exclude<ServerSearchCategory, 'all'>;
+/** A category the engine answers: one of `/search`'s, or Text search. */
+type EngineSection = ServerSection | 'text';
 
 /** Asked one request each, so a fast category never waits on a slow one:
  *  thread search embeds the query, the rest are listings. */
 const SERVER_SECTIONS: ServerSection[] = ['apps', 'files', 'threads', 'triggers', 'changes'];
 
 /** Keystrokes coalesce this long before the engine is asked. Local hits skip it. */
-const SERVER_DEBOUNCE_MS = 150;
+export const SERVER_DEBOUNCE_MS = 150;
+
+/** The Text tab draws its lines this many at a time, adding more on scroll. */
+export const TEXT_TAB_WINDOW = 100;
 
 /** The two categories the frontend answers itself, never the engine. */
 function isLocalCategory(category: SearchCategory): category is LocalCategory {
   return category === 'settings' || category === 'menu';
+}
+
+function isServerSection(category: SearchCategory): category is ServerSection {
+  return category !== 'all' && category !== 'text' && !isLocalCategory(category);
 }
 
 function localSection(section: LocalCategory, query: string, limit: number): SearchResultItem[] {
@@ -60,15 +92,21 @@ function localSection(section: LocalCategory, query: string, limit: number): Sea
 
 /** The local half of the overview, so it renders on the keystroke. */
 function localOverview(query: string): Record<LocalCategory, SearchResultItem[]> {
-  return { settings: localSection('settings', query, OVERVIEW_LIMIT), menu: localSection('menu', query, OVERVIEW_LIMIT) };
+  return { settings: localSection('settings', query, ALL_TAB_LIMIT), menu: localSection('menu', query, ALL_TAB_LIMIT) };
 }
 
 function sectionLabel(section: string): string {
   return CATEGORIES.find(c => c.id === section)?.label ?? section;
 }
 
-function itemKey(item: SearchResultItem): string {
+function itemKey(item: PaletteItem): string {
   return `${item.category}:${item.id}`;
+}
+
+/** A Text hit is remembered as its file, since the line goes stale as the
+ *  file changes. Shaped like the engine's own Files hit. */
+function fileRecent(path: string): SearchResultItem {
+  return { id: path, title: path.slice(path.lastIndexOf('/') + 1), subtitle: path, category: 'files', score: 1 };
 }
 
 const MAX_RECENTS = 15;
@@ -166,9 +204,39 @@ function ResultRow({ item, index = 0, selected = false, onSelect, onHover }: {
   );
 }
 
+/** One Text search line: the snippet with its match marked, then where the
+ *  line is. Rows always have an item: the skeleton is drawn by `ResultRow`. */
+function TextHitRow({ item, index, selected, onSelect, onHover }: {
+  item: TextHitItem;
+  index: number;
+  selected: boolean;
+  onSelect: (item: TextHitItem) => void;
+  onHover: (index: number) => void;
+}) {
+  const { hit } = item;
+  return (
+    <button
+      data-role="search-result"
+      class={`search-everywhere-result${selected ? ' selected' : ''}`}
+      onMouseEnter={() => onHover(index)}
+      onClick={() => onSelect(item)}
+    >
+      <span class="search-everywhere-result-icon">
+        <CategoryIcon category={searchResultIconCategory(item)} />
+      </span>
+      <span class="search-everywhere-result-info">
+        <span class="search-everywhere-result-title">
+          {hit.before}<mark class="search-match">{hit.matched}</mark>{hit.after}
+        </span>
+        <span class="search-everywhere-result-subtitle">{hit.path}:{hit.line}</span>
+      </span>
+    </button>
+  );
+}
+
 /** The trailing row while engine categories are still out. Local hits and the
  *  categories that already answered stay above it. */
-function PendingRow({ sections }: { sections: ServerSection[] }) {
+function PendingRow({ sections }: { sections: EngineSection[] }) {
   const names = sections.map(s => sectionLabel(s).toLowerCase()).join(', ');
   return (
     <div class="search-everywhere-pending" role="status">
@@ -229,6 +297,52 @@ function useServerHits(
   return section => (hits.search === search && hits.sections[section]) || { status: 'loading' };
 }
 
+type TextAnswer = { search: string; state: Loadable<TextSearchResponse> };
+
+/** Asks Text search once the keystrokes pause, stamped and aborted like
+ *  `useServerHits`. A `null` mode asks nothing and returns `null`. */
+function useTextHits(
+  isOpen: boolean,
+  search: string,
+  query: string,
+  mode: TextSearchMode | null,
+): Loadable<TextSearchResponse> | null {
+  const [answer, setAnswer] = useState<TextAnswer | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) setAnswer(null);
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || mode === null) return;
+    const controller = new AbortController();
+    const settle = (state: Loadable<TextSearchResponse>) => {
+      if (!controller.signal.aborted) setAnswer({ search, state });
+    };
+    const timer = setTimeout(() => {
+      searchText(query, mode, { signal: controller.signal }).then(
+        data => settle({ status: 'loaded', data }),
+        err => settle(toFailed(err)),
+      );
+    }, SERVER_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [search, query, mode, isOpen]);
+
+  if (mode === null) return null;
+  return answer?.search === search ? answer.state : { status: 'loading' };
+}
+
+function textHitItems(state: Loadable<TextSearchResponse> | null): TextHitItem[] {
+  return state?.status === 'loaded' && state.data.status === 'ok' ? state.data.hits.map(textHitItem) : [];
+}
+
+function counted(count: number, one: string, many: string): string {
+  return `${count.toLocaleString()} ${count === 1 ? one : many}`;
+}
+
 export function SearchEverywhere() {
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<SearchCategory>('all');
@@ -239,23 +353,31 @@ export function SearchEverywhere() {
 
   const isRecentsMode = !query && category === 'all';
   const isOpen = searchEverywhereOpen.value;
-  // The overview answers the All tab and every tab's count, so it is keyed by
+  // The overview answers the All tab and every tab's dimming, so it is keyed by
   // the query alone: switching tabs never asks it again.
-  const overviewState = useServerHits(isOpen, query, query, query ? SERVER_SECTIONS : NO_SECTIONS, OVERVIEW_LIMIT);
+  const overviewState = useServerHits(isOpen, query, query, query ? SERVER_SECTIONS : NO_SECTIONS, ALL_TAB_LIMIT);
+  const overviewText = useTextHits(isOpen, query, query, query ? 'preview' : null);
   // A category tab also asks for its own full page.
   const pageSections = useMemo(
-    () => (category === 'all' || isLocalCategory(category) ? NO_SECTIONS : [category]),
+    () => (isServerSection(category) ? [category] : NO_SECTIONS),
     [category],
   );
   const pageState = useServerHits(isOpen, `${category}\n${query}`, query, pageSections, undefined);
+  // Asked even with no query: the engine's answer says how much to type.
+  const pageText = useTextHits(isOpen, `text\n${query}`, query, category === 'text' ? 'all' : null);
 
   const requested = category === 'all' ? (query ? SERVER_SECTIONS : NO_SECTIONS) : pageSections;
   const listState = category === 'all' ? overviewState : pageState;
-  const pending = requested.filter(s => listState(s).status === 'loading');
-  const failed = requested.flatMap(s => {
+  const textState = category === 'all' ? overviewText : category === 'text' ? pageText : null;
+  const pending: EngineSection[] = requested.filter(s => listState(s).status === 'loading');
+  if (textState?.status === 'loading') pending.push('text');
+  const failed: { section: EngineSection; error: string }[] = requested.flatMap(s => {
     const state = listState(s);
     return state.status === 'failed' ? [{ section: s, error: state.error }] : [];
   });
+  if (textState?.status === 'failed') failed.push({ section: 'text', error: textState.error });
+  const requestedCount = requested.length + (textState ? 1 : 0);
+  const textAnswer = textState?.status === 'loaded' ? textState.data : null;
   // Placeholder rows only once a search has run past the delay gate. Hits
   // still show the instant they arrive; the fade only lets the rows go.
   const showSearchLoading = useDelayedFlag(pending.length > 0);
@@ -289,8 +411,8 @@ export function SearchEverywhere() {
     }
   }, [isOpen]);
 
-  function handleSelect(item: SearchResultItem) {
-    saveRecent(item);
+  function handleSelect(item: PaletteItem) {
+    saveRecent(isTextHit(item) ? fileRecent(item.hit.path) : item);
     close();
     // After navigating, move real DOM focus into the destination pane's scroll
     // surface (the transcript for a thread; the body scroller / iframe for an app,
@@ -302,6 +424,13 @@ export function SearchEverywhere() {
     // (app/trigger/change resolve their target before revealing the content pane)
     // chain the focus off their promise so it lands after the destination renders.
     const focusDest = () => focusPaneMainControl(searchResultDestinationPane(item.category));
+    if (isTextHit(item)) {
+      // The navigation router owns opening at a line: source view, the range
+      // and the scroll, applied after the open clears the previous file's.
+      void handleNavigationRequest({ target: 'file', file_path: item.hit.path, line: item.hit.line });
+      focusDest();
+      return;
+    }
     switch (item.category) {
       case 'threads': focusThreadOrBootstrap(item.id); focusDest(); break;
       case 'files': openFilePreview(item.id); focusDest(); break;
@@ -349,30 +478,65 @@ export function SearchEverywhere() {
     if (state.status === 'loaded') results[section] = state.data;
   }
 
-  const sections = category === 'all' && !isRecentsMode ? rankedSections(results, query) : [];
-  const flat = isRecentsMode
-    ? recents
-    : category === 'all' ? sections.flatMap(s => s.items) : results[category] ?? [];
+  const textHits = useMemo(() => textHitItems(textState), [textState]);
+  const textFiles = useMemo(() => new Set(textHits.map(item => item.hit.path)).size, [textHits]);
+  const sections = category === 'all' && !isRecentsMode ? rankedSections(results, query, textHits) : [];
+  let flat: PaletteItem[];
+  if (isRecentsMode) flat = recents;
+  else if (category === 'all') flat = sections.flatMap(s => s.items);
+  else if (category === 'text') flat = textHits;
+  else flat = results[category] ?? [];
 
   function hitsOnTab(tab: SearchCategory): TabHits {
-    if (tab === 'all' || !overviewLocal) return { kind: 'unknown' };
+    if (tab === 'all' || !overviewLocal) return 'unknown';
+    if (tab === 'text') {
+      // A query too short to search says nothing about the files.
+      return overviewText?.status === 'loaded' && overviewText.data.status === 'ok'
+        ? tabHits({ status: 'loaded', data: overviewText.data.hits })
+        : 'unknown';
+    }
     return isLocalCategory(tab)
       ? tabHits({ status: 'loaded', data: overviewLocal[tab] })
       : tabHits(overviewState(tab));
+  }
+
+  // The Text tab can hold thousands of lines. It draws a window that grows as
+  // the list scrolls, or as the selection moves past its end.
+  const [shownRows, setShownRows] = useState(TEXT_TAB_WINDOW);
+  useEffect(() => setShownRows(TEXT_TAB_WINDOW), [query, category]);
+  const rendered = category === 'text' ? flat.slice(0, shownRows) : flat;
+  function growOnScroll(e: Event) {
+    const list = e.currentTarget as HTMLElement;
+    const nearEnd = list.scrollHeight - list.scrollTop - list.clientHeight < list.clientHeight;
+    if (category === 'text' && nearEnd && shownRows < flat.length) setShownRows(n => n + TEXT_TAB_WINDOW);
   }
   // The selection follows its row, so a category landing above it cannot move
   // the cursor onto another hit.
   const selectedIndex = selectedKey === null ? -1 : flat.findIndex(item => itemKey(item) === selectedKey);
   const selectAt = (index: number) => setSelectedKey(index >= 0 && flat[index] ? itemKey(flat[index]) : null);
 
-  // Scroll selected result into view
   useEffect(() => {
-    if (selectedIndex >= 0 && resultsRef.current) {
-      const buttons = resultsRef.current.querySelectorAll('[data-role="search-result"]');
-      const el = buttons[selectedIndex] as HTMLElement | undefined;
-      el?.scrollIntoView({ block: 'nearest' });
+    if (category === 'text' && selectedIndex >= shownRows) {
+      setShownRows(Math.ceil((selectedIndex + 1) / TEXT_TAB_WINDOW) * TEXT_TAB_WINDOW);
     }
-  }, [selectedIndex]);
+  }, [category, selectedIndex, shownRows]);
+
+  // Scroll the selected result into view, once per selection. A row the Text
+  // tab has not drawn yet scrolls when its window grows. A window grown by the
+  // reader's own scrolling leaves the list where they put it.
+  const scrolledToIndex = useRef(-1);
+  useEffect(() => {
+    if (selectedIndex < 0) {
+      scrolledToIndex.current = -1;
+      return;
+    }
+    if (scrolledToIndex.current === selectedIndex || !resultsRef.current) return;
+    const buttons = resultsRef.current.querySelectorAll('[data-role="search-result"]');
+    const el = buttons[selectedIndex] as HTMLElement | undefined;
+    if (!el) return;
+    el.scrollIntoView({ block: 'nearest' });
+    scrolledToIndex.current = selectedIndex;
+  }, [selectedIndex, shownRows]);
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
@@ -414,48 +578,74 @@ export function SearchEverywhere() {
   // visibility via CSS to avoid ghost pixels from the will-change compositing
   // layer. anchor: the search toggle, exempt from outside-dismiss so re-tapping
   // it closes (never reopens). Both contracts live in <Overlay>.
+  function row(item: PaletteItem, index: number) {
+    const props = { index, selected: index === selectedIndex, onSelect: handleSelect, onHover: selectAt };
+    return isTextHit(item)
+      ? <TextHitRow key={itemKey(item)} item={item} {...props} />
+      : <ResultRow key={itemKey(item)} item={item} {...props} />;
+  }
+
   function rows() {
     if (category === 'all' && !isRecentsMode) {
       return sections.map(({ section, items, offset }) => (
         <div key={section}>
           <div class="search-everywhere-section-header">{section}</div>
-          {items.map((item, i) => (
-            <ResultRow
-              key={itemKey(item)}
-              item={item}
-              index={offset + i}
-              selected={offset + i === selectedIndex}
-              onSelect={handleSelect}
-              onHover={selectAt}
-            />
-          ))}
+          {items.map((item, i) => row(item, offset + i))}
         </div>
       ));
     }
-    return flat.map((item, index) => (
-      <ResultRow
-        key={itemKey(item)}
-        item={item}
-        index={index}
-        selected={index === selectedIndex}
-        onSelect={handleSelect}
-        onHover={selectAt}
-      />
-    ));
+    return rendered.map(row);
+  }
+
+  /** The Text tab's totals above its lines. The engine returns every line up
+   *  to its cap, so the counts are the list's own. */
+  function textSummary() {
+    if (category !== 'text' || !hasResults) return null;
+    return (
+      <div class="search-everywhere-summary" role="status">
+        {counted(textHits.length, 'match', 'matches')} in {counted(textFiles, 'file', 'files')}
+      </div>
+    );
+  }
+
+  /** What Text search could not cover. The All tab says so only when it found
+   *  nothing, so a workspace with large files is not reminded on every search. */
+  function textNotes() {
+    if (textAnswer?.status !== 'ok') return null;
+    const showSkipped = textAnswer.skipped_large_files > 0 && (category === 'text' || !textHits.length);
+    return (
+      <>
+        {category === 'text' && textAnswer.truncated && (
+          <div class="search-everywhere-note">
+            Showing the first {counted(textHits.length, 'match', 'matches')}. Refine your query to see the rest.
+          </div>
+        )}
+        {showSkipped && (
+          <div class="search-everywhere-note">
+            Text search skipped {counted(textAnswer.skipped_large_files, 'large file', 'large files')}.
+          </div>
+        )}
+      </>
+    );
+  }
+
+  function emptyMessage(): string {
+    if (category === 'text' && textAnswer?.status === 'query-too-short') {
+      return `Type at least ${textAnswer.min_query_chars} characters to search inside files`;
+    }
+    return query ? `No results for "${query}"` : `No ${sectionLabel(category).toLowerCase()}`;
   }
 
   function searchBody() {
     if (!hasResults && pending.length > 0) return null;
-    if (!hasResults && failed.length > 0 && failed.length === requested.length) {
+    if (!hasResults && failed.length > 0 && failed.length === requestedCount) {
       return <div class="search-everywhere-empty error-text">Search failed: {failed[0].error}</div>;
     }
     return (
       <>
-        {hasResults ? rows() : (
-          <div class="search-everywhere-empty">
-            {query ? `No results for "${query}"` : `No ${sectionLabel(category).toLowerCase()}`}
-          </div>
-        )}
+        {textSummary()}
+        {hasResults ? rows() : <div class="search-everywhere-empty">{emptyMessage()}</div>}
+        {textNotes()}
         {failed.map(({ section, error }) => (
           <div key={section} class="search-everywhere-note error-text">
             {sectionLabel(section)} search failed: {error}
@@ -517,23 +707,24 @@ export function SearchEverywhere() {
         <div class="search-everywhere-tabs">
           {CATEGORIES.map(cat => {
             const hits = hitsOnTab(cat.id);
-            const label = cat.id === 'all' && !query ? 'Recent' : cat.label;
+            const label = cat.id === 'all' && !query ? RECENT_LABEL : cat.label;
             return (
               <button
                 key={cat.id}
                 class={`search-everywhere-tab${cat.id === category ? ' active' : ''}`}
                 aria-pressed={cat.id === category}
                 aria-label={tabAccessibleName(label, hits)}
-                data-empty={hits.kind === 'none' ? '' : undefined}
+                data-empty={hits === 'none' ? '' : undefined}
                 onClick={() => setCategory(cat.id)}
               >
-                {label}
-                {hits.kind === 'some' && <span class="search-everywhere-tab-count">{hits.count}</span>}
+                {cat.id === 'all' ? (
+                  <span class="search-everywhere-widest" data-widest={RECENT_LABEL}><span>{label}</span></span>
+                ) : label}
               </button>
             );
           })}
         </div>
-        <div class="search-everywhere-results" ref={resultsRef}>
+        <div class="search-everywhere-results" ref={resultsRef} onScroll={growOnScroll}>
           {isRecentsMode ? (
             hasResults ? rows() : <div class="search-everywhere-empty">No recent items</div>
           ) : (

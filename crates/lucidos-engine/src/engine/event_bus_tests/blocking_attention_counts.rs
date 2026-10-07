@@ -33,6 +33,8 @@ async fn fresh_running_cc_child_blocks_parent_before_first_idle() {
                 args: serde_json::json!({}),
                 description: String::new(),
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                parent_tool_use_id: None,
+                api_call_id: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),

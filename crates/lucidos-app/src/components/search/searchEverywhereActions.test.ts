@@ -29,6 +29,10 @@ describe('searchResultIconCategory', () => {
     expect(searchResultIconCategory({ category: 'menu', id: 'plugins' })).toBe('plugins');
     expect(searchResultIconCategory({ category: 'menu', id: 'settings' })).toBe('settings');
   });
+
+  it('marks a Text line by the file it is in', () => {
+    expect(searchResultIconCategory({ category: 'text', id: 'knowhow/notes.md:12' })).toBe('files');
+  });
 });
 
 /**

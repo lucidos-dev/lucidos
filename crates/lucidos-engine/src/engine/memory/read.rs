@@ -11,7 +11,7 @@
 //! corpus overwhelmingly about that subject, so the top 25 came back
 //! effectively arbitrary, the agent asserted something that had not happened,
 //! and it had no way to ask again. The decomposition is fixed at the root in
-//! `QUERY_CLASSIFICATION_PROMPT`; this is the backstop for the misses that
+//! `SUB_QUERY_PROMPT`; this is the backstop for the misses that
 //! remain, because no pre-turn guess is ever complete.
 //!
 //! # One ranking, not two

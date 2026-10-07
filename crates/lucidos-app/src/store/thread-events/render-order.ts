@@ -1,4 +1,4 @@
-import { compareSortKeys, happenedAt, isUningestedMessage } from './exchange-grouping';
+import { compareSortKeys, happenedAt, isUningestedMessage, isUnsentExchange } from './exchange-grouping';
 import { isTurnlessBoundary } from './thread-event-types';
 import type { Exchange } from './exchange';
 import type { StoredEvent } from './thread-event-types';
@@ -68,7 +68,7 @@ function rowOf(
  *
  * Normally the boundary's own key: the card is on screen from that moment, so
  * anything later belongs under it. `null` for a card that holds no turn at all,
- * which owes nothing below it. Those are exceptions A and C.
+ * which owes nothing below it. Those are exceptions A, C and D.
  */
 function engagedKey(exchange: Exchange, index: number): RenderRow | null {
   // Never picked up. The turn above is still writing and owes this card
@@ -77,6 +77,8 @@ function engagedKey(exchange: Exchange, index: number): RenderRow | null {
   // The reader's Stop, or a note that a child stopped or moved to top level:
   // none takes a turn or draws a body.
   if (isTurnlessBoundary(exchange.userEvent)) return null;
+  // Never reached the engine, so the turn above keeps writing past it.
+  if (isUnsentExchange(exchange)) return null;
   const pickedUp = ingestionStep(exchange);
   if (pickedUp) return rowOf(index, 'step', pickedUp.seq, pickedUp.event);
   return rowOf(index, 'boundary', exchange.userSeq, exchange.userEvent);
@@ -120,7 +122,7 @@ function resultRejoinsItsCall(exchange: Exchange, event: StoredEvent): boolean {
  * Every place the flattened transcript reads out of order. Empty is the
  * invariant holding.
  *
- * **Three exceptions, and the set is closed.** A fourth shape is a bug until
+ * **Four exceptions, and the set is closed.** A fifth shape is a bug until
  * somebody adds it here with its own reason. The glossary's § Render order
  * states each one and why the fold produces it on purpose.
  *
@@ -129,6 +131,8 @@ function resultRejoinsItsCall(exchange: Exchange, event: StoredEvent): boolean {
  *   between the two and against no other.
  * - **C. A turnless boundary** (`isTurnlessBoundary`), such as the reader's
  *   Stop-waiting panel, which takes no turn (ADR 0049).
+ * - **D. An unsent message**, which never reached the engine, so the running
+ *   turn above it keeps writing past it.
  */
 export function renderOrderViolations(exchanges: Exchange[]): RenderOrderViolation[] {
   const violations: RenderOrderViolation[] = [];

@@ -3,6 +3,7 @@
 --
 --   psql -v ON_ERROR_STOP=1 \
 --        -v model=… -v model_label=… -v model_provider=… -v reasoning_effort=… \
+--        -v background_model=… -v context_window=… \
 --        -f seed.sql
 --
 -- Everything here is literal. No id is generated, no timestamp is `now()`, and
@@ -30,6 +31,18 @@ INSERT INTO preferences (key, value, device_id, updated_at) VALUES
   ('chat_reasoning_effort', :'reasoning_effort', NULL, '2026-01-01 00:00:00+00'),
   ('timezone',              'Europe/Oslo',       NULL, '2026-01-01 00:00:00+00'),
   ('language',              'English',           NULL, '2026-01-01 00:00:00+00'),
+  -- The memory tasks lead with models chosen by the configured providers
+  -- (ADR 0377), so an unpinned run would bill whichever model this host
+  -- reaches. Pinned to the catalog's background model at the efforts every
+  -- earlier run used, so results stay comparable across hosts.
+  ('model_memory',                   :'background_model', NULL, '2026-01-01 00:00:00+00'),
+  ('reasoning_memory',               'none',              NULL, '2026-01-01 00:00:00+00'),
+  ('model_query_classification',     :'background_model', NULL, '2026-01-01 00:00:00+00'),
+  ('reasoning_query_classification', 'none',              NULL, '2026-01-01 00:00:00+00'),
+  ('model_conversation_summary',     :'background_model', NULL, '2026-01-01 00:00:00+00'),
+  ('reasoning_conversation_summary', 'low',               NULL, '2026-01-01 00:00:00+00'),
+  ('model_memory_find',              :'background_model', NULL, '2026-01-01 00:00:00+00'),
+  ('reasoning_memory_find',          'none',              NULL, '2026-01-01 00:00:00+00'),
   -- Without this the engine persists `content: None` on every section, so a
   -- capture carries names and char counts and no bodies. Every run before
   -- ADR 0110 recorded nothing replayable. It is seeded here rather than per

@@ -90,6 +90,20 @@ export function namespacedKey(key: string, ws: string): string {
   return `${NAMESPACE_PREFIX}${ws}:${key}`;
 }
 
+/**
+ * The key `key` is actually stored under in workspace `ws`.
+ *
+ * What the override below writes for a caller's `key`. A reader that walks
+ * `Storage.key(i)`, which the override does not wrap, matches against this.
+ * Passing it back through the override is safe, because a `ws:` key is left
+ * alone.
+ */
+export function rawStorageKey(key: string, ws: string | null): string {
+  return !ws || key.startsWith(NAMESPACE_PREFIX) || isGlobalKey(key)
+    ? key
+    : namespacedKey(key, ws);
+}
+
 /** Whether the one-time migration should SEED this workspace's namespaced value
  *  from a legacy raw value: only the former-global appearance keys, and only when
  *  not already namespaced. */
@@ -172,10 +186,7 @@ export function installWorkspaceStorage(storage: Storage, ws: string | null): vo
     // namespace by hand for the iframe realm and would otherwise be
     // double-prefixed (`ws:slug:ws:slug:key`) if ever invoked in this overridden
     // parent realm. Re-prefixing is always a bug, so guard it at the override.
-    const mapKey = (key: string): string =>
-      key.startsWith(NAMESPACE_PREFIX) || isGlobalKey(key)
-        ? key
-        : namespacedKey(key, ws);
+    const mapKey = (key: string): string => rawStorageKey(key, ws);
 
     proto.getItem = function (this: Storage, key: string) {
       return rawGet.call(this, mapKey(key));

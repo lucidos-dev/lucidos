@@ -116,7 +116,8 @@ pub(crate) async fn load_blocking_sample(
 /// Single in-tx writer of `active_children_count` on the terminal-event
 /// path. Each terminal-event arm in `update_thread_projection`
 /// (CodingAgentIdled, ResponseGenerated, ResponseFailed, ResponseCanceled,
-/// a ResponseAborted that promises no resume, non-transient SessionEnded) calls this
+/// a ResponseAborted that promises no resume, non-transient SessionEnded,
+/// ThreadArchived) calls this
 /// after flipping the child's `status` to its terminal value, so the COUNT
 /// already excludes the just-terminated child. The companion `+1` paths
 /// (MessageReceived spawn, `reincrement_parent_active_count_if_revived`)
@@ -662,6 +663,35 @@ pub(crate) async fn propagate_blocking_change(
 }
 
 impl EventBus {
+    /// Recount `thread_id`'s own child and descendant counts from ground truth,
+    /// then broadcast every row it touched, as an event's ancestors are.
+    ///
+    /// Archive runs it on a target already stored archived: such a thread sits in
+    /// Current only while a count says something under it is live. A drifted
+    /// count then heals at once on every device, not at the next boot.
+    pub async fn recount_family_counts(
+        &self,
+        thread_id: Uuid,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut tx = self.pool.begin().await?;
+        lock_parent_recount(&mut tx, thread_id).await?;
+        recount_active_children(&mut tx, thread_id).await?;
+        let mut touched = vec![thread_id];
+        touched.extend(reconcile_descendant_counts_from(&mut tx, thread_id).await?);
+        let mut aggregates = Vec::with_capacity(touched.len());
+        for id in &touched {
+            if let Some(agg) = crate::core::store::fetch_thread_aggregate(&mut *tx, *id).await? {
+                aggregates.push((*id, agg));
+            }
+        }
+        tx.commit().await?;
+        for (id, agg) in aggregates {
+            let (active, total) = (agg.active_children_count, agg.total_children_count);
+            self.send_children_count_event(id, active, total, Some(agg));
+        }
+        Ok(())
+    }
+
     /// Recompute every parent's `active_children_count`,
     /// `waiting_children_count` and `total_children_count` from ground truth.
     ///

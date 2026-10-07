@@ -28,6 +28,7 @@ import {
   type WireRequest,
   type WireResponse,
 } from './_bridge';
+import { HEADER_DEVICE_ID } from './generated/engine-constants';
 
 /** Derive the workspace base path (`/<slug>`) the SDK runs under, so calls to
  *  the engine's `/api/v1` surface carry the gateway prefix (ADR 0014). Three
@@ -142,8 +143,6 @@ export function restampDeadline(
   return err;
 }
 
-/** The header the engine resolves a request's actor from (`api::actor`). */
-const DEVICE_ID_HEADER = 'x-lucidos-device-id';
 
 async function rawFetch(
   path: string,
@@ -176,7 +175,7 @@ async function directFetch(
   // edit is attributed to the person who clicked it. Without it the engine has
   // no evidence of who is calling and refuses the write (ADR 0169).
   const deviceId = wsDeviceId();
-  if (deviceId) headers[DEVICE_ID_HEADER] = deviceId;
+  if (deviceId) headers[HEADER_DEVICE_ID] = deviceId;
   if (_authToken) headers['Authorization'] = `Bearer ${_authToken}`;
 
   // `AbortSignal.timeout` rejects with a `TimeoutError`, which callers can tell

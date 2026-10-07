@@ -22,6 +22,7 @@
 // store signals, which is what gives content-pane navigation from a preview its
 // nav-history entry for free: those helpers already push one.
 
+import { ALL_HIGHLIGHT, CURRENT_HIGHLIGHT } from '@lucidos/find';
 import { WORKSPACE_ID } from '../../utils/basePath';
 import { escapeHtmlAttr } from '../../utils/markedConfig';
 import {
@@ -30,6 +31,7 @@ import {
   extractLocalFileTarget,
   extractTriggerIdFromHref,
   extractRepoFileTargetFromHref,
+  extractSettingsViewFromHref,
   hasUrlScheme,
   type RepoFileHrefTarget,
 } from '../../utils/linkifyPaths';
@@ -38,6 +40,10 @@ import { openAppById } from '../../store/actions/apps';
 import { openThreadAcrossWorkspaces } from '../../store/actions/cross-workspace';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { openRepoFileLink } from '../../store/actions/repoFileLink';
+import { encodeRepoPath, type RepoLocator } from '../../store/repoPath';
+import { showToast } from '../../store/store';
+import { HEADING_ID_PREFIX } from '../../utils/headingSlug';
+import { scrollBehavior } from '../../utils/motion';
 
 /** `thread:<workspace>/<uuid>` and the bare `thread:<uuid>` form, mirroring the
  *  markdown rewrite in `utils/renderMarkdown.ts`. */
@@ -61,6 +67,12 @@ export interface PreviewLinkContext {
    *  artifact declares its own `<base href>` (see `documentDeclaresBase`). In
    *  that case relative links resolve there rather than against `artifactPath`. */
   documentBase?: string;
+  /** Set when the previewed document lives inside a registered repository
+   *  checkout rather than the workspace data tree: the locator it is being
+   *  shown at. A relative href then resolves against ITS directory, at the
+   *  same ref/mode/changeId, inside the same checkout. The workspace data
+   *  root and `artifactPath` play no part then. */
+  repoLocator?: RepoLocator;
 }
 
 /** How the host should handle a click on a link inside a preview. `null` means
@@ -73,7 +85,8 @@ export type PreviewLinkAction =
    *  none. An artifact citing one item inside a shared app carries it. */
   | { kind: 'app'; appId: string; fragment?: string }
   | { kind: 'trigger'; triggerId: string }
-  | { kind: 'nav'; target: string }
+  /** `settingsView` is the Settings page a `settings:<view>` link named. */
+  | { kind: 'nav'; target: string; settingsView?: string }
   | { kind: 'local-file'; target: string }
   | { kind: 'file'; path: string }
   | ({ kind: 'repo-file' } & RepoFileHrefTarget)
@@ -84,7 +97,7 @@ export type PreviewLinkAction =
  *  every other scheme (`mailto:`, `tel:`) to the browser, as the router would.
  *  A test pins the two together. */
 export const PREVIEW_HOST_SCHEMES: readonly string[] =
-  ['http', 'https', 'thread', 'app', 'trigger', 'repo', 'file'];
+  ['http', 'https', 'thread', 'app', 'trigger', 'repo', 'file', 'settings'];
 
 function decodeFragment(id: string): string {
   try {
@@ -121,6 +134,23 @@ export function resolvePreviewRelativePath(artifactPath: string, href: string): 
   if (pathPart.startsWith('/')) return normalizeSegments(pathPart);
   const folder = artifactPath.slice(0, artifactPath.lastIndexOf('/') + 1);
   return normalizeSegments(folder + pathPart);
+}
+
+/** Resolve a scheme-less href written inside a previewed REPO file to a
+ *  sibling location in the same checkout, at the same ref/mode/changeId.
+ *  Mirrors `resolvePreviewRelativePath`, but a leading `/` anchors at the
+ *  checkout root rather than the workspace data root: a repo file's
+ *  `/docs/x.md` names that repo's own `docs/x.md`, not a workspace path.
+ *
+ *  `normalizeSegments` pops a `..` off what it already pushed. It can never
+ *  go negative. So a path with more `..` than the file has ancestors lands
+ *  at the checkout root, rather than climbing out of it. */
+export function resolvePreviewRelativeRepoPath(locator: RepoLocator, href: string): RepoLocator {
+  const [pathPart] = href.split(/[?#]/, 1);
+  const path = pathPart.startsWith('/')
+    ? normalizeSegments(pathPart.slice(1))
+    : normalizeSegments(locator.path.slice(0, locator.path.lastIndexOf('/') + 1) + pathPart);
+  return { ...locator, path };
 }
 
 /** Two pathnames naming the same page, ignoring a trailing slash. */
@@ -197,9 +227,15 @@ export function classifyPreviewLink(
   // to the browser and the link dead-ends. Same shape as the `repo:` arm.
   const triggerId = extractTriggerIdFromHref(href);
   if (triggerId) return { kind: 'trigger', triggerId };
+  const settingsView = extractSettingsViewFromHref(href);
+  if (settingsView) return { kind: 'nav', target: 'settings', settingsView };
   const navTarget = extractNavTargetFromHref(href);
   if (navTarget) return { kind: 'nav', target: navTarget };
-  const localFile = extractLocalFileTarget(href);
+  // A bare leading `/` is skipped for a repo preview: there it names a
+  // checkout-root path (the catch-all below), never a real filesystem
+  // location. A `file://` URL is unambiguous in either context and still
+  // goes to the OS opener.
+  const localFile = ctx.repoLocator && href.startsWith('/') ? null : extractLocalFileTarget(href);
   if (localFile) return { kind: 'local-file', target: localFile };
 
   // A file in a registered repository clone. `repo:` is a scheme, so without
@@ -236,9 +272,14 @@ export function classifyPreviewLink(
     }
   }
 
-  // Whatever is left is a path the document author meant as a workspace file.
-  // Claimed even when it names nothing: `openFilePreview` renders a real load
-  // error, whereas declining would let the iframe navigate to the app shell.
+  // Whatever is left is a path the document author meant as a sibling file:
+  // inside the same repo checkout when the preview is a repo file, inside the
+  // workspace data tree otherwise. Claimed even when it names nothing:
+  // `openFilePreview` renders a real load error, whereas declining would let
+  // the iframe navigate to the app shell.
+  if (ctx.repoLocator) {
+    return { kind: 'file', path: encodeRepoPath(resolvePreviewRelativeRepoPath(ctx.repoLocator, href)) };
+  }
   return { kind: 'file', path: resolvePreviewRelativePath(ctx.artifactPath, href) };
 }
 
@@ -263,7 +304,7 @@ export function runPreviewLinkAction(action: PreviewNavigation, artifactPath: st
       );
       return;
     case 'nav':
-      handleNavigationRequest({ target: action.target });
+      handleNavigationRequest({ target: action.target, settings_view: action.settingsView });
       return;
     case 'local-file':
       void openLocalFileOnConfirm(action.target, artifactPath);
@@ -283,7 +324,11 @@ export function runPreviewLinkAction(action: PreviewNavigation, artifactPath: st
 /** Where this page is, as `classifyPreviewLink` needs it. Guarded like
  *  `threadLinkHref` in utils/renderMarkdown.ts: `location` is always there in
  *  the app, never in a bare unit-test environment. */
-export function previewLinkContext(artifactPath: string, documentBase?: string): PreviewLinkContext {
+export function previewLinkContext(
+  artifactPath: string,
+  documentBase?: string,
+  repoLocator?: RepoLocator,
+): PreviewLinkContext {
   const page = typeof location === 'undefined' ? null : location;
   return {
     artifactPath,
@@ -291,17 +336,34 @@ export function previewLinkContext(artifactPath: string, documentBase?: string):
     hostPath: page?.pathname ?? '/',
     workspaceId: WORKSPACE_ID,
     documentBase,
+    repoLocator,
   };
+}
+
+/** The element a `#fragment` names inside a rendered markdown document, or
+ *  `null`. A heading's id carries `HEADING_ID_PREFIX` while the link names the
+ *  bare slug, so that form is tried first. Compared as strings rather than
+ *  through a selector, which a fragment holding a quote or a newline breaks. */
+function fragmentTarget(root: Element, id: string): Element | null {
+  const candidates = Array.from(root.querySelectorAll('[id], [name]'));
+  return candidates.find((el) => el.id === `${HEADING_ID_PREFIX}${id}`)
+    ?? candidates.find((el) => el.id === id)
+    ?? candidates.find((el) => el.getAttribute('name') === id)
+    ?? null;
 }
 
 /** Route one click on a link in a MARKDOWN preview, which renders into the host
  *  document itself.
  *
- *  An in-page fragment is left to the browser here. `#x` resolves to the page
- *  the user is already on, an ordinary same-document hash change that neither
- *  reloads nor destroys anything. (`marked` emits no heading ids either, so
- *  claiming it would only toast on every link.) */
-export function handlePreviewLinkClick(e: MouseEvent, artifactPath: string): void {
+ *  An in-page fragment scrolls the rendered document, and never reaches the
+ *  browser: the host page's hash belongs to the deep-link router. A fragment
+ *  naming nothing toasts, as the HTML preview's does.
+ *
+ *  `repoLocator` is set for a document previewed from a repository checkout,
+ *  so a relative href resolves against the checkout rather than the
+ *  workspace. `artifactPath` still identifies the previewed document for the
+ *  local-file-open confirm; a repo caller passes its `repo:`-encoded path. */
+export function handlePreviewLinkClick(e: MouseEvent, artifactPath: string, repoLocator?: RepoLocator): void {
   if (e.defaultPrevented) return;
   // A modifier or a non-primary button is the user explicitly asking the BROWSER
   // to act (new tab, new window, save link). Claiming those would break the one
@@ -326,11 +388,33 @@ export function handlePreviewLinkClick(e: MouseEvent, artifactPath: string): voi
     return;
   }
 
-  const action = classifyPreviewLink(anchor.getAttribute('href') ?? '', previewLinkContext(artifactPath));
-  if (!action || action.kind === 'fragment') return;
+  const action = classifyPreviewLink(
+    anchor.getAttribute('href') ?? '',
+    previewLinkContext(artifactPath, undefined, repoLocator),
+  );
+  if (!action) return;
+  if (action.kind === 'fragment') {
+    const root = anchor.closest?.('.markdown-content') ?? null;
+    if (!root) return;
+    e.preventDefault();
+    e.stopPropagation();
+    scrollToFragment(root, action.id, repoLocator?.path ?? artifactPath);
+    return;
+  }
   e.preventDefault();
   e.stopPropagation();
   runPreviewLinkAction(action, artifactPath);
+}
+
+/** Scroll a rendered document to the element `id` names, or to its top for a
+ *  bare `#`. `documentPath` names the file in the toast when nothing matches. */
+function scrollToFragment(root: Element, id: string, documentPath: string): void {
+  const target = id ? fragmentTarget(root, id) : root;
+  if (!target) {
+    showToast(`No "${id}" section in ${documentPath}`, 'error');
+    return;
+  }
+  target.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
 }
 
 /** The `<base href>` a previewed artifact should carry: its own folder, so
@@ -415,8 +499,18 @@ export function withPreviewBase(html: string, baseHref: string): string {
  *  either, rather than an error: an unreadable preference must never cost the
  *  reader the document. */
 export function withPreviewSizing(html: string, scalePercent: number): string {
-  return injectAtHeadStart(html, `<style>${previewZoomRule(scalePercent)}${PREVIEW_BODY_TEXT_RULE}</style>`);
+  return injectAtHeadStart(
+    html,
+    `<style>${previewZoomRule(scalePercent)}${PREVIEW_BODY_TEXT_RULE}${PREVIEW_FIND_RULES}</style>`,
+  );
 }
+
+/** The find bar's highlights inside the preview. An artifact carries no theme
+ *  tokens, so they use the system's own find colours. `--find-highlights` tells
+ *  the stamped finder these rules are here. */
+export const PREVIEW_FIND_RULES = ':root{--find-highlights:styled}'
+  + `::highlight(${ALL_HIGHLIGHT}){background-color:Mark;color:MarkText}`
+  + `::highlight(${CURRENT_HIGHLIGHT}){background-color:SelectedItem;color:SelectedItemText}`;
 
 /** `--font-size-sm`, the step chat prose renders at, before the zoom scales it. */
 const PREVIEW_BODY_TEXT_RULE = ':where(body){font-size:0.75rem}';

@@ -3,6 +3,14 @@ import { getDraft } from '../store/composeDrafts';
 
 const MAX_LEN = 40;
 
+/** What a thread with no title is called where only its stored title is known. */
+export const UNTITLED_THREAD = 'Untitled thread';
+
+/** A stored thread title as shown, or `UNTITLED_THREAD` when it is empty. */
+export function storedThreadTitle(title: string | null | undefined): string {
+    return title?.trim() || UNTITLED_THREAD;
+}
+
 function previewText(text: string): string {
     const trimmed = text.trim();
     return trimmed.length > MAX_LEN ? trimmed.slice(0, MAX_LEN - 1) + '…' : trimmed;

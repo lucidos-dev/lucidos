@@ -1,8 +1,9 @@
 //! Auto-update wiring (`tauri-plugin-updater`). No-op in development.
 //!
 //! A packaged build surfaces updates INSIDE the workspace UI, not a native
-//! launch dialog and not the picker. The web app polls [`check_app_update`] and
-//! shows an in-app toast whose action calls
+//! launch dialog and not the picker. The gateway finds a newer release (ADR
+//! 0108). The web app calls [`check_app_update`] only when a manual check gets
+//! no gateway answer. It shows an in-app toast whose action calls
 //! [`install_app_update_and_restart`]. That installs the new signed bundle and
 //! restarts the WHOLE stack: the launchd background service AND the GUI client.
 //! A session that cannot install asks for the same run through the update

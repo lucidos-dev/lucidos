@@ -14,7 +14,7 @@
  */
 
 import { threadMap, focusedThreadId, changes, showConfirm, effectiveThreadStatus, applyingNowThreadIds, applyingChangeThreadIds, discardingCCThreadIds, archivingThreadIds, standingApplyThreadIds, armingStandingApplyThreadIds } from '../store';
-import { getCodingAgentWaitingInfo } from '../thread-events';
+import { getCodingAgentWaitingInfo, type ThreadMeta } from '../thread-events';
 import { availableThreadActions, type Action } from '../../generated/thread-lifecycle';
 import { getDraft, draftIsEmpty } from '../composeDrafts';
 import { handleArchiveThread, handleSaveThread, handleUnsaveThread } from './threads';
@@ -88,6 +88,13 @@ export function threadHasIncompleteChange(threadId: string): boolean {
  * Per-thread tagged actions in cascade priority order: the close set
  * (DiscardDraft → Discard/Apply → Archive) followed by the Save/Unsave toggle.
  */
+/** Whether a pin can do anything for this thread. A draft has nothing to pin
+ *  until it is sent. The home thread sits in no drawer section, so a pin
+ *  would move it nowhere, and the engine refuses one (ADR 0362). */
+export function threadIsPinnable(meta: Pick<ThreadMeta, 'state' | 'home'>): boolean {
+  return meta.state !== 'composing' && !meta.home;
+}
+
 export function resolveThreadActions(threadId: string): TaggedAction[] {
   const thread = threadMap.value.get(threadId);
   if (!thread) return [];
@@ -148,13 +155,15 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
     kinds = kinds.filter((a) => a !== 'apply_when_settled');
   }
 
-  // A composing draft only exists in the frontend (no persisted thread), and
-  // `isExcludedFromSections` keeps it out of every drawer section — including
-  // Saved. Saving it would set `is_saved` but the row would still render in the
-  // compose/Drafts surface, never moving to the Saved section. Suppress the
-  // save toggle so the action isn't offered for something it can't accomplish.
-  if (thread.meta.state === 'composing') {
+  // No save toggle where a pin can accomplish nothing.
+  if (!threadIsPinnable(thread.meta)) {
     kinds = kinds.filter((a) => a !== 'save' && a !== 'unsave');
+  }
+  // The home thread never ends, so it has no Archive action (ADR 0362). The
+  // engine refuses one anyway. The thread menu shows it blocked, with the
+  // reason (ADR 0378), from `exitItems`, not from this list.
+  if (thread.meta.home) {
+    kinds = kinds.filter((a) => a !== 'archive');
   }
 
   const requiresRestart =

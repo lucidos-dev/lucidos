@@ -12,6 +12,7 @@ import { SurfaceHead } from '../shared/Surface';
 import { FilePreviewInline } from './FilePreviewInline';
 import { RepoFileContent, previewGitRef } from './RepoFilePreview';
 import { previewFilePath, previewFileName } from '../../utils/previewPath';
+import { filePreviewCopyPathAction } from '../layout/ContentHeaderActions';
 
 type LineRange = { start: number; end: number } | null;
 
@@ -127,6 +128,7 @@ export function FilePreviewModal() {
     editing: false,
     diffShowsWholeFile: true,
   });
+  const copyPath = filePreviewCopyPathAction(state.path);
 
   return (
     <Overlay
@@ -150,6 +152,16 @@ export function FilePreviewModal() {
         }
         actions={
           <>
+            {copyPath && (
+              <button
+                class="icon-btn"
+                aria-label={copyPath.label}
+                data-tooltip={copyPath.label}
+                onClick={copyPath.onClick}
+              >
+                {copyPath.icon()}
+              </button>
+            )}
             {canWrap && (
               <button
                 class={`icon-btn file-preview-wrap-toggle${wrapOn ? ' filter-active' : ''}`}

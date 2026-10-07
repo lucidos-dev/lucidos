@@ -14,7 +14,7 @@ import { navigateToPane } from '../../store/actions/pane';
 import { useThreadSearch } from '../../hooks/useThreadSearch';
 import { ThreadFilterButton, ThreadsPaneTitle } from './ThreadFilterButton';
 import { ThreadTitleMenu } from '../chat/ThreadTitle';
-import { threadVisualStatus } from '../shared/ThreadStatusIcon';
+import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { MobileThreadsPane } from './MobileThreadsPane';
 import { ThreadPane } from './ThreadPane';

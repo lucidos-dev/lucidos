@@ -174,7 +174,11 @@ export type ContextPurpose =
   | 'memory_correction'
   | 'artifact_summary'
   | 'side_question'
-  | 'change_summary';
+  | 'change_summary'
+  | 'summary_compaction'
+  | 'memory_find'
+  | 'web_search'
+  | 'proxy';
 
 /** API role bucket a `ContextSection` belongs to. Mirrors the three buckets
  *  in the LLM API call: the system prompt, prior messages (verbatim resume
@@ -717,6 +721,23 @@ export type ThreadEvent =
        *  present `usage` block keeps reporting measured spend only. Written
        *  by `core::aux_context_backfill` and by nothing else. */
       reconstructed?: boolean;
+      /** The `Agent` call whose sub-agent made this call, so the capture
+       *  binds to that sub-agent's steps. Absent for every other capture. */
+      parent_tool_use_id?: string;
+      /** The coding agent's id for this API call. Every
+       *  `CodingAgentToolCalled` the call produced carries the same id, so
+       *  the capture binds to each of them. Absent for every other capture. */
+      api_call_id?: string;
+      /** The reasoning tier this call ran at, where the caller has one to
+       *  report. Absent for every purpose but the compactor today, and for
+       *  every row written before the field existed. Lets a cost estimate
+       *  split measured usage by tier instead of treating all history as
+       *  one baseline. */
+      reasoning_effort?: string;
+      /** How long the call took, wall clock, where the caller timed it.
+       *  Absent for every purpose but the compactor today. The Tree
+       *  backfill estimate reads it as a model's seconds per call. */
+      duration_ms?: number;
       /** Server dropped `sections` and `tools` here. The modal lazy-fetches them. */
       sections_stripped?: boolean;
       /** Links this event back to the request that opened the turn. */
@@ -993,6 +1014,9 @@ export type ThreadEvent =
       type: 'CodingAgentTextStreamed';
       text: string;
       coding_agent?: CodingAgent;
+      /** The `Agent` call whose sub-agent wrote this text. Such text is the
+       *  sub-agent's narration, never the session's reply. Absent otherwise. */
+      parent_tool_use_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1028,6 +1052,12 @@ export type ThreadEvent =
        *  when an `EXCHANGE_START_TYPES` event (e.g. permission prompt)
        *  splits them across exchanges. Empty for legacy DB rows. */
       tool_use_id?: string;
+      /** The `Agent` call whose sub-agent made this call. Absent for the
+       *  session's own calls and on rows written before the field existed. */
+      parent_tool_use_id?: string;
+      /** The API call that made this tool call, matching that call's
+       *  `ContextCaptured`. Absent from Codex and on older rows. */
+      api_call_id?: string;
       /** Server dropped `args` here. The step detail lazy-fetches them. `description` is filled from `describe_cc_tool` first, so the inline step label never waits on that fetch. */
       args_stripped?: boolean;
       /** Links this event back to the request that opened the turn. */
@@ -1049,6 +1079,10 @@ export type ThreadEvent =
       /** Matches the originating `CodingAgentToolCalled.tool_use_id`.
        *  Empty for legacy DB rows. */
       tool_use_id?: string;
+      /** The `Agent` call whose sub-agent made the call this answers. Absent
+       *  for the session's own calls and on rows written before the field
+       *  existed. */
+      parent_tool_use_id?: string;
       /** Server dropped `result` here. The step detail lazy-fetches it. */
       result_stripped?: boolean;
       /** Links this event back to the request that opened the turn. */
@@ -1302,6 +1336,19 @@ export type ThreadEvent =
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
       channel?: EventChannel;
+    }
+  /** The workspace's *home thread* was created (ADR 0362): an active chat
+   *  thread titled "Home", with no message yet. `ensure_home_thread`
+   *  emits it once per workspace, at boot. The projection's unique marker
+   *  refuses a second one, which rolls the event back with it. */
+  | {
+      type: 'HomeThreadCreated';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
     }
   /** A user attached an image to this thread's compose draft. Emitted by
    *  POST /api/v1/threads/:id/blobs after the bytes are content-addressed
@@ -2473,6 +2520,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ThreadTriageProposed: true,
   ThreadStarted: true,
   ThreadDiscarded: true,
+  HomeThreadCreated: true,
   ImageUploaded: true,
   TriggerStarted: true,
   TriggerCompleted: true,

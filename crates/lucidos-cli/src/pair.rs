@@ -16,10 +16,13 @@
 
 use crate::workspace::BoxError;
 
-/// Gateway ports to try, in order. The packaged gateway holds 5252 and the dev
-/// one 5251, deliberately one apart so both can run at once. Probing beats
-/// asking the user, since most people have exactly one.
-const DEFAULT_PORTS: [u16; 2] = [5252, 5251];
+/// Gateway ports to try, in order: the packaged gateway's, then the dev one's.
+/// They differ so both can run at once. Probing beats asking the user, since
+/// most people have exactly one.
+const DEFAULT_PORTS: [u16; 2] = [
+    lucidos_installs::DEFAULT_GATEWAY_PORT,
+    lucidos_installs::DEFAULT_DEV_GATEWAY_PORT,
+];
 
 /// Where the gateway's own surface lives, behind the reserved sigil namespace.
 const PAIRING_CODE_PATH: &str = "/~/api/v1/auth/pairing-code";
@@ -371,24 +374,25 @@ fn choose_gateway(found: &[FoundGateway], preferred: Option<u16>) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lucidos_installs::{DEFAULT_DEV_GATEWAY_PORT as DEV, DEFAULT_GATEWAY_PORT as PACKAGED};
 
     #[test]
     fn an_explicit_dev_override_is_probed_before_the_defaults() {
         // Set on a dev machine that also runs a packaged install, where probing
-        // 5252 first would pair the wrong gateway.
-        assert_eq!(candidate_ports_from(Some(5999)), vec![5999, 5252, 5251]);
+        // the packaged port first would pair the wrong gateway.
+        assert_eq!(candidate_ports_from(Some(5999)), vec![5999, PACKAGED, DEV]);
     }
 
     #[test]
     fn an_override_equal_to_a_default_is_not_listed_twice() {
-        assert_eq!(candidate_ports_from(Some(5251)), vec![5251, 5252]);
-        assert_eq!(candidate_ports_from(Some(5252)), vec![5252, 5251]);
+        assert_eq!(candidate_ports_from(Some(DEV)), vec![DEV, PACKAGED]);
+        assert_eq!(candidate_ports_from(Some(PACKAGED)), vec![PACKAGED, DEV]);
     }
 
     #[test]
     fn the_defaults_are_probed_when_nothing_is_set() {
         // Packaged first: it is the one an ordinary install has.
-        assert_eq!(candidate_ports_from(None), vec![5252, 5251]);
+        assert_eq!(candidate_ports_from(None), vec![PACKAGED, DEV]);
     }
 
     fn found(ports: &[u16]) -> Vec<FoundGateway> {

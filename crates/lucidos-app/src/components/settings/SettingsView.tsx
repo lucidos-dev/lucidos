@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentBackgroundReasoning, saveModelSelection, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileDynamicBars, setMobileDynamicBars, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
-import { THEME_EFFECTS_PREFS, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
+import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileDynamicBars, setMobileDynamicBars, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, homeThreadEnabled, setHomeThreadEnabled, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
+import { DEFAULT_THEME_MODE, THEME_EFFECTS_PREFS, THEME_MODES, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
+import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
@@ -28,11 +29,12 @@ import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { SETTINGS_SECTION_REFRESH } from './settingsSectionRefresh';
 import {
-  lucidosModelChoices, modelReasoningEfforts, LUCIDOS_TIER_VOCABULARY,
-  rememberProvider,
+  lucidosModelChoices, LUCIDOS_TIER_VOCABULARY, rememberProvider,
 } from '../../store/actions/models';
-import { lucidosTiers, type ModelChoice } from '../../store/modelSelection';
+import { type ModelChoice } from '../../store/modelSelection';
 import { ModelSelectionRow } from './ModelSelectionRow';
+import { BackgroundModelRow } from './BackgroundModelRow';
+import { useBackgroundModels } from './useBackgroundModels';
 import { ResponseStylesSection } from './ResponseStylesSection';
 import { ModelsManager } from './ModelsManager';
 import { VoiceSection } from './VoiceSection';
@@ -44,6 +46,8 @@ import { OpenCodeFreeSettings } from './OpenCodeFreeSettings';
 import { ProviderBlock } from './ProviderBlock';
 import { LocalProviderSettings } from './LocalProviderSettings';
 import { TypeSafeJudgmentSettings } from './TypeSafeJudgmentSettings';
+import { CloudflareWorkersAiSettings } from './CloudflareWorkersAiSettings';
+import { CustomSystemOneSettings } from './CustomSystemOneSettings';
 import { JudgmentModelRow } from './JudgmentModelRow';
 import { Dropdown } from '../shared/Dropdown';
 import { fontOptions } from './fontOptions';
@@ -84,6 +88,7 @@ import { openSettingsSubview } from '../../store/actions/menu';
 import { focusFirstFocusableWithin } from '../layout/paneFocus';
 import { formatTimeAgo } from '../../utils/formatTime';
 import type { ImageModel } from '../../store/actions/preferences';
+import { Disclosure } from '../shared/Disclosure';
 import { errorDetail } from '../../utils/errorDetail';
 import { motionPreference, scrollBehavior } from '../../utils/motion';
 import { themeEffectsPreference } from '../../utils/themeEffects';
@@ -117,12 +122,17 @@ function formatScopes(scopes: string): string {
     .join(', ');
 }
 
-/** System first, as in the Motion row: it is the default for both. */
-const THEME_MODES: Array<{ value: ThemeMode; label: string }> = [
-  { value: 'system', label: 'System' },
-  { value: 'light', label: 'Light' },
-  { value: 'dark', label: 'Dark' },
-];
+const THEME_MODE_LABELS: Record<ThemeMode, string> = {
+  light: 'Light',
+  dark: 'Dark',
+  system: 'System',
+};
+
+/** The default first, as in the Motion row. */
+const THEME_MODE_OPTIONS: Array<{ value: ThemeMode; label: string }> = [
+  DEFAULT_THEME_MODE,
+  ...THEME_MODES.filter((mode) => mode !== DEFAULT_THEME_MODE),
+].map((mode) => ({ value: mode, label: THEME_MODE_LABELS[mode] }));
 
 const MOTION_LABELS: Record<MotionPref, string> = {
   system: 'System',
@@ -136,62 +146,41 @@ const THEME_EFFECTS_LABELS: Record<ThemeEffectsPref, string> = {
   full: 'Full',
 };
 
-const EXTERNAL_LINK_TARGET_OPTIONS: Array<{ value: ExternalLinkTarget; label: string }> = [
-  { value: 'safari', label: 'Safari' },
-  { value: 'ask', label: 'Ask (share sheet)' },
-  { value: 'in-app', label: 'In-app view' },
-];
+const EXTERNAL_LINK_TARGET_LABELS: Record<ExternalLinkTarget, string> = {
+  safari: 'Safari',
+  ask: 'Ask (share sheet)',
+  'in-app': 'In-app view',
+};
+
+const EXTERNAL_LINK_TARGET_OPTIONS = PREFERENCE_CATALOG.external_link_target.values
+  .map((target) => ({ value: target, label: EXTERNAL_LINK_TARGET_LABELS[target] }));
 
 // Presets for the per-turn tool-call cap. The dropdown is `freeText`, so these
-// are a starting point rather than the allowed set: any number can be typed,
-// and there is no maximum (see `MAX_TOOL_CALLS_MIN`).
-const MAX_TOOL_CALLS_OPTIONS = [
-  { value: '50', label: '50' },
-  { value: '100', label: '100' },
-  { value: '250', label: '250' },
-  { value: '500', label: '500 (default)' },
-  { value: '1000', label: '1000' },
-  { value: '2000', label: '2000' },
-  { value: '5000', label: '5000' },
-];
+// are a starting point rather than the allowed set: any whole number between
+// `MAX_TOOL_CALLS_MIN` and `MAX_TOOL_CALLS_MAX` can be typed.
+const MAX_TOOL_CALLS_PRESETS = [50, 100, 250, 1000, 2000, 5000];
 
-const IMAGE_MODELS = [
-  { value: 'auto', label: 'Auto' },
-  { value: 'imagen-4', label: 'Imagen 4' },
-  { value: 'gpt-image-1', label: 'GPT Image 1' },
-  { value: 'gpt-image-1.5', label: 'GPT Image 1.5' },
-  { value: 'gpt-image-2', label: 'GPT Image 2' },
-];
-
-// Curated cheap/fast models for auxiliary background work (title generation,
-// image description, memory extraction, command judge). Deliberately a small
-// list separate from the full chat registry — these run on every turn, so the
-// options are the low-cost tiers. GPT-5.4 mini is the OpenAI option — the
-// Flash/Haiku-class peer of the others (not the flagship GPT-5.4 Standard);
-// routed via the MemoryExtractor's gpt-* prefix when picked.
-const BACKGROUND_MODEL_IDS = [
-  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
-  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
-  { value: 'claude-haiku-4-5', label: 'Haiku 4.5' },
-  { value: 'gpt-5.4-mini', label: 'GPT-5.4 mini' },
-];
-
-/** The background models as *model selections*: each row carries the tiers the
- *  engine will actually accept for it, so the paired Reasoning control offers
- *  the set `RoutingProvider` clamps onto. */
-function backgroundModelChoices(): ModelChoice[] {
-  return BACKGROUND_MODEL_IDS.map((m) => ({
-    value: m.value,
-    label: m.label,
-    reasoningEfforts: lucidosTiers(m.value, modelReasoningEfforts(m.value)),
+/** The presets and the default, in order, with the default marked. */
+const MAX_TOOL_CALLS_OPTIONS = [...new Set([...MAX_TOOL_CALLS_PRESETS, MAX_TOOL_CALLS_DEFAULT])]
+  .sort((a, b) => a - b)
+  .map((cap) => ({
+    value: String(cap),
+    label: cap === MAX_TOOL_CALLS_DEFAULT ? `${cap} (default)` : String(cap),
   }));
-}
+
+const IMAGE_MODEL_LABELS: Record<ImageModel, string> = {
+  auto: 'Auto',
+  'imagen-4': 'Imagen 4',
+  'gpt-image-1': 'GPT Image 1',
+  'gpt-image-1.5': 'GPT Image 1.5',
+  'gpt-image-2': 'GPT Image 2',
+};
 
 /** Image generation has no reasoning tiers at all, so its picker renders the
  *  model alone. The empty list is what decides that, not a prop. */
-const IMAGE_MODEL_CHOICES: ModelChoice[] = IMAGE_MODELS.map((m) => ({
-  value: m.value,
-  label: m.label,
+const IMAGE_MODEL_CHOICES: ModelChoice[] = PREFERENCE_CATALOG.image_model.values.map((model) => ({
+  value: model,
+  label: IMAGE_MODEL_LABELS[model],
   reasoningEfforts: [],
 }));
 
@@ -498,7 +487,7 @@ function VertexProviderSettings() {
           options={VERTEX_REGIONS}
           value={currentVertexRegion()}
           freeText
-          placeholder="e.g. europe-west1"
+          placeholder={`e.g. ${PREFERENCE_CATALOG.vertex_region.fallback}`}
           onChange={setVertexRegion}
         />
       </div>
@@ -530,6 +519,8 @@ export function SettingsView() {
   // cannot be called from inside the Devices branch alone. It costs one local
   // request, which resolves to "no gateway" everywhere else.
   const paired = usePairedDevices();
+  const background = useBackgroundModels();
+  usePanelRefresh('background models', background.refresh);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [oauthProvider, setOauthProvider] = useState('');
   const [oauthConnecting, setOauthConnecting] = useState(false);
@@ -1039,14 +1030,14 @@ export function SettingsView() {
             onChange={(c) => void setCommandGuardJudge(c)}
           />
         </div>
-        {/* TypeSafe (Jev) is a row in this picker, not a switch beside it: a
+        {/* Every System One row is in this picker, not a switch beside it: a
             backend is picked where the model is. */}
         <JudgmentModelRow
           site="command-guard"
           label="Judge model"
           anchor="command-safety:judge-model"
           nested
-          models={backgroundModelChoices()}
+          background={background}
           disabled={!guardOn || !judgeOn}
         />
       </div>
@@ -1133,12 +1124,10 @@ export function SettingsView() {
         return;
       }
       const parsed = Number(trimmed);
-      // Not the policy ceiling this setting deliberately omits: past
-      // MAX_SAFE_INTEGER, JS rounds the number, so saving it would store
-      // something other than what was typed (see MAX_TOOL_CALLS_REPRESENTABLE).
-      if (parsed > MAX_TOOL_CALLS_REPRESENTABLE) {
+      // The engine refuses a cap above its bound, so say so before the write.
+      if (parsed > MAX_TOOL_CALLS_MAX) {
         showToast(
-          `${trimmed} is too large to store exactly (max ${MAX_TOOL_CALLS_REPRESENTABLE.toLocaleString()})`,
+          `${trimmed} is above the limit of ${MAX_TOOL_CALLS_MAX.toLocaleString()} tool calls`,
           'error',
         );
         return;
@@ -1189,9 +1178,9 @@ export function SettingsView() {
                   can continue from by sending anything.
                 </p>
                 <p>
-                  There's no maximum, but the cap is what bounds a runaway turn, and
-                  it's roughly how long one can run. Cost grows faster than time,
-                  because every step resends the conversation.
+                  The cap is what bounds a runaway turn, and it's roughly how long
+                  one can run. Cost grows faster than time, because every step
+                  resends the conversation.
                 </p>
               </Explainer>
             </span>
@@ -1199,7 +1188,7 @@ export function SettingsView() {
               options={MAX_TOOL_CALLS_OPTIONS}
               value={String(maxToolCalls)}
               freeText
-              placeholder="e.g. 500"
+              placeholder={`e.g. ${MAX_TOOL_CALLS_DEFAULT}`}
               onChange={handleMaxToolCallsChange}
             />
           </div>
@@ -1228,72 +1217,64 @@ export function SettingsView() {
         </div>
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="models:background-tasks">Background tasks</div>
-          <ModelSelectionRow
+          <BackgroundModelRow
             label="Title generation"
             anchor="models:title-generation"
-            models={backgroundModelChoices()}
-            vocabulary={LUCIDOS_TIER_VOCABULARY}
-            model={currentBackgroundModel('model_title')}
-            effort={currentBackgroundReasoning('reasoning_title')}
-            onChange={(p) => void saveModelSelection('model_title', 'reasoning_title', p)}
+            modelKey="model_title"
+            reasoningKey="reasoning_title"
+            background={background}
           />
           {/* Under the title model, because it inherits it while unset: both
               write one line naming a piece of work. */}
-          <ModelSelectionRow
+          <BackgroundModelRow
             label="Change summary"
             anchor="models:change-summary"
             nested
-            models={backgroundModelChoices()}
-            vocabulary={LUCIDOS_TIER_VOCABULARY}
-            model={currentBackgroundModel('model_change_summary')}
-            effort={currentBackgroundReasoning('reasoning_change_summary')}
-            onChange={(p) => void saveModelSelection('model_change_summary', 'reasoning_change_summary', p)}
+            modelKey="model_change_summary"
+            reasoningKey="reasoning_change_summary"
+            background={background}
           />
-          <ModelSelectionRow
+          <BackgroundModelRow
             label="Image description"
             anchor="models:image-description"
-            models={backgroundModelChoices()}
-            vocabulary={LUCIDOS_TIER_VOCABULARY}
-            model={currentBackgroundModel('model_image_description')}
-            effort={currentBackgroundReasoning('reasoning_image_description')}
-            onChange={(p) => void saveModelSelection(
-              'model_image_description',
-              'reasoning_image_description',
-              p,
-            )}
+            modelKey="model_image_description"
+            reasoningKey="reasoning_image_description"
+            background={background}
           />
-          <ModelSelectionRow
+          <BackgroundModelRow
             label="Memory extraction"
             anchor="models:memory-extraction"
-            models={backgroundModelChoices()}
-            vocabulary={LUCIDOS_TIER_VOCABULARY}
-            model={currentBackgroundModel('model_memory')}
-            effort={currentBackgroundReasoning('reasoning_memory')}
-            onChange={(p) => void saveModelSelection('model_memory', 'reasoning_memory', p)}
+            modelKey="model_memory"
+            reasoningKey="reasoning_memory"
+            background={background}
           />
-          {/* Under the memory model, because it inherits it while unset, and
-              because this is the call deciding whether memory is retrieved at
-              all. TypeSafe (Jev) is one of its model rows. */}
+          {/* Under the memory model, because this is the call deciding whether
+              memory is retrieved at all. The System One rows are among its
+              models. */}
           <JudgmentModelRow
             site="query-classification"
             label="Query classification"
             anchor="models:query-classification"
             nested
-            models={backgroundModelChoices()}
+            background={background}
           />
-          <ModelSelectionRow
+          <BackgroundModelRow
             label="Conversation summary"
             anchor="models:conversation-summary"
-            models={backgroundModelChoices()}
-            vocabulary={LUCIDOS_TIER_VOCABULARY}
-            model={currentBackgroundModel('model_conversation_summary')}
-            effort={currentBackgroundReasoning('reasoning_conversation_summary')}
-            onChange={(p) => void saveModelSelection(
-              'model_conversation_summary',
-              'reasoning_conversation_summary',
-              p,
-            )}
+            modelKey="model_conversation_summary"
+            reasoningKey="reasoning_conversation_summary"
+            background={background}
           />
+          {/* The compactor runs only under Tree, so the row shows only then. */}
+          <Disclosure open={currentMemoryModule() === 'tree'}>
+            <BackgroundModelRow
+              label="Summary compaction"
+              anchor="models:summary-compaction"
+              modelKey="model_summary_compaction"
+              reasoningKey="reasoning_summary_compaction"
+              background={background}
+            />
+          </Disclosure>
         </div>
         <VoiceSection />
         <div class="settings-section">
@@ -1306,6 +1287,8 @@ export function SettingsView() {
           <OpenCodeFreeSettings />
           <LocalProviderSettings />
           <TypeSafeJudgmentSettings />
+          <CloudflareWorkersAiSettings />
+          <CustomSystemOneSettings />
         </div>
         <ModelsManager />
       </>
@@ -1343,7 +1326,7 @@ export function SettingsView() {
           <div class="settings-row" data-search-anchor="appearance:mode">
             <span class="settings-row-label">Mode</span>
             <div class="segmented-control" role="group" aria-label="Theme mode">
-              {THEME_MODES.map((t) => (
+              {THEME_MODE_OPTIONS.map((t) => (
                 <button
                   key={t.value}
                   type="button"
@@ -1498,6 +1481,7 @@ export function SettingsView() {
         )}
         {notificationsSection()}
         {linksSection()}
+        {experimentalSection()}
       </>
     );
   }
@@ -1680,6 +1664,38 @@ export function SettingsView() {
             />
           </div>
         )}
+      </div>
+    );
+  }
+
+  /** Experimental: features that ship off while they prove themselves. Each
+   *  row is a switch the engine reads too, so it holds on every device. */
+  function experimentalSection() {
+    const loaded = preferences.value.status === 'loaded';
+    return (
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="appearance:experimental">Experimental</div>
+        <div class="settings-row" data-search-anchor="appearance:home-thread">
+          <span class="settings-row-label">
+            Home thread
+            <Explainer title="Home thread">
+              <p>
+                One conversation that never ends, at the top of your threads. It
+                can follow up any of your other threads, and it presses your
+                buttons only when you ask it to in that message.
+              </p>
+              <p>
+                Voice calls happen there, so voice needs it on. Turning it off
+                hides Home, and turning it on again brings the same thread back.
+              </p>
+            </Explainer>
+          </span>
+          <LoadableToggle
+            loaded={loaded}
+            checked={homeThreadEnabled()}
+            onChange={(c) => void setHomeThreadEnabled(c)}
+          />
+        </div>
       </div>
     );
   }

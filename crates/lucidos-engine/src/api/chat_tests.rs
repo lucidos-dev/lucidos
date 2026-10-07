@@ -358,6 +358,44 @@ fn the_unknown_thread_refusal_points_at_the_wrong_engine() {
     );
 }
 
+// A create with nothing to say is refused before the thread exists. The caller
+// gets the error, not a link to a dead thread (ADR 0376).
+
+#[test]
+fn a_create_with_no_text_and_no_image_is_refused() {
+    for blank in ["", "  \n\t "] {
+        let err = require_input_to_create(false, blank, &[]).expect_err("nothing to start with");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, NOTHING_TO_START_THE_THREAD_WITH);
+    }
+}
+
+#[test]
+fn an_image_alone_is_enough_to_create() {
+    let image = ChatImage {
+        base64: "AA==".into(),
+        mime_type: "image/png".into(),
+    };
+    assert!(require_input_to_create(false, "", std::slice::from_ref(&image)).is_ok());
+}
+
+#[test]
+fn text_alone_is_enough_to_create() {
+    assert!(require_input_to_create(false, "do the thing", &[]).is_ok());
+}
+
+#[test]
+fn a_drafts_first_send_is_a_create() {
+    assert!(!thread_has_started(None));
+    assert!(!thread_has_started(Some(ThreadState::Composing.as_str())));
+    assert!(thread_has_started(Some(ThreadState::Active.as_str())));
+}
+
+#[test]
+fn a_follow_up_is_not_judged_here() {
+    assert!(require_input_to_create(true, "", &[]).is_ok());
+}
+
 fn base_req(mode: ActorMode) -> ChatRequest {
     ChatRequest {
         message: "hi".into(),

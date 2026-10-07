@@ -7,8 +7,8 @@
 //! independently and observe events only after `tx.commit()`.
 //!
 //! See the [`EventBus`] struct doc-comment for the full two-contract surface:
-//! the five-phase in-emit pipeline (Validate → Persist → Project → CaptureAggregate
-//! → PostCommit) and the post-commit subscriber contract.
+//! the six-phase in-emit pipeline (Serialize → Validate → Persist → Project →
+//! CaptureAggregate → PostCommit) and the post-commit subscriber contract.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -217,6 +217,9 @@ use parent_wake_hold::ParentWakeHold;
 mod parent_callback;
 pub(crate) use parent_callback::ChildSettle;
 
+mod append_horizon;
+pub(crate) use append_horizon::committed_event_horizon;
+
 impl EmittedEvent {
     /// Convert to SSE-compatible JSON string.
     /// Thread events use `{ "type": "ThreadEvent", "data": { thread_id, seq?, event } }`.
@@ -324,14 +327,25 @@ pub trait EventBusEmitter: Send + Sync {
 /// Channel capacity for the event broadcast.
 const BUS_CAPACITY: usize = 4096;
 
+/// Advisory-lock class for [`EventBus::lock_thread_append`]. The two-key form
+/// keeps it apart from the one-key locks elsewhere in the engine.
+const THREAD_APPEND_LOCK_CLASS: i32 = 0x6170_6e64;
+
 /// Single entry point for every domain event. Carries two distinct contracts:
 ///
-/// # In-emit pipeline (5 phases, in this order)
+/// # In-emit pipeline (6 phases, in this order)
 ///
-/// Every persisted-thread `emit()` runs the same 5-phase pipeline. Each phase
+/// Every persisted-thread `emit()` runs the same 6-phase pipeline. Each phase
 /// is marked in source with a `// === Phase: <Name> ===` banner; the
-/// `emit_pipeline_has_five_named_phases_in_order` test pins the ordering.
+/// `emit_pipeline_has_six_named_phases_in_order` test pins the ordering.
 ///
+/// The transaction opens with [`EventBus::begin_append`], before any phase. Its
+/// in-flight append lock is what makes a committed horizon readable (ADR 0364).
+///
+/// 0. **Serialize** — take the thread append lock, the transaction's second
+///    lock after the in-flight append lock. A thread's events therefore commit
+///    in sequence order, which every `sequence > after` catch-up relies on
+///    (ADR 0360).
 /// 1. **Validate** — pre-INSERT checks (e.g. `request_event_id` existence) that
 ///    read the same tx snapshot the upcoming Persist will use. May short-circuit
 ///    with `Err` before any events row is written, or with `Ok(None)` for the
@@ -355,12 +369,12 @@ const BUS_CAPACITY: usize = 4096;
 ///    Project's side-effects via recursive `emit()` calls.
 ///
 /// New code added inside `emit()` must declare which phase it belongs to by
-/// placing it under the matching banner. Phases 1–4 share one transaction —
+/// placing it under the matching banner. Phases 0–4 share one transaction —
 /// they cannot be moved out without breaking validate-reads-projection or the
 /// CaptureAggregate read-your-write guarantee. The system-event arm and
 /// transient arms are simplified variants of the thread persisted arm and run
-/// the relevant subset (no Validate for system events, no CaptureAggregate for
-/// transient events).
+/// the relevant subset (no Serialize or Validate for system events, no
+/// CaptureAggregate for transient events).
 ///
 /// # Post-commit subscriber contract
 ///
@@ -420,6 +434,11 @@ impl EventBus {
             },
             parent_callback_rx,
         )
+    }
+
+    /// The database this bus persists to.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// The register the engine takes a hold in before it emits a terminal it
@@ -567,7 +586,30 @@ impl EventBus {
 
     // ---- Shared persistence ----
 
+    /// Take `thread_id`'s *thread append lock*, held until the transaction
+    /// ends. Every append of a row carrying a `thread_id` takes it, so a
+    /// thread's events commit in sequence order (ADR 0360).
+    ///
+    /// **Only the in-flight append lock may come before it.** A waiter then
+    /// holds just its own in-flight key, which only a horizon read waits on, so
+    /// it cannot close a deadlock cycle (ADR 0364).
+    async fn lock_thread_append(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        thread_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+            .bind(THREAD_APPEND_LOCK_CLASS)
+            .bind(thread_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     /// Persist an event to the events table. Returns (event_id, sequence).
+    ///
+    /// `created` is `clock_timestamp()`, not the transaction start: a thread
+    /// event's transaction may have waited for its append lock, and its stamp
+    /// must not precede the event it queued behind.
     async fn persist(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -579,7 +621,7 @@ impl EventBus {
     ) -> Result<i64, sqlx::Error> {
         let seq: i64 = sqlx::query_scalar(
             r#"INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id)
-               VALUES ($1, $2, $3, $4, $5, NOW(),
+               VALUES ($1, $2, $3, $4, $5, clock_timestamp(),
                        CASE WHEN $2 = 'thread' THEN $3::uuid ELSE NULL END)
                RETURNING sequence"#,
         )
@@ -621,10 +663,14 @@ impl EventBus {
     ///
     /// `created` lets the caller stamp the historical wall-clock time of the
     /// original event so projections that group by `created` see a
-    /// chronologically-accurate row; `None` uses `NOW()` (right for backfills
-    /// derived from data that has no original timestamp, like the
+    /// chronologically-accurate row; `None` stamps the insert time (right for
+    /// backfills derived from data that has no original timestamp, like the
     /// `image_description` field where the description was written in place
     /// onto the source `MessageReceived` payload).
+    ///
+    /// It draws a sequence like any append, so it opens with
+    /// [`Self::begin_append`] too (ADR 0364). A row with a `thread_id` then
+    /// takes that thread's append lock, like every live append (ADR 0360).
     pub(crate) async fn replay_historical_event(
         &self,
         replay: HistoricalReplay<'_>,
@@ -639,9 +685,13 @@ impl EventBus {
             created,
             broadcast,
         } = replay;
+        let mut tx = self.begin_append().await?;
+        if let Some(thread_id) = thread_id {
+            Self::lock_thread_append(&mut tx, thread_id).await?;
+        }
         let seq: Option<i64> = sqlx::query_scalar(
             r#"INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, thread_id, created)
-               VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()))
+               VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, clock_timestamp()))
                ON CONFLICT (id) DO NOTHING
                RETURNING sequence"#,
         )
@@ -652,8 +702,9 @@ impl EventBus {
         .bind(payload)
         .bind(thread_id)
         .bind(created)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         // Broadcast on the bus so subscribers observe the replay. Only emit
         // when the insert actually happened — re-runs (ON CONFLICT skip) must
@@ -771,7 +822,13 @@ impl EventBus {
             } => {
                 if te.is_persisted() {
                     let event_id = meta.event_id.unwrap_or_else(Uuid::new_v4);
-                    let mut tx = self.pool.begin().await?;
+                    let mut tx = self.begin_append().await?;
+
+                    // === Phase: Serialize ===
+                    // Right after the in-flight lock and before any other
+                    // statement: Validate's row locks must never be held by a
+                    // transaction waiting here.
+                    Self::lock_thread_append(&mut tx, *thread_id).await?;
 
                     // === Phase: Validate ===
                     // Pre-INSERT checks that read the same tx snapshot the upcoming
@@ -831,17 +888,25 @@ impl EventBus {
                         }
                     }
 
-                    // A thread waiting on the user is never archived, whoever
-                    // emits the archive (ADR 0259).
+                    // A thread waiting on the user is never archived, and the
+                    // home thread is never archived, whoever emits the archive
+                    // (ADR 0259, ADR 0362).
                     if matches!(te, ThreadEvent::ThreadArchived) {
                         Self::check_archive_allowed(&mut tx, thread_id).await?;
+                    }
+
+                    // Nothing titles the home thread automatically, whoever
+                    // emits the title. A rename by hand is `ThreadTitleRenamed`
+                    // and lands (ADR 0362).
+                    if matches!(te, ThreadEvent::ThreadTitleGenerated { .. }) {
+                        Self::check_title_generated_allowed(&mut tx, thread_id).await?;
                     }
 
                     // A card for a child moved to top level is dropped, not
                     // delivered (ADR 0278). The fan-in read the edge before this
                     // transaction began, so a detach can land in between. A
                     // move whose edge is already gone is dropped the same way,
-                    // so the fan-out cap counts each move once.
+                    // so the former parent records each move once.
                     let dropped_child = match te {
                         ThreadEvent::ChildThreadCompleted {
                             child_thread_id, ..
@@ -972,7 +1037,7 @@ impl EventBus {
                     });
                     // Rebroadcast each affected ancestor's aggregate so the
                     // frontend's `meta.blockingDescendantCount` stays live —
-                    // without this, the cascading-archive button-hide
+                    // without this, the thread menu's blocked Archive
                     // wouldn't update in real time. We piggyback on the
                     // already-emitted ChildrenCountChanged transient: same
                     // shape, same channel, just carrying a different aggregate
@@ -1043,7 +1108,7 @@ impl EventBus {
                 if se.is_persisted() {
                     let event_id = Uuid::new_v4();
                     let stored_event_type = se.stored_event_type();
-                    let mut tx = self.pool.begin().await?;
+                    let mut tx = self.begin_append().await?;
                     let seq = self
                         .persist(
                             &mut tx,
@@ -1149,7 +1214,8 @@ impl EventBus {
             .unwrap_or(ArchiveState::Archived))
     }
 
-    /// Refuse a `ThreadArchived` on a thread waiting on the user.
+    /// Refuse a `ThreadArchived` on a thread waiting on the user, or on the
+    /// home thread.
     ///
     /// `FOR UPDATE` is load-bearing. A concurrent `UserQuestionAsked` holds the
     /// row until it commits, so this read waits and sees the parked status. A
@@ -1158,20 +1224,44 @@ impl EventBus {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         thread_id: &Uuid,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let row: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT source, archive_state, status FROM thread_summaries \
+        let row: Option<(String, String, String, bool)> = sqlx::query_as(
+            "SELECT source, archive_state, status, is_home FROM thread_summaries \
              WHERE thread_id = $1 FOR UPDATE",
         )
         .bind(thread_id)
         .fetch_optional(&mut **tx)
         .await?;
-        let Some((source, section, status)) = row else {
+        let Some((source, section, status, is_home)) = row else {
             return Ok(());
         };
         thread_lifecycle::check_archive_allowed(
             ThreadType::from_source(&source),
             ArchiveState::parse(&section),
             thread_lifecycle::ThreadStatus::parse(&status),
+            is_home,
+        )?;
+        Ok(())
+    }
+
+    /// Refuse a `ThreadTitleGenerated` on the home thread. A missing row is a
+    /// thread whose first event this is, and that is never the home thread.
+    async fn check_title_generated_allowed(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        thread_id: &Uuid,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let row: Option<(String, String, bool)> = sqlx::query_as(
+            "SELECT source, archive_state, is_home FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some((source, section, is_home)) = row else {
+            return Ok(());
+        };
+        thread_lifecycle::check_title_generated_allowed(
+            ThreadType::from_source(&source),
+            ArchiveState::parse(&section),
+            is_home,
         )?;
         Ok(())
     }

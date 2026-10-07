@@ -461,8 +461,7 @@ pub fn host_protection_env_vars(workspace_path: &std::path::Path) -> Vec<(&'stat
             // gateway when it spawns the engine, so this override never fires in
             // the legacy / Tauri / production single-engine model.
             let behind_gateway = std::env::var("LUCIDOS_BIND_LOOPBACK")
-                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-                .unwrap_or(false);
+                .is_ok_and(|v| crate::core::prefs::env_switch_is_on(&v));
             if behind_gateway {
                 // Scheme via `net_config::tls_scheme` (never hardcoded): a
                 // fronted engine serves plain HTTP today (the gateway strips

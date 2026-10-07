@@ -19,10 +19,6 @@
 //! this file reaching into the engine. It is also what a delegation meets while
 //! the doer is parked inside a card of its own: see [`Call::settle_or_refuse`],
 //! which is how a talker holding no answering tool settles one anyway.
-//!
-//! **Naming the thread is the fourth.** A [`ThreadNamer`] is asked once the
-//! call has an exchange in it, and decides everything else on the far side of
-//! a spawn. The loop is never held up for a name.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -34,7 +30,6 @@ use uuid::Uuid;
 
 use super::decision::{DecisionKind, DecisionResolver, OpenDecision, Resolution};
 use super::doer::TurnStarter;
-use super::naming::ThreadNamer;
 use super::provider::{wait_until, SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
 use super::wire::{ClientControl, ServerFrame};
 use super::{build, language, resident};
@@ -352,18 +347,16 @@ pub struct CallSubject {
 /// all. That case writes NO events: a start with no call behind it would make
 /// the pair count sessions that never happened.
 ///
-/// Five of the arguments are the SEAMS this file is built on, and each is a
-/// separate thing a call can be given: the talker, the caller, the doer, what
-/// is waiting, and what names the thread. Bundling them would hide which ones
-/// a test is standing in for, which is the whole point of having them.
-#[allow(clippy::too_many_arguments)]
+/// Four of the arguments are the SEAMS this file is built on, and each is a
+/// separate thing a call can be given: the talker, the caller, the doer, and
+/// what is waiting. Bundling them would hide which ones a test is standing in
+/// for, which is the whole point of having them.
 pub async fn run_call(
     bus: &EventBus,
     provider: &dyn VoiceProvider,
     transport: &mut dyn CallTransport,
     doer: &dyn TurnStarter,
     decisions: &dyn DecisionResolver,
-    namer: &dyn ThreadNamer,
     opening: SessionOpening,
     subject: CallSubject,
 ) -> Option<VoiceSessionEndReason> {
@@ -417,8 +410,6 @@ pub async fn run_call(
         provider,
         doer,
         decisions,
-        namer,
-        asked_for_a_name: false,
         capture: AuxCapture::new(bus, subject.thread_id, ContextPurpose::Voice),
         subject: subject.clone(),
         thread,
@@ -556,17 +547,6 @@ struct Call<'a> {
     doer: &'a dyn TurnStarter,
     /// What this call can do about what is waiting on its own thread.
     decisions: &'a dyn DecisionResolver,
-    /// What names the thread, once this call has something to name it by.
-    namer: &'a dyn ThreadNamer,
-    /// Whether this call has already asked for a name.
-    ///
-    /// Every utterance after the first one answers a reply too, and asking on
-    /// each would put a read behind every sentence the caller says. The name is
-    /// settled by the first ask.
-    ///
-    /// Not the idempotency rule, which is the engine's: a thread that already
-    /// has a name is never renamed, whoever asks.
-    asked_for_a_name: bool,
     capture: AuxCapture,
     subject: CallSubject,
     thread: Receiver<EmittedEvent>,
@@ -1014,8 +994,7 @@ impl Call<'_> {
                     // words are its business rather than the doer's. Left on
                     // the pile, a later ask would run on a question already
                     // answered plus the new one.
-                    let answered_before = std::mem::take(&mut self.talker_answered_them);
-                    if answered_before {
+                    if std::mem::take(&mut self.talker_answered_them) {
                         self.undelivered_words = None;
                     }
                     // **The reply is over only if the caller TOOK THE FLOOR.**
@@ -1031,17 +1010,6 @@ impl Call<'_> {
                         self.write_down_the_reply().await;
                     }
                     self.write_a_spoken_row(transcript.clone()).await;
-                    // **This is the moment a call earns a name.** The caller
-                    // answered something the talker said, so the thread holds
-                    // both voices and a subject. An opening "hey" reaches
-                    // nobody's ear but the talker's, and names nothing.
-                    //
-                    // After the row, because the namer reads the exchange back
-                    // out of the thread and this utterance is half of it.
-                    if answered_before && !self.asked_for_a_name {
-                        self.asked_for_a_name = true;
-                        self.namer.name_this_call(self.subject.thread_id).await;
-                    }
                     self.caller_said_more(&transcript);
                     self.caller_is_owed_an_answer();
                 }

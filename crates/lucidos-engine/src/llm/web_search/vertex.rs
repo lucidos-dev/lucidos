@@ -2,14 +2,14 @@
 //!
 //! The incumbent backend, and first in the chain so existing workspaces see no
 //! change in behavior. Owns its own [`VertexProvider`] built from the engine's
-//! Vertex config rather than borrowing the `MemoryExtractor`'s: web search and
-//! memory extraction are unrelated capabilities that merely happened to share a
-//! provider, and that coupling is what left every non-Vertex user with no
-//! search at all.
+//! Vertex config, because web search and memory extraction are unrelated
+//! capabilities. Sharing one provider is what once left every non-Vertex user
+//! with no search at all.
 
 use async_trait::async_trait;
 
-use super::WebSearchProvider;
+use super::{WebSearchProvider, WebSearchResult};
+use crate::llm::metered::CallToken;
 use crate::llm::vertex::{LocationHandle, TokenCache, VertexProvider};
 
 /// Model the grounded search runs on. Only used to construct the provider —
@@ -48,10 +48,17 @@ impl WebSearchProvider for VertexGroundingSearch {
         &self,
         query: &str,
         max_results: usize,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.provider
+        _call: CallToken,
+    ) -> Result<WebSearchResult, Box<dyn std::error::Error + Send + Sync>> {
+        let (text, usage) = self
+            .provider
             .search_with_grounding(query, max_results)
-            .await
+            .await?;
+        Ok(WebSearchResult {
+            text,
+            usage,
+            model: GROUNDING_MODEL.to_string(),
+        })
     }
 
     fn id(&self) -> &'static str {

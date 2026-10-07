@@ -11,7 +11,7 @@ import { missingBodyReason, type MissingBodyReason } from './missingBodyReason';
 import { contextViewer } from '../../store/store';
 import { currentCaptureContext } from '../../store/actions/preferences';
 import { openCaptureContextSetting } from '../../store/actions/menu';
-import { ChevronRightIcon } from '../shared/icons';
+import { DisclosureChevron } from '../shared/DisclosureChevron';
 import { Disclosure } from '../shared/Disclosure';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkText, SkeletonProvider } from '../shared/Skeleton';
@@ -28,22 +28,6 @@ type CaptureFacts = { tokens: TokenScale; missingBody: MissingBodyReason };
 function formatChars(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
   return `${n}`;
-}
-
-/** The one disclosure marker for all three tiers of the tree: a single chevron
- *  in a fixed box, turned a quarter turn when the row is open.
- *
- *  It replaces three glyph pairs at three sizes (▼/▶ on the role and section
- *  rows, ▾/▸ on the inner ones). Those had different advance widths, so no two
- *  tiers put their label on the same column and each row's label shifted
- *  sideways as it was toggled. A rotated icon keeps one footprint in both
- *  states, and the box is sized in CSS so every tier's chevron is the same. */
-function ContextChevron({ open }: { open: boolean }) {
-  return (
-    <span class="context-chevron" data-open={open ? 'true' : 'false'} aria-hidden="true">
-      <ChevronRightIcon />
-    </span>
-  );
 }
 
 /** The viewer is a modal over the content pane, so it closes before the
@@ -85,7 +69,7 @@ function ContextSectionRow({ section, tokens, missingBody }: CaptureFacts & { se
   return (
     <div class="context-section" data-role="section-row">
       <button class="context-section-header" onClick={() => setOpen(!open)} aria-expanded={open}>
-        <ContextChevron open={open} />
+        <DisclosureChevron open={open} />
         <span class="context-section-name">{section.name}</span>
         <span class="context-section-chars">
           {formatChars(section.budget_delta_chars)} · ≈{formatTokens(tokens(section.budget_delta_chars))}
@@ -110,7 +94,7 @@ function ContextInnerGroup({ group, ...facts }: CaptureFacts & { group: InnerGro
   return (
     <div class="context-inner-group">
       <button class="context-inner-header" onClick={() => setOpen(!open)} aria-expanded={open}>
-        <ContextChevron open={open} />
+        <DisclosureChevron open={open} />
         <span class="context-inner-label">{group.name}</span>
         <span class="context-inner-chars">
           {formatChars(totalChars)} · ≈{formatTokens(facts.tokens(totalChars))}
@@ -136,7 +120,7 @@ function ContextRoleGroup({ role, facts }: { role?: RoleGroup; facts?: CaptureFa
     return (
       <div class="context-role" aria-hidden="true">
         <div class="context-role-header">
-          <ContextChevron open={false} />
+          <DisclosureChevron open={false} />
           <SkText class="context-role-label" w="7rem" />
           <SkText class="context-role-chars" w="9rem" />
         </div>
@@ -149,7 +133,7 @@ function ContextRoleGroup({ role, facts }: { role?: RoleGroup; facts?: CaptureFa
   return (
     <div class="context-role">
       <button class="context-role-header" onClick={() => setOpen(!open)} aria-expanded={open}>
-        <ContextChevron open={open} />
+        <DisclosureChevron open={open} />
         <span class="context-role-label">{role.label}</span>
         <span class="context-role-chars">
           {formatChars(totalChars)}<span class="context-unit"> chars</span> · ≈{formatTokens(facts.tokens(totalChars))}<span class="context-unit"> tokens</span>

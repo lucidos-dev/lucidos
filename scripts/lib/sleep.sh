@@ -1,12 +1,12 @@
 #!/bin/bash
 # Clamshell (lid-close) sleep prevention for macOS Apple Silicon.
-# caffeinate -s only works on AC power and NEVER prevents clamshell sleep.
-# Only `pmset disablesleep 1` prevents lid-close sleep.
+# Only `pmset disablesleep 1` prevents lid-close sleep. Idle sleep is the
+# engine's own job: it holds an assertion while work runs (ADR 0366).
 # Lock directory coordinates multiple workspaces: only the last to exit
 # re-enables sleep.
-# macOS-only side effects: caffeinate/pmset/clamshell prevention have no Linux
+# macOS-only side effects: pmset/clamshell prevention have no Linux
 # equivalent, so the entry-point functions (release_sleep_lock here;
-# start_caffeinate + enable_clamshell_prevention in workspace.sh) no-op on
+# enable_clamshell_prevention in workspace.sh) no-op on
 # non-Darwin and the engine starts/stops cleanly on Linux/CI. String hashing is
 # portable (md5 or md5sum) via hash_string.
 

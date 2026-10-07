@@ -993,6 +993,7 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
             event: ThreadEvent::CodingAgentTextStreamed {
                 text: "\n\nCommitting, then running the suite.".into(),
                 coding_agent,
+                parent_tool_use_id: None,
             },
             meta: cc_meta(),
         })
@@ -1005,6 +1006,7 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
                 result: "ok".into(),
                 coding_agent,
                 tool_use_id: String::new(),
+                parent_tool_use_id: None,
             },
             meta: cc_meta(),
         })
@@ -1063,7 +1065,7 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ContinuationRequested {
-                reason: "user_clicked_continue".into(),
+                reason: crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON.into(),
             },
             meta: cc_meta(),
         })
@@ -1219,6 +1221,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
                 result: "ok".into(),
                 coding_agent,
                 tool_use_id: String::new(),
+                parent_tool_use_id: None,
             },
             meta: cc_meta(),
         })
@@ -1229,6 +1232,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
             event: ThreadEvent::CodingAgentTextStreamed {
                 text: "\n\nCommitting.".into(),
                 coding_agent,
+                parent_tool_use_id: None,
             },
             meta: cc_meta(),
         })
@@ -1292,7 +1296,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ContinuationRequested {
-                reason: "auto_resume_after_switch".into(),
+                reason: crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON.into(),
             },
             meta: cc_meta(),
         })
@@ -2269,7 +2273,7 @@ async fn a_chat_continue_leaves_the_compose_epoch_alone() {
         event: ThreadEvent::ContinuationStarted {
             branch: String::new(),
             origin: None,
-            reason: Some("user_clicked_continue".into()),
+            reason: Some(crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON.into()),
         },
         meta: EventMeta::NONE,
     })

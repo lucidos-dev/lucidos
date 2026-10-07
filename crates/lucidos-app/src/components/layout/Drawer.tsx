@@ -14,6 +14,7 @@ import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
 import { systemAttentionBadge } from '../../store/systemAttentionBadge';
 import { MENU_ITEM_LABELS, type MenuItem } from '../../store/types';
 import { drawerAnchor, drawerClosing, drawerOpen, drawerSide, forceCloseDrawer } from './drawerState';
+import { GlyphBadge } from '../shared/GlyphBadge';
 
 /** The rows this drawer lists in order. Not every menu item: Changes and
  *  Settings are rendered below with a badge of their own, and Notifications is
@@ -184,7 +185,7 @@ export function Drawer() {
           >
             {MENU_ITEM_LABELS.changes}
             {changeBadge !== null && changeBadge > 0 && (
-              <span class="drawer-badge">{changeBadge > 99 ? '99+' : changeBadge}</span>
+              <GlyphBadge class="drawer-badge">{changeBadge > 99 ? '99+' : changeBadge}</GlyphBadge>
             )}
           </div>
         )}

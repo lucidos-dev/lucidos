@@ -9,8 +9,8 @@
 /** Stop retrying after this many failed loads, so a genuinely-missing image
  *  doesn't loop. Beyond it the element stays broken, same as a bare `<img>`. */
 export const MAX_ATTEMPTS = 6;
-const BASE_DELAY_MS = 800;
-const MAX_DELAY_MS = 15000;
+export const BASE_DELAY_MS = 800;
+export const MAX_DELAY_MS = 15000;
 
 /** `blob:` / `data:` URLs are in-memory bytes, so a failed load can't recover
  *  over the network. Only server-fetched URLs are retried. */

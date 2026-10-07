@@ -13,6 +13,7 @@
 #
 # Usage:
 #   ./scripts/e2e.sh [--packaged] [--no-webkit]
+#   ./scripts/e2e.sh --github [--no-webkit]   # on GitHub's runners, ADR 0382
 #
 # --no-webkit skips the mobile-webkit browser project. The compressor does not
 # drain between projects, so mobile-webkit spends the session's whole budget
@@ -44,6 +45,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/e2e_github.sh
+source "$SCRIPT_DIR/lib/e2e_github.sh"
+e2e_github_handoff all "$@"
 
 # Opt-in: append the packaged-build boot smoke test as a final phase (default off).
 RUN_PACKAGED="${LUCIDOS_E2E_PACKAGED:-0}"
@@ -60,6 +64,9 @@ done
 
 source "$SCRIPT_DIR/lib/e2e.sh"
 
+# The browser phase's projects, named in this hold's E2ELockAcquired.
+# shellcheck disable=SC2034 # read by _e2e_announce_lock_acquired in scripts/lib/e2e_lock.sh
+E2E_LOCK_PROJECTS="$(e2e_browser_projects ${BROWSER_ARGS[@]+"${BROWSER_ARGS[@]}"} | paste -sd, -)"
 acquire_e2e_lock e2e || exit 1
 kill_orphan_simulator
 teardown_e2e() {

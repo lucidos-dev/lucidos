@@ -57,8 +57,12 @@ const CONSUMER_EXEMPT: Record<string, Exemption> = {
   'components/settings/AddDeviceSection.tsx': { tag: 'working-state', why: 'mints a pairing code on a button press' },
   'components/settings/DebuggingSection.tsx': { tag: 'structure-first', why: 'LoadableToggle holds the switch and defers its value' },
   'components/settings/JudgmentModelRow.tsx': { tag: 'structure-first', why: 'real picker row; defers which choices it offers' },
+  'components/settings/MemoryModuleSection.tsx': { tag: 'structure-first', why: 'real segmented control; presses nothing until preferences load' },
+  'components/settings/MemoryPage.tsx': { tag: 'structure-first', why: 'real sections; the inspector stays until preferences say Tree' },
+  'components/settings/TreeBackfillStatus.tsx': { tag: 'structure-first', why: 'real progress row; the bar track draws at once, values wait' },
   'components/settings/ProviderBlock.tsx': { tag: 'structure-first', why: 'switch drawn at once; config rows stay shut until known' },
-  'components/settings/TypeSafeJudgmentSettings.tsx': { tag: 'structure-first', why: 'real controls; defer their values' },
+  'components/settings/SystemOneProviderFrame.tsx': { tag: 'structure-first', why: 'real controls; defer their values' },
+  'components/settings/CustomSystemOneSettings.tsx': { tag: 'structure-first', why: 'real controls; defer their values' },
 };
 
 /** "Loading…" literals that may stay, keyed by file. */

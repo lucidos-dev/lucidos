@@ -23,12 +23,27 @@ use std::time::{Duration, Instant};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-const PG_USER: &str = "lucidos";
-const PG_PASSWORD: &str = "lucidos";
+// The dev scripts start this same cluster, so `scripts/lib/workspace_constants.sh`
+// carries a copy of each `pub(crate)` value below. `value_pins_tests` pins them.
+pub(crate) const PG_USER: &str = "lucidos";
+pub(crate) const PG_PASSWORD: &str = "lucidos";
 const PG_ADMIN_DATABASE: &str = "postgres";
-const PG_IMAGE: &str = "pgvector/pgvector:pg18";
-const SHARED_DOCKER_CONTAINER: &str = "lucidos-pg-shared";
-const SHARED_DOCKER_VOLUME: &str = "lucidos-pg-data-shared";
+pub(crate) const PG_IMAGE: &str = "pgvector/pgvector:pg18";
+pub(crate) const SHARED_DOCKER_CONTAINER: &str = "lucidos-pg-shared";
+pub(crate) const SHARED_DOCKER_VOLUME: &str = "lucidos-pg-data-shared";
+
+/// The Docker cluster's `/dev/shm`. pgvector builds the HNSW index with
+/// parallel maintenance workers backed by POSIX shared memory there. Docker's
+/// 64m default overflows on a workspace with a sizeable memory_entries table.
+/// The migration or restore then aborts with "could not resize shared memory
+/// segment ... No space left on device".
+pub(crate) const PG_SHM_SIZE: &str = "1g";
+
+/// ONE shared cluster serves every workspace (ADR 0014 §6/§7), and each engine
+/// opens a pool of up to 50 connections (construction.rs). Postgres' default
+/// 100 is exhausted by two busy workspaces, so a third fails to provision with
+/// "sorry, too many clients already". 500 fits about 10 concurrent engines.
+pub(crate) const PG_MAX_CONNECTIONS: u32 = 500;
 
 /// Which shared-cluster backend the gateway uses. Selected once from the
 /// environment at gateway start (`LUCIDOS_GATEWAY_PG_BACKEND`): dev → Docker,
@@ -280,8 +295,20 @@ pub fn database_name(ws_id: &str) -> Result<String, BoxError> {
     if !crate::registry::is_valid_id(ws_id) {
         return Err(format!("invalid workspace id for database name: '{ws_id}'").into());
     }
-    Ok(format!("lucidos_{ws_id}"))
+    Ok(format!("{DATABASE_PREFIX}{ws_id}"))
 }
+
+const DATABASE_PREFIX: &str = "lucidos_";
+
+/// Postgres silently cuts an identifier past this many bytes (`NAMEDATALEN - 1`).
+const PG_MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// The longest id a NEW workspace may take. Past it, Postgres cuts the database
+/// name: two long ids sharing a prefix then share one database, and an id past
+/// 64 bytes fails `is_valid_id` and cannot be deleted. Every path that mints an
+/// id checks this. `is_valid_id` keeps 64, so an id registered before stays
+/// addressable.
+pub const MAX_NEW_WORKSPACE_ID_BYTES: usize = PG_MAX_IDENTIFIER_BYTES - DATABASE_PREFIX.len();
 
 // ── Docker backend (dev) ────────────────────────────────────────────────────
 
@@ -428,14 +455,7 @@ async fn ensure_docker_cluster(container: &str) -> Result<u16, ProvisionError> {
                 container,
                 "--restart",
                 "unless-stopped",
-                // pgvector builds the HNSW index with parallel maintenance
-                // workers backed by POSIX shared memory under /dev/shm. Docker's
-                // 64m default overflows ("could not resize shared memory segment
-                // ... No space left on device") when migrating/restoring a
-                // workspace with a sizeable memory_entries table, aborting the
-                // migration. Keep this in lockstep with scripts/lib/workspace.sh
-                // (the dev launcher's shared-cluster docker run).
-                "--shm-size=1g",
+                &format!("--shm-size={PG_SHM_SIZE}"),
                 "-p",
                 &format!("127.0.0.1:{port}:5432"),
                 "-e",
@@ -447,15 +467,9 @@ async fn ensure_docker_cluster(container: &str) -> Result<u16, ProvisionError> {
                 "-v",
                 &format!("{SHARED_DOCKER_VOLUME}:/var/lib/postgresql"),
                 PG_IMAGE,
-                // ONE shared cluster serves every workspace (ADR 0014 §6/§7) and
-                // each engine opens a pool of up to 50 connections
-                // (construction.rs). Postgres' default 100 is exhausted by two
-                // busy workspaces, so a third fails to provision with "sorry,
-                // too many clients already". 500 fits ~10 concurrent engines.
-                // Keep in lockstep with scripts/lib/workspace.sh.
                 "postgres",
                 "-c",
-                "max_connections=500",
+                &format!("max_connections={PG_MAX_CONNECTIONS}"),
             ])?;
             port
         }
@@ -1487,6 +1501,15 @@ mod tests {
         assert_eq!(database_name("e2e-test").unwrap(), "lucidos_e2e-test");
         assert!(database_name("../bad").is_err());
         assert!(database_name("Upper").is_err());
+    }
+
+    #[test]
+    fn a_new_workspace_id_at_the_limit_keeps_its_whole_database_name() {
+        let longest = "a".repeat(MAX_NEW_WORKSPACE_ID_BYTES);
+        assert_eq!(
+            database_name(&longest).unwrap().len(),
+            PG_MAX_IDENTIFIER_BYTES
+        );
     }
 
     #[test]

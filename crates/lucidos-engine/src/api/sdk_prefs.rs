@@ -38,7 +38,7 @@
 
 use super::*;
 
-use crate::core::PreferenceStore;
+use crate::core::{prefs, PreferenceStore};
 
 /// The appearance FOUC script, built from `packages/lucidos-sdk/src/boot/` and
 /// checked in. The app shell inlines the sibling `host` bundle into its own
@@ -65,15 +65,15 @@ const SDK_PREFS_JS: &str =
 /// theme's resolved token maps, which the engine alone can compute.
 /// [`WORKSPACE_FONT_SEED_KEY`] carries the workspace font `font-family` names.
 const SEED_KEYS: [&str; 11] = [
-    "theme-mode",
-    "font-family",
-    "ui-scale",
+    prefs::THEME_MODE.key(),
+    prefs::FONT_FAMILY.key(),
+    prefs::UI_SCALE.key(),
     "text-size",
     "font-size",
     crate::core::themes::STYLE_OVERRIDES_KEY,
-    "autocorrect",
-    "motion",
-    "theme-effects",
+    prefs::AUTOCORRECT.key(),
+    prefs::MOTION.key(),
+    prefs::THEME_EFFECTS.key(),
     THEME_RESOLVED_SEED_KEY,
     WORKSPACE_FONT_SEED_KEY,
 ];
@@ -158,7 +158,7 @@ fn with_resolved_theme(
 ) {
     prefs.remove(THEME_RESOLVED_SEED_KEY);
     let resolved = prefs
-        .get("theme")
+        .get(prefs::THEME.key())
         .and_then(|id| crate::core::themes::resolved_json_for_preference(data_dir, id));
     if let Some(json) = resolved {
         prefs.insert(THEME_RESOLVED_SEED_KEY.to_string(), json);
@@ -175,7 +175,7 @@ fn with_workspace_font(
     use crate::core::workspace_fonts;
     prefs.remove(WORKSPACE_FONT_SEED_KEY);
     let Some(id) = prefs
-        .get("font-family")
+        .get(prefs::FONT_FAMILY.key())
         .filter(|id| workspace_fonts::is_workspace_id(id))
     else {
         return;
@@ -273,16 +273,28 @@ mod tests {
         // Two sources, in that order. The seed is what an ISOLATED app frame
         // has, since it can read none of the shell's storage. Storage is the
         // shell's own path, and the fallback behind the seed everywhere else.
-        assert!(SDK_PREFS_JS.contains(r#"THEME_MODE_KEY = "theme-mode""#));
+        // The bundle carries the generated catalog's key objects, so each key
+        // is the catalog's own.
+        for key in [
+            prefs::THEME_MODE.key(),
+            prefs::FONT_FAMILY.key(),
+            prefs::UI_SCALE.key(),
+        ] {
+            assert!(
+                SDK_PREFS_JS.contains(&format!(r#"key: "{key}""#)),
+                "sdk-prefs.js must carry the generated catalog's {key}"
+            );
+        }
+        assert!(SDK_PREFS_JS.contains("THEME_MODE_KEY = PREF_THEME_MODE.key"));
         assert!(SDK_PREFS_JS.contains(r#"THEME_MODE_STORAGE_KEY = "lucidos-theme-mode""#));
         assert!(SDK_PREFS_JS.contains("seeded(served, THEME_MODE_KEY, THEME_MODE_STORAGE_KEY)"));
         assert!(
-            SDK_PREFS_JS.contains(r#"seeded(served, "font-family", "lucidos-font-family")"#),
+            SDK_PREFS_JS.contains(r#"seeded(served, PREF_FONT_FAMILY.key, "lucidos-font-family")"#),
             "sdk-prefs.js must read font-family from the seed, then storage"
         );
         // Scale reads the seed inline rather than through `seeded`, because it
         // carries the two pre-grid aliases as well. Same order, same fallback.
-        assert!(SDK_PREFS_JS.contains(r#"served["ui-scale"]"#));
+        assert!(SDK_PREFS_JS.contains("served[PREF_UI_SCALE.key]"));
         assert!(SDK_PREFS_JS.contains(r#"served["text-size"]"#));
         assert!(SDK_PREFS_JS.contains(r#"wsLocalGet("lucidos-ui-scale")"#));
     }
@@ -367,7 +379,9 @@ mod tests {
         assert!(!SDK_PREFS_JS.contains("setProperty(\"font-feature-settings\""));
     }
 
-    fn prefs(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+    /// A stored preference map. The expected seed lines below spell their keys
+    /// out, because that JSON is the wire format the boot script reads.
+    fn stored(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -377,7 +391,10 @@ mod tests {
     #[test]
     fn the_seed_line_carries_the_appearance_keys() {
         assert_eq!(
-            seed_line(&prefs(&[("theme-mode", "dark"), ("ui-scale", "150")])),
+            seed_line(&stored(&[
+                (prefs::THEME_MODE.key(), "dark"),
+                (prefs::UI_SCALE.key(), "150")
+            ])),
             "window.__lucidosPrefs={\"theme-mode\":\"dark\",\"ui-scale\":\"150\"};\n"
         );
     }
@@ -387,7 +404,7 @@ mod tests {
         // An isolated frame reads none of the shell's storage, so the seed is
         // its only synchronous source for the stamp's first value.
         assert_eq!(
-            seed_line(&prefs(&[("autocorrect", "true")])),
+            seed_line(&stored(&[(prefs::AUTOCORRECT.key(), "true")])),
             "window.__lucidosPrefs={\"autocorrect\":\"true\"};\n"
         );
     }
@@ -395,7 +412,7 @@ mod tests {
     #[test]
     fn the_seed_line_carries_theme_effects() {
         assert_eq!(
-            seed_line(&prefs(&[("theme-effects", "reduce")])),
+            seed_line(&stored(&[(prefs::THEME_EFFECTS.key(), "reduce")])),
             "window.__lucidosPrefs={\"theme-effects\":\"reduce\"};\n"
         );
     }
@@ -405,20 +422,20 @@ mod tests {
         // Without it an isolated frame paints its first frame from the OS
         // switch alone, and a device that chose Reduce sees motion.
         assert_eq!(
-            seed_line(&prefs(&[("motion", "reduce")])),
+            seed_line(&stored(&[(prefs::MOTION.key(), "reduce")])),
             "window.__lucidosPrefs={\"motion\":\"reduce\"};\n"
         );
     }
 
     #[test]
     fn the_seed_line_carries_nothing_else() {
-        let line = seed_line(&prefs(&[
-            ("theme-mode", "light"),
-            ("chat_model", "claude-opus-5"),
+        let line = seed_line(&stored(&[
+            (prefs::THEME_MODE.key(), "light"),
+            (prefs::CHAT_MODEL.key(), "claude-opus-5"),
         ]));
-        assert!(line.contains(r#""theme-mode":"light""#));
+        assert!(line.contains(&format!(r#""{}":"light""#, prefs::THEME_MODE.key())));
         assert!(
-            !line.contains("chat_model"),
+            !line.contains(prefs::CHAT_MODEL.key()),
             "an unrelated preference must not reach an app: {line}"
         );
     }
@@ -426,7 +443,7 @@ mod tests {
     #[test]
     fn the_seed_carries_the_active_theme_resolved() {
         let data = std::path::Path::new("/nonexistent");
-        let mut seeded = prefs(&[("theme", "nord")]);
+        let mut seeded = stored(&[(prefs::THEME.key(), "nord")]);
         with_resolved_theme(&mut seeded, data);
         let line = seed_line(&seeded);
         assert!(line.contains("theme_resolved"), "{line}");
@@ -434,7 +451,10 @@ mod tests {
 
         // A forged value under the seed key never survives, and the default
         // theme seeds nothing to apply.
-        let mut forged = prefs(&[("theme", "lucidos"), ("theme_resolved", "{\"dark\":{}}")]);
+        let mut forged = stored(&[
+            (prefs::THEME.key(), "lucidos"),
+            ("theme_resolved", "{\"dark\":{}}"),
+        ]);
         with_resolved_theme(&mut forged, data);
         assert!(!forged.contains_key("theme_resolved"));
     }
@@ -451,7 +471,7 @@ mod tests {
         .unwrap();
         std::fs::write(font.join("a.woff2"), b"wOF2 bytes").unwrap();
 
-        let mut seeded = prefs(&[("font-family", "ws-brand")]);
+        let mut seeded = stored(&[(prefs::FONT_FAMILY.key(), "ws-brand")]);
         with_workspace_font(&mut seeded, dir.path());
         let line = seed_line(&seeded);
         assert!(line.contains("workspace_font"), "{line}");
@@ -459,7 +479,7 @@ mod tests {
 
         // A forged entry never survives, and a font that is gone seeds nothing.
         for pick in ["ws-gone", "fira-code"] {
-            let mut forged = prefs(&[("font-family", pick), ("workspace_font", "{}")]);
+            let mut forged = stored(&[(prefs::FONT_FAMILY.key(), pick), ("workspace_font", "{}")]);
             with_workspace_font(&mut forged, dir.path());
             assert!(!forged.contains_key("workspace_font"), "{pick}");
         }
@@ -467,7 +487,7 @@ mod tests {
 
     #[test]
     fn nothing_stored_prepends_nothing() {
-        assert_eq!(seed_line(&prefs(&[])), "");
+        assert_eq!(seed_line(&stored(&[])), "");
     }
 
     #[test]
@@ -475,7 +495,7 @@ mod tests {
         // `style_overrides` is a map any app may write through
         // `lucidos.preferences.set`, and it is served as JavaScript. `serde_json`
         // escapes the quote, so the value stays one string literal.
-        let line = seed_line(&prefs(&[(
+        let line = seed_line(&stored(&[(
             "style_overrides",
             "{\"--x\":\"\";window.stolen=1;//\"}",
         )]));
@@ -491,7 +511,7 @@ mod tests {
     fn the_seed_precedes_the_bundle_it_feeds() {
         let body = format!(
             "{}{}",
-            seed_line(&prefs(&[("theme-mode", "dark")])),
+            seed_line(&stored(&[(prefs::THEME_MODE.key(), "dark")])),
             SDK_PREFS_JS
         );
         let seed_at = body.find("__lucidosPrefs").expect("seed present");

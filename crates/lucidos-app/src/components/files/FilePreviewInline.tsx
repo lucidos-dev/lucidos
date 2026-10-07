@@ -43,6 +43,7 @@ import {
 import { PREVIEW_FRAME_ROLE } from '../../utils/previewFrameProtocol';
 import { artifactPreviewCapability, peekArtifactPreviewCapability } from '../../store/actions/frame-capability';
 import { forwardableBindings } from '../../store/actions/keybindings';
+import type { ShortcutId } from '../../utils/shortcuts';
 import { currentUiScale } from '../../store/actions/preferences';
 import { IframeTabExit } from '../shared/IframeTabExit';
 
@@ -523,13 +524,13 @@ function TextContent({ body, url, path, revision, servesPanel }: {
 
   function loadedBody(content: string) {
     if (body === 'html') {
-      return <HtmlPreviewFrame content={content} url={url} path={path} withCapability={withCapability} />;
+      return <HtmlPreviewFrame content={content} url={url} path={path} withCapability={withCapability} modal={!servesPanel} />;
     }
     // A markdown artifact renders into the HOST document, so its links resolve
     // against the engine-stamped `<base href="/<slug>/">`: a plain sibling link
     // like `notes.md` becomes `/<slug>/notes.md`, the SPA fallback serves the
-    // shell, and the whole workspace reloads. Same routing as the HTML preview,
-    // minus the fragment arm (see `handlePreviewLinkClick`).
+    // shell, and the whole workspace reloads. Same routing as the HTML preview
+    // (see `handlePreviewLinkClick`).
     if (body === 'markdown') {
       const editable = isEditableDataFile(path);
       // Captured per render, from what the reader actually sees: the count a
@@ -550,6 +551,7 @@ function TextContent({ body, url, path, revision, servesPanel }: {
       return (
         <MarkdownDocument
           content={content}
+          location={{ kind: 'workspace', path }}
           onClick={(e) => handlePreviewLinkClick(e, path)}
           editable={editable}
           onToggleCheckbox={editable ? handleToggleCheckbox : undefined}
@@ -565,6 +567,8 @@ function TextContent({ body, url, path, revision, servesPanel }: {
   }
 }
 
+const FIND_SHORTCUT: readonly ShortcutId[] = ['findInView'];
+
 /** An HTML artifact, rendered in a sandboxed frame at an opaque origin (ADR
  *  0322). Its scripts run, and it reaches the shell only through the message
  *  bridge in `previewFrameBridge.ts`.
@@ -577,11 +581,13 @@ function TextContent({ body, url, path, revision, servesPanel }: {
  *  `withPreviewSizing` stamps the UI scale and a body text default, since the
  *  document inherits no root font-size either. Reading `currentUiScale()` and
  *  the shortcut bindings here subscribes to both, so a change re-stamps. */
-function HtmlPreviewFrame({ content, url, path, withCapability }: {
-  content: string; url: string; path: string; withCapability: boolean;
+function HtmlPreviewFrame({ content, url, path, withCapability, modal }: {
+  content: string; url: string; path: string; withCapability: boolean; modal: boolean;
 }) {
   const scale = currentUiScale();
-  const bindings = forwardableBindings();
+  // In the modal, Mod+F stays the browser's find: the find bar searches the
+  // pane behind it, not this document.
+  const bindings = forwardableBindings(modal ? FIND_SHORTCUT : []);
   const bindingsKey = JSON.stringify(bindings);
   const declaresOwnBase = documentDeclaresBase(content);
   // Keyed on the base, not the URL: the URL's revision stamp changes on every

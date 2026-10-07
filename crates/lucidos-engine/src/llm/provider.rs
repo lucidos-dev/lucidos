@@ -19,9 +19,9 @@ impl MessageContent {
             MessageContent::Blocks(blocks) => blocks
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::Text { text } | ContentBlock::EngineTail { text } => {
-                        Some(text.as_str())
-                    }
+                    ContentBlock::Text { text }
+                    | ContentBlock::EngineTail { text }
+                    | ContentBlock::MemoryView { text } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -77,6 +77,17 @@ pub enum ContentBlock {
     /// the results the block rides on.
     #[serde(rename = "engine_tail")]
     EngineTail { text: String },
+    /// A *memory view* block that ends a cache prefix (ADR 0362). One is the
+    /// workspace view snapshot, which every thread of one budget sends byte
+    /// for byte. The others are thread view pieces, each ending at a cache
+    /// mark that consecutive turns share.
+    ///
+    /// Every provider renders it as ordinary text. Anthropic also puts a cache
+    /// breakpoint on it while one of the four is free, so a later request
+    /// reads the prefix through it from the cache. A Classic turn never builds
+    /// one, which is what keeps its request byte-identical.
+    #[serde(rename = "memory_view")]
+    MemoryView { text: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +109,7 @@ pub struct ToolCall {
     pub thought_signature: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
@@ -197,6 +208,10 @@ pub struct ModelSelection<'a> {
     /// One of `llm::reasoning::EFFORT_LADDER`, snapped onto what the resolved
     /// backend supports. `None` leaves the provider's own default.
     pub reasoning_effort: Option<&'a str>,
+    /// Cap on one HTTP attempt, body included. An *auxiliary model call* sets
+    /// it so its deadline can contain the provider's retries (ADR 0107). A turn
+    /// leaves it `None`, so a long valid stream is never cut off.
+    pub attempt_timeout: Option<std::time::Duration>,
 }
 
 impl<'a> ModelSelection<'a> {
@@ -212,10 +227,17 @@ impl<'a> ModelSelection<'a> {
         self.reasoning_effort = effort;
         self
     }
+
+    pub fn with_attempt_timeout(mut self, attempt_timeout: Option<std::time::Duration>) -> Self {
+        self.attempt_timeout = attempt_timeout;
+        self
+    }
 }
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
+    /// One billable call. `call` comes from the model call service, which
+    /// records it (`engine::model_call`). A wrapper forwards the token it got.
     async fn chat(
         &self,
         messages: Vec<Message>,
@@ -223,6 +245,7 @@ pub trait LlmProvider: Send + Sync {
         selection: ModelSelection<'_>,
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
+        call: crate::llm::metered::CallToken,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Returns the default model name for this provider.

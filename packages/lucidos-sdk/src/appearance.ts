@@ -29,19 +29,26 @@ import {
   type FontGroup,
   type FontId,
 } from './generated/font-catalog';
+import {
+  PREF_FONT_FAMILY, PREF_MOTION, PREF_THEME, PREF_THEME_EFFECTS, PREF_THEME_MODE, PREF_UI_SCALE,
+  type PreferenceValues,
+} from './generated/preference-catalog';
+import {
+  MAX_RESOLVED_TOKENS, MAX_SHADOW_PX, MAX_VALUE_LENGTH, PX_PER_REM, SHADOW_COLOUR_FUNCTIONS,
+} from './generated/theme-parts';
 import { PART_TOKEN_PREFIX, checkPartToken } from './themeParts';
 
 export { FALLBACK_FONT, FOLLOW_THEME, FONT_CATALOG, WORKSPACE_FONT_ID_PREFIX, WORKSPACE_FONT_LIMITS };
 export type { FontEntry, FontGroup, FontId };
 
-export type ThemeMode = 'light' | 'dark' | 'system';
+export type ThemeMode = PreferenceValues<'theme-mode'>;
 /** A theme mode with `system` already resolved against the OS. */
-export type ResolvedThemeMode = 'light' | 'dark';
+export type ResolvedThemeMode = Exclude<ThemeMode, 'system'>;
 
-export const THEME_MODES: readonly ThemeMode[] = ['light', 'dark', 'system'];
+export const THEME_MODES: readonly ThemeMode[] = PREF_THEME_MODE.values;
 
 /** The device-scoped preference holding the theme mode. */
-export const THEME_MODE_KEY = 'theme-mode';
+export const THEME_MODE_KEY = PREF_THEME_MODE.key;
 
 /** Workspace-scoped mirror of `theme-mode`, read by the boot script. */
 export const THEME_MODE_STORAGE_KEY = 'lucidos-theme-mode';
@@ -51,7 +58,7 @@ export const THEME_MODE_ATTRIBUTE = 'data-theme-mode';
 
 /** What an unset `theme-mode` preference means: follow the OS light/dark
  *  setting. A device that explicitly picked light or dark keeps its pick. */
-export const DEFAULT_THEME_MODE: ThemeMode = 'system';
+export const DEFAULT_THEME_MODE: ThemeMode = PREF_THEME_MODE.fallback;
 
 /** The document background per resolved mode. Painted inline on `<html>` by
  *  every surface, so it is legible before any stylesheet has been parsed. */
@@ -69,10 +76,6 @@ export type FontKey = FontId | WorkspaceFontId;
 
 /** A `font-family` preference value: a font, or follow the theme. */
 export type FontPreference = FontKey | typeof FOLLOW_THEME;
-
-/** What an unset `font-family` preference means: follow the active theme, which
- *  falls back to {@link FALLBACK_FONT} when the theme names no font. */
-export const DEFAULT_FONT_PREFERENCE: FontPreference = FOLLOW_THEME;
 
 /** Every `font-family` value, in the order Settings lists them. */
 export const FONT_PREFERENCES: readonly FontPreference[] = [
@@ -172,13 +175,12 @@ const FONT_FEATURES_LIGATURES: FontFeaturePair = {
   code: '"liga" 1, "calt" 1',
 };
 
-export const UI_SCALE_MIN = 75;
-export const UI_SCALE_MAX = 200;
+export const UI_SCALE_MIN = PREF_UI_SCALE.min;
+export const UI_SCALE_MAX = PREF_UI_SCALE.max;
 /** 12.5% keeps the root font-size on integer pixels (16 x 0.125 = 2px per
  *  step). Every `rem` then resolves to an integer, so 1px borders do not
  *  anti-alias at varying widths across the layout. */
 export const UI_SCALE_STEP = 12.5;
-export const UI_SCALE_DEFAULT = 100;
 
 /** Pre-grid enum values, still present in old stored preferences. `medium`
  *  snaps to 112.5 on the 12.5 grid. */
@@ -242,11 +244,11 @@ export const SYSTEM_THEME_MODE_SETTLE_MS = 300;
 
 /** The device-scoped `motion` preference. `system` follows the OS switch,
  *  `reduce` and `full` override it either way. */
-export type MotionPref = 'system' | 'reduce' | 'full';
+export type MotionPref = PreferenceValues<'motion'>;
 
-export const MOTION_PREFS: readonly MotionPref[] = ['system', 'reduce', 'full'];
+export const MOTION_PREFS: readonly MotionPref[] = PREF_MOTION.values;
 
-export const DEFAULT_MOTION: MotionPref = 'system';
+export const DEFAULT_MOTION: MotionPref = PREF_MOTION.fallback;
 
 /** Workspace-scoped mirror of `motion`, read by the boot script before any
  *  module loads. */
@@ -278,11 +280,11 @@ export function motionAttribute(reduced: boolean): 'reduce' | 'full' {
 /** The device-scoped `theme-effects` preference (ADR 0307). `reduce` drops the
  *  shadows and filters a theme puts on its parts, and keeps part colours and
  *  letter-spacing. `system` follows two OS signals, `full` ignores them. */
-export type ThemeEffectsPref = 'system' | 'reduce' | 'full';
+export type ThemeEffectsPref = PreferenceValues<'theme-effects'>;
 
-export const THEME_EFFECTS_PREFS: readonly ThemeEffectsPref[] = ['system', 'reduce', 'full'];
+export const THEME_EFFECTS_PREFS: readonly ThemeEffectsPref[] = PREF_THEME_EFFECTS.values;
 
-export const DEFAULT_THEME_EFFECTS: ThemeEffectsPref = 'system';
+export const DEFAULT_THEME_EFFECTS: ThemeEffectsPref = PREF_THEME_EFFECTS.fallback;
 
 /** Workspace-scoped mirror of `theme-effects`, read by the boot script. */
 export const THEME_EFFECTS_STORAGE_KEY = 'lucidos-theme-effects';
@@ -475,13 +477,13 @@ export const STYLE_OVERRIDES_STORAGE_KEY = 'lucidos-style-overrides';
  *  being legible. */
 export const STYLE_RESET_PARAM = 'style-reset';
 
-/** Cap on entries. A design remote tunes tens of values; a map in the thousands
- *  is a runaway writer, not a user. */
-export const MAX_STYLE_OVERRIDES = 200;
+/** Cap on entries: the engine's cap on a resolved theme. A design remote tunes
+ *  tens of values; a map in the thousands is a runaway writer, not a user. */
+export const MAX_STYLE_OVERRIDES = MAX_RESOLVED_TOKENS;
 
-/** Cap on one value's length. The longest real token in `base.css` is a layered
- *  box-shadow at 94 characters. */
-export const MAX_STYLE_VALUE_LENGTH = 120;
+/** Cap on one value's length: the engine's cap on a theme value. The longest
+ *  real token in `base.css` is a layered box-shadow at 94 characters. */
+export const MAX_STYLE_VALUE_LENGTH = MAX_VALUE_LENGTH;
 
 /** Only a custom property can be set: never `color`, never a selector. */
 const NAME_RE = /^--[a-z][a-z0-9-]*$/;
@@ -535,13 +537,7 @@ export const SHADOW_OVERRIDE_TOKENS: readonly string[] = [
   '--shadow-sm', '--shadow-md', '--shadow-lg', '--shadow-up',
 ];
 
-/** How far a shadow may paint past its box, in px, and the functions it may
- *  call. The engine holds a theme to the same (`validate_shadow_reach`). */
-const MAX_SHADOW_PX = 32;
-const PX_PER_REM = 16;
-const SHADOW_COLOUR_FUNCTIONS = new Set([
-  'rgb', 'rgba', 'hsl', 'hsla', 'hwb', 'lab', 'lch', 'oklab', 'oklch', 'color', 'color-mix',
-]);
+const SHADOW_COLOUR_FUNCTION_SET = new Set(SHADOW_COLOUR_FUNCTIONS);
 
 /** Split at `isSep` characters outside parentheses, dropping empty pieces. */
 function splitTopLevel(value: string, isSep: (c: string) => boolean): string[] {
@@ -598,7 +594,7 @@ export function shadowWithinReach(value: string): boolean {
       const word = raw.toLowerCase();
       if (word.includes('(')) {
         const name = wholeCallName(word);
-        if (name === null || !SHADOW_COLOUR_FUNCTIONS.has(name)) return false;
+        if (name === null || !SHADOW_COLOUR_FUNCTION_SET.has(name)) return false;
         continue;
       }
       const px = shadowLengthPx(word);
@@ -692,10 +688,7 @@ export function styleResetRequested(search: string): boolean {
 // as the overrides, because a workspace theme is a file any app can write.
 
 /** The device-scoped preference naming the active theme. */
-export const THEME_KEY = 'theme';
-
-/** What an unset `theme` means: the stylesheet as shipped, no inline tokens. */
-export const DEFAULT_THEME_ID = 'lucidos';
+export const THEME_KEY = PREF_THEME.key;
 
 /** Workspace-scoped localStorage key: the active theme, resolved, as JSON, for
  *  the boot script. The engine seeds an app frame the same shape. */
@@ -941,12 +934,12 @@ export const UI_SCALE_STORAGE_KEY = 'lucidos-ui-scale';
 const APPEARANCE_PUSH_SOURCES: ReadonlyArray<readonly [string, string]> = [
   [THEME_MODE_KEY, THEME_MODE_STORAGE_KEY],
   [THEME_SEED_KEY, THEME_STORAGE_KEY],
-  ['font-family', FONT_FAMILY_STORAGE_KEY],
+  [PREF_FONT_FAMILY.key, FONT_FAMILY_STORAGE_KEY],
   [WORKSPACE_FONT_SEED_KEY, WORKSPACE_FONT_STORAGE_KEY],
-  ['ui-scale', UI_SCALE_STORAGE_KEY],
+  [PREF_UI_SCALE.key, UI_SCALE_STORAGE_KEY],
   ['style_overrides', STYLE_OVERRIDES_STORAGE_KEY],
-  ['motion', MOTION_STORAGE_KEY],
-  ['theme-effects', THEME_EFFECTS_STORAGE_KEY],
+  [PREF_MOTION.key, MOTION_STORAGE_KEY],
+  [PREF_THEME_EFFECTS.key, THEME_EFFECTS_STORAGE_KEY],
 ];
 
 /** What the shell painted, read from its mirrors. Raw strings: the frame runs

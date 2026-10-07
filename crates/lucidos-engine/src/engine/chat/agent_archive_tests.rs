@@ -235,3 +235,31 @@ async fn an_agent_archive_records_the_agent_thread_and_leaves_the_parent() {
 
     teardown_test_db(&db).await;
 }
+
+/// No agent archives the home thread (ADR 0362, invariant I10): not its own
+/// agent, and not a thread whose child it could never be. The refusal is the
+/// Archive route's own status and slug.
+#[tokio::test]
+async fn no_agent_archives_the_home_thread() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .unwrap();
+
+    let refusal = authorize(&pool, Some(home), home).await.unwrap_err();
+    let AgentArchiveError::Refused((status, body)) = &refusal else {
+        panic!("expected the route's refusal, got {refusal:?}");
+    };
+    assert_eq!(status.as_u16(), 409);
+    assert_eq!(body["reason"], "home_thread");
+    assert_eq!(refusal.reason(), "home_thread");
+
+    let other = spawn(&bus, None).await;
+    assert!(matches!(
+        authorize(&pool, Some(other), home).await,
+        Err(AgentArchiveError::NotYourThread(id)) if id == home
+    ));
+
+    teardown_test_db(&db).await;
+}

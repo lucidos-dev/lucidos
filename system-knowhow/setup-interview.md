@@ -6,27 +6,25 @@ description: Use when the user wants Lucidos set up around their own life rather
 # Setup Interview
 
 Interview the user about their life, then **build them a real starting kit in
-this session**. Not a plan, not a tour, not a list of what Lucidos can do: apps,
-triggers and knowhow that exist in their workspace when the thread ends.
+this session**. Not a plan, a tour or a list of features: apps, triggers and
+knowhow that exist in their workspace when the thread ends.
 
-**This is not a job interview.** Work is one of the areas it can cover, and it
-is where the ladder below will drift if you let it. Personal admin, health and
-training, learning, a side project and a household all belong here on the same
-footing, and for plenty of people they are the whole answer. Rung 1 exists to
-find out which mix you are dealing with, before any of it is assumed.
+**This is not a job interview.** Work is one area, and the ladder drifts toward
+it if you let it. Personal admin, health and training, learning, a side project
+and a household count the same, and for many people they are the whole answer.
+Rung 1 finds out the mix before you assume any of it.
 
 The user is usually new and often skeptical. They do not know what an app or a
-trigger is here, and they should not have to. Never send them to read anything
-to keep going. **The first card finds out how technical they are** (§1), and
-every word after it is pitched at that level.
+trigger is, and should not have to. Never send them to read anything to keep
+going. **The first card finds out how technical they are** (§1), and every word
+after it is pitched at that level.
 
-**The mechanics of building live elsewhere.** Load
+This file owns the interview and the choice of what to build. Load
 `system-knowhow/building-an-app` before the first `create_app` and
-`system-knowhow/triggers` before the first trigger, as usual. This file owns the
-interview and the choice of what to build; those own how to build it well.
+`system-knowhow/triggers` before the first trigger: they own how to build well.
 
 **Where this sits next to the other two workspace-wide recipes.** All three look
-at the whole workspace and write a report, and they answer different questions.
+at the whole workspace and write a report, but they answer different questions.
 Do not run one when the user wanted another.
 
 | Recipe | Question it answers | Starts from |
@@ -35,74 +33,65 @@ Do not run one when the user wanted another.
 | `system-knowhow/workspace-learning` | Are the conventions wrong for this user? | Recent events |
 | This file | Does the workspace match this **person**? | Asking them |
 
-The other two are read-only sweeps that propose. This one asks first and then
-**builds**, which is why it is the only one of the three that needs the user
-present.
+The other two are read-only sweeps that propose. This one asks, then
+**builds**, so it is the only one that needs the user present.
 
 ## Ground rules
 
 - **Ask with `ask_user_question`, not prose.** Every question is a card with
-  tappable options, so a skeptical newcomer can get through the whole thing
-  without typing. A question typed into your message text forces them to type
-  back, which is exactly the friction this feature exists to remove.
-- **Give 3 or 4 options that lead somewhere different.** Options are there to
-  make answering cheap, not to constrain the answer: the user can type anything
-  into the prompt and it arrives as their answer to the card. Never add an
-  "Other" / "Something else" option (it hands you back the literal label and
-  wastes a slot).
+  tappable options, so a newcomer can finish without typing. A question in your
+  message text forces them to type back, which is the friction this removes.
+- **Give 3 or 4 options that lead somewhere different.** Options make answering
+  cheap but do not constrain it: anything the user types into the prompt arrives
+  as their answer. Never add an "Other" / "Something else" option (it hands you
+  back the literal label and wastes a slot).
 - **Set `multiSelect: true` whenever more than one option can be true at once.**
-  Most of this interview is like that: which areas to cover, where their time
-  goes, what they redo by hand, what slips. Ask one of those as a single pick
-  and the user has to type
-  "the first three" into the prompt to say what three taps should have said,
-  which is the friction this whole feature exists to remove. The test is
-  mechanical: *could a reasonable person want two of these?* Yes, set the flag.
-  Leave it off only for a genuine fork, where the answers really are exclusive
-  and picking one changes what you do next: build all of it versus start with
+  Most of this interview is like that: which areas, where their time goes, what
+  they redo by hand, what slips. As a single pick, the user must type "the first
+  three" to say what three taps should have said. The test: *could a reasonable
+  person want two of these?* If yes, set the flag. Leave it off only for a real
+  fork, where picking one changes what you do next: build all versus start with
   one, daily versus weekly. A checklist is multi-select; a fork is not.
 - **One card at a time, in the user's language.**
-- **Build nothing until they confirm the proposal.** Everything before the
-  confirm is reversible by walking away, and that is what makes the interview
-  safe to abandon.
+- **Build nothing until they confirm the proposal.** Until then, walking away
+  undoes everything, which makes the interview safe to abandon.
 - **This overrides ACTION FIRST.** The usual rule says do not ask clarifying
   questions. Here the questions ARE the work.
 
 ## 1. Check for a previous run, then open
 
-**First, read `artifacts/setup-interview.md`.** If it exists this is a re-run,
-and the point of having written it is that you do not start over:
+**First, read `artifacts/setup-interview.md`.** If it exists, this is a re-run,
+so do not start over:
 
 - Skip every rung it already answers. Ask what CHANGED instead ("last time you
-  said your week was X, still true?"), which is usually two cards, not six.
-- Read "Areas they want covered" and confirm it still holds rather than
-  re-deriving it. A person who came for work help in March may be here about
-  training in September.
-- Read "Built this session" so you do not rebuild what they have, and
-  "Considered and not built" so you lead with those rather than re-proposing
-  something already declined.
+  said your week was X, still true?"): usually two cards, not six.
+- Confirm "Areas they want covered" still holds rather than re-deriving it.
+  Someone who came for work help in March may be here about training in September.
+- Read "Built this session" so you do not rebuild what they have. Read
+  "Considered and not built" and lead with those, without re-proposing anything
+  they declined.
 
 If it does not exist, this is a first run and the whole ladder applies.
 
 **Also read `technical_literacy` with `get_preferences`.** If it holds any
-value, `not-set` included, skip the literacy card below. The user already
-answered, usually in the first-run setup or in Settings.
+value, `not-set` included, skip the literacy card. The user already answered,
+usually in the first-run setup or in Settings.
 
-Then open: one or two sentences, and the first card immediately. Say what is
-about to happen and what they get at the end, in concrete terms: a few
-questions, then you build the things that fit. Word it as **"we build", never
-"I build"**: every piece comes out of what they tell you. Make it plain that
-this is not only about work, so someone who wants help with training or the
-household knows they are in the right place. Do not explain Lucidos, do not
-define "app" or "trigger", and do not list capabilities.
+Then open with one or two sentences and the first card at once. Say concretely
+what happens and what they get: a few questions, then you build what fits. Word
+it as **"we build", never "I build"**: every piece comes from what they tell
+you. Make plain this is not only about work, so someone after help with
+training or the household knows they are in the right place. Do not explain
+Lucidos, define "app" or "trigger", or list capabilities.
 
-**Communicate in-thread only.** The user is reading this thread right now, so
-never `send_notification` during the interview or the build. A push about work
-they are watching happen is noise.
+**Communicate in-thread only.** The user is reading this thread, so never
+`send_notification` during the interview or the build. A push about work they
+are watching is noise.
 
 ### The literacy card comes first
 
-Before rung 1, ask how technical they are, as a single-pick card. It changes
-how you word every card, the proposal and the build summary, so it cannot wait.
+Before rung 1, ask how technical they are, as a single-pick card. It sets the
+wording of every card, the proposal and the build summary, so it cannot wait.
 Ask "How technical should I be with you?" with exactly these three options,
 word for word. Translate them only when the user writes another language.
 
@@ -116,9 +105,9 @@ word for word. Translate them only when the user writes another language.
 detail comes back ("full depth"), which a level must not mean.
 
 **Store the answer at once** with
-`set_preference(key="technical_literacy", value=<level>)`, before the next card. Then word
-everything after it at that level. This is the response style's second part,
-so it also reaches every later thread, trigger and coding-agent session.
+`set_preference(key="technical_literacy", value=<level>)`, before the next card.
+Word everything after it at that level. This is the response style's second
+part, so it also reaches every later thread, trigger and coding-agent session.
 
 A typed answer that clearly maps to one level counts as that pick. If it maps
 to none, or they Cancel, store `not-set` and word the rest plainly. Never set a
@@ -126,13 +115,12 @@ level from your own impression of how they write.
 
 **A level sets the words, not the amount.** A technical person who wants only
 the outcome still picks their real level. How much comes back is the style's
-job, so offer them a short one instead of a lower level.
+job, so offer a short style instead of a lower level.
 
 ### The question ladder
 
-**Target 5 to 7 cards. Hard stop at 8**, the literacy card included. Each rung
-should change what you would build; if an answer would not change the kit, skip
-that rung.
+**Target 5 to 7 cards. Hard stop at 8**, the literacy card included. Skip any
+rung whose answer would not change the kit.
 
 | # | Ask | Multi? | Why it earns its card |
 |---|---|---|---|
@@ -144,39 +132,31 @@ that rung.
 | 6 | What they wish happened without them having to remember | no | The one they will actually judge you on |
 | 7 | Where that lives today (email, calendar, a spreadsheet, a watch or fitness app, in their head) | no | Only ask if 4 to 6 implied an integration. Decides what to connect, not whether the kit is feasible |
 
-**Rung 2 is multi-select, and phrased as "where does it go" rather than "what
-takes up MOST of it", on purpose.** The superlative is what makes the card look
-like a single pick, and it is not: ask a person what eats their day and three of
-your four options are usually true at once. This is the rung that produced the
-reported "the first three" answer, typed into the prompt because the card would
-only take one.
+**Phrase rung 2 as "where does it go", not "what takes up MOST of it".** The
+superlative makes it look like a single pick, but three of four options are
+usually true at once.
 
 Rungs 3 and 6 are the two deliberate single-picks. Rung 3's options really are
-exclusive (a week is one of those shapes). Rung 6 is exclusive by choice rather
-than by nature: a kit carries 1 or 2 triggers, so making them name the one thing
-is a forcing function, and it is the answer the whole kit gets judged on.
+exclusive (a week has one shape). Rung 6 is exclusive by choice: a kit carries 1
+or 2 triggers, so naming the one thing forces focus, and the kit is judged on it.
 
-**Rung 1 pays for itself.** It is one tap, and it prunes: someone who picks only
-training does not need rung 3 framed around a working week, and two areas out of
-four already halve the ground rungs 4 and 5 have to cover. It is the reason
-seven rungs still lands inside a five-to-seven card interview.
+**Rung 1 pays for itself.** It is one tap, and it prunes. Someone who picks only
+training needs no rung 3 framed around a working week. Two areas out of four
+halve the ground rungs 4 and 5 cover. That is how seven rungs fit in five to
+seven cards.
 
-Rung 7 is conditional. Skip it whenever the earlier answers already tell you
-where the data is, and skip it entirely if the kit you are heading for needs no
-outside data.
+Also skip rung 7 when earlier answers already say where the data is.
 
-Useful option sets, as a starting point rather than a script. **These are pools
-to draw from, not cards to render.** A card takes at most 4 options and several
-of the pools below list more, so pick the 3 or 4 that fit what they have already
-told you and drop the rest.
+**These option sets are pools to draw from, not cards to render.** A card takes
+at most 4 options, so pick the 3 or 4 that fit what they told you.
 
 **Rung 1**, the four areas: work / home and personal admin / health, training
 and sport / learning and side projects. Use the user's own words for any area
 they have already named.
 
-**Rung 2** depends on what they picked at rung 1, and this is where the drift
-happens. For work: hands-on delivery / meetings and coordination / deciding what
-to do next / firefighting. For training: following a plan / fitting sessions
+**Rung 2** depends on rung 1, and this is where the drift happens. For work:
+hands-on delivery / meetings and coordination / deciding what to do next /
+firefighting. For training: following a plan / fitting sessions
 around everything else / knowing whether it is working. For home: appointments
 and paperwork / the running of the house / other people's schedules. For
 learning: reading and courses / a project of their own / keeping up with a
@@ -197,23 +177,20 @@ or check-in / something watching for a change.
 Read these as "stop asking": one-word answers, "just do it", "whatever you
 think", answering your question with a question, or Cancel on a card.
 
-When you see one, **stop the ladder immediately** and jump to §2 with what you
-have. Two answers is enough to propose something. Do not apologise for the
-questions and do not ask a meta-question about whether to continue: that is one
-more card, which is the problem.
+On any of these, **stop the ladder immediately** and jump to §2 with what you have. Two
+answers are enough to propose something. Do not apologise, and do not ask
+whether to continue: that is one more card, which is the problem.
 
 ## 2. Read the room before you propose
 
-Different answers imply genuinely different kits. **Do not default to a habit
-tracker.** It is the thing every assistant reaches for, it fits almost nobody,
-and proposing it is the tell that you did not listen. Health and training being
-on the table at rung 1 does not change this: a training kit is built around
-their goal, their week and their constraints, and a grid of ticks is what you
-fall back on when you did not ask about any of those.
+Different answers imply different kits. **Do not default to a habit tracker.**
+Every assistant reaches for it, it fits almost nobody, and it shows you did not
+listen. Training at rung 1 does not change this: a training kit is built around
+their goal, week and constraints. A grid of ticks is the fallback when you asked
+about none of those.
 
-Six worked mappings, to calibrate the distance between answers and a kit. The
-last three are there because the first three are the ones you will reach for by
-default, and half the people running this interview did not come about a job:
+Six worked mappings calibrate the distance from answers to a kit. Half of them
+are not about a job, because half the people here did not come about one:
 
 | What they said | Kit worth proposing |
 |---|---|
@@ -224,83 +201,74 @@ default, and half the people running this interview did not come about a job:
 | Running a household, appointments and paperwork, other people's schedules | App: what is due and who it belongs to. Trigger: a Sunday look at the week ahead. Knowhow: the recurring ones and their real lead times, so a renewal is raised early enough to act on |
 | Study or research, "things I meant to read" | App: a reading queue with what is unread. Trigger: weekly, pick one thing and say why now. Knowhow: their sources and what makes something worth their time |
 
-Some of these need an account they have not connected yet: invoices sitting in
-email, or a project tool behind the morning brief. Connecting it is part of
-building the kit, not a prerequisite the user arranges first. See §4.
+Some of these need an account they have not connected yet: invoices in email,
+or a project tool behind the morning brief. Connecting it is part of the build
+(§4).
 
-The pattern under all six: **the app is the thing they open, the trigger is the
-thing that saves them remembering, and the knowhow is what makes both stay
-right next month.** If a proposed piece does not fill one of those three roles,
-cut it.
+The pattern under all six: **the app is what they open, the trigger saves them
+remembering, and the knowhow keeps both right next month.** Cut any piece that
+fills none of those roles.
 
 A kit is **2 or 3 apps, 1 or 2 triggers, and the knowhow to back them**. Fewer
 is fine and often better. More is not: an overloaded first session is abandoned.
 
 ### Prefer a curated starter when one fits
 
-If the workspace already has an installable plugin that matches what you are
-about to generate, install that instead and adapt it. Generating is the normal
-path today, so do not go looking hard, do not make the user browse for one, and
-never make "go and pick a plugin" the outcome. If nothing obvious fits, just
-build it.
+If the workspace already has an installable plugin that matches what you would
+generate, install and adapt it instead. Generating is the normal path, so do not
+search hard or make the user browse. Never make "go and pick a plugin" the
+outcome. If nothing obvious fits, build it.
 
 ## 3. Propose, and get a real yes
 
-One short message: each piece, one line, in their words, saying what it does for
-them. No file names, no technical shape, no menu of alternatives.
+One short message: each piece on one line, in their words, saying what it does
+for them. No file names, no technical shape, no menu of alternatives.
 
-Then confirm with `ask_user_question`. Give them a way to shrink the scope, not
-just yes or no. Something like: build all of it / start with just the first one
-/ not yet. "Start with one" is a common and correct answer for a skeptical
-user, and it is a better outcome than a polite yes followed by three things they
-never open.
+Then confirm with `ask_user_question`, with a way to shrink the scope, not just
+yes or no: build all of it / start with just the first one / not yet. "Start
+with one" is a common, correct answer for a skeptical user. It beats a polite
+yes followed by three things they never open.
 
 ## 4. Connect an account, in the session
 
 Rung 7 sometimes points at an outside account: email, calendar, an accounting
-system, a fitness watch. Connecting it is part of the build, not a
-prerequisite the user arranges before you start. Do the setup WITH them, now.
-Never hand them a list of steps for later, and never say "come back once
-you've connected X".
+system, a fitness watch. Connecting it is part of the build, not a prerequisite
+the user arranges first. Do the setup WITH them, now. Never hand them steps for
+later, and never say "come back once you've connected X".
 
 - **Load `system-knowhow/oauth-providers` before you collect anything, and
-  follow it rather than re-deriving the mechanics here.** It explains why
-  `connect_oauth_account` is the one call for the whole flow, and why a
-  separate `request_credential` call first only duplicates it.
-- **Read the provider's own row before you say anything about it.** The rows
-  in `system-knowhow/oauth-providers.json` carry a `setup_hint`, a
-  `permissions_hint` and a `console_url` per provider. Relay what the row
-  says, in the user's own words. Never invent a step for a provider whose row
-  you have not read.
-- **Say the cost before they commit.** Roughly how long it takes, whether
-  they will need to create an app in a developer console, and what Lucidos
-  will be able to see. Someone deciding whether to hand over their mail five
-  minutes into meeting this tool deserves the real number.
-- **Offer it as a card with a genuine decline.** Something like: connect it
-  now / build it by hand for now / skip that piece. A cautious newcomer
-  declining is a legitimate answer, not a failure to route around.
+  follow it.** It explains why `connect_oauth_account` is the one call for the
+  whole flow, and why a `request_credential` call first only duplicates it.
+- **Read the provider's own row before you say anything about it.** Each row in
+  `system-knowhow/oauth-providers.json` carries a `setup_hint`, a
+  `permissions_hint` and a `console_url`. Relay what the row says, in the
+  user's words. Never invent a step for a provider whose row you have not read.
+- **Say the cost before they commit:** roughly how long it takes, whether they
+  must create an app in a developer console, and what Lucidos will see. Someone
+  five minutes in, deciding whether to hand over their mail, deserves the real
+  number.
+- **Offer it as a card with a genuine decline:** connect it now / build it by
+  hand for now / skip that piece. Declining is a legitimate answer, not a
+  failure to route around.
 - **If they decline, or the connection fails, build the manual version
   anyway.** Say plainly what it will and will not do (it cannot know an
   invoice was paid, and it needs typing). Record in the artifact that the
   connected version is available, so a re-run leads with it.
 
-One warning worth its own line: an OAuth setup that goes wrong mid-interview
-can eat the whole session and lose the kit. If it stalls, park it, build the
-rest, and come back to it.
+An OAuth setup that goes wrong can eat the whole session and lose the kit. If it
+stalls, park it, build the rest, and come back to it.
 
 ## 5. Build it for real
 
 Use `todo_write` so they can watch it happen, one item per piece.
 
-Build in this session. "Here is what you could build" is a failure of this
-whole workflow, and so is handing the user homework: a list of steps for them
-to run later. Walking them through a connection now (§4) is the opposite of
-that, not an exception to it.
+Build in this session. "Here is what you could build" is a failure, and so is
+homework: steps for the user to run later. Walking them through a connection
+now (§4) is not homework.
 
 - Load `system-knowhow/building-an-app` before the first app, and
-  `system-knowhow/triggers` before the first trigger. Both have their own
-  quality bars; meet them. A cheap-looking first app is the user's first
-  impression of everything.
+  `system-knowhow/triggers` before the first trigger. Meet both quality bars:
+  a cheap-looking first app is the user's first impression of everything.
 - **Seed each app with something to look at.** An empty board on first open
   reads as broken. Use what they told you in the interview as the first rows.
 - A trigger's `run.intent` is what the user would say. Every "how" goes in
@@ -309,7 +277,7 @@ that, not an exception to it.
 
 When you finish, tell them what exists now and **link every app as a clickable
 `app:<id>` markdown link**, e.g. `[Reading Queue](app:reading-queue)`. A bare
-mention of the name is not a link and they will not find it.
+name is not a link, and they will not find it.
 
 Say plainly when the first trigger will fire. A trigger they do not expect is
 worse than no trigger.
@@ -319,10 +287,10 @@ worse than no trigger.
 Two destinations, and the split matters.
 
 **The interview record: `artifacts/setup-interview.md`.** One durable file at a
-stable path so later threads can find it without searching, and so §1 can read
-it back on a re-run. Append a new section headed with **today's date** in the
-user's timezone; never overwrite an earlier one, since what changed between runs
-is itself the useful part.
+stable path, so later threads find it without searching and §1 can read it on a
+re-run. Append a new section headed with **today's date** in the user's
+timezone. Never overwrite an earlier one: what changed between runs is the
+useful part.
 
 ```markdown
 # Setup interview
@@ -366,9 +334,8 @@ is itself the useful part.
 - Inferences go here and ONLY here
 ```
 
-**Memory and `user_profile.md`: confirmed facts only.** This workflow is unusually
-tempting to infer from, because the interview format makes a guess feel like an
-answer. It is not one.
+**Memory and `user_profile.md`: confirmed facts only.** The interview format
+makes a guess feel like an answer. It is not one.
 
 | They said | Goes to profile / memory? |
 |---|---|
@@ -379,9 +346,13 @@ answer. It is not one.
 
 If a guess matters enough to act on, ask a card and turn it into a fact.
 
-**Then emit the completion event**, the same way the other two workspace-wide
-recipes close out, so a later thread can find this run without reading the
-artifact:
+**Under the Tree *memory module*, your replies are memory too.** Every turn
+becomes a summary line, so a guess you state as fact in chat reaches memory
+without any extraction. Say an inference as a guess, or keep it in the
+artifact.
+
+**Then emit the completion event**, like the other two workspace-wide recipes,
+so a later thread can find this run without reading the artifact:
 
 ```
 emit_event("SetupInterviewCompleted", {
@@ -395,57 +366,52 @@ emit_event("SetupInterviewCompleted", {
 ## 7. The exits
 
 **They stop answering, or Cancel a card.** Do not keep asking and do not build
-in silence. Nothing has been created yet (see *Ground rules*: nothing is built
-before the confirm in §3), so there is nothing to clean up. Say what you have, offer the single smallest useful thing, and let
-it go if they do not take it.
+in silence. Nothing exists yet (nothing is built before the confirm in §3), so
+there is nothing to clean up. Say what you have, offer the single smallest
+useful thing, and let it go if they decline.
 
-**"Just build me something" after two questions.** Take it literally. Skip
-straight to §3, propose exactly ONE thing, the highest-confidence piece from
-what little you have, and build it if they say yes. Do not go back to the
-ladder afterwards and do not ask why they cut it short.
+**"Just build me something" after two questions.** Take it literally. Skip to
+§3, propose exactly ONE thing, the highest-confidence piece from what you have,
+and build it if they say yes. Do not return to the ladder or ask why they cut
+it short.
 
-**They bail mid-build.** Say what already exists and offer to remove it. Do not
-leave a live trigger from an abandoned session: a trigger that fires next
-morning for someone who walked away is the worst outcome this workflow has.
+**They bail mid-build.** Say what already exists and offer to remove it. Never
+leave a live trigger from an abandoned session: one that fires next morning for
+someone who walked away is the worst outcome this workflow has.
 
 **They finish, and want more.** Write the artifact first, then offer the next
 piece from "Considered and not built". Do not re-run the ladder.
 
 ## Common mistakes
 
-- **Explaining Lucidos instead of interviewing.** They can read about it later.
-  Every sentence spent describing the system is a sentence not spent learning
-  something you could build from.
+- **Explaining Lucidos instead of interviewing.** Every sentence about the
+  system is one not spent learning what to build.
 - **Ending with a recommendation.** "You could build X" is the failure state.
   Build X.
 - **Ending anywhere outside their workspace.** The Plugins panel, the docs, a
   tutorial. The payoff is in their workspace or there is no payoff.
-- **Assuming it is about work.** The single most likely way this interview goes
-  wrong. Rung 1 is what stops it, so ask it first and then actually honour the
-  answer: if they picked training and learning, do not slip a "so what does your
-  working day look like?" into rung 2.
-- **A single-select card for a question with several true answers.** They then
-  type "the first three" into the prompt, which is the typing this feature
-  exists to remove. See *Ground rules*.
-- **The same kit for everyone.** See §2. If you have proposed a habit tracker,
-  check that they actually described tracking a habit.
+- **Assuming it is about work.** The most likely way this goes wrong. Ask rung 1
+  first and honour it: if they picked training and learning, do not slip a "so
+  what does your working day look like?" into rung 2.
+- **A single-select card for a question with several true answers.** See
+  *Ground rules*.
+- **The same kit for everyone.** See §2. If you proposed a habit tracker, check
+  that they described tracking a habit.
 - **Too many questions.** Eight cards is the ceiling and five is usually better.
   The interview is the cost; the kit is the product.
-- **Building before the confirm.** It removes their exit and it is the one
-  irreversible thing in this whole workflow.
+- **Building before the confirm.** It removes their exit, and it is the one
+  irreversible step in this workflow.
 - **Writing inferences to memory.** See §6.
-- **Guessing their technical level.** A fluent writer may still want plain
-  words, and a terse one may be a developer. Ask the literacy card; never set
+- **Guessing their technical level.** A fluent writer may want plain words, and
+  a terse one may be a developer. Ask the literacy card; never set
   `technical_literacy` from an impression.
 - **Asking the literacy card, then ignoring it.** A "keep it plain" user who
-  then sees a file path or the word "trigger" undefined has been told their
-  answer did not matter.
-- **Proposing something you cannot actually build.** This is about a genuinely
-  unreachable source: a closed practice system with no API, data that exists
-  nowhere Lucidos can reach. "No account connected yet" is not that. It is one
-  offer away (§4). A promise you retract two turns later costs more than the
-  smaller thing you could have offered.
+  then meets a file path or an undefined "trigger" learns their answer did not
+  matter.
+- **Proposing something you cannot actually build.** This means a truly
+  unreachable source: a closed practice system with no API, data nowhere
+  Lucidos can reach. "No account connected yet" is not that: it is one offer
+  away (§4). A promise retracted two turns later costs more than a smaller offer.
 - **Silently building the hand-typed version instead of offering to connect.**
-  The kit still looks finished, so nobody notices until the user is typing by
-  hand something they already have somewhere else. If a connection was
-  possible, offer it before you build around it.
+  The kit looks finished, so nobody notices until the user hand-types something
+  they already have elsewhere. If a connection was possible, offer it first.

@@ -60,6 +60,7 @@ function cleanPreflight() {
     thread_count: 1,
     sub_thread_titles: [],
     memory_count: 0,
+    summary_rebuild_count: 0,
     has_unapplied_branch_work: false,
     has_applied_changes: false,
     backups_present: false,

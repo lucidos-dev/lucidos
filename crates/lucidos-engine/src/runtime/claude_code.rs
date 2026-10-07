@@ -516,7 +516,7 @@ pub async fn ask_side_question(
         super::spawn_env::resolve_binary_override(
             path,
             "Claude Code (`claude`)",
-            crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
+            crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
         )?;
     }
     let settings =
@@ -640,7 +640,7 @@ pub async fn probe_cc_models(
         super::spawn_env::resolve_binary_override(
             path,
             "Claude Code (`claude`)",
-            crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
+            crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
         )?;
     }
     // The session command names this file with --settings, and a fresh install
@@ -832,7 +832,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
             super::spawn_env::resolve_binary_override(
                 path,
                 "Claude Code (`claude`)",
-                crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
+                crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
             )?;
         }
         place_lucidos_cli_skill(
@@ -1193,6 +1193,10 @@ fn build_command_with_settings(
     if permission_mode.needs_auto_opt_in() {
         cmd.env(AUTO_MODE_OPT_IN_ENV, "1");
     }
+    // A background job dies with the turn, yet Claude Code promises the model
+    // a notification for one. Engine-owned, so it also goes AFTER
+    // `apply_lucidos_env` (ADR 0358).
+    cmd.env(BACKGROUND_TASKS_OFF_ENV, "1");
     // Engine-owned, so it goes AFTER `apply_lucidos_env`. A workspace value
     // then becomes the relay's upstream instead of bypassing the relay.
     stamp_vertex_relay(&mut cmd, args, super::vertex_relay::port());
@@ -1205,9 +1209,11 @@ fn build_command_with_settings(
     // The 30-second `MCP_TIMEOUT` default is what produced an infinite loop of
     // identical permission cards: CC's MCP client cancelled the permission RPC,
     // the engine gc'd the orphaned waiter, and CC's model retried the original
-    // tool. Both are set to 24 hours.
-    cmd.env("MCP_TOOL_TIMEOUT", (86_400u64 * 1000).to_string());
-    cmd.env("MCP_TIMEOUT", (86_400u64 * 1000).to_string());
+    // tool. Both are set to the user-answer wait, in milliseconds.
+    let user_answer_wait_ms =
+        (crate::engine::cc_settings::USER_ANSWER_WAIT_SECS * 1000).to_string();
+    cmd.env("MCP_TOOL_TIMEOUT", &user_answer_wait_ms);
+    cmd.env("MCP_TIMEOUT", &user_answer_wait_ms);
     // No macOS TCC responsibility disclaim is attempted here, and adding one
     // back would be inert: a `pre_exec` hook forces the `fork()` path, where the
     // only effective knob is never consulted. See ADR 0075.
@@ -1281,6 +1287,10 @@ pub(crate) enum CcPermissionMode {
 /// `default`, which cards MORE than `acceptEdits` does.
 const AUTO_MODE_OPT_IN_ENV: &str = "CLAUDE_CODE_ENABLE_AUTO_MODE";
 
+/// Removes `run_in_background` from the `Bash` and `Agent` schemas, and makes a
+/// timed-out command fail rather than move to the background.
+const BACKGROUND_TASKS_OFF_ENV: &str = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS";
+
 /// The session's `--add-dir` list as a JSON array of strings. Claude Code reads
 /// agent definitions from those directories, and the hook payload does not
 /// name them, so `lucidos cc-agent-guard` reads them here.
@@ -1303,13 +1313,17 @@ impl CcPermissionMode {
 
 /// Read the stored preference value as a mode.
 ///
-/// Anything unrecognised falls back to [`CcPermissionMode::AcceptEdits`], which
-/// is what every session ran before the preference existed. Never to `auto`,
-/// which nobody asked for, and never to CC's `default`, which cards more.
+/// The handle resolves an unset or unrecognised value to the catalog default,
+/// `accept-edits`. Never to `auto`, which nobody asked for, and never to CC's
+/// `default`, which cards more. Every arm names a catalog value, so a renamed
+/// value cannot hide behind a catch-all.
 pub(crate) fn resolve_permission_mode(preference: Option<&str>) -> CcPermissionMode {
-    match preference.map(str::trim) {
-        Some("auto") => CcPermissionMode::Auto,
-        _ => CcPermissionMode::AcceptEdits,
+    let mode = crate::core::prefs::CODING_AGENT_CLAUDE_PERMISSION_MODE.resolve(preference);
+    match mode.as_str() {
+        "accept-edits" => CcPermissionMode::AcceptEdits,
+        "auto" => CcPermissionMode::Auto,
+        // `every_catalogued_permission_mode_maps` walks the catalog's list.
+        other => unreachable!("the catalog admits no permission mode {other:?}"),
     }
 }
 
@@ -1712,6 +1726,9 @@ async fn driver_task(
 
     // A call cut off mid-stream still billed its prompt.
     if let Some(usage) = stream_state.close_open_call() {
+        let _ = events_tx.send(usage);
+    }
+    for usage in stream_state.release_held_usage() {
         let _ = events_tx.send(usage);
     }
     let _ = events_tx.send(AgentEvent::OutputEnded);

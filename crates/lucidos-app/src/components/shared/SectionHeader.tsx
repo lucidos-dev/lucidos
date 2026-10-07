@@ -1,4 +1,5 @@
 import type { ComponentChildren, ComponentType } from 'preact';
+import { GlyphBadge } from './GlyphBadge';
 
 /** The icon, label and count every list panel's section header draws: the
  *  thread drawer, Triggers, Changes and Thread queue. One markup, so the
@@ -20,7 +21,7 @@ export function SectionHeaderContent({ Icon, title, count, running }: {
             <span class={`section-label${running ? ' running-shimmer running-shimmer-invert' : ''}`}>{title}</span>
             {count !== undefined && (
                 <span class="section-count">
-                    <span class="section-count-badge">{count}</span>
+                    <GlyphBadge class="section-count-badge">{count}</GlyphBadge>
                     <span class="section-count-open">{count}</span>
                 </span>
             )}

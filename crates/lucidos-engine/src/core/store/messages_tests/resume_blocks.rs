@@ -1,5 +1,6 @@
 use super::msg_helpers::*;
 use super::*;
+use crate::core::changes::ChangeStatus;
 
 // ----------------------------------------------------------------------------
 // build_resume_tool_blocks_with_skip_ids — Phase 3 of the
@@ -886,25 +887,28 @@ fn child_completed_block_lists_sub_thread_changes_apart_from_its_own() {
         thread_id: None,
         sequence: Some(1),
     };
-    let block = format_child_thread_completed_block(&row(json!({
-        "child_thread_id": Uuid::new_v4().to_string(),
-        "child_thread_title": "orchestrator",
-        "status": "success",
-        "summary": "handed over",
-        "sub_thread_pending_changes": [
-            {
-                "change_id": settled_change,
-                "thread_id": settled_thread,
-                "thread_title": "milestone 9b",
-                "thread_unsettled": false,
-            },
-            {
-                "change_id": working_change,
-                "thread_id": working_thread,
-                "thread_unsettled": true,
-            },
-        ],
-    })));
+    let block = format_child_thread_completed_block(
+        &row(json!({
+            "child_thread_id": Uuid::new_v4().to_string(),
+            "child_thread_title": "orchestrator",
+            "status": "success",
+            "summary": "handed over",
+            "sub_thread_pending_changes": [
+                {
+                    "change_id": settled_change,
+                    "thread_id": settled_thread,
+                    "thread_title": "milestone 9b",
+                    "thread_unsettled": false,
+                },
+                {
+                    "change_id": working_change,
+                    "thread_id": working_thread,
+                    "thread_unsettled": true,
+                },
+            ],
+        })),
+        &ChangeStatuses::new(),
+    );
     assert!(
         block.contains("Pending changes: none\nPending changes in its sub-threads"),
         "the own line stays, and the sub-thread section follows it; got:\n{block}"
@@ -923,10 +927,122 @@ fn child_completed_block_lists_sub_thread_changes_apart_from_its_own() {
     );
 
     // A card with nothing below it reads exactly as before.
-    let plain = format_child_thread_completed_block(&row(json!({
+    let plain = format_child_thread_completed_block(
+        &row(json!({
+            "child_thread_id": Uuid::new_v4().to_string(),
+            "status": "success",
+            "summary": "done",
+        })),
+        &ChangeStatuses::new(),
+    );
+    assert!(!plain.contains("sub-threads"), "got:\n{plain}");
+}
+
+fn child_report_row(payload: serde_json::Value) -> EventRow {
+    EventRow {
+        id: Uuid::new_v4(),
+        event_type: "ChildThreadCompleted".into(),
+        payload,
+        created: chrono::Utc::now(),
+        thread_id: None,
+        sequence: Some(1),
+    }
+}
+
+/// A parent said a change "still waits for your Apply" two days after the
+/// user applied it. The card froze the change list as the child left it, and
+/// every resume rebuilt it that way. The card now names what became of each
+/// change since, and says that any later "pending" is out of date.
+#[test]
+fn child_completed_block_names_what_became_of_each_change_since() {
+    let (applied, waiting, discarded) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let sub_thread = Uuid::new_v4();
+    let report = child_report_row(json!({
         "child_thread_id": Uuid::new_v4().to_string(),
         "status": "success",
-        "summary": "done",
-    })));
-    assert!(!plain.contains("sub-threads"), "got:\n{plain}");
+        "summary": "3 commits, change pending your Apply",
+        "pending_change_ids": [applied, waiting],
+        "sub_thread_pending_changes": [{
+            "change_id": discarded,
+            "thread_id": sub_thread,
+            "thread_title": "helper",
+            "thread_unsettled": false,
+        }],
+    }));
+    let statuses = ChangeStatuses::from([
+        (applied, Some(ChangeStatus::Applied)),
+        (waiting, Some(ChangeStatus::Pending)),
+        (discarded, Some(ChangeStatus::Discarded)),
+    ]);
+
+    let block = format_child_thread_completed_block(&report, &statuses);
+
+    assert!(
+        block.contains(&format!(
+            "Pending changes: {applied} (now applied), {waiting}\n"
+        )),
+        "an applied change says so, a pending one reads as before; got:\n{block}"
+    );
+    assert!(
+        block.contains(&format!(
+            "- {discarded} from sub-thread \"helper\" ({sub_thread}): now discarded"
+        )),
+        "the frozen sub-thread state gives way to the change's own; got:\n{block}"
+    );
+    assert!(
+        block.contains(CHANGES_MOVED_ON_NOTE),
+        "the card overrides the summary's stale claim; got:\n{block}"
+    );
+
+    // Nothing resolved since: the card reads exactly as the child left it.
+    let unchanged = format_child_thread_completed_block(&report, &ChangeStatuses::new());
+    assert!(
+        unchanged.contains(&format!("Pending changes: {applied}, {waiting}\n")),
+        "got:\n{unchanged}"
+    );
+    assert!(!unchanged.contains("now "), "got:\n{unchanged}");
+    assert!(
+        !unchanged.contains(CHANGES_MOVED_ON_NOTE),
+        "got:\n{unchanged}"
+    );
+}
+
+/// The store reads each reported change's status from the `changes` table.
+/// A resume then sees the change as it is now, including one whose row a
+/// thread delete removed.
+#[tokio::test]
+async fn store_built_messages_read_each_reported_change_as_it_is_now() {
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    let change_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO changes (id, request_id, branch_name, repo_root, status) \
+         VALUES ($1, $2, 'b-applied', '/repo', 'applied')",
+    )
+    .bind(change_id)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("insert an applied change");
+    let deleted_id = Uuid::new_v4();
+    let events = vec![child_report_row(json!({
+        "child_thread_id": Uuid::new_v4().to_string(),
+        "status": "success",
+        "summary": "pending your Apply",
+        "pending_change_ids": [change_id, deleted_id],
+    }))];
+
+    let messages = EventStore::new(pool.clone())
+        .build_messages_now(&events)
+        .await;
+
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0].content.contains(&format!(
+            "Pending changes: {change_id} (now applied), {deleted_id} (now deleted)"
+        )),
+        "got:\n{}",
+        messages[0].content
+    );
+    teardown_test_db(&db).await;
 }

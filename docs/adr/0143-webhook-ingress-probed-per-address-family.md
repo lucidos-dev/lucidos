@@ -5,7 +5,9 @@
   now falls through an answer naming no record, and only a probe that was
   actually sent can degrade a family. The stage table is **extended by
   [ADR 0172](0172-a-blocked-port-is-not-a-dead-ingress.md)** with a seventh
-  value. Everything else here still holds.
+  value. The two-strike debounce is **amended by
+  [ADR 0367](0367-a-sleeping-host-is-not-a-dead-ingress.md)**: a round the
+  computer slept through is not evidence. Everything else here still holds.
 - **Date**: 2026-08-27
 
 ## Context

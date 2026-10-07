@@ -16,17 +16,17 @@ The Claude Code profile a *coding-agent thread* is permanently bound to: the one
 Rows from before the marker resolve as the default profile when their dir is `~/.claude`, unless the live env sets exactly that path. The auto-detected resume session id is scoped to the pinned dir (`lookup_latest_cc_session_id_for_config_dir`). Claude-Code-specific: Codex records no config dir, so it has no pin. See `crates/lucidos-engine/src/runtime/agent_runtime.rs`, `crates/lucidos-engine/src/engine/agent_session/resume.rs` and `run_session/run.rs`.
 
 ### Auxiliary model call
-A model call the engine makes for itself rather than as an agent's turn. Twelve
-of them, listed with what each one is in `system-knowhow/thread-events.md`
-§ Which call each purpose names. Each emits a `ContextCaptured` stamped
-`producer: auxiliary`, plus a `purpose` naming which one it was. Token
-accounting then sees the engine's own spend, instead of undercounting by
-everything on that list.
+A model call the engine makes for itself rather than as an agent's turn, or
+one an app or script makes through the credentialed proxy. Each is listed with
+what it is in `system-knowhow/thread-events.md` § Which call each purpose
+names. Each emits a `ContextCaptured` stamped `producer: auxiliary`, plus a
+`purpose` naming which one it was. Token accounting then sees the engine's own
+spend, instead of undercounting by everything on that list.
 
 **Every model call the engine makes is one of these or a turn** (ADR 0242).
-`every_file_that_calls_a_model_records_the_cost` holds that per FILE over the
-source tree, and its exemption table is empty. Six calls were silent until that
-ADR, the command guard's judge since ADR 0107 named the gap and left it open.
+The *model call service* is the only path to a model, so a call that records
+nothing does not compile. Six calls were silent until that ADR, the command
+guard's judge since ADR 0107 named the gap and left it open.
 
 **`voice` is the one that is not a single HTTP call.** The talker holds a
 socket, so a row is written per spoken reply and the purpose's `AuxBudget` is
@@ -35,12 +35,23 @@ chars, and its `usage` block is the only real number on the row.
 
 Built only through `engine::AuxCapture`, which pairs the producer with the
 purpose so the two cannot disagree. Recorded per ATTEMPT: a resampled title
-and a retried extraction are separate API calls that each spent tokens.
-Skipped entirely when no thread anchors the call, which is artifact indexing,
-rather than inventing a thread id. The transcript renders none of them
+and a retried extraction are separate API calls that each spent tokens. A call
+no thread caused records on the *home thread*, created hidden while its switch
+is off, never on an invented id. The transcript renders none of them
 (`isAuxiliaryCapture` drops them from the exchange fold). A capture binds to
 the step it follows, so an auxiliary row would overwrite that step's context
 chip.
+
+### Call token
+`llm::metered::CallToken`: the permission every billable provider method
+(`LlmProvider::chat`, `JudgmentProvider::ask`, `ImageProvider::generate`,
+`WebSearchProvider::search`) takes. Only `llm::metered` can make one, and
+every function there hands the call's cost to a `CostSink` before it returns.
+That is what makes the *model call service* the only way to call a model.
+
+`lucidos-eval` builds its tokens through `CallToken::for_eval_harness`, since
+it scores models outside any workspace. A test fails if an engine source calls
+it.
 
 ### Fresh input
 The part of a request the model actually read, with the cached part taken out.
@@ -521,7 +532,7 @@ badge, Refresh, the restart guards) stayed in the menu and are not part of this.
 The invariant that a Lucidos document never leaves another one on the browser's history stack. Every navigation between them replaces the current entry instead of pushing one. `utils/documentNavigation.ts` owns the rule for the navigations a user triggers, and a source scan pins `utils/openExternalUrl.ts` as the only remaining `location.href` assignment. It matters on mobile, where a swipe right from the left screen edge IS iOS's back gesture. `shouldSuppressEdgeNavigation` cannot cancel every touch, so leaving the previous workspace one entry back turned each hole in it into a silent teleport. The cost is that browser back no longer returns to the *workspace picker*, which the *in-app workspace switcher*'s Manage workspaces row reaches instead.
 
 ### Appearance boot contract
-The single source for what a device's theme, UI font, ligature settings, UI scale and *style remote* overrides resolve to: `packages/lucidos-sdk/src/appearance.ts`, a pure module with no DOM and no storage. Four surfaces have to agree on those values and each used to carry its own copy: the host store (`store/actions/preferences.ts`), the two **appearance boot scripts**, and the SDK's `ui.applyPreferences()`. They paint at different moments of one page load, so a disagreement between any two is a visible flash, and the copies were held together by source-scanning guards that could only compare literals. Distinct from the *preference catalog*, which is the engine-side, agent-facing DESCRIPTION of the same two defaults, in another language and process, and is pinned against this file by a unit test rather than merged into it.
+The single source for what a device's theme, UI font, ligature settings, UI scale and *style remote* overrides resolve to: `packages/lucidos-sdk/src/appearance.ts`, a pure module with no DOM and no storage. Four surfaces have to agree on those values and each used to carry its own copy: the host store (`store/actions/preferences.ts`), the two **appearance boot scripts**, and the SDK's `ui.applyPreferences()`. They paint at different moments of one page load, so a disagreement between any two is a visible flash. Source-scanning guards that could only compare literals once held the copies together. The defaults themselves come from the *preference catalog*, through its generated TS copy, so this module resolves values and holds none.
 
 ### Appearance boot script
 The parser-blocking script that writes the *appearance boot contract* onto `<html>` before any stylesheet is parsed or any module loads, so the first frame is already the user's appearance rather than a default that gets corrected. **One program, embedded in two documents**: the app shell inlines it into `index.html`'s `<head>` (the `lucidos-appearance-boot` Vite plugin substitutes it for a marker comment, in `serve` as well as `build`), and the engine serves the same program to every app iframe as `/api/v1/sdk-prefs.js` (`api/sdk_prefs.rs` `include_str!`s it). Both are built by esbuild from `packages/lucidos-sdk/src/boot/`, which is what makes "cannot import at runtime" stop meaning "cannot share a source"; the two entry points differ only in a `styleReset` boolean, and the shell's boot-splash gradient and theme telemetry stay in its own entry rather than the shared program. The bundles are CHECKED IN under `src/generated/`, unlike `dist/sdk.js`: the engine bakes one in, so `cargo build` must not require npm to have run, and unlike the SDK bundle a boot script has no usable "not built yet" fallback. `appearanceBoot.staleness.test.ts` rebuilds and diffs, so an unrebuilt source edit fails the test run instead of silently shipping the previous script.
@@ -529,12 +540,28 @@ The parser-blocking script that writes the *appearance boot contract* onto `<htm
 ### Boot splash
 The brand cover shown while a workspace comes up: the gradient wash, the white Lucidos mark, and one status line under it. **One splash, rendered by two documents.** The *Workspace gateway* serves it as a 503 page while the engine starts (`proxy.rs::splash_page_html`, labelled with the current *boot phase* or a *boot failure*); the app document then serves it inline in `crates/lucidos-app/index.html`, painted on the first frame before the bundle loads. Both live at the SAME url, so a cold launch crosses from one to the other mid-boot and any difference between them reads as the brand jumping.
 
-They cannot differ, because there is only one definition: index.html holds the stylesheet and the mark markup (between its `lucidos-boot-splash-css` / `lucidos-boot-splash-mark` markers), and the gateway `include_str!`s that file and lifts both out at compile time, overriding only what is genuinely its own (a wrapping status line, no breathe under its meta-refresh, a tappable escape link, its own label). Two rules follow from the shared-across-documents shape. Every length in it is **px, never rem**: the app's root font-size is `var(--user-ui-scale)` and the gateway's is the browser default, so one rem value paints at two sizes (the 2026-07-31 seam bug, where the mark grew from 240px to 330px at 137.5% scale). And the built mark is **handed over** rather than rebuilt: a per-tab `sessionStorage` flag tells the next document the mark is already standing on screen, so it is revealed once per boot instead of re-revealing on every gateway refresh and again on the swap (`boot-splash-formed`; the app document consumes the flag as it reads it). Some documents deliberately show **no mark at all**: a *quiet boot cover* (`boot-splash-quiet`) is what a document paints instead of the splash when its load continues a session rather than starting one. Not to be confused with the iOS `apple-touch-startup-image` PNGs, which are solid-color launch images the OS draws before any document exists.
+They cannot differ, because there is only one definition. index.html holds the stylesheet and the mark markup, between its `lucidos-boot-splash-css` / `lucidos-boot-splash-mark` markers. The gateway `include_str!`s that file and lifts both out at compile time. It overrides only what is genuinely its own: a wrapping status line, no breathe under its meta-refresh, a tappable escape link, and its own label.
+
+Two rules follow from the shared-across-documents shape:
+
+- **Every length in it is px, never rem.** The app's root font-size is `var(--user-ui-scale)` and the gateway's is the browser default, so one rem value paints at two sizes. That was the 2026-07-31 seam bug, where the mark grew from 240px to 330px at 137.5% scale.
+- **The built mark is handed over rather than rebuilt** (`boot-splash-formed`). A per-tab `sessionStorage` flag tells the next document the mark is already standing on screen. So it is revealed once per boot, not again on every gateway refresh and on the swap. The app document consumes the flag as it reads it.
+
+Some documents deliberately show **no mark at all**. A *quiet boot cover* (`data-boot-splash-quiet` on `<html>`) is what a document paints when its load continues a session rather than starting one. Not to be confused with the iOS `apple-touch-startup-image` PNGs: those are solid-color launch images the OS draws before any document exists.
 
 It **leaves in two beats**, which only the app document ever plays (`boot-splash-leaving`): the status fades in 0.18s and the mark in 0.3s, and only then does the gradient veil finish dissolving over 0.65s, so nothing branded is left standing over the app's own content while the veil is thin enough to read through. Fading all three on one curve is what made the hand-off read as unsmooth, and it is also why the answer to "the transition is too fast" is not simply a longer fade. Two things follow for anyone touching it. The mark's exit is **appended** to its animation list with the entries ahead of it restated verbatim, so the reveal keeps its start time and the exit composites over the *breathe* instead of snapping the mark back to full opacity first. And `animationend` **bubbles**, so `dismissBootSplash` removes the node only for the splash's OWN fade: acting on the mark's shorter one tore the splash out at 57% veil opacity, and the same reasoning sets the fallback timer above the veil's duration rather than at it.
 
 ### Quiet boot cover
-The *boot splash*'s no-ceremony mode, used by a document whose load CONTINUES a session rather than starting one (`boot-splash-quiet`, set by an inline script in `crates/lucidos-app/index.html` before first paint). Two triggers: a **refresh the user asked for** (`refreshClient` stamps the one-shot `lucidos-splash-quiet` flag before reloading, covering the control-panel button, the "New version available" toast, the applied-change / reconnect toasts, the recovery Reload buttons and the stale-chunk auto-reload), and a **notification deep link** on the URL. It drops the mark, the baked "Opening your workspace…" status and the brand gradient, painting the app's own `--bg-primary` on the splash and on both canvas layers, and `bootSplashPlaysNoReveal()` lets `useBootSplashReady` skip the min-reveal floor. It exists because such a reload would otherwise play a cold-launch animation over a session the user was already in. (The notification-tap trigger is only needed because WebKit gives a push tap no reload-free channel into an open PWA window, so the tap arrives as a full cross-document load; that URL design is registered in `docs/temporary-measures.md`, the cover is not, see `system-knowhow/notifications.md` §4.5.) Quiet, not silent: the *delayed* status still writes past `STATUS_DELAY_MS`, so a stuck load still says so. It stands down for a document the *Workspace gateway* handed a standing mark to (`boot-splash-formed`), which is a cold boot the user already watched rather than a continuation.
+The *boot splash*'s no-ceremony mode, for a document whose load CONTINUES a session rather than starting one. It has two triggers:
+
+- **A refresh the user asked for.** `refreshClient` stamps the one-shot `lucidos-splash-quiet` flag before it reloads. That covers the control-panel button, the "New version available" toast, the applied-change and reconnect toasts, the recovery Reload buttons and the stale-chunk auto-reload.
+- **A notification deep link on the URL.** WebKit gives a push tap no reload-free channel into an open PWA window, so the tap arrives as a full cross-document load. That URL design is registered in `docs/temporary-measures.md`. The cover is not, since the refresh trigger is permanent (`system-knowhow/notifications.md` §4.5).
+
+An inline script in the `<head>` of `crates/lucidos-app/index.html` decides it, and sets `data-boot-splash-quiet` on `<html>`. It must decide there: every body script waits for the bundle stylesheet, and WebKit paints a frame when that lands. A body-side decision would show one frame of the blue launch splash.
+
+The cover drops the mark, the baked "Opening your workspace…" status and the brand gradient. It paints the app's own `--bg-primary` on the splash and on both canvas layers. `bootSplashPlaysNoReveal()` lets `useBootSplashReady` skip the min-reveal floor. Without it, such a reload plays a cold-launch animation over a session the user was already in.
+
+Quiet, not silent: the *delayed* status still writes past `STATUS_DELAY_MS`, so a stuck load still says so. It stands down when the *Workspace gateway* handed this document a standing mark (`boot-splash-formed`). That is a cold boot the user already watched, not a continuation.
 
 ### Client startup
 `startClient()` in `crates/lucidos-app/src/store/startup.ts`: the initial loads, the event stream, and the document-level listeners and polls the data layer needs. `main.tsx`'s `boot()` calls it before it renders anything, so the startup fetches run while the *shell chunk* loads (ADR 0288). It returns its teardown. A listener only a drawn UI can need belongs in *shell startup* instead. It was the `useStartup` hook inside `<App/>`, which made every fetch wait for the whole UI to parse and render once.
@@ -660,6 +687,8 @@ Completion and eviction used to be one call (`take_finished`, which did `tasks.r
 
 Reading the final state is now `completion_record`, which returns an owned `CompletionRecord` and touches neither the map nor the drain cursor. It is ONE-SHOT: taking the record claims the right to write the event, so a second caller gets `None` even though the entry is still drainable. Retention deliberately does NOT make a finished task look running: `has_running_for_thread` filters on `!is_finished()`, because the engine arms an *event wait* over every task that answers true. Every production spawn goes through `LucidosEngine::start_background_task`, shared by the chat tool and a coding agent's `lucidos background-task` route (the user-facing *background task*).
 
+**Stop requested.** A task whose stop signal somebody has taken but which has not been reaped yet: a stop, `kill_for_thread`, or the teardown. `RunningTaskHandle::stop_requested` reports it, and the engine never arms an *event wait* for such a task. A stop is two steps, `begin_stop` then `PendingStop::send`, so a thread stopping its own task stands its own waits down in between. Signalling first would let a prompt SIGTERM exit deliver the completion before the stand-down (ADR 0369). Worktree cleanup and the todo consumer still count the task as running, which it is.
+
 ### Abandoned background task
 A *background task* whose engine went away under it. The child belongs to the engine process. A restart, a crash or an OOM kills it, and no watchdog is left to reap a status. Until 2026-08-26 nothing then wrote `BackgroundBashCompleted`, so the `Started` row was the task's last word. The engine-armed *event wait* on that `task_id` sat to its own deadline and then re-opened the thread to blame the deadline. `bash_output` said `unknown task_id`, which reads exactly like a typo.
 
@@ -679,6 +708,9 @@ Three readers are served by the row: the engine-armed *event wait*, which is the
 The marker riding the *Lucidos mark*'s corner in the header. There are **two**, on opposite corners, and "brand badge" unqualified means the first. The **state badge** (`BrandBadge`, top-right) runs a one-slot `busy > ready > pending` ladder: busy while any *activity group* row exists, then the engine lifecycle (see *pending engine version*). Both badges are purely visual and click-through, so a tap anywhere on the mark opens the Lucidos menu, which explains every state. No pointer or screen reader ever lands on a badge, so the mark speaks both in its own label and tooltip (`unreadBadgeLabel`, `brandBadgeLabel`). The **unread badge** (`UnreadBrandBadge`, bottom-right) is the cross-workspace unread count, and reads `crossWorkspaceUnreadTotal`, the same computed `syncWorkspaceAppBadge` writes onto the *app-icon badge*.
 
 Two corners rather than one ladder, because both are resident and each hides the other in one slot. Which corner is not arbitrary either. `LucidosMarkIcon` draws its sparkle top-right, so a badge there costs the brand its distinguishing element. The state badge pays that only while a build runs or an update waits. A count is resident, so it takes the corner the artwork can spare. Both are positioned off one inherited `--brand-badge-corner` on `.brand-mark-slot`, pinned by `styles/__tests__/header-mark-geometry.test.ts`.
+
+### Glyph badge
+A badge that draws text: a count, a sign such as the state badge's "!", or a word such as "Custom". Every one renders through `GlyphBadge` (`components/shared/GlyphBadge.tsx`), which centres the text's **ink** rather than its advance. It measures the drawn glyph in its computed font (`drawnInkShift` in `utils/inkCentre.ts`) and states the gap as the **ink shift**, `--badge-ink-shift`. `styles/badges.css` then moves the text's `.badge-ink` span by it. A dot draws no text, so it is not a glyph badge. Why, and the WebKit residual: ADR 0361.
 
 ### Icon shape regime
 Which of three treatments a generated brand icon gets, decided by how hard its destination masks the art. `crates/lucidos-app/scripts/generate-brand-icons.mjs` is the single source of truth, and `src/brand-icons.test.ts` guards the result.
@@ -783,7 +815,7 @@ A thread's one-shot subscription to an event, registered by the `await_event` LL
 
 **The agent owns all three verbs on its own subscriptions** (`engine/event_wait/agent_surface.rs`): `await_event` arms, `list_event_waits` reads, `cancel_event_wait` stands down, mirrored as `lucidos await-event` / `lucidos event-waits list` / `lucidos event-waits cancel`. All three are scoped to the CALLING thread and take no thread argument, which is what stops one thread reading or ending another's; it is also why the family is a deliberate non-domain in the *capability parity manifest*, whose generators would have to make the thread id an ordinary flag. The read exists because an agent cannot otherwise know: a subscription is spent when it fires and can expire or be stopped while the agent is not running, and one told its user twice that a watch was armed when it had been dead for two hours.
 
-**Ending one is never silent, and a thread-level Stop is not one of the ways.** Stop ends the turn only (removed 2026-08-07; `EventWaitCancelCause::ThreadCanceled` is retired but still deserialized for old rows). The live causes are `UserStop` (the **Stop waiting** button), `AgentStandDown`, `ThreadArchived` and `ThreadDiscarded`. The archive confirms first, naming every subscription the cascade would stop, and every stop leaves a mark in the transcript when it happens.
+**Ending one is never silent, and a thread-level Stop is not one of the ways.** Stop ends the turn only (removed 2026-08-07; `EventWaitCancelCause::ThreadCanceled` is retired but still deserialized for old rows). The live causes are `UserStop` (the **Stop waiting** button), `AgentStandDown`, `ThreadArchived` and `ThreadDiscarded`. `AgentStandDown` also covers a thread stopping a background task it watched, through `bash_kill`, `lucidos background-task stop` or `lucidos hardened mark` (ADR 0369). The archive confirms first, naming every subscription the cascade would stop, and every stop leaves a mark in the transcript when it happens.
 
 A `UserStop` leaves a **turn**, drawn as a headerless event row like *Response canceled* and *Paused by restart*. The device that pressed the button shows in its origin popover: a person did something to this thread, and the moment is the point. Every other cause is somebody acting inside a turn, most sharply an agent's mid-turn stand-down, so it leaves an *event row* where it happened.
 
@@ -799,19 +831,33 @@ The event a resolved *event wait* hangs its re-entry on, and the second half of 
 
 It carries an engine origin with the `event_wait` reason: the outcome, the watched event types and the agent's reason. That is how the transcript and the route popover say where its words came from. Its `mode` stays `agent`, because `held_deliveries` keys on it. Older anchors carry no origin, and `waitReentryReason` reads their shape instead.
 
-The anchor sets the thread `running`, except on a thread parked on a question. There the re-entry waits for the answer (ADR 0255), so the anchor keeps `waiting_for_user_answer` and the card reads "Held until you reply". See `docs/plans/2026-09-24-a-delivery-never-unparks-a-question.md`.
+The anchor sets the thread `running`, except on a thread parked on a question. There the re-entry waits for the answer (ADR 0255), so the anchor keeps `waiting_for_user_answer` and the card reads as not read yet. See `docs/plans/2026-09-24-a-delivery-never-unparks-a-question.md`.
 
 It waits even when a restart dropped the question's turn: see *held delivery*.
 
 Called the **wake anchor** until 2026-08-13, and the whole family with it (`EventWake`, `WakeFromEvent`, the transcript's `Woke on <event>`). The word claimed the thread had been asleep, which a delivery cannot know: registration does not hold the turn, so a wait routinely resolves into a RUNNING thread, and the engine then injects it into that live loop and tells the model it arrived "while you were working". *Re-entry* is what the code already called the act (`PreEmittedOrigin::is_engine_reentry`) and is true in both lanes. See `docs/plans/2026-08-13-a-delivery-does-not-know-the-thread-was-asleep.md`.
 
 ### Held delivery
-A child report or an *event wait* re-entry that reaches a chat thread whose question outlived its turn. Only an engine restart causes that. The chat admission holds it instead of starting a turn that would overtake the card (`delivery_is_held`, `engine/chat/held_deliveries.rs`). Holding writes nothing: the child card and the *re-entry anchor* are already persisted, and the card reads "Held until you reply".
+A child report or an *event wait* re-entry that reaches a chat thread whose question outlived its turn. Only an engine restart causes that. The chat admission holds it instead of starting a turn that would overtake the card (`delivery_is_held`, `engine/chat/held_deliveries.rs`). Holding writes nothing: the child card and the *re-entry anchor* are already persisted, and the card reads as not read yet.
 
 The answer releases it. `resume_chat_after_answer` reads every delivery held since the question and folds it into the resume prompt: a wait's prose in full, a child report as a pointer to its block in history. With the question's turn still live nothing is held, because the re-entry injects into that turn (ADR 0255). Distinct from a *held message* (ADR 0256), which is a coding-agent thread's agent-sent message and carries its own `MessageHeld` event. See ADR 0321.
 
 ### Watermark (event wait)
-The event `sequence` an *event wait* records at registration. Both the registration path and the boot rebuild run the same catch-up scan forward from it, which closes two gaps with one mechanism: events that landed while the engine was down, and the live race between emitting `EventWaitStarted` and the dispatcher inserting its cache entry. It is **forward-only and stays that way**: the third gap, everything that happened before the wait existed, is covered by the *arming lookback* instead, which reports rather than delivers. Backdating this number so the catch-up scan delivers an older match is the rejected repair recorded in ADR 0047.
+The *committed horizon* an *event wait* records at registration. Registration, the boot rebuild and the Lagged re-scan all run the same catch-up scan forward from it.
+
+That closes two gaps with one mechanism. One is events that landed while the engine was down. The other is the live race between emitting `EventWaitStarted` and the dispatcher inserting its cache entry. Plain `MAX(sequence)` closed neither reliably, because an event below it could still commit afterwards (ADR 0364).
+
+It is **forward-only and stays that way**. The third gap, everything before the wait existed, belongs to the *arming lookback*, which reports rather than delivers. Backdating the watermark so the scan delivers an older match is the repair ADR 0047 rejects.
+
+### Committed horizon
+A sequence `H` such that every `events` row with `sequence <= H` has committed, or never will. `committed_event_horizon` (`engine/event_bus/append_horizon.rs`) reads one, and every *event wait* watermark is one.
+
+`MAX(sequence)` is not one. An append draws its sequence at the INSERT and becomes visible at commit, so a lower sequence can commit after a higher one. The read takes `MAX(sequence)`, then waits out every *in-flight append lock* held at that moment. Only the reader waits. See ADR 0364.
+
+### In-flight append lock
+The transaction-scoped advisory lock every `events` append takes as its first statement, keyed by the backend pid (`EventBus::begin_append`). It advertises "this backend may hold an uncommitted sequence", which is what makes a *committed horizon* readable.
+
+The pid key means appends never contend on it. Only a horizon read waits on it, with a shared lock. Being the first lock is load-bearing: a waiter then holds nothing, so it cannot close a deadlock cycle (ADR 0364).
 
 ### Arming lookback
 The short backwards scan an *event wait* runs at registration (`arming_lookback_matches`, window `ARMING_LOOKBACK_SECS` = 3 minutes), naming in the `await_event` tool result anything matching that had already happened by the time the wait was armed. It exists for the gap the *watermark* cannot close: the stretch between the model deciding to wait for something and the call landing, which on 2026-08-06 was 84 seconds and cost a thread the `ChangeProposed` it was waiting for. **It reports, it never delivers**: no `EventWaitDelivered`, no re-entry, the wait is not consumed, and the model decides within the same turn whether the match is one it missed or one it handled itself a moment ago. Only the model can tell those apart, because only it has the turn in context, and that division of labour is what allows the window to be approximate. Bounded at 3 reported matches, newest first, each with its age; more than that sets a flag rather than a total, since counting the rest would mean reading the whole window. **Exactly one thing is suppressed**, and it is an exact set rather than a cutoff: events this thread was literally handed by an earlier wait (`delivered_event_ids`, read from `EventWaitDelivered.event_id`). Two rounds of review killed a *sequence floor* here, each time because it hid an event nobody had reported. A floor at the thread's last `EventWait*` of any kind let an unrelated `ChildThreadCompleted` delivery bury a missed `ChangeProposed`; narrowing it to a shared event *type* still let a `ChangeProposed` wait conditioned on one repo bury a `ChangeProposed` for another, and `[A, B]` bury a later `[A, C]`'s `C`. "Already told" is a property of an individual event under a specific predicate, not of a point on the timeline, and only a delivery names an individual event. The residual cost is accepted deliberately: two overlapping subscriptions may each report the same undelivered event, which is one duplicated paragraph the model is told it may ignore, weighed against the missed event this whole mechanism exists to surface. The window is deliberately a constant rather than the turn: a model decides to subscribe mid-turn, so early events in a long turn are archaeology, not a missed rendezvous. **It is measured by the database clock at both ends**, and passed to the scan as a duration rather than a cutoff instant: `events.created` is stamped by Postgres, so a cutoff the engine computed from its own `Utc::now()` would put two clocks on opposite sides of one comparison, and any drift past the window empties it silently (ADR 0053). The reported age is the same statement's arithmetic for the same reason.
@@ -1195,7 +1241,9 @@ A second constant in the same file, `APP_FRAME_ALLOW`, says what the frame may s
 
 The sandboxed iframe that renders a previewed HTML artifact in the content pane or the file preview modal (ADR 0322). Like an *app frame* it has no `allow-same-origin`. So the artifact's scripts run at an opaque origin, and reach neither the shell nor the engine's API. Unlike an app frame it loads no SDK.
 
-The host stamps a bridge script into the srcdoc instead (`components/files/previewFrameBridge.ts`). It carries link clicks, sibling downloads and shell chords up, and fragment scrolls and *frame capability* renewals down. The bridge hides its nonce from the artifact and posts only for a real event. The host accepts a message only from that frame's own window, at origin `"null"`, with the render's nonce. The PDF preview is NOT an artifact preview frame: it stays same-origin.
+The host stamps a bridge script into the srcdoc instead (`components/files/previewFrameBridge.ts`). It carries link clicks, sibling downloads, shell chords and *find bar* answers up. It carries fragment scrolls, *frame capability* renewals and find requests down.
+
+A bundle of the shared matcher rides inside the bridge script, so the artifact never sees it. The bridge hides its nonce from the artifact and posts only for a real event. The host accepts a message only from that frame's own window, at origin `"null"`, with the render's nonce. The PDF preview is NOT an artifact preview frame: it stays same-origin.
 
 ### App bridge
 
@@ -1203,7 +1251,7 @@ The `postMessage` channel an *app frame* reaches the host over, for the three th
 
 The host is the trusted side and three rules keep it that way. It forwards only what *route reach* marks app-reachable, because it attaches the user's device to what it sends. A blind forwarder would be a confused deputy wearing the user's actor. It resolves the path before checking it, so a `%2e%2e` cannot land somewhere the check never saw. And it strips any `x-lucidos-*` the app supplied, before stamping the real device id and the calling app's id.
 
-Storage is namespaced (`appbridge:`) and holds no host key, so the device id stays out of the frame. A read that must be device-scoped names the device instead, as `@device`, and the host substitutes the id on `/preferences` only.
+Storage is namespaced (`appbridge:<app id>:<sdk|app>:`) and holds no host key, so the device id stays out of the frame. The host names the app from its own frame element, so one app cannot reach another's *app storage*. A read that must be device-scoped names the device instead, as `@device`, and the host substitutes the id on `/preferences` only.
 
 ### Appearance push
 
@@ -1363,11 +1411,13 @@ The transcript's strictest promise: every row reads top to bottom by ONE clock, 
 
 Tests are the only caller, and deliberately so: a check reorders nothing, so a per-frame run would walk the whole transcript to report a bug nobody can act on. It runs where a bug can still be stopped, in `thread-flows-helpers.ts` for every flow test and in `render-order.test.ts` over a corpus of turn shapes.
 
-**Three named exceptions, and the set is closed.** Each is a shape the fold produces on purpose. **A. A message still in the queue.** The reader types while a turn runs, so the card opens at once. The turn keeps writing above it until the loop picks the message up (`isUningestedMessage`, then the absorbing `UserPromptInjected`).
+**Four named exceptions, and the set is closed.** Each is a shape the fold produces on purpose. **A. A message still in the queue.** The reader types while a turn runs, so the card opens at once. The turn keeps writing above it until the loop picks the message up (`isUningestedMessage`, then the absorbing `UserPromptInjected`).
 
 **B. A result rejoining its call.** A permission card opens between a call and its result. The result is routed back so the call's row completes in place, rather than stranding a shimmering row on a finished tool.
 
-**C. The reader's Stop-waiting panel.** A subscription holds no turn (ADR 0049) and the button has no idle guard, so an unrelated turn keeps writing above it. A fourth shape is a bug until somebody adds it there with its own reason. See *continuation handoff* for the decision that keeps the common case in order, and `docs/plans/2026-09-20-the-transcript-reads-by-one-clock.md`.
+**C. The reader's Stop-waiting panel.** A subscription holds no turn (ADR 0049) and the button has no idle guard, so an unrelated turn keeps writing above it.
+
+**D. An unsent message.** It never reached the engine, so no agent reads it, and the running turn keeps writing above its card. A fifth shape is a bug until somebody adds it there with its own reason. See *continuation handoff* for the decision that keeps the common case in order, and `docs/plans/2026-09-20-the-transcript-reads-by-one-clock.md`.
 
 ### Contract test
 A Rust↔TypeScript cross-validation generated from `crates/lucidos-engine/src/engine/agent_session/thread_lifecycle.rs`. The TS file in `crates/lucidos-app/src/generated/` is **never** hand-edited — regenerate with `cargo test -p lucidos-engine generate_typescript_file -- --ignored && cargo test -p lucidos-engine generate_cross_validation_fixture_file -- --ignored`.
@@ -1573,13 +1623,13 @@ What those branches reached for survives as ONE test in the right place. `landAt
 
 **It is a HOLD, not a one-shot, for the four that ask the agent for something.** That is the second thing the acted-on turn decides. Each growth round re-aims at the live edge, and each writes nothing when there is nowhere to go. It lets go on the first CHANGE to the rows the turn had at submit time, which is the agent starting. A change and not a growth: `getCollapsedVisibleEvents` drops earlier prose when a new text block arrives, so the count can fall.
 
-Rows means `DRAWN_ROW_SELECTOR` (`scrollState.ts`), never `.response-body`'s own children: those are the section wrappers, and a resuming agent appends inside the one already there. It looks inside each row's `<Disclosure>` for the same reason, since a run of steps is one Disclosure and a new step joins it.
+Rows means `DRAWN_ROW_SELECTOR` (`scrollState.ts`), never `.response-body`'s own children: those are the section wrappers, and a resuming agent appends inside the one already there. It looks inside each row's `<Disclosure>` for the same reason, since a run of steps is one Disclosure and a new step joins it. A Thinking row (`data-thinking-row`) is not a row the agent drew. An answer resumes the agent with one at once, and its reply can come many seconds later.
 
 The hold's LAST glide freezes its target, resting the reader where the agent's first row put them. Every earlier round tracks the live edge, which is what catches the opening instalments. Without the freeze a second row arriving inside that tween carries them on to it, reported as scrolling past the first step.
 
 The releasing round REACHES a glide already running, and the growth branch stands down for every tween but this one. A fast reply lands wholly inside one glide, so a swallowed round left the release waiting for the tween's end. A turn the submit CREATED counts from zero, for the same reason. It can render with the agent's opening already in it, and reading its rows then swallows them.
 
-A QUEUED follow-up also lets go at once, after its one aim. Holding for a turn that never draws would chase the reader through the reply above it. It is recognised POSITIVELY, by the remove button its queued status carries. Inferring it from a missing `.response-panel` reads true for an unanswered card divider too, which renders none and is about to draw. `LANDING_HOLD_MS` is the backstop for a turn that draws no row: a dead request, a collapsed turn, a coding-agent turn running tool calls with the step log off.
+A QUEUED follow-up also lets go at once, after its one aim. Holding for a turn that never draws would chase the reader through the reply above it. It is recognised POSITIVELY, by the remove button its queued status carries. Inferring it from a missing `.response-panel` reads true for an unanswered card divider too, which renders none and is about to draw. `LANDING_AGENT_START_MS`, a minute, is the backstop for a turn that draws no row: a dead request, a collapsed turn, a coding-agent turn running tool calls with the step log off. It is long because a coding agent resuming on a cold cache can take tens of seconds to write.
 
 Shipping it as a one-shot, spent the first round its turn was addressable, produced two reports within the hour. A card is addressable the instant it is tapped, so a reader at the bottom got no write and everything their answer caused arrived after. A send was spent when its row rendered, so the agent's opening rows landed below the fold. ADR 0080 carries both, and why a fixed time window is not the bound.
 
@@ -1763,6 +1813,11 @@ One markup and one stylesheet serve all four: `components/shared/SectionHeader.t
 
 The same stylesheet draws the **row hairline**: a line on each row's bottom edge, inset to the content column at both ends. A collapsed header carries the same line, as does the Changes panel's button row. A panel opts its list in with `.list-rows-divided`, while the drawer sets per-row insets so a nested thread's line starts at its indent. Settings is not a list panel and keeps its own headings. The app-facing `.list-section-title` base is unchanged. Plan: `docs/plans/2026-09-30-list-panel-section-headers.md`.
 
+### Keep-awake hold
+An `AwakeHold` (`core/keep_awake.rs`): an RAII value a piece of work holds for as long as it runs. While one or more live, the engine holds one macOS `PreventUserIdleSystemSleep` assertion. Its name gives the workspace and the work in flight, so `pmset -g assertions` says what Lucidos is waiting on. Lid close and an explicit Sleep still win.
+
+Five sites take one: a chat-pipeline turn (`ThreadGuard`), a coding-agent session (`run_direct_agent`), a background task (its watchdog), a Thread Queue entry (its joiner) and a backup (`BackupGuard`). Each is a field or a local of the value every exit path drops, so success, error, panic, cancel and kill all release it. ADR 0366 records why the engine owns it.
+
 ### Keyboard handoff
 How a menu with a filter box treats an on-screen keyboard that is already up. Say a text field, usually the prompt, holds the keyboard as a touch menu opens. The menu moves focus to its own filter box, so typing filters the menu instead of the field. A step with no text field hands focus back to the field in the same tap. Closing hands it back too, so the keyboard never drops and the panel never jumps. With no keyboard up, a menu raises none.
 
@@ -1772,7 +1827,7 @@ One module serves every such menu: `components/shared/keyboardHandoff.ts` (`keyb
 The opaque theme surface that hides a pane's view swap, so a view switch is a fade rather than a hard cut. It is `NavigationCover` (`components/shared/NavigationCover.tsx`) with `.nav-cover` in `styles/global/host-components.css`. Two panes host it, each on its own view key and with its own *motion* (`NAV_COVER_MOTIONS`):
 
 - **The content pane**, on every change of the *content view key* (`ContentPane.tsx`). It plays the **arrival**: the leaving view has already unmounted, and the cover clears off the arriving one (`nav-cover-clear`, `--duration-normal`).
-- **The thread drawer**, on the Threads/Filters swap (`ThreadFilterCover.tsx`, key `'threads'` or `'filters'`). It plays the **dip**: it rises over the leaving view, holds opaque while the CSS swaps the views, and clears off the arriving one (`nav-cover-dip`, `--duration-slow`). Both views stay mounted, and each flips its `visibility` at the midpoint. ADR 0291 records why.
+- **The thread drawer**, on every change of what it shows (`ThreadFilterCover.tsx`, key `drawerSwapKey`: `'filters'`, or `'threads:<status>'`). That covers the Threads/Filters swap and every status filter change, whoever makes it. It plays the **dip**: it rises over the leaving view, holds opaque while the CSS swaps the views, and clears off the arriving one (`nav-cover-dip`, `--duration-slow`). The leaving view stays on screen to the midpoint: the panel, or a *leaving-view drawing* of the list. ADRs 0291 and 0359 record why.
 
 It hides the swap frame, which is busier than it looks in the content pane. The old subtree unmounts, a lazy chunk mounts, a remembered scrollTop is restored, and the incoming skeleton settles. It never *waits* on any of that: content shows through the moment it paints, and a slow view uncovers its own skeleton.
 
@@ -1803,10 +1858,10 @@ System > Overview cannot make different claims about one state. It is also the
 surface that states the FULL detail. The menu notice and the mark's tooltip take
 the short form, the explainer having wrapped that panel to three lines.
 
-Present for exactly the states the mark recedes in, which is the whole gate:
-`disconnected` at once, since it already costs four consecutive failed `/health`
-polls to reach, and `connecting` only past a fuse, since that is the ordinary
-pre-first-answer state of a cold start. Nothing to dismiss, unlike the backup
+Present for exactly the states the mark recedes in, which is the whole gate.
+`disconnected` shows at once: reaching it already costs four consecutive failed
+`/health` polls, each made with the page in view. `connecting` shows only past a
+fuse, since it is the ordinary state of a cold start. Nothing to dismiss, unlike the backup
 reminder it sits above: that one stays true until the user acts, where this
 retracts itself on the next good poll, so a dismissal could only hide a live
 fault. An *app-shell banner*, and the second one: both mount once per layout and
@@ -1850,6 +1905,9 @@ A short note a Claude model writes between tool calls, saying what it just
 found and what it does next. Models whose *thinking mode* is always-on (Opus
 5.5, Fable 5.x) return these as `thinking` blocks, empty unless the request sets
 `thinking.display: "updates"` with its beta. The engine always asks for them.
+A note is a short summary of what the model wrote, never the full text. So the
+chat agent puts what the user must read before a card into the card's
+`message`, which the engine shows in full.
 
 `parse_claude_stream` (`llm/anthropic_wire.rs`) turns a finished note into
 ordinary answer text: it streams whole at its `content_block_stop` and joins
@@ -1884,6 +1942,13 @@ not configure it. The `ThinkingMode` column of `ADAPTIVE_THINKING_MODELS`
 `reasoning::supported_efforts` drops `none` for `AlwaysOn` models, so a stored
 `none` snaps to `low` at the routing chokepoint. An `AlwaysOn` model also asks
 for *progress notes*.
+
+### End space
+The room every content-pane view keeps below its last element: `--space-xl` plus the home-indicator inset (`--pane-end-space` on `.content-pane-body`). It is a spacer, `.content-pane-body > :not(.content-view-full-bleed)::after` in `panels/content.css`, so a view's own padding cannot cancel it.
+
+It is **default-deny**. A view loses it only by carrying `content-view-full-bleed`, which says it fills the pane and scrolls inside itself (an app, a preview). A phone's flowing file preview opts back in.
+
+A column view grows with its content instead of taking the pane's height. Pinned, its content would overflow its own box and run past the spacer. `FillSkeleton` subtracts the spacer, so a full-pane skeleton still fits. Pinned by `styles/__tests__/content-pane-end-space.test.ts` and `e2e/content-pane-end-space.spec.ts`.
 
 ### Content view key
 The content pane's single answer to "has this pane navigated" (`components/layout/contentViewKey.ts`). It resolves the *panel overlay* (else the active menu item) down to the identity of the thing on screen. Its consumers must agree, or they break together in the same direction. The scroll memory would restore the outgoing view's offset onto the incoming one. The *navigation cover* would hard-cut the same swap.
@@ -1930,9 +1995,9 @@ An assistant turn NEWER than the summary's boundary is not summarised yet, and r
 Under *self-curated context mode* the summariser does not run at all: the agent writes its own notes as it goes, so a second model compressing the same region blind is redundant (ADR 0109). The cached paragraph still renders where a thread already has one.
 
 ### Conversation summary
-The one paragraph standing in for a thread's older **assistant** turns, produced by `MemoryExtractor::summarize_conversation` and cached as a `ConversationSummarized` thread event. The event IS the cache: there is no table, so the paragraph survives an engine restart because the event does.
+The one paragraph standing in for a thread's older **assistant** turns, produced by `memory::summarize_conversation` and cached as a `ConversationSummarized` thread event. The event IS the cache: there is no table, so the paragraph survives an engine restart because the event does.
 
-It runs on its **own *model selection***, `model_conversation_summary` paired with `reasoning_conversation_summary`, and under its own `ContextPurpose::ConversationSummary`. Both used to be shared with fact extraction and query classification. So Settings named no summariser, and the wire could not tell a 94,903-char summariser call from a 6,800-char extraction. The model key falls back to `model_memory` while unset, so the split moved no existing workspace. The effort defaults to `low`, unchanged: the measurements say output length does not track it.
+It runs on its **own *model selection***, `model_conversation_summary` paired with `reasoning_conversation_summary`, and under its own `ContextPurpose::ConversationSummary`. Both used to be shared with fact extraction and query classification. So Settings named no summariser, and the wire could not tell a 94,903-char summariser call from a 6,800-char extraction. Its model key follows no other key: while unset it runs the first of the compactor's three models a configured provider serves, then the *auxiliary default* (ADR 0377). The effort defaults to `low`: the measurements say output length does not track it.
 
 Re-summarising is the exception, not the rule. `SummaryPlan::refresh_boundary` reuses the cached paragraph and calls the model only when three things hold:
 
@@ -2057,9 +2122,15 @@ A *context-handling benchmark* turn that came back with no text and no tool call
 
 It is the harness's own reading of an *empty completion*, and it is narrower than the engine's. The engine classifies one model response. The harness asks about a whole turn: no `ResponseGenerated` in it carried text, AND it made no tool call. So a turn of tool work that closes with an empty message is not one, and neither is a terse answer. Input tokens corroborate the reading and never decide it.
 
-The driver re-posts the same prompt into the same thread, at most twice (`EMPTY_COMPLETION_RETRIES`). A turn that recovers is scored like any other, and the thread row keeps the count. A turn that never recovers is `TaskStatus::Empty`, written as `empty-completion`, which is not a *finished* status: the task's probes void in both arms, its completion outcome is `Void` rather than `Fail`, and its downstream tasks void in that arm.
+The driver re-posts the same prompt into the same thread, at most twice per turn (`REPOSTS_PER_TURN`, shared with a *refused turn*). A turn that recovers is scored like any other, and the thread row keeps the count. A turn that never recovers is `TaskStatus::Empty`, written as `empty-completion`, which is not a *finished* status: the task's probes void in both arms, its completion outcome is `Void` rather than `Fail`, and its downstream tasks void in that arm.
 
 The distinction it protects is that a thread which never ran did not fail to deliver. Scoring one as a delivery failure is what produced the phantom completion kill in the run ADR 0087's amendment records. The count is reported and never judged, and since ADR 0110 there is nothing left that could judge it.
+
+### Refused turn
+
+A *context-handling benchmark* turn the engine failed with `stop_reason: refusal` and no output. The provider's safety classifier withheld a whole reply, often on benign work. It says nothing about the configuration under test.
+
+The driver reads it off the turn's `ResponseFailed` text, apart from "produced nothing", because a refusal often follows tool calls in the same turn. It re-posts the prompt from the same budget as an *unrecovered empty completion*. A turn that recovers is scored like any other. One that outlasts the budget keeps its `failed` status and counts as a failed task. The thread row records `refusals` and `refusal_retries`, and `report` prints them per arm and per task, so a recovered refusal stays visible. See the ADR 0110 amendment.
 
 ### Scope rule
 The one instruction appended to every *context-handling benchmark* prompt, declared once as `scope_rule` in `tasks.toml`. It tells the agent to do what was asked, not to extend the work, and to name anything else at the end of its reply.
@@ -2236,25 +2307,25 @@ The halves are alternatives rather than a stack, which is what the "or" rule say
 
 The section's note says both halves: "A status shows every thread type. Your picks here apply when you take All statuses." The section was a `<fieldset disabled>`, which natively disabled every nested checkbox, the expandable rows' own included. With the disabling gone the fieldset had no purpose and no accessible name, so it is a `div[role="group"]` named by the heading above it. Merging the former view-selector menu and channel dropdown into one button also fixed a Chrome bug where the menu failed to open.
 
-Views are `DrawerView` in `store/store.ts`, persisted in `localStorage['lucidos-alt-view']` via `setDrawerView`. Legacy `'attention'` and `'drafts'` still restore, and a retired `'none'` or unknown value restores as `all`.
+Views are `DrawerView` in `store/store.ts`, persisted in `localStorage['lucidos-alt-view']` via `setDrawerView`. Legacy `'attention'` and `'drafts'` still restore, the old `'running'` restores as `'in-flight'`, and a retired `'none'` or unknown value restores as `all`.
 
 - **All**: the default sectioned list (Current, Saved, Archive).
 - **Needs attention**: Current and Saved threads where the agent is stuck waiting on the user (`waiting_for_user_answer` OR `failed`). Predicate `threadNeedsAttention`, list `attentionThreads`, count `attentionThreadCount`.
 - **Review**: Current and Saved threads carrying a *change* ready to apply (`codingAgentProposed`, and Apply offered: not mid-turn, no open question, no live *event wait*). Predicate `threadInReview`, list `reviewThreads`, count `reviewThreadCount`.
-- **Running**: Current and Saved threads actively working on a response (effective status `running`). Predicate `threadIsRunning`, list `runningThreads`, count `runningThreadCount`.
+- **In flight**: see *In flight* in `system-knowhow/glossary.md` for what it holds. Predicate `threadIsInFlight`, list `inFlightThreads` (nested by `nestByParent`), count `inFlightThreadCount`, all in `family-graph.ts` because the predicate reads `threadVisualStatus`.
 - **Drafts**: threads with an unsent draft (`draftThreads`).
 
-Needs attention and Review are independent surfaces: a thread awaiting an answer and carrying a proposed change appears in both. Running is mutually exclusive with both, since they exclude `running`.
+Needs attention and Review are independent surfaces: a failed thread carrying a proposed change appears in both. In flight is mutually exclusive with both. The dot ranks a question, a failure and a pause above Waiting. A ready change with only sub-threads reads Changes to review, and a stopped sub-thread is left to Needs attention.
 
-The Filter button shows a **needs-attention badge** (`attentionThreadCount`, the threads stuck waiting on the user). It is **pressed** (`view-selector-active`) while the panel is OPEN, and for no other reason: a filtered list must not look like a panel left open. While open the badge fades out, since the panel's Needs attention row carries the same count. It is never an X, which at the far end of the header reads as "close this pane". Review and Running are counted per row inside the Status section only, and never inflate the badge.
+The Filter button shows a **needs-attention badge** (`attentionThreadCount`, the threads stuck waiting on the user). It is **pressed** (`view-selector-active`) while the panel is OPEN, and for no other reason: a filtered list must not look like a panel left open. While open the badge fades out, since the panel's Needs attention row carries the same count. It is never an X, which at the far end of the header reads as "close this pane". Review and In flight are counted per row inside the Status section only, and never inflate the badge.
 
-Review is a change merely ready to apply, and Running is informational: work in flight, nothing to do. The same `attentionThreadCount` also badges the **thread-drawer toggle** (`ThreadToggleButton`) whenever the thread list is HIDDEN. The toggle sits in the desktop header's corner and leads the mobile *thread pane* header. Hidden means `!threadDrawerOpen` on desktop and `mobileView !== 'threads'` on mobile, via the pure `threadToggleBadgeCount` / `threadListVisible` rule. The two surfaces are mutually exclusive by construction, since the Filter button lives in the threads header, which hides with the list.
+Review is a change merely ready to apply, and In flight is informational: work under way or parked on purpose, nothing to do. The same `attentionThreadCount` also badges the **thread-drawer toggle** (`ThreadToggleButton`) whenever the thread list is HIDDEN. The toggle sits in the desktop header's corner and leads the mobile *thread pane* header. Hidden means `!threadDrawerOpen` on desktop and `mobileView !== 'threads'` on mobile, via the pure `threadToggleBadgeCount` / `threadListVisible` rule. The two surfaces are mutually exclusive by construction, since the Filter button lives in the threads header, which hides with the list.
 
 The button's whole appearance comes from `filterButtonState` (`ThreadFilterPanel.tsx`), called by `ThreadFilterButton`, which both headers render and which shares the panel rows' glyphs. Its glyph reports **what the list is filtered to**, open or closed: each status view's own glyph, the funnel `FilterIcon` for the default `all` view, and `FilteredIcon` (the same funnel, filled) while thread types narrow it. Pressing never swaps the glyph. The panel carries no Close button of its own, so this button is also its way out. The accessible name stays "Filter threads" either way, the disclosure pattern: `aria-expanded` carries the state, so the name never renames the control after its next action.
 
 Picking a Status row applies it AND closes the panel, since a status is a terminal choice and closing reveals the list it filtered. "All statuses" closes too, being the same kind of terminal choice, while a channel toggle leaves the panel up.
 
-The Running view's icon is a **static ring spinner** (`RunningIcon`), the same family as the animated `.mini-spinner` on running thread rows (`modal-overlay.css`). So the app shows one spinner shape. It stays static everywhere it labels the "running" category: the Filter button, the panel's Running row and the RUNNING section header. Only the per-thread spinners animate, so motion appears only where work is in flight. While threads are running, the Running list's section header label shimmers, the same "live" cue the lifecycle sections use.
+The In flight view's icon is a **static ring spinner** (`InFlightIcon`), the same family as the animated `.mini-spinner` on running thread rows (`modal-overlay.css`). So the app shows one spinner shape. It stays static everywhere it labels the view: the Filter button, the panel's In flight row and the IN FLIGHT section header. Only the per-thread spinners animate, so motion appears only where a turn is running. The section header label shimmers only while a row is running (`inFlightHasRunning`), the same "live" cue the lifecycle sections use. A list of parked threads stays still.
 
 The panel is **NOT** an `<Overlay>`. It renders inside the thread drawer pane (`ThreadDrawer`, behind both the desktop drawer and the mobile threads pane). Its *thread filter cover* covers the list with `position: absolute; inset: 0` on the pane's own background. So nothing floats over the thread and content panes, nothing behind goes inert, and a click over there is the user's own click.
 
@@ -2280,7 +2351,14 @@ The box the *thread filter panel* shows in: `.thread-filter-cover`, rendered by 
 
 The two views **dip through the pane background** under the *navigation cover*, the same both ways. The cover rises over the leaving view, holds opaque while the views swap, and clears off the arriving one. Never a crossfade: the panel wears the list's own geometry, so both drawn at once print rows and options on the same lines. The pane title switches word at once.
 
+A status change with the panel shut dips the same way, through a *leaving-view drawing* (ADR 0359).
+
 Everything else follows the open signal at once: Escape, the overlay stack, the drawer's keys and the pressed Filter button. Escape and the stack entry also wait for the drawer to be visible. A shut cover is hidden and `inert`, so it takes no pointer and no focus, and so is an open cover on a collapsed drawer. A swap during a dip restarts the dip. The plans are `docs/plans/2026-09-25-filter-transitions.md`, `docs/plans/2026-09-26-drawer-filter-swap-uses-the-navigation-cover.md` and `docs/plans/2026-09-26-drawer-filter-swap-dips-through-the-background.md`.
+
+### Leaving-view drawing
+An inert clone of the thread drawer's list, held over the pane while a status filter change dips (`LeavingViewDrawing`, `crates/lucidos-app/src/components/drawer/LeavingViewDrawing.tsx`, `.thread-view-drawing` in `drawer.css`). It plays the closing panel's part when only the status changes, as from "See all statuses": the old list stays on screen until the dip's midpoint, and a CSS animation hides it there. The arriving list renders at once underneath.
+
+It is taken in `getSnapshotBeforeUpdate`, before the list's DOM changes, and drops `id`, `data-thread-nav` and `data-flip-id`, so no lookup finds it. A drawing still showing when a new dip starts re-keys itself and holds to the new midpoint. It ends on the cover's fuse. Reduced motion hides it from its first frame. ADR 0359 records why.
 
 ### Crossfade stack
 A crossfade between a fixed set of layers stacked in one grid cell: `CrossfadeStack` (`crates/lucidos-app/src/components/shared/CrossfadeStack.tsx`) with `.crossfade-stack` in `host-components.css`. Every layer stays mounted and only the current one is opaque. A swap is then an opacity transition on nodes that already exist. It reverses mid-way and starts in the same frame as its neighbours, which a freshly mounted element may not: WebKit can start its animation a frame late.
@@ -2498,6 +2576,17 @@ The random id one hold of the *e2e lock* carries. The orphan sweep and the WebKi
 
 A `browser` orphan needs two facts: its argv[0] lies in the Playwright browsers cache, and its environment holds the marker. The cache path alone matched every Playwright browser on the host. Teardown sweeps its own run's marker, a reclaim the dead owner's, and a lock file with no `RUN_ID` finds no browser orphans. Read from the environment only, never argv (ADR 0251).
 
+### GitHub mode (e2e)
+The `--github` flag on the e2e scripts. The selected suites run on GitHub's runners instead of this host, and the report and exit code stay the same. The driver pushes a *stripped release tree* of `HEAD`, parentless and scanned, to an *e2e run branch* of the mirror. `.github/workflows/e2e.yml` runs the shards from that push, and the driver deletes the branch when the run ends.
+
+The run has two legs. The *remote leg* is everything GitHub runs. The *local leg* is the few specs that need a logged-in Claude Code. They run on this host under the *e2e lock*, which the leg waits for rather than failing. A selection without those specs has no local leg and takes no lock. See `scripts/lib/e2e_github.sh` and ADR 0382.
+
+### e2e run branch
+The `e2e/<run-id>` branch on the public mirror that one *GitHub mode* run pushes and its workflow runs from. The run id is a UTC timestamp plus a random suffix, so the sweep can age a branch without asking the API. The driver deletes its own branch at the end. Each run also sweeps finished ones over a day old. Only refs matching that shape are ever deleted (`e2e_github_is_run_branch`). Not the *temp branch* of a merge worktree.
+
+### Per-spec memory sample
+One line the Playwright reporter `crates/lucidos-app/e2e/memSampleReporter.ts` appends at each test end, macOS only. It records the macOS compressor pages, their limit, the change since the previous test in the same worker slot, and the live WebKit GPU processes. The lines go to the run's `mem-samples.log` and to its *mirror*, `~/.lucidos/e2e-mem/<run id>.log`, named for the *e2e run marker* so it outlives worktree cleanup. `report_e2e_mem_top_deltas` ranks them at the end of a run. Format and rationale: `docs/e2e-test-decisions.md` § "Per-spec compressor sampling".
+
 ### Build memory gate
 The check every heavy cargo build passes before it starts: `scripts/build-memory-gate.sh`, run by `scripts/with-build-slot.sh` before it asks for a slot and by `scripts/harden-suites.sh` before each cargo suite. Its verdict is the pre-flight gate's rule, applied by `host_memory_gate_verdict` in `scripts/lib/host_memory_guard.sh`. On NO-GO it waits up to 15 minutes for the host to recover, then exits 72, which says the build never started. A host it cannot read is GO. A pass holds for 60 s in the process tree, so a nested build skips the readings (ADR 0351).
 
@@ -2599,13 +2688,13 @@ The 10-minute inactivity timer inside `run_session`'s `select!` (`WATCHDOG_INACT
 The pre-edit planning artifact for complex implementation work: ADR-backed or design-thread-backed work, cross-layer changes, routing/topology/storage/security/migration/process changes, or any non-local implementation. Created via the repo-owned `implementation-plan` skill before code edits and always written to a checked-in file at `docs/plans/YYYY-MM-DD-<slug>.md` (the committed file is the source of truth; a short summary may also appear in the conversation). It consumes the user prompt, any `grill` or design thread, ADRs/plans, and code reconnaissance, then records settled decisions, non-goals/deferred work, phase order, load-bearing implementation invariants, and verification for each invariant. It is an execution contract, not a retrospective `/harden` audit: unresolved load-bearing questions block edits, and implementation phases re-read the invariants before changing behavior.
 
 ### Judge (command guard)
-The fallible LLM half of the *command guard* (ADR 0002, Phase 3), in `engine/command_judge.rs`. A cheap, fast model classifies the *ambiguous middle*: the commands the static *command classifier* returns as `NeedsJudge`. Haiku is the default, and the `model_command_judge` preference changes it. The judge picks a *RiskLane* (`Safe` / `ReversibleDanger` / `IrreversibleDanger`, never `Catastrophic`) and writes the one-line `summary` the permission card shows.
+The fallible half of the *command guard* (ADR 0002, Phase 3), in `engine/command_judge.rs`. It classifies the *ambiguous middle*: the commands the static *command classifier* returns as `NeedsJudge`. It asks two typed Choice questions of the site's *judgment provider*: the chat model `model_command_judge` names (Haiku by default), or a System One row picked in the same control (ADR 0363). The judge picks a *RiskLane* (`Safe` / `ReversibleDanger` / `IrreversibleDanger`, never `Catastrophic`), and code derives the one-line `summary` the permission card shows.
 
-For the `IrreversibleDanger` lane it also tags a *SideEffectCategory* (`email` / `external_api` / `cloud_cli` / `out_of_workspace_destruction` / `other`). The trigger *side-effect grant* check keys on that category. The judge errs toward *ask*: an unrecognized or unparseable verdict resolves to `IrreversibleDanger` with category `Other`.
+For the `IrreversibleDanger` lane it also tags a *SideEffectCategory* (`email` / `external_api` / `cloud_cli` / `out_of_workspace_destruction` / `other`). The trigger *side-effect grant* check keys on that category. The judge errs toward *ask* through thresholds in Rust: a weak, missing or malformed answer resolves to `IrreversibleDanger` with category `Other`, on every provider.
 
-It returns `Err` only on infra failure: no provider, or a failed or empty call. The guard then falls back to `fallback_classify` and `static_side_effect_category`. `command_guard_judge` gates it, and defaults on when the guard is on. Verdicts are cached per response by `JudgeInput::cache_key`: the tool, the command text and the out-of-workspace marker. So a re-emit does not re-pay, and a link laid down mid-turn misses the cache.
+It returns `Err` only when nothing answered: no provider, a failed call, or a timeout. The guard then falls back to `fallback_classify` and `static_side_effect_category`. `command_guard_judge` gates it, and defaults on when the guard is on. Verdicts are cached per response by `JudgeInput::cache_key`: the tool, the command text and the out-of-workspace marker. So a re-emit does not re-pay, and a link laid down mid-turn misses the cache.
 
-Triggers DO reach the judge now (Phase 5), since the side-effect grant needs the lane and the category. `judge_with_provider` is the provider-agnostic core, exercised offline with a stubbed `LlmProvider` in tests.
+Triggers DO reach the judge now (Phase 5), since the side-effect grant needs the lane and the category. `judge_with` is the provider-agnostic core, exercised offline with stubbed judgment providers in tests.
 
 ### Keybinding registry
 The customizable keyboard-shortcut subsystem. Pure registry + binding math in
@@ -2639,6 +2728,16 @@ chord forwarded from an app frame or the HTML preview is refused, because that
 frame's own script can post one. `forwardableBindings` leaves it out of the
 bindings pushed to frames. Apply and the voice call are host-only, since one
 merges a change and the other opens the microphone.
+
+### Find target
+What one *find bar* session searches. An app frame and the *artifact preview frame* are each asked over their bridge. A text preview is searched in the host's own DOM. The transcript is counted from the thread's data (`store/actions/transcript-find.ts`). `targetFor` in `store/actions/find-bar.ts` picks it from the focused pane and what that pane shows. All four use one matcher, `packages/lucidos-sdk/src/find.ts`.
+
+**A contextual shortcut** claims its chord only where it applies, by a rule
+in `CLAIMS_ONLY_WHEN` (`hooks/useKeyboardShortcuts.ts`). Anywhere else
+`classifyChord` leaves the key alone, so the browser's own action still runs.
+The *find bar*'s Mod+F is the one today: it claims the key only when the focused
+pane shows something the bar can search. A keydown forwarded from a frame is
+judged against the content pane, so the PDF preview keeps its own find.
 
 ### last_agent_action
 `thread_summaries` column (`TIMESTAMPTZ NOT NULL`) holding when the AGENT (or trigger) last did something on a thread — streaming, a terminal response, a `CodingAgentIdled`, a trigger fire/complete, the agent asking the user, or a non-human `MessageReceived`. The counterpart to *last_user_action*. Not a sort key; it drives the thread-row tooltip's "Agent ·" line (frontend `meta.lastAgentAction`), kept distinct from `last_user_action` so the tooltip is accurate even right after the user acts. Bumped per-arm in `event_bus_projection_thread.rs` (co-located in the existing `last_activity` UPDATEs — no extra hot-path queries).
@@ -2699,6 +2798,8 @@ What a *webhook* has been turning away since it last accepted anything, on four 
 
 **Every age on it is measured by Postgres** (ADR 0053), and carried as `run_secs` and `quiet_secs`. `judge` therefore takes no clock. A host ahead of a drifting database would read every run as negative seconds old and judge every hook clear for good.
 
+**The run's span is first refusal to last**, `run_secs - quiet_secs`. For a hook that is on, the span is what must pass the 30-minute clock, so a burst followed by silence declares nothing (ADR 0365).
+
 The engine's own *ingress probe* never reaches the run. That probe presents a per-cycle bearer, and `api::webhooks::is_probe_delivery` skips the stamp on a match, or a healthy workspace would log four refusals an hour.
 
 The run is a `RefusalRun`, the `refusal_run` field on the wire, and `lucidos webhooks list` prints it. Judged by `core/webhook_refusal.rs`, which is pure.
@@ -2744,6 +2845,16 @@ What it buys is one branch in `deliver`. Without it the probe's own refusal woul
 **Not a marker the sender could set.** A forgeable one would let an attacker hide a signature-guessing run from the page the *delivery outcome stamps* feed. Compared in constant time, superseded by the next mint, and expired after two minutes. A leaked token therefore cannot silence the page for as long as the engine runs.
 See also: *delivery outcome stamps*, *webhook token*, *ingress probe* (user-facing), ADR 0143.
 
+### Sleep spell
+The sleep the *ingress probe* has summed since its last awake round that probed (`Watch::spell` in `scheduler/webhook_ingress/mod.rs`, ADR 0367). A round slept through when the wall clock gained on the monotonic clock, during it or since the last round. A late tick counts too. `core::host_sleep::slept` reads all three signs and is pure.
+
+**A slept-through round is not evidence.** It never declares or adds a strike, and it breaks the debounce chain. It can still recover, because sleep cannot fake a 401.
+
+The first awake round that probes closes the spell. A spell of 30 minutes or more emits `WebhookDeliveriesSleptThrough` once, so a night of dark wakes is one event in the morning. A round that could not probe carries the spell on; a closed gate (no hook, no funnel) forgets it.
+
+Memory only. A restart starts a new spell, so the cost is at most one report.
+See also: *ingress probe* (user-facing), ADR 0367.
+
 ### Lifted family
 A *family* whose root's own natural display section is lower-priority than the section the family was routed to, i.e. a descendant earned the lift. Surfaces in the drawer as two coordinated cues: the parent row renders with demoted styling (muted opacity) so it reads as "I'm here because of one of my children", and any non-root descendant whose own natural section equals the routed section ("responsible child") gets a brighter accent rail in place of the default gray. When every family member naturally belongs to the routed section, the family isn't lifted and neither cue fires. Computed by `computeFamilyDecorations` (in `crates/lucidos-app/src/components/drawer/family-graph.ts`) as `{ routedByThread, liftedRoots, archivedSubThreads }`; routed section comes from the same priority pass `categorizeThreads` uses (current > saved > archive). See also: *Archived sub-thread cue*.
 
@@ -2776,7 +2887,15 @@ The four-state TypeScript type for every async-fetched value: `{ status: 'not-lo
 See also: `.claude/rules/frontend.md` § "Async Data Loading".
 
 ### Max tool calls
-The per-turn tool-call cap for *Lucidos Agent* turns, chat and trigger alike: how many tool calls a single turn may make before the engine ends it with an `[ENGINE-LIMIT]` *ResponseGenerated* terminator naming the cap and pointing at the setting. Counts **calls, not LLM rounds** (`tool_calls_made`, incremented inside the per-call loop, distinct from `iterations`), because one response can carry several tool calls and the system prompt asks for exactly that when writing N files; counting rounds would let a cap of 500 pass well over 500 calls while every user-facing string says "tool calls". The response that crosses the line completes first, since every `tool_use` needs a matching `tool_result` or the provider rejects the next request, so the overshoot is bounded by one response's worth of calls. Stored as the global `max_tool_calls` *preference*, defaulting to `DEFAULT_MAX_TOOL_CALLS` (500, the value of the former hardcoded `MAX_ITERATIONS`), resolved per turn by `PreferenceStore::max_tool_calls`. **No maximum** (a high cap costs the user time and tokens, which is theirs to spend); `MIN_MAX_TOOL_CALLS` is 1, ruling out only `0`, which would fire the backstop before the first LLM call. Absent or unparseable resolves to the default rather than failing the turn. Human-only: it is in `INTERNAL_KEYS`, because it is the backstop over the agent's own loop and the agent must not raise its own limit. The turn's resolved cap is read ONCE in `process_message_with_steps_internal` and passed to both the system-prompt builder and `run_agentic_loop`, so the number the prompt quotes to the model is the number enforced, and a mid-turn Settings change cannot move it. Distinct from the *circuit breakers*, which fire much earlier and on a different signal (3 consecutive identical FAILURES warn, 5 break) rather than on volume; a cap set below 5 pre-empts them, which is the honest consequence of asking for a tiny cap. Settings → Models → Chat & triggers.
+The per-turn tool-call cap for *Lucidos Agent* turns, chat and trigger alike. A turn that reaches it ends with an `[ENGINE-LIMIT]` *ResponseGenerated* terminator naming the cap and pointing at the setting.
+
+- **It counts calls, not LLM rounds** (`tool_calls_made`, incremented inside the per-call loop). One response can carry several tool calls, and counting rounds would let a cap of 500 pass well over 500 calls.
+- **The response that crosses the line completes first.** Every `tool_use` needs a matching `tool_result`, so the overshoot is at most one response's worth of calls.
+- **Stored as the human-only `max_tool_calls` *preference*.** Its default and bounds live in the *preference catalog*, and `PreferenceStore::max_tool_calls` reads it through its *preference handle*. The floor of 1 rules out only `0`, which would fire the backstop before the first LLM call. The ceiling is far above any real turn.
+- **The agent must not raise its own limit**, because the cap is the backstop over its own loop. `set_preference` refuses it with a hint.
+- **Read once per turn** in `process_message_with_steps_internal` and passed to both the system-prompt builder and `run_agentic_loop`. The number the prompt quotes is the number enforced, and a mid-turn Settings change cannot move it.
+
+Distinct from the *circuit breakers*, which fire on 3 and 5 consecutive identical failures rather than on volume. A cap set below 5 pre-empts them. Settings → Models → Chat & triggers.
 
 ### Wire shape
 What a *thread event*'s JSON actually looks like by the time the frontend reads it, as opposed to what the Rust `ThreadEvent` variant declares. The two differ, and the difference is the whole reason the frontend types are generated rather than derived:
@@ -2794,9 +2913,16 @@ Two more things widen it. The snapshot serves the raw JSONB column, so an old ro
 ### MCP tool surface
 What the running *MCP servers* contribute to the *Lucidos Agent*'s tool array right now, plus the generation stamp saying when that was true. `McpToolSurface` in `crates/lucidos-engine/src/mcp/mod.rs`, read by `McpManager::tool_surface`. Every enabled tool of every running server, under its *wire tool name*; a stopped server contributes nothing, and a *disabled tool* is absent by definition.
 
+It is fitted under the *MCP tool ceiling*, and it carries what the ceiling left out (`dropped`). The turn tells the model that in one line, so the model can tell the user.
+
 The stamp is the point. A turn reads the array once at setup and runs for many rounds, so it has to know whether what it holds is current. `tool_surface_generation` moves on exactly the four changes that move the offered set: a server connects, stops, is removed while running, or has its disabled-tools set rewritten while running. It does not move on a start of something already running, or a remove of something already stopped. The counter is bumped under the registry's write lock and read under its read lock. So a stamp always describes the array it came with, and a turn can never record a stamp newer than the tools it holds.
 
 `TurnTools` (`engine/agentic_loop/helpers.rs`) is the consumer: it holds the turn's whole array and swaps only the MCP slice when the generation has moved. Everything else is a function of workspace capability rather than of the turn (ADR 0088), fixed for the turn's whole life. Before this existed the MCP slice was fixed too, and a server the agent started mid-turn stayed uncallable until the next user message. See ADR 0195 for why the prompt-cache write that a mid-turn swap costs is the right price.
+
+### MCP tool ceiling
+The chars every running *MCP server*'s tools may take in one request together: a quarter of the request's char budget for the resolved model's window. `mcp_tool_char_ceiling` in `crates/lucidos-engine/src/mcp/mod.rs`. A `tools/list` is third-party input, and an uncapped one once took the whole budget. The conversation was trimmed to nothing, and then every turn failed.
+
+The fit is deterministic. Servers go in id order, and each gets a max-min fair share: a server asking for less than an even split keeps all of it, and the rest share what it leaves. Within its share a server keeps its tools in its own listed order and skips any that no longer fit. The request and the cost report run the same fit. The report is `McpBudget`, served as `budget` by `GET /api/v1/mcp/servers`: the request's char budget, the ceiling, what a request sends (`sent_*`), what is dropped, and a warning from 80% of the ceiling.
 
 ### Wire tool name
 The name a tool is offered to the model under. Lucidos's canonical identifier for an *MCP* tool: `mcp__<server_id>__<tool>`, rewritten to satisfy the Messages API pattern `^[a-zA-Z0-9_-]{1,128}$`. Every other character becomes `_`, and the result is truncated to 128.
@@ -2858,9 +2984,14 @@ Every surface that can name a newer release reads it: the offer toast, the *What
 **A surface that has already named the release passes that fact in, so `check` never appears on it.** What's New does, by listing the published changelog. Offering a check there sends the reader to confirm what the `Newer` chip beside it just said. Overview's own button is install, relay or check, because it names no release and is where `guide` lands.
 
 ### Update relay
-How a session that cannot install gets the desktop client to install for it (ADR 0338). The client's Rust side sends the gateway a heartbeat every 5 seconds, with its version and its *remote install blocker*. A session following the `relay` *update route* posts a request. The gateway hands it to the next heartbeat, once. The client then runs the same install a click on the Mac runs, and posts each progress phase back.
+How a session that cannot install gets the desktop client to install for it (ADR 0338). The client's Rust side sends the gateway a heartbeat every 5 seconds, with its release (never its *client build id*) and its *remote install blocker*. A session following the `relay` *update route* posts a request. The gateway hands it to the next heartbeat, once. The client then runs the same install a click on the Mac runs, and posts each progress phase back.
 
 The state lives in gateway memory (`update_relay.rs`) and dies with the service restart the install causes. So the requesting session keeps its own in-flight marker, and proves success by the gateway's running version after it reconnects. An unclaimed request expires after 2 minutes, and a claim with no progress after 30 seconds. The heartbeat, which also carries the progress, takes only the machine-local token, so no browser session can pose as the client.
+
+### Client build id
+The desktop app's CalVer stamp (`2026.10.03.0`), embedded as `LUCIDOS_APP_VERSION` and injected as `window.__LUCIDOS_APP_VERSION__`. `build.rs` bumps it in the gitignored `crates/lucidos-app/VERSION` when the client's Rust source changes. It identifies a build, and the System page's Client row shows it. The app's *release* is a separate value, `LUCIDOS_RELEASE` from the `RELEASE` file, injected as `window.__LUCIDOS_APP_RELEASE__`.
+
+**Compare like with like.** A release is never newer than a CalVer stamp, so a build id compared against a release always reads as current. That hid the *update relay* from every phone, and put an "older Lucidos" notice on every DMG client. A build id is compared only against another build id: the engine's `latest_tauri_app_version`, which is the checkout's `VERSION` in dev. Everything compared against an engine's or a gateway's release uses `LUCIDOS_RELEASE`.
 
 ### Remote install blocker
 Why an update could not run with nobody at the Mac, as the client reports it in the *update relay* heartbeat. It is the install's own blocker (a disk image, a translocated copy, a temp dir on another device). It also covers a bundle folder this user cannot write. That case sends the updater down its admin-password path, which a local click can answer and a relayed install would hang on. A client reporting one offers no `relay` route, and re-checks before it runs a request.
@@ -2868,7 +2999,7 @@ Why an update could not run with nobody at the Mac, as the client reports it in 
 ### Release notice cursor
 The `release_notice_cursor` preference: the id of the last *release notice* this workspace answered. Everything after it in `release-notices.toml`, and at or before the running release, is still owed. One scalar is the whole of the ordering and the one-time-ness, because the authored file is an ordered append-only sequence.
 
-Workspace-global (`device_id IS NULL`) and **silent**, listed in both `INTERNAL_KEYS` and `SILENT_PREF_KEYS` for the two separate reasons `backup_last_run` is: the agent must not write it, and the resolve announces `ReleaseNoticeResolved` on its own. The engine owns every write. `POST /api/v1/release-notices/resolve` moves it forward only, and a boot with no cursor may place one (`seed_cursor_at_startup`).
+Workspace-global (`device_id IS NULL`) and **silent**: its catalog spec is `PrefAccess::Engine`, like `backup_last_run`. The agent must not write it, and the resolve announces `ReleaseNoticeResolved` on its own. The engine owns every write. `POST /api/v1/release-notices/resolve` moves it forward only, and a boot with no cursor may place one (`seed_cursor_at_startup`).
 
 Only a workspace with NO rows in `thread_summaries` is placed, at the last notice AT or before the running release. It starts level and hears from the next release instead, which is what keeps a modal off the first-run welcome. A workspace that has been used is left with no cursor, so it owes every visible notice, oldest first: it has never been shown one. Stamping it past the releases it happens to have run is what ADR 0130 replaced. A stored id this build does not carry reads as nothing answered.
 
@@ -2941,7 +3072,15 @@ A tap on a button or a link never counts, nor does the mouseup ending a text sel
 The dimming wash behind a modal surface, one the app waits on until it closes: a dialog, a detail modal, the mobile drawer. A read-only dialog counts, because what dims is modality, not a pending answer. Every one reads the `--scrim` token. A menu, a popover or a palette paints none, since it blocks nothing (ADR 0290). The image viewer and the camera keep a darker scrim of their own, as lightboxes.
 
 ### Drill-in
-How a popover shows more detail without a second layer (ADR 0290). The detail replaces the popover's content in place, under a head whose back link names the view it returns to. Escape steps back first, through an Escape-only registrant on the *overlay stack*, and a second Escape closes the popover. The waiting panel's condition is the worked example (`components/chat/WaitingPanel.tsx`). A dialog may still stack a confirm on itself, because a confirm needs an answer.
+How a popover shows more detail without a second layer (ADR 0290). The detail replaces the popover's content in place, under a head whose back link names the view it returns to. Escape steps back first, through an Escape-only registrant on the *overlay stack*, and a second Escape closes the popover. The waiting panel's condition is the worked example (`components/chat/WaitingPanel.tsx`). A dialog may still stack a confirm on itself, because a confirm needs an answer. Each view is a *surface step*, and moving between them is a *step morph*.
+
+### Surface step
+One view of a *drill-in*: the waiting panel's list or a condition, the coding-agent menu's command list, or one step of the model picker. Its root carries `data-surface-step="<identity>"`. Steps nest, so a panel's steps read outermost first (`stepSignature` in `hooks/panelStepMorph.ts`). A change in that list is what `useAnchoredPosition` treats as a step change. Any anchored popover gets the *step morph* by marking its views this way.
+
+### Step morph
+How an anchored popover moves between *surface steps*. The box glides from its old size and position to the new ones, and the new content fades in. The children hold their final size throughout and the box clips them, so no text rewraps mid-glide. Size and offset share one curve, so an upward panel keeps its bottom edge on its anchor. Reduced motion swaps instantly.
+
+Code that measures the panel mid-morph, such as a highlight's `scrollIntoView`, waits for it through `whenStepSettled`. Plan: `docs/plans/2026-10-03-popover-steps-morph.md`.
 
 ### Overlay stack
 The central LIFO registry of dismissable overlays (`store/overlayStack.ts`). Every overlay *panel* registers through the `<Overlay>` component, its sole panel registrant. The panel-less pseudo-fullscreen mode pushes an Escape-dismiss entry directly. Each entry registers its `dismiss` on mount and removes it on unmount. One capture-phase dispatcher in `useKeyboardShortcuts` (`dispatchEscape`) pops the top entry, so per-instance Escape listeners no longer race.
@@ -2956,7 +3095,7 @@ Escape policy is non-destructive. The dispatcher tries these in order:
 
 *Pseudo-fullscreen* is NOT covered by the stand-down. It is painted in the normal layer and dismissed through this same stack. It registers before the overlay, so LIFO pops the overlay first and fullscreen survives. The *close cascade* has its own trigger, not Escape. So a double Escape on a cascade confirm cancels the dialog and skips no layer.
 
-**An entry either owns a panel or answers only Escape, and the two are asked different questions.** `<Overlay>` marks its entry `hasPanel`. Everything else is an **Escape-only registrant**: a surface answering the key while owning no pixels, namely pseudo-fullscreen, the thread filter, and a step inside a panel (`useEscapeStep`). **Escape asks `topOverlay`; a POINTER asks `topPanelOverlay`.** A registrant can never receive a click, and one deliberately sits ABOVE the panel it belongs to. Answering the raw top for the pointer switched outside-click dismiss off on every model menu whose tier row was open.
+**An entry either owns a panel or answers only Escape, and the two are asked different questions.** `<Overlay>` marks its entry `hasPanel`. Everything else is an **Escape-only registrant**, owning no pixels: pseudo-fullscreen, the thread filter, the *find bar*, or a step inside a panel (`useEscapeStep`). **Escape asks `topOverlay`; a POINTER asks `topPanelOverlay`.** A registrant can never receive a click, and one deliberately sits ABOVE the panel it belongs to. Answering the raw top for the pointer switched outside-click dismiss off on every model menu whose tier row was open.
 
 ### Overlay layer
 The App-root group of host-rendered overlays, moved as a unit by `components/layout/OverlayLayer.tsx`. It holds:
@@ -3011,7 +3150,11 @@ A receipt is not a separate destination. The `mark*` action (`markEmailSent`, `m
 The panels deliberately do not switch the active menu item (see `openEmailConfirmRequest` / `openPluginInstallRequest`); confirming a send used to teleport the user to Settings → Accounts and strand them there.
 
 ### Per-thread events bump
-The frontend reactivity primitive in `crates/lucidos-app/src/store/threadActivity.ts` that splits SSE fan-out into two channels so a long-running streaming thread doesn't fire every wide `threadMap` subscriber on every token. `bumpThreadEvents(threadId)` increments a lazy-created `Signal<number>` for that thread only (RAF-coalesced); `getThreadEventsBump(threadId)` subscribes to just that thread. Streaming events (`TextStreamed`, `CodingAgentTextStreamed`, `CodingAgentToolCalled`, `ContextCaptured`, …) bump the per-thread signal and do **not** flip `threadMap`. Meta-shape changes (status, title, channel, codingAgent flags, child counts, …) flip `threadMap` and fire the wide subscribers (`attentionThreadCount`, `ThreadDrawer.ThreadList`, every `PromptInput` effect). Focused-thread views (`activeExchanges`, `activeStreamingBuffer`, `ThreadView`'s exchanges memo) subscribe to the per-thread bump and read `threadMap.peek()`. **Contract**: every code path that mutates `thread.events`, `thread.streamingBuffer`, or `thread.pendingUserMessages` MUST pair the mutation with `bumpThreadEvents(threadId)` — the SSE handler at the bottom of `handleThreadEvent` bumps unconditionally; the optimistic-message paths in `chat.ts` (`addPendingMessage`, `removePendingMessage`, `clearStalePendingMessages`, the unreachable-engine fallback) and the `CodingAgentThreadSpawned` branch in `handleGlobalEvent` bump explicitly. Wires same pattern as `composeDrafts` / `draftPresentThreadIds` for compose state.
+The frontend reactivity primitive in `crates/lucidos-app/src/store/threadActivity.ts`. It splits SSE fan-out into two channels, so a long-running streaming thread does not fire every wide `threadMap` subscriber on every token. `bumpThreadEvents(threadId)` increments a lazy-created `Signal<number>` for that thread only (RAF-coalesced), and `getThreadEventsBump(threadId)` subscribes to just that thread.
+
+Streaming events (`TextStreamed`, `CodingAgentTextStreamed`, `CodingAgentToolCalled`, `ContextCaptured`, …) bump the per-thread signal and do **not** flip `threadMap`. Meta-shape changes (status, title, channel, codingAgent flags, child counts, …) flip `threadMap` and fire the wide subscribers (`attentionThreadCount`, `ThreadDrawer.ThreadList`, every `PromptInput` effect). Focused-thread views (`activeExchanges`, `activeStreamingBuffer`, `ThreadView`'s exchanges memo) subscribe to the per-thread bump and read `threadMap.peek()`.
+
+**Contract**: every code path that mutates `thread.events`, `thread.streamingBuffer` or `thread.pendingUserMessages` MUST pair the mutation with `bumpThreadEvents(threadId)`. The SSE handler at the bottom of `handleThreadEvent` bumps unconditionally. The optimistic-message paths in `chat.ts` (`addPendingMessage`, `removePendingMessage`, the unreachable-engine fallback) bump explicitly, as does the `CodingAgentThreadSpawned` branch in `handleGlobalEvent`. It follows the same pattern as `composeDrafts` / `draftPresentThreadIds` for compose state.
 
 ### MessageOrigin
 The Rust enum for *actor*, defined in `crates/lucidos-engine/src/engine/thread_events.rs`. Variants:
@@ -3041,7 +3184,14 @@ The Rust enum in `crates/lucidos-engine/src/engine/chat/process/mod.rs` telling 
 The rule that `POST /api/v1/chat/stream` persists a chat follow-up's `MessageReceived` **before** it returns 200, so the ack means "recorded, with its sequence assigned" rather than merely "accepted". Implemented by `LucidosEngine::pre_emit_chat_message_received`, which runs after every validation gate and hands the event id to the spawned turn as a *PreEmittedOrigin*. It is what makes the frontend's *send chain* a real ordering guarantee: the handler otherwise spawns the turn and acks immediately, with the emit sitting behind a Thread Queue slot wait, so a client that waited for the ack could still have the next request's task take the lower sequence. Deliberately self-gating: a brand-new thread, a coding-agent dispatch, a non-human mode, a thread with an open question (the reply becomes `UserQuestionAnswered` and never a `MessageReceived`), and a failed emit all fall back to the turn emitting it. See `docs/plans/2026-07-30-serialize-chat-sends-per-thread.md`.
 
 ### Send chain
-The per-thread promise chain in `crates/lucidos-app/src/store/actions/chat.ts` that keeps at most one `POST /chat/stream` in flight per thread, so a device's messages reach the engine in the order the user pressed send. The slot is claimed **synchronously** in `enterSendChain` at `sendMessage` call time, not when the POST is issued, because `sendMessage` can await before it gets there (`getWebviewContent()` on the Tauri panel path) and two of those resolve in either order. Links settle rather than resolve-on-success, so one failed send cannot poison the chain, and the wait for the predecessor is bounded by `SEND_CHAIN_MAX_WAIT_MS` because `mutatingFetch` has no client timeout and a hung POST would otherwise swallow every later message on the thread. Its engine counterpart is *emit-before-ack*; without that, the chain narrows the race but does not close it.
+The per-thread promise chain in `crates/lucidos-app/src/store/actions/sendChain.ts`. It keeps at most one `POST /chat/stream` in flight per thread, so a device's messages reach the engine in the order the user pressed send. `enterSendChain` claims the slot **synchronously**, when `sendMessage` is called, not when the POST goes out. `sendMessage` can await first (`getWebviewContent()` on the Tauri panel path), and two of those awaits resolve in either order. Links settle rather than resolve-on-success, so one failed send cannot poison the chain.
+
+A send holds its slot through every *quiet retry*, so a later message never overtakes one still retrying. The wait is bounded by `SEND_CHAIN_MAX_HOLD_MS`, timed from the predecessor's own turn and derived from the retry deadline and `SUBMIT_CHAT_TIMEOUT_MS`. It is a net for a send that hangs some other way. Its engine counterpart is *emit-before-ack*; without that, the chain narrows the race but does not close it.
+
+### Quiet retry
+A send's automatic repeat of a POST that got no reply, before anything says Not sent (`withQuietRetries` in `crates/lucidos-app/src/store/actions/sendRetry.ts`). Every send path takes them: a message, an answer to a question card, and a *side question*. Only a failure that says nothing about the request retries: a transport error, an abort or timeout, or the gateway's boot splash. The schedule is `SEND_RETRY_BACKOFF_MS`, and no retry starts later than `SEND_RETRY_DEADLINE_MS` after the first attempt.
+
+A wait ends early when the browser reports the network back or the page becomes visible. What the attempts ended on opens from the Not sent label. Plan: `docs/plans/2026-10-03-auto-retry-a-send-before-not-sent.md`.
 
 ### Accepted messages
 The engine's record of the client event ids that `POST /api/v1/chat/stream` already took. A re-post of the same body acks `200` with the same `event_id` and starts nothing. That is what makes an *unsent message*'s Retry safe when the first POST did land and only its answer was lost.
@@ -3053,9 +3203,9 @@ The engine's record of the client event ids that `POST /api/v1/chat/stream` alre
 
 
 ### Unsent message record
-The stored copy of a send on the sending device (`store/unsentMessageRecords.ts`), in a per-workspace IndexedDB database. `sendMessage` writes it before the POST, in phase `sending`. No answer marks it `unsent` with its retry count. An accepted or refused send, the engine's own row, Discard, and deleting the thread all end it. So a record found at startup is a send whose outcome the page never learned.
+The stored copy of a send on the sending device (`store/unsentMessageRecords.ts`), in a per-workspace IndexedDB database. `sendMessage` writes it before the POST, in phase `sending`. No answer marks it `unsent` with its retry count. An accepted or refused send, the engine's own row, Discard, and deleting the thread all end it. So does a new answer from this device to the question card a *typed answer* record names in `answersQuestion`. So a record found at startup is a send whose outcome the page never learned.
 
-`store/actions/unsentMessageRestore.ts` brings each one back once the engine serves the thread list, where it was sent (`sentAt`). It is adopted only if no live tab owns it (`store/pageOwner.ts`). See ADR 0352.
+`store/actions/unsentMessageRestore.ts` brings each one back once the engine serves the thread list, where it was sent (`sentAt`). A typed answer returns to its card while the thread still waits on it. It is adopted only if no live tab owns it (`store/pageOwner.ts`). See ADR 0352.
 
 ### Send settlement
 What a sender owes once the engine decides its send after the first attempt (`SendSettlement` in `store/unsentMessages.ts`). It is data, not a callback, so an *unsent message record* settles after a reload exactly as in the page that sent it. It has three kinds:
@@ -3083,6 +3233,26 @@ Single source of truth for two consumers that must not disagree. `RoutingProvide
 Derived per request rather than stored, so it is never a column and a user adding a local model is never asked to declare it. The prefix heuristic in `store/models.ts` survives only as the frontend's pre-load fallback.
 
 The coding agent's tiers come from elsewhere and are **served in the same shape**. `cc_menu_options.json` / `codex_menu_options.json` keep a hand-maintained `supported_models` matrix on their EFFORT rows, because that is how upstream announces a tier: one line naming the models that accept it. `runtime::claude_code::model_and_effort_options` transposes it when serving the menu, so the wire carries `reasoning_efforts` per model row on both surfaces and one picker rule covers both. `validate_codex_effort` still DROPS an unsupported effort, but as a backstop for API and trigger callers: the picker clamps, so the drop is unreachable from the UI. See `docs/plans/2026-08-12-reasoning-effort-follows-model.md` and `docs/plans/2026-08-22-model-selection-picker-and-summariser-split.md`.
+
+### Writer thread
+The thread whose turn wrote an artifact, carried as `writer_thread_id` on
+`ArtifactCreated`, `ArtifactUpdated` and `ArtifactImported` when one did. The
+Tree compactor and the memory indexer bill their calls about that write to it.
+Once it is deleted, they bill the home thread instead (ADR 0381). The data API takes
+it only from the token-verified caller, never from the request.
+
+### Model call service
+`engine::model_call`: the one path an engine model call takes, and the
+`ContextCaptured` row it always leaves (ADR 0242). An auxiliary call goes
+through `AuxCapture::chat`, `judge`, `generate` or `search`. The agent's own
+turn goes through `turn_chat`, whose `TurnCapture` records its usage even if
+the loop never finishes the row. Spend that arrives outside a provider call
+(voice, a coding agent's side question, the proxy) goes through
+`AuxCapture::record_usage`.
+
+It does not choose the model: `AuxCall` and the router still resolve that. It
+makes the call and records it, and the *call token* makes it the only thing
+that can.
 
 ### Model selection
 A model id paired with a reasoning effort, resolved together for one surface. The tiers offered are the model's *supported reasoning tiers*, so the pair is never independently valid. Every model picker resolves one through `useModelSelection`. Distinct from *per-thread model memory*, which is where a chat thread's selection is remembered.
@@ -3155,13 +3325,13 @@ The Rust enum (`crates/lucidos-engine/src/llm/model_registry.rs`) naming which b
 ### provider switch
 The per-provider on/off control on Settings → Models → Providers, and the thing that folds a provider's config rows away when it is off. Backed by the `provider_enabled_<id>` preference for the six credential- and environment-configured providers (`vertex`, `anthropic`, `openai`, `openrouter`, `xai`, `local`), resolved into `ProviderSwitches` by `llm/provider_build.rs`. Absent means **on**, so a workspace that never opened the page builds the provider set it always did.
 
-A switch is a **veto**, never an installer: off drops the provider before the router is assembled, taking its web-search backend with it, and on adds nothing that is not otherwise configured. It leaves the stored credential alone, which is the whole point of having it beside Remove: it parks a key rather than spending it. It hot-swaps, being in `PROVIDER_PREFERENCE_KEYS`, and the frontend re-probes `/health` on the same keys so the model picker tracks it. The six keys are in `INTERNAL_KEYS`: the provider a `set_preference` would switch off may be the one answering that turn.
+A switch is a **veto**, never an installer: off drops the provider before the router is assembled, taking its web-search backend with it, and on adds nothing that is not otherwise configured. It leaves the stored credential alone, which is the whole point of having it beside Remove: it parks a key rather than spending it. It hot-swaps, being in `PROVIDER_PREFERENCE_KEYS`, and the frontend re-probes `/health` on the same keys so the model picker tracks it. The six keys are human-only in the *preference catalog*: the provider a `set_preference` would switch off may be the one answering that turn.
 
 `opencode-free` is deliberately outside the family. It is opt-**in** under `opencode_free_enabled`, whose absence means off (ADR 0104), where these are opt-**out**. The frontend state machine is `components/settings/providerEnablement.ts`. Its three states (`on` / `switched-off` / `not-set-up`) are what tell a parked provider from one never configured. See `docs/plans/2026-08-25-provider-onboarding-and-providers-page.md`.
 
-**TypeSafe (Jev) has a seventh switch, in the family but not in that list.** `provider_enabled_typesafe` keeps the absent-means-on rule, the veto semantics and the parked-key promise, and its row wears the same `ProviderBlockFrame`. What differs is everything downstream of the chat registry. Jev holds no conversation, so it has no `ProviderKind`, never reaches `provider_build.rs`, and is absent from `ProviderSwitches`, `PROVIDER_ENABLED_KEYS` and `/health.configured_providers` (ADR 0220).
+**The System One providers have three more switches, in the family but not in that list.** `provider_enabled_typesafe`, `provider_enabled_cloudflare_workers_ai` and `provider_enabled_system_one_custom` keep the absent-means-on rule, the veto semantics and the parked-key promise, and their rows wear the same `ProviderBlockFrame` through `SystemOneProviderFrame`. What differs is everything downstream of the chat registry. A System One model holds no conversation, so it has no `ProviderKind`, never reaches `provider_build.rs`, and is absent from `ProviderSwitches`, `PROVIDER_ENABLED_SWITCHES` and `/health.configured_providers` (ADR 0220).
 
-`llm::judgment::select::jev_for` reads the key per call instead, which is what makes it hot-swap with no subscriber. It is the master switch above the two per-site `judgment_*` preferences. Each of those is written from its site's model picker rather than a switch (ADR 0224). Its row cannot ask `/health` what is configured, so it reads a stored `typesafe` credential in place of that list (`typeSafeProviderState`). It is in `INTERNAL_KEYS` for its own reason: off turns the command guard's backend back to chat, and that key is already human-only. See `docs/plans/2026-09-19-typesafe-provider-row-master-switch.md`.
+`llm::judgment::select::system_one_for` reads them per call instead, which is what makes them hot-swap with no subscriber. Each is the master switch above every `judgment_*` preference that picked a row on its provider. Each of those is written from its site's model picker rather than a switch (ADR 0224). The rows cannot ask `/health` what is configured, so they read what the page can see in place of that list (`systemOneProviderState`): a stored key, or the custom endpoint's URL. They are human-only for their own reason: off turns the command guard's backend back to chat, and that key is already human-only. See `docs/plans/2026-09-19-typesafe-provider-row-master-switch.md`.
 
 ### model-only text
 The `LlmResponse::model_only_text` field: text a model produced that the USER must not see and the MODEL must. The single reader is `LlmResponse::history_text`, which the *agentic loop* calls when it rebuilds an assistant turn. Gemini alone sets it. It narrates its plan in ordinary (non-`thought`) text parts beside a `functionCall`, which is working notes rather than a printable answer. So `content` stays `None` and nothing streams or persists.
@@ -3172,7 +3342,29 @@ Nulling `content` alone also erased that text from the model's own history. Gemi
 A subset of *Event* (see user-facing glossary): past-tense, written to the `events` table by `EventBus::emit`, replayable, visible to projections, matched by triggers. The default flavor.
 
 ### Preference catalog
-The single source of truth (`crates/lucidos-engine/src/core/preference_catalog.rs`) for the agent-settable *preferences* (user-facing term). A static `CATALOG: &[PrefSpec]` declares each key's scope (`PrefScope::Global` / `Device`), allowed values (`PrefValue`), default, description, and write side-effect (`PrefSideEffect::{None, Language, Timezone, Push}`); a separate `INTERNAL_KEYS` list names known-but-not-settable keys (command guard, *max tool calls*, backup last-run state, keybindings) with a hint. (The backup *schedule*/*provider*/*retention* ARE settable: they live in `CATALOG`; only `backup_last_run` stays internal.) The `set_preference` tool gates writes against it (reject unknown/internal/invalid); `get_preferences` renders it. NOT consulted for storage: the authoritative value still lives in the `preferences` table. Both write paths (the tool and HTTP `PUT /preferences`) funnel through `LucidosEngine::apply_preference_write` (`engine/preferences.rs`), which reads the catalog only to dispatch a key's side-effect; that chokepoint is permissive about the key (the HTTP/Settings path writes internal keys too), so the catalog *gate* lives in the tool handler, not the chokepoint. Kept in lockstep with `system-knowhow/preferences.md` by a sync test (`.claude/rules/system-knowhow.md`).
+The one place every preference key, its allowed values and its default are written: `crates/lucidos-engine/src/core/preference_catalog.rs` (ADR 0368).
+
+- **One `PrefSpec` per key**, held by a named *preference handle* and listed in `CATALOG`. It declares the key's access, scope, `PrefValue`, `PrefDefault` and write side effect.
+- **Every key the engine names is in it.** `PrefAccess` marks who may write: `Agent`, `Human { hint }` or `Engine { hint }`. `internal_specs()` and `is_silent_key` are views of the one list, which replaced `INTERNAL_KEYS` and `SILENT_PREF_KEYS`.
+- **A default is a value, unset, or inherited.** `PrefDefault::Inherits` names another spec, so the background model keys follow each other without a second table.
+- **The agent's tools read it.** `set_preference` refuses a non-agent key with its hint, and `get_preferences` renders each default with `default_label()`.
+- **The frontend reads a generated copy**, `packages/lucidos-sdk/src/generated/preference-catalog.ts`, with a staleness test.
+- **It is not storage.** The value lives in the `preferences` table. Both write paths funnel through `LucidosEngine::apply_preference_write`, which reads the catalog only for side effects.
+
+A sync test keeps `system-knowhow/preferences.md` in lockstep, keys and stated defaults both.
+
+### Preference handle
+A typed const per catalog entry, `Pref<K>`, reached as `crate::core::prefs::X`. It is the only way engine code reads a preference.
+
+- **The kind fixes the return type.** `Flag` returns `bool`, `Number` an `f64` held in the spec's bounds, `Text` a `String`, and `Optional` an `Option<String>`. A defaulted kind never returns `Option`, so a caller has no fallback to pass.
+- **A mismatch does not compile.** Each kind's `const fn` constructor refuses a spec of another shape.
+- **`read` is total and `try_read` keeps the error**, for a caller that must choose a direction on an unreadable row. `stored` returns the raw row, for a reader with an env layer between the row and the default.
+
+### One definition per value
+The rule that a value is written in one place and every other place reads it (ADR 0368, `.claude/rules/one-definition-per-value.md`). Readers resolve defaults from the source, a second language gets a generated copy, and tests reference a constant rather than restate it. A *pin test* is the fallback where a copy can neither import nor be generated.
+
+### Pin test
+A test that reads a hand-written copy of a value and fails when it differs from the constant it copies, rendered from that constant. It is the last resort under *one definition per value*, for a copy nothing can import or generate: a shell script, or prose the LLM reads raw. The table-driven ones are `engine/value_pins_tests.rs` and the gateway's `value_pins_tests.rs`, and `harden_suites.sh` selects them when a pinned file changes.
 
 ### Pending preference write
 A *preference* value the frontend has already applied locally but the engine has not accepted yet. It is parked in `store/actions/preferences.ts` and re-sent from `startClient`'s resume handler.
@@ -3233,13 +3425,17 @@ A loaded thread whose event log this device may have fallen behind on while it w
 
 A sync point (an iOS PWA wake, an SSE reopen after a drop, a `Lagged`, an engine restart) used to answer the possibility by fetching: `runResumeSync` and `resyncLoadedThreads` each issued one incremental `refreshThreadEvents` per loaded thread, bounded to `THREAD_EVENTS_FETCH_CONCURRENCY` at a time. Bounding turned a burst into a queue but still spent a request on every thread in the map, none of which the user was looking at. They now call `markLoadedThreadsStale()` and refresh the FOCUSED thread only; `focusThread` calls `refreshStaleThreadEvents` for the rest, one at a time, as they are opened.
 
-What makes that safe is that **nothing a background thread contributes to the drawer comes from its events**: the status dot, the Current / Review / Running / Attention sections, the badges and the counts all read `meta` (`effectiveThreadStatus` is `meta.status` plus pending rows, `getCodingAgentWaitingInfo` takes a `ThreadMeta`, `family-graph.ts` reads no event at all), and `meta` is refreshed for every thread the response covers by the single `loadAllThreads` request the same sync point already makes. Events are read by the transcript, which renders one thread. The known gap is a loaded thread that has fallen outside every `loadAllThreads` window (an archived row paged in earlier, or a family extension), whose meta was previously refreshed as a side effect of its own refresh's `currentAggregate` and now waits until it is opened; such a thread is terminal by construction, and the identical one is already unrefreshed whenever it was never opened, since the fan-out only ever covered `eventsLoaded` threads.
+The open thread's mark is also retried on every health poll (`checkConnection`). The sync point's own refresh of it can die in transport, the iOS wake case, while the thread-list read beside it lands. The header then shows the new status over a transcript that stops short of it. The reported case read "Waiting for your answer" over a turn still "Working". A live SSE event never closes that gap, since it carries only itself. So the poll keeps asking until one refresh lands and clears the mark.
+
+What makes that safe is that **nothing a background thread contributes to the drawer comes from its events**. The status dot, the Current / Review / In flight / Attention sections, the badges and the counts all read `meta`. `effectiveThreadStatus` is `meta.status` plus pending rows, `getCodingAgentWaitingInfo` takes a `ThreadMeta`, and `family-graph.ts` reads no event at all. The single `loadAllThreads` request the same sync point already makes refreshes `meta` for every thread the response covers. Events are read by the transcript, which renders one thread.
+
+The known gap is a loaded thread that has fallen outside every `loadAllThreads` window: an archived row paged in earlier, or a family extension. Its meta used to refresh as a side effect of its own refresh's `currentAggregate`, and now waits until it is opened. Such a thread is terminal by construction. The identical one is already unrefreshed whenever it was never opened, since the fan-out only ever covered `eventsLoaded` threads.
 
 Three rules keep the mark honest. It is **rebuilt** from `threadMap` at each sync point rather than added to, so an entry cannot outlive its thread: both optimistic-send rollbacks delete a row carrying `eventsLoaded: true`, the exact shape that would otherwise accumulate over a long-lived PWA session (and the reason the failure maps next door need a `dropDepartedThreads` reconcile). Only a **landed** fetch clears one, and either fetch qualifies, since a full load carries no `after` and so subsumes a refresh; a transient failure, a verdict and a coalesced decline all leave it set, which is what makes re-opening a thread a genuine retry. And a fetch counts only if it **started after the gap opened**, which is what `staleMarkedAtToken` (the `fetchAttemptSeq` value at the last mark) answers when compared against the attempt's own token. A request issued before a gap carries a snapshot that predates it, and that ordering is ordinary rather than exotic: WebKit routinely leaves a fetch hanging across an iOS suspension, so "request out, device sleeps, events emitted, device wakes and marks, request lands" happens on any wake with a slow request outstanding. Same discipline as the `lastRefreshReport` high-water mark.
 
 That last rule has **two** faces, and the second is the sharper one. Such a fetch may not CLEAR the mark, since the gap it would be claiming to close is one it never covered. It may also not be COALESCED INTO: `refreshThreadEvents`' `{ coalesce: true }` declines a duplicate only when the live attempt is newer than the mark, because handing a pre-mark attempt to a caller acting on the current mark leaves that caller with no request at all, and the thread the user has just opened stays stale with nothing in flight to fix it. `resyncLoadedThreads` is where that bites, since it marks without resetting the fetch guards, so a refresh outstanding from before the `Lagged` is still claiming the slot; `runResumeSync` happens to be immune only because `clearThreadFetchGuards` drops every claim immediately before it marks.
 
-Deliberately **not** one of the guards `clearThreadFetchGuards` resets, which is the easy mistake to make since both live in the same module: that function runs at the top of `runResumeSync`, the very place the marks are set. It is also mutated without a paired `threadMap` signal write, unlike `eventsLoaded` / `eventsLoadFailed`, because nothing renders off a mark; it is read imperatively at focus time to decide whether to issue a fetch.
+The mark is deliberately **not** one of the guards `clearThreadFetchGuards` resets. Both live in the same module, so that mistake is easy to make. That function runs at the top of `runResumeSync`, the very place the marks are set. The mark is also mutated without a paired `threadMap` signal write, unlike `eventsLoaded` / `eventsLoadFailed`, because nothing renders off it. It is read imperatively, at focus time and on each health poll, to decide whether to fetch.
 
 ### Transient event
 A subset of *Event*: past-tense, broadcast over SSE only, never persisted, never reaches projections or the trigger matcher. A trigger on a transient event can never fire — it isn't even allowlistable, because the scheduler's matcher only looks at persisted events. Routing is determined by `ThreadEvent::is_persisted()` / `SystemEvent::is_persisted()`.
@@ -3249,6 +3445,9 @@ The enumerated half of the deterministic private-data guard: the exact tokens (c
 
 ### Private-data exceptions list
 The `private-data-exceptions` block of the *private-data denylist*: `<ERE token> => <space-separated paths>`, meaning the token is legitimate **only** at those paths. It exists for project identity — a contributor's real name is legitimate as the copyright holder, governance owner, code-of-conduct contact, or credited contributor, and illegitimate everywhere else (fixtures, examples, device labels, home paths, incidental mentions). Each such name is denied outright and its attribution sites enumerated beside it, so the same name anywhere else is a release-blocking hit. Deliberately preferred over narrowing the token to a possessive/path form, which silently permits every other bare use. Each entry is scanned in its own `git grep` pass with its paths excluded.
+
+### Proxy-origin marker
+The `x-lucidos-proxied` header the credentialed proxy puts on every request it forwards (`proxy::PROXY_ORIGIN_HEADER`). It goes on after the proxy strips the caller's `x-lucidos-*` headers, so no caller can remove or forge it. Every engine refuses an inbound request carrying it, with a 403, before any credential is read (`proxy::refuse_proxied_request`). An `apis.json` entry aimed at this engine, a sibling or the gateway therefore never reads as the shell. A self-loop dies on its first hop.
 
 ### Plugin catalog cache
 What the last marketplace scan found, kept at `.lucidos/plugin-catalog.json` so a page open never waits for one. A scan git-clones every registered marketplace, which costs seconds per repo. `GET /api/v1/plugins/catalog` used to run one per request, and now reads this file instead. The scan runs on the scheduler (`scheduler::plugin_updates`), whose identical five-minute pass previously kept only the update candidates.
@@ -3317,7 +3516,10 @@ source-scan guards in `noAutofill.test.ts`. See `.claude/rules/frontend-css.md`.
 The distinction the product-philosophy lens turns on, applied to a proposal that adds a **surface** or an **integration** (`docs/philosophy.md`, `.claude/rules/philosophy.md`). A **ramp** reaches out to where the user already is and leads back into the *workspace*: an OS notification banner, a share-sheet entry, a widget showing what a *trigger* found, a link in an email, a data source pulled from somebody's cloud, an app downloaded from a store. It holds no state and its whole payload is a way in, so it is wanted. Lucidos deliberately builds ramps inside Apple's and Google's systems, because that is where people already are, and the clause that keeps that honest is that we own the fallback (the headless tarball against the notarized `.dmg`). A **room** is somewhere the user works *instead* of coming to Lucidos: the transcript lives there, the formatting is theirs, the history is theirs, and the workspace is reduced to whatever their protocol can express. Rooms fragment the single memory the product rests on, so they are refused. A proposal that reads as both is a room. Two are already settled as rooms: a chat-platform bridge as *the* interface, and hosting one of our agents (the *Lucidos Agent* or a *coding agent*: the objection does not turn on which) inside another editor via a third-party agent protocol. The distinction is deliberately silent on anything whose destination is our own client (a `lucidos://` scheme, another client of ours); argue those on cost and mechanics, never by citing the philosophy.
 
 ### Projection
-A cached materialized view maintained by EventBus inside `emit()`, in the same transaction as the source event INSERT — `thread_summaries` (from thread lifecycle events), `notifications` (from `NotificationCreated`), `pinned_apps` (from pinning events). The *event store* is the source of truth; projections are recomputable, and consistent with it under read-your-write. See the `EventBus` struct doc-comment in `crates/lucidos-engine/src/engine/event_bus.rs` for the full five-phase pipeline (Validate → Persist → **Project** → CaptureAggregate → PostCommit).
+A cached materialized view maintained by EventBus inside `emit()`, in the same transaction as the source event INSERT. Examples: `thread_summaries` (from thread lifecycle events), `notifications` (from `NotificationCreated`), `pinned_apps` (from pinning events). The *event store* is the source of truth; projections are recomputable, and consistent with it under read-your-write. See the `EventBus` struct doc-comment in `crates/lucidos-engine/src/engine/event_bus/mod.rs` for the full six-phase pipeline (Serialize → Validate → Persist → **Project** → CaptureAggregate → PostCommit).
+
+### Thread append lock
+The per-thread Postgres advisory lock that every append of an `events` row with a `thread_id` takes right after its *in-flight append lock* (`EventBus::lock_thread_append`). It is the `Serialize` phase of `emit()`, and `replay_historical_event` takes it too. Held until commit, it makes a thread's events commit in sequence order, which every `sequence > after` catch-up relies on. Only the in-flight append lock may precede it, so a waiter can never close a deadlock cycle (ADR 0364). It orders one thread only, so a reader keeping a global sequence mark reads a *committed horizon* instead (ADR 0360).
 
 ### Front door
 The **deployed `lucidos.dev` origin** as a delivery surface in its own right: what the advertised `curl -fsSL https://lucidos.dev/install.sh | sh` actually reaches. It is more than `install.sh`. A piped install has no checkout, so `_source_libs` fetches the helper libs from `${LUCIDOS_INSTALL_URL%/install.sh}/scripts/lib` too, and the publisher rewrites the baked `LUCIDOS_INSTALL_URL` to this origin, which makes `/scripts/lib/*.sh` part of the front door rather than an implementation detail of the repo. **`/uninstall.sh` is part of it too**, and on a sharper edge: `install.sh --uninstall` fetches it from the same origin and runs `exec bash -c "$payload"` on what comes back, while `curl -fsSL <origin>/uninstall.sh | sh` pipes the same bytes straight into a shell, so a soft-404 there does not fail, it *executes the landing page*. Worth its own term because it **regresses independently of any commit**: the *stripped release tree* can be perfect and every install-smoke job green while the origin serves something else entirely. On 2026-07-29 the Cloudflare Pages deploy published `/install.sh` but not the helper libs, and because Pages soft-404s (landing-page HTML at status **200**) `curl -fsSL` succeeded and the installer sourced HTML as shell. Guarded in three independent places, deliberately not folded into one: the publisher uploads + post-deploy-verifies the libs, `install.sh` fails closed on an HTML payload, and `install-smoke.yml`'s **`front-door`** + **`front-door-macos` jobs** run the advertised command against the origin, daily on a cron and on a `workflow_dispatch` whose `origin` input says which front door to test. The post-publish run is that dispatch, fired by the site publisher after `SitePublished`, NOT the `release: published` webhook: the Pages deploy runs outside CI, so the webhook arrives mid-deploy and would verify the previous origin. The front door is **per-platform**, which is why there are two jobs: `install.sh` resolves a different tarball per host triple, so a green `ubuntu:22.04` run says nothing about `aarch64-apple-darwin` or `x86_64-apple-darwin` (the latter being where the landing page sends Intel Mac users, since the DMG is aarch64-only). The macOS job differs only in launch shape (with `launchctl` present `install.sh` registers a launchd job and exits 0 instead of holding the foreground), so it never treats an exited installer as a failure. Since 2026-07-30 those jobs also assert the **uninstall** half in full mode (rungs 5-8): `--list` through both the delegation and the direct piped front door, a data-safe removal that must keep the data dir (and, on macOS, boot out the launchd agent), and `--all --purge` that must really remove the instance data and the shared runtime. Distinct from every other install-smoke job, which tests a *tree* or an artifact built from one. Each of those jobs resolves ONE origin per run, so a fourth job, **`front-door-parity`**, exists solely to compare this front door's *publish route* set against the *RC front door*'s. See also *RC front door*, *publish route*.
@@ -3337,7 +3539,9 @@ The rc push also builds what SHIPS. `release-tarballs.yml` has an `rc/**` arm, s
 The one commit a release puts on the public mirror: the *stripped release tree*, committed with the internal *release commit*'s identity and dates, carrying the **previous** release's published commit as its single parent. It is what the mirror's `main` and its `v<version>` tag both name, and the same object throughout: built once in Phase A, tested on `rc/<version>` as the *release candidate*, then promoted verbatim. Call it that, **not** "the orphan commit": it was parentless until 2026-08-04, which is why `github.com/lucidos-dev/lucidos` showed a one-commit history with 36 unrelated tags, and ADR 0039 chained it. A parent is safe here for one specific reason and only that reason: a push sends every reachable object while `release_tree_scan` inspects only the tip tree, so the parent is REQUIRED to be the SHA the mirror's own `main` already holds, and the push then adds nothing the public does not already have. `release_tree_ancestry_is_published` enforces exactly that (at most one parent, so a merge is refused; that parent equal to the mirror's `main`; parentless only against an empty mirror), and the push to `main` is `--force-with-lease`d against the same SHA.
 
 ### Stripped release tree
-The only tree Lucidos ever publishes: `HEAD` (or the release commit) minus every `RELEASE_TREE_EXCLUDE_PATHS` entry, with `WORKSPACES.md` replaced by the public stub, scanned by `release_tree_scan` (fail-closed on a hit AND on a denylist that won't load). Built by `release_tree_build` in a throwaway index, so the working tree and real index are untouched. `scripts/lib/release_tree.sh` is the single definition — the *release candidate* push and `release-to-lucidos.sh` both call it, because a duplicated exclusion list is how internal content leaks. The lib and its test exclude themselves.
+The only tree Lucidos ever publishes. It is `HEAD` (or the release commit) minus every `RELEASE_TREE_EXCLUDE_PATHS` entry, with `WORKSPACES.md` replaced by the public stub. `release_tree_scan` scans it and fails closed on a hit and on a denylist that will not load. `release_tree_build` builds it in a throwaway index, so the working tree and real index are untouched.
+
+`scripts/lib/release_tree.sh` is the single definition. The *release candidate* push, `release-to-lucidos.sh` and the e2e *GitHub mode* push all call it, because a duplicated exclusion list is how internal content leaks. The lib and its test exclude themselves.
 
 ### Promotion (release)
 Phase B's publish step: pushing the **already-validated** *release candidate* commit object onto the mirror's `main` (under `--force-with-lease` against the parent it was built on) and tagging it `v<version>` **by SHA**, as opposed to rebuilding an equivalent tree at publish time, which would ship an object CI never saw. Gated by `release_promote_preflight`, which refuses when no `RC_COMMIT` was recorded, when `rc/<version>` is absent from the mirror, when it **moved** (someone re-pushed ⇒ stale gate result), when no `RC_PARENT` was recorded, when the mirror's `main` **moved** off that parent (a release landed since), when the staging manifest's `source_commit` ≠ the worktree HEAD, or when a staged artifact's sha256 drifted. It also refuses the wrong argument count, since the parent pair was appended to an older signature and a five-argument caller would skip that half in silence. Driven by `release-to-lucidos.sh --promote-rc <sha>`; `release.sh --push-rc <version>` re-arms the gate without a rebuild. See ADR 0024. The source-side half that follows it is the *release landing*.
@@ -3565,11 +3769,21 @@ What became of one *step* in a rendered exchange, as the frontend models it: the
 **`'blocked'` and `'denied'` are the two halves of a permission decision**, reading "Needs approval" and "Denied". A gated call used to open at `'pending'`, so a command blocked on a human shimmered like one that was running. A *permission card* also parks the thread at `waiting_for_user_answer`, which the `threadIdle` sweep read as finished. The un-run row then took a green check instead, and which of the two you saw was a race. Both live outside `'pending'`, which is what exempts a held row from the sweeps and from `liveStepInBody`.
 See also: `docs/plans/2026-08-03-unfinished-step-outcome.md`, `docs/plans/2026-08-25-permission-blocked-step-state.md`.
 
+### Sub-agent step
+A step a Claude Code sub-agent took: a tool call made inside the session's own `Agent` call. Its `CodingAgentToolCalled`, `CodingAgentToolResult` and `ContextCaptured` carry `parent_tool_use_id`, the id of that `Agent` call. The transcript nests these steps under the agent's row, folded, with one line beneath it: a running agent's latest step, or an ended agent's outcome mark and how it ended, "Done" on success (`SubAgentStepGroup`). The sub-agent's own prose is a `CodingAgentTextStreamed` carrying the same field, recorded but kept out of the session's reply. A capture binds to every step sharing its *API call id*, or, without one, to the last step of its own agent. Rows written before the field render flat (ADR 0371).
+
+### API call id
+The coding agent's own id for one model API call, carried as `api_call_id` on `CodingAgentToolCalled` and `ContextCaptured`. For Claude Code it is the response's `message.id`, which every frame of that message repeats. One API call can make several tool calls, a *parallel batch*. The id is how the transcript shows that call's context figure on every row of the batch. Position cannot do it: a sub-agent's capture arrives after the first call of its batch, the session's after the last. Codex reports usage per turn, so it carries none, and neither do rows written before the field.
+
 ### Step row
 One row of the transcript's step list, and **one per action**: the model's thinking and the call that thinking produced share a row rather than taking two (`.inline-step`, rendered by `InlineStep` in `components/chat/chat-exchange-parts.tsx` from either projection in `store/thread-events/exchange-render.ts`). The row is born as an unnamed `Thinking` marker when the LLM call starts, shimmers while it has nothing to say, and **renames itself** to the tool the call produced (`nameThinkingRow`), keeping the context snapshot bound to it, the reasoning it streamed, and its pending outcome, since the tool it just named is now what is running. Only the first call of a thinking pass takes the row, whether it was still pending or already resolved by the pass's own prose (see below): naming it stops it matching `isThinking`, so parallel calls push rows of their own, which they must, because a result pairs back by `tool_use_id`. A pass that answers in text calls nothing, so its row stays a resolved `Thinking` marker in place, which is where that call's context counter lives.
+A *sub-agent step* never takes the row. The `Thinking` marker is the session's own, so a sub-agent's call always opens a row of its own.
 On a **coding-agent** turn the row is DERIVED rather than born from an event, because the backend emits nothing where the engine emits `ThoughtStreamed`. Both projections append one pending `Thinking` row at the end when the turn is live and nothing is pending (`needsLiveThinkingRow`), which is precisely the moment the model holds control. There was otherwise no live row at all in two windows, and the only thing saying work was happening was the "Working" label in the response header: between a `CodingAgentToolResult` and the next `CodingAgentToolCalled`, and, on a turn that RESUMES the subprocess (which emits no `CodingAgentPromptSent`), for the fifteen to twenty seconds between `SessionStarted` and the first tool call. `SessionStarted` is therefore enough on its own to derive the row, and it is the same event that flips that header. The next tool call consumes it by taking the index it occupied, so it renames on screen exactly like the native arm's. Derived at the end and not pushed from the tool-result and text arms, for one reason: the engine flushes coding-agent text at every renderable boundary (`should_flush`), so a multi-paragraph answer arrives as several visible `CodingAgentTextStreamed` events, and a row pushed between them would defeat `mergeAdjacentTextEvents` and split a code block across two markdown documents. It is also gated on the turn being the ACTIVE exchange and on the boundary not being a *switch teardown*, since neither is live however the thread projection reads.
 **Prose does not cost a pass its row either**, and this is the half that took two goes to get right. Visible text resolves the marker, since the model saying something is genuine output, so a narrated pass leaves the arriving call nothing PENDING to name. Until 2026-08-12 the call opened a second row there, which meant every pass that explains itself before it acts printed a `Thinking ✓` above the step it produced: the Lucidos Agent narrates on nearly every pass, so the fold was in practice off for chat threads, and it became visible on every turn once the turn controls started seeded on. `nameThinkingRow` therefore falls back to claiming the pass's own RESOLVED marker, which is the last step row whenever nothing else has taken one since; an `unfinished` marker is excluded, since that turn died and a later call is not that pass continuing. The interleaved projection also MOVES the claimed row to the end, because the prose was pushed after it and renaming in place would put `Running: cd …` above the sentence introducing that command. A blank chunk is a separate case with a separate reason: it never resolves the marker at all (`hasVisibleText`, `store/event-rendering.ts`), because a checkmark there would report a pass that finished nothing. Every `CodingAgentToolCalled` is preceded by a whitespace-only `CodingAgentTextStreamed`, and since the renderer drops a blank text event, the checkmark it used to produce sat directly above the tool row and made the fold look broken on the threads that produce the most steps.
-It carries **two** click targets and is therefore a `<div>` around two `<button>`s rather than one button (a button may not contain another interactive element): `.step-main` opens the *step detail*, and the context counter `.step-context` opens the *context viewer*. The reasoning ticker (the tail of the streamed reasoning, shown in the detail slot) stops at the rename, because a truncated mid-sentence fragment trailing `Running: cd …` is noise; today it only ever has content on Codex threads (Claude Code's headless stream exposes no reasoning, see the `cc-reasoning-dormant` investigation in `docs/temporary-measures.md`, and a chat `ThoughtStreamed` carries a context summary rather than reasoning). An *event wait* rendered as a step row too until 2026-08-10, and no longer does: it is an *event row*, because a step row's outcome icon claimed success on a subscription that was still sleeping.
+It carries more than one click target, so it is a `<div>` around `<button>`s: a button may not contain another interactive element. `.step-main` opens the *step detail*, and the context counter `.step-context` opens the *context viewer*. An `Agent` row with sub-agent steps adds its fold toggle on both sides of `.step-main`.
+
+The reasoning ticker is the tail of the streamed reasoning, shown in the detail slot. It stops at the rename, because a truncated fragment trailing `Running: cd …` is noise. Today only Codex threads give it content. Claude Code's headless stream exposes no reasoning (the `cc-reasoning-dormant` investigation in `docs/temporary-measures.md`). A chat `ThoughtStreamed` carries a context summary rather than reasoning. An *event wait* is an *event row*, not a step row: a step row's outcome icon claimed success on a sleeping subscription.
+
 Pressing `.step-main` prefetches whatever the snapshot stripped into the *step detail cache* (`store/stepDetailCache.ts`). The step detail then opens at its final height rather than growing when the fetch lands.
 See also: `docs/plans/2026-08-06-fold-thinking-into-the-step-row.md`.
 
@@ -3997,7 +4211,7 @@ The predicate is *stale resume*'s exact complement on one field: an empty, activ
 ### Agent error banner
 A coding-agent backend's own report of an upstream failure, delivered on the wire in the shape of an assistant message but authored by the harness rather than the model: Claude Code emits a `<synthetic>`-model line flagged `is_api_error_message: true` whose single text block is `API Error: Stream idle timeout - no chunks received` / `API Error: Response stalled mid-stream. The response above may be incomplete.` It is a SURFACE, not output, and it is the same string the backend then returns as the turn's `result` error, which the engine records as `ResponseFailed` and the transcript draws in its failure card.
 
-So a banner taken as prose states one failure **twice**, which is what the transcript did until 2026-08-10: a paragraph in the response body and the red card immediately beneath it saying the identical thing. `claude_code_parse.rs` now skips the text blocks of a flagged line, which also stops a **sub-agent's** banner leaking into its parent's prose: those ride the parent's stream carrying the same flag, and unlike the parent's they never reach a `result`, so they are dropped rather than moved.
+So a banner taken as prose states one failure **twice**, which is what the transcript did until 2026-08-10: a paragraph in the response body and the red card immediately beneath it saying the identical thing. `claude_code_parse.rs` now skips the text blocks of a flagged line, a **sub-agent's** banner included.
 
 Recognised by the backend's own flag rather than by an `API Error` prefix, deliberately: the prefix is a *temporary measure* elsewhere (transient-vs-permanent classification, and the `is_error: true` + `subtype: success` contradiction), and reusing it here would drop a turn where the model itself writes about an API error. Two things stay downstream of the drop and are not redundant with it: the Result flush declines to emit `result.result` as text when it is verbatim the failure reason (`result_text_is_own_prose`), which is reachable precisely because the banner no longer sits in the text buffer; and the frontend's echo drop (`failureEchoPredicate`) remains the backstop for events older engines already persisted, for the chat channel, for Codex, and for a CC that stops flagging its banner.
 
@@ -4073,7 +4287,7 @@ Built from a registry of named **resident sections** (`voice::sections::SECTIONS
 
 **What is RUNNING is a second line of `workspace-shape`, beside it.** It names the threads the workspace was working on as the call opened, read through the same `status=running` filter the threads-list API uses. The two lines are deliberately unmistakable, in their labels and in a sentence above them: given the waiting line alone, a talker asked what was running read that one out instead, three times in one call. Nothing refreshes the block mid-call, so the running label says when it was read and the talker is told to ask before answering from it.
 
-The `voice_resident_sections` preference names which are on, as comma-separated ids. Settings draws it as one toggle per section, over `VOICE_RESIDENT_SECTIONS` in `store/actions/preferences.ts`, a mirror of the registry that `voice::sections`'s own guard pins. An id nothing defines is ignored with a log line, rather than costing the whole block. An id the registry does not carry survives a toggle, since a newer engine may define one this client has not heard of.
+The `voice_resident_sections` preference names which are on, as comma-separated ids. Settings draws it as one toggle per section, over `VOICE_RESIDENT_SECTIONS`, which the SDK's generated `engine-constants.ts` copies from the registry. An id nothing defines is ignored with a log line, rather than costing the whole block. An id the registry does not carry survives a toggle, since a newer engine may define one this client has not heard of.
 
 **A row that exists means exactly what it lists, and an EMPTY one means none.** Only a row that was never written falls back to `who-and-where`, `this-thread` and `workspace-shape`. The two used to be one case, which would have made the last toggle impossible to turn off.
 
@@ -4099,18 +4313,8 @@ The seam a talker sits behind (`voice::provider`). `VoiceProvider` opens a `Voic
 
 **It does carry one CAPABILITY, `holds_the_answer_tool`.** A talker with no channel to hand a choice id back settles a question card another way (ADR 0205). So `call.rs` has to know which it is talking to. A boolean rather than a name, so nothing above the seam learns which provider answered. It defaults to true, which is what every provider was before one answered false.
 
-### Call naming
-Giving the thread a call runs on a title, from the call's own *spoken exchange* rather than from one utterance (ADR 0208). Same path as the chat titler otherwise: the same model selection, the same validator, the same `ThreadTitleGenerated`, the same projection.
-
-**The exchange is both voices**, the caller's `SpokenMessageReceived` rows and the talker's `SpokenReplyGenerated` rows, oldest first and capped at 40 turns. The talker's half is often where the subject is: in one reported call the caller only ever said "Yeah, please check". `EventStore::get_thread_spoken_exchange` reads it and `chat::title::spoken_exchange_as_title_input` renders it, naming each speaker.
-
-**It fires at the first caller utterance that FOLLOWS a talker reply.** An opening "hey" names nothing, and what a caller says after an answer is about something. That signal doubles as the floor. A call with only one voice in it is never named here. It is handed back to the chat titler, so words typed on that thread later still name it.
-
-Three sites ask, and they differ only in when: `call.rs` through the `ThreadNamer` seam (`voice/naming.rs`), `api::voice` once the call is over, and the chat titler on a delegated turn. All three reach `LucidosEngine::spawn_call_title_generation`, which decides everything and answers whether there is a call here to name.
-
-**Guarded twice, because `thread_has_title` alone cannot hold it.** A name takes a model call, so two askers a second apart both read "no name yet". The call loop asks once per call, and every titler takes a per-thread naming slot (`threads_being_named`), the chat one included.
-
-See also: *talker*, *spoken merge*, *voice session*, ADR 0208.
+### Call naming (retired)
+Titling the thread a call ran on from the call's spoken exchange, at the first caller utterance that answered a talker reply (ADR 0208). It was retired once calls ran only on the home thread (ADR 0362), which never takes an automatic title, so it could never name anything. The term survives here only so a reader meeting it in ADR 0208 can look it up, and no code implements it. The per-thread naming slot it shared (`threads_being_named`) still guards the chat titler. Plan: `docs/plans/2026-10-05-retire-call-naming.md`.
 
 ### Judgment
 One answer to a typed question about a state, carrying the probability of every
@@ -4128,21 +4332,36 @@ than a sentence in a prompt a model may ignore.
 The backend answering a *judgment* (`llm::judgment::JudgmentProvider`). A
 sibling of `LlmProvider`, never a kind of one: `chat` takes messages and returns
 text, while this takes a state plus named questions and returns typed answers.
-`JevProvider` is the only implementation, over TypeSafe's System One endpoint.
+Two implementations (ADR 0363):
+
+- **`SystemOneProvider`** posts to any endpoint speaking TypeSafe's System One
+  API. `llm::judgment::endpoint` holds the rows: Jev, Cloudflare's Clef and
+  Clef-flash on Workers AI, and a custom endpoint URL the user sets, such as a
+  self-hosted model. Each provider has its own master switch.
+- **`ChatJudgmentProvider`** asks a chat model the same questions. The answer
+  comes back through one tool whose schema the questions define, and Rust
+  normalises it into a distribution, dropping anything malformed.
+
+**Every site speaks this trait alone.** The command guard's judge, query
+classification and the recall tools' `find` (`JudgmentSite::MemoryFind`) each
+ask through it, and each keeps its threshold in Rust. A missing answer reads as
+the site's safe default: *ask* for the guard, *load* for classification, *not
+relevant* for `find`.
 
 **A call site is never switched over by a credential.** Each one owns a
-preference naming `chat` or `jev`, and `chat` is the default and the unset
-value. Storing a TypeSafe key therefore changes nothing on its own. Two sites
-can be converted today: the command guard's judge, and query classification.
-Each keeps its prompt-and-parse code as the path it falls back to.
+preference naming `chat` or a System One row id (`jev`, `clef`, `clef-flash`,
+`custom`), and `chat` is the default and the unset value. So an untouched
+workspace runs every site on a chat model. A System One pick has the site's
+chat model behind it, used when the System One call fails (`for_site`).
 
 **The preference is written from the site's MODEL control, not from a switch.**
-`TypeSafe (Jev)` is a row in that picker beside the chat models, so a backend is
-chosen where a model is (ADR 0224). Picking it writes `jev` and leaves the
-stored model alone; picking any model writes `chat` and the pair. The row is
-offered only when the provider can answer, or when the site already runs on it.
+Each configured System One row sits in that picker beside the chat models, so a
+backend is chosen where a model is (ADR 0224). Picking one writes its id and
+leaves the stored model alone; picking any model writes `chat` and the pair. A
+row is offered only when its provider is set up and on, or when the site already
+runs on it.
 
-See also: ADR 0220, ADR 0224, *command guard*, *judge tool*.
+See also: ADR 0220, ADR 0224, ADR 0363, *command guard*, *judge tool*.
 
 ### Judge tool
 The agent's own route to a *judgment*, `judge` (ADR 0223). It takes a state and
@@ -4157,9 +4376,9 @@ prose. What earns it a place is batching, calibration and cost, and its schema's
 main job is to stop a fan-out: the engine runs a round's tool calls one after
 another, where one call carrying fifty questions is a single round trip.
 
-**A failure is reported, never answered around.** The two sites fall through to
-their own path when Jev errors. This caller has none, and inventing an answer
-would be a lie about a number.
+**A failure is reported, never answered around.** The judgment sites fall back
+to their chat model when a System One call errors. This caller has none, and
+inventing an answer would be a lie about a number.
 
 ### Drawn caret
 The composer caret Lucidos paints itself when the `composer-text` *theme part*
@@ -4191,9 +4410,168 @@ One definition: `engine/title_match.rs` (`TitleMatch`, `TitleRank`). The fronten
 
 See also: ADR 0348.
 
+### Text search
+The Search Everywhere category (`text`) that finds a literal phrase inside workspace files, ignoring case. It scans `artifacts/`, `apps/`, `knowhow/` and `triggers/` live, with no index. It skips binary files, invalid UTF-8, build output and files over 2 MB, and says how many large files it skipped. Distinct from the Files category, which matches names and paths only.
+
+One result is one matching line: the snippet with the match highlighted, plus the path and line number. Opening it shows the file at that line. The All tab shows up to five lines after every name section. The Text tab lists every match, up to 5,000 lines.
+
+One definition: `engine/text_search.rs`, served by `GET /api/v1/search/text`. Lines rank by *title rank* level on the line, then newest file, then path.
+
+See also: ADR 0383.
+
+### Summary tree
+A binary tree of summary lines over a log (ADR 0362). Each *thread* in scope
+has one over its own entries, and the workspace has one whose leaves are
+settled thread turns and artifact writes. A trigger thread is in scope once it
+holds a human message. A node covers `start+span` entries, span a power of 2.
+A message of 512 bytes or less is its own node. Not the *thread* tree, which is
+the parent and *sub-thread* hierarchy.
+
+- **The log is the events table**, read through the projection in
+  `engine/summary_tree/log.rs`. Only the nodes are stored, in
+  `summary_tree_nodes`.
+- **Positions are a function of events.** A thread delete removes its leaves,
+  so later workspace leaves move up and every merge after them is rebuilt.
+- Built by the *compactor*. A Tree workspace reads them through its *memory
+  views* and the *recall tools*. The user reads them in the *summary tree
+  browser*.
+
+### Summary tree browser
+Settings → System → Memory on the Tree *memory module*, in place of Classic's
+memory inspector (`components/settings/SummaryTreeBrowser.tsx`). It shows the
+top of the workspace's *summary tree* or any thread's, from
+`GET /api/v1/memory/tree`. Each line opens one level through the *recall
+tools*' `zoom`, so it shows exactly what the agent sees.
+
+### Memory view
+What a Tree turn preloads of a *summary tree* (ADR 0362), from the fold in
+`engine/summary_tree/fold.rs`. OptChat's fold: each entry's line is appended,
+and the most due pair of sibling lines merges while the view is over budget.
+Source: "OptChat - HOW TO REPLICATE MY SETUP" by Victor Taelin,
+<https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449>,
+gist revision f51fe5c9, read 2026-10-06. Section numbers refer to that
+revision.
+Detail fades with age in steps, and the view changes near its end. Every read
+replays the *built prefix*, where every node is built, from entry 0. Newer
+entries follow in a reserve.
+
+- The *workspace memory view* rides as a *view snapshot* plus a recent block.
+- The *thread memory view* reads an unbuilt leaf from its event. It leads the
+  message cut at two cache marks on line ends, so consecutive turns read its
+  stable start from the prompt cache.
+- Sized in bytes, never tokens, per surface and per model
+  (`workspace_view_bytes_*`, `thread_view_bytes`, `memory_view_model_caps`).
+- Not `ThreadView`, the transcript component. The engine's `view::ThreadView`
+  is the rendered thread memory view with its marks.
+
+### Built prefix
+The longest start of a *summary tree*'s log over which every node is built
+(`built_prefix_end` in `engine/summary_tree/fold.rs`). A *memory view* replays
+only this prefix, so a longer one extends the shorter one's view exactly.
+Entries past it follow as leaves. Not a *settled* turn, which is a finished
+turn of a thread.
+
+### View snapshot
+The frozen workspace *memory view* that every thread of one budget shares,
+byte for byte, within its epoch (`engine/summary_tree/view.rs`). Entries newer
+than it ride in a recent block after the thread memory view. It rolls over
+when that block passes 8 KB, or half the budget when that is smaller. Its block
+carries a cache breakpoint, so another thread's settled turn does not break
+this thread's cache prefix. Held in memory: a restart folds afresh.
+
+### Compactor
+The background job that writes *summary tree* nodes on an auxiliary model,
+under the `summary_compaction` purpose (`engine/summary_tree/compactor.rs`).
+A thread's leaves build in order; the workspace's build at once, since a turn
+leaf reads only its own turn's entries. It merges only built children. Model
+calls run in *compactor lanes*. A failed node retries every 10 seconds without
+holding up other scopes. Progress lives in `summary_tree_scopes`, so a restart
+resumes the backfill, and the workspace row's `backfilled_at` is the ready flag. It
+runs exactly while the *memory module* is `tree`: one compactor per engine,
+paused and resumed as the preference changes. A pause clears the ready flag,
+so a workspace switched back reads Classic until the compactor catches up.
+
+### Compactor lane
+One provider route's share of *compactor* calls (`summary_tree/limit.rs`),
+keyed `provider/wire id`. It allows 64 calls at once to start, between 1 and
+128. Each success adds `1 / limit`; a rate limit, overload or timeout halves
+it, once per window. A call for a live event takes a freed place before any
+backfill call. Held in memory: a restart starts each lane at 64 again.
+
+### Ready window
+The threads the ready flag waits on besides the workspace tree: those active
+in the last 7 days (`READY_DAYS` in `summary_tree/mod.rs`). Older threads fill
+in after the flag is set, and until then read as raw entries (ADR 0362, I7).
+
+### Compactor models
+`COMPACTOR_MODELS` in `summary_tree/compactor_models.rs`: the models the
+compactor comparison measured, each with its list price and per-call token seed
+for the *Tree backfill estimate*. Every *compactor default* entry is a row, so
+the default always has a price. No picker reads it: every background picker
+offers the registry's models, its recommended ones first (ADR 0375).
+
+### Compactor default
+The model and tier the *compactor* runs on while `model_summary_compaction` is
+unset: the first of GPT-6.1 Sol, Gemini 3.8 Flash and Sonnet 5.5 that a
+configured provider serves, at `low`, else the chat model. One ordered list in
+`summary_tree/compactor_models.rs` defines it (ADR 0373). The conversation
+summary leads its *auxiliary default* with the same three (ADR 0377).
+`GET /api/v1/models/background` serves the resolved choice.
+
+### Auxiliary default
+The model an *auxiliary model call* runs on while its model preference is unset.
+It is `LUCIDOS_EXTRACTION_MODEL` when set and served, except for the command
+judge. Next comes the purpose's *lead*, the models its comparison measured best:
+GPT-5.6 Luna for fact extraction, the *compactor default*'s three for the
+conversation summary, none for the rest (ADR 0377). Then the purpose's catalog
+default when a configured provider serves it. Otherwise it is the first of
+`AUX_FALLBACKS` (Gemini 3 Flash, GPT-5.4 mini, Haiku 4.5) one serves, and with
+none of those, the chat model. The same list is what Settings recommends first.
+
+`engine/aux_purpose/default.rs` defines it, and `GET /api/v1/models/background`
+serves each row's resolution. A stored pick is never replaced by it. For image
+description the list keeps only models with the *vision flag*, and the chat
+model counts only if it has it too.
+
+### Tree backfill
+The *compactor*'s pass over a workspace's history after Tree is chosen. It
+takes the workspace tree first, then threads newest first, and sets the ready
+flag once the workspace and the *ready window* are built. Until then turns run
+Classic; after, the older threads fill in and Settings shows them under Ready.
+Its progress is
+counted in trees, each in-scope thread plus the workspace, and announced as
+`TreeBackfillProgressed`, then `TreeBackfillCompleted`; leaving Tree emits
+`TreeBackfillReset` (`summary_tree::module::TreeBackfill`). Settings shows it
+as a progress bar. The bar also counts the nodes of each tree under way, so a
+long tree still moves it. It says when a failed node retries.
+The first time, Settings shows a *Tree backfill estimate* and asks for a
+confirm. Once nodes are stored, choosing Tree again resumes at once.
+
+### Tree backfill estimate
+What a *Tree backfill* of this workspace would cost, as low and high bounds:
+calls, tokens, the time until usable and until complete, and a price per
+background model, plus the daily upkeep
+from the last week's activity (`summary_tree/estimate.rs`). The entry counts
+are real, read in one pass over `events`. Entry sizes come from stored payload
+sizes, so they are approximate, which is why every figure is a range.
+
+### Recall tools
+The four tools of the Tree *memory module* (ADR 0362): one grouped `recall` LLM
+tool, offered only on a ready Tree workspace, plus `/api/v1/recall/*` and
+`lucidos recall`, from the capability parity manifest. A node id is
+`w/start+span` or `<thread id>/start+span`. The LLM tool takes the slot of
+Classic's `memory` tool, which a ready Tree workspace is not offered.
+
+`zoom(id, n)` opens a node `n` levels down, through turn leaves into thread
+trees and down to the exact event. `find(query)` walks the workspace tree with
+the `MemoryFind` *judgment provider* site, batching about 40 lines per request. `search(text)` is the
+trigram search over message text, returning tree addresses. `date(id)` gives
+the time range a node covers. Code: `engine/summary_tree/recall.rs`,
+`engine/tools/recall.rs`.
+
 ## When to add a term
 
-Add it here if it's dev-only — engine plumbing, DB schema, test infrastructure, build tooling, CC mechanics. If users (or the workspace LLM) would ever encounter it, add it to `system-knowhow/glossary.md` instead (under **Core** if it's general, or under **Advanced — coding agents** if it's only relevant to coding-agent workflows).
+Add it here if it's dev-only: engine plumbing, DB schema, test infrastructure, build tooling, CC mechanics. If users (or the workspace LLM) would ever meet it, add it to `system-knowhow/glossary.md` instead. Put it under **Core terms** if it's general, or under **Advanced (coding agents)** if only coding-agent workflows need it.
 
 ## When a term changes
 

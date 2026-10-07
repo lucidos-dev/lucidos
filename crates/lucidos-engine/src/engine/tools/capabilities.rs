@@ -53,8 +53,9 @@ impl LucidosEngine {
         // payload all answer from ONE read: a mid-turn Settings change cannot
         // then leave the prompt describing a mode the payload is not in.
         // Total, and an unreadable row resolves OFF.
-        let context_mode =
-            crate::core::PreferenceStore::self_curated_context_mode(&self.pool).await;
+        let context_mode = crate::core::prefs::SELF_CURATED_CONTEXT_MODE
+            .read(&self.pool)
+            .await;
         // Two more rows, and only where they are read. An off workspace pays
         // no query for a schedule nothing consults.
         let schedule = if context_mode {
@@ -70,6 +71,9 @@ impl LucidosEngine {
                 image_provider: self.current_image_provider().await.is_some(),
                 judgment_provider: crate::llm::judgment::judgment_available(&self.pool).await,
                 context_mode,
+                // The one gate an unreadable row closes: closed is Classic,
+                // today's turn, while open would swap the turn's whole memory.
+                memory_tree: crate::engine::summary_tree::module::tree_ready(&self.pool).await,
             },
             intents,
             schedule,

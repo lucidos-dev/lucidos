@@ -64,17 +64,17 @@ reset_process_table() {
 # ── fixture helpers ────────────────────────────────────────────────────
 make_pkg_dir() {
     # Creates a package dir with a package.json and (optionally) a node_modules.
-    # Install-detection is content-based now (see _deps_fingerprint), so what
-    # matters is whether node_modules exists, not relative mtimes: fresh=1 →
-    # node_modules present (no install needed, self-heals a stamp), fresh=0 →
-    # node_modules absent (install needed).
+    # Install-detection is content-based (see _deps_fingerprint), so what
+    # matters is whether a finished install exists, not relative mtimes:
+    # fresh=1 → node_modules with npm's install marker (no install needed,
+    # self-heals a stamp), fresh=0 → node_modules absent (install needed).
     local dir="$1"
-    local fresh="${2:-1}"   # 1 = node_modules present
+    local fresh="${2:-1}"   # 1 = a finished install is present
     mkdir -p "$dir"
     echo '{"name":"x"}' > "$dir/package.json"
     if [ "$fresh" = "1" ]; then
         mkdir -p "$dir/node_modules"
-        echo '{}' > "$dir/node_modules/.marker"
+        echo '{}' > "$dir/node_modules/.package-lock.json"
     fi
 }
 
@@ -417,6 +417,7 @@ test_workspace_member_with_root_deps_skips_install() {
     #   $root/pkg-member/   ( NO node_modules — this is the fresh-worktree case )
     local root="$SANDBOX/wsroot-$$"
     mkdir -p "$root/node_modules" "$root/pkg-member"
+    echo '{}' > "$root/node_modules/.package-lock.json"
     cat > "$root/package.json" <<'EOF'
 {"private":true,"workspaces":["pkg-member"]}
 EOF
@@ -461,6 +462,7 @@ test_workspace_member_install_when_package_json_bumped() {
 
     local root="$SANDBOX/wsroot2-$$"
     mkdir -p "$root/node_modules" "$root/pkg-member"
+    echo '{}' > "$root/node_modules/.package-lock.json"
     cat > "$root/package.json" <<'EOF'
 {"private":true,"workspaces":["pkg-member"]}
 EOF
@@ -506,6 +508,7 @@ test_noop_rewrite_does_not_trigger_install() {
     local PROJECT_DIR="$SANDBOX/proj-noop"
     local pkg="$PROJECT_DIR"
     mkdir -p "$pkg/node_modules"
+    echo '{}' > "$pkg/node_modules/.package-lock.json"
     echo '{"name":"x"}' > "$pkg/package.json"
 
     npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
@@ -576,6 +579,38 @@ EOF
         pass "npm install ran when root node_modules missing"
     else
         fail "npm install did not run; output: $out"
+    fi
+}
+
+# ── Test: an interrupted install is reinstalled, never stamped as current ──
+# `npm ci` wipes node_modules before it installs. Killed mid-way, it leaves a
+# tree with no stamp and packages missing, which every later build fails on.
+test_interrupted_install_is_reinstalled() {
+    echo "test: node_modules without npm's install marker is reinstalled"
+
+    rm -rf "${HOME:?}/workspaces"
+
+    local pkg="$SANDBOX/pkg-interrupted"
+    mkdir -p "$pkg/node_modules/.vite-temp"
+    echo '{"name":"x"}' > "$pkg/package.json"
+
+    npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
+    export -f npm
+
+    local out rc
+    out="$(ensure_npm_deps "$pkg" "test deps" 2>&1)"
+    rc=$?
+    unset -f npm
+
+    if [ $rc -ne 0 ]; then
+        fail "expected exit 0, got $rc; output: $out"
+    else
+        pass "exited 0"
+    fi
+    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
+        pass "npm install ran on an incomplete tree"
+    else
+        fail "an incomplete tree was trusted; output: $out"
     fi
 }
 
@@ -1217,6 +1252,7 @@ test_workspace_member_with_root_deps_skips_install
 test_workspace_member_install_when_package_json_bumped
 test_noop_rewrite_does_not_trigger_install
 test_workspace_member_install_when_root_node_modules_missing
+test_interrupted_install_is_reinstalled
 test_resolves_bare_name_to_home_workspaces
 test_resolves_absolute_path_unchanged
 test_errors_on_missing_workspace
@@ -2449,6 +2485,18 @@ test_a_half_set_gateway_mode_never_builds_a_prefix
 # https-then-http fallback is pinned rather than assumed. No request leaves this
 # process. Same shape as the gateway_stop_status stub above.
 
+# Exit with the next code in $SANDBOX/curl-queue, or 7 (refused) once it is
+# empty. A subshell binds `curl` to this, so the real one never runs.
+queued_curl() {
+    local seq head rest
+    seq="$(cat "$SANDBOX/curl-queue")"
+    head="${seq%% *}"
+    rest="${seq#* }"
+    [ "$rest" = "$seq" ] && rest=""
+    printf '%s' "$rest" >"$SANDBOX/curl-queue"
+    return "${head:-7}"
+}
+
 # Run engine_health_scheme with `curl` exiting with the queued codes in $1.
 # The subshell runs under `set -e`, as start_engine does.
 health_scheme_with() {
@@ -2456,15 +2504,7 @@ health_scheme_with() {
     (
         set -e
         # shellcheck disable=SC2317 # called by engine_health_scheme
-        curl() {
-            local seq head rest
-            seq="$(cat "$SANDBOX/curl-queue")"
-            head="${seq%% *}"
-            rest="${seq#* }"
-            [ "$rest" = "$seq" ] && rest=""
-            printf '%s' "$rest" >"$SANDBOX/curl-queue"
-            return "${head:-7}"
-        }
+        curl() { queued_curl; }
         engine_health_scheme 5173
     )
 }
@@ -2515,9 +2555,30 @@ test_health_scheme_is_empty_and_succeeds_when_nothing_answers() {
     fi
 }
 
+test_health_scheme_bounds_every_probe() {
+    echo "test: engine_health_scheme bounds both probes"
+    # Every gateway launch runs this probe, so an engine that accepts and never
+    # answers must cost seconds, not the whole launch.
+    : >"$SANDBOX/curl-args"
+    (
+        # shellcheck disable=SC2317 # called by engine_health_scheme
+        curl() { printf '%s\n' "$*" >>"$SANDBOX/curl-args"; return 28; }
+        engine_health_scheme 5173 >/dev/null
+    )
+    local probes bounded
+    probes="$(grep -c . "$SANDBOX/curl-args")"
+    bounded="$(grep -c -- '--max-time' "$SANDBOX/curl-args")"
+    if [ "$probes" -eq 2 ] && [ "$bounded" -eq 2 ]; then
+        pass "a timed-out https probe falls to a bounded http probe"
+    else
+        fail "want 2 probes with --max-time, got: $(cat "$SANDBOX/curl-args")"
+    fi
+}
+
 test_health_scheme_reports_https_when_tls_answers
 test_health_scheme_falls_back_to_http
 test_health_scheme_is_empty_and_succeeds_when_nothing_answers
+test_health_scheme_bounds_every_probe
 
 # ── adopt_engine_scheme: the running engine owns its scheme ────────────
 
@@ -2565,6 +2626,121 @@ test_adopting_a_different_scheme_rewrites_the_ports_file() {
 
 test_adopting_a_matching_scheme_changes_nothing
 test_adopting_a_different_scheme_rewrites_the_ports_file
+
+# ── record_engine_scheme: a gateway launch records the engine's scheme ─
+#
+# The bug this pins: a gateway-mode launch reused the running gateway and
+# engine, so neither adopt_engine_scheme nor the gateway's own ports publish
+# ran. The ports file kept the https detect_tls derived from .certs/, while
+# the engine served plain http (ADR 0096), and every CLI call by workspace
+# name then failed its TLS handshake.
+#
+# `curl` is shadowed in a subshell and answers from the same queue as
+# health_scheme_with, so no request leaves this process.
+
+# Seed $WORKSPACE's ports file, run record_engine_scheme under `set -e` with
+# `curl` exiting with the queued codes in $1, and print the in-memory PROTO
+# after. The caller sets WORKSPACE, because callers run this inside `$(...)`.
+record_scheme_with() { # <curl-queue>
+    mkdir -p "$WORKSPACE/.lucidos"
+    printf 'API_PORT=5173\nPROTO=https\n' >"$WORKSPACE/.lucidos/ports"
+    printf '%s' "$1" >"$SANDBOX/curl-queue"
+    (
+        set -e
+        ENGINE_PORT=5173
+        PROTO=https
+        # shellcheck disable=SC2317 # called by engine_health_scheme
+        curl() { queued_curl; }
+        record_engine_scheme >/dev/null
+        printf '%s' "$PROTO"
+    )
+}
+
+test_a_gateway_launch_records_a_plain_http_engine() {
+    echo "test: record_engine_scheme writes the scheme the engine serves"
+    local proto
+    WORKSPACE="$SANDBOX/ws-record-http"
+    proto="$(record_scheme_with "35 0")"
+    if grep -qx 'PROTO=http' "$WORKSPACE/.lucidos/ports"; then
+        pass "the ports file names the plain-http engine"
+    else
+        fail "want PROTO=http in the ports file, got: $(cat "$WORKSPACE/.lucidos/ports")"
+    fi
+    if grep -qx 'API_PORT=5173' "$WORKSPACE/.lucidos/ports"; then
+        pass "the other keys survive the rewrite"
+    else
+        fail "API_PORT was lost: $(cat "$WORKSPACE/.lucidos/ports")"
+    fi
+    # $PROTO names the gateway's door in this mode: the banner, the window
+    # and gateway_curl all build on it, and the gateway keeps its TLS.
+    if [ "$proto" = "https" ]; then
+        pass "the in-memory scheme still names the gateway"
+    else
+        fail "want PROTO to stay https for the gateway URLs, got '$proto'"
+    fi
+}
+
+test_a_silent_engine_leaves_the_ports_file_alone() {
+    echo "test: record_engine_scheme writes nothing when no engine answers"
+    local rc
+    WORKSPACE="$SANDBOX/ws-record-silent"
+    record_scheme_with "7 7" >/dev/null
+    rc=$?
+    if grep -qx 'PROTO=https' "$WORKSPACE/.lucidos/ports"; then
+        pass "no answer is no evidence, so the file is untouched"
+    else
+        fail "want PROTO=https untouched, got: $(cat "$WORKSPACE/.lucidos/ports")"
+    fi
+    if [ "$rc" -eq 0 ]; then
+        pass "an absent engine still exits 0 under set -e"
+    else
+        fail "want exit 0 when nothing answers, got $rc"
+    fi
+}
+
+# Both launchers reach the engine through ensure_workspace_engine_running, on
+# its adopt branch and on its restart branch alike. The helper stubs every
+# host-touching call it makes, so this pins the wiring without a gateway.
+ensure_running_with() { # <engine-is-live: 1 or empty>
+    WORKSPACE="$SANDBOX/ws-ensure-scheme"
+    mkdir -p "$WORKSPACE/.lucidos"
+    printf 'API_PORT=5173\nPROTO=https\n' >"$WORKSPACE/.lucidos/ports"
+    printf '35 0' >"$SANDBOX/curl-queue"
+    (
+        set -e
+        ENGINE_PORT=5173; PROTO=https; GATEWAY_PORT=5251; GATEWAY_WS_ID=ws
+        ENGINE_ONLY=""; LIVE="$1"
+        # shellcheck disable=SC2317 # all called by ensure_workspace_engine_running
+        {
+            engine_on_port_serves_workspace() { [ -n "$LIVE" ]; }
+            gateway_lists_workspace() { return 0; }
+            gateway_curl() { return 0; }
+            wait_for_workspace_health() { return 0; }
+            curl() { queued_curl; }
+        }
+        ensure_workspace_engine_running >/dev/null
+    )
+}
+
+test_both_gateway_branches_record_the_engine_scheme() {
+    echo "test: ensure_workspace_engine_running records the engine scheme"
+    ensure_running_with 1
+    if grep -qx 'PROTO=http' "$WORKSPACE/.lucidos/ports"; then
+        pass "adopting the running engine records its scheme"
+    else
+        fail "the adopt branch left: $(cat "$WORKSPACE/.lucidos/ports")"
+    fi
+    ensure_running_with ""
+    if grep -qx 'PROTO=http' "$WORKSPACE/.lucidos/ports"; then
+        pass "starting the engine records its scheme"
+    else
+        fail "the restart branch left: $(cat "$WORKSPACE/.lucidos/ports")"
+    fi
+}
+
+test_a_gateway_launch_records_a_plain_http_engine
+test_a_silent_engine_leaves_the_ports_file_alone
+test_both_gateway_branches_record_the_engine_scheme
 
 # ── workspace_engine_restart_is_needed: adopt, don't restart ───────────
 #
@@ -2700,6 +2876,69 @@ test_the_health_wait_sends_the_local_token() {
 }
 
 test_the_health_wait_sends_the_local_token
+
+# ── LUCIDOS_EXTERNAL_PG_PORT: a native Postgres replaces the Docker cluster ──
+#
+# E2E GitHub mode sets it on macOS runners, which have no Docker. Both binaries
+# are stubbed, so a call reaching the wrong one shows up in the call log.
+# shellcheck disable=SC2317 # the stubs are called by the functions under test
+test_shared_pg_psql_follows_the_external_port() {
+    echo "test: shared_pg_psql talks to the external port when set, Docker otherwise"
+    local external docker_out
+    external="$(
+        docker() { echo "docker $*"; }
+        psql() { echo "psql $* PGPASSWORD=${PGPASSWORD:-}"; }
+        LUCIDOS_EXTERNAL_PG_PORT=5999 shared_pg_psql mydb -tAc "SELECT 1"
+    )"
+    docker_out="$(
+        docker() { echo "docker $*"; }
+        psql() { echo "psql $*"; }
+        unset LUCIDOS_EXTERNAL_PG_PORT
+        shared_pg_psql mydb -tAc "SELECT 1"
+    )"
+    if [ "$external" = "psql -h 127.0.0.1 -p 5999 -U lucidos -d mydb -tAc SELECT 1 PGPASSWORD=lucidos" ]; then
+        pass "the external port reaches psql over loopback TCP"
+    else
+        fail "external call was '$external'"
+    fi
+    if [ "$docker_out" = "docker exec lucidos-pg-shared psql -U lucidos -d mydb -tAc SELECT 1" ]; then
+        pass "no external port keeps the Docker cluster"
+    else
+        fail "default call was '$docker_out'"
+    fi
+}
+
+# shellcheck disable=SC2317 # the stubs are called by setup_postgres
+test_setup_postgres_on_an_external_port_never_calls_docker() {
+    echo "test: setup_postgres with LUCIDOS_EXTERNAL_PG_PORT skips every Docker step"
+    : >"$SANDBOX/pg-calls"
+    local port
+    port="$(
+        WORKSPACE="$SANDBOX/ws-external"; PG_PORT=5432
+        docker() { echo "docker $*" >>"$SANDBOX/pg-calls"; return 1; }
+        report_docker_daemon_if_down() { echo "daemon-probe" >>"$SANDBOX/pg-calls"; return 1; }
+        psql() {
+            echo "psql $*" >>"$SANDBOX/pg-calls"
+            case "$*" in (*"FROM pg_database"*|*"SELECT 1"*) echo 1 ;; esac
+        }
+        sleep() { :; }
+        LUCIDOS_EXTERNAL_PG_PORT=5999 setup_postgres >/dev/null 2>&1 || echo failed
+        echo "$PG_PORT"
+    )"
+    if [ "$port" = "5999" ]; then
+        pass "PG_PORT follows the external port"
+    else
+        fail "setup_postgres printed '$port'"
+    fi
+    if grep -q "^docker\|^daemon-probe" "$SANDBOX/pg-calls"; then
+        fail "Docker was touched: $(grep "^docker\|^daemon-probe" "$SANDBOX/pg-calls" | head -1)"
+    else
+        pass "no Docker call and no daemon probe"
+    fi
+}
+
+test_shared_pg_psql_follows_the_external_port
+test_setup_postgres_on_an_external_port_never_calls_docker
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

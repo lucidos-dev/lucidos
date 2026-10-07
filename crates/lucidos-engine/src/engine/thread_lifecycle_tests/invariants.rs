@@ -245,3 +245,73 @@ fn is_blocking_definition() {
     assert!(!is_blocking(cc, Failed, Inbox, false, false));
     assert!(!is_blocking(chat, Failed, Inbox, false, false));
 }
+
+/// `own_blocker` names the clause that holds, and the status clauses win over a
+/// pending change: a waiting thread with a change asks for the answer first.
+#[test]
+fn own_blocker_names_the_clause() {
+    use ArchiveState::*;
+    use ThreadStatus::*;
+    use ThreadType::*;
+    let cc = CodingAgent;
+
+    assert_eq!(
+        own_blocker(Chat, Running, Archived, false, false),
+        Some(OwnBlocker::Running)
+    );
+    assert_eq!(
+        own_blocker(cc, WaitingForUserAnswer, Inbox, true, false),
+        Some(OwnBlocker::Question)
+    );
+    assert_eq!(
+        own_blocker(cc, Idle, Inbox, true, false),
+        Some(OwnBlocker::PendingChange)
+    );
+    assert_eq!(own_blocker(cc, Idle, Archived, true, false), None);
+    assert_eq!(own_blocker(cc, Idle, Inbox, true, true), None);
+    assert_eq!(own_blocker(Chat, Idle, Inbox, true, false), None);
+}
+
+/// The home thread outranks everything, the thread's own blocker outranks a
+/// descendant's, and the enum's order picks the strongest descendant.
+#[test]
+fn action_blocker_picks_one_reason_in_priority_order() {
+    use OwnBlocker::*;
+    assert_eq!(action_blocker(Some(Running), true, None), Blocker::Home);
+    assert_eq!(
+        action_blocker(Some(PendingChange), false, Some(Running)),
+        Blocker::PendingChange
+    );
+    assert_eq!(
+        action_blocker(
+            None,
+            false,
+            [Some(PendingChange), Some(Question)]
+                .into_iter()
+                .flatten()
+                .min()
+        ),
+        Blocker::DescendantQuestion
+    );
+    assert_eq!(
+        action_blocker(None, false, Some(Running)),
+        Blocker::DescendantRunning
+    );
+    assert_eq!(action_blocker(None, false, None), Blocker::None);
+}
+
+/// A descendant blocker's slug is its own blocker's slug behind `descendant_`.
+/// The generated TS builds the descendant slug that way, so this pins it.
+#[test]
+fn descendant_blocker_slugs_prefix_the_own_slugs() {
+    for own in OwnBlocker::ALL {
+        assert_eq!(
+            action_blocker(Some(own), false, None).as_str(),
+            own.as_str()
+        );
+        assert_eq!(
+            action_blocker(None, false, Some(own)).as_str(),
+            format!("descendant_{}", own.as_str())
+        );
+    }
+}

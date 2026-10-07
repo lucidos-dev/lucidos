@@ -1,10 +1,19 @@
 /* Inline steps (between text chunks). ONE row per action: the model's thinking
    and the call it produced share a row (see `nameThinkingRow` in
-   `exchange-render.ts`), so the row carries TWO click targets, `.step-main`
-   (what the step did) and `.step-context` (what the model was sent). That is
-   why the row is a plain flex container with the button chrome pushed down onto
-   the two targets, rather than the row itself being a <button>: a button may
-   not contain another interactive element. */
+   `exchange-render.ts`), so the row carries more than one click target:
+   `.step-main` (what the step did), `.step-context` (what the model was sent),
+   and on an `Agent` row the fold toggles. That is why the row is a plain flex
+   container with the button chrome pushed down onto the targets, rather than the
+   row itself being a <button>: a button may not contain another interactive
+   element. */
+/* The mark column and the gap after it. A sub-agent group lines its chevron,
+   rail and children up on these, so they are named once. */
+.inline-step,
+.sub-agent-group {
+    --step-mark-width: 0.75em;
+    --step-mark-gap: 0.25rem;
+}
+
 .inline-step {
     /* Shared with the counter's touch reach, which covers this gap. */
     --step-row-gap: 0.375rem;
@@ -62,7 +71,7 @@
        description to detail, loses nothing by it: the detail prefixes itself
        with a dash and a non-breaking space (see `.step-detail::before`), so the
        separator there is the dash, not the gap. */
-    gap: 0.25rem;
+    gap: var(--step-mark-gap);
     flex: 1 1 auto;
     min-width: 0;
     background: none;
@@ -97,7 +106,8 @@
 }
 
 .inline-step .step-main:focus-visible,
-.inline-step button.step-context:focus-visible {
+.inline-step button.step-context:focus-visible,
+.inline-step .step-fold:focus-visible {
     /* Shared --focus-ring. */
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);
@@ -112,7 +122,7 @@
    before the `.step-main` gap. */
 .inline-step .step-icon {
     flex-shrink: 0;
-    width: 0.75em;
+    width: var(--step-mark-width);
 }
 
 /* One cap band tall, square, with its bottom edge on the text baseline: the
@@ -129,12 +139,15 @@
 }
 
 /* Grey, dimmed toward the background: a finished step is the common case, so
-   its mark sits behind the text and only a problem row carries colour. */
-.inline-step.success .step-icon {
+   its mark sits behind the text and only a problem row carries colour. A
+   finished agent's chevron stands in that slot, so it wears the same grey. */
+.inline-step.success .step-icon,
+.inline-step.success .step-fold {
     color: color-mix(in srgb, var(--text-muted) 70%, var(--bg-primary));
 }
 
-.inline-step.error .step-icon {
+.inline-step.error .step-icon,
+.inline-step.error .step-fold {
     color: var(--accent-red);
 }
 
@@ -180,7 +193,8 @@
    --accent-notable, not --accent-yellow: waiting is the state that token was
    split off to carry, and yellow is caution only. The thread drawer already
    paints this same waiting thread notable, so the two surfaces agree. */
-.inline-step.blocked .step-icon {
+.inline-step.blocked .step-icon,
+.inline-step.blocked .step-fold {
     color: var(--accent-notable);
 }
 
@@ -213,9 +227,14 @@
     padding: 0 0.125rem;
 }
 
-.inline-step .step-detail {
+/* The row's secondary text. An `Agent` row's step count reads as its detail. */
+.inline-step .step-detail,
+.inline-step .step-fold-count {
     color: var(--text-muted);
     font-size: 0.85em;
+}
+
+.inline-step .step-detail {
     /* One line, ellipsized, exactly like .step-description. The detail used to
        wrap (`word-break: break-word`, so a long path could break mid-token),
        and that is what turned the basis-0 flex below into a 935px-tall row: a
@@ -237,8 +256,99 @@
     min-width: min(35%, 9rem);
 }
 
-.inline-step .step-detail::before {
+.inline-step .step-detail::before,
+.inline-step .step-fold-count::before {
     content: '\2014\00a0';
+}
+
+/* A sub-agent's steps fold under its `Agent` row (`SubAgentStepGroup`).
+
+   The chevron takes the mark's slot and width. It leads `.step-main` instead of
+   sitting in it, since a button cannot nest. So it pays the row gap where the
+   mark paid the tighter `.step-main` gap, and the negative margin gives back the
+   difference: the description stays on the column of the rows around it. */
+.inline-step .step-fold {
+    --disclosure-chevron-size: var(--step-mark-width);
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-self: center;
+    margin: 0 calc(var(--step-mark-gap) - var(--step-row-gap)) 0 0;
+    padding: 0;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+}
+
+/* Three quarters of a cap band tall, at the outcome mark's stroke, so it never
+   outweighs the mark. The chevron fills half its 24-unit viewBox, so the svg
+   is 1.5 caps square, and 2 units is a cap's eighth, the mark's 1.5 of 12. The
+   slot centres it and it overflows evenly, so the column holds. The em pair is
+   the fallback for a browser without `cap`. */
+.inline-step .step-fold .disclosure-chevron {
+    align-items: center;
+    justify-content: center;
+}
+
+.inline-step .step-fold .disclosure-chevron svg {
+    flex: none;
+    width: 1.05em;
+    height: 1.05em;
+    width: 1.5cap;
+    height: 1.5cap;
+    overflow: visible;
+    stroke-width: 2;
+}
+
+/* The description hugs its text so the count follows it. The count's auto
+   margin then pushes the context counter to the row's end, where it sits on
+   every other row. */
+.inline-step.has-fold .step-main {
+    flex: 0 1 auto;
+}
+
+.inline-step .step-fold-count {
+    flex: 0 0 auto;
+    margin: 0 auto 0 0;
+    padding: 0;
+    background: none;
+    border: none;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .inline-step .step-fold:hover,
+    .inline-step .step-fold-count:hover {
+        color: var(--text-secondary);
+    }
+}
+
+/* The children and the tail start on the agent's description column. The
+   indent alone marks them as nested. Both state the row's font size, so
+   their `em` is the row's `em`. */
+.sub-agent-steps,
+.sub-agent-tail {
+    font-size: var(--font-size-sm);
+    padding-left: calc(var(--step-mark-width) + var(--step-mark-gap));
+}
+
+/* While the agent runs, the tail is a glance at the latest step, with an
+   arrow in the mark's slot whatever that step's outcome. */
+.sub-agent-tail:not(.ended) .step-icon > svg {
+    display: none;
+}
+
+.sub-agent-tail:not(.ended) .step-icon::before {
+    content: '\21B3';
+    color: var(--text-muted);
+}
+
+/* An ended agent's tail keeps the agent's outcome mark. Its word is muted and
+   never struck: "Did not finish" already says what the strike would. */
+.sub-agent-tail.ended .step-description {
+    color: var(--text-muted);
+    text-decoration: none;
 }
 
 /* The context counter is a fixed-width fact, so it never wraps and never
@@ -345,7 +455,7 @@
  * so a section sat half a step LEFT of the role header that owned it. */
 .context-sections {
     /* One chevron box for all three tiers, and one step down the tree. */
-    --context-chevron-size: 0.75rem;
+    --disclosure-chevron-size: 0.75rem;
     --context-row-inset: var(--space-sm);
     --context-indent: 1rem;
     display: flex;
@@ -439,8 +549,8 @@
         color: var(--text-primary);
     }
 
-    .context-inner-header:hover .context-chevron,
-    .context-section-header:hover .context-chevron {
+    .context-inner-header:hover .disclosure-chevron,
+    .context-section-header:hover .disclosure-chevron {
         color: var(--text-secondary);
     }
 }
@@ -460,22 +570,28 @@
     box-shadow: inset var(--focus-ring);
 }
 
-.context-chevron {
+/* The marker beside a fold's toggle (`DisclosureChevron`). Its surface sets
+   `--disclosure-chevron-size`, and its colour: the step row's fold reads the
+   row's outcome colour through it. */
+.disclosure-chevron {
     flex: 0 0 auto;
     display: inline-flex;
-    width: var(--context-chevron-size);
-    height: var(--context-chevron-size);
-    color: var(--text-muted);
+    width: var(--disclosure-chevron-size);
+    height: var(--disclosure-chevron-size);
     transition: transform var(--duration-fast) ease, color var(--duration-fast) ease;
 }
 
-.context-chevron svg {
+.context-sections .disclosure-chevron {
+    color: var(--text-muted);
+}
+
+.disclosure-chevron svg {
     display: block;
     width: 100%;
     height: 100%;
 }
 
-.context-chevron[data-open="true"] {
+.disclosure-chevron[data-open="true"] {
     transform: rotate(90deg);
 }
 
@@ -937,6 +1053,8 @@
     flex: 0 0 auto;
     align-self: flex-end;
     display: flex;
+    /* The growing body already sends the group to the card's right edge. */
+    justify-content: flex-end;
     align-items: center;
     gap: 0.625rem;
 }

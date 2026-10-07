@@ -39,9 +39,13 @@ export function isTerminated(status: ExchangeStatus): boolean {
   return TERMINATED_STATUSES.has(status);
 }
 
-/** What anything waiting on an open question says: a held message, and a
- *  callback queued behind the answer. */
-export const HELD_UNTIL_REPLY = 'Held until you reply';
+/** The line on a callback waiting behind an open question's answer. Its card
+ *  dims, and nothing else in the turn is drawn until the answer. */
+export const HELD_CALLBACK_NOTE = 'Not read yet. The agent reads it after you answer below.';
+
+/** The line on an agent-sent message a coding agent holds behind an open
+ *  question or permission card (ADR 0256). */
+export const HELD_MESSAGE_NOTE = 'Not delivered yet. The coding agent gets it after you answer below.';
 
 /** Map status to a UI label, a CSS class, and for a turn that ended badly a
  *  tooltip saying what happened. A one-word badge cannot say it alone. */
@@ -53,7 +57,7 @@ export function statusLabel(
     case 'queued':
       return { label: 'Queued', className: 'queued' };
     case 'held':
-      return { label: HELD_UNTIL_REPLY, className: 'queued' };
+      return { label: 'Not read yet', className: 'queued' };
     case 'pending':
     case 'streaming':
       return hasSteps

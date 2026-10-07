@@ -147,6 +147,9 @@ export interface EventRowProps {
   /** What the reader can do from the row: an open form request's Open, a
    *  change's Diff and Revert. A plain record carries none. */
   actions?: ComponentChildren;
+  /** Set while the row waits behind an open question: the card dims and
+   *  carries this line. Absent on every row that is not held. */
+  heldNote?: string;
   /** `data-role`, for the tests and for e2e selectors. */
   role?: string;
 }
@@ -167,12 +170,13 @@ export function eventRowBody({
   facts,
   fold,
   actions,
+  heldNote,
   role,
 }: EventRowProps) {
   const shown = (facts ?? []).filter((f): f is EventRowFact => !!f);
   const Glyph = VERDICT_GLYPH[tone];
   const card = (
-    <div class="event-row" data-role={role} data-kind={kind} data-state={state}>
+    <div class="event-row" data-role={role} data-kind={kind} data-state={state} data-held={heldNote ? '' : undefined}>
       {/* The subject and its verdict share the top line, so the card opens with
           one readable sentence and the state sits where the eye already is.
           They were stacked, which spent a whole line on a single word and made
@@ -188,6 +192,7 @@ export function eventRowBody({
       </div>
       {detail && <div class="event-row-detail">{detail}</div>}
       {shown.length > 0 && <div class="event-row-meta">{renderFacts(shown)}</div>}
+      {heldNote && <div class="event-row-held-note">{heldNote}</div>}
       {fold && <EventRowFoldView {...fold} />}
       {actions && <div class="event-row-actions">{actions}</div>}
     </div>

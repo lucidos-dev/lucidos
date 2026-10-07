@@ -17,7 +17,6 @@ pub mod decision;
 pub mod doer;
 pub mod language;
 pub mod live;
-pub mod naming;
 pub mod provider;
 pub mod realtime;
 pub mod recovery;
@@ -38,29 +37,6 @@ use decision::DecisionChoice;
 pub use language::SpokenLanguage;
 pub use provider::{AudioFormat, SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
 pub use sections::{ResidentSection, SECTIONS};
-
-/// A preference's value when set to something non-blank.
-///
-/// A read error reads as unset. A session that will not open over one
-/// unreachable preference row is worse than one that opens knowing less.
-///
-/// Private, so it reaches this module's own children and nothing else. Every
-/// caller is a session-open path, and no other part of the engine reads a
-/// preference this leniently.
-async fn read_pref(pool: &sqlx::PgPool, key: &str) -> Option<String> {
-    match crate::core::PreferenceStore::get(pool, key).await {
-        Ok(Some(v)) if !v.trim().is_empty() => Some(v),
-        Ok(_) => None,
-        Err(e) => {
-            log!(
-                "[Voice] Could not read {}: {}. Treating it as unset",
-                key,
-                e
-            );
-            None
-        }
-    }
-}
 
 /// How long one thing the talker reads may be before it is cut.
 ///

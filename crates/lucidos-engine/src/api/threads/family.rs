@@ -13,7 +13,9 @@
 use axum::http::StatusCode;
 use uuid::Uuid;
 
-use crate::engine::thread_lifecycle::{is_blocking, ArchiveState, ThreadStatus, ThreadType};
+use crate::engine::thread_lifecycle::{
+    action_blocker, own_blocker, ArchiveState, Blocker, OwnBlocker, ThreadStatus, ThreadType,
+};
 
 /// Row shape pulled by the recursive CTE in [`load_family`]: the subset of
 /// `thread_summaries` that feeds `is_blocking` plus the parent's own gate.
@@ -27,6 +29,8 @@ pub(in crate::api) struct FamilyRow {
     pub(in crate::api) coding_agent_is_external_repo: bool,
     /// The pin. An agent's archive leaves a pinned member open (ADR 0312).
     pub(in crate::api) is_saved: bool,
+    /// The home thread, which neither verb may take (ADR 0362).
+    pub(in crate::api) is_home: bool,
 }
 
 impl FamilyRow {
@@ -42,10 +46,24 @@ impl FamilyRow {
         ThreadStatus::parse(&self.status)
     }
 
+    /// This member's own blocker, judged in `archive_state`.
+    pub(in crate::api) fn own_blocker(&self, archive_state: ArchiveState) -> Option<OwnBlocker> {
+        own_blocker(
+            self.thread_type(),
+            self.status_enum(),
+            archive_state,
+            self.coding_agent_proposed,
+            self.coding_agent_is_external_repo,
+        )
+    }
+
     pub(in crate::api) fn archive_state_enum(&self) -> ArchiveState {
         ArchiveState::parse(&self.archive_state)
     }
 }
+
+/// Slug for a cascade that would take the home thread (ADR 0362).
+pub(in crate::api) const HOME_THREAD: &str = "home_thread";
 
 /// Which cascade is asking. It names the refusal, so the frontend can render a
 /// sentence per verb.
@@ -105,14 +123,14 @@ pub(in crate::api) async fn load_family(
         locked AS MATERIALIZED (
             SELECT t.thread_id, t.is_coding_agent, t.status, t.archive_state,
                    t.coding_agent_proposed, t.coding_agent_is_external_repo,
-                   t.is_saved, f.level
+                   t.is_saved, t.is_home, f.level
             FROM thread_summaries t
             JOIN family f ON f.thread_id = t.thread_id
             ORDER BY t.depth DESC, t.thread_id
             FOR UPDATE OF t
         )
         SELECT thread_id, is_coding_agent, status, archive_state,
-               coding_agent_proposed, coding_agent_is_external_repo, is_saved
+               coding_agent_proposed, coding_agent_is_external_repo, is_saved, is_home
         FROM locked
         ORDER BY level, thread_id",
     )
@@ -124,17 +142,24 @@ pub(in crate::api) async fn load_family(
 /// The pure decision, given a locked family snapshot and the target. Split out
 /// so tests drive it without a live HTTP stack.
 ///
-/// The parent gate refuses three states:
+/// The decision is [`action_blocker`] over the family, the function the
+/// thread menu draws from, so the menu's reason and this refusal's `blocker`
+/// slug always agree:
 ///
-///   1. Running. Live work cannot be terminal, whatever `archive_state` says.
-///   2. `WaitingForUserAnswer`. The question needs the user (ADR 0259).
-///   3. An in-workspace coding-agent thread with a pending change. The user must
-///      Apply or Discard first, which is what `resolve_actions` already offers
-///      there. External-repo coding agents are exempt, because Apply cannot
-///      merge into a foreign repo and the cascade is their only exit.
+///   1. A family holding the home thread, whichever member it is (ADR 0362).
+///   2. A parent that is running, waiting on the user (ADR 0259), or an
+///      in-workspace coding-agent thread with a pending change. It is judged
+///      as if in the inbox, so an archived parent cannot hide live work.
+///      External-repo coding agents are exempt from the change clause, because
+///      Apply cannot merge into a foreign repo and the cascade is their only
+///      exit.
+///   3. Any descendant that blocks in its own real `archive_state`, which is
+///      what lets an archived descendant holding a pending change through.
 ///
-/// Descendants are judged by `is_blocking` with their own real `archive_state`,
-/// which is what lets an archived descendant holding a pending change through.
+/// An already-archived parent is NOT refused, and that is load-bearing for
+/// archive: rejecting it produced a stuck button. A frontend whose
+/// `meta.section` had desynced to inbox offered Archive, the 409 rolled its
+/// optimistic flip back, and the button reappeared on every tap.
 pub(in crate::api) fn classify_family(
     family: &[FamilyRow],
     thread_uuid: Uuid,
@@ -147,59 +172,50 @@ pub(in crate::api) fn classify_family(
         };
     };
 
-    // An already-archived parent is NOT refused, and that is load-bearing for
-    // archive: rejecting here produced a stuck button. A frontend whose
-    // `meta.section` had desynced to inbox offered Archive, the 409 rolled its
-    // optimistic flip back, and the button reappeared on every tap.
-    if matches!(
-        parent_row.status_enum(),
-        ThreadStatus::Running | ThreadStatus::WaitingForUserAnswer
-    ) {
-        return FamilyDecision::Reject {
-            status: StatusCode::CONFLICT,
-            body: parent_blocked_body(verb, &parent_row.status, parent_row.coding_agent_proposed),
-        };
-    }
-    if parent_row.is_coding_agent
-        && parent_row.coding_agent_proposed
-        && !parent_row.coding_agent_is_external_repo
-    {
-        return FamilyDecision::Reject {
-            status: StatusCode::CONFLICT,
-            body: serde_json::json!({
-                "reason": "parent_has_pending_changes",
-            }),
-        };
-    }
-
-    let blockers: Vec<&FamilyRow> = family
+    // Strongest first, so `blocking[0]` is a member holding the named
+    // blocker: the client's Show sub-thread opens it.
+    let mut blockers: Vec<(&FamilyRow, OwnBlocker)> = family
         .iter()
         .filter(|r| r.thread_id != thread_uuid)
-        .filter(|r| {
-            is_blocking(
-                r.thread_type(),
-                r.status_enum(),
-                r.archive_state_enum(),
-                r.coding_agent_proposed,
-                r.coding_agent_is_external_repo,
-            )
-        })
+        .filter_map(|r| r.own_blocker(r.archive_state_enum()).map(|b| (r, b)))
         .collect();
-    if !blockers.is_empty() {
-        return FamilyDecision::Reject {
-            status: StatusCode::CONFLICT,
-            body: serde_json::json!({
-                "reason": "descendants_blocking",
-                "blocking": blockers.iter().map(|r| serde_json::json!({
-                    "thread_id": r.thread_id,
-                    "status": r.status,
-                    "has_pending_changes": r.coding_agent_proposed,
-                })).collect::<Vec<_>>(),
-            }),
-        };
+    blockers.sort_by_key(|(_, b)| *b);
+    let blocker = action_blocker(
+        parent_row.own_blocker(ArchiveState::Inbox),
+        family.iter().any(|r| r.is_home),
+        blockers.iter().map(|(_, b)| *b).min(),
+    );
+    let body = match blocker {
+        Blocker::None => return FamilyDecision::Proceed,
+        Blocker::Home => serde_json::json!({ "reason": HOME_THREAD }),
+        Blocker::Running | Blocker::Question => {
+            parent_blocked_body(verb, &parent_row.status, parent_row.coding_agent_proposed)
+        }
+        Blocker::PendingChange => serde_json::json!({ "reason": "parent_has_pending_changes" }),
+        Blocker::DescendantRunning
+        | Blocker::DescendantQuestion
+        | Blocker::DescendantPendingChange => serde_json::json!({
+            "reason": "descendants_blocking",
+            "blocking": blockers.iter().map(|(r, _)| serde_json::json!({
+                "thread_id": r.thread_id,
+                "status": r.status,
+                "has_pending_changes": r.coding_agent_proposed,
+            })).collect::<Vec<_>>(),
+        }),
+    };
+    FamilyDecision::Reject {
+        status: StatusCode::CONFLICT,
+        body: with_blocker(body, blocker),
     }
+}
 
-    FamilyDecision::Proceed
+/// `body` with the `blocker` slug the client words the refusal from.
+pub(in crate::api) fn with_blocker(
+    mut body: serde_json::Value,
+    blocker: Blocker,
+) -> serde_json::Value {
+    body["blocker"] = blocker.as_str().into();
+    body
 }
 
 /// The refusal body for a parent the verb cannot act on: running, or waiting on

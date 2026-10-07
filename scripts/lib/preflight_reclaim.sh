@@ -54,6 +54,10 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host_memory_guard.sh"
 # the owning gateway's port with the same function.
 # shellcheck source=proc_env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proc_env.sh"
+# For `service_bundle_identifier`, which names the packaged app's data dir.
+# Pure helpers only, so sourcing it starts nothing.
+# shellcheck source=service.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/service.sh"
 
 RECLAIM_TAG="[preflight-reclaim]"
 
@@ -141,7 +145,7 @@ _reclaim_sleep() { sleep "$1"; }
 # crates/lucidos-app/src/desktop.rs).
 _reclaim_gateway_logs() {
     printf '%s\n' "${LUCIDOS_GATEWAY_DATA:-$HOME/.lucidos/gateway}/gateway.log"
-    printf '%s\n' "$HOME/Library/Application Support/com.lucidos.app/logs/engine-service.out.log"
+    printf '%s\n' "$HOME/Library/Application Support/$(service_bundle_identifier)/logs/engine-service.out.log"
 }
 
 # The stop.sh this reclaim drives, under the repo root. One definition, so the

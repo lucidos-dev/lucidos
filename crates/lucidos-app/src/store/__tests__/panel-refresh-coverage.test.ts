@@ -48,7 +48,7 @@ const SETTINGS: Record<SettingsSubview, Coverage> = {
   'thread-queue': { registers: ['thread-queue/ThreadQueueView.tsx'] },
   models: { sectionTable: true },
   appearance: { sectionTable: true },
-  memory: { registers: ['settings/MemoryInspector.tsx'] },
+  memory: { registers: ['settings/MemoryInspector.tsx', 'settings/SummaryTreeBrowser.tsx'] },
   devices: { sectionTable: true },
   accounts: { sectionTable: true },
   backup: { registers: ['settings/BackupSection.tsx'] },

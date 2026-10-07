@@ -155,7 +155,10 @@ problem.
 `CLAUDE.md` is explicit that GitHub Actions is release-only, and that no
 workflow may compile, lint, type-check or test the tree. Lucidos is not
 PR-based, so a `pull_request` trigger never fires and a `push` one reports after
-the change has landed. The per-change gate is `/harden`.
+the change has landed. The per-change gate is `/harden`. **[Superseded by
+[ADR 0382](0382-e2e-runs-on-github-from-a-stripped-temp-branch.md):** the agent
+now asks for a hosted run itself, before Apply, so `mobile-webkit` can run on
+macOS runners.**]**
 
 **Give the project its own scheduled run on a freshly booted host.** Rejected as
 unnecessary once the guard is fixed, and it is expensive: it needs a reboot

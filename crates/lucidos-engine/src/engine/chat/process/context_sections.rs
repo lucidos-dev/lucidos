@@ -299,6 +299,8 @@ URL: {}\n\
                  [END THREAD CONTEXT]",
                 depth, MAX_THREAD_DEPTH, guidance
             )
+        } else if self.is_home_thread_for_context(thread_id).await {
+            HOME_THREAD_CONTEXT.to_string()
         } else {
             String::new()
         };
@@ -315,6 +317,34 @@ URL: {}\n\
             url_context_section,
             thread_depth_context,
         }
+    }
+}
+
+/// What the home thread's agent is told about the thread it runs in
+/// (ADR 0362). Only the home thread gets it, so every other thread's request
+/// is unchanged. A sub-thread is never the home thread, which keeps this and
+/// the depth notice apart.
+const HOME_THREAD_CONTEXT: &str = "[THREAD CONTEXT]\n\
+     This is the workspace's home thread, where the user talks to you by \
+     default. It never ends, and nobody can archive or delete it.\n\
+     From here follow_up_child_thread reaches ANY thread in this workspace, \
+     coding-agent threads included, not only your own children. A thread you did \
+     not spawn reports to its own parent, so read its reply later with \
+     query_events and its thread_id.\n\
+     An owner button on another thread (Apply, Archive, a permission card) is \
+     yours to press only while the user's words in this turn ask for it.\n\
+     [END THREAD CONTEXT]";
+
+impl LucidosEngine {
+    /// Whether `thread_id` is the home thread, for the context notice. A read
+    /// error only costs the notice, so it logs and answers no.
+    async fn is_home_thread_for_context(&self, thread_id: Uuid) -> bool {
+        crate::engine::home_thread::is_home_thread(&self.pool, thread_id)
+            .await
+            .unwrap_or_else(|e| {
+                log!("[Chat] Could not read whether {} is home: {}", thread_id, e);
+                false
+            })
     }
 }
 

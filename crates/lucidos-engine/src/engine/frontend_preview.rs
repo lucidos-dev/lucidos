@@ -584,7 +584,7 @@ impl LucidosEngine {
         // nothing tracking its pid: no slot, no sidecar, no reaper.
         let _lifecycle = self.frontend_preview_lifecycle.lock().await;
         let workspace = self.workspace_path.clone();
-        let worktrees = workspace.join(".lucidos").join("worktrees");
+        let worktrees = workspace.join(crate::paths::WORKTREES_SUBPATH);
         let worktree =
             super::agent_session::resume::deterministic_worktree_path(&workspace, thread_id);
         let vite_bin = worktree.join("node_modules").join(".bin").join("vite");

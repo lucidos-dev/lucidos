@@ -193,9 +193,11 @@ Three more things follow, and each is enforced rather than remembered.
 - **It only touches workspaces it created.** Every arm workspace is named
   `eval-<arm>-<repeat>` under `$LUCIDOS_EVAL_ROOT`, and the harness refuses a
   path whose name lacks the prefix.
-- **The pins are the measurement.** Model, reasoning effort and embedding model
-  are all environment variables with defaults in the script. Changing one
-  changes what a result means, so change it deliberately and say so in the run.
+- **The pins are the measurement.** Model and reasoning effort default in the
+  harness (`seed_pins`, `crates/lucidos-eval/src/main.rs`), and the embedding
+  model comes from the seed fixture. Each takes an environment override.
+  Changing one changes what a result means, so change it deliberately and say
+  so in the run.
 - **Each arm is a registered workspace**, so the picker lists it and
   `/eval-<label>-<arm>-<repeat>/` is browsable during a run and after it. The
   label defaults to the model id, so two providers can run at once without
@@ -419,7 +421,7 @@ brought clean in one mechanical sweep first (424 of 614 files at the time).
 2. `build_or_find_engine`: builds, **publishes** and signs BOTH `lucidos-engine` and `lucidos-gateway` (plus the `lucidos` CLI). See "Published launch binaries" below: the launch path is `.launch/<profile>/<variant>/`, NOT cargo's shared `target/<profile>/lucidos-engine`.
 3. `seed_gateway_registry` — upserts this workspace into the **machine-global** registry `$HOME/.lucidos/gateway/config/workspaces.json` (NOT per-workspace): refreshes its **direct** engine port + workspace dir, removes any legacy `database_url`, **preserves** any picker-set display name + `autostart` flag. A brand-new entry defaults `autostart:false`.
 4. `start_gateway`: reuse a healthy gateway already on 5251, else start ONE under the **dedicated gateway supervisor** `run_gateway_supervised` (`scripts/lib/gateway_supervisor.sh`). Its env is `LUCIDOS_ENGINE_BIN=<engine>`, `LUCIDOS_STATIC_DIR=<dist>`, `LUCIDOS_API_PORT=5251`, `LUCIDOS_GATEWAY_BIND_ALL=1`, `LUCIDOS_GATEWAY_DATA=$HOME/.lucidos/gateway`, `LUCIDOS_GATEWAY_PG_BACKEND=docker`, `LUCIDOS_GATEWAY_PG_PORT=<shared-pg-port>`, `LUCIDOS_GATEWAY_PG_CONTAINER=lucidos-pg-shared`. Nothing sets `LUCIDOS_GATEWAY_ENGINE_LOOPBACK`, so engines stay on loopback.
-5. `ensure_workspace_engine_running`: POSTs `/~/api/v1/control/workspaces/<id>/restart` to start (or respawn, for Apply) THIS workspace's engine. New workspaces default `autostart:false`, so the gateway's own boot won't spawn them. **It ADOPTS an engine already answering** and skips the POST (below). Either way it then waits for `/<slug>/api/v1/health`.
+5. `ensure_workspace_engine_running`: POSTs `/~/api/v1/control/workspaces/<id>/restart` to start (or respawn, for Apply) THIS workspace's engine. New workspaces default `autostart:false`, so the gateway's own boot won't spawn them. **It ADOPTS an engine already answering** and skips the POST (below). Either way it then waits for `/<slug>/api/v1/health`, and `record_engine_scheme` writes the scheme the engine answers on into the ports file's `PROTO`. Only the file follows the engine: the shell's `$PROTO` keeps naming the gateway, which keeps its TLS. Otherwise a reused stack keeps `detect_tls`'s https from `.certs/` against a plain-http engine, and every CLI call by workspace name fails its TLS handshake.
 
 ### A launch never tears down a healthy engine (ADR 0219)
 

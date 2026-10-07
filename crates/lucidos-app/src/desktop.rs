@@ -27,19 +27,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
-/// Bundle identifier — must match `tauri.conf.json` `identifier`. Used to
-/// resolve the OS app-data dir from the service role, which has no `AppHandle`.
-const BUNDLE_IDENTIFIER: &str = "com.lucidos.app";
+// The bundle identifier must match `tauri.conf.json` `identifier`. It resolves
+// the OS app-data dir from the service role, which has no `AppHandle`.
+use lucidos_installs::BUNDLE_IDENTIFIER;
 
-/// launchd label for the **service agent**, the always-on gateway service. The
-/// value is historical, from before the gateway owned the stack, and must not
-/// change: it keys every already-installed plist.
-pub const SERVICE_AGENT_LABEL: &str = "com.lucidos.engine";
-
-/// launchd label for the **login agent**, the one-shot job that reopens the
-/// CLIENT at login. That is what keeps the menu-bar item, and with it native
-/// notifications, across a restart. The service agent hosts no UI at all.
-pub const LOGIN_AGENT_LABEL: &str = "com.lucidos.client";
+// The launchd labels of the **service agent** (the always-on gateway service)
+// and the **login agent** (the one-shot job that reopens the CLIENT at login).
+// Both key every already-installed plist, so neither may change.
+pub use lucidos_installs::{LOGIN_AGENT_LABEL, SERVICE_AGENT_LABEL};
 
 /// The argument the login agent passes the client, marking a launch as
 /// "started at login, not by a person". Such a launch comes up menu-bar-only:
@@ -54,7 +49,7 @@ pub const LOGIN_FLAG: &str = "--login";
 /// across restarts. The `engine` in the name is historical: under ADR 0014 the
 /// gateway owns this public port and each spawned engine binds loopback only.
 /// Override with `LUCIDOS_ENGINE_PORT` or `<app-data>/config/engine-port`.
-pub const DEFAULT_ENGINE_PORT: u16 = 5252;
+pub const DEFAULT_ENGINE_PORT: u16 = lucidos_installs::DEFAULT_GATEWAY_PORT;
 
 /// How long to wait for the gateway to answer `/~/api/v1/health`
 /// (migrations + embedding-model warmup can be slow on a fresh workspace).
@@ -1525,8 +1520,9 @@ pub fn leftover_installs(app_data: &Path) -> Vec<String> {
 /// Every decision lives in `install_preflight`, which is pure and tested. This
 /// is the effectful half: it shows what that module hands back, and nothing.
 fn announce_install_conflict(app: &AppHandle, app_data: &Path, port: u16) {
-    let version = env!("LUCIDOS_APP_VERSION");
-    let Some(notice) = crate::install_preflight::take_notice(app_data, port, version) else {
+    let Some(notice) =
+        crate::install_preflight::take_notice(app_data, port, crate::LUCIDOS_RELEASE)
+    else {
         return;
     };
     eprintln!(

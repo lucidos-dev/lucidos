@@ -57,6 +57,22 @@ export function previewDiskPath(
   return joinPath(workspacePath, `data/${encoded}`);
 }
 
+/** What "copy the path" puts on the clipboard: the absolute disk path where
+ *  {@link previewDiskPath} can resolve one, else the repo- or
+ *  workspace-relative path the locator itself names. `absolute` says which one
+ *  it got, so the caller's confirmation can say so too.
+ *
+ *  Pure, for the same reason `previewDiskPath` is: the roots are arguments, not
+ *  signals read here. */
+export function previewCopyPath(
+  encoded: string,
+  workspacePath: string,
+  repositories: readonly { id: string; path: string }[],
+): { path: string; absolute: boolean } {
+  const disk = previewDiskPath(encoded, workspacePath, repositories);
+  return disk ? { path: disk, absolute: true } : { path: previewFilePath(encoded), absolute: false };
+}
+
 /** Join an absolute root to a relative path, tolerating a trailing slash on the
  *  root: `workspace_path` comes off the wire and a caller may register a clone
  *  either way. */

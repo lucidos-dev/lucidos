@@ -138,6 +138,10 @@ fn context_captured_event_type_and_persistence() {
         trim_passes: Vec::new(),
         purpose: crate::engine::ContextPurpose::Turn,
         reconstructed: false,
+        parent_tool_use_id: None,
+        api_call_id: None,
+        reasoning_effort: None,
+        duration_ms: None,
     };
     assert_eq!(event.event_type(), "ContextCaptured");
     assert!(event.is_persisted());
@@ -224,6 +228,34 @@ fn a_capture_row_without_the_new_keys_reads_as_a_turn() {
     assert_eq!(sections[0].content_chars, None);
 }
 
+/// A Claude Code capture's `api_call_id` survives the wire. A row without one
+/// reads as having none and writes no key.
+#[test]
+fn a_capture_api_call_id_round_trips_and_is_omitted_when_absent() {
+    let capture = |extra: &str| {
+        format!(
+            r#"{{"type":"ContextCaptured","producer":"claude_code","model":"claude-sonnet-5",
+                "context_window":1000000,"sections":[],"estimated_total_tokens":438000{extra}}}"#
+        )
+    };
+    let api_call_id_of = |json: &str| match serde_json::from_str::<ThreadEvent>(json).unwrap() {
+        ThreadEvent::ContextCaptured { api_call_id, .. } => api_call_id,
+        other => panic!("expected ContextCaptured, got {other:?}"),
+    };
+
+    let stamped = capture(r#","api_call_id":"msg_1""#);
+    assert_eq!(api_call_id_of(&stamped).as_deref(), Some("msg_1"));
+    let reserialized =
+        serde_json::to_value(serde_json::from_str::<ThreadEvent>(&stamped).unwrap()).unwrap();
+    assert_eq!(reserialized["api_call_id"], "msg_1");
+
+    let legacy = capture("");
+    assert_eq!(api_call_id_of(&legacy), None);
+    let reserialized =
+        serde_json::to_value(serde_json::from_str::<ThreadEvent>(&legacy).unwrap()).unwrap();
+    assert!(reserialized.get("api_call_id").is_none());
+}
+
 /// The other half of back-compat. A turn row keeps its previous wire shape,
 /// so nothing downstream sees a new key on the path that carries almost
 /// every row.
@@ -241,6 +273,10 @@ fn a_turn_capture_writes_neither_new_key() {
         trim_passes: Vec::new(),
         purpose: crate::engine::ContextPurpose::Turn,
         reconstructed: false,
+        parent_tool_use_id: None,
+        api_call_id: None,
+        reasoning_effort: None,
+        duration_ms: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert!(json.get("purpose").is_none());
@@ -251,7 +287,7 @@ fn a_turn_capture_writes_neither_new_key() {
 /// and any cost breakdown key on.
 #[test]
 fn an_auxiliary_capture_writes_its_purpose_and_producer() {
-    let event = crate::engine::aux_capture::auxiliary_capture(
+    let event = crate::engine::model_call::auxiliary_capture(
         crate::engine::ContextPurpose::Memory,
         "gemini-3-flash-preview",
         800,
@@ -284,7 +320,7 @@ fn every_purpose_survives_a_round_trip() {
         ),
         (crate::engine::ContextPurpose::ImageGen, "image_gen"),
     ] {
-        let event = crate::engine::aux_capture::auxiliary_capture(purpose, "m", 1, None, false);
+        let event = crate::engine::model_call::auxiliary_capture(purpose, "m", 1, None, false);
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["purpose"], wire);
         let parsed: ThreadEvent = serde_json::from_value(json).unwrap();
@@ -541,6 +577,7 @@ fn is_per_token_streaming_blocks_text_chunk_variants() {
     assert!(ThreadEvent::CodingAgentTextStreamed {
         text: String::new(),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        parent_tool_use_id: None,
     }
     .is_per_token_streaming());
 }
@@ -592,6 +629,8 @@ fn is_per_token_streaming_allows_per_action_lifecycle_and_blocking_request_varia
         description: String::new(),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         tool_use_id: String::new(),
+        parent_tool_use_id: None,
+        api_call_id: None,
     }
     .is_per_token_streaming());
     // Lifecycle / one-per-turn variants.

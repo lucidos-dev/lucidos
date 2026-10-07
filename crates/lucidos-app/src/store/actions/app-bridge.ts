@@ -11,11 +11,25 @@
  * `docs/plans/2026-09-19-an-app-frame-cannot-starve-the-shell.md`.
  */
 
-import { appMayCall, normalizeSuffix } from '@lucidos/sdk';
+import {
+  APP_STORAGE_AREAS,
+  APP_STORAGE_SPACES,
+  appMayCall,
+  appStoragePrefix,
+  appStorageRefusal,
+  emptyAppStorageSnapshot,
+  normalizeSuffix,
+  type AppStorageArea,
+  type AppStorageSnapshot,
+  type AppStorageSpace,
+} from '@lucidos/sdk';
 import { API } from '../../api/client';
 import { deviceIdHeader, readDeviceId } from '../../utils/deviceIdHeader';
 import { registrationToAwait } from '../../utils/deviceRegistration';
 import { appFrameFor, appIdForFrame } from '../../utils/appFrame';
+import { WORKSPACE_ID } from '../../utils/basePath';
+import { rawStorageKey } from '../../utils/workspaceStorage';
+import { showToast } from '../store';
 
 /** Mirrors `packages/lucidos-sdk/src/_bridge.ts`. Two copies, because the SDK
  *  bundles standalone for app frames and cannot import the host. */
@@ -297,68 +311,183 @@ export function askFrame(
 // Storage, on the app's behalf
 // ---------------------------------------------------------------------------
 
-/** Where an app's stored values live in the host's own storage.
- *
- *  The SDK already namespaces its keys by workspace, and the one thing an app
- *  stores (its scroll position) carries the app id as well. This prefix keeps
- *  the two key spaces apart, so nothing an app writes can land on a host key. */
-const APP_STORAGE_PREFIX = 'appbridge:';
-
-/** Mirror key, the same shape `_storage.ts` builds on the app side. */
-function mirrorKey(key: string, session: boolean): string {
-  return `${session ? 'session' : 'local'}:${key}`;
+/** What a frame sent for a storage op. Every field crossed a `postMessage`
+ *  from app code, so each is checked before use. */
+interface StorageArgs {
+  space?: unknown;
+  area?: unknown;
+  key?: unknown;
+  value?: unknown;
 }
 
-function appStorage(session: boolean): Storage | null {
-  try {
-    return session ? sessionStorage : localStorage;
-  } catch {
-    return null;
+interface StorageTarget {
+  space: AppStorageSpace;
+  area: AppStorageArea;
+}
+
+function storageTarget(args: StorageArgs): StorageTarget {
+  const { space, area } = args;
+  if (!APP_STORAGE_SPACES.includes(space as AppStorageSpace)) {
+    throw new Error(`App storage has no space "${String(space)}"`);
   }
+  if (!APP_STORAGE_AREAS.includes(area as AppStorageArea)) {
+    throw new Error(`App storage has no area "${String(area)}"`);
+  }
+  return { space: space as AppStorageSpace, area: area as AppStorageArea };
 }
 
-/**
- * Everything this frame has stored, in one answer.
+function storageString(args: StorageArgs, name: 'key' | 'value'): string {
+  const value = args[name];
+  if (typeof value !== 'string') throw new Error(`App storage needs a string ${name}`);
+  return value;
+}
+
+function browserStore(area: AppStorageArea): Storage {
+  try {
+    const store = area === 'session' ? sessionStorage : localStorage;
+    if (store) return store;
+  } catch {
+    // Falls through to the refusal: a disabled store is reported, not hidden.
+  }
+  throw new Error('Browser storage is unavailable here');
+}
+
+/** Where one app's keys in one space sit in the shell's storage, as stored.
  *
- * One call rather than a read per key, because the SDK's readers are
- * synchronous and `postMessage` is not. The app mirrors this and serves its
- * reads from the mirror, so nothing downstream has to learn to wait.
- */
-function storagePrime(): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const session of [false, true]) {
-    const store = appStorage(session);
-    if (!store) continue;
-    for (let i = 0; i < store.length; i++) {
-      const raw = store.key(i);
-      if (!raw?.startsWith(APP_STORAGE_PREFIX)) continue;
-      const value = store.getItem(raw);
-      // Keyed by store, matching `_storage.ts`'s `mirrorKey`. The two are
-      // separate stores, and one map merging them would let a session write
-      // answer a local read under the same name.
-      if (value !== null) out[mirrorKey(raw.slice(APP_STORAGE_PREFIX.length), session)] = value;
-    }
+ *  Raw, so a walk over `Storage.key(i)` finds them. The workspace override
+ *  rewrites every key it writes, and `key(i)` is not wrapped. */
+function storedPrefix(appId: string, space: AppStorageSpace): string {
+  return rawStorageKey(appStoragePrefix(appId, space), WORKSPACE_ID);
+}
+
+function entriesUnder(store: Storage, prefix: string): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  for (let i = 0; i < store.length; i++) {
+    const raw = store.key(i);
+    if (!raw?.startsWith(prefix)) continue;
+    const value = store.getItem(raw);
+    if (value !== null) out.push([raw.slice(prefix.length), value]);
   }
   return out;
 }
 
-function storageSet(args: { key: string; value: string; session: boolean }): null {
+/**
+ * Everything this app has stored, in one answer.
+ *
+ * One call rather than a read per key, because the SDK's readers are
+ * synchronous and `postMessage` is not. The app mirrors this and serves its
+ * reads from the mirror, so nothing downstream has to learn to wait.
+ *
+ * An area the browser keeps disabled primes empty, so the other still answers.
+ * A write to it is still refused, by `browserStore`.
+ */
+function storagePrime(appId: string): AppStorageSnapshot {
+  const snapshot = emptyAppStorageSnapshot();
+  for (const area of APP_STORAGE_AREAS) {
+    let store: Storage;
+    try {
+      store = browserStore(area);
+    } catch {
+      continue;
+    }
+    for (const space of APP_STORAGE_SPACES) {
+      snapshot[space][area] = Object.fromEntries(entriesUnder(store, storedPrefix(appId, space)));
+    }
+  }
+  return snapshot;
+}
+
+function storageSet(appId: string, args: StorageArgs): null {
+  const { space, area } = storageTarget(args);
+  const key = storageString(args, 'key');
+  const value = storageString(args, 'value');
+  const store = browserStore(area);
+  const prefix = storedPrefix(appId, space);
+  // Checked here as well as in the SDK, in both spaces, because the frame is
+  // not trusted and names the space itself.
+  const refusal = appStorageRefusal(entriesUnder(store, prefix), key, value, space);
+  if (refusal) throw new Error(refusal);
   try {
-    appStorage(args.session)?.setItem(`${APP_STORAGE_PREFIX}${args.key}`, args.value);
+    store.setItem(prefix + key, value);
   } catch {
-    // A full or disabled store costs an app its scroll position. Failing the
-    // call would cost it the interaction that wrote it.
+    throw new Error('Browser storage is full');
   }
   return null;
 }
 
-function storageRemove(args: { key: string; session: boolean }): null {
-  try {
-    appStorage(args.session)?.removeItem(`${APP_STORAGE_PREFIX}${args.key}`);
-  } catch {
-    /* nothing to clear in a store we cannot reach */
-  }
+function storageRemove(appId: string, args: StorageArgs): null {
+  const { space, area } = storageTarget(args);
+  browserStore(area).removeItem(storedPrefix(appId, space) + storageString(args, 'key'));
   return null;
+}
+
+function removeUnder(store: Storage, prefix: string): void {
+  for (const [key] of entriesUnder(store, prefix)) store.removeItem(prefix + key);
+}
+
+function storageClear(appId: string, args: StorageArgs): null {
+  const { space, area } = storageTarget(args);
+  removeUnder(browserStore(area), storedPrefix(appId, space));
+  return null;
+}
+
+/**
+ * Forget everything a deleted app stored on this device, in both spaces and
+ * both areas. An app later installed under the same id then starts empty.
+ *
+ * Only a device with the shell open when the delete lands clears here. Another
+ * device clears nothing until it hears of a delete itself (ADR 0372).
+ */
+export function clearAppStorage(appId: string): void {
+  let prefixes: string[];
+  try {
+    prefixes = APP_STORAGE_SPACES.map((space) => storedPrefix(appId, space));
+  } catch {
+    return; // an id storage cannot scope by never stored anything
+  }
+  for (const area of APP_STORAGE_AREAS) {
+    let store: Storage;
+    try {
+      store = browserStore(area);
+    } catch {
+      continue;
+    }
+    for (const prefix of prefixes) removeUnder(store, prefix);
+  }
+}
+
+/**
+ * Run one storage op for the app this frame belongs to.
+ *
+ * The app comes from the host's own element, never from the message. A frame
+ * with no app has no storage. A failure in the `app` space is the app's data,
+ * so the user is told as well as the app.
+ */
+function runStorageOp(
+  frame: HTMLIFrameElement,
+  args: unknown,
+  op: (appId: string, args: StorageArgs) => unknown,
+): unknown {
+  const appId = appIdForFrame(frame);
+  if (!appId) throw new Error('This frame runs no app, so it has no storage');
+  const storageArgs = (args ?? {}) as StorageArgs;
+  try {
+    return op(appId, storageArgs);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (storageArgs.space === 'app') {
+      showToast(message, 'error', {
+        title: `App "${appId}" could not save`,
+        key: `app-storage:${appId}`,
+      });
+    } else {
+      // The SDK's own write is a scroll position saved on pagehide, with no
+      // user action behind it and no reply owed. The next save retries it, and
+      // a full store also fails the app's own writes, which toast.
+      console.warn(`[app-bridge] app "${appId}" could not keep its scroll position:`, message);
+    }
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -375,9 +504,10 @@ async function runOp(
     case 'fetch': return bridgedFetch(args as WireRequest, appIdForFrame(frame));
     case 'sse.open': sseSubscribers.set(source, frame); return null;
     case 'sse.close': sseSubscribers.delete(source); return null;
-    case 'storage.prime': return storagePrime();
-    case 'storage.set': return storageSet(args as { key: string; value: string; session: boolean });
-    case 'storage.remove': return storageRemove(args as { key: string; session: boolean });
+    case 'storage.prime': return runStorageOp(frame, args, storagePrime);
+    case 'storage.set': return runStorageOp(frame, args, storageSet);
+    case 'storage.remove': return runStorageOp(frame, args, storageRemove);
+    case 'storage.clear': return runStorageOp(frame, args, storageClear);
     default: throw new Error(`The app bridge has no operation "${op}"`);
   }
 }

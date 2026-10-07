@@ -20,7 +20,7 @@ pub(crate) async fn summarize_on<P: LlmProvider + ?Sized>(
     provider: &P,
     path: &str,
     content: &str,
-    capture: Option<&AuxCapture>,
+    capture: &AuxCapture,
 ) -> Option<String> {
     if content.len() < 50 {
         return Some(format!("Small file: {}", path));
@@ -41,15 +41,15 @@ pub(crate) async fn summarize_on<P: LlmProvider + ?Sized>(
         "Summarize this file in 1-2 sentences. Focus on what it contains and its purpose.\n\nFile: {}\n\nContent:\n{}",
         path, content_for_summary
     );
-    let request_chars = prompt.chars().count();
 
     let messages = vec![Message {
         role: "user".to_string(),
         content: MessageContent::Text(prompt),
     }];
 
-    match provider
+    match capture
         .chat(
+            provider,
             messages,
             vec![],
             crate::llm::ModelSelection::default(),
@@ -58,14 +58,7 @@ pub(crate) async fn summarize_on<P: LlmProvider + ?Sized>(
         )
         .await
     {
-        Ok(response) => {
-            if let Some(capture) = capture {
-                capture
-                    .record(provider.default_model(), request_chars, &response)
-                    .await;
-            }
-            response.content
-        }
+        Ok(response) => response.content,
         Err(e) => {
             log!("[Memory] Failed to generate summary for {}: {}", path, e);
             None
@@ -89,13 +82,7 @@ impl LucidosEngine {
             thread_id,
             crate::engine::ContextPurpose::ArtifactSummary,
         );
-        summarize_on(
-            self.current_provider().as_ref(),
-            path,
-            content,
-            Some(&capture),
-        )
-        .await
+        summarize_on(self.current_provider().as_ref(), path, content, &capture).await
     }
 
     /// Rebuild memory entries from event store and artifact history.
@@ -551,7 +538,7 @@ mod summary_capture_tests {
             &provider,
             "artifacts/projects/reports/q4.md",
             &"sales figures, one per region. ".repeat(20),
-            Some(&capture),
+            &capture,
         )
         .await;
         assert_eq!(summary.as_deref(), Some("A quarterly sales report."));
@@ -581,7 +568,7 @@ mod summary_capture_tests {
 
         // No scripted reply: reaching the provider at all would fail the call.
         let provider = ScriptedProvider::new(SUMMARY_MODEL, vec![]);
-        let summary = summarize_on(&provider, "notes.md", "too short", Some(&capture)).await;
+        let summary = summarize_on(&provider, "notes.md", "too short", &capture).await;
         assert!(summary.is_some_and(|s| s.starts_with("Small file:")));
         assert!(aux_captures(&pool, thread_id, "artifact_summary")
             .await

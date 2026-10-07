@@ -407,11 +407,9 @@
  * styles/__tests__/prompt-row-one-row-guard.test.ts.
  *
  * Every descendant, not just the row's own children: `.prompt-actions-right`
- * and the `.split-pill` inside it are flex containers, so their buttons would
- * shrink inside them. */
+ * is a flex container, so its buttons would shrink inside it. */
 .prompt-actions-row > *,
-.prompt-actions-right > *,
-.split-pill > * {
+.prompt-actions-right > * {
     flex-shrink: 0;
 }
 
@@ -924,114 +922,6 @@
     min-width: 8.75rem;
 }
 
-/* The button at the row's end, Send or Submit, and the Side question half it
-   opens into. The half measures against this box, so it fits either button.
-   No z-index here: the half must outrank its neighbours in the row, and a
-   stacking context would trap it beneath them. */
-.split-pill {
-    --split-pill-radius: calc(var(--radius-control) * 0.5);
-    position: relative;
-    display: inline-flex;
-}
-.split-pill:has(> .send-cancel-round) {
-    --split-pill-radius: var(--radius-round);
-}
-/* Empty while banner buttons own the end of the row. It stays mounted, so the
-   pill still runs its close, but takes no gap the fold never counts. */
-.split-pill:empty {
-    display: none;
-}
-
-/* The Side question half. It is out of flow, so the row's fold never
-   measures it and nothing in the row moves. The box ends at the button's left
-   edge and clips only there, so the half slides out of the button. */
-.send-hold-menu {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    right: 100%;
-    display: flex;
-    align-items: center;
-    z-index: 1;
-    clip-path: inset(-0.5rem 0 -0.5rem -0.5rem);
-}
-
-/* The half draws the seam's hairline, as a split button's caret does. It is
-   out of flow, so the line costs the row nothing. On the button it would
-   widen a Submit sized to its label, and the row's fold would re-measure. */
-.send-hold-menu > .action-btn {
-    height: 100%;
-    padding: 0 0.625rem 0 0.75rem;
-    border-right: 1px solid color-mix(in srgb, var(--text-on-accent) 30%, transparent);
-    border-radius: var(--split-pill-radius) 0 0 var(--split-pill-radius);
-    font-size: var(--font-size-sm);
-    animation: send-hold-slide-out var(--duration-normal) ease-out;
-}
-
-/* The button paints over the half, so its own focus ring shows at the seam. */
-.split-pill > .action-btn {
-    position: relative;
-    z-index: 2;
-}
-
-/* The button is the pill's right half while it is open: its left side squares
-   off at the seam. */
-.split-pill > .split-open {
-    border-top-left-radius: 0;
-    border-bottom-left-radius: 0;
-    clip-path: inset(-0.25rem -0.25rem -0.25rem 0);
-}
-
-/* Focus rings the whole pill, whichever half holds it. Both halves draw the
-   ring and each clips it at the seam, so the two join into one outline. The
-   focused half lightens, to say which one Enter presses. The transparent
-   outline is the forced-colors ring, where box-shadow is stripped. */
-.split-pill:has(> .send-hold-menu > .action-btn:focus-visible) > .action-btn,
-.split-pill:has(> .split-open:focus-visible) > .send-hold-menu > .action-btn {
-    outline: 0.125rem solid transparent;
-    box-shadow: var(--focus-ring);
-}
-.send-hold-menu > .action-btn:focus-visible,
-.split-pill > .split-open:focus-visible {
-    background-color: color-mix(in srgb, var(--accent-action) 80%, var(--text-on-accent));
-}
-.split-pill > .split-open.action-btn-confirm:focus-visible {
-    background-color: color-mix(in srgb, var(--confirm-bg) 80%, var(--text-on-accent));
-}
-.split-pill > .split-open.action-btn-danger:focus-visible {
-    background-color: color-mix(in srgb, var(--accent-red) 80%, var(--text-on-accent));
-}
-
-/* Starts wholly behind the seam. */
-@keyframes send-hold-slide-out {
-    from {
-        transform: translateX(100%);
-    }
-    to {
-        transform: none;
-    }
-}
-
-/* Shutting reverses the entrance: a drawing of the half slides back behind
-   the seam. It is a span, so it centres its label as the button does. */
-.send-hold-menu-leaving {
-    pointer-events: none;
-}
-.send-hold-menu-leaving > .action-btn {
-    display: inline-flex;
-    align-items: center;
-    animation: send-hold-slide-in var(--duration-normal) ease-in forwards;
-}
-
-@keyframes send-hold-slide-in {
-    from {
-        transform: none;
-    }
-    to {
-        transform: translateX(100%);
-    }
-}
-
 .image-attach-menu button,
 .image-attach-menu label {
     display: flex;
@@ -1450,6 +1340,11 @@
     font-weight: bold;
 }
 
+/* A typed answer whose POST got no answer: the card waits on the user again. */
+.exchange-status-not-sent {
+    color: var(--accent-red);
+}
+
 /* Sized in em so the triangle follows the status word. At 1.15em its base
    sits on the word's baseline and its tip just clears the capitals. */
 .exchange-status-warning {
@@ -1568,9 +1463,8 @@
     justify-content: center;
     /* The design size, which `badges.css` rounds to whole pixels. */
     --badge-height: 0.7rem;
-    width: var(--badge-box, var(--badge-height));
+    min-width: var(--badge-box, var(--badge-height));
     height: var(--badge-height);
-    border-radius: var(--radius-round);
     background: var(--text-secondary);
     font-size: var(--font-size-3xs);
     font-weight: 700;
@@ -1821,12 +1715,11 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
 
 /* Surface, radius, padding and leading come from `.user-bubble`, so the card
    reads as the thread's own question-then-answer shape. This adds the right
-   alignment and a typed question's own line breaks. */
+   alignment, and keeps a long unbroken token from widening the card. */
 .side-question-question {
     width: fit-content;
     margin: var(--space-sm) 0 var(--space-md) auto;
     color: var(--text-primary);
-    white-space: pre-wrap;
     overflow-wrap: anywhere;
 }
 
@@ -1842,6 +1735,46 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
 .side-question-error {
     color: var(--accent-red);
     overflow-wrap: anywhere;
+}
+
+/* The error and its Retry share one row. Retry is quiet text with no box, and
+   its padding is handed back so the word sits on the card's content edge. */
+.side-question-failure {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+}
+
+.side-question-retry {
+    display: inline-flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: var(--space-xs);
+    margin: calc(-1 * var(--space-xs)) calc(-1 * var(--space-sm));
+    padding: var(--space-xs) var(--space-sm);
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+}
+
+.side-question-retry svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+.side-question-retry:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+@media (hover: hover) {
+    .side-question-retry:hover {
+        color: var(--text-primary);
+    }
 }
 
 /* `flex-start` plus a row unit on every field, exactly as `.response-header`
@@ -2148,6 +2081,19 @@ button.initiator-actor,
     /* Match the LLM response body's left inset so change cards, questions, and
        every other initiator turn line up with the response text above them. */
     padding-left: var(--turn-body-inset);
+}
+
+/* A turn waiting behind an open question: a queued message, or a callback
+   whose body has no card to carry the note. */
+.initiator-panel[data-held] {
+    opacity: 0.55;
+}
+
+.initiator-held-note {
+    margin-top: var(--space-xs);
+    font-size: var(--font-size-xs);
+    font-style: italic;
+    color: var(--text-secondary);
 }
 
 /* User message → right-aligned bubble with the accent tint (the same surface as

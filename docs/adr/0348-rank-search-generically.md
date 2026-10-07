@@ -19,7 +19,8 @@ category is most relevant.
 No per-keyword map. Every category ranks its hits by one generic *title rank*
 before it cuts at the cap. The All tab orders its sections by the title rank of
 each section's best hit, with the old fixed order as the tiebreak. The tab strip
-itself never reorders, and each tab shows how many hits it holds.
+itself never reorders. A tab shows no hit count; a category that answers with
+no hits is dimmed.
 
 The title rank is a match level (`None`, `Phrase`, `WordStart`, `Exact`) and
 then coverage, the query's share of the title's length. One definition lives in
@@ -60,8 +61,10 @@ without naming either category.
   meaning. Embedding settings, pages, apps and file names would cost an
   embedding call per keystroke for labels a lexical rank already orders well.
 - **Tab counts alone, keeping the fixed section order.** It shows where hits
-  are, but leaves the best hit below a screen of weaker ones. The counts ship
-  beside the ranking instead.
-- **Exact totals per category.** Thread search's merge has no total. Asking each
-  category for one hit past the All tab's cap tells "5" from "5+" for every
-  category alike.
+  are, but leaves the best hit below a screen of weaker ones.
+- **Tab counts beside the ranking.** They shipped first, capped at "5+", and
+  were removed. Most tabs read "5+", which says little, and the space the count
+  needed made the pills shift or look unevenly spaced. Dimming an empty
+  category keeps the one signal that mattered.
+- **Exact totals per category.** Thread search's merge has no total, so a
+  count would need a second query per category on every keystroke.

@@ -7,11 +7,11 @@ description: Install, fix or remove the user's own fonts, or ship one in a plugi
 
 A *workspace font* is a font installed into the workspace, beside the fonts
 Lucidos bundles. The user installs one in Settings → Appearance → Workspace
-fonts, you install one by writing its files, and a plugin can ship one. It then
-works like a catalog font: the user picks it under Font, and a theme can name it.
+fonts, you write its files, or a plugin ships one. It then works like a catalog
+font: the user picks it under Font, and a theme can name it.
 
-The engine serves it from the workspace, never from the internet. Decision
-record: [ADR 0308](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0308-workspace-fonts-install-under-data-fonts.md).
+The engine serves it from the workspace, never from the internet: `font.json`
+has no URL field. Decision record: [ADR 0308](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0308-workspace-fonts-install-under-data-fonts.md).
 
 ## The layout
 
@@ -48,8 +48,8 @@ data/fonts/brand-sans/
   It is not checked against the file, so say `mono` only for a monospaced font.
 - `weight` is one number, or the `min max` range a variable file covers.
   Default `400`. `style` is `normal` (the default) or `italic`.
-- `ligatures` marks a mono font that ships programming ligatures. They then
-  apply on code surfaces only, as for Fira Code.
+- `ligatures` marks a mono font with programming ligatures. They apply on code
+  surfaces only, as for Fira Code.
 - `license` is optional text for the user to read.
 
 ## The limits
@@ -63,34 +63,29 @@ data/fonts/brand-sans/
 | Fonts | 100 per workspace. Installing one more is refused until one is removed. |
 | Label | 1 to 60 characters |
 
-`font.json` has no URL field. A font cannot load from anywhere but the
-workspace.
-
 ## Install one
 
-Write the font files first and `font.json` last, so the font appears only once
-it is complete:
+Write the face files first and `font.json` last, so the font appears only when
+complete:
 
 ```bash
 lucidos data write fonts/brand-sans/BrandSans-Regular.woff2 --from /tmp/BrandSans-Regular.woff2
 lucidos data write fonts/brand-sans/font.json --from /tmp/font.json
 ```
 
-Each write is checked before it reaches disk, and a refused one exits non-zero
-with the reason. If the user gave you a URL, download the file once to `/tmp`
-and write it from there. That is one download the user asked for. Once
-installed, the font loads from the workspace.
+The engine checks each write before it reaches disk. A refused write exits
+non-zero with the reason. If the user gave you a URL, download the file once to
+`/tmp` and write it from there.
 
-Only use a font the user has the right to use. Check the licence when you fetch
-one yourself, and put its SPDX id in `license`.
+Only use a font the user has the right to use. When you fetch one yourself,
+check the licence and put its SPDX id in `license`.
 
 ## Check it
 
 `GET /api/v1/fonts` lists the catalog, then every valid workspace font with
 `source: "workspace"`, its `family`, and its `faces` as `data/`-relative paths.
 A font that fails a check appears on no surface. It is listed under `invalid`
-with the reason, for example a face file that `font.json` names but that is
-missing. Fix the file, or remove the font.
+with the reason, such as a missing face file. Fix the file, or remove the font.
 
 ## Use it
 
@@ -101,18 +96,18 @@ missing. Fix the file, or remove the font.
   `system-knowhow/themes.md` § Fonts. Approval cards still show a command in a
   catalog code font (`system-knowhow/themes.md` § Protected surfaces).
 
-A font removed later falls back quietly: the preference or the theme then paints
-as if it named nothing.
+If the font is removed later, the preference or theme quietly paints as if it
+named nothing.
 
 ## Remove one
 
-The user removes one in Settings → Appearance → Workspace fonts. Deleting the
-directory works too. Open clients pick the change up the next time they read
-the font list.
+The user removes one in Settings → Appearance → Workspace fonts, or you delete
+the directory. Open clients see the change the next time they read the font
+list.
 
 ## Ship one in a plugin
 
 Put the directory under the plugin's own `fonts/`, as in the layout above.
-Staging checks every font the same way, and refuses a plugin whose new fonts
+Staging checks every font the same way. It refuses a plugin whose new fonts
 would take the workspace past 100. A theme in the plugin may name a workspace
 font only if the same plugin ships it. See `system-knowhow/plugins.md`.

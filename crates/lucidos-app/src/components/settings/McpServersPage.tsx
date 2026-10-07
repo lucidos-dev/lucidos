@@ -228,6 +228,7 @@ function mcpCostSummary(summary: McpHeaderSummary | null, sk = false): VNode {
       {(sk || summary?.share) && (
         <SkText class="mcp-cost-share" as="div" w="14rem">{summary?.share}</SkText>
       )}
+      {!sk && summary?.warning && <div class="mcp-cost-warning">{summary.warning}</div>}
       {(sk || summary?.stopped) && (
         <SkText class="mcp-cost-aside" as="div" w="17rem">{summary?.stopped}</SkText>
       )}
@@ -257,7 +258,12 @@ export function mcpServersBody(props: McpServersBodyProps): VNode {
   const { data } = props;
   const summary =
     data.status === 'loaded'
-      ? mcpHeaderSummary(data.data.totals, data.data.context_window, data.data.model)
+      ? mcpHeaderSummary(
+          data.data.totals,
+          data.data.context_window,
+          data.data.model,
+          data.data.budget,
+        )
       : null;
 
   return (

@@ -9,6 +9,7 @@
 //! - the data route refuses a bad theme before it reaches disk.
 
 use crate::support::{base_url, user_client, workspace_path, workspace_tree_lock};
+use lucidos_engine::core::prefs;
 
 fn api(path: &str) -> String {
     format!("{}/api/v1{}", base_url(), path)
@@ -444,7 +445,7 @@ async fn a_theme_mode_written_to_the_theme_key_is_refused_with_the_key_it_meant(
     let device = format!("e2e-theme-mode-{}", uuid::Uuid::new_v4().simple());
 
     let refused: serde_json::Value = client
-        .put(api("/preferences?key=theme"))
+        .put(api(&format!("/preferences?key={}", prefs::THEME.key())))
         .json(&serde_json::json!({ "value": "dark", "device_id": device }))
         .send()
         .await
@@ -457,12 +458,15 @@ async fn a_theme_mode_written_to_the_theme_key_is_refused_with_the_key_it_meant(
         refused["error"]
             .as_str()
             .unwrap_or("")
-            .contains("theme-mode"),
+            .contains(prefs::THEME_MODE.key()),
         "the refusal names the key it meant: {refused}"
     );
 
     let accepted: serde_json::Value = client
-        .put(api("/preferences?key=theme-mode"))
+        .put(api(&format!(
+            "/preferences?key={}",
+            prefs::THEME_MODE.key()
+        )))
         .json(&serde_json::json!({ "value": "dark", "device_id": device }))
         .send()
         .await

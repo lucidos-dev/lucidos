@@ -14,21 +14,21 @@ use crate::memory::{cosine_similarity, CorrectedMemory, EmbeddingProvider};
 /// A free function so a stubbed provider drives it offline. The handler around
 /// it needs an index, an embedder and a live engine.
 ///
-/// The capture is recorded before the answer is read, so a verdict nobody could
-/// parse is still accounted. The call was paid for either way.
+/// `capture` makes the call and records it before the answer is read, so a
+/// verdict nobody could parse is still accounted.
 pub(crate) async fn verify_entries<P: LlmProvider + ?Sized>(
     provider: &P,
     prompt: String,
     candidates: usize,
-    capture: Option<&AuxCapture>,
+    capture: &AuxCapture,
 ) -> Option<Vec<usize>> {
-    let request_chars = prompt.chars().count();
     let messages = vec![Message {
         role: "user".to_string(),
         content: MessageContent::Text(prompt),
     }];
-    let response = match provider
+    let response = match capture
         .chat(
+            provider,
             messages,
             vec![],
             crate::llm::ModelSelection::default(),
@@ -43,12 +43,6 @@ pub(crate) async fn verify_entries<P: LlmProvider + ?Sized>(
             return None;
         }
     };
-    if let Some(capture) = capture {
-        capture
-            .record(provider.default_model(), request_chars, &response)
-            .await;
-    }
-
     let answer = response
         .content
         .as_deref()
@@ -199,7 +193,7 @@ If NONE should be deleted, reply with "none"."#,
             self.current_provider().as_ref(),
             verify_prompt,
             candidates.len(),
-            Some(&capture),
+            &capture,
         )
         .await
         else {
@@ -552,7 +546,7 @@ mod tests {
         );
 
         let provider = ScriptedProvider::new("claude-opus-4-5", vec!["1, 3"]);
-        let verified = verify_entries(&provider, "which of these?".to_string(), 3, Some(&capture))
+        let verified = verify_entries(&provider, "which of these?".to_string(), 3, &capture)
             .await
             .expect("the scripted reply parses");
         assert_eq!(
@@ -585,7 +579,7 @@ mod tests {
         );
 
         let provider = ScriptedProvider::new("claude-opus-4-5", vec!["none"]);
-        let verified = verify_entries(&provider, "which of these?".to_string(), 3, Some(&capture))
+        let verified = verify_entries(&provider, "which of these?".to_string(), 3, &capture)
             .await
             .expect("the scripted reply parses");
         assert!(verified.is_empty());

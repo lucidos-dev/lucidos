@@ -6,6 +6,10 @@ use crate::engine::thread_events::{ActorMode, EventChannel};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
 async fn spawn(bus: &EventBus, pool: &sqlx::PgPool) -> Uuid {
+    spawn_under(bus, pool, None).await
+}
+
+async fn spawn_under(bus: &EventBus, pool: &sqlx::PgPool, parent: Option<Uuid>) -> Uuid {
     let id = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: id,
@@ -16,7 +20,7 @@ async fn spawn(bus: &EventBus, pool: &sqlx::PgPool) -> Uuid {
             user_image_hashes: vec![],
             device_id: None,
             image_description: None,
-            parent_thread_id: None,
+            parent_thread_id: parent,
             spawning_event_id: None,
             mode: ActorMode::Human,
             model: None,
@@ -74,9 +78,15 @@ async fn unarchive_moves_exactly_the_archived_ids_back() {
         archive(&bus, id).await;
     }
 
-    let back = unarchive_threads(&bus, &pool, &[batch_a, batch_b, open], device())
-        .await
-        .unwrap();
+    let back = unarchive_threads(
+        &bus,
+        &pool,
+        &[batch_a, batch_b, open],
+        UnarchiveScope::Exactly,
+        device(),
+    )
+    .await
+    .unwrap();
     assert_eq!(back.len(), 2);
     assert!(back.contains(&batch_a) && back.contains(&batch_b));
     for id in [batch_a, batch_b, open] {
@@ -99,7 +109,7 @@ async fn an_unarchived_thread_pins_and_unpins_cleanly() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let id = spawn(&bus, &pool).await;
     archive(&bus, id).await;
-    unarchive_threads(&bus, &pool, &[id], device())
+    unarchive_threads(&bus, &pool, &[id], UnarchiveScope::Exactly, device())
         .await
         .unwrap();
     for event in [ThreadEvent::ThreadSaved, ThreadEvent::ThreadUnsaved] {
@@ -112,6 +122,42 @@ async fn an_unarchived_thread_pins_and_unpins_cleanly() {
         .unwrap();
     }
     assert_eq!(section(&pool, id).await, "inbox");
+
+    teardown_test_db(&db).await;
+}
+
+/// Move to Current brings the sub-threads back with the thread, as Archive took
+/// them; Undo's exact scope leaves them where they are.
+#[tokio::test]
+async fn unarchive_with_sub_threads_restores_the_family() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let parent = spawn(&bus, &pool).await;
+    let child = spawn_under(&bus, &pool, Some(parent)).await;
+    let grandchild = spawn_under(&bus, &pool, Some(child)).await;
+    for id in [parent, child, grandchild] {
+        archive(&bus, id).await;
+    }
+
+    let exact = unarchive_threads(&bus, &pool, &[parent], UnarchiveScope::Exactly, device())
+        .await
+        .unwrap();
+    assert_eq!(exact, vec![parent]);
+    assert_eq!(section(&pool, child).await, "archived");
+
+    let family = unarchive_threads(
+        &bus,
+        &pool,
+        &[parent],
+        UnarchiveScope::WithSubThreads,
+        device(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(family, vec![child, grandchild], "parents first");
+    for id in [parent, child, grandchild] {
+        assert_eq!(section(&pool, id).await, "inbox");
+    }
 
     teardown_test_db(&db).await;
 }

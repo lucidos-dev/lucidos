@@ -7,6 +7,7 @@ import { FileTypeIcon, FolderIcon } from '../../utils/fileIcons';
 import { loadedOr } from '../../store/types';
 import { SkText, SkBlock } from '../shared/Skeleton';
 import { Disclosure } from '../shared/Disclosure';
+import { ChevronRightIcon } from '../shared/icons';
 import { markNavigationScroll } from '../chat/scrollState';
 
 type FileEntry = { name: string; path: string };
@@ -22,7 +23,7 @@ function TreeRowSkeleton({ kind, depth }: { kind: 'folder' | 'file'; depth: numb
     kind === 'folder' ? (
       <div class="folder-item">
         <div class="folder-header">
-          <SkBlock w="0.6rem" h="0.6rem" round />
+          <SkBlock w="0.75rem" h="0.75rem" round />
           <SkBlock w="1rem" h="1rem" round />
           <SkText class="folder-name" w="7rem" />
         </div>
@@ -134,7 +135,9 @@ export function TreeNode({
         return (
           <div key={folderPath} class="folder-item">
             <div class="folder-header" data-path={folderPath} onClick={() => onToggle(folderPath)}>
-              <span class="folder-arrow">{expanded ? '\u25BC' : '\u25B6'}</span>
+              <span class="folder-chevron" data-open={expanded ? 'true' : 'false'} aria-hidden="true">
+                <ChevronRightIcon />
+              </span>
               <FolderIcon className="folder-icon" />
               <span class="folder-name">{folderName}</span>
               <span class="folder-count">({childCount})</span>

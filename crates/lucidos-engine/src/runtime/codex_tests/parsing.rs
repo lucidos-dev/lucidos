@@ -122,7 +122,9 @@ fn full_real_turn_maps_to_canonical_events() {
         other => panic!("expected Init first, got {:?}", other),
     }
     match &events[1] {
-        AgentEvent::ToolUse { name, input, id } => {
+        AgentEvent::ToolUse {
+            name, input, id, ..
+        } => {
             assert_eq!(name, "command_execution");
             assert_eq!(input["command"], "/bin/zsh -lc ls");
             assert_eq!(id, "item_0");
@@ -130,7 +132,9 @@ fn full_real_turn_maps_to_canonical_events() {
         other => panic!("expected ToolUse second, got {:?}", other),
     }
     match &events[2] {
-        AgentEvent::ToolResult { output, status, id } => {
+        AgentEvent::ToolResult {
+            output, status, id, ..
+        } => {
             assert_eq!(output, "run1.jsonl\nsample.txt\n");
             assert_eq!(status, "success");
             assert_eq!(id, "item_0", "result must pair with its call");

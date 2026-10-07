@@ -1531,6 +1531,7 @@ impl GatewayState {
             }
             let base = registry::slugify(name);
             let id = registry::unique_slug(&base, &|s| reg.contains(s));
+            refuse_an_id_postgres_would_truncate(name, &id)?;
             let port = reg
                 .allocate_port()
                 .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -1663,6 +1664,7 @@ impl GatewayState {
                     entry.clone()
                 }
                 None => {
+                    refuse_an_id_postgres_would_truncate(basename, &id)?;
                     let port = reg
                         .allocate_port()
                         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -1820,6 +1822,10 @@ impl GatewayState {
                 return Err(ApiError::conflict(name_taken_message(&existing.name)));
             }
             let slug = registry::slugify(&name);
+            if let Err(refusal) = refuse_an_id_postgres_would_truncate(&name, &slug) {
+                let _ = std::fs::remove_file(&archive_tmp);
+                return Err(refusal);
+            }
             if let Some(existing) = reg.get(&slug) {
                 let _ = std::fs::remove_file(&archive_tmp);
                 return Err(ApiError::conflict(address_taken_message(
@@ -3591,6 +3597,20 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
 /// "personaaa" they can see in the list.
 fn name_taken_message(existing_name: &str) -> String {
     format!("You already have a workspace called \"{existing_name}\". Choose a different name.")
+}
+
+/// Refuse a NEW workspace id whose database name Postgres would cut. Create,
+/// restore and a first adopt mint ids, so all three call this before `reg.add`.
+fn refuse_an_id_postgres_would_truncate(name: &str, id: &str) -> Result<(), ApiError> {
+    let limit = crate::postgres::MAX_NEW_WORKSPACE_ID_BYTES;
+    if id.len() <= limit {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(format!(
+        "\"{name}\" gives the address /{id}/, which is {} characters long. A workspace \
+         address can have at most {limit}. Choose a shorter name.",
+        id.len()
+    )))
 }
 
 /// Do these two display names count as the same one? Trimmed and
@@ -6083,6 +6103,45 @@ mod tests {
             "the same sentence create gives, quoting the name as stored",
         );
         assert_eq!(registered(&state).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_name_whose_database_postgres_would_truncate() {
+        let (state, _root) = adopting_state();
+        let name = "w".repeat(crate::postgres::MAX_NEW_WORKSPACE_ID_BYTES + 1);
+
+        let Err(refusal) = state.create_workspace(&name).await else {
+            panic!("a {}-byte workspace id was minted", name.len());
+        };
+        let response = axum::response::IntoResponse::into_response(refusal);
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(registered(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_first_adopt_refuses_a_basename_whose_database_postgres_would_truncate() {
+        let (state, root) = adopting_state();
+        let too_long = "a".repeat(crate::postgres::MAX_NEW_WORKSPACE_ID_BYTES + 1);
+        let dir = a_directory(root.path(), &too_long);
+
+        let (status, body) = adopt(&state, json!({ "dir": dir })).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(registered(&state).is_empty());
+    }
+
+    #[test]
+    fn the_truncation_check_measures_the_suffixed_address() {
+        let limit = crate::postgres::MAX_NEW_WORKSPACE_ID_BYTES;
+        let at_limit = "a".repeat(limit);
+        assert!(refuse_an_id_postgres_would_truncate("x", &at_limit).is_ok());
+
+        // A name at the limit whose address took a suffix is measured with it.
+        let suffixed = format!("{at_limit}-2");
+        let refusal = refuse_an_id_postgres_would_truncate(&at_limit, &suffixed).unwrap_err();
+        let body = axum::response::IntoResponse::into_response(refusal);
+        assert_eq!(body.status(), StatusCode::BAD_REQUEST);
     }
 
     // ── Adopting an engine the gateway did not start ─────────────────────────

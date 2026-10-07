@@ -694,6 +694,8 @@ pub(crate) struct EditFileArgs<'a> {
     /// pairings that would lie are refused.
     pub commit: Option<bool>,
     pub message: Option<&'a str>,
+    /// The thread whose turn made the edit, stamped on the artifact event.
+    pub writer_thread_id: Option<uuid::Uuid>,
 }
 
 impl LucidosEngine {
@@ -752,6 +754,7 @@ impl LucidosEngine {
             replace_all,
             commit,
             message,
+            writer_thread_id,
         } = args;
 
         // Checked before the read, so a rejected call never touches disk.
@@ -862,6 +865,7 @@ impl LucidosEngine {
                     artifact_path: artifact_path.to_string(),
                     commit: commit_sha.clone(),
                     source: None,
+                    writer_thread_id,
                 }))
                 .await
                 .map_err(|e| format!("Failed to emit event: {}", e))?;
@@ -989,16 +993,23 @@ fn image_media_type(ext: &str) -> Option<&'static str> {
     }
 }
 
-/// Encode image `bytes` (with source `media_type`) into the `[IMAGE_CONTENT:<type>]\n<base64>`
-/// sentinel that `read_file` returns for images. The image is run through
-/// `ChatImage::fit_for_llm` — the same fit-to-target step every LLM-bound image path uses —
-/// so an oversized iPhone photo is downsampled to fit rather than rejected. Fitting compresses
-/// to JPEG when it shrinks the image, so the emitted media type becomes `image/jpeg` for those;
-/// the sentinel always names the media type of the bytes actually returned.
+/// Encode image `bytes` into the `[IMAGE_CONTENT:<type>]\n<base64>` sentinel that
+/// `read_file` returns for images. The media type is sniffed from `bytes` via
+/// `core::blobs::sniff_image_mime`. `fallback_media_type` (normally the extension)
+/// is used only when the bytes match none of the sniffed formats. A mismatched
+/// extension, like a JPEG saved as `.png`, would otherwise reach the model under
+/// the wrong media type. Claude on Vertex rejects the whole request for that.
+///
+/// The image then runs through `ChatImage::fit_for_llm`, the same fit-to-target
+/// step every LLM-bound image path uses. An oversized iPhone photo is downsampled
+/// to fit rather than rejected. Fitting compresses to JPEG when it shrinks the
+/// image, so the emitted media type becomes `image/jpeg` for those. The sentinel
+/// always names the media type of the bytes actually returned.
 ///
 /// `pub(crate)` so `view_image` (`engine::tools::image`) can emit the same sentinel —
 /// the agentic loop's `parse_image_content_marker` lifts it into a vision block.
-pub(crate) fn encode_image_for_read(bytes: Vec<u8>, media_type: &str) -> String {
+pub(crate) fn encode_image_for_read(bytes: Vec<u8>, fallback_media_type: &str) -> String {
+    let media_type = crate::core::blobs::sniff_image_mime(&bytes).unwrap_or(fallback_media_type);
     let fitted = crate::api::ChatImage {
         base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
         mime_type: media_type.to_string(),
@@ -1212,6 +1223,7 @@ impl LucidosEngine {
         &self,
         name: &str,
         args: &serde_json::Value,
+        thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             "read_file" => {
@@ -1362,6 +1374,7 @@ impl LucidosEngine {
                             artifact_path.to_string(),
                             commit_sha.clone(),
                             None,
+                            Some(thread_id),
                         )))
                         .await?;
                 }
@@ -1408,6 +1421,7 @@ impl LucidosEngine {
                         replace_all: args["replace_all"].as_bool().unwrap_or(false),
                         commit: args.get("commit").and_then(|v| v.as_bool()),
                         message: args.get("message").and_then(|v| v.as_str()),
+                        writer_thread_id: Some(thread_id),
                     })
                     .await
                 {
@@ -1650,6 +1664,7 @@ impl LucidosEngine {
                             artifact_path.to_string(),
                             commit_sha.clone(),
                             None,
+                            Some(thread_id),
                         )))
                         .await?;
                 }

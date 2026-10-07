@@ -15,7 +15,8 @@
 import { describe, expect, it } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { SpokenChip, SpokenReply } from '../chat-exchange-parts';
-import { describeInitiator, isUserBubbleEvent } from '../ChatExchange';
+import { describeInitiator } from '../ChatExchange';
+import { isUserBubbleEvent } from '../../../store/thread-events/exchange';
 import { vnodeToText } from './vnodeToText';
 import { drawsResponseRow, getCollapsedVisibleEvents } from '../../../store/event-rendering';
 import { exchangeResponseEvents } from '../../../store/thread-events';

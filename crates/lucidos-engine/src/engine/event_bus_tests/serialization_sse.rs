@@ -357,7 +357,7 @@ fn system_preferences_changed_matches_server_event_shape() {
         seq: None,
         created: Utc::now(),
         typed: BusEvent::System(SystemEvent::PreferencesChanged {
-            key: "timezone".into(),
+            key: crate::core::prefs::TIMEZONE.key().into(),
             value: Some("Europe/Oslo".into()),
             actor: None,
         }),
@@ -368,7 +368,7 @@ fn system_preferences_changed_matches_server_event_shape() {
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
     assert_eq!(json["type"], "PreferencesChanged");
-    assert_eq!(json["data"]["key"], "timezone");
+    assert_eq!(json["data"]["key"], crate::core::prefs::TIMEZONE.key());
     assert_eq!(json["data"]["value"], "Europe/Oslo");
 }
 
@@ -697,6 +697,11 @@ fn reserved_type_names_match_event_type() {
             model_id: "m".into(),
             load_state: crate::memory::EmbeddingModelLoadState::Loading,
         },
+        TreeBackfillProgressed {
+            progress: Default::default(),
+        },
+        TreeBackfillCompleted { total: 0 },
+        TreeBackfillReset {},
         ChangesUpdated {
             pending: vec![],
             set_aside: vec![],
@@ -735,6 +740,7 @@ fn reserved_type_names_match_event_type() {
             source_detail: "d".into(),
             commit_hash: "c".into(),
             summary: None,
+            writer_thread_id: None,
         },
         TriggerCreated {
             trigger_id: "t".into(),
@@ -790,11 +796,13 @@ fn reserved_type_names_match_event_type() {
             artifact_path: "p".into(),
             commit: "c".into(),
             source: None,
+            writer_thread_id: None,
         },
         ArtifactUpdated {
             artifact_path: "p".into(),
             commit: "c".into(),
             source: None,
+            writer_thread_id: None,
         },
         ArtifactDeleted {
             artifact_path: "p".into(),
@@ -890,6 +898,7 @@ fn a_live_coding_agent_result_leaves_its_text_for_the_modal_to_fetch() {
         result: "test output\n".repeat(1_000),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         tool_use_id: "toolu_1".into(),
+        parent_tool_use_id: None,
     });
     assert!(
         event.get("result").is_none(),
@@ -925,6 +934,8 @@ fn a_live_coding_agent_call_leaves_its_args_for_the_modal_to_fetch() {
         description: "Write notes.ts".into(),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         tool_use_id: "toolu_1".into(),
+        parent_tool_use_id: None,
+        api_call_id: None,
     });
     assert!(
         event.get("args").is_none(),

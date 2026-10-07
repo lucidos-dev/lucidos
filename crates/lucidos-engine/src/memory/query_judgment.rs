@@ -1,8 +1,8 @@
 //! Query classification as three typed yes/no questions.
 //!
-//! The Jev half of `MemoryExtractor::classify_query`. It answers the three
-//! booleans and nothing else: `sub_queries` is generation, so it stays on the
-//! chat model and the extractor runs it only when memory is wanted.
+//! What `memory::classify_query` asks the site's judgment provider. It
+//! answers the three booleans and nothing else: `sub_queries` is generation,
+//! so it stays on the chat model and runs only when memory is wanted.
 //!
 //! Everything here is pure, so the questions, the state and the thresholding
 //! are tested without a pool or a network.
@@ -24,7 +24,7 @@ pub(crate) const NEEDS_CREDENTIALS: &str = "needs_credentials";
 /// answer loads, and only a confident no skips.
 ///
 /// A starting value, pinned by the tests rather than fitted to data. Tuning it
-/// needs real traffic through a live key.
+/// needs real traffic on each provider.
 pub(crate) const YES_THRESHOLD: f64 = 0.35;
 
 /// What the model reads. Named fields, because the message and the

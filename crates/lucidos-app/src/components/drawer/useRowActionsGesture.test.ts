@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { makeLongPressHandlers, type LongPressCallback } from '../../hooks/useLongPress';
+import {
+  makeLongPressHandlers, LONG_PRESS_DELAY_MS, type LongPressCallback,
+} from '../../hooks/useLongPress';
 import { rowGestureHandlers } from './useRowActionsGesture';
 
 const row = { closest: () => null };
@@ -106,7 +108,7 @@ describe('rowGestureHandlers', () => {
     it('a hold opens the menu and swallows its paired click', () => {
       const h = build(true);
       h.onPointerDown!(pointerDown());
-      vi.advanceTimersByTime(450);
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
       h.onPointerUp!(pointerDown());
       h.onClick!(click());
       expect(open).toHaveBeenCalledWith(row);
@@ -116,7 +118,7 @@ describe('rowGestureHandlers', () => {
     it('a hold that starts on an inline control is left to it', () => {
       const h = build(true);
       h.onPointerDown!(pointerDown(pinButton));
-      vi.advanceTimersByTime(450);
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
       expect(open).not.toHaveBeenCalled();
       expect(prefetch).toHaveBeenCalledTimes(1);
     });
@@ -126,7 +128,7 @@ describe('rowGestureHandlers', () => {
       // not open the row's menu.
       const h = build(true);
       h.onPointerDown!(pointerDown(archivedLabelText));
-      vi.advanceTimersByTime(450);
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
       expect(open).not.toHaveBeenCalled();
       expect(prefetch).toHaveBeenCalledTimes(1);
     });

@@ -95,6 +95,7 @@ async fn rejected_tool_result_ends_the_park() {
                 .into(),
             coding_agent: CodingAgent::ClaudeCode,
             tool_use_id: String::new(),
+            parent_tool_use_id: None,
         }))
         .await,
         "the agent raced past the question, so the thread is an interrupted turn, \
@@ -108,6 +109,7 @@ async fn agent_text_after_the_question_ends_the_park() {
         !parked_after(Some(ThreadEvent::CodingAgentTextStreamed {
             text: "\n\n".into(),
             coding_agent: CodingAgent::ClaudeCode,
+            parent_tool_use_id: None,
         }))
         .await,
         "the agent kept talking past the question, so the card is dead"
@@ -295,6 +297,7 @@ mod preserve_at_shutdown {
             event: ThreadEvent::CodingAgentTextStreamed {
                 text: "moving on".into(),
                 coding_agent: CodingAgent::ClaudeCode,
+                parent_tool_use_id: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),

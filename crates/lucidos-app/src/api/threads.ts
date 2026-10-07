@@ -25,6 +25,9 @@ export interface ThreadSummary {
    *  no such array. Both come from `thread_summaries.is_saved`, so they agree.
    *  Optional only so test mocks needn't supply it. */
   saved?: boolean;
+  /** Whether this is the workspace's home thread (ADR 0362). The engine sends
+   *  it only when true. */
+  home?: boolean;
   section: ThreadSection;
   active_children_count: number;
   /** Direct children idle on their own live event wait. Such a child has not
@@ -152,6 +155,9 @@ export interface ThreadsResponse {
     family_threads: ThreadSummary[];
     /** Included when the focused thread isn't in the other lists. */
     focused_thread?: ThreadSummary;
+    /** The home thread, whatever window the lists above cut. Null before the
+     *  engine has created it; absent from an older engine or a test mock. */
+    home_thread?: ThreadSummary | null;
 }
 
 export async function fetchThreads(focusedThreadId?: string): Promise<ThreadsResponse> {
@@ -241,14 +247,19 @@ export async function archiveAllPreflight(): Promise<ArchiveAllPreflight> {
  *  member the cascades took, which is what Undo hands back to `unarchiveThreads`. */
 export async function archiveAll(
   threadIds: string[],
-): Promise<{ archived: string[]; kept: { thread_id: string; reason: string }[] }> {
+): Promise<{ archived: string[]; kept: { thread_id: string; reason: string; slug: string }[] }> {
     const res = await postThreadAction('archive-all', { thread_ids: threadIds });
     return res.json();
 }
 
-/** Move archived threads back to the inbox: Archive all's Undo. */
-export async function unarchiveThreads(threadIds: string[]): Promise<{ unarchived: string[] }> {
-    const res = await postThreadAction('unarchive', { thread_ids: threadIds });
+/** Move archived threads back to the inbox. Archive all's Undo names every
+ *  id; the thread menu's Move to Current passes `withSubThreads`, so the
+ *  engine brings the family back as Archive took it. */
+export async function unarchiveThreads(
+  threadIds: string[],
+  { withSubThreads = false }: { withSubThreads?: boolean } = {},
+): Promise<{ unarchived: string[] }> {
+    const res = await postThreadAction('unarchive', { thread_ids: threadIds, with_sub_threads: withSubThreads });
     return res.json();
 }
 
@@ -267,6 +278,9 @@ export interface DeletePreflight {
   thread_count: number;
   sub_thread_titles: string[];
   memory_count: number;
+  /** Model-written summary tree lines the delete sends back to be rebuilt,
+   *  each one background model call. */
+  summary_rebuild_count: number;
   has_unapplied_branch_work: boolean;
   has_applied_changes: boolean;
   backups_present: boolean;

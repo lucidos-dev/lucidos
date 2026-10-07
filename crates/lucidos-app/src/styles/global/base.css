@@ -76,7 +76,8 @@ html {
     --radius-surface: 0.75rem;
     /* Circles and pills. On a square box 999px clamps to half the side, the
        same circle as 50%. Every other corner in the shell is a multiple of
-       the two steps above, so a theme can square the whole UI. */
+       the two steps above, so a theme can square the whole UI. Spinners and
+       badges are the exceptions and stay round (styles/badges.css). */
     --radius-round: 999px;
     /* Light mode inverts the background ladder, so it overrides this fill. */
     --surface-bg: var(--bg-secondary);

@@ -52,24 +52,25 @@ pub(crate) fn resolve_data_path(ws: &Workspace, relative: &str) -> Result<PathBu
 ///
 /// An image gets markdown IMAGE syntax, which renders inline. Agents paste this
 /// line verbatim, and a plain link to a picture only opens a preview on tap.
-/// Markdown ends a bare destination at a space, so an image path holding one
-/// is angle-bracketed. A known `size` becomes an image size hint, which lets
-/// the card or reply reserve the picture's box before it loads.
+/// Markdown ends a bare destination at a space, so a path holding one is
+/// angle-bracketed. A known `size` becomes an image size hint, which lets the
+/// card or reply reserve the picture's box before it loads.
 fn chat_link(normalized: &str, size: Option<(usize, usize)>) -> String {
     let label = normalized.rsplit('/').next().unwrap_or(normalized);
-    if !is_image(label) {
-        return format!("[{}]({})", label, normalized);
-    }
+    let image = is_image(label);
     let target = match size {
-        Some((w, h)) if (1..=MAX_HINT_SIDE).contains(&w) && (1..=MAX_HINT_SIDE).contains(&h) => {
+        Some((w, h))
+            if image && (1..=MAX_HINT_SIDE).contains(&w) && (1..=MAX_HINT_SIDE).contains(&h) =>
+        {
             format!("{normalized}#{w}x{h}")
         }
         _ => normalized.to_string(),
     };
+    let bang = if image { "!" } else { "" };
     if target.contains(char::is_whitespace) {
-        format!("![{}](<{}>)", label, target)
+        format!("{bang}[{label}](<{target}>)")
     } else {
-        format!("![{}]({})", label, target)
+        format!("{bang}[{label}]({target})")
     }
 }
 
@@ -107,7 +108,26 @@ const IMAGE_NOT_SHOWN_YET: &str = "The user cannot see this picture yet. If a qu
      Your words before any tool call reach the user only as a short summary, which drops \
      the picture. Otherwise paste the line in the reply that ends your turn.";
 
-/// Mirrors `IMAGE_EXTENSIONS` in the frontend's `utils/fileIcons.tsx`.
+/// Printed after saving any other artifact. An agent saved an HTML explainer
+/// and wrote its link just before a card, so the user got a summary and no link.
+const LINK_NOT_SHOWN_YET: &str = "The user cannot see this file yet. If a question card comes \
+     next, put the link line ON the card, in its question. An option shows a link as plain \
+     text. Your words before any tool call reach the user only as a short summary, which \
+     drops the link. Otherwise paste the line in the reply that ends your turn.";
+
+/// The reminder for a freshly saved file, if the user is meant to see it.
+fn not_shown_yet(normalized: &str) -> Option<&'static str> {
+    if is_image(normalized) {
+        Some(IMAGE_NOT_SHOWN_YET)
+    } else if normalized.starts_with("artifacts/") {
+        Some(LINK_NOT_SHOWN_YET)
+    } else {
+        None
+    }
+}
+
+/// Mirrors `IMAGE_EXTENSIONS` in the frontend's `utils/fileIcons.tsx`, and the
+/// engine card gate's `is_picture`, which a test below pins.
 fn is_image(file_name: &str) -> bool {
     const IMAGE_EXTENSIONS: &[&str] = &["gif", "jpeg", "jpg", "png", "svg", "webp"];
     file_name.rsplit_once('.').is_some_and(|(_, ext)| {
@@ -218,10 +238,10 @@ pub(crate) fn cmd_write(
 
     // Echo the resolved absolute path on stderr so callers see exactly what was
     // written, keeping stdout clean for the clickable link below. The path
-    // stays stderr's LAST line, so a picture's reminder goes before it.
+    // stays stderr's LAST line, so the not-shown reminder goes before it.
     let mut stderr = io::stderr();
-    if is_image(&normalized) {
-        writeln!(stderr, "{IMAGE_NOT_SHOWN_YET}")
+    if let Some(reminder) = not_shown_yet(&normalized) {
+        writeln!(stderr, "{reminder}")
             .map_err(|e| format!("Failed to write status to stderr: {}", e))?;
     }
     writeln!(stderr, "{}", abs.display())
@@ -429,12 +449,16 @@ mod tests {
     }
 
     #[test]
-    fn chat_link_for_an_image_with_a_space_brackets_the_target() {
-        // Markdown ends a bare destination at the first space, so the image
+    fn chat_link_with_a_space_brackets_the_target() {
+        // Markdown ends a bare destination at the first space, so the line
         // would render as literal text. An angle-bracketed one may hold spaces.
         assert_eq!(
             chat_link("artifacts/quarterly chart.png", None),
             "![quarterly chart.png](<artifacts/quarterly chart.png>)"
+        );
+        assert_eq!(
+            chat_link("artifacts/quarterly report.html", None),
+            "[quarterly report.html](<artifacts/quarterly report.html>)"
         );
     }
 
@@ -507,6 +531,37 @@ mod tests {
         assert!(IMAGE_NOT_SHOWN_YET.contains("`preview`"));
         assert!(IMAGE_NOT_SHOWN_YET.contains("short summary"));
         assert!(!IMAGE_NOT_SHOWN_YET.contains("same message"));
+    }
+
+    /// The engine's question-card gate asks for this line's image form exactly
+    /// when the CLI prints one, so both read the same extensions.
+    #[test]
+    fn the_card_gate_reads_the_same_picture_extensions() {
+        const GATE: &str = include_str!("../../lucidos-engine/src/engine/question_card_gate.rs");
+        const LIST: &str = r#"&["gif", "jpeg", "jpg", "png", "svg", "webp"]"#;
+        assert!(GATE.contains(LIST), "the gate's `is_picture` list drifted");
+        assert!(include_str!("data.rs").contains(LIST), "`is_image` drifted");
+    }
+
+    #[test]
+    fn every_artifact_gets_a_reminder_and_other_files_none() {
+        assert_eq!(
+            not_shown_yet("artifacts/design/a.png"),
+            Some(IMAGE_NOT_SHOWN_YET)
+        );
+        assert_eq!(
+            not_shown_yet("artifacts/explainer.html"),
+            Some(LINK_NOT_SHOWN_YET)
+        );
+        assert_eq!(not_shown_yet("knowhow/notes.md"), None);
+        let card = LINK_NOT_SHOWN_YET
+            .find("ON the card")
+            .expect("names the card");
+        let reply = LINK_NOT_SHOWN_YET
+            .find("reply that ends your turn")
+            .expect("names the turn-ending reply");
+        assert!(card < reply, "the card comes first: {LINK_NOT_SHOWN_YET}");
+        assert!(LINK_NOT_SHOWN_YET.contains("short summary"));
     }
 
     #[test]

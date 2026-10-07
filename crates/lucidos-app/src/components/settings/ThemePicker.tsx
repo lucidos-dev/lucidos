@@ -1,6 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import {
-  DEFAULT_THEME_ID,
   FOLLOW_THEME,
   fontFeaturesFor,
   fontStackFor,
@@ -11,7 +10,7 @@ import {
 import { registerWorkspaceFont } from '@lucidos/font-faces';
 import { THEME_FAMILIES, dataMountUrl, type Theme, type ThemeFamily } from '../../api/client';
 import { themeGallery, loadThemeGallery, pickTheme } from '../../store/actions/themes';
-import { currentThemeId, paintedThemeMode } from '../../store/actions/preferences';
+import { DEFAULT_THEME_ID, currentThemeId, paintedThemeMode } from '../../store/actions/preferences';
 import { preferences } from '../../store/store';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { isReducedMotion } from '../../utils/motion';
@@ -21,6 +20,7 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, SkBlock, SkText, useSkeleton } from '../shared/Skeleton';
 import { playStripMove, snapshotStrip, type StripSnapshot } from './themeStripMotion';
+import { GlyphBadge } from '../shared/GlyphBadge';
 
 function modesLabel(theme: Theme): string | null {
   if (theme.modes.length !== 1) return null;
@@ -438,7 +438,7 @@ function ThemeCard({ theme, defaults, mode, selected = false, column, row, onCli
       <span class="theme-card-meta" style={theme ? themeFontStyle(theme) : undefined}>
         <SkText class="theme-card-name" w="50%">{theme?.name}</SkText>
         <span class="theme-card-meta-trailing">
-          {theme?.source === 'workspace' && <span class="theme-card-badge">Custom</span>}
+          {theme?.source === 'workspace' && <GlyphBadge class="theme-card-badge">Custom</GlyphBadge>}
           {label && <span class="theme-card-modes">{label}</span>}
         </span>
       </span>

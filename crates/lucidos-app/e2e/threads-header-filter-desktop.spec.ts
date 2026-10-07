@@ -211,7 +211,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // The thread types below are NOT a sixth, they narrow this one.
     const labels = await panel.locator('.drawer-view-option .drawer-view-label').allTextContents();
     expect(labels).toEqual([
-      'Needs attention', 'Review', 'Running', 'Drafts', 'All statuses',
+      'Needs attention', 'Review', 'In flight', 'Drafts', 'All statuses',
     ]);
 
     // The channel section is a named group, and its knobs are live. They are

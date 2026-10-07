@@ -83,8 +83,12 @@ pub(crate) fn parse_context_suffix(model: &str) -> (&str, bool) {
 /// The Sonnet arms are two rules, not one: `claude-sonnet-4` covers the 4.x
 /// line but does NOT match `claude-sonnet-5`, so a new Sonnet generation needs
 /// its own arm or it silently falls to the no-thinking 8192-token path.
+///
+/// Haiku 4.5 rides the `budget_tokens` path. Its 64K output ceiling clears
+/// the largest budget plus the reply allowance in [`thinking_config`].
 pub(crate) fn supports_extended_thinking(model: &str) -> bool {
     model.contains("claude-3-7-sonnet")
+        || model.contains("claude-haiku-4-5")
         || model.contains("claude-sonnet-4")
         || model.contains("claude-sonnet-5")
         || model.contains("claude-opus-4")
@@ -191,29 +195,40 @@ pub(crate) fn thinking_mode(model: &str) -> Option<ThinkingMode> {
 ///
 /// Also reports where this message's cache marker belongs: the index of the
 /// last block that is not an engine tail block, or `None` for string content.
-/// The anchor is computed here because this is where the emitted array is
-/// built. The filter below drops blocks, so an emitted index is not a source
-/// index.
-fn message_content_to_claude_value(content: &MessageContent) -> (serde_json::Value, Option<usize>) {
+/// And it reports each memory view block's index, where a view's own
+/// breakpoint may go. Both are computed here because this is where the
+/// emitted array is built. The filter below drops blocks, so an emitted index
+/// is not a source index.
+fn message_content_to_claude_value(
+    content: &MessageContent,
+) -> (serde_json::Value, Option<usize>, Vec<usize>) {
     match content {
-        MessageContent::Text(s) => (serde_json::Value::String(s.clone()), None),
+        MessageContent::Text(s) => (serde_json::Value::String(s.clone()), None, Vec::new()),
         MessageContent::Blocks(blocks) => {
             let mut json_blocks: Vec<serde_json::Value> = Vec::with_capacity(blocks.len());
             let mut anchor: Option<usize> = None;
-            // Both text forms are filtered. They emit the same `type: "text"`
+            let mut views: Vec<usize> = Vec::new();
+            // Every text form is filtered. They emit the same `type: "text"`
             // below, and the API rejects an empty one.
             for block in blocks.iter().filter(|block| {
                 !matches!(
                     block,
-                    ContentBlock::Text { text } | ContentBlock::EngineTail { text }
+                    ContentBlock::Text { text }
+                        | ContentBlock::EngineTail { text }
+                        | ContentBlock::MemoryView { text }
                         if text.is_empty()
                 )
             }) {
                 if !matches!(block, ContentBlock::EngineTail { .. }) {
                     anchor = Some(json_blocks.len());
                 }
+                if matches!(block, ContentBlock::MemoryView { .. }) {
+                    views.push(json_blocks.len());
+                }
                 json_blocks.push(match block {
-                    ContentBlock::Text { text } | ContentBlock::EngineTail { text } => {
+                    ContentBlock::Text { text }
+                    | ContentBlock::EngineTail { text }
+                    | ContentBlock::MemoryView { text } => {
                         serde_json::json!({
                             "type": "text",
                             "text": text,
@@ -256,7 +271,7 @@ fn message_content_to_claude_value(content: &MessageContent) -> (serde_json::Val
                     }),
                 });
             }
-            (serde_json::Value::Array(json_blocks), anchor)
+            (serde_json::Value::Array(json_blocks), anchor, views)
         }
     }
 }
@@ -268,13 +283,14 @@ type ThinkingConfig = (Option<ClaudeThinking>, Option<ClaudeOutputConfig>, u32);
 
 /// Compute the `(thinking, output_config, max_tokens)` triple from the base
 /// model + reasoning effort. Adaptive-thinking models (Opus 4.7+, Fable 5) use
-/// `output_config.effort`; older thinking models use a `budget_tokens` ceiling;
-/// non-thinking models get neither.
+/// `output_config.effort`; older thinking models (Sonnet 4.x, Haiku 4.5) use a
+/// `budget_tokens` ceiling; non-thinking models get neither.
 fn thinking_config(base_model: &str, reasoning_effort: Option<&str>) -> ThinkingConfig {
     if !supports_extended_thinking(base_model) {
         return (None, None, NO_THINKING_MAX_TOKENS);
     }
-    let effort = reasoning_effort.unwrap_or("high");
+    let effort =
+        reasoning_effort.unwrap_or(crate::core::prefs::CHAT_REASONING_EFFORT.default_text());
     match adaptive_model(base_model) {
         Some(entry) => adaptive_thinking_config(entry, effort),
         None if effort == "none" => (None, None, NO_THINKING_MAX_TOKENS),
@@ -381,10 +397,13 @@ pub(crate) fn build_claude_request(
         );
     }
 
+    let mut view_blocks: Vec<(usize, usize)> = Vec::new();
     let mut claude_messages: Vec<ClaudeMessage> = messages
         .iter()
-        .map(|m| {
-            let (content, cache_anchor) = message_content_to_claude_value(&m.content);
+        .enumerate()
+        .map(|(i, m)| {
+            let (content, cache_anchor, views) = message_content_to_claude_value(&m.content);
+            view_blocks.extend(views.into_iter().map(|block| (i, block)));
             ClaudeMessage {
                 role: m.role.clone(),
                 content,
@@ -393,10 +412,10 @@ pub(crate) fn build_claude_request(
         })
         .collect();
 
-    let claude_tools: Option<Vec<ClaudeTool>> = if tools.is_empty() {
+    let mut claude_tools: Option<Vec<ClaudeTool>> = if tools.is_empty() {
         None
     } else {
-        let mut converted: Vec<ClaudeTool> = tools
+        let converted: Vec<ClaudeTool> = tools
             .into_iter()
             .map(|t| ClaudeTool {
                 name: t.name,
@@ -405,12 +424,27 @@ pub(crate) fn build_claude_request(
                 cache_control: None,
             })
             .collect();
-        apply_cache_control_to_last_tool(&mut converted);
         Some(converted)
     };
 
-    apply_cache_control_to_last_message(&mut claude_messages);
-    apply_cache_control_to_penultimate_message(&mut claude_messages);
+    let mut breakpoints = usize::from(apply_cache_control_to_last_message(&mut claude_messages))
+        + usize::from(apply_cache_control_to_penultimate_message(
+            &mut claude_messages,
+        ));
+    for &(message, block) in &view_blocks {
+        if breakpoints == MAX_CACHE_BREAKPOINTS {
+            break;
+        }
+        breakpoints += usize::from(mark_block_for_cache(&mut claude_messages[message], block));
+    }
+    let mark_system = breakpoints < MAX_CACHE_BREAKPOINTS;
+    let system = system_block(system_prompt, mark_system);
+    breakpoints += usize::from(mark_system && system.is_some());
+    if breakpoints < MAX_CACHE_BREAKPOINTS {
+        if let Some(tools) = claude_tools.as_mut() {
+            apply_cache_control_to_last_tool(tools);
+        }
+    }
 
     let (thinking, output_config, max_tokens) = thinking_config(base_model, reasoning_effort);
 
@@ -443,7 +477,7 @@ pub(crate) fn build_claude_request(
         model: model_field,
         max_tokens,
         stream: true,
-        system: system_with_cache_control(system_prompt),
+        system,
         messages: claude_messages,
         tools: claude_tools,
         thinking,
@@ -590,6 +624,17 @@ pub(crate) async fn parse_claude_stream(
             "Claude stream truncated: {} closed the stream before message_delta, with nothing to show for {} input tokens",
             provider_tag,
             turn_meta.input_tokens.unwrap_or(0),
+        )
+        .into());
+    }
+
+    // A `tool_use` stop names a call this stream never carried. Vertex has
+    // sent exactly that: the interrupted-work sentinel, then the stop. With
+    // nothing on screen and no tool run, a retry duplicates nothing (ADR 0089).
+    if turn_meta.stop_reason.as_deref() == Some("tool_use") && !blocks.iter().any(carries_output) {
+        return Err(format!(
+            "Claude stream truncated: {} stopped on tool_use without sending the tool call",
+            provider_tag,
         )
         .into());
     }
@@ -993,18 +1038,30 @@ fn process_sse_data(
 
 // ===== Claude/Anthropic prompt caching =====
 
+/// The API's limit on `cache_control` markers in one request.
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
 /// Anthropic ephemeral cache marker (5-minute TTL, the default). Writes cost
 /// ~1.25× input price; reads cost ~0.1×, so a single cache hit pays back the
 /// write premium and everything beyond is pure savings. Render order is
 /// `tools` → `system` → `messages` — a marker on the last block of each tier
-/// caches everything before it. We place markers on tools[-1], the system
-/// block, the last message's last content block, and the one before it. That
-/// is all 4 of the allowed breakpoints.
+/// caches everything before it.
 ///
-/// **All 4 are spent, so a fifth marker is a turn-killing change.** The request
-/// carries no top-level `cache_control`, so nothing asks for an automatic
-/// breakpoint, and an automatic one alongside 4 explicit ones is a 400. To add
-/// a marker somewhere new, one of the four has to go, and
+/// Markers go in priority order until [`MAX_CACHE_BREAKPOINTS`] are spent:
+/// the last message, the one before it, each memory view block, the system
+/// block, then tools[-1]. A Classic request holds no memory view block, so it
+/// marks tools, system and the two messages, as it always has.
+///
+/// A Tree turn's first round marks the view snapshot and both thread view
+/// marks, and later rounds keep the snapshot and the first. Every view prefix
+/// holds tools and system, so their own markers only pay when the snapshot
+/// misses. A first round's reads need no marker of their own: the lookback
+/// from the last message reaches every view boundary in it. ADR 0362's
+/// amendment weighs it.
+///
+/// **A fifth marker is a turn-killing change.** The request carries no
+/// top-level `cache_control`, so nothing asks for an automatic breakpoint, and
+/// an automatic one alongside 4 explicit ones is a 400.
 /// `docs/investigations/2026-08-23-context-mode-cache-breakpoint-diagnosis.md`
 /// measures what each is worth.
 fn ephemeral_cache_marker() -> serde_json::Value {
@@ -1023,18 +1080,21 @@ fn text_block_with_cache_control(text: String) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// Wrap the system prompt as a one-block content array tagged with
-/// `cache_control`. Returning `None` for empty/missing input keeps the request
-/// body minimal (`system` is omitted entirely) and avoids sending an empty text
-/// block, which Anthropic rejects.
-fn system_with_cache_control(system: Option<&str>) -> Option<serde_json::Value> {
+/// Wrap the system prompt as a one-block content array, tagged with
+/// `cache_control` when `marked`. Returning `None` for empty/missing input
+/// keeps the request body minimal (`system` is omitted entirely) and avoids
+/// sending an empty text block, which Anthropic rejects.
+fn system_block(system: Option<&str>, marked: bool) -> Option<serde_json::Value> {
     let s = system?;
     if s.is_empty() {
         return None;
     }
-    Some(serde_json::Value::Array(vec![
-        text_block_with_cache_control(s.to_string()),
-    ]))
+    let block = if marked {
+        text_block_with_cache_control(s.to_string())
+    } else {
+        serde_json::json!({"type": "text", "text": s})
+    };
+    Some(serde_json::Value::Array(vec![block]))
 }
 
 fn apply_cache_control_to_last_tool(tools: &mut [ClaudeTool]) {
@@ -1059,33 +1119,41 @@ fn apply_cache_control_to_last_tool(tools: &mut [ClaudeTool]) {
 /// round anyway, so no request could ever have read them. We skip an empty
 /// string. It has nothing worth caching, and the array form would turn it into
 /// an empty text block, which the API rejects.
-fn mark_message_for_cache(message: &mut ClaudeMessage) {
-    let anchor = message.cache_anchor;
-    match &mut message.content {
+fn mark_message_for_cache(message: &mut ClaudeMessage) -> bool {
+    let len = match &mut message.content {
         serde_json::Value::String(s) if !s.is_empty() => {
             let text = std::mem::take(s);
             message.content = serde_json::Value::Array(vec![text_block_with_cache_control(text)]);
             message.cache_anchor = Some(0);
+            return true;
         }
-        serde_json::Value::Array(arr) => {
-            // A message of nothing but tail blocks falls back to its final one.
-            // Still exactly one mark, so the count of four holds.
-            let at = anchor.unwrap_or(arr.len().saturating_sub(1));
-            let Some(block) = arr.get_mut(at).and_then(|b| b.as_object_mut()) else {
-                return;
-            };
-            block.insert("cache_control".to_string(), ephemeral_cache_marker());
-        }
-        _ => {}
-    }
+        serde_json::Value::Array(arr) => arr.len(),
+        _ => return false,
+    };
+    // A message of nothing but tail blocks falls back to its final one. Still
+    // exactly one mark, so the count of four holds.
+    let at = message.cache_anchor.unwrap_or(len.saturating_sub(1));
+    mark_block_for_cache(message, at)
+}
+
+/// Mark one block of an array message. Returns whether a new marker landed,
+/// so a block marked twice still counts once against the four.
+fn mark_block_for_cache(message: &mut ClaudeMessage, at: usize) -> bool {
+    let serde_json::Value::Array(arr) = &mut message.content else {
+        return false;
+    };
+    let Some(block) = arr.get_mut(at).and_then(|b| b.as_object_mut()) else {
+        return false;
+    };
+    block
+        .insert("cache_control".to_string(), ephemeral_cache_marker())
+        .is_none()
 }
 
 /// Mark the final message so the entire prior conversation prefix becomes a
 /// cache breakpoint on the next turn.
-fn apply_cache_control_to_last_message(messages: &mut [ClaudeMessage]) {
-    if let Some(last) = messages.last_mut() {
-        mark_message_for_cache(last);
-    }
+fn apply_cache_control_to_last_message(messages: &mut [ClaudeMessage]) -> bool {
+    messages.last_mut().is_some_and(mark_message_for_cache)
 }
 
 /// Mark the message in front of the tail, so a round that rewrites the tail can
@@ -1105,11 +1173,11 @@ fn apply_cache_control_to_last_message(messages: &mut [ClaudeMessage]) {
 /// The penultimate message is the newest position neither case disturbs. The
 /// measurements are in
 /// `docs/investigations/2026-08-23-context-mode-cache-breakpoint-diagnosis.md`.
-fn apply_cache_control_to_penultimate_message(messages: &mut [ClaudeMessage]) {
+fn apply_cache_control_to_penultimate_message(messages: &mut [ClaudeMessage]) -> bool {
     let Some(index) = messages.len().checked_sub(2) else {
-        return;
+        return false;
     };
-    mark_message_for_cache(&mut messages[index]);
+    mark_message_for_cache(&mut messages[index])
 }
 
 // ===== Claude/Anthropic request/response types =====
@@ -1127,8 +1195,8 @@ pub(crate) struct ClaudeRequest {
     pub max_tokens: u32,
     pub stream: bool,
     /// Either a bare string or an array of typed content blocks (the latter is
-    /// required to attach `cache_control`). `system_with_cache_control` emits
-    /// the array form so the system prompt becomes a cache breakpoint.
+    /// required to attach `cache_control`). `system_block` emits the array
+    /// form, so the system prompt can carry a cache breakpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<serde_json::Value>,
     pub messages: Vec<ClaudeMessage>,
@@ -1191,9 +1259,8 @@ pub(crate) struct ClaudeTool {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-    /// Set on the last tool to make tools+system a cached prefix. The cap is 4
-    /// cache_control breakpoints per request. This one, system, the last
-    /// message and the one before it are all 4, so there is no spare.
+    /// Set on the last tool to make tools a cached prefix, when a breakpoint
+    /// is left over (see [`ephemeral_cache_marker`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<serde_json::Value>,
 }
@@ -1545,6 +1612,94 @@ mod tests {
         assert_eq!(max_tokens, budget + 16384);
     }
 
+    /// Haiku 4.5's synchronous `max_tokens` ceiling, from Anthropic's models
+    /// overview. A wire contract: a request above it fails on the model.
+    const HAIKU_4_5_MAX_OUTPUT_TOKENS: u32 = 64_000;
+
+    /// The ids Haiku 4.5 goes by: the alias, the Claude API snapshot, and
+    /// the Vertex snapshot.
+    const HAIKU_4_5_IDS: [&str; 3] = [
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20251001",
+        "claude-haiku-4-5@20251001",
+    ];
+
+    /// Each tier the picker offers Haiku 4.5 reaches the request, on both
+    /// transports, as its own `budget_tokens` under the model's ceiling.
+    #[test]
+    fn haiku_4_5_sends_the_tier_the_picker_offers() {
+        use crate::llm::model_registry::ProviderKind;
+        for id in HAIKU_4_5_IDS {
+            assert!(supports_extended_thinking(id), "extended: {id}");
+            assert!(thinking_mode(id).is_none(), "budget path: {id}");
+            for provider in [ProviderKind::Vertex, ProviderKind::Anthropic] {
+                let offered = crate::llm::reasoning::supported_efforts(provider, id);
+                assert!(offered.contains(&"high"), "{provider:?}/{id} offers high");
+                for &effort in offered {
+                    for target in [
+                        WireTarget::Vertex {
+                            url: VERTEX_TEST_URL,
+                        },
+                        WireTarget::Direct {
+                            url: "https://api.anthropic.com/v1/messages",
+                        },
+                    ] {
+                        let (req, _) = build_claude_request(
+                            vec![Message {
+                                role: "user".into(),
+                                content: MessageContent::Text("hi".into()),
+                            }],
+                            vec![],
+                            id,
+                            None,
+                            Some(effort),
+                            target,
+                            "test",
+                        );
+                        let json = serde_json::to_value(&req).unwrap();
+                        let max_tokens = json["max_tokens"].as_u64().unwrap();
+                        assert!(
+                            max_tokens <= u64::from(HAIKU_4_5_MAX_OUTPUT_TOKENS),
+                            "{id} at {effort}: max_tokens {max_tokens} over the ceiling"
+                        );
+                        assert!(json.get("output_config").is_none(), "{id} at {effort}");
+                        if effort == "none" {
+                            assert!(json.get("thinking").is_none(), "{id} at none");
+                            continue;
+                        }
+                        assert_eq!(json["thinking"]["type"], "enabled", "{id} at {effort}");
+                        let budget = json["thinking"]["budget_tokens"].as_u64().unwrap();
+                        assert_eq!(
+                            budget,
+                            u64::from(crate::llm::thinking_budget_for_effort(effort)),
+                            "{id} at {effort}"
+                        );
+                        assert!(budget < max_tokens, "{id} at {effort}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every tier offered to Haiku 4.5 sends a different request, so no two
+    /// picker entries are the same setting under different names.
+    #[test]
+    fn every_tier_offered_to_haiku_4_5_is_distinct_on_the_wire() {
+        use crate::llm::model_registry::ProviderKind;
+        let offered =
+            crate::llm::reasoning::supported_efforts(ProviderKind::Vertex, "claude-haiku-4-5");
+        let mut sent: Vec<(Option<u32>, u32)> = offered
+            .iter()
+            .map(|effort| {
+                let (thinking, _, max_tokens) = thinking_config("claude-haiku-4-5", Some(effort));
+                (thinking.and_then(|t| t.budget_tokens), max_tokens)
+            })
+            .collect();
+        sent.sort_unstable();
+        sent.dedup();
+        assert_eq!(sent.len(), offered.len(), "{offered:?} sent {sent:?}");
+    }
+
     #[test]
     fn message_content_to_claude_value_filters_empty_text_blocks() {
         // When pasting images without text, empty text blocks must be filtered
@@ -1559,7 +1714,7 @@ mod tests {
                 data: "AAAA".to_string(),
             },
         ]);
-        let (value, _) = message_content_to_claude_value(&content);
+        let (value, _, _) = message_content_to_claude_value(&content);
         let arr = value.as_array().unwrap();
         // Empty text block should be filtered out, leaving only the image
         assert_eq!(arr.len(), 1);
@@ -1578,7 +1733,7 @@ mod tests {
                 data: "AAAA".to_string(),
             },
         ]);
-        let (value, _) = message_content_to_claude_value(&content);
+        let (value, _, _) = message_content_to_claude_value(&content);
         let arr = value.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["type"], "text");
@@ -1644,18 +1799,18 @@ mod tests {
     }
 
     #[test]
-    fn system_with_cache_control_none_returns_none() {
-        assert!(system_with_cache_control(None).is_none());
+    fn system_block_none_returns_none() {
+        assert!(system_block(None, true).is_none());
     }
 
     #[test]
-    fn system_with_cache_control_empty_string_returns_none() {
-        assert!(system_with_cache_control(Some("")).is_none());
+    fn system_block_empty_string_returns_none() {
+        assert!(system_block(Some(""), true).is_none());
     }
 
     #[test]
-    fn system_with_cache_control_wraps_string_in_block_with_marker() {
-        let value = system_with_cache_control(Some("you are a helpful assistant")).unwrap();
+    fn system_block_wraps_string_in_block_with_marker() {
+        let value = system_block(Some("you are a helpful assistant"), true).unwrap();
         let arr = value.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["type"], "text");
@@ -1728,7 +1883,7 @@ mod tests {
     /// A message built the way `build_claude_request` builds one, so the anchor
     /// is derived from the block types rather than asserted into place.
     fn from_blocks(role: &str, blocks: Vec<ContentBlock>) -> ClaudeMessage {
-        let (content, cache_anchor) =
+        let (content, cache_anchor, _) =
             message_content_to_claude_value(&MessageContent::Blocks(blocks));
         ClaudeMessage {
             role: role.into(),
@@ -2166,7 +2321,7 @@ mod tests {
             model: None,
             max_tokens: 1024,
             stream: true,
-            system: system_with_cache_control(Some("system prompt body")),
+            system: system_block(Some("system prompt body"), true),
             messages,
             tools: Some(tools),
             thinking: None,
@@ -2787,6 +2942,82 @@ mod tests {
         assert_eq!(*seen.lock().expect("callback mutex"), "Started on it.");
     }
 
+    /// The live incident: Vertex sent only the interrupted-work sentinel, then
+    /// stopped on `tool_use` with no `tool_use` block. The call it names never
+    /// arrived, and the agentic loop failed the turn as an empty completion.
+    fn tool_use_stop_without_its_block_sse(preamble: &str) -> String {
+        format!(
+            concat!(
+                r#"data: {{"type":"message_start","message":{{"usage":{{"input_tokens":9}}}}}}"#,
+                "\n\n",
+                "{preamble}",
+                r#"data: {{"type":"content_block_start","index":1,"#,
+                r#""content_block":{{"type":"thinking","thinking":""}}}}"#,
+                "\n\n",
+                r#"data: {{"type":"content_block_delta","index":1,"#,
+                r#""delta":{{"type":"thinking_delta","#,
+                r#""thinking":"This part of the response was interrupted before it finished."}}}}"#,
+                "\n\n",
+                r#"data: {{"type":"content_block_stop","index":1}}"#,
+                "\n\n",
+                r#"data: {{"type":"message_delta","delta":{{"stop_reason":"tool_use"}},"#,
+                r#""usage":{{"output_tokens":1126}}}}"#,
+                "\n\n"
+            ),
+            preamble = preamble,
+        )
+    }
+
+    /// Nothing reached the user and no tool ran, so a retry duplicates nothing.
+    #[tokio::test]
+    async fn a_tool_use_stop_that_carried_no_tool_call_retries() {
+        let (cb, seen) = recording_callback();
+        let err = parse_claude_stream(
+            sse_response(tool_use_stop_without_its_block_sse("")),
+            &Some(cb),
+            ThinkingDisplay::ProgressUpdates,
+            "Test",
+        )
+        .await
+        .expect_err("a tool_use stop with no tool call is not a completed turn");
+
+        assert!(seen.lock().unwrap().is_empty(), "nothing reached the user");
+        let msg = err.to_string();
+        assert!(
+            crate::llm::is_retryable_error(&msg),
+            "the lost tool call must reach the retry path, got: {msg}"
+        );
+    }
+
+    /// Text already on screen makes a retry unsafe (ADR 0089), so the turn
+    /// keeps that text as its answer rather than rendering it twice.
+    #[tokio::test]
+    async fn a_tool_use_stop_with_no_tool_call_after_streamed_text_keeps_the_text() {
+        const PREAMBLE: &str = concat!(
+            r#"data: {"type":"content_block_start","index":0,"#,
+            r#""content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"#,
+            r#""delta":{"type":"text_delta","text":"Checking the filter."}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+        );
+        let (cb, seen) = recording_callback();
+        let response = parse_claude_stream(
+            sse_response(tool_use_stop_without_its_block_sse(PREAMBLE)),
+            &Some(cb),
+            ThinkingDisplay::ProgressUpdates,
+            "Test",
+        )
+        .await
+        .expect("streamed text must not be retried");
+
+        assert_eq!(response.content.as_deref(), Some("Checking the filter."));
+        assert_eq!(seen.lock().unwrap().as_str(), "Checking the filter.");
+        assert!(response.tool_calls.is_empty());
+    }
+
     /// A note cut before its `content_block_stop` never reached the user, so
     /// the dropped stream is still a retryable truncation. Counting it as
     /// output would end the turn with half a sentence as the answer.
@@ -3227,5 +3458,170 @@ mod tests {
             },
         ]);
         assert_eq!(breakpoints(&req), 4);
+    }
+
+    /// A Classic turn past its first round: history images, a tool round, and
+    /// a context-mode tail block. Every Classic request shape in one.
+    fn classic_round_two() -> Vec<Message> {
+        vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "[Long-term Memory]\n- a fact [id: 1]\n\nRequest: hello".into(),
+                    },
+                    image_block(),
+                ]),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "reading the file now".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "toolu_1".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path": "notes.md"}),
+                        thought_signature: None,
+                    },
+                ]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "toolu_1".into(),
+                        content: "# Notes".into(),
+                    },
+                    ContentBlock::EngineTail {
+                        text: "[CONTEXT PANEL]".into(),
+                    },
+                ]),
+            },
+        ]
+    }
+
+    /// A Tree turn's opening message as `TurnMemoryViews::lead` builds it:
+    /// the snapshot, two thread view pieces ending at marks, the view's rest,
+    /// then the message.
+    fn tree_message(snapshot: bool) -> Message {
+        let mut blocks = Vec::new();
+        if snapshot {
+            blocks.push(ContentBlock::MemoryView {
+                text: "[WORKSPACE MEMORY VIEW]\n[w/0+4] shared\n".into(),
+            });
+        }
+        blocks.extend([
+            ContentBlock::MemoryView {
+                text: "[THREAD MEMORY VIEW]\n[0+8] old\n".into(),
+            },
+            ContentBlock::MemoryView {
+                text: "[8+4] middle\n".into(),
+            },
+            ContentBlock::Text {
+                text: "[12+1] new\n[END THREAD MEMORY VIEW]".into(),
+            },
+            ContentBlock::Text {
+                text: "Request: hello".into(),
+            },
+        ]);
+        Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(blocks),
+        }
+    }
+
+    /// A Tree turn after `rounds` rounds.
+    fn tree_turn(snapshot: bool, rounds: usize) -> ClaudeRequest {
+        let mut messages = vec![tree_message(snapshot)];
+        for _ in 1..rounds {
+            messages.push(Message {
+                role: "assistant".into(),
+                content: MessageContent::Text("reading the file now".into()),
+            });
+            messages.push(Message {
+                role: "user".into(),
+                content: MessageContent::Text("[tool result]".into()),
+            });
+        }
+        request_for(messages)
+    }
+
+    /// Where each marker sits: `tools`, `system`, or `m<message>b<block>`.
+    fn marked(req: &ClaudeRequest) -> Vec<String> {
+        let body = serde_json::to_value(req).expect("the request serializes");
+        let has = |v: &serde_json::Value| v.get("cache_control").is_some();
+        let mut out = Vec::new();
+        if body["tools"].as_array().is_some_and(|t| t.iter().any(has)) {
+            out.push("tools".to_string());
+        }
+        if body["system"].as_array().is_some_and(|s| s.iter().any(has)) {
+            out.push("system".to_string());
+        }
+        for (m, message) in body["messages"].as_array().unwrap().iter().enumerate() {
+            for (b, block) in message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if has(block) {
+                    out.push(format!("m{m}b{b}"));
+                }
+            }
+        }
+        out
+    }
+
+    /// A Tree turn's first round writes the snapshot and both thread view
+    /// marks, so the next turn reads the view's stable start. The system
+    /// marker gives way: every view prefix already holds the system block.
+    #[test]
+    fn a_tree_first_round_marks_the_snapshot_and_both_thread_marks() {
+        assert_eq!(
+            marked(&tree_turn(true, 1)),
+            ["m0b0", "m0b1", "m0b2", "m0b4"]
+        );
+    }
+
+    /// Past the first round the two message markers keep the turn's prefix,
+    /// and the snapshot and the first thread mark keep theirs.
+    #[test]
+    fn a_later_tree_round_keeps_the_snapshot_and_the_first_thread_mark() {
+        assert_eq!(
+            marked(&tree_turn(true, 2)),
+            ["m0b0", "m0b1", "m1b0", "m2b0"]
+        );
+    }
+
+    /// With no snapshot, the free marker goes back to the system block.
+    #[test]
+    fn a_tree_turn_with_no_snapshot_marks_the_system_block() {
+        assert_eq!(
+            marked(&tree_turn(false, 1)),
+            ["system", "m0b0", "m0b1", "m0b3"]
+        );
+    }
+
+    /// Anthropic rejects a fifth marker, whatever shape the Tree turn takes.
+    #[test]
+    fn no_tree_request_carries_more_than_four_breakpoints() {
+        for snapshot in [true, false] {
+            for rounds in 1..5 {
+                let req = tree_turn(snapshot, rounds);
+                assert_eq!(breakpoints(&req), 4, "snapshot {snapshot}, {rounds} rounds");
+            }
+        }
+    }
+
+    /// I2 of the tree memory plan: a Classic request is byte-identical to the
+    /// one the engine sent before the Tree module existed. The fixture was
+    /// written by the pre-Tree build, so regenerating it to pass is the failure.
+    #[test]
+    fn a_classic_request_is_byte_identical_to_the_pre_tree_build() {
+        let body = serde_json::to_string_pretty(&request_for(classic_round_two()))
+            .expect("the request serializes");
+        assert_eq!(body, include_str!("anthropic_wire_classic_request.json"));
     }
 }

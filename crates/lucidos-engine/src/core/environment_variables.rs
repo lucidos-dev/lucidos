@@ -82,8 +82,8 @@ const RESERVED_EXACT: &[&str] = &[
     "RUSTC_WRAPPER",
     // Engine-owned LUCIDOS_* (see `api::actor` + `runtime::spawn_env`).
     "LUCIDOS_WORKSPACE",
-    "LUCIDOS_AGENT_ORIGIN_TOKEN",
-    "LUCIDOS_THREAD_ID",
+    crate::api::actor::ENV_AGENT_ORIGIN_TOKEN,
+    crate::api::actor::ENV_SOURCE_THREAD_ID,
     "LUCIDOS_HOST_PID",
     "LUCIDOS_FRONTEND_PID",
     "LUCIDOS_API_PORT",

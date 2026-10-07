@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::core::PreferenceStore;
+use crate::core::prefs;
 use crate::engine::command_guard::SideEffectCategory;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::triggers::{
@@ -386,9 +386,9 @@ pub(super) async fn create_trigger(
     // Read timezone from preferences before validating cron: the guard reports its
     // next-run preview in the trigger's own timezone. A missing preference defaults
     // to UTC; a read failure surfaces instead of silently scheduling the wrong zone.
-    let timezone = match PreferenceStore::get(&state.pool, "timezone").await {
+    let timezone = match prefs::TIMEZONE.try_stored(&state.pool).await {
         Ok(Some(tz)) => tz,
-        Ok(None) => "UTC".to_string(),
+        Ok(None) => crate::triggers::definition::default_timezone(),
         Err(e) => return ApiResult::err(format!("Failed to read timezone preference: {}", e)),
     };
 

@@ -3,7 +3,11 @@ import { assertPlainObject, assertString } from './_validate';
 import { wsLocalGet } from './_storage';
 import { onHostPush } from './_bridge';
 import {
-  APPEARANCE_CHANNEL, DEFAULT_THEME_ID, EMPTY_THEME, FONT_FAMILY_STORAGE_KEY,
+  PREF_EXTERNAL_LINK_TARGET, PREF_FONT_FAMILY, PREF_MOTION, PREF_THEME, PREF_UI_SCALE,
+  type PreferenceValues,
+} from './generated/preference-catalog';
+import {
+  APPEARANCE_CHANNEL, EMPTY_THEME, FONT_FAMILY_STORAGE_KEY,
   THEME_EFFECTS_STORAGE_KEY, THEME_KEY, THEME_SEED_KEY, THEME_STORAGE_KEY, MORE_CONTRAST_QUERY,
   MOTION_STORAGE_KEY, REDUCED_MOTION_QUERY, REDUCED_TRANSPARENCY_QUERY, STYLE_OVERRIDES_STORAGE_KEY,
   FONT_BOLD_ATTRIBUTE, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODE_ATTRIBUTE, THEME_MODE_BG, THEME_MODE_KEY,
@@ -251,12 +255,10 @@ function installPreviewListener() {
   });
 }
 
-/** Where an external http(s) link goes when tapped in an installed iOS PWA.
- *  Mirrors `ExternalLinkTarget` in
- *  `crates/lucidos-app/src/store/actions/preferences.ts`. */
-export type ExternalLinkTarget = 'safari' | 'ask' | 'in-app';
+/** Where an external http(s) link goes when tapped in an installed iOS PWA. */
+export type ExternalLinkTarget = PreferenceValues<'external_link_target'>;
 
-const EXTERNAL_LINK_TARGETS: readonly ExternalLinkTarget[] = ['safari', 'ask', 'in-app'];
+const EXTERNAL_LINK_TARGETS: readonly ExternalLinkTarget[] = PREF_EXTERNAL_LINK_TARGET.values;
 
 /** The last-seen `external_link_target`, refreshed by `applyPreferences` (and
  *  therefore by `watchPreferences`, which re-runs it on `PreferencesChanged`).
@@ -271,7 +273,7 @@ let externalLinkTargetCache: ExternalLinkTarget | null = null;
 function cacheExternalLinkTarget(raw: string | undefined): void {
   externalLinkTargetCache = EXTERNAL_LINK_TARGETS.includes(raw as ExternalLinkTarget)
     ? raw as ExternalLinkTarget
-    : 'safari';
+    : PREF_EXTERNAL_LINK_TARGET.fallback;
 }
 
 /** Whether a device-preference read has landed here, from the load-time prime
@@ -309,7 +311,7 @@ function applyDevicePreferences(prefs: Record<string, string>, attempt: number):
  *  attribute `sdk-prefs.js` sets at first paint, so an app keys its own
  *  animations on one selector. */
 function applyMotionPreference(prefs: Record<string, string>): void {
-  lastMotionPreference = parseMotion(prefs['motion'] || wsLocalGet(MOTION_STORAGE_KEY));
+  lastMotionPreference = parseMotion(prefs[PREF_MOTION.key] || wsLocalGet(MOTION_STORAGE_KEY));
   resolveMotionAttribute();
 }
 
@@ -449,7 +451,7 @@ async function fetchWorkspaceFonts(): Promise<WorkspaceFont[] | null> {
  *  the default theme. Any other failure answers null, which keeps the theme
  *  already painted until the next apply retries. */
 async function fetchTheme(id: string): Promise<ResolvedTheme | null> {
-  if (id === DEFAULT_THEME_ID) return EMPTY_THEME;
+  if (id === PREF_THEME.fallback) return EMPTY_THEME;
   try {
     const theme = await request<{ resolved?: unknown }>(`/theme?id=${encodeURIComponent(id)}`);
     return sanitizeResolvedTheme(theme?.resolved);
@@ -512,7 +514,7 @@ function paint(prefs: Record<string, string>): void {
   root.setAttribute(FONT_BOLD_ATTRIBUTE, fontBoldMark(font));
 
   const scale = parseUiScale(
-    prefs['ui-scale'] || prefs['text-size'] || prefs['font-size']
+    prefs[PREF_UI_SCALE.key] || prefs['text-size'] || prefs['font-size']
     || wsLocalGet(UI_SCALE_STORAGE_KEY),
   );
   if (scale !== null) root.style.setProperty('--user-ui-scale', `${scale}%`);
@@ -524,7 +526,7 @@ function paint(prefs: Record<string, string>): void {
 }
 
 function storedFontPreference(prefs: Record<string, string>): string | null {
-  return prefs['font-family'] || wsLocalGet(FONT_FAMILY_STORAGE_KEY);
+  return prefs[PREF_FONT_FAMILY.key] || wsLocalGet(FONT_FAMILY_STORAGE_KEY);
 }
 
 /** Take the shell's push and repaint from it, with no request. The shell
@@ -553,7 +555,7 @@ export const ui = {
     if (!hostAppearance) {
       // The theme is fetched only when it changed, so a mode flip or an
       // unrelated preference costs no request.
-      const nextThemeId = prefs[THEME_KEY] || DEFAULT_THEME_ID;
+      const nextThemeId = prefs[THEME_KEY] || PREF_THEME.fallback;
       if (nextThemeId !== themeId || themeStale) {
         const theme = await fetchTheme(nextThemeId);
         // A newer apply started while this one fetched, and its answer wins.
@@ -603,7 +605,7 @@ export const ui = {
       // that is how an agent republishes a theme it edited in place.
       const key = (data as { key?: unknown } | null)?.key;
       if (key === THEME_KEY) themeStale = true;
-      if (key === 'font-family') workspaceFontsStale = true;
+      if (key === PREF_FONT_FAMILY.key) workspaceFontsStale = true;
       reapply();
     });
     // Editing the active theme's file, or installing or removing the plugin

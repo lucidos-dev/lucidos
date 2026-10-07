@@ -6,13 +6,13 @@
  * effectiveThreadStatus() returns 'running' forever → "Requesting..." stuck.
  *
  * Fix: After submitChat() succeeds, a safety timer calls refreshThreadEvents()
- * after PENDING_MESSAGE_SAFETY_MS. If the pending message is still there after
- * the refresh (e.g., engine down), it's forcefully removed.
+ * after PENDING_MESSAGE_SAFETY_MS. If that send's pending row is still there
+ * after a refresh that landed, it is removed. No other row is touched.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { effectiveThreadStatus, threadMap } from '../store';
 import type { ThreadState } from '../thread-events';
-import { PENDING_MESSAGE_SAFETY_MS, STALE_EXCHANGE_FOLLOWUP_MS, clearStalePendingMessages, schedulePendingCleanup } from './chat';
+import { PENDING_MESSAGE_SAFETY_MS, STALE_EXCHANGE_FOLLOWUP_MS, schedulePendingCleanup } from './chat';
 import { refreshThreadEvents } from './thread-loading';
 
 // Override only refreshThreadEvents; keep the rest of thread-loading real so
@@ -84,58 +84,6 @@ describe('Pending message safety timer', () => {
     expect(effectiveThreadStatus(thread)).toBe('idle');
   });
 
-  it('clearStalePendingMessages removes messages older than PENDING_MESSAGE_SAFETY_MS', () => {
-    const thread = makeThread();
-    const staleTime = new Date(Date.now() - PENDING_MESSAGE_SAFETY_MS - 1000).toISOString();
-    thread.pendingUserMessages.push({
-      text: 'stale message',
-      eventId: 'e-stale',
-      created: staleTime,
-    });
-
-    const map = new Map([['thread-1', thread]]);
-    threadMap.value = map;
-
-    clearStalePendingMessages('thread-1');
-
-    expect(thread.pendingUserMessages).toHaveLength(0);
-    expect(effectiveThreadStatus(thread)).toBe('idle');
-  });
-
-  it('clearStalePendingMessages keeps recent pending messages', () => {
-    const thread = makeThread();
-    thread.pendingUserMessages.push({
-      text: 'recent message',
-      eventId: 'e-recent',
-      created: new Date().toISOString(),
-    });
-
-    const map = new Map([['thread-1', thread]]);
-    threadMap.value = map;
-
-    clearStalePendingMessages('thread-1');
-
-    expect(thread.pendingUserMessages).toHaveLength(1);
-    expect(effectiveThreadStatus(thread)).toBe('running');
-  });
-
-  it('clearStalePendingMessages removes only stale messages, keeps recent', () => {
-    const thread = makeThread();
-    const staleTime = new Date(Date.now() - PENDING_MESSAGE_SAFETY_MS - 1000).toISOString();
-    thread.pendingUserMessages.push(
-      { text: 'stale', eventId: 'e-stale', created: staleTime },
-      { text: 'recent', eventId: 'e-recent', created: new Date().toISOString() },
-    );
-
-    const map = new Map([['thread-1', thread]]);
-    threadMap.value = map;
-
-    clearStalePendingMessages('thread-1');
-
-    expect(thread.pendingUserMessages).toHaveLength(1);
-    expect(thread.pendingUserMessages[0].eventId).toBe('e-recent');
-  });
-
   it('PENDING_MESSAGE_SAFETY_MS is exported and is a reasonable value', () => {
     expect(PENDING_MESSAGE_SAFETY_MS).toBeGreaterThanOrEqual(15_000);
     expect(PENDING_MESSAGE_SAFETY_MS).toBeLessThanOrEqual(60_000);
@@ -174,8 +122,8 @@ describe('schedulePendingCleanup gates force-clear on refetch success', () => {
     // read as always-succeeded in production while looking tested here.
     vi.mocked(refreshThreadEvents).mockResolvedValue(false);
     const thread = makeThread();
-    // Old enough that clearStalePendingMessages WOULD drop it — proving the
-    // survival is due to the refetch-failure gate, not the recency window.
+    // Old enough that a landed refetch WOULD drop it, so its survival is the
+    // refetch-failure gate's doing.
     const staleTime = new Date(Date.now() - PENDING_MESSAGE_SAFETY_MS - 1000).toISOString();
     thread.pendingUserMessages.push({ text: 'msg2', eventId: 'e-2', created: staleTime });
     threadMap.value = new Map([['thread-1', thread]]);
@@ -206,6 +154,22 @@ describe('schedulePendingCleanup gates force-clear on refetch success', () => {
     // A successful refetch proves the event is absent → safe to drop the stuck row.
     expect(thread.pendingUserMessages).toHaveLength(0);
     expect(refreshThreadEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it('removes only its own send\'s row, never one that is still sending', async () => {
+    vi.mocked(refreshThreadEvents).mockResolvedValue(true);
+    const thread = makeThread();
+    const staleTime = new Date(Date.now() - PENDING_MESSAGE_SAFETY_MS - 1000).toISOString();
+    thread.pendingUserMessages.push(
+      { text: 'accepted', eventId: 'e-accepted', created: staleTime },
+      { text: 'still retrying', eventId: 'e-retrying', created: staleTime },
+    );
+    threadMap.value = new Map([['thread-1', thread]]);
+
+    schedulePendingCleanup('thread-1', 'e-accepted');
+    await vi.advanceTimersByTimeAsync(PENDING_MESSAGE_SAFETY_MS);
+
+    expect(thread.pendingUserMessages.map(p => p.eventId)).toEqual(['e-retrying']);
   });
 
   it('stops retrying after the cap but KEEPS the unconfirmed row', async () => {

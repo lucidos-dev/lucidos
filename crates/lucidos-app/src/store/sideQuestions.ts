@@ -5,6 +5,7 @@ import {
   ApiError,
 } from '../api/client';
 import { errorDetail } from '../utils/errorDetail';
+import { withQuietRetries } from './actions/sendRetry';
 import { getComposeSelectionOverride } from './composeSelections';
 import { showToast, threadMap } from './store';
 import { isSideQuestionEvent } from './thread-events/thread-event-types';
@@ -26,10 +27,15 @@ export type SideQuestion = {
   afterSeq: number | null;
   /** Dismissed cards collapse to a row that reopens. */
   dismissed: boolean;
+  /** How many times it was asked. A retry re-asks under the same id, and a
+   *  retry this device sent counts one more than the events show so far. */
+  asks: number;
 } & (
   | { status: 'pending' }
   | { status: 'answered'; answer: string }
-  | { status: 'failed'; error: string }
+  /** `dropped`: the request failed before the engine replied, so the ask
+   *  may still be running there. */
+  | { status: 'failed'; error: string; dropped?: true }
 );
 
 /** One shared empty list, so an imageless card keeps a stable prop. */
@@ -68,7 +74,7 @@ export const SIDE_QUESTION_CODEX =
   'Side questions are not available in Codex threads. Send it as a normal message instead.';
 
 /** Route a submit. `asked` is true when the user chose a side question: the
- *  composer is in side-question mode, or the Send button's hold asked. A side
+ *  composer is in side-question mode, or was when an upload queued it. A side
  *  question never becomes a turn: it is asked, or refused with the draft kept.
  *  A Codex thread takes none, and refusing here keeps the draft and its images. */
 export function routeSideQuestion(
@@ -108,7 +114,10 @@ export function recordedSideQuestions(thread: ThreadState | undefined): SideQues
     if (!isSideQuestionEvent(event)) continue;
     const id = event.side_question_id;
     const card = byId.get(id);
-    if (event.type === 'SideQuestionAsked') {
+    if (event.type === 'SideQuestionAsked' && card) {
+      // A retry: the card keeps its place and waits again.
+      byId.set(id, { ...card, status: 'pending', asks: card.asks + 1 });
+    } else if (event.type === 'SideQuestionAsked') {
       byId.set(id, {
         id,
         threadId: thread.meta.id,
@@ -116,6 +125,7 @@ export function recordedSideQuestions(thread: ThreadState | undefined): SideQues
         imageHashes: event.image_hashes ?? NO_IMAGES,
         afterSeq: seq,
         dismissed: false,
+        asks: 1,
         status: 'pending',
       });
     } else if (!card) {
@@ -137,7 +147,7 @@ export function recordedSideQuestions(thread: ThreadState | undefined): SideQues
 }
 
 function sameCard(a: SideQuestion, b: SideQuestion): boolean {
-  return a.status === b.status && a.dismissed === b.dismissed && a.afterSeq === b.afterSeq
+  return a.status === b.status && a.dismissed === b.dismissed && a.afterSeq === b.afterSeq && a.asks === b.asks
     && (a.status !== 'answered' || (b.status === 'answered' && a.answer === b.answer))
     && (a.status !== 'failed' || (b.status === 'failed' && a.error === b.error));
 }
@@ -154,16 +164,22 @@ function drawn(card: SideQuestion, dismissed: boolean): SideQuestion {
   return flipped;
 }
 
-/** A recorded card still pending while this device already holds the
- *  answer, drawn with that answer at the recorded moment. */
-const settledCache = new WeakMap<SideQuestion, SideQuestion>();
+/** What this device knows ahead of the recorded events: a retry whose ask
+ *  is not recorded yet, or the engine's reply to an ask still recorded as
+ *  pending. A dropped request never settles a recorded ask, since the engine
+ *  may still be answering it, and nothing outranks a recorded answer. Drawn at
+ *  the recorded moment. */
+const aheadCache = new WeakMap<SideQuestion, SideQuestion>();
 
-function settledEarly(recorded: SideQuestion, local: SideQuestion | undefined): SideQuestion {
-  if (recorded.status !== 'pending' || !local || local.status === 'pending') return recorded;
-  const hit = settledCache.get(local);
+function withLocal(recorded: SideQuestion, local: SideQuestion | undefined): SideQuestion {
+  const replied = local !== undefined && local.status !== 'pending' && !(local.status === 'failed' && local.dropped);
+  const ahead = local !== undefined && recorded.status !== 'answered'
+    && (local.asks > recorded.asks || (replied && recorded.status === 'pending'));
+  if (!ahead) return recorded;
+  const hit = aheadCache.get(local);
   if (hit && hit.afterSeq === recorded.afterSeq && hit.dismissed === recorded.dismissed) return hit;
   const merged = { ...local, afterSeq: recorded.afterSeq, dismissed: recorded.dismissed };
-  settledCache.set(local, merged);
+  aheadCache.set(local, merged);
   return merged;
 }
 
@@ -172,7 +188,7 @@ function settledEarly(recorded: SideQuestion, local: SideQuestion | undefined): 
 export function sideQuestionsFor(threadId: string): SideQuestion[] {
   const localCards = localSideQuestions.value;
   const recorded = recordedSideQuestions(threadMap.value.get(threadId))
-    .map((card) => settledEarly(card, localCards.get(card.id)));
+    .map((card) => withLocal(card, localCards.get(card.id)));
   const recordedIds = new Set(recorded.map((card) => card.id));
   const local = [...localCards.values()]
     .filter((card) => card.threadId === threadId && !recordedIds.has(card.id));
@@ -197,31 +213,85 @@ function withId(set: ReadonlySet<string>, id: string, present: boolean): Readonl
   return next;
 }
 
+type Ask = Omit<SideQuestion, 'status' | 'answer' | 'error'>;
+
+/** Only a failure that came back quicker than this is retried: a dropped
+ *  connection or a hiccup, never an ask that already spent its time. */
+export const QUICK_FAILURE_MS = 20_000;
+
+/** A refusal (4xx) fails the same way every time, so only a dropped request
+ *  or an engine error is worth asking again. */
+function retryable(err: unknown): boolean {
+  return !(err instanceof ApiError) || err.httpCode >= 500;
+}
+
+/** The next ask under a card's id: one past those recorded. A failure the
+ *  engine never recorded is still its first. */
+function nextAsks(threadId: string, id: string): number {
+  const recorded = recordedSideQuestions(threadMap.value.get(threadId)).find((c) => c.id === id);
+  return (recorded?.asks ?? 0) + 1;
+}
+
+/** Post one ask and draw its card pending at once, retrying a quick failure
+ *  on the schedule every send shares before the card shows it. Never throws.
+ *  A 409 means the engine already holds this ask, so its recorded events
+ *  settle the card. */
+async function postAsk(first: Ask): Promise<void> {
+  let ask = first;
+  setLocal({ ...ask, status: 'pending' });
+  const result = await withQuietRetries(
+    () => postSideQuestion(ask.threadId, ask.id, ask.question, ask.imageHashes),
+    {
+      path: 'side-question',
+      retryable: (err, attemptMs) => retryable(err) && attemptMs < QUICK_FAILURE_MS,
+      beforeRetry: (err) => {
+        // An engine reply counts this attempt before its events arrive. A
+        // dropped request counts only what is recorded: it may never have arrived.
+        const recorded = nextAsks(ask.threadId, ask.id);
+        ask = { ...ask, asks: err instanceof ApiError ? Math.max(ask.asks + 1, recorded) : recorded };
+        setLocal({ ...ask, status: 'pending' });
+      },
+    },
+  );
+  if (result.kind === 'done') {
+    setLocal({ ...ask, status: 'answered', answer: result.value });
+    return;
+  }
+  if (result.kind === 'landed') return;
+  const err = result.error;
+  if (err instanceof ApiError && err.httpCode === 409) {
+    // Count no ask past those recorded, so the engine's events rule.
+    setLocal({ ...ask, asks: nextAsks(ask.threadId, ask.id) - 1, status: 'pending' });
+    return;
+  }
+  setLocal(err instanceof ApiError
+    ? { ...ask, status: 'failed', error: err.reason }
+    : { ...ask, status: 'failed', error: errorDetail(err), dropped: true });
+}
+
 /** Ask a side question with any uploaded images and show its card at once.
- *  Never throws: a failure lands on the card. The recorded events take over
- *  when they arrive. */
-export async function askSideQuestion(
+ *  The recorded events take over when they arrive. */
+export function askSideQuestion(
   threadId: string,
   question: string,
   imageHashes: readonly string[] = NO_IMAGES,
 ): Promise<void> {
-  const id = crypto.randomUUID();
-  const asked = {
-    id,
+  return postAsk({
+    id: crypto.randomUUID(),
     threadId,
     question,
     imageHashes,
     afterSeq: latestEventSeq(threadMap.value.get(threadId)),
     dismissed: false,
-  };
-  setLocal({ ...asked, status: 'pending' });
-  try {
-    const answer = await postSideQuestion(threadId, id, question, imageHashes);
-    setLocal({ ...asked, status: 'answered', answer });
-  } catch (err) {
-    const error = err instanceof ApiError ? err.reason : errorDetail(err);
-    setLocal({ ...asked, status: 'failed', error });
-  }
+    asks: 1,
+  });
+}
+
+/** Ask a failed side question again under its own id, so the card keeps its
+ *  place on every device. */
+export function retrySideQuestion(card: SideQuestion): Promise<void> {
+  const { id, threadId, question, imageHashes, afterSeq, dismissed } = card;
+  return postAsk({ id, threadId, question, imageHashes, afterSeq, dismissed, asks: nextAsks(threadId, id) });
 }
 
 /** Dismiss a card and record the dismissal. A 404 means the engine never

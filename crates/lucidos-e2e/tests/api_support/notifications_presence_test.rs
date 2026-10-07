@@ -868,6 +868,40 @@ async fn the_sdk_navigate_bridge_still_passes_a_real_target() {
     }
 }
 
+/// A `repo:` locator naming an unregistered repository reached the page as a
+/// bare uuid parse error. The bridge now refuses it and names what was asked.
+/// A malformed one still passes, since the page reads it as an artifact path.
+#[tokio::test]
+async fn the_sdk_navigate_bridge_refuses_a_repository_nobody_registered() {
+    let file_path = format!("repo:{}:file:README.md", unique_marker("unregistered-repo"));
+    let resp = user_client()
+        .await
+        .post(format!("{}/api/v1/ui/navigate", base_url()))
+        .json(&serde_json::json!({ "target": "file", "params": { "file_path": file_path } }))
+        .send()
+        .await
+        .expect("ui navigate request");
+    let status = resp.status().as_u16();
+    let reason = resp.text().await.expect("read refusal body");
+    assert_eq!(
+        status, 400,
+        "an unregistered repository must be refused, got {reason}"
+    );
+    assert!(
+        reason.contains(&file_path),
+        "the refusal names the locator: {reason}"
+    );
+
+    let resp = user_client()
+        .await
+        .post(format!("{}/api/v1/ui/navigate", base_url()))
+        .json(&serde_json::json!({ "target": "file", "params": { "file_path": "repo:x" } }))
+        .send()
+        .await
+        .expect("ui navigate request");
+    assert_eq!(resp.status(), 200, "a malformed locator still navigates");
+}
+
 /// The guard is scoped to a thread target. An app id is a directory name and a
 /// panel target carries no id at all.
 #[tokio::test]

@@ -190,6 +190,13 @@ impl PermissionState {
         self.by_dedup_key.remove(&key)
     }
 
+    /// The thread a pending card belongs to, without resolving it. The consent
+    /// routes weigh the caller's reach over it before they answer.
+    pub fn thread_of(&self, request_id: &str) -> Option<Uuid> {
+        let key = self.by_request_id.get(request_id)?;
+        self.by_dedup_key.get(key).map(|entry| entry.thread_id)
+    }
+
     /// Record a session-allow pattern for a thread. Idempotent: a duplicate
     /// insert is a no-op. The pattern is what `derive_allow_pattern` returned
     /// for `AllowScope::Session` on the originating prompt, and matching is
@@ -871,15 +878,17 @@ fn path_outside_workspace(path: &str, workspace_path: &Path) -> bool {
     // `path_inside_worktree` resolves both sides. A symlink inside the
     // workspace pointing outside makes the path read as contained while the
     // write lands elsewhere, and the unattended lane auto-allows that. Resolve
-    // here too, but only to OVERRIDE a lexical "inside". When either side fails
-    // to resolve we keep the lexical answer. The ordinary case is a `Write`
-    // naming a file that does not exist yet, and calling that outside would
-    // card every new file.
+    // here too, but only to OVERRIDE a lexical "inside". A dangling link on the
+    // chain reads as outside, since the write follows it somewhere unknown.
+    // Otherwise, when either side fails to resolve we keep the lexical answer.
+    // The ordinary case is a `Write` naming a file that does not exist yet, and
+    // calling that outside would card every new file.
     match (
         std::fs::canonicalize(workspace_path),
         canonical_existing_prefix(p),
     ) {
-        (Ok(root), Some(resolved)) => !resolved.starts_with(&root),
+        (_, ExistingPrefix::DanglingLink) => true,
+        (Ok(root), ExistingPrefix::Resolved(resolved)) => !resolved.starts_with(&root),
         _ => false,
     }
 }
@@ -895,19 +904,34 @@ fn has_rejected_component(p: &Path) -> bool {
     })
 }
 
+/// What the longest existing prefix of a path resolves to.
+#[derive(Debug, PartialEq, Eq)]
+enum ExistingPrefix {
+    Resolved(std::path::PathBuf),
+    /// An entry on the chain exists but does not resolve: a dangling or
+    /// looping symlink. A write follows it, so its destination is unknown.
+    DanglingLink,
+    /// Nothing along the chain exists.
+    Unresolved,
+}
+
 /// Canonicalize the longest existing prefix of `p`. A `Write` names a file that
 /// does not exist yet, so canonicalizing the target itself fails on exactly the
 /// case we most need to classify. Walk up to the nearest ancestor that does
-/// resolve, and return `None` when nothing along the chain does.
-fn canonical_existing_prefix(p: &Path) -> Option<std::path::PathBuf> {
+/// resolve. Never walk past an entry that exists but fails to resolve: its
+/// parent says nothing about where a write through that link lands.
+fn canonical_existing_prefix(p: &Path) -> ExistingPrefix {
     let mut current = Some(p);
     while let Some(candidate) = current {
         if let Ok(real) = std::fs::canonicalize(candidate) {
-            return Some(real);
+            return ExistingPrefix::Resolved(real);
+        }
+        if std::fs::symlink_metadata(candidate).is_ok() {
+            return ExistingPrefix::DanglingLink;
         }
         current = candidate.parent();
     }
-    None
+    ExistingPrefix::Unresolved
 }
 
 /// True when `path` provably resolves INSIDE `worktree_root`, the session's own
@@ -936,7 +960,7 @@ fn path_inside_worktree(path: &str, worktree_root: &Path) -> bool {
     let Ok(root) = std::fs::canonicalize(worktree_root) else {
         return false;
     };
-    let Some(resolved) = canonical_existing_prefix(p) else {
+    let ExistingPrefix::Resolved(resolved) = canonical_existing_prefix(p) else {
         return false;
     };
     let Ok(relative) = resolved.strip_prefix(&root) else {
@@ -1157,18 +1181,19 @@ async fn judge_escalation_lane(
     thread_id: Uuid,
 ) -> Option<RiskLane> {
     let pool = engine.pool();
-    let guard_on = crate::core::PreferenceStore::command_guard(pool)
+    let guard_on = crate::core::prefs::COMMAND_GUARD
+        .try_read(pool)
         .await
         .unwrap_or(false);
     if !guard_on
-        || !crate::core::PreferenceStore::command_guard_judge(pool)
+        || !crate::core::prefs::COMMAND_GUARD_JUDGE
+            .try_read(pool)
             .await
             .unwrap_or(false)
     {
         return None;
     }
-    let model = crate::core::PreferenceStore::command_judge_model(pool).await;
-    match engine.judge_command(&model, ji, thread_id).await {
+    match engine.judge_command(ji, thread_id).await {
         Ok(verdict) => Some(verdict.lane),
         Err(e) => {
             crate::log!(
@@ -3238,6 +3263,24 @@ mod tests {
             &under(&f.root, "crates/lucidos-engine/src/brand_new.rs"),
             &f.root
         ));
+    }
+
+    /// A link to a missing target fails to canonicalize. The walk used to step
+    /// past it to the worktree root and call it contained, while a write
+    /// through it creates the target outside.
+    #[test]
+    #[cfg(unix)]
+    fn a_dangling_symlink_is_never_read_as_contained() {
+        let f = worktree_fixture();
+        std::os::unix::fs::symlink(f.outside.join("not-yet.plist"), f.root.join("dangling"))
+            .expect("symlink");
+        let link = under(&f.root, "dangling");
+        assert!(!path_inside_worktree(&link, &f.root));
+        assert!(path_outside_workspace(&link, &f.root));
+        assert_eq!(
+            canonical_existing_prefix(Path::new(&link)),
+            ExistingPrefix::DanglingLink
+        );
     }
 
     // --- decision matrix (pure, no DB) -------------------------------------

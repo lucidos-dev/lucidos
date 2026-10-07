@@ -5,7 +5,7 @@
  * saved on its own would leave local chat keyless, and the server answers 401.
  */
 import { describe, it, expect } from 'vitest';
-import { localKeyRescope } from './LocalProviderSettings';
+import { providerKeyRescope } from './providerCredential';
 import type { CredentialInfo } from '../../store/types';
 
 const key = (base_urls: string[], env_var_name: string | null = null): CredentialInfo => ({
@@ -18,9 +18,9 @@ const key = (base_urls: string[], env_var_name: string | null = null): Credentia
   env_var_name,
 });
 
-describe('localKeyRescope', () => {
+describe('providerKeyRescope', () => {
   it('moves the key to a newly saved URL', () => {
-    expect(localKeyRescope(key(['http://localhost:1234/v1']), ' http://localhost:1235/v1 ')).toEqual({
+    expect(providerKeyRescope(key(['http://localhost:1234/v1']), ' http://localhost:1235/v1 ')).toEqual({
       base_urls: ['http://localhost:1235/v1'],
       auth_type: 'api_key',
       auth_header: 'Authorization',
@@ -29,18 +29,18 @@ describe('localKeyRescope', () => {
   });
 
   it('keeps a custom env var name, since an edit replaces every field', () => {
-    expect(localKeyRescope(key(['http://a/v1'], 'LOCAL_KEY'), 'http://b/v1')?.env_var_name).toBe('LOCAL_KEY');
+    expect(providerKeyRescope(key(['http://a/v1'], 'LOCAL_KEY'), 'http://b/v1')?.env_var_name).toBe('LOCAL_KEY');
   });
 
   it('does nothing when the key already covers the URL', () => {
-    expect(localKeyRescope(key(['http://localhost:1234/v1']), 'http://localhost:1234/v1')).toBeNull();
+    expect(providerKeyRescope(key(['http://localhost:1234/v1']), 'http://localhost:1234/v1')).toBeNull();
   });
 
   it('does nothing with no saved key', () => {
-    expect(localKeyRescope(undefined, 'http://localhost:1234/v1')).toBeNull();
+    expect(providerKeyRescope(undefined, 'http://localhost:1234/v1')).toBeNull();
   });
 
   it('leaves the key alone when the field is cleared, since the engine may fall back to an env URL', () => {
-    expect(localKeyRescope(key(['http://localhost:1234/v1']), '  ')).toBeNull();
+    expect(providerKeyRescope(key(['http://localhost:1234/v1']), '  ')).toBeNull();
   });
 });

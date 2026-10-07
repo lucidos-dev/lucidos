@@ -97,7 +97,14 @@ pub(super) const APPLY_VERIFY_RULE: &str = "APPLYING & VERIFYING CHANGES, ACT AN
 /// It only looked one turn later, after the user objected, by which point they
 /// had supplied the fact themselves and the lookup could do nothing but agree
 /// with them.
-pub(super) const LOOK_BEFORE_ASSESSING_RULE: &str = "ESTABLISH THE STATE BEFORE YOU FORM AN ASSESSMENT:\nAsked to judge, compare or advise on something of theirs, find out how it is ACTUALLY going before deciding what you think. Injected memories come first; when they are thin, the `memory` and `threads` tools both have a 'search'. An ORDER, not a review at the end: once you have a view you will not go looking.\n- NEVER assert something has not happened, does not exist, or was never discussed, unless you looked. Absence from your context is not absence from their history.\n- For answering, not browsing: stop once you have what you need.";
+///
+/// `__MEMORY_LOOKUP__` names what to look with, which depends on the memory
+/// module: [`MEMORY_LOOKUP_CLASSIC`] or [`MEMORY_LOOKUP_TREE`].
+pub(super) const LOOK_BEFORE_ASSESSING_RULE: &str = "ESTABLISH THE STATE BEFORE YOU FORM AN ASSESSMENT:\nAsked to judge, compare or advise on something of theirs, find out how it is ACTUALLY going before deciding what you think. __MEMORY_LOOKUP__ An ORDER, not a review at the end: once you have a view you will not go looking.\n- NEVER assert something has not happened, does not exist, or was never discussed, unless you looked. Absence from your context is not absence from their history.\n- For answering, not browsing: stop once you have what you need.";
+
+pub(super) const MEMORY_LOOKUP_CLASSIC: &str = "Injected memories come first; when they are thin, the `memory` and `threads` tools both have a 'search'.";
+
+pub(super) const MEMORY_LOOKUP_TREE: &str = "Your memory views come first; when they are thin, the `recall` and `threads` tools both have a 'search'.";
 
 /// The half of the apply/verify rule that is only true on an install launched
 /// from a Lucidos source checkout: the engine rebuild+restart choreography for
@@ -292,8 +299,8 @@ pub(super) fn forced_classification(
 
 /// This turn's classification when the process pins one, logged like any other.
 ///
-/// `None` leaves the caller on today's path: consult the extractor and pay the
-/// round-trip. The env read happens once, because process configuration cannot
+/// `None` leaves the caller on today's path: ask the classification model and
+/// pay the round-trip. The env read happens once, because process configuration cannot
 /// change under a running engine.
 pub(super) fn pinned_classification() -> Option<crate::memory::QueryClassification> {
     static PIN: OnceLock<Option<crate::memory::QueryClassification>> = OnceLock::new();

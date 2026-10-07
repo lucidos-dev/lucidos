@@ -1,6 +1,7 @@
-/** Default chat model when no preference is set.
- *  Mirrored on the backend in `crates/lucidos-engine/src/core/preferences.rs`. */
-export const DEFAULT_CHAT_MODEL = 'claude-opus-5';
+import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
+
+/** Default chat model when no preference is set. */
+export const DEFAULT_CHAT_MODEL: string = PREFERENCE_CATALOG.chat_model.fallback;
 
 /** Fallback chat model options shown before the DB-backed registry (`/models`)
  *  loads, and used by tests + label lookups. The live picker reads the loaded
@@ -63,65 +64,21 @@ export const REASONING_LEVELS = [
   { value: 'max', label: 'Max' },
 ];
 
-/** Filter REASONING_LEVELS to those the given model actually supports.
+/** The REASONING_LEVELS a model supports, by the engine's own answer.
  *
- *  `supported` is the model's `reasoning_efforts` from the `/models` registry:
- *  the engine's own answer (`llm::reasoning::supported_efforts`), and the same
- *  set `RoutingProvider` clamps the request onto. **Pass it whenever you have
- *  it**, by going through `lucidosTiers` in `store/modelSelection.ts`, paired
- *  with the registry lookup in `store/actions/models.ts`. Deriving the answer
- *  here independently is what produced the bug this argument closes: the
- *  heuristic below matches on the model id's SHAPE, which says nothing about
- *  which server serves the model. A local `muse-glimmer:30b-mlx` matched no
- *  branch, fell through to the Gemini-shaped default, and was offered `max`;
- *  the engine then sent something else and its server 400'd.
- *
- *  The heuristic is the fallback for the two cases with no registry answer: the
- *  picker rendering before `/models` lands, and a saved `chat_model` naming an
- *  id with no row. It tracks the engine's per-family answer, family by family,
- *  so a pre-load picker offers what the request will actually honour:
- *  - GPT-5.6 (Sol / Terra / Luna) and GPT-6 Astra: full set. Both accept a
- *    distinct `max` reasoning tier (Sol's headline "Max reasoning effort").
- *    Matched by name, not by a `gpt-6` prefix: the engine's
- *    `llm::reasoning::supported_efforts` keeps the same per-family list, since
- *    a family that tops out at `xhigh` answers `max` with a 400.
- *  - Other OpenAI: drops `max` (their top tier is `xhigh`, so `max` would be a duplicate).
- *  - Opus 5.5 / Sonnet 5.5 / Fable (5 and 5.1): every tier except `none`. They
- *    always think, so the engine snaps a stored `none` to `low`. Sonnet 5.5 is
- *    matched before the `claude-sonnet-5` prefix below, which would claim it.
- *  - Opus 4.7+ (incl. Opus 5) / Sonnet 5: full set (the adaptive Anthropic family that
- *    natively supports `xhigh`). Sonnet 5 is the first Sonnet-tier model with a distinct `xhigh`;
- *    Sonnet 4.6 and older stay on the filtered set below.
- *  - Other Claude / Gemini: drops `xhigh` (not a distinct tier on those backends). */
+ *  `supported` is the model's `reasoning_efforts` from the `/models` registry
+ *  (`llm::reasoning::supported_efforts`), the same set `RoutingProvider`
+ *  clamps a request onto. Get it through `lucidosTiers` in
+ *  `store/modelSelection.ts`. With no answer, every level is offered, and the
+ *  engine snaps the request onto what the backend accepts. That covers a
+ *  registry still loading and an id with no row. The client keeps no copy of the per-family
+ *  rules, so it cannot offer a tier the engine has stopped honouring
+ *  (ADR 0368). */
 export function availableReasoningLevels(
-  model: string,
   supported?: readonly string[],
 ): typeof REASONING_LEVELS {
-  if (supported) {
-    const offered = REASONING_LEVELS.filter(l => supported.includes(l.value));
-    // An empty result would render an empty dropdown, so a registry row that
-    // declares nothing we recognise falls through to the heuristic rather than
-    // leaving the user no way to pick.
-    if (offered.length > 0) return offered;
-  }
-  if (model.startsWith('gpt-')) {
-    if (model.startsWith('gpt-5.6') || model === 'gpt-6-astra') return REASONING_LEVELS;
-    return REASONING_LEVELS.filter(l => l.value !== 'max');
-  }
-  if (
-    model.startsWith('claude-opus-5-5') ||
-    model.startsWith('claude-sonnet-5-5') ||
-    model.startsWith('claude-fable-5')
-  ) {
-    return REASONING_LEVELS.filter(l => l.value !== 'none');
-  }
-  if (
-    model.startsWith('claude-opus-4-7') ||
-    model.startsWith('claude-opus-4-8') ||
-    model.startsWith('claude-opus-5') ||
-    model.startsWith('claude-sonnet-5')
-  ) {
-    return REASONING_LEVELS;
-  }
-  return REASONING_LEVELS.filter(l => l.value !== 'xhigh');
+  const offered = supported ? REASONING_LEVELS.filter(l => supported.includes(l.value)) : [];
+  // An empty result would render an empty dropdown, so a registry row that
+  // declares nothing we recognise offers the whole ladder instead.
+  return offered.length > 0 ? offered : REASONING_LEVELS;
 }

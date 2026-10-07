@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, isMobileViewport } from './helpers';
+import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, isMobileViewport, touchPress } from './helpers';
 import { psql, createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 import { randomUUID } from 'crypto';
 
@@ -161,9 +161,7 @@ test.describe('Answer Submit with the mobile keyboard up', () => {
         const r = probe!.rect;
         const x = Math.round((r.left + r.right) / 2);
         const y = Math.round((r.top + r.bottom) / 2);
-        const cdp = await page.context().newCDPSession(page);
-        await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
-        await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+        await touchPress(page, [{ type: 'touchStart', x, y }, { type: 'touchEnd' }]);
 
         await expect
           .poll(

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import type { DiffFile, RepoDiff, RepoLocator } from '../../store/store';
-import { repoDiff, repoPending, filePreviewSource, filePreviewWrap, diffSideBySide, repoSelectedChangeId, openFilePreviewRevision } from '../../store/store';
+import { repoDiff, repoPending, filePreviewSource, filePreviewWrap, diffSideBySide, repoSelectedChangeId, openFilePreviewRevision, encodeRepoPath } from '../../store/store';
 import { diffBodyKind } from '../../store/diffBody';
 import type { Loadable } from '../../store/types';
 import { getRepoFileContent, getChangeFileContent, repoFileUrl, changeFileUrl } from '../../api/client';
@@ -10,6 +10,7 @@ import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { highlightFileLines, CODE_EXTS } from '../../utils/syntaxHighlight';
 import { escapeHtml } from '../../utils/escapeHtml';
 import { MarkdownDocument } from './MarkdownDocument';
+import { handlePreviewLinkClick } from './previewIframeLinks';
 import { renderCsvTable } from '../../utils/csv';
 import { PreviewImage } from './PreviewImage';
 import { previewExt, repoPreviewBody } from './previewBody';
@@ -305,7 +306,31 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFi
     //
     // `.repo-file-rendered` insets the content to match the rendered diff
     // (.rendered-diff), so toggling between them keeps the same gutter.
-    if (body === 'markdown') return <div class="repo-file-rendered"><MarkdownDocument content={content!} /></div>;
+    if (body === 'markdown') {
+      // Shared by the Files-panel preview AND the app-facing glance modal
+      // (both render through `RepoFileContent` → here), so a sibling link
+      // routes identically from either surface.
+      //
+      // Always `mode: 'file'`, even while THIS file is shown via a change's
+      // whole-file diff view (`changeId` set): a sibling link names a plain
+      // file, not another diff entry, and a sibling outside the change has
+      // no diff entry at all. The `whole-file` case above already passes
+      // this file's own `gitRef` as the change's branch, so the sibling
+      // still lands on that same branch.
+      //
+      // Its images, though, are read where the document's own text was read:
+      // from the change when one is set, which follows it once applied.
+      const locator: RepoLocator = { repoId, mode: 'file', ref: gitRef ?? undefined, path };
+      return (
+        <div class="repo-file-rendered">
+          <MarkdownDocument
+            content={content!}
+            location={{ kind: 'repo', repoId, path, ref: gitRef ?? undefined, changeId }}
+            onClick={(e) => handlePreviewLinkClick(e, encodeRepoPath(locator), locator)}
+          />
+        </div>
+      );
+    }
     if (body === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: csvHtml! }} />;
 
     return (

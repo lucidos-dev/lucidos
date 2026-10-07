@@ -25,6 +25,10 @@
 #   MEMORY_WATCH_LOG_MAX_KB   size at which the log rotates, keeping one old file (default 10240)
 #   MEMORY_WATCH_DIR          where the log and state live (default ~/.lucidos/memory-watch)
 
+# For WORKTREES_SUBPATH, which the installer refuses to run from.
+# shellcheck source=scripts/lib/workspace_constants.sh
+source "$(dirname "${BASH_SOURCE[0]}")/workspace_constants.sh"
+
 # The longest command line kept in a record. A coding agent's argv carries a
 # system prompt of about 22 KB, which would bury the log.
 MEMORY_WATCH_COMMAND_MAX=400
@@ -315,7 +319,7 @@ PLIST
 memory_watch_install() {
     local project="$1" agents="$2" plist uid
     case "$project" in
-        */.lucidos/worktrees/*)
+        */"$WORKTREES_SUBPATH"/*)
             echo "Refusing: $project is inside a coding-agent worktree, which is deleted when its session ends." >&2
             echo "Run this from your own checkout instead." >&2
             return 1

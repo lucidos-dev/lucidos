@@ -9,6 +9,9 @@ name = "lucidos"
 path = "src/main.rs"
 
 [dependencies]
+# `lucidos spawn-thread --image` sends each file inline, as the engine's
+# `images` body expects.
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 # Reads a picture's size from its header, for the size hint on the line
@@ -18,6 +21,9 @@ imagesize = "0.13"
 # scheduling priority, and the whole compile tree inherits it.
 libc = "0.2"
 lucidos-build-slot = { path = "../lucidos-build-slot" }
+# The two default gateway ports `lucidos pair` probes. Its only dependency is
+# serde, which this crate already takes.
+lucidos-installs = { path = "../lucidos-installs" }
 lucidos-local-token = { path = "../lucidos-local-token" }
 # `lucidos pair --qr` draws the code in the terminal, and needs a hostname a
 # phone can reach to put in it. Tailscale answers that from the interface list

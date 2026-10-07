@@ -25,8 +25,10 @@ import { ProposeUpstreamButton } from './ProposeUpstreamButton';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { AddOfficialMarketplaceButton } from './AddOfficialMarketplaceButton';
 import { contentLabel } from './pluginContent';
+import { NO_ENGINE_REQUIREMENT_CHIP, NO_ENGINE_REQUIREMENT_SENTENCE } from './engineRequirement';
 import { applyNavFocus } from '../shared/focusMarker';
 import { scrollBehavior } from '../../utils/motion';
+import { GlyphBadge } from '../shared/GlyphBadge';
 
 /** Jump to Settings → Marketplaces from anywhere. One call: `openSettingsSubview`
  *  lands the Settings panel and the sub-section together, so the jump is a single
@@ -48,19 +50,26 @@ function actionLabel(plugin: MarketplacePlugin): string {
 }
 
 /** The card's primary button. Progresses Install/Update → Setup → Open:
- *  - not installed → Install (or Update for an out-of-date install)
+ *  - not installed → Install (or Update for an out-of-date install), disabled
+ *    with the engine's reason when this Lucidos cannot install that version
  *  - installed with an unfinished setup thread → Setup (opens that thread)
  *  - installed and setup done (or none) with an app → Open (launches it)
  *  - installed with nothing to open → no button; the status badge says it
  *  An out-of-date install always shows Update first, before Setup/Open. */
 type CardAction =
-  | { kind: 'install'; label: string }
+  | { kind: 'install'; label: string; blockedReason?: string }
   | { kind: 'setup'; threadId: string }
   | { kind: 'open'; appId: string }
   | { kind: 'none' };
 
-function cardPrimaryAction(plugin: MarketplacePlugin): CardAction {
-  if (plugin.status !== 'installed') return { kind: 'install', label: actionLabel(plugin) };
+export function cardPrimaryAction(plugin: MarketplacePlugin): CardAction {
+  if (plugin.status !== 'installed') {
+    return {
+      kind: 'install',
+      label: actionLabel(plugin),
+      blockedReason: plugin.engine_compatible ? undefined : plugin.engine_incompatible_reason,
+    };
+  }
   if (plugin.setup_thread_id && !plugin.setup_complete) {
     return { kind: 'setup', threadId: plugin.setup_thread_id };
   }
@@ -188,6 +197,9 @@ function orphanRow(p: InstalledPlugin): MarketplacePlugin {
     app_id: p.app_id,
     modified: p.modified,
     modified_paths: p.modified_paths,
+    engine_requirement: p.engine_requirement,
+    // Already installed, so there is nothing to install and nothing to block.
+    engine_compatible: true,
   };
 }
 
@@ -580,17 +592,21 @@ interface PluginStoreRowProps {
  *  placeholder via the Sk* leaves; with real props it renders the catalog row
  *  normally. Props are optional only to support the skeleton call; real call
  *  sites pass them all. */
-function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<PluginStoreRowProps>) {
+export function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<PluginStoreRowProps>) {
   const sk = useSkeleton();
   // 'available' is the only not-yet-installed state; 'installed' and
   // 'update_available' both mean the plugin is on disk → uninstallable.
   const isInstalled = !!plugin && plugin.status !== 'available';
   const busy = !!plugin && installingSource === plugin.source;
   const action = plugin ? cardPrimaryAction(plugin) : { kind: 'none' as const };
-  let primary: { label: string; onClick: () => void } | null = null;
+  let primary: { label: string; onClick: () => void; blockedReason?: string } | null = null;
   switch (action.kind) {
     case 'install':
-      primary = { label: action.label, onClick: () => plugin && void stageInstall?.(plugin) };
+      primary = {
+        label: action.label,
+        onClick: () => plugin && void stageInstall?.(plugin),
+        blockedReason: action.blockedReason,
+      };
       break;
     case 'setup':
       // The catalog surfaces this button for a present-or-queued setup thread;
@@ -617,15 +633,15 @@ function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<Plug
           <SkText class="title list-row-name" w="9rem">{plugin?.name}</SkText>
           {(sk || plugin) && (
             <SkBlock w="5rem" h="1rem" round>
-              <span class={`app-store-status app-store-status-${plugin?.status}`}>
+              <GlyphBadge class={`app-store-status app-store-status-${plugin?.status}`}>
                 {plugin && statusLabel(plugin)}
-              </span>
+              </GlyphBadge>
             </SkBlock>
           )}
           {plugin?.modified && (
-            <span class="app-store-modified-chip" data-tooltip={modifiedTooltip(plugin.modified_paths)}>
+            <GlyphBadge class="app-store-modified-chip" data-tooltip={modifiedTooltip(plugin.modified_paths)}>
               Modified
-            </span>
+            </GlyphBadge>
           )}
         </div>
         {(sk || plugin?.description) && (
@@ -647,6 +663,20 @@ function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<Plug
               {categoryLabel(c)}
             </span>
           ))}
+          {primary?.blockedReason && (
+            <span class="label label-warning" data-role="engine-requirement">
+              {primary.blockedReason}
+            </span>
+          )}
+          {plugin && plugin.engine_requirement == null && (
+            <span
+              class="label label-neutral"
+              data-role="engine-undeclared"
+              data-tooltip={NO_ENGINE_REQUIREMENT_SENTENCE}
+            >
+              {NO_ENGINE_REQUIREMENT_CHIP}
+            </span>
+          )}
         </div>
       </div>
       <div class="list-row-actions">
@@ -664,7 +694,12 @@ function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<Plug
         )}
         {(sk || primary) && (
           <SkBlock w="4.5rem" h="2rem" round>
-            <button class="action-btn" type="button" disabled={busy} onClick={primary?.onClick}>
+            <button
+              class="action-btn"
+              type="button"
+              disabled={busy || !!primary?.blockedReason}
+              onClick={primary?.onClick}
+            >
               {busy ? 'Staging' : primary?.label}
             </button>
           </SkBlock>

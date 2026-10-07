@@ -97,4 +97,36 @@ test.describe('Image upload progress in the composer', () => {
     await sendButton(page).click();
     await expect(userMessageBody(page).filter({ hasText: message })).toHaveCount(1, { timeout: 15_000 });
   });
+
+  test('an upload the engine took lands on its event when the answer never arrives', async ({ page }) => {
+    // The engine stores the image and emits ImageUploaded. Its answer never
+    // reaches the page, as on the phone that reported the stall.
+    let uploads = 0;
+    await page.route(BLOB_ROUTE, async (route: Route) => {
+      uploads += 1;
+      // WebKit hands page.route a multipart body with the file's bytes left
+      // out, so a bare route.fetch() replays an empty upload the engine refuses.
+      // The rebuilt form takes a new boundary, so the old framing headers go.
+      const headers = await route.request().allHeaders();
+      delete headers['content-type'];
+      delete headers['content-length'];
+      const stored = await route.fetch({
+        headers,
+        multipart: { file: { name: 'photo.png', mimeType: 'image/png', buffer: PNG } },
+      });
+      expect(stored.status(), 'the engine refused the replayed upload').toBe(201);
+    });
+    await navigateToApp(page);
+    const message = uniqueMessage('upload-answer-lost');
+    const input = await waitForVisibleInput(page);
+    await input.fill(message);
+
+    await attachImage(page);
+    await sendButton(page).click();
+
+    // Well inside the 20 s stall deadline that would otherwise re-upload.
+    await expect(pendingChip(page)).toHaveCount(0, { timeout: 10_000 });
+    await expect(userMessageBody(page).filter({ hasText: message })).toHaveCount(1, { timeout: 15_000 });
+    expect(uploads).toBe(1);
+  });
 });

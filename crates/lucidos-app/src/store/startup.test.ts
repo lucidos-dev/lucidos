@@ -186,7 +186,7 @@ describe('startClient notifications cold start', () => {
     // value's cache at module load and this effect cannot outrun it. Move the
     // seed into an effect or an await and the eager load starts guessing.
     const store = readFileSync(resolve(dirname(SOURCE), '../store/store.ts'), 'utf8');
-    expect(store).toContain(`localStorage.getItem('lucidos-notifications-filter')`);
+    expect(store).toContain('localStorage.getItem(NOTIFICATIONS_FILTER_STORAGE_KEY)');
   });
 });
 

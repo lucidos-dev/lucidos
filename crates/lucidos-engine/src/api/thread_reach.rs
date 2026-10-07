@@ -14,12 +14,15 @@
 //! The gate is per VERB, never per route. Three verbs arrive by more than one
 //! path, and gating the first path of each is how the ungated set grew.
 //!
-//! **Two things here are still open, and both are recorded rather than left to
-//! be rediscovered** in `docs/plans/2026-08-30-a-thread-acts-in-its-own-subtree.md`.
-//! Resolving a permission card is the one clause-4 verb with no gate, in
-//! `command_permission` and `mcp_permission`. Taking an owner's standing apply
-//! back is the other, and clause 4 has no verb for it: it classifies pressing
-//! an owner button, not revoking one.
+//! **Messaging is reach, not authority.** A follow-up addresses a thread's own
+//! direct children, and the *home thread* may address any thread (ADR 0362).
+//! [`follow_up_reach`] answers that. It widens no clause-4 verb: the home
+//! thread still presses an owner button only on a standing instruction.
+//!
+//! **One thing here is still open, and it is recorded rather than left to be
+//! rediscovered** in `docs/plans/2026-08-30-a-thread-acts-in-its-own-subtree.md`.
+//! Taking an owner's standing apply back has no gate, and clause 4 has no verb
+//! for it: it classifies pressing an owner button, not revoking one.
 //!
 //! - **The caller is authenticated, never asserted.** It is the prefix of the
 //!   thread-bound origin token, which is HMAC-covered (`api::actor`).
@@ -60,6 +63,10 @@ pub(crate) enum ThreadReachVerb {
     BringBack,
     Revert,
     AnswerQuestion,
+    /// Answering a permission card: Allow once, Allow for this thread, or
+    /// Deny. The two Always-allow grants are refused to every agent outright,
+    /// by [`refuse_agent_always_allow`].
+    ResolvePermission,
     Continue,
     /// Creating a thread with no parent, which aims at the workspace root. The
     /// root is not a thread and gets no row (ADR 0168 clause 1), so no place in
@@ -86,6 +93,7 @@ impl ThreadReachVerb {
             Self::BringBack => "bring back a change from",
             Self::Revert => "revert a change from",
             Self::AnswerQuestion => "answer a question card on",
+            Self::ResolvePermission => "answer a permission card on",
             Self::Continue => "restart the turn on",
             Self::CreateTopThread => "create a top-thread beside",
         }
@@ -108,6 +116,7 @@ impl ThreadReachVerb {
             Self::BringBack => "bringing a change back",
             Self::Revert => "reverting a change",
             Self::AnswerQuestion => "answering a question card",
+            Self::ResolvePermission => "answering a permission card",
             Self::Continue => "restarting a turn",
             Self::CreateTopThread => "creating a top-thread",
         }
@@ -289,6 +298,98 @@ async fn authorize_thread_reach(
     })?;
 
     Ok(reachable)
+}
+
+/// How a follow-up reaches its target, as [`follow_up_reach`] reads it. The
+/// wire spells it `own-child` or `home`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FollowUpReach {
+    /// The target is one of the caller's own direct children.
+    OwnChild,
+    /// The caller is the home thread, and the target is not its child. Its
+    /// reply goes to its own parent, if any, never back to the home thread.
+    Home,
+}
+
+/// May `caller` follow up on a thread whose parent is `target_parent`? `None`
+/// means the target is out of reach.
+///
+/// A thread reaches its own direct children (ADR 0043). The home thread also
+/// reaches every other thread, coding-agent threads included (ADR 0362). No
+/// other thread gains anything, so a sibling stays out of reach.
+pub(crate) async fn follow_up_reach(
+    pool: &sqlx::PgPool,
+    caller: Uuid,
+    target_parent: Option<Uuid>,
+) -> Result<Option<FollowUpReach>, sqlx::Error> {
+    if target_parent == Some(caller) {
+        return Ok(Some(FollowUpReach::OwnChild));
+    }
+    Ok(crate::engine::home_thread::is_home_thread(pool, caller)
+        .await?
+        .then_some(FollowUpReach::Home))
+}
+
+/// Refuse an agent pressing either Always-allow grant on a permission card.
+///
+/// Both widen what every future session may do without asking, so they stay
+/// the owner's, pressed on screen (ADR 0362). No standing instruction lifts
+/// this, and voice withholds them for the same reason (`voice::decision`).
+/// Allow once, this thread's allow and Deny are not affected.
+fn refuse_agent_always_allow(
+    headers: &HeaderMap,
+    persist_scope: Option<crate::engine::claude_code::AllowScope>,
+) -> Result<(), super::error::ApiError> {
+    use crate::engine::claude_code::AllowScope;
+    let widest = matches!(persist_scope, Some(AllowScope::Narrow | AllowScope::Broad));
+    let agent = matches!(
+        crate::api::actor::subprocess_origin(headers),
+        SubprocessOrigin::Subprocess { .. }
+    );
+    if widest && agent {
+        crate::log!("[ThreadReach] Refused: an agent pressed an Always-allow grant");
+        return Err(super::error::ApiError::new(
+            StatusCode::FORBIDDEN,
+            "An agent cannot press Always allow. It widens what every future session \
+             may do without asking, so only the workspace owner grants it, on screen. \
+             Allow once, allow for this thread, or deny instead.",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an agent answering a permission card it has no authority for.
+///
+/// Two checks, the widest grants first. No agent presses Always allow; a
+/// denial carrying a scope grants nothing, so it is not one. Any
+/// other answer is a clause-4 verb on the card's thread, so a caller outside
+/// that thread's subtree needs the owner's standing instruction. The home
+/// thread passes on the owner's words in its turn, like any thread.
+///
+/// `card_thread` is `None` for a card nothing is waiting on, and the route
+/// then answers its own 404.
+pub(in crate::api) async fn refuse_permission_answer(
+    pool: &sqlx::PgPool,
+    headers: &HeaderMap,
+    card_thread: Option<Uuid>,
+    allowed: bool,
+    persist_scope: Option<crate::engine::claude_code::AllowScope>,
+) -> Result<(), super::error::ApiError> {
+    if allowed {
+        refuse_agent_always_allow(headers, persist_scope)?;
+    }
+    let Some(thread) = card_thread else {
+        return Ok(());
+    };
+    refuse_without_authority(
+        pool,
+        headers,
+        Some(thread),
+        ThreadReachVerb::ResolvePermission,
+    )
+    .await
+    .map_err(Into::into)
 }
 
 /// Refuse a clause-4 verb this caller has no authority for.

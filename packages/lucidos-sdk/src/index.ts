@@ -13,6 +13,7 @@ import { capture } from './capture';
 import { proxy } from './proxy';
 import { oauth } from './oauth';
 import { request } from './request';
+import { storage } from './storage';
 
 export const lucidos = {
   configure,
@@ -39,11 +40,15 @@ export const lucidos = {
   utils,
   proxy,
   oauth,
+  // Per-app, per-device storage. An isolated frame's own `localStorage`
+  // throws, so this stands in for it.
+  storage,
   _capture: capture,
 };
 
 export { SdkError };
 export type * from './types';
+export type { StorageFailure } from './storage';
 
 // The engine's answer for which routes an app may reach, and the matcher over
 // it. Runtime values rather than an internal, because the host bridge enforces
@@ -52,6 +57,9 @@ export type * from './types';
 export { appMayCall, appReachableMethods, normalizeSuffix, pathMatchesPattern } from './appReach';
 export { APP_REACHABLE_ROUTES } from './generated/app-reach';
 export { parseAppId } from './scroll';
+// App storage's key layout and limits. The host enforces the same limits the
+// SDK checks, so both read this one copy.
+export * from './appStorage';
 
 // Generated navigation contract (source of truth: the engine `navigate_ui`
 // tool). Exposed as runtime values so the host app can cross-check them against

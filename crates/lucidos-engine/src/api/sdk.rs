@@ -242,6 +242,13 @@ pub(super) async fn ui_navigate(
         )
             .into_response();
     }
+    if let Err(e) = super::resolve_repo_in_nav_payload(&state.pool, &mut payload).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response();
+    }
     let payload = payload;
     log!(
         @sdk,

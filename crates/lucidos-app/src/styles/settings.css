@@ -4,6 +4,7 @@
 @import './settings/workspace-fonts.css';
 @import './settings/accounts.css';
 @import './settings/memory-inspector.css';
+@import './settings/summary-tree-browser.css';
 @import './settings/backup.css';
 @import './settings/directory-picker.css';
 @import './settings/response-style-editor.css';

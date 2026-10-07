@@ -10,7 +10,7 @@
  * The chain must not cost anything the user can see: the optimistic rows still
  * appear instantly, a failed send never blocks the next one, and a POST that
  * never settles releases the chain rather than swallowing every later message
- * (`mutatingFetch` has no client-side timeout).
+ * for the length of `SUBMIT_CHAT_TIMEOUT_MS`.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -75,7 +75,7 @@ vi.mock('./thread-loading', () => ({
 }));
 
 vi.mock('./devices', () => ({
-  getDeviceId: () => 'device-test',
+  getDeviceId: vi.fn(() => 'device-test'),
 }));
 
 vi.mock('../../utils/platform', () => ({
@@ -88,10 +88,14 @@ vi.mock('../../utils/tauri', () => ({
 }));
 
 import { focusedThreadId, threadMap, selectedScope, connectionStatus, panelOverlay } from '../store';
-import { sendMessage, SEND_CHAIN_MAX_WAIT_MS } from './chat';
+import { sendMessage } from './chat';
+import { inSendChain, SEND_CHAIN_MAX_HOLD_MS } from './sendChain';
+import { SEND_RETRY_BACKOFF_MS, SEND_RETRY_DEADLINE_MS } from './sendRetry';
+import { getDeviceId } from './devices';
 import { makeOptimisticThreadState } from '../thread-events';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { submitChat } from '../../api/client';
+import { ApiError, submitChat } from '../../api/client';
+import { SUBMIT_CHAT_TIMEOUT_MS } from '../../api/client/chat';
 import { isTauri } from '../../utils/platform';
 import { getWebviewContent } from '../../utils/tauri';
 
@@ -187,7 +191,7 @@ describe('per-thread send serialization', () => {
     await Promise.all([p1, p2]);
   });
 
-  it('a failed send does not block the next one', async () => {
+  it('a refused send does not block the next one', async () => {
     seedActiveThread(THREAD_A);
     const first = deferred<{ event_id: string }>();
     mockedSubmitChat
@@ -198,10 +202,103 @@ describe('per-thread send serialization', () => {
     const p2 = sendMessage('second', undefined, { threadId: THREAD_A, focus: false });
     await flush();
 
-    first.reject(new TypeError('Failed to fetch'));
+    first.reject(new ApiError(500, 'DB error'));
     await Promise.all([p1, p2]);
 
     expect(sentMessages()).toEqual(['first', 'second']);
+  });
+
+  it('a send that is still retrying holds every later send, so they reach the engine in order', async () => {
+    vi.useFakeTimers();
+    seedActiveThread(THREAD_A);
+    mockedSubmitChat
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockResolvedValueOnce({ event_id: 'e1' })
+      .mockResolvedValue({ event_id: 'e' });
+
+    const sends = ['A', 'B', 'C'].map(m => sendMessage(m, undefined, { threadId: THREAD_A, focus: false }));
+    await vi.advanceTimersByTimeAsync(SEND_RETRY_BACKOFF_MS[0]);
+    expect(sentMessages()).toEqual(['A', 'A']);
+    await vi.advanceTimersByTimeAsync(SEND_RETRY_BACKOFF_MS[1]);
+    await Promise.all(sends);
+
+    expect(sentMessages()).toEqual(['A', 'A', 'A', 'B', 'C']);
+  });
+
+  it('times the safety bound from the earlier send\'s turn, so three sends behind a hung one keep their order', async () => {
+    vi.useFakeTimers();
+    seedActiveThread(THREAD_A);
+    const hung = deferred<{ event_id: string }>();
+    const second = deferred<{ event_id: string }>();
+    mockedSubmitChat
+      .mockReturnValueOnce(hung.promise)
+      .mockReturnValueOnce(second.promise)
+      .mockResolvedValueOnce({ event_id: 'e3' });
+
+    void sendMessage('A', undefined, { threadId: THREAD_A, focus: false });
+    void sendMessage('B', undefined, { threadId: THREAD_A, focus: false });
+    const p3 = sendMessage('C', undefined, { threadId: THREAD_A, focus: false });
+    await vi.advanceTimersByTimeAsync(SEND_CHAIN_MAX_HOLD_MS + 1);
+    // B's own turn has only just come, so C still waits on B.
+    expect(sentMessages()).toEqual(['A', 'B']);
+
+    second.resolve({ event_id: 'e2' });
+    await p3;
+    expect(sentMessages()).toEqual(['A', 'B', 'C']);
+  });
+
+  it('bounds the hold by the longest a send can legitimately take', () => {
+    expect(SEND_CHAIN_MAX_HOLD_MS).toBeGreaterThan(SEND_RETRY_DEADLINE_MS + SUBMIT_CHAT_TIMEOUT_MS);
+  });
+
+  it('a send that throws before its POST frees the slot at once', async () => {
+    seedActiveThread(THREAD_A);
+    mockedSubmitChat.mockResolvedValue({ event_id: 'e' });
+    vi.mocked(getDeviceId).mockImplementationOnce(() => { throw new Error('boom'); });
+
+    await expect(sendMessage('broken', undefined, { threadId: THREAD_A, focus: false })).rejects.toThrow('boom');
+    // Its row goes too: no sweep will come for it.
+    expect(threadMap.value.get(THREAD_A)!.pendingUserMessages.map(m => m.text)).toEqual([]);
+    const p = sendMessage('next', undefined, { threadId: THREAD_A, focus: false });
+    await flush();
+    expect(sentMessages()).toEqual(['next']);
+    await p;
+  });
+
+  it('a send that throws while an earlier one retries still keeps later sends behind that one', async () => {
+    vi.useFakeTimers();
+    seedActiveThread(THREAD_A);
+    mockedSubmitChat
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockResolvedValue({ event_id: 'e' });
+
+    const first = sendMessage('A', undefined, { threadId: THREAD_A, focus: false });
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(getDeviceId).mockImplementationOnce(() => { throw new Error('boom'); });
+    await expect(sendMessage('broken', undefined, { threadId: THREAD_A, focus: false })).rejects.toThrow('boom');
+    const later = sendMessage('C', undefined, { threadId: THREAD_A, focus: false });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sentMessages()).toEqual(['A']);
+
+    await vi.advanceTimersByTimeAsync(SEND_RETRY_BACKOFF_MS[0]);
+    await Promise.all([first, later]);
+    expect(sentMessages()).toEqual(['A', 'A', 'C']);
+  });
+
+  it('a message sent after an answer to a question card waits for the answer', async () => {
+    seedActiveThread(THREAD_A);
+    const answer = deferred<boolean>();
+    mockedSubmitChat.mockResolvedValue({ event_id: 'e' });
+
+    const answering = inSendChain(THREAD_A, () => answer.promise);
+    const p = sendMessage('after the tap', undefined, { threadId: THREAD_A, focus: false });
+    await flush();
+    expect(sentMessages()).toEqual([]);
+
+    answer.resolve(true);
+    await Promise.all([answering, p]);
+    expect(sentMessages()).toEqual(['after the tap']);
   });
 
   it('releases the chain when a POST never settles, so later messages still go out', async () => {
@@ -214,7 +311,7 @@ describe('per-thread send serialization', () => {
 
     void sendMessage('first', undefined, { threadId: THREAD_A, focus: false });
     const p2 = sendMessage('second', undefined, { threadId: THREAD_A, focus: false });
-    await vi.advanceTimersByTimeAsync(SEND_CHAIN_MAX_WAIT_MS - 1);
+    await vi.advanceTimersByTimeAsync(SEND_CHAIN_MAX_HOLD_MS - 1);
     expect(sentMessages()).toEqual(['first']);
 
     await vi.advanceTimersByTimeAsync(2);

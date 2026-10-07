@@ -3,13 +3,13 @@ import type { ComponentType, VNode } from 'preact';
 import { useRef, useEffect } from 'preact/hooks';
 import {
   threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, CODING_AGENT_CHANNEL,
-  drawerView, setDrawerView, attentionThreadCount, reviewThreadCount, runningThreadCount,
+  drawerView, setDrawerView, attentionThreadCount, reviewThreadCount,
   type DrawerView, type ThreadChannel,
   includeDeletedFilterOptions, setIncludeDeletedFilterOptions,
 } from '../../store/store';
 import { threadFilterActive, deletedOptionsHidden } from '../../store/threadFilterActive';
-import { draftThreadCount } from '../drawer/family-graph';
-import { DraftsIcon, AttentionIcon, ReviewIcon, RunningIcon, FilterIcon, FilteredIcon, CheckIcon, CodeIcon, StatusIcon, ThreadTypesIcon } from '../shared/icons';
+import { draftThreadCount, inFlightThreadCount } from '../drawer/family-graph';
+import { DraftsIcon, AttentionIcon, ReviewIcon, InFlightIcon, FilterIcon, FilteredIcon, CheckIcon, CodeIcon, StatusIcon, ThreadTypesIcon } from '../shared/icons';
 import { LucidosMark } from '../shared/LucidosMark';
 import { Explainer } from '../shared/Explainer';
 import { Disclosure } from '../shared/Disclosure';
@@ -19,6 +19,7 @@ import { toggleChannel, triggerFilterOptions, toggleTriggerId, toggleTriggerChan
 import { repoFilterOptions, toggleRepoId, toggleCodingAgentChannel, type RepoFilterOption } from '../../store/repoFilters';
 import { appFilterOptions, toggleAppId, type AppFilterOption } from '../../store/appFilters';
 import { formatShortDateWithYear } from '../../utils/formatTime';
+import { GlyphBadge } from '../shared/GlyphBadge';
 
 /** Children rendered under an expanded parent share the same shape — all
  *  child options carry id/label/deleted/lastActivity. */
@@ -52,7 +53,7 @@ const ALL_STATUSES_META: ViewMeta = { view: 'all', label: 'All statuses', Icon: 
 const VIEW_META: readonly ViewMeta<StatusView>[] = [
   { view: 'attention', label: 'Needs attention', Icon: AttentionIcon },
   { view: 'review', label: 'Review', Icon: ReviewIcon },
-  { view: 'running', label: 'Running', Icon: RunningIcon },
+  { view: 'in-flight', label: 'In flight', Icon: InFlightIcon },
   { view: 'drafts', label: 'Drafts', Icon: DraftsIcon },
 ];
 
@@ -70,7 +71,7 @@ export const FILTER_BUTTON_GLYPHS: Readonly<Record<FilterGlyph, IconType>> = {
   filtered: FilteredIcon,
   attention: statusIcon('attention'),
   review: statusIcon('review'),
-  running: statusIcon('running'),
+  'in-flight': statusIcon('in-flight'),
   drafts: statusIcon('drafts'),
 };
 
@@ -131,7 +132,7 @@ function channelIcon(value: ThreadChannel): VNode {
 
 /** The unified thread filter: one panel, one single-select set of five, split by
  *  an "or" rule. Above it the four real **statuses** (Needs attention / Review /
- *  Running / Drafts); below it **All statuses**, then the multi-select channel
+ *  In flight / Drafts); below it **All statuses**, then the multi-select channel
  *  rows under a **By thread types** heading.
  *
  *  Those channel rows are NOT a sixth option. They narrow "All statuses" rather
@@ -186,7 +187,7 @@ export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
     all: 0,
     attention: attentionThreadCount.value,
     review: reviewThreadCount.value,
-    running: runningThreadCount.value,
+    'in-flight': inFlightThreadCount.value,
     drafts: draftThreadCount.value,
   };
   // Channels apply only in the default `all` view: the alternate views bypass
@@ -273,7 +274,7 @@ export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
                 the other views show a plain muted number. The count is pinned to
                 the row's trailing edge (CSS `margin-left:auto`), past the marker. */}
             {count > 0 && (
-              <span class={`drawer-view-count${v === 'attention' ? ' badge' : ''}`}>{count}</span>
+              <GlyphBadge class={`drawer-view-count${v === 'attention' ? ' badge' : ''}`}>{count}</GlyphBadge>
             )}
           </button>
         );

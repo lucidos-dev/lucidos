@@ -39,7 +39,8 @@ import { fileURLToPath } from 'node:url';
 import { dispatchEscape, classifyChord, dispatchForwardedChord, dispatchPreviewIframeShortcut, shouldTypeToFocusPrompt, isMacTextEditingKey } from './useKeyboardShortcuts';
 import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
-import { focusedPane, focusedThreadId, splitRatio, searchEverywhereAnchor, searchEverywhereOpen } from '../store/store';
+import { focusedPane, focusedThreadId, panelOverlay, splitRatio, searchEverywhereAnchor, searchEverywhereOpen, threadMap } from '../store/store';
+import { makeThreadState } from '../store/__tests__/thread-events-helpers';
 import { openHighlightedThreadActions } from '../components/drawer/ThreadDrawer';
 import { openThreadTitleMenu } from '../components/chat/ThreadTitle';
 import { promptStopRequested, promptSideQuestionRequested } from '../components/chat/prompt-input-helpers';
@@ -233,6 +234,44 @@ describe('classifyChord (host keydowns, app-frame forwards, the PDF preview)', (
     expect(classifyChord(chord({ shiftKey: true, key: 'Escape' }))).toBe('focusComposer');
   });
 
+  it('claims Mod+F for find only where the focused pane can be searched', () => {
+    const modF = chord({ metaKey: true, key: 'f' });
+    const app = { type: 'app-ui', app: { id: 'habit-tracker' } } as unknown as typeof panelOverlay.value;
+    focusedPane.value = 'content';
+    panelOverlay.value = null;
+    expect(classifyChord(modF), 'a settings page has nothing to find').toBeNull();
+    panelOverlay.value = { type: 'file-preview', path: 'artifacts/photo.png' };
+    expect(classifyChord(modF), 'nor does a picture').toBeNull();
+    panelOverlay.value = { type: 'file-preview', path: 'artifacts/notes.md' };
+    expect(classifyChord(modF)).toBe('findInView');
+    panelOverlay.value = app;
+    expect(classifyChord(modF)).toBe('findInView');
+    focusedPane.value = 'drawer';
+    expect(classifyChord(modF), 'the drawer has no find bar').toBeNull();
+    expect(classifyChord(modF, true), 'a keydown from a content frame judges the content pane').toBe('findInView');
+    panelOverlay.value = { type: 'file-preview', path: 'artifacts/report.pdf' };
+    expect(classifyChord(modF, true), 'the PDF preview keeps its own find').toBeNull();
+    panelOverlay.value = null;
+    focusedPane.value = 'thread';
+  });
+
+  it('claims Mod+F for the transcript with the thread pane focused, never on a draft or under a modal', () => {
+    const modF = chord({ metaKey: true, key: 'f' });
+    const sent = makeThreadState(new Map());
+    const draft = { ...makeThreadState(new Map()), meta: { ...sent.meta, id: 'draft-1', state: 'composing' as const } };
+    threadMap.value = new Map([[sent.meta.id, sent], ['draft-1', draft]]);
+    focusedPane.value = 'thread';
+    focusedThreadId.value = sent.meta.id;
+    expect(classifyChord(modF)).toBe('findInView');
+    focusedThreadId.value = 'draft-1';
+    expect(classifyChord(modF), 'a draft has no transcript').toBeNull();
+    focusedThreadId.value = sent.meta.id;
+    pushOverlay({ id: 'modal', dismiss: vi.fn(), hasPanel: true });
+    expect(classifyChord(modF), 'a modal covers the pane behind it').toBeNull();
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+  });
+
   it('gives Shift+Escape to the Escape policy while an overlay is open, so one press does one thing', () => {
     pushOverlay({ id: 'm', dismiss: vi.fn(), hasPanel: true });
     expect(classifyChord(chord({ shiftKey: true, key: 'Escape' }))).toBe('escape');
@@ -320,6 +359,23 @@ describe('isMacTextEditingKey', () => {
   it('leaves a shifted chord to the shortcut, since the Mac shows those as ⌃⇧', () => {
     vi.mocked(isTextInput).mockReturnValue(true);
     expect(isMacTextEditingKey({ ...ctrlK, shiftKey: true, key: 'O' }, true)).toBe(false);
+  });
+
+  const optUp = { metaKey: false, ctrlKey: false, shiftKey: false, altKey: true, key: 'ArrowUp', target: null };
+
+  it('leaves Option+Arrow to a Mac text field, where it moves the caret by paragraph or word', () => {
+    vi.mocked(isTextInput).mockReturnValue(true);
+    for (const key of ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) {
+      expect(isMacTextEditingKey({ ...optUp, key }, true)).toBe(true);
+    }
+  });
+
+  it('lets an Option+Arrow shortcut have it outside a field, off a Mac, or with ⌘ held', () => {
+    vi.mocked(isTextInput).mockReturnValue(false);
+    expect(isMacTextEditingKey(optUp, true)).toBe(false);
+    vi.mocked(isTextInput).mockReturnValue(true);
+    expect(isMacTextEditingKey(optUp, false)).toBe(false);
+    expect(isMacTextEditingKey({ ...optUp, metaKey: true }, true)).toBe(false);
   });
 });
 

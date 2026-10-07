@@ -4,7 +4,6 @@ use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::PreferenceStore;
 use crate::llm::vertex::{LocationHandle, TokenCache};
 
 /// Image size presets that map to provider-specific dimensions.
@@ -52,11 +51,13 @@ pub trait ImageProvider: Send + Sync {
     /// - `prompt`: text describing what to generate or how to edit
     /// - `input_images`: optional existing images to edit (as raw bytes)
     /// - `size`: desired output size
+    /// - `call`: from the model call service, which records the call
     async fn generate(
         &self,
         prompt: &str,
         input_images: Vec<Vec<u8>>,
         size: ImageSize,
+        call: crate::llm::metered::CallToken,
     ) -> Result<ImageResult, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Whether this provider supports multiple input images for editing.
@@ -177,6 +178,7 @@ impl ImageProvider for OpenAiImageProvider {
         prompt: &str,
         input_images: Vec<Vec<u8>>,
         size: ImageSize,
+        _call: crate::llm::metered::CallToken,
     ) -> Result<ImageResult, Box<dyn std::error::Error + Send + Sync>> {
         let size_str = Self::openai_size(size);
 
@@ -288,6 +290,7 @@ impl ImageProvider for VertexImagenProvider {
         prompt: &str,
         input_images: Vec<Vec<u8>>,
         size: ImageSize,
+        _call: crate::llm::metered::CallToken,
     ) -> Result<ImageResult, Box<dyn std::error::Error + Send + Sync>> {
         let token = self.get_access_token().await?;
         let aspect_ratio = Self::imagen_aspect_ratio(size);
@@ -386,13 +389,8 @@ pub async fn build_image_provider(
     vertex_location: &LocationHandle,
     vertex_token_cache: &Option<TokenCache>,
 ) -> Option<Arc<dyn ImageProvider>> {
-    let pref = PreferenceStore::get(pool, crate::core::PREF_IMAGE_MODEL)
-        .await
-        .unwrap_or_else(|e| {
-            crate::log!("[Image] Failed to read image_model preference: {}", e);
-            None
-        });
-    let model = pref.as_deref().unwrap_or("auto");
+    let model = crate::core::prefs::IMAGE_MODEL.read(pool).await;
+    let model = model.as_str();
 
     let build_imagen = || -> Option<Arc<dyn ImageProvider>> {
         let tc = vertex_token_cache
@@ -557,18 +555,26 @@ mod tests {
         let project_id = "test-project";
         let api_key = Some("sk-test");
 
-        crate::test_support::seed_preference(&pool, crate::core::PREF_IMAGE_MODEL, "imagen-4")
-            .await
-            .unwrap();
+        crate::test_support::seed_preference(
+            &pool,
+            crate::core::prefs::IMAGE_MODEL.key(),
+            "imagen-4",
+        )
+        .await
+        .unwrap();
         let p1 = build_image_provider(&pool, api_key, project_id, &location, &token_cache).await;
         assert_eq!(
             p1.expect("provider should be built").name(),
             "Vertex AI Imagen 4"
         );
 
-        crate::test_support::seed_preference(&pool, crate::core::PREF_IMAGE_MODEL, "gpt-image-2")
-            .await
-            .unwrap();
+        crate::test_support::seed_preference(
+            &pool,
+            crate::core::prefs::IMAGE_MODEL.key(),
+            "gpt-image-2",
+        )
+        .await
+        .unwrap();
         let p2 = build_image_provider(&pool, api_key, project_id, &location, &token_cache).await;
         assert_eq!(
             p2.expect("provider should be built").name(),

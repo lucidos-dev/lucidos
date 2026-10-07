@@ -1,6 +1,6 @@
 # 0124: A new thread carries no cross-thread conversation history
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by [ADR 0362](0362-tree-memory-module-and-the-home-thread.md): its cross-thread clause, for the Tree memory module
 - **Date**: 2026-08-25
 
 Record: `docs/plans/2026-08-25-a-new-thread-starts-clean-and-the-summariser-goes-async.md`.

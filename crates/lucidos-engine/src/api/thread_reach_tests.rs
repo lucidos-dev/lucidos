@@ -25,6 +25,7 @@ const EVERY_VERB: &[ThreadReachVerb] = &[
     ThreadReachVerb::BringBack,
     ThreadReachVerb::Revert,
     ThreadReachVerb::AnswerQuestion,
+    ThreadReachVerb::ResolvePermission,
     ThreadReachVerb::Continue,
     ThreadReachVerb::CreateTopThread,
 ];
@@ -36,6 +37,9 @@ const EVERY_VERB: &[ThreadReachVerb] = &[
 /// Hand-written, which is its weakness: a route added elsewhere is invisible
 /// here until somebody adds the row, and that is how arming an apply shipped
 /// ungated. Review a new change route against this list.
+///
+/// The three permission consent routes are here too: answering a card is a
+/// clause-4 verb on the card's thread.
 ///
 /// Deliberately absent: an agent's archive (`archive_thread_as_caller`'s token
 /// branch, `execute_archive_thread`). It applies a narrower ladder, the caller
@@ -56,7 +60,19 @@ const GATED_HANDLERS: &[(&str, &str, &str)] = &[
     ("disk_usage.rs", DISK_USAGE_RS, "cleanup_worktree"),
     ("threads/actions.rs", ACTIONS_RS, "answer_thread_question"),
     ("threads/actions.rs", ACTIONS_RS, "continue_thread"),
+    ("threads/actions.rs", ACTIONS_RS, "cancel_thread_event_wait"),
     ("threads/archive.rs", ARCHIVE_RS, "archive_thread"),
+    (
+        "command_permission.rs",
+        COMMAND_PERMISSION_RS,
+        "submit_command_consent",
+    ),
+    (
+        "mcp_permission.rs",
+        MCP_PERMISSION_RS,
+        "submit_mcp_permission_consent",
+    ),
+    ("mcp.rs", MCP_RS, "submit_mcp_consent"),
     ("changes.rs", CHANGES_RS, "arm_standing_apply"),
     ("changes.rs", CHANGES_RS, "disarm_standing_apply"),
     ("changes.rs", CHANGES_RS, "disarm_all_standing_applies"),
@@ -85,6 +101,10 @@ const DISK_USAGE_RS: &str = include_str!("disk_usage.rs");
 const ACTIONS_RS: &str = include_str!("threads/actions.rs");
 const ARCHIVE_RS: &str = include_str!("threads/archive.rs");
 const TOOLS_RS: &str = include_str!("../engine/tools/mod.rs");
+const COMMAND_PERMISSION_RS: &str = include_str!("command_permission.rs");
+const MCP_PERMISSION_RS: &str = include_str!("mcp_permission.rs");
+const MCP_RS: &str = include_str!("mcp.rs");
+const THREAD_REACH_RS: &str = include_str!("thread_reach.rs");
 
 /// The gate under any of its names: the header form a route asks, the
 /// thread form an in-process tool asks, and the three local wrappers. Each
@@ -96,6 +116,7 @@ const GATE_CALLS: &[&str] = &[
     "refuse_change_verb",
     "refuse_batch_change_verb",
     "refuse_tool_without_authority",
+    "refuse_permission_answer",
 ];
 
 /// The plan's own verification for "the standing instruction has exactly one
@@ -126,6 +147,11 @@ fn every_clause_4_route_asks_the_gate() {
             TOOLS_RS,
             "refuse_tool_without_authority",
             "refuse_thread_without_authority",
+        ),
+        (
+            THREAD_REACH_RS,
+            "refuse_permission_answer",
+            "refuse_without_authority",
         ),
     ] {
         let body =
@@ -769,6 +795,185 @@ async fn a_forged_token_does_not_authenticate_as_the_thread_it_names() {
         SubprocessOrigin::NotSubprocess,
         "a spliced prefix must not authenticate as the thread it names"
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+// ── The home thread (ADR 0362) ────────────────────────────────────────────
+//
+// Invariant I11: reach widens for the home thread, and authority does not.
+
+/// The home thread follows up any thread: its own child, a sibling family's
+/// root, and a sub-thread deep in somebody else's family. Any other thread
+/// still reaches its direct children only.
+#[tokio::test]
+async fn the_home_thread_follows_up_any_thread_and_a_sibling_does_not() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let f = family(&pool).await;
+    let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+    let home_child = Uuid::new_v4();
+    seed_thread(&bus, home_child, Some(home)).await;
+
+    let reach = |caller, parent| follow_up_reach(&pool, caller, parent);
+    assert_eq!(
+        reach(home, Some(home)).await.unwrap(),
+        Some(FollowUpReach::OwnChild)
+    );
+    for parent in [None, Some(f.root), Some(f.child)] {
+        assert_eq!(
+            reach(home, parent).await.unwrap(),
+            Some(FollowUpReach::Home)
+        );
+    }
+    assert_eq!(
+        reach(f.child, Some(f.child)).await.unwrap(),
+        Some(FollowUpReach::OwnChild)
+    );
+    assert_eq!(reach(f.child, Some(f.root)).await.unwrap(), None);
+    assert_eq!(reach(f.sibling, Some(home)).await.unwrap(), None);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The home thread presses an owner button outside its own subtree only on a
+/// standing instruction. A turn nobody's device opened refuses every verb,
+/// and a turn the owner opened allows them, exactly as for any thread.
+#[tokio::test]
+async fn the_home_thread_gains_reach_but_not_authority() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let f = family(&pool).await;
+    let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+    let headers = agent_headers(Some(home));
+
+    seed_thread_opened_by(&bus, home, None, None).await;
+    for verb in EVERY_VERB {
+        let Err(err) = refuse_without_authority(&pool, &headers, Some(f.sibling), *verb).await
+        else {
+            panic!("{verb:?} must refuse with no owner words in the turn");
+        };
+        assert_eq!(err.status_code(), StatusCode::FORBIDDEN, "{verb:?}");
+    }
+
+    seed_thread_opened_by(&bus, home, None, Some(owner_device())).await;
+    for verb in EVERY_VERB {
+        assert!(
+            refuse_without_authority(&pool, &headers, Some(f.sibling), *verb)
+                .await
+                .is_ok(),
+            "{verb:?} rides the owner's words in this turn"
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// No agent presses either Always-allow grant, whatever thread it runs in and
+/// whoever opened its turn. The owner's device still does, and an agent keeps
+/// the three narrower answers.
+#[test]
+fn an_agent_never_presses_an_always_allow_grant() {
+    use crate::engine::claude_code::AllowScope;
+    let agent = agent_headers(Some(Uuid::new_v4()));
+    for scope in [AllowScope::Narrow, AllowScope::Broad] {
+        let err = refuse_agent_always_allow(&agent, Some(scope)).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{scope:?}");
+        assert!(refuse_agent_always_allow(&device_headers(), Some(scope)).is_ok());
+    }
+    for scope in [None, Some(AllowScope::Session)] {
+        assert!(
+            refuse_agent_always_allow(&agent, scope).is_ok(),
+            "{scope:?}"
+        );
+    }
+}
+
+/// All three consent routes ask the permission gate before resolving, so a
+/// refusal answers no card.
+#[test]
+fn every_consent_route_asks_the_gate_before_it_answers() {
+    for (path, source, handler) in [
+        (
+            "command_permission.rs",
+            include_str!("command_permission.rs"),
+            "submit_command_consent",
+        ),
+        (
+            "mcp_permission.rs",
+            include_str!("mcp_permission.rs"),
+            "submit_mcp_permission_consent",
+        ),
+        ("mcp.rs", include_str!("mcp.rs"), "submit_mcp_consent"),
+    ] {
+        let body = handler_body(source, handler)
+            .unwrap_or_else(|| panic!("{path}: no handler named {handler}"));
+        let gate = body
+            .find("refuse_permission_answer")
+            .unwrap_or_else(|| panic!("{path}: {handler} never asks the gate"));
+        let resolve = body.find("resolve_").expect("the handler resolves a card");
+        assert!(
+            gate < resolve,
+            "{path}: the gate must run before the card resolves"
+        );
+    }
+}
+
+/// Answering a permission card is a clause-4 verb on the card's thread. Inside
+/// its own subtree an agent answers on its own authority. Outside it, even the
+/// home thread needs the owner's words in this turn. The user's device always
+/// answers, and no agent ever presses Always allow.
+#[tokio::test]
+async fn a_permission_answer_outside_the_subtree_needs_the_owners_words() {
+    use crate::engine::claude_code::AllowScope;
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let f = family(&pool).await;
+    let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+    let answer = |headers: HeaderMap, card: Uuid, scope: Option<AllowScope>| {
+        let pool = pool.clone();
+        async move { refuse_permission_answer(&pool, &headers, Some(card), true, scope).await }
+    };
+
+    let child = agent_headers(Some(f.child));
+    assert!(answer(child.clone(), f.grandchild, None).await.is_ok());
+    let err = answer(child, f.sibling, None).await.unwrap_err();
+    assert_eq!(err.status, StatusCode::FORBIDDEN);
+    assert!(answer(device_headers(), f.sibling, Some(AllowScope::Broad))
+        .await
+        .is_ok());
+
+    seed_thread_opened_by(&bus, home, None, None).await;
+    let from_home = agent_headers(Some(home));
+    assert!(
+        answer(from_home.clone(), f.sibling, Some(AllowScope::Session))
+            .await
+            .is_err()
+    );
+
+    seed_thread_opened_by(&bus, home, None, Some(owner_device())).await;
+    assert!(
+        answer(from_home.clone(), f.sibling, Some(AllowScope::Session))
+            .await
+            .is_ok()
+    );
+    let err = answer(from_home.clone(), f.sibling, Some(AllowScope::Narrow))
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::FORBIDDEN);
+    // A denial carrying a scope grants nothing, so it is not an Always allow.
+    assert!(refuse_permission_answer(
+        &pool,
+        &from_home,
+        Some(f.sibling),
+        false,
+        Some(AllowScope::Narrow)
+    )
+    .await
+    .is_ok());
 
     pool.close().await;
     teardown_test_db(&db_name).await;

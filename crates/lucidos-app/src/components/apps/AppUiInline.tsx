@@ -16,6 +16,8 @@ import { IframeTabExit } from '../shared/IframeTabExit';
 import { APP_FRAME_READY_EVENT } from '../../store/actions/app-ready-bridge';
 import type { AppReveal } from '../../store/types';
 import { appFrameLoading, appFrameRevealed, liveAppReveal, revealFuseMs } from './appFrameReveal';
+import { FindBar } from '../shared/FindBar';
+import { rerunFindOn } from '../../store/actions/find-bar';
 
 /** The load cover's CSS opacity transition at 1x (var(--duration-normal)). The
  *  cover lingers for this, scaled by the Animation speed slider, plus fixed
@@ -160,6 +162,7 @@ function AppFrame({ src, reveal }: { src: string; reveal: AppReveal }) {
           setLoaded(true);
           pushKeybindingsToFrame(e.currentTarget as HTMLIFrameElement);
           pushAppearanceToFrame(e.currentTarget as HTMLIFrameElement);
+          void rerunFindOn('content');
         }}
       />
       <IframeTabExit />
@@ -241,7 +244,7 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
   return (
     <div
       data-role="app-ui-panel"
-      class={`app-ui-inline${isPseudo ? ' app-ui-fullscreen' : ''}`}
+      class={`app-ui-inline content-view-full-bleed${isPseudo ? ' app-ui-fullscreen' : ''}`}
     >
       {isPseudo && (
         <>
@@ -258,6 +261,7 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
           {layout === 'mobile' && <EdgeSwipeZones />}
         </>
       )}
+      <FindBar surface="content" scope={`app:${app.id}`} placeholder="Find in app" />
       {frameSrc && (
         <AppFrame key={`${refreshKey}:${splitFrameSrc(frameSrc).doc}`} src={frameSrc} reveal={reveal} />
       )}

@@ -173,3 +173,67 @@ and holds nothing (`followSideQuestion`, `landOnStart`). Every submit to the
 agent still rests on the live edge. The reader chose this for side questions:
 "scroll down to the message start". Plan:
 `docs/plans/2026-09-28-side-question-sits-inside-its-turn.md`.
+
+## Amendment: a card submit lands once confirmed
+
+An answer to a question card and a decision on a permission card move nobody
+on the tap. The picked button spins until the engine confirms the submit, and
+the reader asked for the scroll to wait for that. The landing then runs as
+above. A reader who scrolls during the wait keeps their place, and a submit
+the engine never confirms moves nobody (`followCardOnceConfirmed`,
+`followConfirmedCard`).
+
+**Only the reader's own scroll cancels a landing.** A move with no gesture
+or placement behind it is the platform's and cancels nothing. The wait made
+this matter: a phone answer closes the keyboard during the round trip, and
+WebKit moves the offset. Read as the reader, that cancelled every phone
+answer's landing.
+
+**A new question card ends the hold too.** A coding agent asks several
+questions as one tool call, and Lucidos shows them one card at a time. Each
+card opens a turn of its own, so the hold on the answered card never sees it
+drawn. The agent's Thinking row lands in the answered card's turn first, a few
+milliseconds ahead. That row ended the hold, so the next card rendered below a
+reader already at rest.
+
+Now a fresh question card ends the hold as a drawn row does. A card arriving
+within a second after the hold ends still lands the reader (`landOnNextCard`).
+Later than that it is the card arriving, which moves nobody (ADR 0064).
+
+## Amendment: the hold waits for the agent's reply
+
+Two rules let a slow agent's reply land under the composer. A coding agent
+resuming after an answer on a cold cache took 7 to 14 seconds to write.
+
+**A Thinking row does not end the hold.** An answer resumes the agent with one
+at once. It shows the agent holding control, not anything it wrote. Counted, it
+ended the hold within milliseconds, and the reply arrived below a reader at
+rest. The row carries `data-thinking-row`, and `DRAWN_ROW_SELECTOR` skips it.
+The hold still re-aims on the growth the row causes, so the row stays in view.
+
+**The wait for the agent gets its own deadline, one minute.** It shared the
+eight-second round-trip budget, so with the step log off the hold lapsed before
+the reply came. The confirm wait and a cancel's one-shot keep that budget. A
+longer hold costs little. A turn that draws nothing grows little, and the
+reader's own scroll still ends the hold at once.
+
+**A tap's focus is no placement.** Tapping an option focuses it, and focus
+inside the transcript marked a reveal even when the browser revealed nothing.
+On a phone the composer shrinks right after an answer, and the clamp that
+follows landed inside that mark's window. It read as the reader placing
+themselves and cancelled the landing before the confirm. Only a focus on a
+control not wholly in view is marked now.
+
+## Amendment: a typed answer lands at once
+
+A typed answer is the exception to the confirm wait. A picked option spins
+where the reader tapped it, so the wait hides nothing. A typed answer spins on
+the "Your answer" label under the options, often below the fold, so the reader
+waited without seeing anything. When the confirm took longer than the
+eight-second budget, the landing lapsed. Neither the answer nor the agent line
+came into view.
+
+So a typed answer lands like a send (`followSentMessage`). It shows the answer
+and its spinner at once, then holds on the live edge until the agent's first
+row, on the one-minute deadline. The confirm plays no part. The reader asked for
+both steps: the typed answer and its spinner first, then the agent line.

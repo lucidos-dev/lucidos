@@ -5,11 +5,8 @@ description: Use when a logged-in site has no usable public API and the user wan
 
 # Deriving an API from a site
 
-A modern web app talks to its own backend in JSON. Drive the site once, watch
-what it calls, and turn that into a proxy entry the whole workspace can reuse.
-
-The payoff is that one derivation lights up three surfaces at once, with no
-further work:
+A web app talks to its own backend in JSON. Drive the site once, watch what it
+calls, and turn that into a proxy entry the whole workspace can reuse:
 
 - **Chat**: `proxy_request` reaches it immediately.
 - **A custom app**: `lucidos.proxy(<name>).fetch(path)`, with the credential
@@ -25,12 +22,11 @@ Two artifacts. **Both, or the derivation failed.**
 | A `data/config/apis.json` entry | base URL, auth pipeline, credential *reference* | the engine, per request |
 | `data/knowhow/<name>-api.md` | the endpoint catalog | the LLM, when reasoning |
 
-The entry alone is useless. It is pure transport, so chat would know a proxy
-exists and nothing about what to call. The catalog alone is equally useless,
-because nothing can authenticate. Ship both.
+The entry is pure transport: without the catalog, chat knows a proxy exists
+but not what to call. Without the entry, nothing can authenticate.
 
-The secret is a third thing and it lives in neither file. Take it with
-`request_credential` and reference it by name.
+The secret lives in neither file. Take it with `request_credential` and
+reference it by name.
 
 ## Before you start
 
@@ -38,15 +34,15 @@ The secret is a third thing and it lives in neither file. Take it with
 answers with a CAPTCHA or a bot wall, stop and tell the user. Do not try to
 defeat it. `browser_open` already reports that case.
 
-**Capture only on the site the user named.** Interception is explicit and
-scoped to one operation. Never leave it installed while the user browses
-elsewhere, and never run it as a background recorder. That boundary is ADR
-0067: data the user did not choose to share is not ours to collect.
+**Capture only on the site the user named,** for one operation. Never leave the
+interceptor installed while the user browses elsewhere, and never run it as a
+background recorder. ADR 0067: data the user did not choose to share is not
+ours to collect.
 
 ## Step 1: open the site and let the user log in
 
 Call `browser_open` with `visible=true` so the user can authenticate. Their
-session then persists in the browser profile.
+session persists in the browser profile.
 
 ## Step 2: install the interceptor
 
@@ -111,30 +107,29 @@ calls on `window.__lucidosCapture`.
 })()
 ```
 
-Four limits, and you must plan around them:
+Plan around four limits:
 
 - **A navigation wipes it.** A full page load builds a fresh JS context, so
   re-install after every one.
-- **The calls made during page load are unreachable.** Do not try to catch them
-  by reloading: that wipes the interceptor, so you capture nothing. Drive the
-  app by clicking within it instead, which keeps the context alive.
-- **`HttpOnly` cookies are invisible to it.** That is the browser's design, and
-  it is how most session-authed sites hold a login. See "When the auth is a
-  cookie" below.
+- **The calls made during page load are unreachable.** Reloading wipes the
+  interceptor, so you capture nothing. Drive the app by clicking within it,
+  which keeps the context alive.
+- **`HttpOnly` cookies are invisible to it,** by browser design, and most
+  session-authed sites hold a login that way. See "When the auth is a cookie"
+  below.
 - **It sees only what the page itself calls.** A service worker or a
   same-origin iframe may bypass the patched functions.
 
 ## Step 3: drive the operation once
 
 Perform the single operation the user wants: run the search, load the feed,
-open the report. Keep it to one operation, because a focused capture derives a
-clean catalog.
+open the report. A focused capture derives a clean catalog.
 
 ## Step 4: read the capture back, redacted
 
-**Never serialize the raw buffer into a tool result.** A tool result is written
-to the transcript, and the buffer holds live bearer tokens. Redact in the page
-first, so only the shape crosses the boundary:
+**Never serialize the raw buffer into a tool result.** Tool results go to the
+transcript, and the buffer holds live bearer tokens. Redact in the page first,
+so only the shape crosses the boundary:
 
 ```js
 (function () {
@@ -186,20 +181,17 @@ first, so only the shape crosses the boundary:
 })()
 ```
 
-Three things are redacted, and each is a real leak otherwise:
+Each redaction closes a real leak:
 
-- **The auth header** becomes a scheme, a length and a JWT flag. That is all you
-  need to classify it. The value reaches the credential store through
-  `request_credential`, where the user pastes it themselves.
-- **The URL** gets its secret-looking query params masked. A `query_param`
-  credential is a supported auth shape, so the key can sit in the URL. Ordinary
-  params like `page` survive, because the catalog needs them.
+- **The auth header** becomes a scheme, a length and a JWT flag, enough to
+  classify it. The user pastes the value into `request_credential` themselves.
+- **The URL** gets its secret-looking query params masked, since a
+  `query_param` credential sits in the URL. Ordinary params like `page` survive
+  for the catalog.
 - **Both bodies** become field names and types, never values. A login POST body
-  holds a password, and a response body holds the user's own rows.
-
-A type tree is what the catalog needs anyway. Strings report a length rather
-than content, and call out an ISO date or a UUID, since a caller needs the
-format.
+  holds a password, and a response body holds the user's own rows. Strings
+  report a length, and flag an ISO date or a UUID because a caller needs the
+  format.
 
 ## Step 5: group the calls into endpoints
 
@@ -210,13 +202,13 @@ format.
    id, a UUID, or a long hex string becomes `{id}`.
 4. Keep exactly one example per method and collapsed path.
 
-So four calls to `/api/users/8813/posts`, `/api/users/9021/posts` and two
-siblings collapse to one entry: `GET /api/users/{id}/posts`.
+So `/api/users/8813/posts`, `/api/users/9021/posts` and two siblings collapse
+to one entry: `GET /api/users/{id}/posts`.
 
 ## Step 6: classify the auth
 
-Match what you observed against the four layer types. The full schema for each
-one is in `system-knowhow/building-an-auth-handshake.md`.
+Match what you saw against the layer types. Each one's full schema is in
+`system-knowhow/building-an-auth-handshake.md`.
 
 | What you saw | Layer |
 |---|---|
@@ -228,10 +220,10 @@ one is in `system-knowhow/building-an-auth-handshake.md`.
 | No auth header at all, yet it needs the login | a cookie session, see below |
 
 **When the auth is a cookie.** This is the common case, and `browser_eval`
-cannot finish it: an `HttpOnly` cookie is unreadable from JS by design. Say so
-plainly rather than deriving an entry that will 401. Two honest ways forward:
-ask the user for a token the site exposes elsewhere, or wait for the engine's
-own capture, which reads cookies over CDP.
+cannot finish it: JS cannot read an `HttpOnly` cookie. Say so plainly rather
+than deriving an entry that will 401. Either ask the user for a token the site
+exposes elsewhere, or wait for the engine's own capture, which reads cookies
+over CDP.
 
 ## Step 7: write the two artifacts
 
@@ -278,29 +270,29 @@ Anything that would waste a later caller's turn: pagination that starts at 0,
 a 200 that carries an error body, a required header the docs would not guess.
 ```
 
-Write the field names and types. A caller that has to fetch an endpoint just to
-learn its shape has gained nothing from the catalog.
+Write the field names and types, so no caller has to fetch an endpoint just to
+learn its shape.
 
 ## Step 8: verify browserless, then claim success
 
-Call each derived endpoint with `proxy_request` and compare against the
-captured example. Do this with the browser closed, since a passing call then
-proves the entry stands on its own.
+First run `browser_eval` with `delete window.__lucidosCapture`, then close the
+browser. Call each derived endpoint with `proxy_request` and compare against
+the captured example. A pass then proves the entry stands on its own.
 
-Report per endpoint. Partial success is the normal outcome, and an endpoint
-that 401s is a finding rather than a failure of the whole derivation. Never
-tell the user it works before a browserless call has returned.
+Report per endpoint. Partial success is normal: an endpoint that 401s is a
+finding, not a failed derivation. Never tell the user it works before a
+browserless call has returned.
 
 ## Step 9: clean up
 
-Run `browser_eval` with `delete window.__lucidosCapture` and close the browser.
-The capture never gets written under `data/`, and it is never committed.
+Step 8 already deleted the capture and closed the browser. Never write the
+capture under `data/` or commit it.
 
 ## Sharing it
 
 The catalog and the entry travel as a plugin. Ship the catalog in the plugin's
-`knowhow/`, and put the `apis.json` snippet in the manifest `setup` field.
+`knowhow/`, and put the `apis.json` snippet in the plugin manifest `setup` field.
 
 Never ship the credential. The installing user supplies their own, and
-`system-knowhow/plugin-setup.md` already tells the setup agent to take it with
+`system-knowhow/plugin-setup.md` tells the setup agent to take it with
 `request_credential`. See `system-knowhow/plugins.md` for packaging.

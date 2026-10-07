@@ -25,6 +25,7 @@ import { loadWorkspaceDisplayName } from './actions/workspace-label';
 import { connectThreadEvents, disconnectThreadEvents } from './actions/thread-sync';
 import { loadAllThreads, loadFilterFacets } from './actions/thread-loading';
 import { refreshPushSubscription, recoverServiceWorker } from './actions/push';
+import { createSwLivenessProbe } from '../utils/swLivenessProbe';
 import { setupNativePushTapRouting } from './actions/native-push';
 import { startDevicePresenceTracking } from './actions/device-presence';
 import { startAppUpdateProgress, stopAppUpdateProgress, refreshReleaseCheck, resumeUpdateRelay } from './actions/app-update';
@@ -45,7 +46,9 @@ import { installMarkdownImageRetry } from '../utils/markdownImageRetry';
 import { installMarkdownImageFallback } from '../utils/markdownImageFallback';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
 import { clipboardOrReport } from '../utils/clipboard';
-import { activeMenuItem, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, setFocusedThread } from './store';
+import { effect } from '@preact/signals';
+import { markBoot } from '../utils/bootTiming';
+import { activeMenuItem, connectionStatus, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, setFocusedThread } from './store';
 import { installContentPaneIframeFocusTracking } from '../components/layout/paneFocus';
 import { requestServiceWorkerBuildId } from '../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './actions/client-update';
@@ -119,6 +122,11 @@ export function startClient(): () => void {
   // line then starts the heartbeat ticker. See utils/liveness.ts.
   reportStartupKind();
   const stopLiveness = startLivenessTracking();
+  markBoot('clientStarted');
+  const stopBootMarks = effect(() => {
+    if (connectionStatus.value === 'connected') markBoot('connected');
+    if (threadsLoaded.value) markBoot('threadsLoaded');
+  });
 
   // Answer isolated app frames, which cannot reach the engine or their own
   // storage. Installed before anything mounts an app, so a frame that asks on
@@ -443,18 +451,19 @@ export function startClient(): () => void {
     void syncClientUpdateFromBuild();
   }
 
-  // Closure-local so a hot-reload restart starts fresh.
-  let lastPongAt = 0;
-  let lastRecoveryAt = 0;
-  let probeInFlight = false;
   let stopped = false;
-  // Resolver for the in-flight probe's pong wait. The SW message handler
-  // calls this to short-circuit the 5s timeout when a pong actually arrives.
-  let pongResolver: (() => void) | null = null;
-  // Cap recovery rate so a misbehaving SW can't churn push subscription
-  // endpoints in the backend.
-  const RECOVERY_COOLDOWN_MS = 60_000;
-  const PROBE_TIMEOUT_MS = 5000;
+  // Closure-local so a hot-reload restart starts fresh.
+  const swLiveness = createSwLivenessProbe({
+    ping: () => {
+      const controller = navigator.serviceWorker?.controller;
+      if (!controller) return false;
+      controller.postMessage({ type: 'lucidos:ping' });
+      return true;
+    },
+    recover: recoverServiceWorker,
+    onRecovered: () => showToast('Notifications repaired: the service worker was unresponsive', 'info'),
+  });
+  const checkSwHealth = () => swLiveness.check();
 
   function onServiceWorkerMessage(event: MessageEvent) {
     const data = event.data as { type?: unknown; target?: unknown; buildId?: unknown } | null;
@@ -466,8 +475,7 @@ export function startClient(): () => void {
       return;
     }
     if (data.type === 'lucidos:pong') {
-      lastPongAt = Date.now();
-      pongResolver?.();
+      swLiveness.notePong();
       return;
     }
     if (data.type === 'lucidos:build-id') {
@@ -479,43 +487,6 @@ export function startClient(): () => void {
         void syncClientUpdateFromBuild();
       }
       return;
-    }
-  }
-
-  async function checkSwHealth() {
-    if (probeInFlight || stopped) return;
-    const controller = navigator.serviceWorker?.controller;
-    if (!controller) return;
-    if (Date.now() - lastRecoveryAt < RECOVERY_COOLDOWN_MS) return;
-
-    probeInFlight = true;
-    try {
-      const sentAt = Date.now();
-      controller.postMessage({ type: 'lucidos:ping' });
-      // Race the timeout against the pong resolver so a healthy SW (pong
-      // in milliseconds) doesn't hold the probe open for the full timeout.
-      // Clear the timer on early resolve: left dangling, it would queue
-      // one wasted task per probe (~12/hour with the visible-tab probe).
-      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-      await new Promise<void>((resolve) => {
-        pongResolver = () => { if (timeoutHandle !== null) clearTimeout(timeoutHandle); resolve(); };
-        timeoutHandle = setTimeout(() => { timeoutHandle = null; resolve(); }, PROBE_TIMEOUT_MS);
-      });
-      pongResolver = null;
-      if (stopped) return;
-      if (lastPongAt >= sentAt) return;
-      lastRecoveryAt = Date.now();
-      // Let recoverServiceWorker throws bubble to the call-site `.catch`.
-      // The user-facing repair toast only fires on the success branch. A
-      // failed recovery genuinely repaired nothing, and any persistent
-      // SW wedge resurfaces on the next probe (5-minute cadence) or next
-      // page reload. RECOVERY_COOLDOWN_MS gates retries, so no spam loop.
-      await recoverServiceWorker();
-      if (!stopped) {
-        showToast('Notifications repaired: the service worker was unresponsive', 'info');
-      }
-    } finally {
-      probeInFlight = false;
     }
   }
 
@@ -713,7 +684,9 @@ export function startClient(): () => void {
 
   return () => {
     stopped = true;
+    swLiveness.stop();
     stopLiveness();
+    stopBootMarks();
     stopAppBridge();
     stopFrameCapabilityRenewal();
     clearInterval(connectionInterval);

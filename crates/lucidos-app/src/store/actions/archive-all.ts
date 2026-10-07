@@ -15,18 +15,17 @@ import {
 import { showConfirm, showToast } from '../store';
 import type { ToastAction } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
+import { CHANGE_TO_RESOLVE, WAITING_FOR_ANSWER } from './blockerCopy';
+import { ARCHIVE_ALL_MAX_IDS } from '@lucidos/engine-constants';
 
 /** How long the Undo stays on screen. */
 const UNDO_MS = 10_000;
 
-/** The most ids one request carries: `MAX_IDS` in `api/threads/archive_all.rs`. */
-export const MAX_IDS_PER_REQUEST = 2_000;
-
 /** Split `ids` into requests the engine accepts. */
 export function idBatches(ids: string[]): string[][] {
   const batches: string[][] = [];
-  for (let i = 0; i < ids.length; i += MAX_IDS_PER_REQUEST) {
-    batches.push(ids.slice(i, i + MAX_IDS_PER_REQUEST));
+  for (let i = 0; i < ids.length; i += ARCHIVE_ALL_MAX_IDS) {
+    batches.push(ids.slice(i, i + ARCHIVE_ALL_MAX_IDS));
   }
   return batches;
 }
@@ -34,17 +33,34 @@ export function idBatches(ids: string[]): string[][] {
 /** A press still running, so a second press cannot start a parallel one. */
 let pressInFlight = false;
 
-/** Each kept reason as a count phrase, singular then plural. */
+/** Each kept reason as a count phrase, singular then plural. Where a reason is
+ *  also a thread menu blocker, the phrase is the menu's own words (ADR 0378).
+ *  `busy` is wider than running: it covers a paused turn and an event wait. */
 const KEPT_PHRASES: Record<string, [string, string]> = {
-  question: ['open question', 'open questions'],
-  pending_change: ['unapplied change', 'unapplied changes'],
+  question: [WAITING_FOR_ANSWER, WAITING_FOR_ANSWER],
+  pending_change: [`with ${CHANGE_TO_RESOLVE}`, `with ${CHANGE_TO_RESOLVE}`],
   unproposed_work: ['with unproposed work', 'with unproposed work'],
-  draft: ['unsent draft', 'unsent drafts'],
-  failed_run: ['failed run', 'failed runs'],
+  draft: ['with an unsent draft', 'with unsent drafts'],
+  failed_run: ['whose last run failed', 'whose last run failed'],
   busy: ['still working', 'still working'],
+  // Only a thread that changed after the confirm is kept for these three.
+  pinned: ['now pinned', 'now pinned'],
+  archived: ['already archived', 'already archived'],
+  gone: ['no longer there', 'no longer there'],
 };
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+/** The kept threads as "12 waiting for your answer, 4 still working". */
+export function keptSummary(counts: Record<string, number>): string {
+  return Object.entries(counts)
+    .filter(([, n]) => n > 0)
+    .map(([slug, n]) => {
+      const [one, many] = KEPT_PHRASES[slug] ?? ['kept for another reason', 'kept for another reason'];
+      return plural(n, one, many);
+    })
+    .join(', ');
+}
 
 /** The confirm, or `null` when nothing in Current is safe to archive. Pure,
  *  so every line of the copy is testable without a dialog. */
@@ -56,21 +72,23 @@ export function archiveAllConfirmation(
   if (preflight.kept_count === 0) {
     return { title, message: 'Everything in Current goes to Archive. You can undo right after.' };
   }
-  const reasons = Object.entries(preflight.kept)
-    .filter(([, n]) => n > 0)
-    .map(([slug, n]) => {
-      const [one, many] = KEPT_PHRASES[slug] ?? ['other', 'other'];
-      return plural(n, one, many);
-    })
-    .join(', ');
   const needs = preflight.kept_count === 1 ? '1 needs you and stays' : `${preflight.kept_count} need you and stay`;
-  return { title, message: `${needs} in Current: ${reasons}. You can undo right after.` };
+  return { title, message: `${needs} in Current: ${keptSummary(preflight.kept)}. You can undo right after.` };
 }
 
-/** What the toast says once the archive answered. */
-export function archiveAllResultMessage(archived: number, changed: number): string {
+/** What the toast says when nothing in Current is safe to archive. */
+export function nothingToArchiveMessage(preflight: ArchiveAllPreflight): string {
+  if (preflight.kept_count === 0) return 'Nothing to archive.';
+  const needs = preflight.kept_count === 1 ? '1 thread in Current needs you' : `${preflight.kept_count} threads in Current need you`;
+  return `Nothing to archive. ${needs}: ${keptSummary(preflight.kept)}.`;
+}
+
+/** What the toast says once the archive answered. `changed` counts, by slug,
+ *  the confirmed threads that changed since the confirm and stayed. */
+export function archiveAllResultMessage(archived: number, changed: Record<string, number>): string {
   const done = `Archived ${plural(archived, 'thread', 'threads')}.`;
-  return changed === 0 ? done : `${done} ${changed} changed since you confirmed and stayed.`;
+  const total = Object.values(changed).reduce((a, b) => a + b, 0);
+  return total === 0 ? done : `${done} ${total} changed since you confirmed and stayed: ${keptSummary(changed)}.`;
 }
 
 export async function handleArchiveAll(): Promise<void> {
@@ -93,12 +111,7 @@ async function runArchiveAll(): Promise<void> {
   }
   const confirmation = archiveAllConfirmation(preflight);
   if (!confirmation) {
-    showToast(
-      preflight.kept_count === 0
-        ? 'Nothing to archive.'
-        : `Nothing to archive. ${plural(preflight.kept_count, 'thread', 'threads')} in Current need you.`,
-      'info',
-    );
+    showToast(nothingToArchiveMessage(preflight), 'info');
     return;
   }
   const ok = await showConfirm(confirmation.message, 'Archive', {
@@ -109,12 +122,12 @@ async function runArchiveAll(): Promise<void> {
   if (!ok) return;
 
   const batch: string[] = [];
-  let changed = 0;
+  const changed: Record<string, number> = {};
   try {
     for (const ids of idBatches(preflight.safe.map((t) => t.thread_id))) {
       const result = await archiveAll(ids);
       batch.push(...result.archived);
-      changed += result.kept.length;
+      for (const { slug } of result.kept) changed[slug] = (changed[slug] ?? 0) + 1;
     }
   } catch (e) {
     if (batch.length === 0) {

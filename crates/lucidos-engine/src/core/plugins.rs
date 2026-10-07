@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use semver::{Op, Version, VersionReq};
+
 use super::{is_build_output_file, VENDORED_DIR_NAMES};
 
 /// Plugin top-level directory (and `data/` subdirectory) that holds compiled
@@ -22,6 +24,10 @@ pub(crate) const CONTENT_DIRS: [&str; 7] = [
 /// that match on filenames should compare against `to_ascii_lowercase()`.
 pub const PLUGIN_ARCHIVE_EXT: &str = ".lucidos-plugin";
 
+/// The longest plugin `id`, in bytes. Every id character is ASCII, so it is
+/// also the limit in characters.
+pub(crate) const MAX_ID_LEN: usize = 64;
+
 /// Parsed `manifest.toml` after validation. Fields beyond v1 are kept on the
 /// raw `serde_json::Value` so they round-trip into the event payload.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,7 +41,6 @@ pub struct PluginManifest {
     /// `update_plugin` and `check_plugin_updates` will refuse a plugin without
     /// one, but install + uninstall work fine.
     pub source: Option<String>,
-    pub engine: Option<String>,
     /// Optional post-install instructions for the LLM to act on (e.g. "create a
     /// daily reflection trigger using `knowhow/foo/run.md`"). Surfaced verbatim
     /// in the `install_plugin` tool result so the agent can offer to wire it up
@@ -125,8 +130,7 @@ impl std::fmt::Display for ValidationError {
             Self::MissingField(name) => write!(f, "manifest.toml missing required field: {}", name),
             Self::InvalidId(id) => write!(
                 f,
-                "invalid id '{}': must match [a-z0-9-]+ and be ≤ 64 chars",
-                id
+                "invalid id '{id}': must match [a-z0-9-]+ and be ≤ {MAX_ID_LEN} chars"
             ),
             Self::InvalidVersion(v) => write!(f, "invalid semver version: {}", v),
             Self::InvalidSource(s) => write!(f, "invalid source URL: {}", s),
@@ -163,7 +167,7 @@ impl std::error::Error for ValidationError {}
 
 fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
-        && id.len() <= 64
+        && id.len() <= MAX_ID_LEN
         && id
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -193,7 +197,7 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ValidationError
         .and_then(|v| v.as_str())
         .ok_or(ValidationError::MissingField("version"))?
         .to_string();
-    if semver::Version::parse(&version).is_err() {
+    if Version::parse(&version).is_err() {
         return Err(ValidationError::InvalidVersion(version));
     }
 
@@ -214,11 +218,6 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ValidationError
         Some(s) => return Err(ValidationError::InvalidSource(s.to_string())),
         None => None,
     };
-
-    let engine = table
-        .get("engine")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
 
     let setup = table
         .get("setup")
@@ -249,7 +248,6 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ValidationError
         name,
         description,
         source,
-        engine,
         setup,
         categories,
         raw,
@@ -504,12 +502,132 @@ pub enum UpdateDecision {
 /// Compare two semver strings. Treats unparseable versions as needing update —
 /// we'd rather attempt the install than silently no-op on a malformed version.
 pub fn compare_versions(installed: &str, remote: &str) -> UpdateDecision {
-    let inst = semver::Version::parse(installed).ok();
-    let rem = semver::Version::parse(remote).ok();
+    let inst = Version::parse(installed).ok();
+    let rem = Version::parse(remote).ok();
     match (inst, rem) {
         (Some(i), Some(r)) if r > i => UpdateDecision::Update,
         (Some(_), Some(_)) => UpdateDecision::AlreadyLatest,
         _ => UpdateDecision::Update,
+    }
+}
+
+/// Why the running Lucidos cannot take a plugin, judged from the manifest's
+/// optional `engine` requirement (a semver requirement such as `">=0.46.1"`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EngineMismatch {
+    /// The requirement is valid and `running`, a release triple, misses it.
+    Unsatisfied {
+        requirement: String,
+        running: Version,
+    },
+    /// The value is not a semver requirement. Held as written, quoted.
+    Invalid { value: String },
+    /// The plugin has a requirement and Lucidos could not read its release.
+    UnknownRelease { error: String },
+}
+
+impl EngineMismatch {
+    /// The phrase a catalog row shows beside its disabled button.
+    pub fn short_reason(&self) -> String {
+        match self {
+            Self::Unsatisfied { requirement, .. } => {
+                format!("Needs Lucidos {}", describe_requirement(requirement))
+            }
+            Self::Invalid { value } => format!("Its engine requirement {value} is not valid"),
+            Self::UnknownRelease { .. } => {
+                "Lucidos could not read its own version to check this plugin".to_string()
+            }
+        }
+    }
+
+    /// The sentence staging refuses with, naming the plugin and both versions.
+    pub fn refusal(&self, plugin_name: &str, plugin_version: &str) -> String {
+        match self {
+            Self::Unsatisfied {
+                requirement,
+                running,
+            } => format!(
+                "{plugin_name} {plugin_version} needs Lucidos {}. This is Lucidos {running}. \
+                 Update Lucidos first.",
+                describe_requirement(requirement)
+            ),
+            Self::Invalid { value } => format!(
+                "{plugin_name} {plugin_version} declares engine = {value} in its manifest, \
+                 which is not a valid version requirement (for example \">=0.46.1\"). \
+                 Nothing was installed. Ask the plugin's author to fix the manifest."
+            ),
+            Self::UnknownRelease { error } => format!(
+                "{plugin_name} {plugin_version} declares an engine requirement, and Lucidos \
+                 could not read its own version to check it: {error}"
+            ),
+        }
+    }
+}
+
+/// The `engine` value as the author wrote it, for display. A string comes back
+/// bare; any other TOML value comes back in its JSON form.
+pub fn engine_requirement_of(manifest: &serde_json::Value) -> Option<String> {
+    manifest.get("engine").map(|v| match v.as_str() {
+        Some(s) => s.to_string(),
+        None => v.to_string(),
+    })
+}
+
+/// The one check every install and update path runs. `manifest` is the raw
+/// manifest JSON. `running` is `release_notices::running_release()`, which
+/// already counts a dirty dev build as the next patch.
+///
+/// Matching uses the release triple only. Plain semver never lets a
+/// pre-release satisfy `>=0.46.1`, which would refuse every dev build.
+/// No `engine` field means any release will do, readable or not. Any value
+/// that is not a valid requirement string is refused, so a typo never installs.
+pub fn check_engine_requirement(
+    manifest: &serde_json::Value,
+    running: &Result<Version, String>,
+) -> Result<(), EngineMismatch> {
+    let Some(value) = manifest.get("engine") else {
+        return Ok(());
+    };
+    let invalid = || EngineMismatch::Invalid {
+        value: value.to_string(),
+    };
+    let text = value.as_str().ok_or_else(invalid)?;
+    let requirement = VersionReq::parse(text).map_err(|_| invalid())?;
+    let running =
+        running
+            .as_ref()
+            .map(release_triple)
+            .map_err(|error| EngineMismatch::UnknownRelease {
+                error: error.clone(),
+            })?;
+    if requirement.matches(&running) {
+        Ok(())
+    } else {
+        Err(EngineMismatch::Unsatisfied {
+            requirement: text.trim().to_string(),
+            running,
+        })
+    }
+}
+
+fn release_triple(version: &Version) -> Version {
+    Version::new(version.major, version.minor, version.patch)
+}
+
+/// `>=0.46.1` reads as "0.46.1 or later". Any other shape is quoted as written.
+fn describe_requirement(requirement: &str) -> String {
+    match VersionReq::parse(requirement)
+        .ok()
+        .as_ref()
+        .map(|r| r.comparators.as_slice())
+    {
+        Some([floor]) if floor.op == Op::GreaterEq && floor.pre.is_empty() => format!(
+            "{}.{}.{} or later",
+            floor.major,
+            floor.minor.unwrap_or(0),
+            floor.patch.unwrap_or(0)
+        ),
+        _ => requirement.to_string(),
     }
 }
 

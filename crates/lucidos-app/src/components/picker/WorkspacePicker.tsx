@@ -29,6 +29,7 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
+import { RetryIcon } from '../shared/icons';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
@@ -104,6 +105,7 @@ import {
 } from './workspaceForms';
 import { pickerFooter, type FooterMode } from './PickerFooter';
 import { restoreBanner } from './RestoreBanner';
+import { GlyphBadge } from '../shared/GlyphBadge';
 
 /** Window-drag gate (Tauri desktop): the picker's whole background drags the
  *  window, except presses on its controls and inside an open popover.
@@ -1125,13 +1127,13 @@ export function WorkspacePicker() {
                           </span>
                         </div>
                         {typeof w.unread_count === 'number' && w.unread_count > 0 && (
-                          <span
+                          <GlyphBadge
                             class="ws-picker-badge"
                             data-tooltip={`${w.unread_count} unread`}
                             aria-label={`${w.unread_count} unread notifications`}
                           >
                             {w.unread_count > 99 ? '99+' : w.unread_count}
-                          </span>
+                          </GlyphBadge>
                         )}
                         {/* Both, because they are different events: a middle
                             press dispatches `auxclick` and no `click` at all, so
@@ -1205,7 +1207,7 @@ export function WorkspacePicker() {
                                 e.stopPropagation();
                                 void withBusy(() => restartWorkspace(w.id).then(refresh));
                               }}
-                            ><PlayIcon /></button>
+                            >{state === 'unhealthy' ? <RetryIcon /> : <PlayIcon />}</button>
                           )}
                           <div class="ws-picker-menu-wrap">
                             <button

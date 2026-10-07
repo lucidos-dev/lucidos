@@ -150,7 +150,7 @@ pub(crate) fn collect_tool_pairs_chronological(events: &[EventRow]) -> Vec<Resum
                         .position(|(slot_idx, _)| slots[*slot_idx].tool_called_event_id == call_id),
                     // Legacy rows carry no id. Pair with the most recent
                     // pending ToolCalled of the same name, else the most
-                    // recent pending entry, as `build_session_messages` does.
+                    // recent pending entry, as `build_session_messages_with` does.
                     None => pending
                         .iter()
                         .rposition(|(_, n)| n == result_name)

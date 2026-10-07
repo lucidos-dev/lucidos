@@ -1384,6 +1384,7 @@ fn two_route_registry() -> crate::llm::ModelRegistry {
                 RouteEntry::new(ProviderKind::Anthropic, "claude-opus-5"),
             ],
             preferred: None,
+            vision: false,
         },
     );
     registry

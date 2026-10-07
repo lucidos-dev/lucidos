@@ -1,6 +1,6 @@
 //! What the provider config subscriber rebuilds on, and what it ignores.
 
-use crate::core::{PREF_LOCAL_BASE_URL, PREF_OPENCODE_FREE_ENABLED};
+use crate::core::prefs;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::provider_config_trigger;
 
@@ -48,7 +48,10 @@ fn an_inferred_provider_scope_triggers_a_rebuild() {
 /// install it. Without this arm, turning it on would need a restart.
 #[test]
 fn a_provider_preference_triggers_a_rebuild() {
-    for key in [PREF_OPENCODE_FREE_ENABLED, PREF_LOCAL_BASE_URL] {
+    for key in [
+        prefs::OPENCODE_FREE_ENABLED.key(),
+        prefs::LOCAL_BASE_URL.key(),
+    ] {
         let trigger = provider_config_trigger(&pref(key));
         assert!(trigger.is_some(), "{key}");
         assert!(trigger.unwrap().contains(key));
@@ -60,7 +63,12 @@ fn a_provider_preference_triggers_a_rebuild() {
 /// Vertex tokens for nothing.
 #[test]
 fn an_unrelated_preference_does_not_trigger_a_rebuild() {
-    for key in ["theme-mode", "timezone", "chat_model", "ui_scale"] {
+    for key in [
+        prefs::THEME_MODE.key(),
+        prefs::TIMEZONE.key(),
+        prefs::CHAT_MODEL.key(),
+        prefs::UI_SCALE.key(),
+    ] {
         assert!(provider_config_trigger(&pref(key)).is_none(), "{key}");
     }
 }

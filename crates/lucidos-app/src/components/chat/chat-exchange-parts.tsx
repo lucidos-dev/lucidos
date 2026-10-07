@@ -3,16 +3,17 @@ import { CONTINUE_GUARD_MS, continueStoppedThread } from './continueStoppedThrea
 import type { Change } from '../../api/client';
 import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
 import { changeCommitList, knownChangeHeadline } from '../../store/changeHeadline';
-import { HELD_UNTIL_REPLY } from '../../store/exchange-status';
+import { HELD_MESSAGE_NOTE } from '../../store/exchange-status';
 import { ensureEventTargetResolved, eventHasTarget, jumpableEventId, showEventWhereItLives } from '../../store/actions/event-navigation';
 import { viewChangeDiff } from '../../store/actions/repositories';
-import { checkpointDiffModal, contextViewer, eventConditionDoor, eventConditionPopoverOpenFor, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal, toggleEventConditionPopover } from '../../store/store';
+import { checkpointDiffModal, contextViewer, eventConditionDoor, eventConditionPopoverOpenFor, findChangeById, lazyChanges, openImagePopupFromGroup, openSubAgentGroups, showToast, stepDetailModal, toggleEventConditionPopover, toggleSubAgentGroup } from '../../store/store';
 import { prefetchStepDetail } from '../../store/stepDetailCache';
 import { LUCIDOS_AGENT_LABEL, awaitedSubject, continuationCause, plainEventName, responseAbortedState, starterEngineReason, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
 import { CommitList } from '../shared/CommitList';
 import { Disclosure } from '../shared/Disclosure';
+import { DisclosureChevron } from '../shared/DisclosureChevron';
 import type { AbortCause, CancelCause, ChangeLifecycleType, EngineReason, EventSubscription, EventWaitReason, EventWaitCancelCause, Exchange, MessageOrigin, StoredEvent, SubscriptionGroup } from '../../store/thread-events';
 import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
@@ -33,6 +34,7 @@ import type { ComponentChildren } from 'preact';
 import { useEffect } from 'preact/hooks';
 import type { InitiatorDescriptor } from './ChatExchange';
 import { ROW_ATTR } from './scrollAnchor';
+import { withScrollAnchor } from './CreateThreadView';
 
 // Presentational sub-components for ChatExchange (panels, bodies, response
 // rendering). Extracted from ChatExchange.tsx; imported back there. The only
@@ -65,7 +67,7 @@ export function FileList({ files }: { files: string[] }) {
 
 /** The thumbnails of images the user attached: to a message, a side question
  *  or a typed answer. Nothing when there are none. */
-export function UserImages({ imageHashes }: { imageHashes: readonly string[] }) {
+function UserImages({ imageHashes }: { imageHashes: readonly string[] }) {
   if (imageHashes.length === 0) return null;
   return (
     <div class="user-images">
@@ -85,7 +87,7 @@ export function UserImages({ imageHashes }: { imageHashes: readonly string[] }) 
   );
 }
 
-export function UserMessageBody({ html, imageHashes }: { html: string; imageHashes: string[] }) {
+export function UserMessageBody({ html, imageHashes }: { html: string; imageHashes: readonly string[] }) {
   return (
     <>
       {html && <div class="markdown-content" dangerouslySetInnerHTML={{ __html: html }} />}
@@ -427,10 +429,12 @@ export function EventDeliveryBody({
   eventType,
   eventId,
   payloadJson,
+  heldNote,
 }: {
   eventType: string;
   eventId?: string;
   payloadJson?: string;
+  heldNote?: string;
 }) {
   const jump = useEventJump(jumpableEventId(eventId, eventType));
   return eventDeliveryBody({
@@ -438,6 +442,7 @@ export function EventDeliveryBody({
     payloadJson,
     opening: jump.opening,
     onOpenMatched: jump.onOpen,
+    heldNote,
   });
 }
 
@@ -498,14 +503,17 @@ export function eventDeliveryBody({
   payloadJson,
   opening,
   onOpenMatched,
+  heldNote,
 }: {
   eventType: string;
   payloadJson?: string;
   opening: boolean;
   onOpenMatched?: () => void;
+  heldNote?: string;
 }) {
   return eventRowBody({
     kind: 'delivery',
+    heldNote,
     role: 'event-delivery',
     // The matched event usually lives somewhere ELSE: a `CodingAgentIdled` or a
     // `ChangeProposed` from the coding-agent thread this one watched. So the
@@ -692,6 +700,9 @@ interface InitiatorPanelProps {
    *  change-lifecycle turns. Attribution is reached via the clickable timestamp,
    *  which opens the route popover. */
   chromeless?: boolean;
+  /** The body waits behind an open question: it dims, and `note` (if any)
+   *  says when it is read. Absent while the body's own card carries the note. */
+  held?: { note?: string };
 }
 
 function ActorChipBody({ initiator }: { initiator: InitiatorDescriptor }) {
@@ -707,7 +718,7 @@ function ActorChipBody({ initiator }: { initiator: InitiatorDescriptor }) {
   );
 }
 
-export function InitiatorPanel({ initiator, timestamp, onActorClick, collapsible, collapsed, onToggle, onBodyClick, bubble = false, chromeless = false }: InitiatorPanelProps) {
+export function InitiatorPanel({ initiator, timestamp, onActorClick, collapsible, collapsed, onToggle, onBodyClick, bubble = false, chromeless = false, held }: InitiatorPanelProps) {
   const accentClass = initiator.accent ? ` initiator-panel-${initiator.accent}` : '';
   const hasBody = !!initiator.summary || !!initiator.details;
 
@@ -726,7 +737,7 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, collapsible
     : null;
 
   return (
-    <div class={`initiator-panel initiator-panel-${initiator.variant}${accentClass}${bubble ? ' initiator-panel-bubble' : ''}`}>
+    <div class={`initiator-panel initiator-panel-${initiator.variant}${accentClass}${bubble ? ' initiator-panel-bubble' : ''}`} data-held={held ? '' : undefined}>
       {/* The row is inert, like the response header's: the control owns folding.
           A row that swallowed a click announced it with nothing but a cursor,
           and it fired for any click that missed the chip. */}
@@ -771,6 +782,7 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, collapsible
           <div class="initiator-body" onClick={onBodyClick}>
             {initiator.summary && <div class="initiator-summary">{initiator.summary}</div>}
             {bubble ? <div class="user-bubble">{initiator.details}</div> : initiator.details}
+            {held?.note && <div class="initiator-held-note">{held.note}</div>}
           </div>
         </Disclosure>
       )}
@@ -1028,17 +1040,23 @@ const NAMED_STEP_OUTCOMES: ReadonlySet<StepOutcome> = new Set<StepOutcome>([
 /** One action, as one row: the model's thinking and the call it produced share
  *  a row rather than taking two (see `nameThinkingRow` in the projection).
  *
- *  The row therefore has TWO click targets, which is why it is a `<div>` around
- *  two buttons rather than one button: a `<button>` may not contain another
+ *  The row therefore has several click targets, which is why it is a `<div>`
+ *  around buttons rather than one button: a `<button>` may not contain another
  *  interactive element. The main target opens what the step DID, and the
- *  context counter opens what the model was SENT. */
+ *  context counter opens what the model was SENT. An `Agent` row adds its fold
+ *  toggle on both sides of the main target. */
 export function InlineStep(
-  { event, rowRef }: {
+  { event, rowRef, fold, anchored = true }: {
     event: Extract<ResponseEvent, { type: 'step' }>;
     /** Handed this row's own element, so a caller can watch where it sits.
      *  `ChatExchange` gives it to the live row alone, which is how the
      *  "Working" label learns whether the live shimmer is on screen. */
     rowRef?: (el: HTMLDivElement | null) => void;
+    /** An `Agent` row's fold over its sub-agent steps (`SubAgentStepGroup`). */
+    fold?: StepFold;
+    /** Whether a reading position may name this row. A row that can vanish
+     *  under a fold must not, or the position cannot be restored. */
+    anchored?: boolean;
   },
 ) {
   const { label, className } = stepStatus(event.outcome);
@@ -1080,10 +1098,12 @@ export function InlineStep(
   return (
     <div
       ref={rowRef}
-      class={`inline-step ${className}`}
+      class={`inline-step ${className}${fold ? ' has-fold' : ''}`}
       data-role="inline-step"
       /* The reading position names this row (`ROW_ATTR` in scrollAnchor.ts). */
-      {...{ [ROW_ATTR]: event.call_event_id ?? event.result_event_id }}
+      {...(anchored ? { [ROW_ATTR]: event.call_event_id ?? event.result_event_id } : {})}
+      /* The agent holding control, not a row it drew (`DRAWN_ROW_SELECTOR`). */
+      data-thinking-row={isThinking(event) ? '' : undefined}
       /* A row the user can't read at a glance needs naming, and the tooltip
          says what the mark means without a trip through the detail modal. The
          four that earn one are the four that are neither a green check nor a
@@ -1091,6 +1111,20 @@ export function InlineStep(
          refused. */
       data-tooltip={NAMED_STEP_OUTCOMES.has(event.outcome) ? label : undefined}
     >
+      {/* The chevron takes the mark's slot, so the description keeps its
+          column. A button may not sit inside `.step-main`, so it leads it. */}
+      {fold && (
+        <button
+          type="button"
+          class="step-fold"
+          data-role="step-fold"
+          aria-expanded={fold.open}
+          aria-label={`${fold.open ? 'Hide' : 'Show'} the agent's ${stepCount(fold.count)}`}
+          onClick={fold.onToggle}
+        >
+          <DisclosureChevron open={fold.open} />
+        </button>
+      )}
       <button
         type="button"
         class="step-main"
@@ -1102,10 +1136,24 @@ export function InlineStep(
         {/* A running step draws no mark, but the span still renders: the slot
             is a fixed-width column in CSS, so the running row's text sits on
             the same column as the finished rows above it. */}
-        <span class="step-icon"><StepOutcomeIcon outcome={event.outcome} /></span>
+        {!fold && <span class="step-icon"><StepOutcomeIcon outcome={event.outcome} /></span>}
         <span class={`step-description${isPending ? ' running-shimmer' : ''}`}>{highlightEllipsis(event.description)}</span>
         {detailText && <span class="step-detail">{highlightEllipsis(detailText)}</span>}
       </button>
+      {/* The count toggles too, as a wider target than the chevron. The
+          chevron is the one keyboard stop, so this one stays out of the tab
+          order and the accessibility tree. */}
+      {fold && (
+        <button
+          type="button"
+          class="step-fold-count"
+          tabIndex={-1}
+          aria-hidden="true"
+          onClick={fold.onToggle}
+        >
+          {stepCount(fold.count)}
+        </button>
+      )}
       {/* The counter is a button only when there is a snapshot behind it. A
           legacy row carries `context_tokens` with nothing to open, and a button
           that opens nothing is worse than plain text. */}
@@ -1122,6 +1170,77 @@ export function InlineStep(
       ) : (
         <span class={`step-context${trimmed ? ' trimmed' : ''}`}>{counter}</span>
       ))}
+    </div>
+  );
+}
+
+interface StepFold {
+  open: boolean;
+  count: number;
+  /** Takes the click, so the pressed control can be held still. */
+  onToggle: (e: MouseEvent) => void;
+}
+
+const stepCount = (n: number) => `${n} ${n === 1 ? 'step' : 'steps'}`;
+
+/** An `Agent` call and the steps its sub-agent took, folded under its row.
+ *
+ *  Folded, one line beneath the row says where the agent is. A running agent
+ *  shows its latest step, so the reader sees it working without the whole list.
+ *  An ended one says how it ended, since the chevron holds the slot where its
+ *  outcome mark would go. The line goes while the fold is open. */
+export function SubAgentStepGroup(
+  { event, rowRef }: {
+    event: Extract<ResponseEvent, { type: 'step' }>;
+    rowRef?: (el: HTMLDivElement | null) => void;
+  },
+) {
+  const children = event.children ?? [];
+  const id = event.tool_use_id ?? '';
+  const open = openSubAgentGroups.value.has(id);
+  const running = event.outcome === 'pending';
+  // Held on the press like a turn control, so the growth cannot scroll a reader
+  // who follows the live edge.
+  const onToggle = (e: MouseEvent) =>
+    withScrollAnchor(e.currentTarget as HTMLElement | null, () => toggleSubAgentGroup(id));
+  return (
+    <div class="sub-agent-group" data-role="sub-agent-group">
+      <InlineStep
+        event={event}
+        rowRef={rowRef}
+        fold={{ open, count: children.length, onToggle }}
+      />
+      <Disclosure open={!open}>
+        <div class={`sub-agent-tail${running ? '' : ' ended'}`} data-role="sub-agent-tail">
+          {running
+            ? <InlineStep event={children[children.length - 1]} anchored={false} />
+            : <SubAgentEnding event={event} />}
+        </div>
+      </Disclosure>
+      <Disclosure open={open}>
+        <div class="sub-agent-steps" data-role="sub-agent-steps">
+          {children.map((child, i) => <InlineStep key={child.tool_use_id ?? i} event={child} anchored={false} />)}
+        </div>
+      </Disclosure>
+    </div>
+  );
+}
+
+/** How an agent ended, as the tail line: its outcome mark and one word. It
+ *  opens the agent's step detail, which holds the report it returned. */
+function SubAgentEnding({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
+  const { label, className } = stepStatus(event.outcome);
+  return (
+    <div class={`inline-step ${className}`}>
+      <button
+        type="button"
+        class="step-main"
+        onPointerDown={() => prefetchStepDetail(event)}
+        onClick={() => { stepDetailModal.value = event; }}
+      >
+        <span class="step-icon"><StepOutcomeIcon outcome={event.outcome} /></span>
+        <span class="step-description">{event.outcome === 'success' ? 'Done' : label}</span>
+      </button>
     </div>
   );
 }
@@ -1392,15 +1511,17 @@ function waitDetail(reason: string): string {
 /** An agent-sent message the coding agent holds until a human replies
  *  (ADR 0256). Once its delivered copy is on record, that copy is the one
  *  card and this row stops drawing (`Exchange.deliveredHeldIds`). A released
- *  row without one stays, so a lost delivery is visible; its text is folded. */
+ *  row without one stays, so a lost delivery is visible; its text is folded.
+ *  While held, the note says what it waits for, so it carries no state word. */
 export function HeldMessageRow({ event }: { event: Extract<ResponseEvent, { type: 'held_message' }> }) {
   return eventRowBody({
     kind: 'held',
     state: event.released ? 'released' : 'held',
     role: 'held-message-row',
     subject: eventNameChip({ kind: 'chip', name: 'MessageHeld', sentenceStart: true }),
-    stateLabel: event.released ? HELD_MESSAGE_DELIVERED : HELD_UNTIL_REPLY,
-    tone: event.released ? 'arrived' : 'live',
+    stateLabel: event.released ? HELD_MESSAGE_DELIVERED : undefined,
+    tone: event.released ? 'arrived' : 'none',
+    heldNote: event.released ? undefined : HELD_MESSAGE_NOTE,
     facts: [{ kind: 'text', text: `from ${event.sender}` }],
     fold: { label: 'Details', body: event.text },
   });

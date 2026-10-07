@@ -48,10 +48,12 @@ async fn list_repositories(pool: &sqlx::PgPool) -> ToolOutcome {
                 // `<username>@<employer-domain>` would otherwise reach
                 // the model provider. `folder` inputs are re-expanded
                 // on the way back in (`resolve_folder_input`), so the
-                // abbreviated form stays usable.
+                // abbreviated form stays usable. The id is what a `repo:`
+                // locator and the HTTP API take.
                 out.push_str(&format!(
-                    "- **{}**: `{}`",
+                    "- **{}** (id `{}`): `{}`",
                     r.name,
+                    r.id,
                     crate::core::home_path::abbreviate_str(&r.path)
                 ));
                 if let Some(ref desc) = r.description {
@@ -264,6 +266,38 @@ mod tests {
             projected_name(&pool, repo.id).await.as_deref(),
             Some("Example"),
             "RepositoryAdded must reach the repo_names projection"
+        );
+
+        teardown_test_db(&db_name).await;
+    }
+
+    /// `list` names each repository's id. A `repo:` locator takes it, and an
+    /// agent had to shell out to the CLI to find it.
+    #[tokio::test]
+    async fn list_names_each_repository_id() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+        manage_repositories_impl(&pool, &bus, &add_args(tmp.path()), Uuid::new_v4())
+            .await
+            .unwrap();
+        let repo = RepositoryStore::get_by_name(&pool, "Example")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let out = manage_repositories_impl(
+            &pool,
+            &bus,
+            &serde_json::json!({ "action": "list" }),
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("list succeeds");
+        assert!(
+            out.contains(&format!("**Example** (id `{}`)", repo.id)),
+            "{out}"
         );
 
         teardown_test_db(&db_name).await;

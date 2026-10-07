@@ -386,6 +386,48 @@ fn read_small_image_is_not_recompressed() {
 }
 
 #[test]
+fn a_jpeg_saved_with_a_png_extension_is_sent_as_jpeg() {
+    // A JPEG renamed to `.png` used to be sent as `image/png`. Vertex
+    // rejects the whole request when the stated type disagrees with the
+    // bytes. The fallback here is what the extension would have claimed,
+    // so this only passes if the sniff wins.
+    let jpeg_bytes: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+    let result = encode_image_for_read(jpeg_bytes, "image/png");
+    assert!(
+        result.starts_with("[IMAGE_CONTENT:image/jpeg]\n"),
+        "got: {}",
+        &result[..result.floor_char_boundary(60)]
+    );
+}
+
+#[test]
+fn a_real_png_still_reports_as_png() {
+    let png_bytes: Vec<u8> = vec![
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00,
+    ];
+    let result = encode_image_for_read(png_bytes, "image/png");
+    assert!(
+        result.starts_with("[IMAGE_CONTENT:image/png]\n"),
+        "got: {}",
+        &result[..result.floor_char_boundary(60)]
+    );
+}
+
+#[test]
+fn an_unrecognized_blob_falls_back_to_the_extension() {
+    // Bytes matching none of the sniffed formats (a corrupt file that still
+    // carries an image extension) keep the extension-derived media type.
+    let unknown_bytes: Vec<u8> = vec![0x00, 0x01, 0x02, 0x03, 0x04];
+    let result = encode_image_for_read(unknown_bytes, "image/webp");
+    assert!(
+        result.starts_with("[IMAGE_CONTENT:image/webp]\n"),
+        "got: {}",
+        &result[..result.floor_char_boundary(60)]
+    );
+}
+
+#[test]
 fn test_svg_not_treated_as_image() {
     // SVG should not match image_media_type — it's text-based
     assert_eq!(image_media_type("svg"), None);

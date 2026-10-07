@@ -239,6 +239,8 @@
    adds to the row's gap, so the button clears the subscription line. */
 .event-wait-foot {
     display: flex;
+    /* The growing meta already pushes Stop to the right end. */
+    justify-content: flex-end;
     align-items: center;
     gap: var(--space-sm);
     margin-top: var(--space-sm);

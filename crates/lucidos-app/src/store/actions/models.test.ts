@@ -12,9 +12,9 @@ import {
   buildRoutes,
   routeDrafts,
 } from './models';
-import { modelRows } from '../modelSelection';
+import { EFFORT_LADDER, modelRows } from '../modelSelection';
 import { formatContextWindow } from '../../utils/formatTokens';
-import { MODELS } from '../models';
+import { DEFAULT_CHAT_MODEL, MODELS } from '../models';
 import { displayModelName } from '../thread-events/exchange';
 import type { ModelInfo } from '../../api/types';
 
@@ -30,6 +30,7 @@ function model(
     label,
     routes: [{ provider, id, reasoning_efforts: reasoning_efforts ?? [] }],
     preferred_provider: null,
+    vision: false,
     sort_order: 0,
     source: 'user',
     enabled,
@@ -168,10 +169,10 @@ describe('chatModelOptions', () => {
     expect(row.providers).toEqual([]);
   });
 
-  // Mirrors `DEFAULT_CHAT_MODEL` in core/preferences.rs. A fresh install with no
-  // saved preference resolves to it, so the picker has to be able to show it.
+  // A fresh install with no saved preference resolves to the catalog default,
+  // so the picker has to be able to show it.
   it('offers the default chat model', () => {
-    expect(MODELS.some((m) => m.value === 'claude-opus-5')).toBe(true);
+    expect(MODELS.some((m) => m.value === DEFAULT_CHAT_MODEL)).toBe(true);
   });
 
   // The newest OpenAI builtin. A seed the fallback list misses is invisible
@@ -195,8 +196,8 @@ describe('chatModelOptions', () => {
   it('offers Opus 5.5 above Opus 5', () => {
     expect(MODELS).toContainEqual({ value: 'claude-opus-5-5', label: 'Opus 5.5' });
     expect(MODELS).toContainEqual({ value: 'claude-opus-5-5[1m]', label: 'Opus 5.5 (1M)' });
-    expect(MODELS.findIndex((m) => m.value === 'claude-opus-5-5')).toBeLessThan(
-      MODELS.findIndex((m) => m.value === 'claude-opus-5'),
+    expect(MODELS.findIndex((m) => m.value === 'claude-opus-5-5[1m]')).toBeLessThan(
+      MODELS.findIndex((m) => m.value === 'claude-opus-5[1m]'),
     );
   });
 
@@ -325,16 +326,13 @@ describe('lucidosModelChoices / clampEffortFor', () => {
     expect(clampEffortFor('max', 'muse-glimmer:30b-mlx')).toBe('high');
   });
 
-  it('falls back to the id-shape heuristic when the registry cannot answer', () => {
+  it('offers the whole ladder when the registry cannot answer', () => {
     chatModels.value = { status: 'not-loaded' };
-    // Pre-load, a GPT-5.6 id still gets its full set so the picker is usable.
-    const row = lucidosModelChoices('gpt-5.6-sol').find((c) => c.value === 'gpt-5.6-sol');
-    expect(row?.reasoningEfforts).toContain('max');
-    // Astra too, which the heuristic missed while it keyed on `gpt-5.6` alone.
-    const astra = lucidosModelChoices('gpt-6-astra').find((c) => c.value === 'gpt-6-astra');
-    expect(astra?.reasoningEfforts).toContain('max');
-    expect(clampEffortFor('max', 'gpt-6-astra')).toBe('max');
-    expect(clampEffortFor('max', 'gpt-5.4')).toBe('xhigh');
+    // Pre-load the picker stays usable, and the engine snaps the pick onto
+    // what the backend accepts: the client keeps no per-family copy.
+    const row = lucidosModelChoices('gpt-5.4').find((c) => c.value === 'gpt-5.4');
+    expect(row?.reasoningEfforts).toEqual(EFFORT_LADDER);
+    expect(clampEffortFor('max', 'gpt-5.4')).toBe('max');
   });
 });
 
@@ -416,7 +414,6 @@ describe('displayModelName', () => {
     chatModels.value = { status: 'not-loaded' };
     expect(displayModelName('claude-opus-5-5')).toBe('Opus 5.5');
     expect(displayModelName('claude-opus-5-5[1m]')).toBe('Opus 5.5 (1M)');
-    expect(displayModelName('claude-opus-5')).toBe('Opus 5');
     expect(displayModelName('claude-opus-5[1m]')).toBe('Opus 5 (1M)');
   });
 

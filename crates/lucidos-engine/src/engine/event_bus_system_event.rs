@@ -92,6 +92,23 @@ pub enum SystemEvent {
         model_id: String,
         load_state: crate::memory::EmbeddingModelLoadState,
     },
+    /// The Tree memory module's backfill moved. The compactor seeded, an owed
+    /// scope started or built a node, a scope completed or started failing,
+    /// or the model wait changed. TRANSIENT,
+    /// like `MemoryRebuildProgress`. `progress` is the shape
+    /// `GET /api/v1/memory/tree-backfill` serves while the backfill runs.
+    TreeBackfillProgressed {
+        progress: crate::engine::summary_tree::BackfillProgress,
+    },
+    /// The backfill set the ready flag: the workspace tree and the threads
+    /// active in the last 7 days are built, so turns now take the Tree path.
+    /// Older threads keep filling in. `total` counts the scopes it covers.
+    TreeBackfillCompleted {
+        total: usize,
+    },
+    /// A switch to Classic cleared a set ready flag. Coming back to Tree
+    /// backfills again before a turn reads the trees.
+    TreeBackfillReset {},
     ChangesUpdated {
         pending: Vec<crate::core::changes::Change>,
         /// Kept for later, newest first (ADR 0328).
@@ -207,6 +224,10 @@ pub enum SystemEvent {
         commit_hash: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
+        /// The thread whose turn wrote it, when one did. Engine work that
+        /// reads the write later, such as a memory summary, bills that thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer_thread_id: Option<uuid::Uuid>,
     },
     TriggerCreated {
         trigger_id: String,
@@ -456,12 +477,19 @@ pub enum SystemEvent {
         commit: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        /// The thread whose turn wrote it, when one did. Engine work that
+        /// reads the write later, such as a memory summary, bills that thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer_thread_id: Option<uuid::Uuid>,
     },
     ArtifactUpdated {
         artifact_path: String,
         commit: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        /// See `ArtifactCreated`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer_thread_id: Option<uuid::Uuid>,
     },
     ArtifactDeleted {
         artifact_path: String,
@@ -957,6 +985,23 @@ pub enum SystemEvent {
         /// How long it lasted, in seconds.
         down_secs: i64,
     },
+    /// This computer slept while a webhook was on, so deliveries sent in that
+    /// time never arrived.
+    ///
+    /// One per *sleep spell*, on the first clean ingress round after it, and
+    /// only for a spell of 30 minutes or more. A night of short dark wakes is
+    /// one spell. It blames no funnel and no family, because none failed
+    /// (`docs/adr/0367-a-sleeping-host-is-not-a-dead-ingress.md`).
+    WebhookDeliveriesSleptThrough {
+        /// The hook the ingress round probed, as on the two events above.
+        webhook_id: String,
+        webhook_name: String,
+        host: String,
+        port: u16,
+        /// How long the computer slept, summed over the spell. Read off the
+        /// gap between the wall clock and the monotonic clock.
+        slept_secs: u64,
+    },
     /// A webhook is turning away the deliveries it receives.
     ///
     /// The verification-layer sibling of `WebhookIngressDegraded`. That one
@@ -1431,18 +1476,21 @@ impl SystemEvent {
         artifact_path: String,
         commit: String,
         source: Option<String>,
+        writer_thread_id: Option<uuid::Uuid>,
     ) -> Self {
         if file_exists {
             Self::ArtifactUpdated {
                 artifact_path,
                 commit,
                 source,
+                writer_thread_id,
             }
         } else {
             Self::ArtifactCreated {
                 artifact_path,
                 commit,
                 source,
+                writer_thread_id,
             }
         }
     }
@@ -1510,6 +1558,7 @@ impl SystemEvent {
         "WebhookDeleted",
         "WebhookIngressDegraded",
         "WebhookIngressRecovered",
+        "WebhookDeliveriesSleptThrough",
         "WebhookDeliveriesRefused",
         "WebhookDeliveriesRecovered",
         "McpServerRegistered",
@@ -1548,6 +1597,8 @@ impl SystemEvent {
         "RecommendedCleanupStarted",
         "RecommendedCleanupCompleted",
         "RecommendedCleanupFailed",
+        "TreeBackfillCompleted",
+        "TreeBackfillReset",
     ];
 
     /// Whether this event writes a row to the `events` table.
@@ -1580,6 +1631,9 @@ impl SystemEvent {
             Self::ReleaseNoticeResolved { .. } => "ReleaseNoticeResolved",
             Self::MemoryRebuildProgress { .. } => "MemoryRebuildProgress",
             Self::EmbeddingModelStatusChanged { .. } => "EmbeddingModelStatusChanged",
+            Self::TreeBackfillProgressed { .. } => "TreeBackfillProgressed",
+            Self::TreeBackfillCompleted { .. } => "TreeBackfillCompleted",
+            Self::TreeBackfillReset { .. } => "TreeBackfillReset",
             Self::ChangesUpdated { .. } => "ChangesUpdated",
             Self::BackupProgress { .. } => "BackupProgress",
             Self::BackupCompleted { .. } => "BackupCompleted",
@@ -1660,6 +1714,7 @@ impl SystemEvent {
             Self::WebhookDeleted { .. } => "WebhookDeleted",
             Self::WebhookIngressDegraded { .. } => "WebhookIngressDegraded",
             Self::WebhookIngressRecovered { .. } => "WebhookIngressRecovered",
+            Self::WebhookDeliveriesSleptThrough { .. } => "WebhookDeliveriesSleptThrough",
             Self::WebhookDeliveriesRefused { .. } => "WebhookDeliveriesRefused",
             Self::WebhookDeliveriesRecovered { .. } => "WebhookDeliveriesRecovered",
             Self::McpServerRegistered { .. } => "McpServerRegistered",
@@ -1727,6 +1782,9 @@ impl SystemEvent {
         "ReleaseNoticeResolved",
         "MemoryRebuildProgress",
         "EmbeddingModelStatusChanged",
+        "TreeBackfillProgressed",
+        "TreeBackfillCompleted",
+        "TreeBackfillReset",
         "ChangesUpdated",
         "BackupProgress",
         "BackupCompleted",
@@ -1807,6 +1865,7 @@ impl SystemEvent {
         "WebhookDeleted",
         "WebhookIngressDegraded",
         "WebhookIngressRecovered",
+        "WebhookDeliveriesSleptThrough",
         "WebhookDeliveriesRefused",
         "WebhookDeliveriesRecovered",
         "McpServerRegistered",
@@ -1912,7 +1971,10 @@ impl SystemEvent {
             | Self::PluginCatalogScanStarted {}
             | Self::PluginCatalogScanned { .. } => "plugin_marketplace",
             Self::ThreadComposeChanged { .. } => "thread",
-            Self::MemoryCorrected { .. } => "memory",
+            Self::MemoryCorrected { .. }
+            | Self::TreeBackfillProgressed { .. }
+            | Self::TreeBackfillCompleted { .. }
+            | Self::TreeBackfillReset { .. } => "memory",
             Self::PinnedAppPinned { .. } | Self::PinnedAppUnpinned { .. } => "pinned_app",
             Self::DeviceRegistered { .. }
             | Self::DeviceRenamed { .. }
@@ -1936,6 +1998,7 @@ impl SystemEvent {
             | Self::WebhookDeleted { .. }
             | Self::WebhookIngressDegraded { .. }
             | Self::WebhookIngressRecovered { .. }
+            | Self::WebhookDeliveriesSleptThrough { .. }
             | Self::WebhookDeliveriesRefused { .. }
             | Self::WebhookDeliveriesRecovered { .. } => "webhook",
             Self::McpServerRegistered { .. }
@@ -2067,6 +2130,7 @@ impl SystemEvent {
             | Self::WebhookDeleted { webhook_id, .. }
             | Self::WebhookIngressDegraded { webhook_id, .. }
             | Self::WebhookIngressRecovered { webhook_id, .. }
+            | Self::WebhookDeliveriesSleptThrough { webhook_id, .. }
             | Self::WebhookDeliveriesRefused { webhook_id, .. }
             | Self::WebhookDeliveriesRecovered { webhook_id, .. } => webhook_id.clone(),
             Self::McpServerRegistered { server_id, .. }

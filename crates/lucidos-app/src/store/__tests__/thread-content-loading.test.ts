@@ -236,7 +236,7 @@ describe('shouldRevealThread with hasContent', () => {
   });
 });
 
-describe('CodingAgentThreadSpawned skeleton — pending messages visible before DB load', () => {
+describe('pending messages show on a thread whose events have not loaded', () => {
   beforeEach(() => {
     threadMap.value = new Map();
     focusedThreadId.value = null;
@@ -245,8 +245,8 @@ describe('CodingAgentThreadSpawned skeleton — pending messages visible before 
   });
 
   it('pending messages make hasContent=true even with eventsLoaded=false', () => {
-    // CodingAgentThreadSpawned creates thread with eventsLoaded=false and transfers
-    // pendingUserMessages. Content should be visible while DB events load.
+    // A send's optimistic row can sit on a thread whose events are still
+    // loading. It must show while they load.
     const thread = makeThread('cc-spawn-1', {
       eventsLoaded: false,
       meta: { channel: 'claude_code' } as any,

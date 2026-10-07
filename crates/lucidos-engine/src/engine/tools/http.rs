@@ -78,6 +78,7 @@ impl LucidosEngine {
     pub(crate) async fn execute_http_tool(
         &self,
         args: &serde_json::Value,
+        thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let method = args["method"].as_str().unwrap_or("GET");
         let url = args["url"].as_str().unwrap_or("");
@@ -421,6 +422,7 @@ impl LucidosEngine {
                         &format!("HTTP response: {}", artifact_path),
                         WriteAnnouncement::Entity {
                             source: Some("http_request".to_string()),
+                            writer_thread_id: Some(thread_id),
                         },
                     )
                     .await?;

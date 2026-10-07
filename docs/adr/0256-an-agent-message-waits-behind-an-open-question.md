@@ -70,7 +70,7 @@ lost.
 ## Consequences
 
 - A parent's follow-up, or any other agent-sent message, no longer destroys the
-  user's question. The transcript shows it as "Held until you reply".
+  user's question. The transcript shows it dimmed, as not delivered yet.
 - A human message is unaffected. One that can answer the question answers it.
   One on an overtaken question supersedes it, per ADR 0082.
 - An agent message on an overtaken question still supersedes it. Nothing is

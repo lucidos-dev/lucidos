@@ -185,6 +185,9 @@ fn catalog_plugin(
         app_id: None,
         modified: false,
         modified_paths: vec![],
+        engine_requirement: None,
+        engine_compatible: true,
+        engine_incompatible_reason: None,
     }
 }
 
@@ -221,12 +224,146 @@ fn update_candidates_returns_newest_update_per_plugin() {
         errors: vec![],
     };
 
-    let candidates = update_candidates(&catalog);
+    let candidates = update_candidates(&catalog, &Ok(semver::Version::new(0, 46, 1)));
 
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].id, "browser-learning");
     assert_eq!(candidates[0].version, "0.2.0");
     assert_eq!(candidates[0].marketplace_id, "community");
+}
+
+fn requiring(mut plugin: MarketplacePlugin, engine: &str) -> MarketplacePlugin {
+    plugin.manifest["engine"] = serde_json::json!(engine);
+    plugin
+}
+
+/// No "update available" notification for a version this release cannot
+/// install. A lower version it can install still counts.
+#[test]
+fn update_candidates_skip_a_version_the_running_release_cannot_install() {
+    let catalog = MarketplaceCatalog {
+        marketplaces: vec![],
+        plugins: vec![
+            catalog_plugin(
+                "theme-studio",
+                "0.1.1",
+                MarketplacePluginStatus::UpdateAvailable,
+                "core",
+            ),
+            requiring(
+                catalog_plugin(
+                    "theme-studio",
+                    "0.2.0",
+                    MarketplacePluginStatus::UpdateAvailable,
+                    "community",
+                ),
+                ">=0.99.0",
+            ),
+            requiring(
+                catalog_plugin(
+                    "needs-newer",
+                    "0.2.0",
+                    MarketplacePluginStatus::UpdateAvailable,
+                    "core",
+                ),
+                ">=0.99.0",
+            ),
+        ],
+        errors: vec![],
+    };
+
+    let on_046 = update_candidates(&catalog, &Ok(semver::Version::new(0, 46, 1)));
+    assert_eq!(on_046.len(), 1);
+    assert_eq!(on_046[0].id, "theme-studio");
+    assert_eq!(on_046[0].version, "0.1.1");
+
+    let on_099 = update_candidates(&catalog, &Ok(semver::Version::new(0, 99, 0)));
+    let versions: Vec<(&str, &str)> = on_099
+        .iter()
+        .map(|p| (p.id.as_str(), p.version.as_str()))
+        .collect();
+    assert_eq!(
+        versions,
+        vec![("needs-newer", "0.2.0"), ("theme-studio", "0.2.0")]
+    );
+}
+
+#[test]
+fn engine_compatibility_overlay_fills_the_catalog_row_fields() {
+    let row = |status| {
+        requiring(
+            catalog_plugin("theme-studio", "0.1.0", status, "core"),
+            ">=0.46.1",
+        )
+    };
+    let mut catalog = MarketplaceCatalog {
+        marketplaces: vec![],
+        plugins: vec![
+            row(MarketplacePluginStatus::Available),
+            catalog_plugin("plain", "0.1.0", MarketplacePluginStatus::Available, "core"),
+        ],
+        errors: vec![],
+    };
+
+    apply_engine_compatibility_to_catalog(&mut catalog, &Ok(semver::Version::new(0, 46, 0)));
+    let blocked = &catalog.plugins[0];
+    assert_eq!(blocked.engine_requirement.as_deref(), Some(">=0.46.1"));
+    assert!(!blocked.engine_compatible);
+    assert_eq!(
+        blocked.engine_incompatible_reason.as_deref(),
+        Some("Needs Lucidos 0.46.1 or later")
+    );
+    let plain = &catalog.plugins[1];
+    assert_eq!(plain.engine_requirement, None);
+    assert!(plain.engine_compatible);
+    assert_eq!(plain.engine_incompatible_reason, None);
+
+    // The same rows re-served by a newer engine flip back, so a verdict stored
+    // in the cache can never outlive an upgrade.
+    apply_engine_compatibility_to_catalog(&mut catalog, &Ok(semver::Version::new(0, 46, 1)));
+    assert!(catalog.plugins[0].engine_compatible);
+    assert_eq!(catalog.plugins[0].engine_incompatible_reason, None);
+}
+
+#[test]
+fn engine_compatibility_fields_are_on_the_wire() {
+    let mut plugin = requiring(
+        catalog_plugin(
+            "theme-studio",
+            "0.1.0",
+            MarketplacePluginStatus::Available,
+            "core",
+        ),
+        ">=0.46.1",
+    );
+    apply_engine_compatibility(&mut plugin, &Ok(semver::Version::new(0, 46, 0)));
+    let wire = serde_json::to_value(&plugin).unwrap();
+    assert_eq!(wire["engine_requirement"], ">=0.46.1");
+    assert_eq!(wire["engine_compatible"], false);
+    assert_eq!(
+        wire["engine_incompatible_reason"],
+        "Needs Lucidos 0.46.1 or later"
+    );
+}
+
+/// A row with no `engine` carries no `engine_requirement`, and still installs.
+/// A malformed value counts as declared, so it is refused and never shown as
+/// "no version requirement".
+#[test]
+fn engine_requirement_is_absent_only_when_the_manifest_declares_none() {
+    let running = Ok(semver::Version::new(0, 46, 0));
+    let mut undeclared =
+        catalog_plugin("plain", "0.1.0", MarketplacePluginStatus::Available, "core");
+    apply_engine_compatibility(&mut undeclared, &running);
+    let wire = serde_json::to_value(&undeclared).unwrap();
+    assert!(wire.get("engine_requirement").is_none(), "got {wire}");
+    assert_eq!(wire["engine_compatible"], true);
+
+    let mut malformed = catalog_plugin("typo", "0.1.0", MarketplacePluginStatus::Available, "core");
+    malformed.manifest["engine"] = serde_json::json!(46);
+    apply_engine_compatibility(&mut malformed, &running);
+    assert_eq!(malformed.engine_requirement.as_deref(), Some("46"));
+    assert!(!malformed.engine_compatible);
 }
 
 /// Install state is live, never cached. The *plugin catalog cache* holds rows
@@ -256,6 +393,9 @@ mod installed_state_overlay {
             app_id: None,
             modified: false,
             modified_paths: vec![],
+            engine_requirement: None,
+            engine_compatible: true,
+            engine_incompatible_reason: None,
         }
     }
 
@@ -271,6 +411,7 @@ mod installed_state_overlay {
             files: vec![],
             modified: true,
             modified_paths: vec!["apps/an-app/index.html".to_string()],
+            engine_requirement: None,
         }
     }
 

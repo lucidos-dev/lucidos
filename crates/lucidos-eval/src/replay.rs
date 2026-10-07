@@ -12,6 +12,7 @@
 //! `--raw` prints the capture's payload JSON. Everything else is a rendering,
 //! and a rendering can be wrong where the bytes cannot.
 
+use lucidos_engine::core::prefs;
 use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -165,9 +166,11 @@ pub fn print_rounds(label: &str, rounds: &[Round], options: &Options) {
 
 /// Why a thread might hold no captured round at all.
 fn nothing_captured() -> String {
-    "no captured rounds. Either the thread never reached the model, or the arm ran without \
-     the `capture_context` preference, which leaves every section body empty."
-        .to_string()
+    format!(
+        "no captured rounds. Either the thread never reached the model, or the arm ran without \
+         the `{}` preference, which leaves every section body empty.",
+        prefs::CAPTURE_CONTEXT.key()
+    )
 }
 
 fn print_round(label: &str, round: &Round, options: &Options) {
@@ -249,8 +252,8 @@ fn print_section(section: &Section, only: Option<&str>) {
         (Some(body), true) => println!("{body}"),
         (Some(body), false) if only.is_none() => println!("      {}", preview(body)),
         (None, true) => println!(
-            "      no body: this arm ran without the full capture, or without \
-             `capture_context`"
+            "      no body: this arm ran without the full capture, or without `{}`",
+            prefs::CAPTURE_CONTEXT.key()
         ),
         _ => {}
     }
@@ -440,7 +443,7 @@ mod tests {
 
     #[test]
     fn an_empty_thread_says_why_rather_than_printing_nothing() {
-        assert!(nothing_captured().contains("capture_context"));
+        assert!(nothing_captured().contains(prefs::CAPTURE_CONTEXT.key()));
     }
 
     /// Only the three that answer a request. A capture on the same thread is

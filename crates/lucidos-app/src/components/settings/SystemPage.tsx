@@ -51,7 +51,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { BackupSection } from './BackupSection';
 import { InstallsSection } from './InstallsSection';
 import { DiskUsagePage } from './DiskUsagePage';
-import { MemoryInspector } from './MemoryInspector';
+import { MemoryPage } from './MemoryPage';
 import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
 import { DebuggingSection } from './DebuggingSection';
 import { CommunicationSurfacesPage } from './CommunicationSurfacesPage';
@@ -191,7 +191,7 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
       case 'whats-new': return <WhatsNewPage />;
       case 'thread-queue': return <ThreadQueueView />;
       case 'backup': return <BackupSection />;
-      case 'memory': return <MemoryInspector />;
+      case 'memory': return <MemoryPage />;
       case 'disk-usage': return <DiskUsagePage />;
       case 'environment-variables': return <EnvironmentVariablesPage />;
       case 'debugging': return <DebuggingSection />;

@@ -50,7 +50,7 @@ pub mod executor;
 pub use executor::{ExecutableEntry, ThreadQueueExecutor};
 pub use policy::{
     AdmissionCounts, AdmissionDecision, CapacityPolicy, OverflowPolicy, ThreadQueueKind,
-    DEFAULT_MAX_EVENT_TRIGGER_DEPTH,
+    DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD, DEFAULT_MAX_EVENT_TRIGGER_DEPTH,
 };
 pub(crate) use request::truncate_summary;
 pub use request::ThreadQueueRequest;
@@ -1510,7 +1510,14 @@ impl ThreadQueue {
             crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
                 .scope(depth, async move { executor.execute(executable).await }),
         );
+        // Lives in the joiner, which outlasts the work whether it returns,
+        // fails or panics. A script trigger has no chat turn of its own.
+        let awake = crate::core::keep_awake::hold(
+            crate::core::keep_awake::Work::QueueEntry,
+            entry_id.to_string(),
+        );
         tokio::spawn(async move {
+            let _awake = awake;
             if let Err(join_err) = work.await {
                 if join_err.is_panic() {
                     log!(

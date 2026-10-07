@@ -566,7 +566,7 @@ fn test_describe_grouped_tools_by_action() {
     assert_eq!(
         describe_tool(
             "preferences",
-            &serde_json::json!({ "action": "set", "key": "theme-mode" })
+            &serde_json::json!({ "action": "set", "key": crate::core::prefs::THEME_MODE.key() })
         ),
         "Updating theme-mode setting..."
     );
@@ -699,7 +699,8 @@ fn every_known_tool_name_has_a_step_label() {
     for tool in crate::llm::tools::get_default_tools(&crate::llm::ToolCapabilities::all_open()) {
         names.insert(tool.name);
     }
-    for tool in crate::capability_manifest::llm_tools() {
+    for tool in crate::capability_manifest::llm_tools_for(&crate::llm::ToolCapabilities::all_open())
+    {
         names.insert(tool.name);
     }
     for domain in crate::capability_manifest::domains() {

@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
+use crate::core::prefs;
 use crate::llm::ToolCapabilities;
 
 /// The memory-recall section's name, as the prompt and the capture both spell
@@ -57,11 +58,6 @@ pub(crate) const TODO_TOOL_REFUSAL: &str =
      list lives under a [TODO] heading inside your [WORKING UNDERSTANDING] \
      block. Write the whole list there, in the same reply as your next tool \
      call. It reaches the same prompt bar the user watches.";
-
-/// How long a result gets before a sweep may take it, by default.
-pub const DEFAULT_EXPIRE_AFTER_ROUNDS: usize = 5;
-/// How often the sweep runs, by default.
-pub const DEFAULT_SWEEP_EVERY_ROUNDS: usize = 10;
 
 /// A ceiling on both numbers, so a mistyped preference cannot make
 /// [`SweepSchedule::leaves_at`] walk forever.
@@ -111,8 +107,16 @@ pub(crate) struct SweepSchedule {
 }
 
 impl Default for SweepSchedule {
+    /// The catalog defaults of the two schedule preferences.
     fn default() -> Self {
-        Self::new(DEFAULT_EXPIRE_AFTER_ROUNDS, DEFAULT_SWEEP_EVERY_ROUNDS)
+        Self::new(
+            prefs::SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS
+                .default_number()
+                .round() as usize,
+            prefs::SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS
+                .default_number()
+                .round() as usize,
+        )
     }
 }
 
