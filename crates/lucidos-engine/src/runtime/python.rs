@@ -1,0 +1,1085 @@
+use crate::core::sanitize_for_jsonb;
+use crate::core::shell::{finalize_stream, KEPT_BYTES_CAP};
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Hard wall-clock ceiling for ONE synchronous Python child, shared by the
+/// `run_python` tool (via `execute_staged`) and by an in-place script run
+/// (`execute_file_with_env`).
+///
+/// Deliberately read from `llm::tools::MAX_TIMEOUT_SECS` rather than restated,
+/// because that constant is already the documented number: three sibling tool
+/// descriptions in `llm/tools/exec.rs` and `system-knowhow/running-python.md`
+/// all quote "run_python's 300s sync ceiling". Until this was wired the
+/// promise was fiction. The synchronous python path had no timeout at all, so
+/// a script with an infinite loop ran at 100% CPU until a human noticed and
+/// killed the OS process by hand. `run_bash` (`engine::tools::bash`) and the
+/// scheduled `.sh` path (`engine_impl::scripts`) already spend exactly this
+/// budget, enforced exactly this way.
+///
+/// The ceiling covers the CHILD only. `ensure_venv` and `ensure_packages` are
+/// awaited before the spawn, so a cold first-run venv creation or a large pip
+/// install never eats a script's budget. Neither of those is bounded here on
+/// purpose: a legitimate `torch` install routinely outruns 300s, and killing
+/// it would break setup rather than a runaway.
+const EXECUTION_TIMEOUT_SECS: u64 = crate::llm::tools::MAX_TIMEOUT_SECS;
+
+/// How long a run's exhaust dir survives before the next `PythonRuntime::new`
+/// reclaims it.
+///
+/// A sweep is needed at all because nothing else prunes the sink: a one-minute
+/// script trigger mints 1,440 dirs a day and the volume fills with no warning.
+/// A blanket wipe is the wrong sweep, because `system-knowhow/running-python.md`
+/// points debugging at `.lucidos/exhaust/<run_id>/stderr.txt`.
+///
+/// Seven days keeps that affordance for the Friday failure a user reads on
+/// Monday. It caps the same trigger near 10,000 dirs instead of 525,000 a year.
+const EXHAUST_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Python bootstrap module dropped into the venv's `site-packages/` as
+/// `_lucidos_agent_origin.py` by `PythonRuntime::install_agent_origin_shim`,
+/// loaded via a sibling `_lucidos_agent_origin.pth` whose single line is
+/// `import _lucidos_agent_origin`. The `.pth` `import` line runs during
+/// `site` startup (before any user code in `run_python` /
+/// `run_python_background`).
+///
+/// Why a `.pth` import and NOT `sitecustomize.py`: CPython imports only the
+/// FIRST module named `sitecustomize` on `sys.path`, and Homebrew's
+/// `python@3.x` ships its own `sitecustomize.py` in the stdlib dir (it
+/// shuffles `sys.path`), which sits *earlier* than the venv's site-packages.
+/// A venv `sitecustomize.py` is therefore silently shadowed on every Homebrew
+/// Python — so the token never got forwarded and `urllib` calls landed as
+/// `Api{Human}` ("You") instead of `Lucidos Agent`. `.pth` files are
+/// different: `site` execs the `import` line of EVERY `.pth` in each site dir,
+/// so a uniquely-named module can never be shadowed by a competing
+/// `sitecustomize`. (Verified against Homebrew Python 3.14.)
+///
+/// What it does: monkey-patches `http.client.HTTPConnection.request` to
+/// attach the engine's thread-bound origin token
+/// (`x-lucidos-agent-origin-token`) on outbound HTTPS/HTTP requests that
+/// target `localhost:LUCIDOS_API_PORT`. That one header carries both facts
+/// the engine needs, because the token names the spawning thread. Since
+/// `urllib`, `requests`, and `urllib3` all route through `http.client`
+/// underneath, a single patch covers every common HTTP client library.
+///
+/// Why monkey-patch and not a Session/opener: the LLM-written agent script
+/// in the original incident did `urllib.request.urlopen(req, ...)` directly,
+/// not via a Lucidos-provided helper. We patch the layer they cannot avoid.
+///
+/// Gate is strict: token AND port both required, host must be one of
+/// `localhost`/`127.0.0.1`/`::1`, port must match `LUCIDOS_API_PORT`. Pip
+/// installs to PyPI (different host), any localhost service on a different
+/// port, and Tauri installs (no `LUCIDOS_API_PORT`) are all untouched.
+const AGENT_ORIGIN_SHIM_PY: &str = r#"# Lucidos venv bootstrap — auto-attribution for engine HTTP callbacks.
+#
+# Loaded at interpreter startup via a sibling _lucidos_agent_origin.pth
+# (`import _lucidos_agent_origin`) — NOT as sitecustomize.py, which Homebrew
+# Python shadows with its own. Patches http.client so that any
+# urllib / requests / urllib3 / http.client call from a Lucidos-spawned
+# subprocess (run_python, run_python_background, scheduled script, ...) to
+# the engine's API port automatically carries the thread-bound agent-origin
+# token. That one token is the whole contract: the engine reads the spawning
+# thread off the token itself, so nothing here has to name it. Without the
+# shim, raw urllib.request.urlopen("https://
+# localhost:PORT/api/v1/changes/<id>/apply") lands as Api{Human} in the
+# events table and the timeline renders the action as "You" instead of
+# "Lucidos Agent".
+#
+# Inert (no patch installed) if LUCIDOS_AGENT_ORIGIN_TOKEN or
+# LUCIDOS_API_PORT is missing. See crates/lucidos-engine/src/api/actor.rs
+# for the engine-side token resolution and crates/lucidos-cli/src/http.rs
+# for the parallel CLI implementation.
+import os as _os
+
+_TOKEN = _os.environ.get("{ENV_AGENT_ORIGIN_TOKEN}")
+_PORT = _os.environ.get("LUCIDOS_API_PORT")
+
+if _TOKEN and _PORT:
+    import http.client as _http_client
+
+    _HEADER_TOKEN = "{HEADER_AGENT_ORIGIN_TOKEN}"
+    _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+    _orig_request = _http_client.HTTPConnection.request
+
+    def _targets_engine(conn):
+        try:
+            host = (conn.host or "").lower()
+            port = str(conn.port or "")
+        except Exception:
+            return False
+        return host in _LOCAL_HOSTS and port == _PORT
+
+    def _request_with_token(self, method, url, body=None, headers=None, *args, **kwargs):
+        if headers is None:
+            headers = {}
+        # Caller may pass a dict OR an iterable of (k, v) pairs — http.client
+        # accepts both. Normalise to a dict so we can do case-insensitive
+        # "is this header already set" checks without mutating the caller's
+        # object.
+        if not isinstance(headers, dict):
+            try:
+                headers = dict(headers)
+            except Exception:
+                # Opaque headers (e.g. HTTPMessage) — leave them alone; the
+                # caller knows what it's doing.
+                return _orig_request(self, method, url, body, headers, *args, **kwargs)
+        else:
+            headers = dict(headers)
+        if _targets_engine(self):
+            present = {k.lower() for k in headers}
+            if _HEADER_TOKEN not in present:
+                headers[_HEADER_TOKEN] = _TOKEN
+        return _orig_request(self, method, url, body, headers, *args, **kwargs)
+
+    _http_client.HTTPConnection.request = _request_with_token
+"#;
+
+/// The shim as written to disk, with the engine's own env-var and header names
+/// spliced in. Python cannot import them, so each `{NAME}` placeholder stands
+/// for the `api::actor` constant of that name.
+fn agent_origin_shim_py() -> String {
+    use crate::api::actor::{ENV_AGENT_ORIGIN_TOKEN, HEADER_AGENT_ORIGIN_TOKEN};
+    AGENT_ORIGIN_SHIM_PY
+        .replace("{ENV_AGENT_ORIGIN_TOKEN}", ENV_AGENT_ORIGIN_TOKEN)
+        .replace("{HEADER_AGENT_ORIGIN_TOKEN}", HEADER_AGENT_ORIGIN_TOKEN)
+}
+
+pub struct PythonRuntime {
+    workspace_path: PathBuf,
+    exhaust_path: PathBuf,
+    venv_path: PathBuf,
+    python_bin: PathBuf,
+    /// Hard ceiling every synchronous child is bounded by, see
+    /// [`EXECUTION_TIMEOUT_SECS`]. A field rather than a call-site argument
+    /// because both callers get the same budget; a caller that ever needs a
+    /// different one threads it in here rather than opting out.
+    execution_timeout: Duration,
+}
+
+impl PythonRuntime {
+    /// Build the Python runtime rooted at the canonicalized `workspace_path`.
+    /// Returns `Err` if canonicalization fails — a missing or unreadable
+    /// workspace at boot must surface as engine-startup failure.
+    ///
+    /// Two sweeps run here. `.lucidos/staging` is wiped, and `.lucidos/exhaust`
+    /// loses every run dir past `EXHAUST_RETENTION`.
+    pub fn new(workspace_path: PathBuf) -> Result<Self, String> {
+        let workspace_path = workspace_path.canonicalize().map_err(|e| {
+            format!(
+                "PythonRuntime: failed to canonicalize workspace path {}: {}",
+                workspace_path.display(),
+                e
+            )
+        })?;
+        let exhaust_path = workspace_path.join(".lucidos").join("exhaust");
+        if let Err(e) = fs::create_dir_all(&exhaust_path) {
+            log!(
+                "[Python] Failed to create exhaust dir at {}: {}",
+                exhaust_path.display(),
+                e
+            );
+        }
+        // The staging sweep below wipes its tree wholesale. A run dir is a
+        // documented debugging affordance, so it ages out instead.
+        Self::sweep_stale_run_dirs(&exhaust_path);
+
+        // Clean up orphaned staging dirs from previous crashed runs
+        let staging_root = workspace_path.join(".lucidos/staging");
+        if staging_root.exists() {
+            if let Err(e) = fs::remove_dir_all(&staging_root) {
+                log!(
+                    "[Python] Failed to clean up orphaned staging dir {}: {}",
+                    staging_root.display(),
+                    e
+                );
+            }
+        }
+
+        let venv_path = workspace_path.join(".lucidos/runtime/python/venv");
+        let python_bin = venv_path.join("bin/python");
+
+        Ok(Self {
+            workspace_path,
+            exhaust_path,
+            venv_path,
+            python_bin,
+            execution_timeout: Duration::from_secs(EXECUTION_TIMEOUT_SECS),
+        })
+    }
+
+    /// Reclaim every run dir past `EXHAUST_RETENTION`. Runs once per engine
+    /// start, so the whole cost is one `read_dir` of the exhaust root.
+    ///
+    /// Destructive, so it deletes only what it can prove is a spent run dir: a
+    /// real directory, named by the UUID `new_run_dir` mints, with a
+    /// readable mtime past the window. `file_type` reports a symlink without
+    /// following it, so a link planted here is never a delete of its target.
+    /// Anything the probe cannot answer is kept, because an unreadable entry is
+    /// not evidence of an expired one.
+    fn sweep_stale_run_dirs(exhaust_path: &std::path::Path) {
+        let Ok(entries) = fs::read_dir(exhaust_path) else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let named_by_run_id = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| uuid::Uuid::parse_str(name).is_ok());
+            if !named_by_run_id || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            // An mtime in the future yields `Err` and keeps the dir, which is
+            // the safe side of a clock that jumped.
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
+            if age <= EXHAUST_RETENTION {
+                continue;
+            }
+            let path = entry.path();
+            if let Err(e) = fs::remove_dir_all(&path) {
+                log!(
+                    "[Python] Failed to reclaim stale exhaust dir {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    /// Shorten the hard ceiling. Test-only: the regression coverage for the
+    /// timeout has to prove the child dies, and waiting 300 real seconds per
+    /// assertion is not a suite anyone runs.
+    #[cfg(test)]
+    pub(crate) fn with_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.execution_timeout = timeout;
+        self
+    }
+
+    /// Path to the venv-rooted Python interpreter. The file only exists
+    /// after `ensure_venv()` has run successfully; in-process callers that
+    /// hand this off to a subprocess (e.g. `run_python_background` shelling
+    /// out via `BackgroundBashRegistry::spawn`) MUST `ensure_venv().await`
+    /// first so the binary is present before spawn time.
+    pub fn python_bin(&self) -> &std::path::Path {
+        &self.python_bin
+    }
+
+    /// Create the venv if it doesn't already exist. Called lazily on first
+    /// execution by `run_script` and `ensure_packages`; also called
+    /// directly by `run_python_background` before handing the venv-rooted
+    /// python invocation to the background bash registry.
+    pub async fn ensure_venv(&self) -> Result<(), String> {
+        if self.python_bin.exists() {
+            // Always re-install the agent-origin shim even on a pre-existing
+            // venv — a Lucidos upgrade that changes the bootstrap (e.g. new
+            // header, tightened gate, the sitecustomize→.pth migration) must
+            // reach existing installs without forcing users to delete
+            // `.lucidos/runtime/python`.
+            self.install_agent_origin_shim()?;
+            return Ok(());
+        }
+
+        log!(
+            "[Python] Creating virtual environment at {}",
+            self.venv_path.display()
+        );
+
+        let parent = self
+            .venv_path
+            .parent()
+            .ok_or_else(|| format!("venv path has no parent: {}", self.venv_path.display()))?;
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+
+        let output = tokio::process::Command::new("python3")
+            .args(["-m", "venv", self.venv_path.to_string_lossy().as_ref()])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map_err(|e| format!("Failed to create venv: {}", e))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "Failed to create venv:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        log!("[Python] Virtual environment created");
+        self.install_agent_origin_shim()?;
+        Ok(())
+    }
+
+    /// Drop the agent-origin shim into the venv's `site-packages/` so every
+    /// Python invocation rooted in this venv (run_python, run_python_background,
+    /// any user script that imports tooling) auto-forwards the engine's
+    /// agent-origin token + spawning thread id on HTTP requests aimed at the
+    /// engine API.
+    ///
+    /// Two files, side by side in `site-packages/`:
+    ///   - `_lucidos_agent_origin.py`, the shim (`agent_origin_shim_py`).
+    ///   - `_lucidos_agent_origin.pth` — one line, `import _lucidos_agent_origin`.
+    ///
+    /// The `.pth` is what makes this load. We deliberately do NOT use
+    /// `sitecustomize.py`: CPython imports only the first `sitecustomize` on
+    /// `sys.path`, and Homebrew's `python@3.x` ships its own in the stdlib dir
+    /// (earlier on the path), silently shadowing a venv copy — which is exactly
+    /// why `urllib` calls were landing as "You" on Homebrew machines. `site`
+    /// execs the `import` line of every `.pth`, so a uniquely-named module can
+    /// never be shadowed.
+    ///
+    /// Without this, the LLM-driven `urllib.request.urlopen(
+    /// "https://localhost:PORT/api/v1/changes/<id>/apply")` call lands as
+    /// `Api { mode: Human }` and the timeline renders the apply as "You" —
+    /// the original incident from `dec8a433-…` that motivated this fix.
+    /// The `lucidos` CLI already forwards the same headers via
+    /// `crates/lucidos-cli/src/http.rs`; this brings raw `urllib` / `requests`
+    /// / `http.client` callers up to the same standard with no agent code
+    /// change.
+    ///
+    /// Re-written on every `ensure_venv()` so a Lucidos upgrade that changes
+    /// the bootstrap takes effect on next run without `rm -rf .lucidos/runtime`.
+    /// Inert when `LUCIDOS_AGENT_ORIGIN_TOKEN` or `LUCIDOS_API_PORT` are unset
+    /// at script-startup time — pip installs to PyPI (different host) and any
+    /// non-engine localhost call are never touched.
+    fn install_agent_origin_shim(&self) -> Result<(), String> {
+        let lib_dir = self.venv_path.join("lib");
+        let read_dir = fs::read_dir(&lib_dir)
+            .map_err(|e| format!("read venv lib dir {}: {}", lib_dir.display(), e))?;
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let is_python_subdir = path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("python"));
+            if !is_python_subdir {
+                continue;
+            }
+            let site_packages = path.join("site-packages");
+            if site_packages.is_dir() {
+                let module = site_packages.join("_lucidos_agent_origin.py");
+                fs::write(&module, agent_origin_shim_py())
+                    .map_err(|e| format!("write {}: {}", module.display(), e))?;
+                // `.pth` lines that start with `import` are exec'd by `site`
+                // for every `.pth` in the dir — not subject to the single
+                // `sitecustomize` name shadow.
+                let pth = site_packages.join("_lucidos_agent_origin.pth");
+                fs::write(&pth, "import _lucidos_agent_origin\n")
+                    .map_err(|e| format!("write {}: {}", pth.display(), e))?;
+                // Remove any stale sitecustomize.py from a pre-.pth install so
+                // we don't leave a shadowed, misleading copy behind.
+                let _ = fs::remove_file(site_packages.join("sitecustomize.py"));
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "no `pythonX.Y/site-packages` under {}",
+            lib_dir.display()
+        ))
+    }
+
+    /// Fresh per-run directory under `.lucidos/exhaust/` — the audit sink for
+    /// this run's `stdout.txt` / `stderr.txt` (and, for string-code runs, the
+    /// `script.py` copy itself).
+    fn new_run_dir(&self) -> Result<PathBuf, String> {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let task_dir = self.exhaust_path.join(&task_id);
+        fs::create_dir_all(&task_dir).map_err(|e| e.to_string())?;
+        Ok(task_dir)
+    }
+
+    /// Shared execution core: writes preamble + user code to a script, runs it, returns output.
+    /// The preamble is empty for `execute_with_env` (no monkey-patching) and the staging-redirect
+    /// `builtins.open` shim for `execute_staged`. Scripts run with full host write access — the
+    /// previous outside-workspace write-guard was removed for consistency with `run_bash`,
+    /// `run_bash_background`, and `run_python_background`, none of which sandbox writes.
+    ///
+    /// This is the *string-code* path (`run_python`, via `execute_staged`),
+    /// where the LLM supplies code that has no home on disk — so the copy under
+    /// `<exhaust>/<uuid>/script.py` IS the script and `__file__` legitimately
+    /// points there. (`run_python_background` doesn't come through here; it
+    /// writes its own copy under the same exhaust layout and hands the
+    /// invocation to `BackgroundBashRegistry::spawn`.) A script that already
+    /// exists on disk must go through `execute_file_with_env` instead.
+    async fn run_script(
+        &self,
+        preamble: &str,
+        code: &str,
+        env_vars: Vec<(String, String)>,
+    ) -> Result<String, String> {
+        self.ensure_venv().await?;
+        let run_dir = self.new_run_dir()?;
+
+        let full_code = format!("{}\n{}", preamble, code);
+        let script_path = run_dir.join("script.py");
+        fs::write(&script_path, &full_code).map_err(|e| e.to_string())?;
+
+        self.spawn_python(&script_path, &run_dir, env_vars).await
+    }
+
+    /// Execute an EXISTING Python file **in place**, from its real on-disk path.
+    ///
+    /// This is the path for a *script* — code that already lives on disk beside
+    /// its consumer, invoked by a script trigger's
+    /// `run = { type = "script", path = "triggers/<slug>/scripts/run.py" }`.
+    /// The difference from `run_script` is the whole point: the interpreter
+    /// reads the code from where the human wrote it, so `__file__` resolves to
+    /// the real file and a script can reach its siblings the ordinary way
+    /// (`os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "state")`).
+    /// Running a copy out of the exhaust dir silently redirects every such path
+    /// into a phantom `.lucidos/exhaust/...` directory — reads return defaults,
+    /// writes land where nobody looks, and nothing errors. That is exactly how
+    /// the 2026-07-29 `notary-verdict-watch` trigger missed the user's DMG
+    /// approval while the approval sat in the real `state/` dir.
+    ///
+    /// Identical to `run_script` in every other respect (venv, cwd, kill_on_drop,
+    /// env, output sanitizing, exhaust audit logs, error shaping).
+    pub async fn execute_file_with_env(
+        &self,
+        script_path: &std::path::Path,
+        env_vars: Vec<(String, String)>,
+    ) -> Result<String, String> {
+        self.ensure_venv().await?;
+        let run_dir = self.new_run_dir()?;
+        self.spawn_python(script_path, &run_dir, env_vars).await
+    }
+
+    /// Spawn `python <script_path>` in the workspace, capture output, drop the
+    /// audit logs in `run_dir`, and shape a non-zero exit into an `Err`.
+    /// `script_path` is either the exhaust copy written by `run_script` or an
+    /// on-disk script run in place (`execute_file_with_env`) — the spawn is the
+    /// same either way, only the provenance of the file differs.
+    ///
+    /// Bounded by `self.execution_timeout` ([`EXECUTION_TIMEOUT_SECS`]). Both
+    /// callers get the ceiling: an unbounded trigger script is the same hazard
+    /// as an unbounded `run_python`, and the `.sh` half of the very same
+    /// scheduled-script dispatch has spent a 300s budget all along.
+    ///
+    /// An expiry is shaped into the ordinary `Err` a crash produces, so the
+    /// agent reads a normal failed tool result instead of watching a turn hang.
+    /// Every caller therefore takes its existing failure path unchanged, which
+    /// is what keeps `run_python`'s staging invariant intact: a timed-out run
+    /// removes its staging tree and commits nothing, exactly like a crash.
+    async fn spawn_python(
+        &self,
+        script_path: &std::path::Path,
+        run_dir: &std::path::Path,
+        env_vars: Vec<(String, String)>,
+    ) -> Result<String, String> {
+        let mut cmd = tokio::process::Command::new(&self.python_bin);
+        cmd.arg(script_path)
+            .current_dir(&self.workspace_path)
+            .stdin(std::process::Stdio::null())
+            // Three things can drop this command future:
+            // 1. The agent loop's run_tool_with_cancel wrapper on user cancel.
+            // 2. The timeout below, when the hard ceiling fires.
+            // 3. Engine shutdown.
+            // Without kill_on_drop all three leave the python child orphaned:
+            // a hung urlopen() / time.sleep() / spin loop keeps running in the
+            // background while the engine logs nothing about it. With it, the
+            // OS sends SIGKILL when the future drops, so each path reliably
+            // reaps the subprocess. The spawned Child is a local of this
+            // future, so dropping the future or returning drops the Child,
+            // which is what triggers the kill.
+            //
+            // Scope of that kill, stated because the ceiling below leans on
+            // it: SIGKILL reaches the INTERPRETER, not a process tree the
+            // script started itself. A script that shells out via
+            // `subprocess.Popen` leaves those grandchildren running, because
+            // they are not in a group we signal. The foreground exec paths
+            // (`run_bash`, the scheduled `.sh` branch and this one) share that
+            // contract. The background registry signals its task's group:
+            // a stop there is a decision to end the work (ADR 0263). ADR 0100
+            // records why `run_bash` does not. A group kill here would also
+            // need a Drop guard, not a call on one arm: `kill_on_drop` still
+            // signals only the leader on cancel and shutdown.
+            .kill_on_drop(true);
+        crate::core::apply_to_subprocess_env(&mut cmd, &env_vars);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to execute Python: {}", e))?;
+        let (stdout_pipe, stderr_pipe) = (child.stdout.take(), child.stderr.take());
+        let run = async {
+            tokio::join!(
+                read_capped(stdout_pipe, Keep::Head),
+                read_capped(stderr_pipe, Keep::Tail),
+                child.wait()
+            )
+        };
+        let ((stdout, stdout_total), (stderr, _), status) =
+            match tokio::time::timeout(self.execution_timeout, run).await {
+                Ok((out, err, Ok(status))) => (out, err, status),
+                Ok((_, _, Err(e))) => return Err(format!("Failed to execute Python: {}", e)),
+                Err(_) => return Err(self.on_execution_timeout(run_dir)),
+            };
+
+        let stdout = finalize_stream(&stdout, stdout_total);
+        let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&stderr));
+
+        if let Err(e) = fs::write(run_dir.join("stdout.txt"), &stdout) {
+            log!("[Python] Failed to write stdout debug log: {}", e);
+        }
+        if let Err(e) = fs::write(run_dir.join("stderr.txt"), &stderr) {
+            log!("[Python] Failed to write stderr debug log: {}", e);
+        }
+
+        if status.success() {
+            Ok(stdout)
+        } else {
+            // Stripping middle frames + tail-clipping pre-traceback noise
+            // keeps the LLM context lean. The kept stderr tail is on disk
+            // at exhaust_path/<task_id>/stderr.txt for debugging.
+            let trimmed = truncate_python_error(&stderr);
+            Err(format!("Python error:\n{}", trimmed))
+        }
+    }
+
+    /// Build the error a hard-ceiling expiry returns, and leave a note in the
+    /// run's exhaust dir so the audit trail says why it holds no output.
+    ///
+    /// The child is SIGKILLed when `spawn_python` returns, and its partial
+    /// stdout and stderr go with the dropped readers.
+    ///
+    /// The message names the ceiling and the escape hatch, because the moment
+    /// an agent hits this wall is exactly when it needs to know
+    /// `run_python_background` exists.
+    fn on_execution_timeout(&self, run_dir: &std::path::Path) -> String {
+        let message = format!(
+            "Python script timed out after {}s, the hard ceiling for synchronous execution. \
+             The script was killed and wrote no output. Move work that needs longer to \
+             run_python_background, which runs up to {}s.",
+            self.execution_timeout.as_secs(),
+            crate::llm::tools::BG_MAX_TIMEOUT_SECS,
+        );
+        log!("[Python] {}", message);
+        // Marked as engine-written: every other line in this file is the
+        // child's own stderr, and an empty run dir would leave a reader with
+        // no way to tell a timeout from a spawn that never happened.
+        if let Err(e) = fs::write(
+            run_dir.join("stderr.txt"),
+            format!("[lucidos] {}\n", message),
+        ) {
+            log!(
+                "[Python] Failed to write timeout note to stderr debug log: {}",
+                e
+            );
+        }
+        message
+    }
+
+    fn workspace_str_escaped(&self) -> String {
+        self.workspace_path
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+    }
+
+    /// Build preamble that redirects writes under `data/` to the staging directory and
+    /// reads from staging first (so a script can read back what it just wrote). Writes
+    /// outside `data/` go straight to the host. The staging redirect is what gives
+    /// `run_python` its atomic-commit semantics — apps see old `data/` files until the
+    /// script finishes and the engine commits the staged tree.
+    ///
+    /// The `_data_dir` prefix carries a trailing separator on purpose. Without it a
+    /// bare `startswith` also matched every SIBLING whose name merely starts with
+    /// `data` (`database.json`, `datasets/`, `data_backup/`): those writes were
+    /// diverted into staging, and since the committer only copies `<staging>/data`
+    /// before deleting the whole staging tree, they were silently discarded while the
+    /// tool still reported success.
+    ///
+    /// `_data_root` is realpath'd, exactly like the paths matched against it.
+    /// A `data` symlink onto another volume is a supported layout, and against
+    /// an unresolved root no write ever matched: every `data/` write landed on
+    /// the host, and the committer then found no staged tree to publish. The
+    /// staged layout stays `<staging>/data/<rel>` either way, which is the one
+    /// shape the committer reads back.
+    ///
+    /// The write branch seeds the staged file from the real one first. A mode
+    /// holding `w` truncates, so it is never seeded. Every other write mode
+    /// (`a`, `r+`, `x`) keeps what the file already held, and an empty staged
+    /// file loses it. The seed runs once per run: a later open must not
+    /// overwrite bytes this run already staged.
+    fn staging_preamble(&self, staging_dir: &std::path::Path) -> String {
+        let workspace = self.workspace_str_escaped();
+        let staging = staging_dir
+            .canonicalize()
+            .unwrap_or(staging_dir.to_path_buf())
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'");
+        format!(
+            "import builtins as _builtins, os as _os, shutil as _shutil\n\
+             _workspace = _os.path.realpath('{workspace}')\n\
+             _staging = _os.path.realpath('{staging}')\n\
+             _data_root = _os.path.realpath(_os.path.join(_workspace, 'data'))\n\
+             _data_dir = _data_root + _os.sep\n\
+             def _staged_path(real):\n\
+             \x20   rel = _os.path.relpath(real, _data_root)\n\
+             \x20   return _os.path.join(_staging, 'data', rel)\n\
+             def _staged_open(file, mode='r', *args, _orig=_builtins.open, **kwargs):\n\
+             \x20   if not isinstance(file, (str, bytes, _os.PathLike)):\n\
+             \x20       return _orig(file, mode, *args, **kwargs)\n\
+             \x20   real = _os.path.realpath(str(file))\n\
+             \x20   is_write = any(c in str(mode) for c in 'wxa+')\n\
+             \x20   if is_write:\n\
+             \x20       if real.startswith(_data_dir):\n\
+             \x20           staged = _staged_path(real)\n\
+             \x20           _os.makedirs(_os.path.dirname(staged), exist_ok=True)\n\
+             \x20           truncating = 'w' in str(mode)\n\
+             \x20           fresh = not _os.path.exists(staged)\n\
+             \x20           if not truncating and fresh and _os.path.exists(real):\n\
+             \x20               _shutil.copy2(real, staged)\n\
+             \x20           return _orig(staged, mode, *args, **kwargs)\n\
+             \x20   elif real.startswith(_data_dir):\n\
+             \x20       staged = _staged_path(real)\n\
+             \x20       if _os.path.exists(staged):\n\
+             \x20           return _orig(staged, mode, *args, **kwargs)\n\
+             \x20   return _orig(file, mode, *args, **kwargs)\n\
+             _builtins.open = _staged_open\n\
+             del _staged_open\n",
+            workspace = workspace,
+            staging = staging,
+        )
+    }
+
+    pub async fn execute_with_env(
+        &self,
+        code: &str,
+        env_vars: Vec<(String, String)>,
+    ) -> Result<String, String> {
+        self.run_script("", code, env_vars).await
+    }
+
+    /// Execute Python with staging: writes under data/ are redirected to the staging directory.
+    /// Reads check staging first (for files written this run), then fall through to workspace.
+    pub async fn execute_staged(
+        &self,
+        code: &str,
+        env_vars: Vec<(String, String)>,
+        staging_dir: &std::path::Path,
+    ) -> Result<String, String> {
+        fs::create_dir_all(staging_dir).map_err(|e| e.to_string())?;
+        let preamble = self.staging_preamble(staging_dir);
+        self.run_script(&preamble, code, env_vars).await
+    }
+
+    pub async fn execute(&self, code: &str) -> Result<String, String> {
+        self.execute_with_env(code, vec![]).await
+    }
+
+    /// Install multiple packages in a single pip invocation.
+    pub async fn ensure_packages(&self, packages: &[&str]) -> Result<(), String> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+        for spec in packages {
+            check_requirement_spec(spec)?;
+        }
+        self.ensure_venv().await?;
+
+        let mut args = vec!["-m", "pip", "install", "--quiet", "--"];
+        args.extend(packages);
+
+        let output = tokio::process::Command::new(&self.python_bin)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            // pip install can hang on a slow network — kill_on_drop ensures
+            // the cancel path reaps it instead of leaking the child.
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to install packages: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Failed to install packages:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+}
+
+/// Refuse a package spec that is not a plain index requirement such as
+/// `pandas`, `numpy>=1.26` or `requests[socks]`. A leading `-` is a pip flag
+/// (`--index-url`, `-r file`). A URL, a path, an archive file name or a
+/// `name @ url` reference installs code from somewhere the user never chose.
+fn check_requirement_spec(spec: &str) -> Result<(), String> {
+    const ARCHIVE_SUFFIXES: &[&str] = &[
+        ".whl",
+        ".zip",
+        ".tar.gz",
+        ".tgz",
+        ".tar.bz2",
+        ".tbz",
+        ".tar.xz",
+        ".txz",
+        ".tar.lz",
+        ".tlz",
+        ".tar.lzma",
+        ".tar",
+        ".egg",
+    ];
+    let lowered = spec.to_ascii_lowercase();
+    let plain = spec
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && !spec.contains(['@', ':', '/', '\\'])
+        && !ARCHIVE_SUFFIXES.iter().any(|ext| lowered.ends_with(ext));
+    if plain {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{spec}' is not a package name: give a PyPI name with an optional version, \
+             such as 'pandas' or 'numpy>=1.26'"
+        ))
+    }
+}
+
+/// Hard cap on lines/bytes we'll send back as a Python error. Above this,
+/// the truncator kicks in. 30 lines + 4 KB is enough room for a full
+/// 5-frame traceback, the exception line, and a couple of pre-crash
+/// stderr prints — below that, the agent rarely benefits from more
+/// context (the kept stderr tail is on disk at exhaust_path/<id>/stderr.txt
+/// either way).
+const PY_ERROR_LINE_BUDGET: usize = 30;
+const PY_ERROR_BYTE_BUDGET: usize = 4096;
+
+/// Which end of an oversized stream a reader keeps.
+#[derive(Clone, Copy)]
+enum Keep {
+    /// Stdout: the model reads from the start.
+    Head,
+    /// Stderr: a traceback always comes last.
+    Tail,
+}
+
+/// Read a pipe to EOF, keeping at most [`KEPT_BYTES_CAP`] bytes from the end
+/// `keep` names. Returns the kept bytes and how many the stream carried.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    pipe: Option<R>,
+    keep: Keep,
+) -> (Vec<u8>, u64) {
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else {
+        return (Vec::new(), 0);
+    };
+    let mut kept = Vec::new();
+    let mut total = 0u64;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n as u64;
+                match keep {
+                    Keep::Head => {
+                        let room = KEPT_BYTES_CAP.saturating_sub(kept.len());
+                        kept.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                    Keep::Tail => {
+                        kept.extend_from_slice(&chunk[..n]);
+                        if kept.len() > 2 * KEPT_BYTES_CAP {
+                            kept.drain(..kept.len() - KEPT_BYTES_CAP);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log!("[Python] Output pipe read failed: {}", e);
+                break;
+            }
+        }
+    }
+    if let Keep::Tail = keep {
+        let excess = kept.len().saturating_sub(KEPT_BYTES_CAP);
+        kept.drain(..excess);
+    }
+    (kept, total)
+}
+
+/// Strip middle frames out of a Python traceback and tail-clip
+/// pre-traceback stderr noise so the LLM-facing tool result stays
+/// useful without bloating context. Preserves: any text before the
+/// `Traceback (...)` line (up to a small cap), the traceback header,
+/// the first and last `File "..."` frames (with the indented code line
+/// below each), and the final `ExceptionClass: message` line.
+///
+/// Why this exists: a live chat agent, observed in
+/// `dev` thread `9d44e81c…`, returned 19 errors in 500 events, most of
+/// them ~30-line `ModuleNotFoundError` tracebacks dominated by
+/// interpreter / importer frames the LLM doesn't act on. Trimming the
+/// middle here cuts each error's context cost without dropping the
+/// signal (exception line + the user frame where it fired).
+pub(crate) fn truncate_python_error(stderr: &str) -> String {
+    let line_count = stderr.lines().count();
+    if line_count <= PY_ERROR_LINE_BUDGET && stderr.len() <= PY_ERROR_BYTE_BUDGET {
+        return stderr.to_string();
+    }
+    let lines: Vec<&str> = stderr.lines().collect();
+    let traceback_start = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("Traceback "));
+
+    if let Some(tb) = traceback_start {
+        // Collect File-frame indices inside the traceback.
+        let file_idxs: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(tb)
+            .filter(|(_, l)| l.trim_start().starts_with("File \""))
+            .map(|(i, _)| i)
+            .collect();
+
+        // Find the exception line: last non-empty, non-whitespace line that
+        // doesn't start with a space (frames are indented; the exception
+        // line is flush-left and looks like `ClassName: message`).
+        let exception_idx = lines
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(i, l)| {
+                *i > tb
+                    && !l.is_empty()
+                    && !l.starts_with(' ')
+                    && !l.starts_with('\t')
+                    && !l.trim_start().starts_with("File \"")
+            })
+            .map(|(i, _)| i);
+
+        if file_idxs.len() > 4 {
+            let mut out = String::new();
+            // Pre-traceback stderr noise (warnings, print(file=sys.stderr)
+            // calls) — keep the last few lines so the LLM still sees what
+            // the script logged before crashing.
+            if tb > 0 {
+                let pre_keep = tb.saturating_sub(3);
+                if pre_keep > 0 {
+                    out.push_str(&format!(
+                        "[... {} lines of pre-traceback stderr omitted ...]\n",
+                        pre_keep
+                    ));
+                }
+                for line in &lines[pre_keep..tb] {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            // Traceback header.
+            out.push_str(lines[tb]);
+            out.push('\n');
+            // First user frame + its indented code line if present.
+            let first_file = file_idxs[0];
+            out.push_str(lines[first_file]);
+            out.push('\n');
+            if let Some(code_line) = lines.get(first_file + 1) {
+                if (code_line.starts_with("    ") || code_line.starts_with("\t"))
+                    && !code_line.trim_start().starts_with("File \"")
+                {
+                    out.push_str(code_line);
+                    out.push('\n');
+                }
+            }
+            // Omitted middle.
+            let omitted = file_idxs.len() - 2;
+            out.push_str(&format!("  [... {} frames omitted ...]\n", omitted));
+            // Last user frame + its indented code line if present.
+            let last_file = *file_idxs.last().unwrap();
+            out.push_str(lines[last_file]);
+            out.push('\n');
+            if let Some(code_line) = lines.get(last_file + 1) {
+                if (code_line.starts_with("    ") || code_line.starts_with("\t"))
+                    && !code_line.trim_start().starts_with("File \"")
+                {
+                    out.push_str(code_line);
+                    out.push('\n');
+                }
+            }
+            // Exception line. `> last_file` (not `> last_file + 1`) so
+            // we still emit when Python omitted the indented source line
+            // below the last frame — frozen importlib._bootstrap frames,
+            // C-extension frames, and some re-raise paths leave the
+            // exception immediately at last_file + 1, and the code-line
+            // if-let above won't have pushed it (exception is flush-left,
+            // not indented). The two paths are mutually exclusive: at the
+            // same index, a line is either indented (code) or flush-left
+            // (exception) — never both.
+            if let Some(ex) = exception_idx {
+                if ex > last_file {
+                    out.push_str(lines[ex]);
+                    out.push('\n');
+                }
+            }
+            return out.trim_end_matches('\n').to_string();
+        }
+    }
+
+    // No traceback (or traceback was already short) — pure stderr noise
+    // overrun, e.g. a script that printed 200 progress lines before
+    // crashing. Keep the tail.
+    let drop = line_count.saturating_sub(PY_ERROR_LINE_BUDGET);
+    let mut out = String::new();
+    if drop > 0 {
+        out.push_str(&format!("[... {} lines of stderr omitted ...]\n", drop));
+    }
+    out.push_str(&lines[drop..].join("\n"));
+    out
+}
+
+#[cfg(test)]
+#[path = "python_tests.rs"]
+mod tests;
+
+/// A non-truncating write must not lose the artifact it writes into. The
+/// committer copies the staged file over the real one, so a staged file that
+/// starts empty erases whatever the artifact held.
+#[cfg(test)]
+mod staging_seed_tests {
+    use super::PythonRuntime;
+    use tempfile::tempdir;
+
+    /// An append keeps the lines the artifact already held. Without the seed the
+    /// staged file starts empty and the commit drops every earlier line.
+    #[tokio::test]
+    async fn an_append_to_an_existing_data_file_keeps_the_prior_contents() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+        std::fs::write(ws.join("data/artifacts/log.jsonl"), "one\ntwo\n").unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+        let staging = ws.join(".lucidos/staging/append-run");
+        let out = runtime
+            .execute_staged(
+                "open('data/artifacts/log.jsonl', 'a').write('three\\n')\nprint('done')",
+                vec![],
+                &staging,
+            )
+            .await
+            .expect("the append must succeed");
+        assert_eq!(out.trim(), "done");
+
+        assert_eq!(
+            std::fs::read_to_string(staging.join("data/artifacts/log.jsonl")).unwrap(),
+            "one\ntwo\nthree\n",
+            "the staged file is what the committer copies over the artifact"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("data/artifacts/log.jsonl")).unwrap(),
+            "one\ntwo\n",
+            "the real artifact stays untouched until the engine commits"
+        );
+    }
+
+    /// A `w` mode still truncates. The caller asked to discard the old bytes, so
+    /// seeding here would hand them straight back.
+    #[tokio::test]
+    async fn a_truncating_write_to_an_existing_data_file_still_truncates() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+        std::fs::write(ws.join("data/artifacts/report.csv"), "stale,rows\n1,2\n").unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+        let staging = ws.join(".lucidos/staging/truncate-run");
+        runtime
+            .execute_staged(
+                "open('data/artifacts/report.csv', 'w').write('fresh\\n')",
+                vec![],
+                &staging,
+            )
+            .await
+            .expect("the truncating write must succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(staging.join("data/artifacts/report.csv")).unwrap(),
+            "fresh\n",
+            "a 'w' mode asked for truncation, so the seed must be skipped"
+        );
+    }
+
+    /// `r+` opens for update and does not create the file. Without the seed it
+    /// raises FileNotFoundError on an artifact that plainly exists.
+    #[tokio::test]
+    async fn an_update_mode_open_reads_an_existing_data_file() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+        std::fs::write(ws.join("data/artifacts/notes.txt"), "hello\n").unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+        let staging = ws.join(".lucidos/staging/update-run");
+        let out = runtime
+            .execute_staged(
+                "with open('data/artifacts/notes.txt', 'r+') as f:\n    print(f.read().strip())",
+                vec![],
+                &staging,
+            )
+            .await
+            .expect("r+ on an existing artifact must not raise");
+
+        assert_eq!(out.trim(), "hello");
+    }
+
+    /// A script that prints far more than the model can read returns a capped,
+    /// marked head, never the whole stream.
+    #[tokio::test]
+    async fn a_huge_stdout_comes_back_capped_and_marked() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("data")).unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+        let staging = ws.join(".lucidos/staging/huge-run");
+        let out = runtime
+            .execute_staged(
+                "import sys\nsys.stdout.write('x' * 3_000_000)",
+                vec![],
+                &staging,
+            )
+            .await
+            .expect("a chatty script still succeeds");
+
+        assert!(out.len() < 200 * 1024, "returned {} bytes", out.len());
+        assert!(
+            out.ends_with("[truncated: 3000000 bytes total]"),
+            "{}",
+            &out[out.len() - 60..]
+        );
+    }
+
+    /// A traceback comes last on stderr. A script that floods stderr first
+    /// (warnings, progress bars) must still report the exception it died of.
+    #[tokio::test]
+    async fn a_traceback_after_a_stderr_flood_survives() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("data")).unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+        let staging = ws.join(".lucidos/staging/flood-run");
+        let err = runtime
+            .execute_staged(
+                "import sys\nsys.stderr.write('w' * 2_000_000)\nraise ValueError('the real cause')",
+                vec![],
+                &staging,
+            )
+            .await
+            .expect_err("the script raises");
+        assert!(
+            err.contains("the real cause"),
+            "{}",
+            &err[..err.len().min(300)]
+        );
+    }
+}

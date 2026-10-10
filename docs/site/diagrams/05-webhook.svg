@@ -1,0 +1,66 @@
+<svg class="lx-diagram" viewBox="0 0 1280 660" role="img"
+     aria-labelledby="t-hook d-hook" xmlns="http://www.w3.org/2000/svg">
+  <title id="t-hook">How an outside service reaches Lucidos</title>
+  <desc id="d-hook">A webhook is the one Lucidos surface an outside service can reach, because a service like GitHub can never pair with your network. Deliveries answer on the hook socket, a second door on the gateway with its own port and exactly one route. Every other route answers 404, so a public caller reaches no control plane and no workspace. The socket forwards the delivery to the engine byte for byte, because a signature is computed over exactly those bytes. The engine checks the delivery's token or the sender's signature, then emits the one event pinned to that webhook when you made it. A trigger reacts to that event like any other.</desc>
+  <defs>
+    <marker id="lx-arrow-o-hook" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-orange)"/>
+    </marker>
+    <marker id="lx-arrow-a-hook" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-aqua)"/>
+    </marker>
+  </defs>
+
+  <text x="24" y="42" text-anchor="start" font-size="14" font-weight="700" fill="var(--lx-orange)" letter-spacing="2">OUTSIDE YOUR NETWORK</text>
+
+  <!-- The sender. Dashed and orange, the page's mark for what sits outside. -->
+  <rect x="24" y="150" width="250" height="130" rx="14" fill="none" stroke="var(--lx-orange)" stroke-width="3" stroke-dasharray="8 8" />
+  <text x="149" y="190" text-anchor="middle" font-size="22" font-weight="600" fill="var(--lx-ink)">An outside service</text>
+  <text x="149" y="220" text-anchor="middle" font-size="16" font-weight="400" fill="var(--lx-ink-soft)">GitHub, Stripe, Slack</text>
+  <text x="149" y="246" text-anchor="middle" font-size="16" font-weight="400" fill="var(--lx-ink-soft)">it can never pair</text>
+
+  <rect x="330" y="60" width="926" height="560" rx="26" fill="var(--lx-panel)" stroke="var(--lx-line)" stroke-width="2" stroke-dasharray="9 9" />
+  <text x="362" y="42" text-anchor="start" font-size="17" font-weight="700" fill="var(--lx-ink-soft)" letter-spacing="2.5">YOUR MACHINE</text>
+
+  <path d="M 274 215 L 366 215" fill="none" stroke="var(--lx-orange)" stroke-width="3" marker-end="url(#lx-arrow-o-hook)"/>
+
+  <!-- The only door a stranger can knock on. -->
+  <rect x="372" y="150" width="372" height="130" rx="14" fill="var(--lx-orange-t)" stroke="var(--lx-orange)" stroke-width="3" />
+  <text x="558" y="196" text-anchor="middle" font-size="25" font-weight="600" fill="var(--lx-ink)">Hook socket</text>
+  <text x="558" y="226" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)">a second door on the gateway</text>
+  <text x="558" y="252" text-anchor="middle" font-size="16" font-weight="400" fill="var(--lx-ink-soft)">its own port, one route</text>
+
+  <!-- Crossed stub: the socket has no path to any of these. -->
+  <path d="M 744 215 L 756 215" fill="none" stroke="var(--lx-orange)" stroke-width="2.5" stroke-dasharray="4 4"/>
+  <path d="M 762 207 L 778 223" fill="none" stroke="var(--lx-orange)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 778 207 L 762 223" fill="none" stroke="var(--lx-orange)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 784 215 L 794 215" fill="none" stroke="var(--lx-orange)" stroke-width="2.5" stroke-dasharray="4 4"/>
+
+  <text x="1008" y="124" text-anchor="middle" font-size="13" font-weight="700" fill="var(--lx-orange)" letter-spacing="1.5">WHAT IT CANNOT REACH</text>
+  <rect x="800" y="150" width="416" height="220" rx="14" fill="none" stroke="var(--lx-orange)" stroke-width="2.5" stroke-dasharray="8 8" />
+  <text x="1008" y="194" text-anchor="middle" font-size="20" font-weight="600" fill="var(--lx-ink)">Every other route</text>
+  <text x="1008" y="218" text-anchor="middle" font-size="15" font-weight="400" fill="var(--lx-ink-soft)">404, and a wrong method too</text>
+  <text x="1008" y="258" text-anchor="middle" font-size="20" font-weight="600" fill="var(--lx-ink)">The control plane</text>
+  <text x="1008" y="282" text-anchor="middle" font-size="15" font-weight="400" fill="var(--lx-ink-soft)">where workspaces are made</text>
+  <text x="1008" y="322" text-anchor="middle" font-size="20" font-weight="600" fill="var(--lx-ink)">Your workspaces</text>
+  <text x="1008" y="346" text-anchor="middle" font-size="15" font-weight="400" fill="var(--lx-ink-soft)">no API, no files, no chat</text>
+
+  <path d="M 558 280 L 558 340" fill="none" stroke="var(--lx-orange)" stroke-width="3" marker-end="url(#lx-arrow-o-hook)"/>
+  <text x="576" y="316" text-anchor="start" font-size="15" font-weight="400" fill="var(--lx-ink-soft)">forwards it byte for byte</text>
+
+  <rect x="372" y="340" width="372" height="232" rx="14" fill="none" stroke="var(--lx-aqua)" stroke-width="3" />
+  <text x="558" y="384" text-anchor="middle" font-size="24" font-weight="600" fill="var(--lx-ink)">Engine</text>
+  <rect x="400" y="406" width="316" height="64" rx="10" fill="none" stroke="var(--lx-line)" stroke-width="2" />
+  <text x="558" y="434" text-anchor="middle" font-size="18" font-weight="500" fill="var(--lx-ink)">Checks the token</text>
+  <text x="558" y="456" text-anchor="middle" font-size="15" font-weight="400" fill="var(--lx-ink-soft)">or the sender's signature</text>
+  <rect x="400" y="486" width="316" height="64" rx="10" fill="none" stroke="var(--lx-line)" stroke-width="2" />
+  <text x="558" y="514" text-anchor="middle" font-size="18" font-weight="500" fill="var(--lx-ink)">Emits the one pinned event</text>
+  <text x="558" y="536" text-anchor="middle" font-size="15" font-weight="400" fill="var(--lx-ink-soft)">chosen when you made the webhook</text>
+
+  <path d="M 744 490 L 794 490" fill="none" stroke="var(--lx-aqua)" stroke-width="3" marker-end="url(#lx-arrow-a-hook)"/>
+  <rect x="800" y="430" width="416" height="120" rx="14" fill="none" stroke="var(--lx-aqua)" stroke-width="3" />
+  <text x="1008" y="478" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)">Your trigger reacts</text>
+  <text x="1008" y="508" text-anchor="middle" font-size="16" font-weight="400" fill="var(--lx-ink-soft)">the event is on the bus, like any other</text>
+</svg>

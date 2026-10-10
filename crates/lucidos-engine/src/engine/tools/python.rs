@@ -1,0 +1,819 @@
+use super::super::LucidosEngine;
+use super::ToolOutcome;
+use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::llm::tools::{BG_DEFAULT_TIMEOUT_SECS, BG_MAX_TIMEOUT_SECS};
+
+/// The packages a `run_python` / `run_python_background` call installs before
+/// it runs. The command guard reads the same list, so it judges what pip gets.
+pub(crate) fn requested_packages(args: &serde_json::Value) -> Vec<&str> {
+    args.get("packages")
+        .and_then(|v| v.as_array())
+        .map(|list| list.iter().filter_map(|p| p.as_str()).collect())
+        .unwrap_or_default()
+}
+
+impl LucidosEngine {
+    pub(crate) async fn execute_python_tool(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let code = args["code"].as_str().unwrap_or("");
+        let commit_message = args.get("commit_message").and_then(|v| v.as_str());
+
+        if let Err(e) = self
+            .python_runtime
+            .ensure_packages(&requested_packages(args))
+            .await
+        {
+            return Err(format!("installing packages: {}", e).into());
+        }
+
+        let env_vars = self.build_tool_env_vars(thread_id).await;
+        // Captured before the env is moved into the run. Both the output and
+        // the error below reach the `ToolResult` event verbatim. A script that
+        // echoes an injected credential would put it there for good. See
+        // `core::injected_secret_values`.
+        let secrets = crate::core::injected_secret_values(&env_vars);
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let staging_dir = self.workspace_path().join(".lucidos/staging").join(&run_id);
+
+        let output = match execute_staged_and_clean_up_on_failure(
+            &self.python_runtime,
+            code,
+            env_vars,
+            &staging_dir,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                return Err(crate::core::redact_secret_values(&e.to_string(), &secrets).into())
+            }
+        };
+
+        let data_staging = staging_dir.join("data");
+        let mut created = Vec::new();
+        let mut updated = Vec::new();
+
+        if data_staging.exists() {
+            let data_dir = self.workspace_path().join("data");
+            Self::collect_staged_files(
+                &data_staging,
+                &data_staging,
+                &data_dir,
+                &mut created,
+                &mut updated,
+            )?;
+
+            if !created.is_empty() || !updated.is_empty() {
+                for path in created.iter().chain(updated.iter()) {
+                    let src = data_staging.join(path);
+                    let dst = data_dir.join(path);
+                    if let Some(parent) = dst.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    commit_staged_file(&src, &dst).map_err(|e| {
+                        format!(
+                            "Failed to commit staged file {} -> {}: {}",
+                            src.display(),
+                            dst.display(),
+                            e
+                        )
+                    })?;
+                }
+
+                let all_paths: Vec<String> =
+                    created.iter().chain(updated.iter()).cloned().collect();
+                let message = commit_message.unwrap_or("Python script output");
+                let commit_sha = self
+                    .artifact_manager
+                    .commit_data_paths(&all_paths, message)
+                    .await
+                    .map_err(|e| format!("Git commit failed: {}", e))?;
+
+                // A script that rewrote the profile has to reach the engine's
+                // hot copy of it too, or the next chat turn renders the one
+                // loaded at startup. The content only exists on disk here: the
+                // staged file was copied into `data/` above. Ahead of the emits
+                // below, which can fail with the files already committed and
+                // would then take this refresh with them.
+                for path in created.iter().chain(updated.iter()) {
+                    if let Some(artifact_path) = path.strip_prefix("artifacts/") {
+                        self.user_profile
+                            .artifact_written_on_disk(self.workspace_path(), artifact_path)
+                            .await;
+                    }
+                }
+
+                for path in &created {
+                    self.event_bus
+                        .emit(BusEvent::System(SystemEvent::ArtifactCreated {
+                            artifact_path: path.clone(),
+                            commit: commit_sha.clone(),
+                            source: Some("run_python".to_string()),
+                            writer_thread_id: Some(thread_id),
+                        }))
+                        .await?;
+                }
+                for path in &updated {
+                    self.event_bus
+                        .emit(BusEvent::System(SystemEvent::ArtifactUpdated {
+                            artifact_path: path.clone(),
+                            commit: commit_sha.clone(),
+                            source: Some("run_python".to_string()),
+                            writer_thread_id: Some(thread_id),
+                        }))
+                        .await?;
+                }
+            }
+        }
+
+        std::fs::remove_dir_all(&staging_dir).ok();
+
+        let mut response = output;
+        if !created.is_empty() || !updated.is_empty() {
+            response.push_str("\n\n[FILES]");
+            for path in &created {
+                response.push_str(&format!("\n  created: data/{}", path));
+            }
+            for path in &updated {
+                response.push_str(&format!("\n  updated: data/{}", path));
+            }
+        }
+
+        Ok(crate::core::redact_secret_values(&response, &secrets))
+    }
+
+    /// `run_python_background(code, description, packages?, timeout_secs?)`: install
+    /// packages into the per-workspace venv, write the script to
+    /// `.lucidos/exhaust/<run_id>/script.py`, then hand a venv-rooted
+    /// `python <script>` invocation off to `BackgroundBashRegistry::spawn`.
+    /// Returns `task_id` immediately; the caller drains incremental output
+    /// through `bash_output(task_id)` and cancels via `bash_kill(task_id)` —
+    /// the same surface `run_bash_background` uses, so the LLM-facing
+    /// drain/cancel contract is identical.
+    ///
+    /// Design choices vs. the synchronous `run_python`:
+    /// - **No staging / no auto-commit.** Long-running tasks need apps to
+    ///   see partial output as it lands in `data/`. The watcher would also
+    ///   have to do git work asynchronously, which is a foot-gun if a
+    ///   multi-hour backtest produces 100 MB of CSVs. Callers commit
+    ///   explicitly via `run_bash_background` if they want git history.
+    /// - **Reuses `BackgroundBashStarted`/`BackgroundBashCompleted` events.**
+    ///   The spawn really is `bash -o pipefail -c "python <script>"`, so the bash
+    ///   audit-trail rows are accurate; the `command` field captures the
+    ///   exact python invocation. Adding parallel `BackgroundPython*`
+    ///   events would duplicate the registry, the watcher, and the
+    ///   `bash_output` fallback path for the same semantics.
+    pub(crate) async fn execute_python_background_tool(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let code = match args.get("code").and_then(|v| v.as_str()) {
+            Some(c) if !c.is_empty() => c,
+            _ => return Err("Error: code is required".to_string()),
+        };
+
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(BG_DEFAULT_TIMEOUT_SECS)
+            .min(BG_MAX_TIMEOUT_SECS);
+
+        // Ensure venv exists. `ensure_packages` would do this transitively
+        // when `packages` is non-empty, but a script with zero declared
+        // packages (e.g. stdlib-only or relying on already-installed deps)
+        // still needs the venv python binary to exist before we hand the
+        // invocation to bash spawn.
+        if let Err(e) = self.python_runtime.ensure_venv().await {
+            return Err(format!("Error: failed to prepare python venv: {}", e));
+        }
+
+        if let Err(e) = self
+            .python_runtime
+            .ensure_packages(&requested_packages(args))
+            .await
+        {
+            return Err(format!("Error: installing packages: {}", e));
+        }
+
+        // Write the script to a per-run directory under `.lucidos/exhaust/`
+        // so it stays around for audit and the `command` field of the
+        // emitted `BackgroundBashStarted` event references a real path.
+        // We use a fresh UUID for the script directory — the user-visible
+        // `task_id` is whatever `BackgroundBashRegistry::spawn` returns,
+        // which is generated inside spawn and unavailable until after the
+        // script file is written.
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let script_dir = self.workspace_path().join(".lucidos/exhaust").join(&run_id);
+        if let Err(e) = std::fs::create_dir_all(&script_dir) {
+            return Err(format!(
+                "Error: failed to create script staging dir {}: {}",
+                crate::core::home_path::abbreviate(&script_dir),
+                e
+            ));
+        }
+        let script_path = script_dir.join("script.py");
+        if let Err(e) = std::fs::write(&script_path, code) {
+            return Err(format!(
+                "Error: failed to write script to {}: {}",
+                crate::core::home_path::abbreviate(&script_path),
+                e
+            ));
+        }
+
+        let env_vars = self.build_tool_env_vars(thread_id).await;
+        let command =
+            build_python_background_command(self.python_runtime.python_bin(), &script_path);
+
+        // The bash path end to end: same registry, same `BackgroundBash*`
+        // events, and so the same event wait re-opens the thread.
+        let (task_id, started_at) = match self
+            .start_background_task(
+                thread_id,
+                &command,
+                args.get("description").and_then(|v| v.as_str()),
+                timeout_secs,
+                self.workspace_path(),
+                &env_vars,
+            )
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                // No `BackgroundBashStarted` will be emitted, so the
+                // script file on disk has no event-store row to correlate
+                // back to. Drop it on the way out, mirroring the sync tool's
+                // error-path cleanup in
+                // `execute_staged_and_clean_up_on_failure`.
+                // Without this, chronic spawn failure (sh fork EAGAIN,
+                // FD exhaustion, broken venv) would accumulate orphan
+                // dirs under `.lucidos/exhaust/` indefinitely — the
+                // startup sweep wipes `.lucidos/staging` but preserves
+                // exhaust for audit.
+                std::fs::remove_dir_all(&script_dir).ok();
+                return Err(e);
+            }
+        };
+
+        Ok(serde_json::json!({
+            "task_id": task_id,
+            "started_at": started_at,
+            "timeout_secs": timeout_secs,
+        })
+        .to_string())
+    }
+
+    /// Walk staging directory and classify files as created or updated.
+    fn collect_staged_files(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        workspace_data: &std::path::Path,
+        created: &mut Vec<String>,
+        updated: &mut Vec<String>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            // A symlink is skipped, never followed. The staging redirect
+            // patches `open`, not `os.symlink`, so a script can leave one
+            // here: `link -> /` would commit host files into `data/`, and
+            // `link -> .` recurses until the stack goes and the engine aborts.
+            //
+            // `entry.file_type()` rather than a `symlink_metadata` call: it
+            // reads the type the directory scan already returned, does not
+            // follow the link, and costs no extra syscall. It also answers the
+            // is-a-directory question below, where `path.is_dir()` would
+            // follow one. An unreadable type is skipped, never assumed.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                Self::collect_staged_files(base, &path, workspace_data, created, updated)?;
+            } else {
+                let relative = path
+                    .strip_prefix(base)
+                    .map_err(|e| format!("Path strip failed: {}", e))?
+                    .to_string_lossy()
+                    .to_string();
+                if workspace_data.join(&relative).exists() {
+                    updated.push(relative);
+                } else {
+                    created.push(relative);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run `code` under the staging redirect. On ANY failure, remove the staging
+/// tree before returning the error, so a run that did not finish cleanly
+/// commits nothing. The error itself always propagates: what gets discarded is
+/// the half-written staged output, never the failure.
+///
+/// This is `run_python`'s atomic-commit invariant, and it has exactly one
+/// failure arm on purpose. A crash, a spawn error and the runtime's hard
+/// execution ceiling all arrive here as the same `Err`, so a script killed
+/// mid-write cannot leave half its output staged for the committer below to
+/// publish, and cannot leave an orphan directory under `.lucidos/staging`
+/// either. A free function rather than a method so the invariant can be
+/// tested against a bare `PythonRuntime`, with no engine, pool or git repo.
+async fn execute_staged_and_clean_up_on_failure(
+    python_runtime: &crate::runtime::PythonRuntime,
+    code: &str,
+    env_vars: Vec<(String, String)>,
+    staging_dir: &std::path::Path,
+) -> Result<String, String> {
+    match python_runtime
+        .execute_staged(code, env_vars, staging_dir)
+        .await
+    {
+        Ok(output) => Ok(output),
+        Err(e) => {
+            std::fs::remove_dir_all(staging_dir).ok();
+            Err(e)
+        }
+    }
+}
+
+/// Publish one staged file onto its real `data/` destination without letting
+/// the staging copy's permission bits become the destination's.
+///
+/// `std::fs::copy` copies the SOURCE's mode onto the destination, so the mode
+/// of a long-lived `data/` file would be decided by whatever the staging tree
+/// happened to carry — a `run_python` script that writes through
+/// `tempfile.mkstemp()` (0600) or `os.open(..., 0o600)` silently re-modes the
+/// real file, and the next writer (an app, another agent, a different identity)
+/// finds itself locked out of a file it could write yesterday. The mode of an
+/// existing file is that file's property, not the temp copy's.
+///
+/// - **Destination exists** → its current mode is restored after the copy.
+/// - **Destination is new** → the mode is whatever the OS gives a normally
+///   created file (`0o666 & ~umask`), obtained by creating it the ordinary way
+///   and reading the mode back, rather than by poking the process-global umask
+///   (which would briefly change it for every other thread).
+///
+/// Non-Unix targets have no POSIX mode bits, so there the copy is all there is
+/// (see the `cfg(not(unix))` twin below).
+#[cfg(unix)]
+fn commit_staged_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Mask to the permission bits: `mode()` also carries the file-type bits
+    // (S_IFREG), which `chmod` does not accept as meaningful input.
+    const PERM_BITS: u32 = 0o7777;
+    let intended_mode = match std::fs::metadata(dst) {
+        Ok(meta) => meta.permissions().mode() & PERM_BITS,
+        Err(_) => {
+            std::fs::File::create(dst)?;
+            std::fs::metadata(dst)?.permissions().mode() & PERM_BITS
+        }
+    };
+    std::fs::copy(src, dst)?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(intended_mode))
+}
+
+/// Non-Unix twin of [`commit_staged_file`]: no POSIX mode bits to preserve.
+#[cfg(not(unix))]
+fn commit_staged_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+/// Shell-quote a path for safe inclusion in the `-c "<cmd>"` string the
+/// engine shell runs (see `core::shell`). The background bash registry hands
+/// commands to that shell with `-c`, so the python
+/// invocation `run_python_background` builds must be parseable by the shell
+/// even when the workspace path contains spaces or other metacharacters.
+/// Standard POSIX trick: wrap in single quotes; if the value itself contains
+/// a single quote, close-escape-reopen with `'\''`.
+fn sh_quote(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    if !s.contains('\'') {
+        format!("'{}'", s)
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// Build the `-c` payload `BackgroundBashRegistry::spawn` will
+/// execute for a `run_python_background` call. The venv-rooted python
+/// interpreter is invoked with the staged script path; both are sh-quoted
+/// so workspace paths containing spaces don't shell-split.
+fn build_python_background_command(
+    python_bin: &std::path::Path,
+    script_path: &std::path::Path,
+) -> String {
+    format!("{} {}", sh_quote(python_bin), sh_quote(script_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_python_background_command, commit_staged_file,
+        execute_staged_and_clean_up_on_failure, sh_quote,
+    };
+    use crate::core::shell::TaskOutcome;
+    use crate::engine::tools::bash_background::BackgroundBashRegistry;
+
+    /// This file with its test module cut off, through the shared reader.
+    fn production_src() -> String {
+        crate::test_support::source_scan::read_production_source(
+            &crate::test_support::source_scan::src_root().join("engine/tools/python.rs"),
+        )
+    }
+
+    /// Both exits leave through the redaction, not around one of them.
+    ///
+    /// The Ok path returns the script's stdout, and the Err path returns its
+    /// stderr. Both are persisted verbatim in `ToolResult`, and every
+    /// credential and OAuth token is in this child's environment. The
+    /// composition is covered in `core::mod_tests`; this is the wiring.
+    #[test]
+    fn both_python_tool_exits_leave_through_the_secret_redaction() {
+        let src = production_src();
+        let at = src
+            .find("pub(crate) async fn execute_python_tool")
+            .expect("execute_python_tool is still here");
+        let end = src[at..]
+            .find("\n    /// `run_python_background(")
+            .expect("execute_python_tool is still followed by the background tool");
+        let body = &src[at..at + end];
+        assert_eq!(
+            body.matches("redact_secret_values(").count(),
+            2,
+            "both the Ok and the Err exit of execute_python_tool must go through \
+             `core::redact_secret_values`. A traceback carries the script's stderr, \
+             which is where an echoed credential lands."
+        );
+        assert!(body.contains("injected_secret_values(&env_vars)"));
+    }
+    use crate::runtime::python::PythonRuntime;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn write_with_mode(path: &std::path::Path, contents: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_staged_file_keeps_the_existing_destination_mode() {
+        // The regression this pins: `std::fs::copy` copies the SOURCE's mode
+        // onto the destination, so a staged file written via mkstemp (0600)
+        // would silently re-mode a 0644 data file and lock out the next writer.
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("staged.json");
+        let dst = tmp.path().join("data.json");
+        write_with_mode(&dst, "{\"old\":true}", 0o644);
+        write_with_mode(&src, "{\"new\":true}", 0o600);
+
+        commit_staged_file(&src, &dst).unwrap();
+
+        assert_eq!(
+            mode_of(&dst),
+            0o644,
+            "destination mode must survive a commit"
+        );
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "{\"new\":true}");
+        assert_eq!(mode_of(&src), 0o600, "the staged copy is left alone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_staged_file_gives_a_new_file_a_umask_respecting_mode() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("staged.txt");
+        let dst = tmp.path().join("brand-new.txt");
+        write_with_mode(&src, "hello", 0o600);
+
+        // Oracle: the mode a plain `fs::write` gets under THIS process's umask
+        // — that's the mode a new data file should end up with, whatever the
+        // umask happens to be on the machine running the test.
+        let reference = tmp.path().join("reference.txt");
+        std::fs::write(&reference, "x").unwrap();
+        let expected = mode_of(&reference);
+
+        commit_staged_file(&src, &dst).unwrap();
+
+        assert_eq!(mode_of(&dst), expected, "a new file follows the umask");
+        // Readable restatement of the regression for the common case. Guarded,
+        // because under a restrictive umask (077) the umask-CORRECT answer is
+        // itself 0600 — an unconditional assert_ne! would fail on a hardened
+        // machine while the implementation was behaving exactly as specified.
+        // The equality above is the assertion that holds under every umask.
+        if expected != 0o600 {
+            assert_ne!(
+                mode_of(&dst),
+                0o600,
+                "a new file must not inherit the staged copy's private mode"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "hello");
+    }
+
+    /// Build a workspace with one real artifact and a warmed venv whose
+    /// execution ceiling is `ceiling`. Returns the runtime and the workspace
+    /// path so a caller can assert on `data/` afterwards.
+    async fn staging_fixture(ws: &std::path::Path, ceiling: Duration) -> PythonRuntime {
+        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+        std::fs::write(ws.join("data/artifacts/report.csv"), "original").unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+        // Venv creation is not covered by the ceiling, but a cold tempdir can
+        // spend seconds on it, so build it before shortening the budget.
+        runtime.execute("print('warmup')").await.expect("warmup");
+        runtime.with_execution_timeout(ceiling)
+    }
+
+    /// The staging invariant under the hard execution ceiling: a run killed at
+    /// the ceiling takes the same path as a crash, so it commits nothing and
+    /// leaves no orphan tree under `.lucidos/staging`.
+    ///
+    /// This is what kept the 2026-08-07 runaway from touching the workspace
+    /// while it spun for 20 minutes. Now that the engine ends such a run
+    /// itself, the property has to be pinned rather than inherited from the
+    /// fact that nothing ever returned.
+    #[tokio::test]
+    async fn a_timed_out_staged_run_commits_nothing_and_cleans_up() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        let runtime = staging_fixture(ws, Duration::from_secs(1)).await;
+
+        let staging = ws.join(".lucidos/staging").join("timed-out-run");
+        let err = execute_staged_and_clean_up_on_failure(
+            &runtime,
+            "open('data/artifacts/report.csv', 'w').write('half written')\n\
+             import time\n\
+             time.sleep(60)",
+            vec![],
+            &staging,
+        )
+        .await
+        .expect_err("the script sleeps past the ceiling");
+
+        assert!(err.contains("timed out"), "got: {err}");
+        assert!(
+            !staging.exists(),
+            "a timed-out run must remove its staging tree: {}",
+            staging.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("data/artifacts/report.csv")).unwrap(),
+            "original",
+            "a timed-out run must not publish its half-written output"
+        );
+    }
+
+    /// The other half of the same contract: a clean run keeps its staging tree,
+    /// because the committer above still has to walk it. A cleanup that fired
+    /// unconditionally would silently drop every artifact run_python writes.
+    #[tokio::test]
+    async fn a_clean_staged_run_keeps_its_tree_for_the_committer() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        let runtime = staging_fixture(ws, Duration::from_secs(30)).await;
+
+        let staging = ws.join(".lucidos/staging").join("clean-run");
+        let out = execute_staged_and_clean_up_on_failure(
+            &runtime,
+            "open('data/artifacts/report.csv', 'w').write('fresh'); print('done')",
+            vec![],
+            &staging,
+        )
+        .await
+        .expect("a fast script must still succeed");
+
+        assert_eq!(out.trim(), "done");
+        assert_eq!(
+            std::fs::read_to_string(staging.join("data/artifacts/report.csv")).unwrap(),
+            "fresh",
+            "the staged write must survive for the committer to publish"
+        );
+    }
+
+    /// A crash cleans up the same way a timeout does. Pinned alongside its
+    /// sibling so the single failure arm the two share cannot be split into
+    /// one that cleans and one that does not.
+    #[tokio::test]
+    async fn a_crashed_staged_run_also_cleans_up() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        let runtime = staging_fixture(ws, Duration::from_secs(30)).await;
+
+        let staging = ws.join(".lucidos/staging").join("crashed-run");
+        let err = execute_staged_and_clean_up_on_failure(
+            &runtime,
+            "open('data/artifacts/report.csv', 'w').write('half written')\n\
+             raise ValueError('kaboom')",
+            vec![],
+            &staging,
+        )
+        .await
+        .expect_err("the script raises");
+
+        assert!(err.contains("ValueError"), "got: {err}");
+        assert!(
+            !staging.exists(),
+            "a crashed run must remove its staging tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("data/artifacts/report.csv")).unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    fn sh_quote_wraps_plain_path_in_single_quotes() {
+        let q = sh_quote(&PathBuf::from("/tmp/foo/bar"));
+        assert_eq!(q, "'/tmp/foo/bar'");
+    }
+
+    #[test]
+    fn sh_quote_handles_path_with_spaces() {
+        // A workspace under "/Users/me/my ws" must not shell-split into
+        // `/Users/me/my` + `ws` when we hand the command to `sh -c`.
+        let q = sh_quote(&PathBuf::from("/Users/me/my ws"));
+        assert_eq!(q, "'/Users/me/my ws'");
+    }
+
+    #[test]
+    fn sh_quote_escapes_embedded_single_quote() {
+        // POSIX trick: close-escape-reopen — `'…'\''…'` so a workspace
+        // path with a literal `'` doesn't break out of the wrapping
+        // single-quote context.
+        let q = sh_quote(&PathBuf::from("/tmp/it's/here"));
+        assert_eq!(q, "'/tmp/it'\\''s/here'");
+    }
+
+    #[test]
+    fn build_python_background_command_joins_interpreter_and_script() {
+        let cmd = build_python_background_command(
+            &PathBuf::from("/ws/.lucidos/runtime/python/venv/bin/python"),
+            &PathBuf::from("/ws/.lucidos/exhaust/abc/script.py"),
+        );
+        assert_eq!(
+            cmd,
+            "'/ws/.lucidos/runtime/python/venv/bin/python' '/ws/.lucidos/exhaust/abc/script.py'"
+        );
+    }
+
+    /// End-to-end pipeline test: prove the `run_python_background` plumbing
+    /// works — venv python from `PythonRuntime` invoked via
+    /// `BackgroundBashRegistry::spawn`, with output drainable through the
+    /// standard `read_output_in_memory_wait` path (the same path `bash_output`
+    /// reads from). Without this test the wiring between the two
+    /// independent subsystems is unverified at unit level — only at full-
+    /// engine integration time, where a regression is much louder to
+    /// diagnose.
+    ///
+    /// The wall-clock-3600s "longer than the 300s sync ceiling" property
+    /// the user originally lost a backtest sweep over is structurally
+    /// guaranteed by the bash registry path (its `BG_MAX_TIMEOUT_SECS` is
+    /// 3600s and `BackgroundBashRegistry::spawn` doesn't impose any
+    /// shorter ceiling — see `timeout_kills_long_running_task` in
+    /// `bash_background.rs` for the watchdog regression). What this test
+    /// adds on top is the python-specific link: the venv python is
+    /// actually invokable through that path with the same env-var /
+    /// cwd / drain contract.
+    #[tokio::test]
+    async fn python_via_bash_background_runs_stdlib_script_and_drains_output() {
+        let dir = tempdir().unwrap();
+        let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
+        runtime.ensure_venv().await.expect("ensure_venv");
+
+        let script_dir = dir.path().join(".lucidos/exhaust/test-run");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        let script_path = script_dir.join("script.py");
+        std::fs::write(
+            &script_path,
+            "import sys\n\
+             print('python_ok')\n\
+             print('on stderr', file=sys.stderr)\n",
+        )
+        .unwrap();
+
+        let reg = BackgroundBashRegistry::new();
+        let command = build_python_background_command(runtime.python_bin(), &script_path);
+        let (task_id, _finish_rx) = reg
+            .spawn(&command, 10, dir.path(), &[], None, None)
+            .await
+            .expect("spawn");
+
+        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(8)).await;
+        assert!(finished, "python task did not finish within 8s");
+
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, std::time::Duration::ZERO)
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            snap.outcome,
+            Some(TaskOutcome::Exited(0)),
+            "python invocation failed: stderr={}",
+            snap.stderr
+        );
+        assert!(
+            snap.stdout.contains("python_ok"),
+            "stdout was: {}",
+            snap.stdout
+        );
+        assert!(
+            snap.stderr.contains("on stderr"),
+            "stderr was: {}",
+            snap.stderr
+        );
+        assert!(snap.finished);
+    }
+
+    /// Env vars handed to `BackgroundBashRegistry::spawn` reach the python
+    /// child — the user's spec is explicit that CRED_* / OAUTH_* /
+    /// LUCIDOS_WORKSPACE must be visible to scripts the same way they are
+    /// in the sync `run_python` tool. Pin the env-pass-through here so a
+    /// refactor that drops the `&env` arg from the spawn call breaks this
+    /// test instead of silently shipping a tool whose scripts can't reach
+    /// their secrets.
+    ///
+    /// The `CRED_TEST` assertion carries BOTH halves of that contract. The
+    /// script prints `<missing>` when the variable never arrived, so a
+    /// redacted value proves the child could read it. The drain then masks
+    /// it, which is what keeps the credential out of the model's context and
+    /// out of `BackgroundBashCompleted`. Asserting the raw value here would
+    /// pin the leak instead.
+    #[tokio::test]
+    async fn python_via_bash_background_inherits_provided_env_vars() {
+        let dir = tempdir().unwrap();
+        let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
+        runtime.ensure_venv().await.expect("ensure_venv");
+
+        let script_dir = dir.path().join(".lucidos/exhaust/env-test");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        let script_path = script_dir.join("script.py");
+        std::fs::write(
+            &script_path,
+            "import os\n\
+             print('CRED_TEST=' + os.environ.get('CRED_TEST', '<missing>'))\n\
+             print('LUCIDOS_WORKSPACE=' + os.environ.get('LUCIDOS_WORKSPACE', '<missing>'))\n",
+        )
+        .unwrap();
+
+        let env = vec![
+            ("CRED_TEST".to_string(), "secret-value".to_string()),
+            (
+                "LUCIDOS_WORKSPACE".to_string(),
+                dir.path().to_string_lossy().to_string(),
+            ),
+        ];
+        let reg = BackgroundBashRegistry::new();
+        let command = build_python_background_command(runtime.python_bin(), &script_path);
+        let (task_id, _finish_rx) = reg
+            .spawn(&command, 10, dir.path(), &env, None, None)
+            .await
+            .expect("spawn");
+
+        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(8)).await;
+        assert!(finished);
+
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, std::time::Duration::ZERO)
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            snap.outcome,
+            Some(TaskOutcome::Exited(0)),
+            "stderr: {}",
+            snap.stderr
+        );
+        assert!(
+            snap.stdout.contains("CRED_TEST=[REDACTED]"),
+            "the child must receive CRED_TEST and the drain must mask it: {}",
+            snap.stdout
+        );
+        assert!(
+            !snap.stdout.contains("secret-value"),
+            "the drain handed the model a live credential: {}",
+            snap.stdout
+        );
+        assert!(
+            snap.stdout.contains("LUCIDOS_WORKSPACE="),
+            "stdout did not see LUCIDOS_WORKSPACE: {}",
+            snap.stdout
+        );
+    }
+}

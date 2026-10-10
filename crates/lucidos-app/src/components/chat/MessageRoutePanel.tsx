@@ -1,0 +1,855 @@
+import { useRef } from 'preact/hooks';
+import { UNTITLED_THREAD } from '../../utils/threadTitle';
+import type { ComponentChildren } from 'preact';
+import { AppsIcon } from '../shared/icons';
+import { messageRoutePanel, closeMessageRoutePanel, contextViewer, triggers, threadMap, repositories, appsList, workspaceName } from '../../store/store';
+import { loadApps } from '../../store/actions/apps';
+import { turnDeviceName } from '../../store/actions/devices';
+import { focusThreadOrBootstrap } from '../../store/actions/threads';
+import {
+  openThreadAcrossWorkspaces,
+  crossWorkspaceThreadTitle,
+  ensureCrossWorkspaceThreadTitle,
+} from '../../store/actions/cross-workspace';
+import { navigateToTrigger } from '../../store/actions/triggers';
+import { loadRepositories } from '../../store/actions/chat';
+import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { formatMessageTimestamp } from '../../utils/formatTime';
+import { Overlay } from '../shared/Overlay';
+import { EventRowFoldView } from './EventRow';
+import { loadedOr } from '../../store/types';
+import {
+  capturedEventToData,
+  ENGINE_LABEL,
+  LUCIDOS_AGENT_LABEL,
+  exchangeResponseModel,
+  exchangeReasoningEffort,
+  displayModelName,
+  displayReasoningEffort,
+  modeToInitiator,
+  PENDING_TITLE_PLACEHOLDER,
+  plainEventName,
+  sortEventsChronologically,
+  SYSTEM_LABEL,
+  type Exchange,
+  type EngineReason,
+  type MessageOrigin,
+  type StoredEvent,
+  type ThreadMeta,
+} from '../../store/thread-events';
+import type { ContextCapture } from '../../store/types';
+import {
+  describeAbortCause,
+  describeCancelCause,
+  describeContinuationReason,
+  describeEngineReason,
+  engineReasonConfirmingDevice,
+  engineReasonHeadline,
+  UNRECORDED_ENGINE_SEED_EXPLAINER,
+} from '../../utils/engineEventExplainers';
+import { dividerSettlement, resolveOrigin, type DividerSettlement } from './messageOrigin';
+
+/** Live lookup wins over `cachedLinkedTitle` because SSE handlers
+ *  (`CodingAgentThreadSpawned`, the skeleton path in `handleThreadEvent`)
+ *  create the linked thread without metadata, so the cache stays undefined
+ *  until the next full thread load (boot, or an SSE reconnect). Without this
+ *  fallback the popover shows the linked thread's UUID for that window. */
+export function resolveThreadLinkTitle(
+  origin: Extract<MessageOrigin, { kind: 'thread_link' }>,
+  cachedLinkedTitle: string | undefined,
+  getLiveTitle: (threadId: string) => string | undefined,
+): string {
+  const live = getLiveTitle(origin.thread_id);
+  if (live && live !== PENDING_TITLE_PLACEHOLDER) return live;
+  if (origin.title) return origin.title;
+  if (cachedLinkedTitle) return cachedLinkedTitle;
+  return UNTITLED_THREAD;
+}
+
+/** A linked thread whose title never loaded. Its id is in Technical details. */
+
+/** Branch comes from `SessionStarted` (or `ContinuationStarted`), which fire once per CC
+ *  process spawn — not per user message. A follow-up exchange within an existing Claude Code
+ *  session has no SessionStarted in its own steps, so we walk the full thread up to this
+ *  exchange's user event and track the most recent branch-defining event.
+ *
+ *  The session id is NOT on `SessionStarted` — the engine emits that with an empty
+ *  `session_id` at spawn time (the real id isn't known yet). The agent reports it in its
+ *  `Init` event, which the engine persists onto `CodingAgentSettingsChanged.cc_session_id`
+ *  (and later `CodingAgentIdled.cc_session_id`) for both Claude Code and Codex. So we read
+ *  the session id from those, falling back to a non-empty `SessionStarted.session_id` only
+ *  for legacy rows. Like branch, it's session-scoped, so it rides the same full-thread walk.
+ *
+ *  Context info is per-exchange and stays scoped to `exchange.steps`. The turn's
+ *  last capture rides along as `contextCapture`, so the Context row can open
+ *  the context viewer on it. A legacy row carries a count with no snapshot. */
+export function executorExtras(
+  exchange: Exchange,
+  threadEvents: Map<number, StoredEvent>,
+): {
+  branch?: string;
+  ccSessionId?: string;
+  contextTokens?: number;
+  contextTrimmed?: boolean;
+  contextCapture?: ContextCapture;
+  repoId?: string;
+} {
+  // The cutoff is the last seq in this exchange — SessionStarted typically lives in
+  // `steps` right after the userEvent, so breaking at `userSeq` would exit too early.
+  let lastSeq = exchange.userSeq;
+  for (const { seq } of exchange.steps) {
+    if (seq > lastSeq) lastSeq = seq;
+  }
+
+  let branch: string | undefined;
+  let ccSessionId: string | undefined;
+  let repoId: string | undefined;
+  for (const { seq, event } of sortEventsChronologically(threadEvents)) {
+    if (event.type === 'SessionStarted') {
+      if (event.branch) branch = event.branch;
+      // session_id is empty on real SessionStarted rows (see doc comment) — only
+      // legacy rows ever carry it here; the live id lands on the events below.
+      if (event.session_id) ccSessionId = event.session_id;
+      // Each SessionStarted snapshots its own repo bind — don't fall back to a
+      // prior session's repo_id when the current SessionStarted lacks one
+      // (legacy events from before the engine always stamped repo_id).
+      repoId = event.repo_id;
+    } else if (event.type === 'ContinuationStarted' && event.branch) {
+      branch = event.branch;
+    } else if (event.type === 'CodingAgentSettingsChanged' || event.type === 'CodingAgentIdled') {
+      // The agent's Init session id is persisted onto CodingAgentSettingsChanged
+      // (and CodingAgentIdled), for both Claude Code and Codex — this is the real
+      // source for the Session row.
+      if (event.cc_session_id) ccSessionId = event.cc_session_id;
+    }
+    if (seq === lastSeq) break;
+  }
+
+  let contextTokens: number | undefined;
+  let contextTrimmed: boolean | undefined;
+  let contextCapture: ContextCapture | undefined;
+  for (const { event } of exchange.steps) {
+    if (event.type === 'ThoughtStreamed') {
+      // Legacy DB rows — ContextCaptured below overrides when present.
+      if (typeof event.context_tokens === 'number') {
+        contextTokens = event.context_tokens;
+        contextCapture = undefined;
+      }
+      if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;
+    } else if (event.type === 'ContextCaptured') {
+      contextCapture = capturedEventToData(event, event._eventId);
+      // Prefer real input_tokens; fall back to the engine's chars*2/5
+      // estimate (see `estimate_tokens_from_chars` in the engine, which is
+      // measured at 2.5 chars/token, NOT the trim budget's conservative 1.5).
+      const tokens = event.usage?.input_tokens ?? event.estimated_total_tokens;
+      if (typeof tokens === 'number') contextTokens = tokens;
+      if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;
+    }
+  }
+  return { branch, ccSessionId, contextTokens, contextTrimmed, contextCapture, repoId };
+}
+
+export function MessageRoutePanel() {
+  const state = messageRoutePanel.value;
+  const ref = useRef<HTMLDivElement>(null);
+  // Clamp horizontally to the chat pane that owns the anchor so the popover
+  // stays inside the chat column instead of overflowing into the content pane.
+  const pos = useAnchoredPosition(state?.anchor ?? null, ref, '.thread-pane');
+
+  if (!state) return null;
+  const { exchange, threadId, section, priorModel, priorEffort, pausedBy, readAt } = state;
+  const thread = threadMap.value.get(threadId);
+  if (!thread) return null;
+
+  return (
+    <Overlay
+      open
+      onClose={closeMessageRoutePanel}
+      anchor={state.anchor}
+      backdrop={false}
+      panelClass={`surface message-route-panel ${pos?.placement ?? ''}`}
+      panelStyle={pos ? { top: `${pos.top}px`, left: `${pos.left}px` } : { visibility: 'hidden' }}
+      panelRole="dialog"
+      panelProps={{ 'aria-label': section === 'origin' ? 'Who started this' : 'Who answered' }}
+      panelRef={ref}
+    >
+      {section === 'origin'
+        ? renderOriginSection(exchange, thread.meta.parentThreadTitle, getLiveThreadTitle, pausedBy, readAt)
+        : renderExecutorSection(exchange, thread.events, thread.meta, priorModel, priorEffort)}
+    </Overlay>
+  );
+}
+
+function getLiveThreadTitle(threadId: string): string | undefined {
+  return threadMap.value.get(threadId)?.meta.title;
+}
+
+/** The popover's Origin half: WHO raised the turn, on what surface, and why.
+ *  Exported for unit tests, which assert the whole section rather than its
+ *  pieces because the wart it exists to prevent (a bare "Unknown" over an
+ *  attributed chip) is a property of the assembled panel. */
+export function renderOriginSection(
+  exchange: Exchange,
+  parentTitle: string | undefined,
+  getLiveTitle: (threadId: string) => string | undefined,
+  pausedBy?: StoredEvent,
+  readAt?: string,
+) {
+  const userEvent = exchange.userEvent;
+  // TriggerStarted keeps its richer renderer (invocation kind + event link).
+  if (userEvent.type === 'TriggerStarted') {
+    return (
+      <section class="route-section">
+        <h4>Origin</h4>
+        {renderTriggerOrigin(userEvent)}
+        {renderTechnicalDetails(userEvent, undefined)}
+      </section>
+    );
+  }
+
+  const origin = resolveOrigin(exchange);
+  const settledAt = renderSettledAt(userEvent, dividerSettlement(exchange));
+  const technical = renderTechnicalDetails(userEvent, origin);
+  const channel = origin
+    ? renderChannelSection(origin, parentTitle, getLiveTitle, deviceRowLabel(userEvent))
+    : null;
+  const unrecordedSeed = !origin && isUnrecordedEngineSeed(userEvent);
+  // Engine and system origins have no channel to disclose (they ARE the
+  // channel, which is why `renderChannelSection` returns null for both), so
+  // name the issuer here or the panel is an explainer paragraph with no "who"
+  // above it, out of step with every other origin kind.
+  const issuer = origin?.kind === 'engine' || unrecordedSeed ? renderIssuedByRow(ENGINE_LABEL)
+    : origin?.kind === 'system' ? renderIssuedByRow(SYSTEM_LABEL)
+      : origin?.kind === 'agent' ? renderIssuedByRow(LUCIDOS_AGENT_LABEL)
+        : null;
+  const engineRows = origin?.kind === 'engine' ? renderEngineReasonRows(origin.reason) : null;
+  // A resume boundary prefers its own `reason` field, which is finer-grained
+  // than the `continuation_started` EngineReason (that one would claim an
+  // engine restart even for a local hang recovery). It falls through to the
+  // persisted engine reason rather than replacing it, so a row that recorded
+  // an origin but no reason keeps the explanation it already rendered.
+  const continuationWhy = userEvent.type === 'ContinuationStarted'
+    ? renderExplainer('Why this resumed', describeContinuationReason(userEvent.reason))
+    : null;
+  const explainer = continuationWhy
+    ?? (origin?.kind === 'engine' ? renderEngineExplainerSection(origin.reason)
+      : unrecordedSeed ? renderExplainer(ENGINE_WHY_HEADING, UNRECORDED_ENGINE_SEED_EXPLAINER)
+        : null);
+  const paused = pausedBy ? renderFoldedPause(pausedBy) : null;
+  const delivery = readAt ? renderDelivery(userEvent, readAt) : null;
+
+  // An abort always says why it stopped, whoever stopped it. With no actor, or
+  // the host killing the process, the issuer is the System. A device or API
+  // actor (a restart, a button that cleared a stuck reply) keeps its own row.
+  if (userEvent.type === 'ResponseAborted') {
+    const byHost = origin === undefined || origin.kind === 'system';
+    return (
+      <section class="route-section">
+        <h4>Origin</h4>
+        {byHost ? renderIssuedByRow(SYSTEM_LABEL) : channel}
+        {renderExplainer('Why the response stopped', describeAbortCause(userEvent.cause))}
+        {technical}
+      </section>
+    );
+  }
+
+  // User-driven `ResponseCanceled` (CancelCause). The "Response canceled" turn
+  // carries no actor chip — this popover IS its initiator disclosure. Cancel is
+  // user-driven by definition, so always attribute it to "You"; include the
+  // device when one was recorded (the chat-thread cancel path doesn't plumb an
+  // actor, so it's often absent). The cause line explains how it stopped.
+  if (userEvent.type === 'ResponseCanceled') {
+    return (
+      <section class="route-section">
+        <h4>Origin</h4>
+        {renderIssuedByRow('You')}
+        {origin?.kind === 'device' && channel}
+        {renderExplainer('Why the response stopped', describeCancelCause(userEvent.cause))}
+        {technical}
+      </section>
+    );
+  }
+
+  if (!issuer && !channel && !explainer && !paused) {
+    return (
+      <section class="route-section">
+        <h4>Origin</h4>
+        <div class="route-row">
+          <strong>Sent by</strong>
+          <span class="muted">Not recorded</span>
+        </div>
+        {renderExplainer('Why this is blank', NOT_RECORDED_EXPLAINER)}
+        {delivery}
+        {technical}
+      </section>
+    );
+  }
+
+  return (
+    <section class="route-section">
+      <h4>Origin</h4>
+      {settledAt}
+      {issuer}
+      {engineRows}
+      {channel}
+      {delivery}
+      {explainer}
+      {paused}
+      {technical}
+    </section>
+  );
+}
+
+/** The heading over every "why the engine acted" paragraph. */
+const ENGINE_WHY_HEADING = 'Why Lucidos acted';
+
+/** What the popover says when no layer recorded who started a turn. True of
+ *  every such row, old or new, which is why it claims no cause. */
+const NOT_RECORDED_EXPLAINER =
+  'Lucidos did not record who started this turn. Older turns often lack it.';
+
+/** What the user did to settle a question or permission card. */
+function settledVerb(userEvent: StoredEvent): 'Answered' | 'Decided' | null {
+  switch (userEvent.type) {
+    case 'UserQuestionAsked':            return 'Answered';
+    case 'CodingAgentPermissionRequest':
+    case 'CommandPermissionRequested':
+    case 'McpPermissionRequested':       return 'Decided';
+    default:                             return null;
+  }
+}
+
+/** What the device row is called, by what the device did. A question's device
+ *  answered it, so a bare "Device" would read as the asker. */
+function deviceRowLabel(userEvent: StoredEvent): string {
+  const verb = settledVerb(userEvent);
+  if (verb) return `${verb} on`;
+  switch (userEvent.type) {
+    case 'MessageReceived':
+    case 'PromptInjected':               return 'Sent from';
+    case 'ResponseAborted':
+    case 'ResponseCanceled':
+    case 'EventWaitCanceled':            return 'Stopped from';
+    default:                             return 'Device';
+  }
+}
+
+/** The machine names behind the panel, folded away: the event type a reader
+ *  subscribes to, and any ids or raw client strings the origin carried. The
+ *  panel body names things in words, so this is the one place ids appear. */
+function renderTechnicalDetails(
+  userEvent: StoredEvent,
+  origin: MessageOrigin | undefined,
+): preact.JSX.Element {
+  const rows: [string, string][] = [['Event type', userEvent.type]];
+  if (origin?.kind === 'api' && origin.user_agent) rows.push(['Client', origin.user_agent]);
+  if (origin?.kind === 'workspace') {
+    if (origin.thread_id) rows.push(['Thread id', origin.thread_id]);
+    if (origin.event_id) rows.push(['Event id', origin.event_id]);
+    if (origin.user_agent) rows.push(['Client', origin.user_agent]);
+  }
+  if (origin?.kind === 'engine' && origin.reason.kind === 'event_wait' && origin.reason.watched.length > 0) {
+    rows.push(['Waited for', origin.reason.watched.join(', ')]);
+  }
+  if (origin?.kind === 'thread_link') {
+    rows.push(['Thread id', origin.thread_id]);
+    if (origin.spawning_event_id) rows.push(['Event id', origin.spawning_event_id]);
+  }
+  if (userEvent.type === 'TriggerStarted' && userEvent.invocation?.kind === 'Event') {
+    rows.push(['Fired on', userEvent.invocation.event_type]);
+    if (userEvent.invocation.event_id) rows.push(['Event id', userEvent.invocation.event_id]);
+  }
+  return (
+    <div class="route-technical" data-role="route-technical">
+      <EventRowFoldView
+        label="Technical details"
+        body={rows.map(([label, value]) => (
+          <div key={label} class="route-row">
+            <strong>{label}</strong>
+            <span class="mono">{value}</span>
+          </div>
+        ))}
+      />
+    </div>
+  );
+}
+
+/** When a read message was sent and when the agent read it. Its header shows
+ *  the read time, so this is where the sent time stays visible. */
+function renderDelivery(message: StoredEvent, readAt: string): preact.JSX.Element {
+  const sentAt = message.created || message._displayCreated;
+  return (
+    <>
+      {sentAt && (
+        <div class="route-row">
+          <strong>Sent</strong>
+          <span>{formatMessageTimestamp(sentAt)}</span>
+        </div>
+      )}
+      <div class="route-row">
+        <strong>Read</strong>
+        <span>{formatMessageTimestamp(readAt)}</span>
+      </div>
+    </>
+  );
+}
+
+/** The restart pause a resume absorbed (`restartPauseFoldsInto`): when and why
+ *  the turn stopped, and which device asked for the restart. The pause draws no
+ *  panel of its own, so this is the only place that still says so. */
+function renderFoldedPause(pause: StoredEvent): preact.JSX.Element {
+  const { cause, actor } = pause.type === 'ResponseAborted' ? pause : { cause: undefined, actor: undefined };
+  const pausedAt = pause.created || pause._displayCreated;
+  return (
+    <>
+      {pausedAt && (
+        <div class="route-row">
+          <strong>Paused</strong>
+          <span>{formatMessageTimestamp(pausedAt)}</span>
+        </div>
+      )}
+      {renderExplainer('Why it paused', describeAbortCause(cause))}
+      {actor?.kind === 'device' && (
+        <div class="route-row">
+          <strong>Restarted from</strong>
+          <span>{turnDeviceName(actor.device_id)}</span>
+        </div>
+      )}
+    </>
+  );
+}
+
+/** A message the engine or an agent wrote, with nothing recorded to say which:
+ *  no origin, no parent, no device. The chip already reads "Lucidos Engine" for
+ *  it, so the panel names the engine too. A human-mode row with nothing
+ *  recorded stays not recorded: that one genuinely is. */
+function isUnrecordedEngineSeed(userEvent: StoredEvent): boolean {
+  switch (userEvent.type) {
+    case 'MessageReceived':
+    case 'PromptInjected':
+      return modeToInitiator(userEvent.mode) === 'system';
+    case 'CodingAgentPromptSent':
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** The rows an engine reason adds under "Issued by": the thing it acted on
+ *  (a plugin install or update, a patch) and the device that confirmed it.
+ *  Null for a reason that names neither, so most engine origins add nothing. */
+function renderEngineReasonRows(reason: EngineReason): preact.JSX.Element | null {
+  const headline = engineReasonHeadline(reason);
+  const deviceId = engineReasonConfirmingDevice(reason);
+  if (!headline && !deviceId) return null;
+  return (
+    <>
+      {headline && (
+        <div class="route-row">
+          <strong>{headline.label}</strong>
+          <span>{headline.value}</span>
+        </div>
+      )}
+      {deviceId && (
+        <div class="route-row">
+          <strong>Confirmed on</strong>
+          <span>{turnDeviceName(deviceId)}</span>
+        </div>
+      )}
+    </>
+  );
+}
+
+/** Names WHO raised the turn, for the origin kinds that have no channel to
+ *  disclose (engine, system) and for the ones the panel attributes by event
+ *  type rather than by a persisted actor (`ResponseCanceled` is user-driven by
+ *  definition). Every other kind gets its identity from `renderChannelSection`. */
+function renderIssuedByRow(label: string): preact.JSX.Element {
+  return (
+    <div class="route-row">
+      <strong>Issued by</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+/** The popover's "why" paragraph. One heading per question the panel can
+ *  answer ("Why the response stopped", "Why this resumed", "Why Lucidos
+ *  acted"); the body comes from the matching `describe*` helper. Renders
+ *  nothing when the helper has no honest answer, so a caller can pass the
+ *  nullable result straight through. */
+function renderExplainer(heading: string, body: string | null): preact.JSX.Element | null {
+  if (!body) return null;
+  return (
+    <div class="route-explainer">
+      <strong>{heading}</strong>
+      <p>{body}</p>
+    </div>
+  );
+}
+
+/** When the user answered a question or decided a permission. The header
+ *  shows when the agent asked, so this is where the answer time is visible. */
+function renderSettledAt(
+  userEvent: StoredEvent,
+  settlement: DividerSettlement | undefined | null,
+): preact.JSX.Element | null {
+  const verb = settledVerb(userEvent);
+  const at = settlement && (settlement.created || settlement._displayCreated);
+  if (!verb || !at) return null;
+  return (
+    <div class="route-row">
+      <strong>{verb}</strong>
+      <span>{formatMessageTimestamp(at)}</span>
+    </div>
+  );
+}
+
+/** Channel: who, on what surface: a device, an outside app, a workspace, a
+ *  linked thread. Returns null for engine origins, since the engine is the
+ *  channel. Raw client strings and ids go to `renderTechnicalDetails`. */
+export function renderChannelSection(
+  origin: MessageOrigin,
+  fallbackParentTitle?: string,
+  getLiveTitle?: (threadId: string) => string | undefined,
+  deviceLabel = 'Device',
+): preact.JSX.Element | null {
+  switch (origin.kind) {
+    case 'device':
+      return (
+        <div class="route-row">
+          <strong>{deviceLabel}</strong>
+          <span>{turnDeviceName(origin.device_id)}</span>
+        </div>
+      );
+    case 'api': {
+      // `source_thread_id` is set when the engine recognised this request
+      // as coming from a Lucidos-spawned subprocess (CC, run_bash,
+      // run_python, scheduled script, `lucidos` CLI). Surface it as a
+      // deep-link so the popover answers "which agent did this".
+      const sourceThreadId = origin.source_thread_id;
+      const sourceTitle = sourceThreadId
+        ? getLiveTitle?.(sourceThreadId) ?? UNTITLED_THREAD
+        : null;
+      return (
+        <div class="route-row">
+          <strong>Sent by</strong>
+          <span class="route-value-group">
+            <span>{sourceThreadId ? 'A script run by the agent in' : 'An app or script outside Lucidos'}</span>
+            {sourceThreadId && (
+              <button
+                type="button"
+                class="accent-link"
+                onClick={() => {
+                  focusThreadOrBootstrap(sourceThreadId);
+                  closeMessageRoutePanel();
+                }}
+              >
+                {sourceTitle}
+              </button>
+            )}
+          </span>
+        </div>
+      );
+    }
+    case 'workspace': {
+      const tid = origin.thread_id;
+      return (
+        <>
+          <div class="route-row">
+            <strong>Workspace</strong>
+            <span>{origin.workspace}</span>
+          </div>
+          {tid && renderWorkspaceThreadLink(origin.workspace, tid, getLiveTitle)}
+        </>
+      );
+    }
+    case 'thread_link': {
+      const title = resolveThreadLinkTitle(
+        origin,
+        fallbackParentTitle,
+        getLiveTitle ?? (() => undefined),
+      );
+      const linkedId = origin.thread_id;
+      // The home thread follows up threads it never spawned (ADR 0362), so a
+      // message from it is not necessarily from a parent.
+      const heading = origin.direction === 'child' ? 'Child thread'
+        : threadMap.value.get(linkedId)?.meta.home ? 'Home thread'
+        : 'Parent thread';
+      return (
+        <div class="route-row">
+          <strong>{heading}</strong>
+          <button
+            type="button"
+            class="accent-link"
+            onClick={() => {
+              focusThreadOrBootstrap(linkedId);
+              closeMessageRoutePanel();
+            }}
+          >
+            {title}
+          </button>
+        </div>
+      );
+    }
+    case 'webhook':
+      return (
+        <div class="route-row">
+          <strong>Webhook</strong>
+          <span>{origin.name}</span>
+        </div>
+      );
+    // No channel to name. The engine IS the channel, and an agent's identity
+    // is already the chip label above (ADR 0149: the user meets one entity,
+    // so a second agent's turn is not broken out here either).
+    case 'agent':
+    case 'engine':
+    case 'system':
+      return null;
+  }
+}
+
+/** Named, clickable link to a Workspace-origin's source thread. Resolves the
+ *  title: same-workspace → live `threadMap` lookup; cross-workspace → the
+ *  best-effort live-fetch cache (firing the fetch when absent, which re-renders
+ *  the popover once it arrives). Falls back to "Untitled thread" so the link is
+ *  never blank. The click routes cross-workspace-aware — focus in place when local,
+ *  hop to the source workspace's UI when remote. */
+function renderWorkspaceThreadLink(
+  workspace: string,
+  threadId: string,
+  getLiveTitle?: (threadId: string) => string | undefined,
+): preact.JSX.Element {
+  const isLocal = !workspaceName.value || workspace === workspaceName.value;
+  let title: string | undefined;
+  if (isLocal) {
+    title = getLiveTitle?.(threadId);
+  } else {
+    title = crossWorkspaceThreadTitle(workspace, threadId);
+    if (title === undefined) void ensureCrossWorkspaceThreadTitle(workspace, threadId);
+  }
+  const label =
+    title && title !== PENDING_TITLE_PLACEHOLDER ? title : UNTITLED_THREAD;
+  return (
+    <div class="route-row">
+      <strong>Thread</strong>
+      <button
+        type="button"
+        class="accent-link"
+        onClick={() => {
+          openThreadAcrossWorkspaces(workspace, threadId);
+          closeMessageRoutePanel();
+        }}
+      >
+        {label}
+      </button>
+    </div>
+  );
+}
+
+/** Engine explainer: the "why" copy for engine-acted events. The heading is
+ *  constant; the body comes from `describeEngineReason`. */
+export function renderEngineExplainerSection(reason: EngineReason): preact.JSX.Element | null {
+  return renderExplainer(ENGINE_WHY_HEADING, describeEngineReason(reason));
+}
+
+/** The popover's Executor half: WHICH agent ran the turn, on what model, in
+ *  which repo/branch/session. Exported for the row-shape guard in
+ *  MessageRoutePanel.test.ts. */
+export function renderExecutorSection(
+  exchange: Exchange,
+  threadEvents: Map<number, StoredEvent>,
+  meta: ThreadMeta,
+  priorModel?: string,
+  priorEffort?: string,
+) {
+  const model = exchangeResponseModel(exchange) ?? priorModel;
+  const effort = exchangeReasoningEffort(exchange) ?? priorEffort;
+  const extras = executorExtras(exchange, threadEvents);
+  const hasContent = model || effort || extras.branch
+    || extras.ccSessionId || typeof extras.contextTokens === 'number';
+  const ccActive = extras.branch !== undefined || extras.ccSessionId !== undefined;
+  const repo = ccActive ? resolveRepoLabel(extras.repoId) : undefined;
+  // App coding-agent threads carry their kind on the projection; resolve the
+  // app's icon + display name so the App row reads "{icon} {name}" above the
+  // Branch row. The folder's last segment is the canonical app id.
+  const appInfo = meta.codingAgentKind === 'app' ? resolveAppInfo(meta.codingAgentFolder) : undefined;
+
+  return (
+    <section class="route-section">
+      <h4>Answered by</h4>
+      {!hasContent && <div class="muted">Nothing recorded yet</div>}
+      {model && (
+        <div class="route-row">
+          <strong>Model</strong>
+          <span>{displayModelName(model)}</span>
+        </div>
+      )}
+      {effort && (
+        <div class="route-row">
+          <strong>Effort</strong>
+          <span>{displayReasoningEffort(effort)}</span>
+        </div>
+      )}
+      {typeof extras.contextTokens === 'number' && (
+        <div class="route-row">
+          <strong>Context</strong>
+          <span>
+            {contextLink(extras.contextTokens, extras.contextCapture)}
+            {extras.contextTrimmed && <span class="pill"> older parts left out</span>}
+          </span>
+        </div>
+      )}
+      {repo && (
+        <div class="route-row">
+          <strong>Repository</strong>
+          <span class={repo.failed ? 'error-text' : undefined}>{repo.text}</span>
+        </div>
+      )}
+      {appInfo && extras.branch && (
+        <div class="route-row">
+          <strong>App</strong>
+          <span class="route-value-group">
+            <span class="route-app-icon" aria-hidden="true">{appInfo.icon}</span>
+            <span class={appInfo.failed ? 'error-text' : undefined}>{appInfo.name}</span>
+          </span>
+        </div>
+      )}
+      {extras.branch && (
+        <div class="route-row">
+          <strong>Branch</strong>
+          <span class="mono">{extras.branch}</span>
+        </div>
+      )}
+      {extras.ccSessionId && (
+        <div class="route-technical">
+          <EventRowFoldView
+            label="Technical details"
+            body={
+              <div class="route-row">
+                <strong>Session id</strong>
+                <span class="mono">{extras.ccSessionId}</span>
+              </div>
+            }
+          />
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** The Context row's figure. With a snapshot behind it, it opens the context
+ *  viewer on the turn's last call, as a step row's counter does for its own. */
+function contextLink(tokens: number, snapshot: ContextCapture | undefined): preact.JSX.Element | string {
+  const label = `${tokens.toLocaleString()} tokens`;
+  if (!snapshot) return label;
+  return (
+    <button
+      type="button"
+      class="accent-link"
+      aria-label="Show the context sent for the last call of this turn"
+      onClick={() => {
+        closeMessageRoutePanel();
+        contextViewer.value = { snapshot, description: 'Last call of this turn' };
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+/** App icon + name for the App row on app coding-agent threads (rendered above
+ *  the Branch row). Distinguishes the four `Loadable` states so a failed
+ *  appsList fetch doesn't render identically to a loading one (per frontend.md).
+ *
+ *  `icon` is `ComponentChildren` rather than `string` because the slot holds two
+ *  different KINDS of thing. An app's own `manifest.json` icon is user-authored
+ *  content, almost always an emoji, and passes through verbatim: it is not ours
+ *  to restyle. The fallback for an app that declares none is ours, and it is
+ *  `<AppsIcon/>`, the single apps mark that also labels a Search Everywhere app
+ *  hit and an app entry in the content-pane history menu. Exported for the unit
+ *  test that pins exactly that split. */
+export function resolveAppInfo(
+  folder: string | undefined,
+): { icon: ComponentChildren; name: string; failed?: boolean } | undefined {
+  if (!folder) return undefined;
+  const appId = folder.split('/').filter(Boolean).pop();
+  if (!appId) return undefined;
+  const apps = appsList.value;
+  // Idempotent kick-off from the render path: loadApps() flips the signal to
+  // `loading` synchronously (setLoadingIfFresh), so the next render no longer
+  // sees `not-loaded` and won't re-fetch — exactly one fetch fires.
+  if (apps.status === 'not-loaded') void loadApps();
+  const fallbackIcon = <AppsIcon />;
+  if (apps.status === 'failed') {
+    return { icon: fallbackIcon, name: `${appId} (apps failed to load)`, failed: true };
+  }
+  if (apps.status !== 'loaded') {
+    return { icon: fallbackIcon, name: appId };
+  }
+  const match = apps.data.find(a => a.id === appId);
+  return {
+    icon: match?.icon || fallbackIcon,
+    name: match?.name || appId,
+  };
+}
+
+/** CC repo label. Returns undefined for legacy events from before the engine
+ *  always stamped `repo_id` — those sessions render no Repository row. */
+function resolveRepoLabel(repoId: string | undefined): { text: string; failed?: boolean } | undefined {
+  if (!repoId) return undefined;
+  const repos = repositories.value;
+  // Idempotent render-path kick-off — see resolveAppInfo above: loadRepositories
+  // flips the signal to `loading` synchronously, so only one fetch fires.
+  if (repos.status === 'not-loaded') void loadRepositories();
+  if (repos.status === 'failed') return { text: 'Repository list failed to load', failed: true };
+  // A single value inside real markup: the slot stays empty until it lands.
+  if (repos.status !== 'loaded') return { text: '' };
+  const match = repos.data.find(r => r.id === repoId);
+  // The repo was registered when the session ran but has since been removed —
+  // surface that instead of a bare UUID.
+  return match ? { text: match.name } : { text: 'A repository since removed' };
+}
+
+function renderTriggerOrigin(userEvent: Extract<StoredEvent, { type: 'TriggerStarted' }>) {
+  const ts = triggers.value;
+  const list = loadedOr(ts, []);
+  // Fall back to name match when the stored trigger_id no longer resolves —
+  // re-created triggers keep their name but get a new id, so events from the
+  // old incarnation point at a dead id.
+  const trigger = list.find(x => x.id === userEvent.trigger_id)
+    ?? list.find(x => x.name === userEvent.trigger_name);
+  // Never the trigger id: no screen in Lucidos is labelled with one.
+  const name = trigger?.name ?? userEvent.trigger_name ?? 'Unnamed trigger';
+  const knownDeleted = ts.status === 'loaded' && !trigger;
+  const invocation = userEvent.invocation;
+  // A fragment, not a wrapper element: the rows have to be direct children of
+  // `.route-section` to join its label/value grid.
+  return (
+    <>
+      <div class="route-row">
+        <strong>Trigger</strong>
+        {knownDeleted ? (
+          <span>{name} <span class="muted">(deleted)</span></span>
+        ) : (
+          <button
+            type="button"
+            class="accent-link"
+            onClick={() => {
+              void navigateToTrigger(trigger?.id ?? userEvent.trigger_id);
+              closeMessageRoutePanel();
+            }}
+          >
+            {name}
+          </button>
+        )}
+      </div>
+      {invocation?.kind === 'Event' && (
+        <div class="route-row">
+          <strong>Fired when</strong>
+          <span>{plainEventName(invocation.event_type)}</span>
+        </div>
+      )}
+    </>
+  );
+}

@@ -1,0 +1,156 @@
+# Concepts
+
+Everything you do is recorded as an **event**. Your files are **artifacts**. What
+you want is an **intent**, and how to do it is **knowhow**. An **app** gives that
+a UI. A **trigger** runs a script, or starts the assistant or a coding agent, on
+a schedule or when an event happens. A **webhook** lets an outside service set
+off a trigger.
+
+Every chat, trigger run and coding-agent run is a **thread**. The **proxy**
+connects your accounts to the assistant, your apps and your scripts. A
+**plugin** bundles the pieces so you can share them.
+
+## Events and artifacts
+
+**Events** are the immutable record of what happened, and the source of truth.
+**Artifacts** are your durable, git-tracked files.
+
+{%
+   include-markdown "../../system-knowhow/glossary.md"
+   start="<!--gloss-event-start-->"
+   end="<!--gloss-event-end-->"
+%}
+
+{%
+   include-markdown "../../system-knowhow/glossary.md"
+   start="<!--gloss-artifact-start-->"
+   end="<!--gloss-artifact-end-->"
+%}
+
+Because events are the authority, these always hold:
+
+{%
+   include-markdown "../../README.md"
+   start="<!--invariants-start-->"
+   end="<!--invariants-end-->"
+%}
+
+## Intent, knowhow, and scripts
+
+Lucidos keeps three things apart: **what** you want (stable, in your words),
+**how** to do it (technical, evolving), and the **code** that does it.
+
+{%
+   include-markdown "../taxonomy.md"
+   start="<!--concepts-content-types-start-->"
+   end="<!--concepts-content-types-end-->"
+   heading-offset=1
+%}
+
+{%
+   include-markdown "../taxonomy.md"
+   start="<!--concepts-intent-knowhow-start-->"
+   end="<!--concepts-intent-knowhow-end-->"
+   heading-offset=1
+%}
+
+## Apps and triggers
+
+An **app** is a UI you open repeatedly. A **trigger** runs work on a schedule or
+in response to an event.
+
+{%
+   include-markdown "../../system-knowhow/glossary.md"
+   start="<!--gloss-app-start-->"
+   end="<!--gloss-app-end-->"
+%}
+
+{%
+   include-markdown "../../system-knowhow/glossary.md"
+   start="<!--gloss-trigger-start-->"
+   end="<!--gloss-trigger-end-->"
+%}
+
+Once you create a trigger, it runs unattended. An intent trigger starts a trigger
+thread with every tool the assistant has. That thread can start sub-threads, or
+hand code work to a coding agent.
+
+## Webhooks
+
+A **webhook** receives events from an outside service, and a trigger can react to
+them. It is the one surface a stranger can reach.
+
+{%
+   include-markdown "../../system-knowhow/glossary.md"
+   start="<!--gloss-webhook-start-->"
+   end="<!--gloss-webhook-end-->"
+%}
+
+## Threads
+
+A **thread** is one run of work. A chat, a trigger run and a coding-agent run
+are all threads in the same workspace. The assistant (the *Lucidos Agent*) can
+split a job into **sub-threads** that run in parallel, and each one reports back
+when it ends. It can also hand code work to a **coding agent** (Claude Code or
+Codex). The coding agent works in its own git worktree and proposes a change for
+you to review and Apply.
+
+{%
+   include-markdown "../../system-knowhow/glossary.md"
+   start="<!--gloss-sub-thread-start-->"
+   end="<!--gloss-sub-thread-end-->"
+%}
+
+## Proxies
+
+You connect a service once. After that, the assistant, your apps, your scripts
+and your triggers all call it through the **proxy**. The engine adds the key to
+each request, so an app never sees it.
+
+{%
+   include-markdown "../../system-knowhow/glossary.md"
+   start="<!--gloss-proxy-start-->"
+   end="<!--gloss-proxy-end-->"
+%}
+
+## Plugins
+
+A **plugin** bundles apps, triggers, knowhow and scripts that belong together.
+You install one from any git repo: a public GitHub repo to share with everyone,
+or a company repo to share with your coworkers.
+
+{%
+   include-markdown "../../system-knowhow/glossary.md"
+   start="<!--gloss-plugin-start-->"
+   end="<!--gloss-plugin-end-->"
+%}
+
+## The prompt-first model
+
+The prompt is the primary interface. You describe what you want, and Lucidos
+builds the data and the presentation together, live.
+
+{%
+   include-markdown "../../system-knowhow/glossary.md"
+   start="<!--gloss-live-cocreation-start-->"
+   end="<!--gloss-live-cocreation-end-->"
+%}
+
+## Coming from other AI tools? The "skill" question
+
+Other AI assistants often package "how to do X" as a **skill**. Lucidos splits a
+skill into these pieces:
+
+| Where a "skill" elsewhere bundles… | In Lucidos it's a… |
+|---|---|
+| Instructions the agent follows for a task | **Knowhow**: how-to docs the *Lucidos Agent* writes, keeps up to date, and loads on demand |
+| A reusable interface for the capability | **App**: a persistent UI under `data/apps/<id>/` |
+| Helper code the instructions call | **Script** |
+| The whole capability shipped as one installable | **Plugin**: a bundle of apps + knowhow + triggers + scripts |
+| "Do this automatically / when X happens" | **Trigger** |
+
+**Knowhow** is the closest match to a skill, but you never invoke it by name. The
+agent matches your request against each knowhow file's description at runtime,
+and loads the file when it is relevant. A new knowhow file is available as soon
+as it exists. The agent writes one when it learns something new, and updates a
+file when it finds a quirk or a better approach. You can write and edit them too.
