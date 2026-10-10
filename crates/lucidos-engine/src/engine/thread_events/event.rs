@@ -1,0 +1,1810 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+use crate::api::thread_reach::ThreadReachVerb;
+use crate::core::event_subscription::EventSubscription;
+use crate::runtime::CodingAgent;
+
+use super::{
+    AbortCause, ActorMode, AnswerKind, CancelCause, CaptureFormat, ChildCompletionStatus,
+    EventWaitCancelCause, FormRequestOutcome, MessageOrigin, OwnerApproval, QuestionOption,
+    RecalledMemory, SessionEndReason, TodoItem, TriggerInvocation, UnproposedReason,
+    VoiceSessionEndReason,
+};
+
+/// Replay default for events persisted before the `agent` field existed —
+/// all such events were Claude Code (the only agent at the time).
+fn default_coding_agent_claude_code() -> CodingAgent {
+    CodingAgent::ClaudeCode
+}
+
+fn is_empty_str(s: &str) -> bool {
+    s.is_empty()
+}
+fn is_false(b: &bool) -> bool {
+    !b
+}
+/// Skip-serializing predicate for the default `CodingAgentKind` (`Lucidos`)
+/// — keeps `SessionStarted` rows that have no app/external context wire-quiet
+/// so the diff against legacy rows stays minimal.
+fn is_default_coding_agent_kind(k: &crate::engine::agent_session::CodingAgentKind) -> bool {
+    matches!(k, crate::engine::agent_session::CodingAgentKind::Lucidos)
+}
+fn default_session_ended_reason() -> SessionEndReason {
+    // Legacy DB rows persisted before `reason` was a required wire field lack
+    // the field entirely. Removed non-terminal reasons that DO carry a value
+    // deserialize via `#[serde(other)]` into `LegacyNonTerminal`; this default
+    // covers the missing-field case for the same row class.
+    SessionEndReason::LegacyNonTerminal
+}
+
+/// Backward-compat default for `MessageReceived.mode` on DB rows persisted
+/// before the `mode` field existed. New emissions MUST set `mode` explicitly
+/// — the API layer enforces this on incoming requests.
+fn default_mode_human() -> ActorMode {
+    ActorMode::Human
+}
+
+fn default_cancel_cause() -> CancelCause {
+    CancelCause::Unknown
+}
+
+fn default_abort_cause() -> AbortCause {
+    AbortCause::Unknown
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_inject_mode() -> ActorMode {
+    // Historical PromptInjected rows pre-date the mode field. The only
+    // emit site at the time was the user-correction path, so defaulting to
+    // Human keeps legacy rows attributed correctly.
+    ActorMode::Human
+}
+
+/// Persisted thread events — stored in the DB with thread_id + sequence.
+/// Names are past tense, matching the `event_type` column.
+///
+/// Every field needed for persistence AND SSE broadcast lives here.
+/// New fields use `#[serde(default)]` so old DB rows deserialize safely.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ThreadEvent {
+    // Chat
+    MessageReceived {
+        text: String,
+        /// Content-addressed sha256 hashes of user-attached image blobs.
+        /// Bytes live exactly once under `data/blobs/<hh>/<hash>.<ext>`;
+        /// the LLM call resolves hashes to bytes at send time. Old DB rows
+        /// migrate from `images: [{base64, mime_type}, ...]` via the
+        /// startup migration in `core::image_migration`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        user_image_hashes: Vec<String>,
+        /// The device the message came from, by id only. A display resolves
+        /// its name; older rows also carry a `device` name, which is ignored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_description: Option<String>,
+        /// Set when this thread was spawned by another thread. Required when
+        /// `mode != Human` and the spawn originated from a parent thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_thread_id: Option<uuid::Uuid>,
+        /// Event in the parent thread that triggered this spawn (e.g. the
+        /// `ToolCalled` event for a `run_thread` invocation). Only set when
+        /// `mode != Human`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spawning_event_id: Option<uuid::Uuid>,
+        /// Semantic mode of the actor that emitted this message. Required for
+        /// new emissions (enforced at the API layer). The serde default exists
+        /// only to replay old DB rows persisted before the `mode` field existed.
+        #[serde(default = "default_mode_human")]
+        mode: ActorMode,
+        /// Model the engine will use to answer this message. Stamped at request
+        /// time so the route tooltip can display it before ResponseGenerated
+        /// fires. Coding-agent sessions still rely on CodingAgentSettingsChanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Reasoning effort the engine will use to answer this message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        /// The backend this message was PINNED to: an explicit pick, or one
+        /// this thread remembered for the same model. Stamped beside the model
+        /// so the pick outlives a later change to the model's *preferred
+        /// provider*. `None` means nothing was pinned, so the row decides.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// Structured origin, captured from HTTP headers / device lookup at
+        /// the API boundary. Optional on the wire so old DB rows deserialize
+        /// cleanly; the frontend's `legacyOrigin()` synthesizes from the
+        /// legacy `device_id` / `parent_thread_id` fields when this is None.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
+        /// The *voice session* this message was spoken on, when it was spoken
+        /// rather than typed. Absent means typed, which is every message
+        /// written before voice existed.
+        ///
+        /// It has to live on the message itself. Voice is a mode of a thread
+        /// (ADR 0148), so the composer stays live during a call. A typed
+        /// message therefore sits between the same pair of session events a
+        /// spoken one does, and the bounds cannot answer this.
+        ///
+        /// The id rather than a bare flag: `VoiceSessionStarted`,
+        /// `VoiceSessionEnded` and `SpokenReplyGenerated` all carry it, so one
+        /// call's rows join on one value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice_session_id: Option<uuid::Uuid>,
+    },
+    /// User removed a queued chat follow-up before the agentic loop ingested it.
+    /// The original `MessageReceived` stays in the append-only log. Renderers
+    /// hide it while it is still stepless, and the agentic loop skips the
+    /// matching injected prompt when it drains the queue.
+    QueuedMessageRemoved {
+        removed_message_id: uuid::Uuid,
+    },
+    /// An agent-sent message held back from a coding agent, because the thread
+    /// waits on a human: an open question, or older held messages. It stays
+    /// held until a human replies, and is released as an ordinary
+    /// `MessageReceived`. Unlike that event, it moves no status, so the
+    /// question stays answerable. See ADR 0256.
+    MessageHeld {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        user_image_hashes: Vec<String>,
+        #[serde(default = "default_mode_human")]
+        mode: ActorMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
+    },
+    /// A `MessageHeld` was handed to the agent. Emitted just before its
+    /// `MessageReceived`, so a message is released at most once.
+    HeldMessageReleased {
+        held_message_id: uuid::Uuid,
+    },
+    TextStreamed {
+        text: String,
+    },
+    #[serde(alias = "Thinking")]
+    ThoughtStreamed {
+        text: String,
+    },
+    /// One captured context per LLM call. `usage` is None pre-call and on
+    /// providers that don't report it (OpenAI, Gemini). When present it
+    /// reflects the real prompt-token cost from the provider's `usage`
+    /// block. `estimated_total_tokens` is the engine's pre-call estimate
+    /// (`estimate_tokens_from_chars`, a measured 2.5 chars/token, NOT the
+    /// trim budget's conservative 1.5). The modal renders both so the user
+    /// can spot estimator drift.
+    ///
+    /// A section's `budget_delta_chars` is the one that sums, and over a
+    /// capture they sum to exactly the chars behind `estimated_total_tokens`.
+    /// That is what lets the LLM Context Viewer render each section as a share
+    /// of the headline total. Without it the panel would re-derive a ratio of
+    /// its own. Keep it true when adding a section, and never sum
+    /// `content_chars`: on `Conversation` it counts the tree a second time.
+    ///
+    /// **Not every capture is a turn.** `purpose` names which call this was.
+    /// An *auxiliary model call* emits one too, so token accounting sees the
+    /// engine's own spend. Build those through
+    /// [`crate::engine::AuxCapture`], never by hand: it is what keeps
+    /// `producer` and `purpose` agreeing. The transcript projection renders
+    /// only `Turn` rows. A capture binds to the step it follows, so an aux
+    /// row would overwrite that step's context chip.
+    ContextCaptured {
+        producer: crate::engine::ContextProducer,
+        model: String,
+        context_window: usize,
+        sections: Vec<crate::engine::ContextSection>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
+        estimated_total_tokens: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::engine::ApiUsage>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        trimmed: bool,
+        /// Which trim passes cut something, ascending. Empty when none did.
+        ///
+        /// `trimmed` says a round lost content and this says where from. The
+        /// distinction that matters is pass 5, the only one that removes a
+        /// message rather than leaving an addressed stub. Absent on every row
+        /// written before the field existed, which reads as unknown rather
+        /// than as none: those rows recorded a boolean and nothing else.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        trim_passes: Vec<u8>,
+        /// Which call this records. Absent on every row written before the
+        /// field existed. Absent on every turn row since, so it defaults to
+        /// `Turn` and serializes only for an auxiliary call.
+        #[serde(
+            default,
+            skip_serializing_if = "crate::engine::ContextPurpose::is_turn"
+        )]
+        purpose: crate::engine::ContextPurpose,
+        /// True when the row was rebuilt after the fact from other events
+        /// rather than recorded at the call. Its numbers are estimates, and
+        /// it deliberately carries no `usage`, so a rollup that filters on a
+        /// present `usage` block keeps reporting measured spend only. Written
+        /// by `core::aux_context_backfill` and by nothing else.
+        #[serde(default, skip_serializing_if = "is_false")]
+        reconstructed: bool,
+        /// The `Agent` call whose sub-agent made this call, so the capture
+        /// binds to that sub-agent's steps. Absent for every other capture.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+        /// The coding agent's id for this API call. Every
+        /// `CodingAgentToolCalled` the call produced carries the same id, so
+        /// the capture binds to each of them. Absent for every other capture.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_call_id: Option<String>,
+        /// The reasoning tier this call ran at, where the caller has one to
+        /// report. Absent for every purpose but the compactor today, and for
+        /// every row written before the field existed. Lets a cost estimate
+        /// split measured usage by tier instead of treating all history as
+        /// one baseline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        /// How long the call took, wall clock, where the caller timed it.
+        /// Absent for every purpose but the compactor today. The Tree
+        /// backfill estimate reads it as a model's seconds per call at a tier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        /// The *served model*: the model id the provider's reply named,
+        /// verbatim. `model` is the one Lucidos asked for. Absent when the
+        /// reply named none, and on every row written before the field
+        /// existed. One that is neither `model` nor a dated snapshot of it
+        /// means another model answered: a provider reroute, or the router
+        /// sending a retired model's successor (ADR 0418).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
+    },
+    /// The engine's automatic pre-turn recall: `retrieve_context` vector-searched
+    /// long-term memory with classifier-derived `queries` and injected the hits
+    /// into the turn's context, before the model saw anything.
+    ///
+    /// **Not the agent's own lookup.** That one is a `ToolCalled` for the
+    /// `memory` tool's `search` action, which the agent issues mid-turn with a
+    /// query of its own when the injection missed (see `engine::memory::read`).
+    /// The two were both labelled around the word "search" until 2026-08-12,
+    /// which read as one thing happening twice; the labels and this name were
+    /// split onto recall-vs-search to keep them apart. `MemorySearched` is the
+    /// pre-rename name, kept as an alias for rows already persisted under it.
+    #[serde(alias = "MemorySearched")]
+    MemoryRecalled {
+        #[serde(default)]
+        results: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        queries: Vec<String>,
+        /// The memories injected, in the order the model saw them, so
+        /// `memories.len() == results`. Absent on rows written before it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        memories: Vec<RecalledMemory>,
+    },
+    ToolCalled {
+        name: String,
+        args: Value,
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        description: String,
+    },
+    ToolResult {
+        name: String,
+        result: String,
+        #[serde(default)]
+        images: Vec<String>,
+        #[serde(default = "default_true")]
+        success: bool,
+        /// Event id of the originating `ToolCalled`. Stamped on every live
+        /// emit by the chat agentic loop, and on synthetic backfills by the
+        /// recovery sweep (`recover_orphan_tool_calls`). The frontend's
+        /// `groupIntoExchanges` uses it (via `chatToolCallOwners`) to route
+        /// the result back to the call's exchange.
+        ///
+        /// Without explicit pairing,
+        /// an `ask_user_question` result followed the post-`UserQuestionAsked`
+        /// request_id redirect into the question divider and left the
+        /// original exchange's "Executing …" spinner pending forever.
+        /// Every reader pairs a result with its call by this id, since a
+        /// parallel run answers in completion order (ADR 0246). Optional for
+        /// legacy DB rows, which keep each reader's positional rule.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_called_event_id: Option<uuid::Uuid>,
+    },
+    /// Lucidos Agent's current todo list, replaced wholesale on every
+    /// `todo_write` tool call. Sticky UI panel reads the latest of these per
+    /// thread; the empty list means the agent cleared the list. Not emitted
+    /// from coding-agent threads. CC's own `TodoWrite` continues to render
+    /// inline on the tool-call step.
+    TodoListWritten {
+        items: Vec<TodoItem>,
+        /// *Todo notes*: free text the agent keeps beside the items, replaced
+        /// whole with them (ADR 0085). Absent on an older row and on a call
+        /// that passes none, so it is skipped when serializing and defaults
+        /// when read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+    },
+    /// Background task spawned via `run_bash_background` (shell command) OR
+    /// `run_python_background` (venv-rooted python script: the engine
+    /// wraps it as `bash -o pipefail -c "<venv-python> <script>"` and routes through
+    /// the same `BackgroundBashRegistry`). The `command` field captures
+    /// the exact shell invocation, so a reader can tell which spawning
+    /// tool produced the row. Paired with a later `BackgroundBashCompleted`.
+    /// The two events are the durable audit trail of every long-running
+    /// background task. `bash_output` reads from the in-memory registry
+    /// while a task runs, and for the few minutes its completion is retained
+    /// there. It then falls back to the `BackgroundBashCompleted` payload,
+    /// whichever tool spawned it.
+    BackgroundBashStarted {
+        task_id: String,
+        command: String,
+        timeout_secs: u64,
+        started_at: chrono::DateTime<chrono::Utc>,
+    },
+    BackgroundBashCompleted {
+        task_id: String,
+        /// Truncated to 200 chars for log readability; full command lives
+        /// on the paired `BackgroundBashStarted`.
+        command: String,
+        /// The child's normal exit status. `None` whenever there isn't one:
+        /// the child died on a signal (see `signal`), or the engine failed to
+        /// reap it at all. Never a stand-in number: a reader that sees
+        /// `exit_code: 0` can trust the command really exited 0.
+        exit_code: Option<i32>,
+        /// Unix signal that terminated the child, when one did. 9 is SIGKILL
+        /// from the watchdog timeout or `bash_kill`, 11 is SIGSEGV, and 13 is
+        /// SIGPIPE from a `pipefail` pipeline. Mutually exclusive with
+        /// `exit_code`; both `None` means the status was unavailable.
+        /// Absent on rows written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
+        stdout: String,
+        stderr: String,
+        started_at: chrono::DateTime<chrono::Utc>,
+        finished_at: chrono::DateTime<chrono::Utc>,
+        /// Watchdog killed the task because `timeout_secs` elapsed.
+        #[serde(default, skip_serializing_if = "is_false")]
+        timed_out: bool,
+        /// `bash_kill` killed the task explicitly.
+        #[serde(default, skip_serializing_if = "is_false")]
+        killed: bool,
+        /// The engine that owned this task stopped while it was running, so the
+        /// child died with the process and nobody watched it exit. Distinct
+        /// from `killed`, which means a person or an agent cancelled the work:
+        /// a reader that conflates the two concludes the task was called off.
+        /// `exit_code` and `signal` are both `None` here, because no status was
+        /// ever reaped. Written by the teardown emit or by the boot sweep, in
+        /// `engine/tools/bash_background_recovery.rs`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        abandoned: bool,
+    },
+    ResponseGenerated {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+    },
+    ResponseCanceled {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default = "default_cancel_cause")]
+        cause: CancelCause,
+    },
+    ResponseAborted {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default = "default_abort_cause")]
+        cause: AbortCause,
+    },
+    ResponseFailed {
+        error: String,
+    },
+
+    // Resume-after-abort boundary. Opens a new exchange in the timeline whose
+    // body is the rerun (chat: SessionRecovered's predecessor → engine note +
+    // re-LLM call; CC: --resume into the same cc_session_id). Past name was
+    // SessionRecovered (and SessionResumed before that) — kept as serde aliases
+    // so older DB rows still deserialize. Renamed to ContinuationStarted
+    // because (a) "session" was ambiguous between chat and CC, and (b) the
+    // resumed response is actually a *new* response continuing the prior
+    // attempt, not the prior response coming back to life.
+    #[serde(alias = "SessionRecovered", alias = "SessionResumed")]
+    ContinuationStarted {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        branch: String,
+        /// Engine-stamped origin so the route popover can render
+        /// "Engine · Auto-resumed after restart" for recovered sessions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
+        /// Why the continuation opened, forwarded from the originating
+        /// `ContinuationRequested.reason`. The frontend reads it to label the
+        /// resume honestly: `user_clicked_continue` is genuinely a resume
+        /// after an engine restart, but `auto_recovery_after_hang` fires for a
+        /// hung subprocess OR a stray signal-kill (e.g. a cross-workspace
+        /// `cargo check` broad-kill) where NO engine restart happened.
+        /// Labeling those "Resumed after engine restart" misattributes a local
+        /// interruption to a restart. `None` for legacy rows and the chat
+        /// rerun path (which carries its own engine note instead).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    SessionStarted {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        branch: String,
+        /// External repository ID this session is bound to.
+        /// Persisted in thread_summaries so follow-ups reuse the same repo.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_id: Option<String>,
+        /// What kind of coding-agent thread this is: `lucidos` (default,
+        /// edits Lucidos source), `app` (edits a `data/apps/<id>/` folder
+        /// in the workspace), or `external` (edits a registered external
+        /// repo). Default applies to legacy rows persisted before this
+        /// field existed; those are interpreted via `repo_id` (NULL ⇒
+        /// `lucidos`, set ⇒ `external`).
+        #[serde(default, skip_serializing_if = "is_default_coding_agent_kind")]
+        coding_agent_kind: crate::engine::agent_session::CodingAgentKind,
+        /// Canonical folder the user (or LLM) picked when spawning. For
+        /// `app` threads this is `<workspace>/data/apps/<id>/`. For
+        /// `lucidos` and `external` it equals the repo root. Empty for
+        /// legacy rows persisted before this field existed.
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        coding_agent_folder: String,
+        /// App id when `coding_agent_kind == "app"`; `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_id: Option<String>,
+        /// Which backend drives this thread (`claude-code` | `codex`).
+        /// Locked in at first SessionStarted via the thread_summaries
+        /// projection (COALESCE keeps the existing value) so follow-ups and
+        /// recovery resume on the same backend. The default covers legacy rows,
+        /// which are all Claude Code.
+        #[serde(default = "default_coding_agent_claude_code")]
+        coding_agent: CodingAgent,
+    },
+    SessionEnded {
+        /// Why the session ended. Always serialized, because the frontend reads
+        /// `reason` to distinguish a normal completion from a system abort,
+        /// and `Completed` must reach the wire as `"completed"`. The default
+        /// applies only when reading old DB rows persisted before `reason`
+        /// existed. A row written before the terminal-only reasons still
+        /// carries a retired value. The snapshot serves the raw column, so a
+        /// reader must tolerate any string here.
+        #[serde(default = "default_session_ended_reason")]
+        reason: SessionEndReason,
+    },
+    #[serde(alias = "ClaudeCodeTextStreamed")]
+    CodingAgentTextStreamed {
+        text: String,
+        #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
+        coding_agent: CodingAgent,
+        /// The `Agent` call whose sub-agent wrote this text. Such text is the
+        /// sub-agent's narration, never the session's reply. Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+        /// The text is a *progress note*: the provider's summary of what the
+        /// agent wrote before a tool call. The agent itself read it in full.
+        #[serde(default, skip_serializing_if = "is_false")]
+        progress_note: bool,
+    },
+    /// Streamed reasoning from a coding agent, the coding-agent mirror
+    /// of the chat agent's `ThoughtStreamed`. Carries plaintext reasoning the
+    /// agent emitted before its visible output (CC's `thinking_delta`; Codex's
+    /// `item/reasoning/*Delta` / `reasoning` item). Per-token streamed, persisted,
+    /// rendered as the "Thinking" step's live content so a long reasoning pass
+    /// shows progress instead of a silent "Working" gap.
+    #[serde(alias = "ClaudeCodeThoughtStreamed")]
+    CodingAgentThoughtStreamed {
+        text: String,
+        #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
+        coding_agent: CodingAgent,
+    },
+    #[serde(alias = "ClaudeCodeToolCalled")]
+    CodingAgentToolCalled {
+        name: String,
+        args: Value,
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        description: String,
+        #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
+        coding_agent: CodingAgent,
+        /// Agent-issued identifier for this tool invocation, persisted so the
+        /// matching `CodingAgentToolResult` can be paired with the call even
+        /// when an `EXCHANGE_START_TYPES` event (e.g. permission prompt)
+        /// splits them across exchanges. Empty for legacy DB rows.
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        tool_use_id: String,
+        /// The `Agent` call whose sub-agent made this call. Absent for the
+        /// session's own calls and on rows written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+        /// The API call that made this tool call, matching that call's
+        /// `ContextCaptured`. Absent from Codex and on older rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_call_id: Option<String>,
+    },
+    #[serde(alias = "ClaudeCodeToolResult")]
+    CodingAgentToolResult {
+        /// The tool of the call this answers. Empty on older rows and for a
+        /// call the session never saw.
+        name: String,
+        /// The agent's whole output. Older rows kept only its first 200 chars.
+        /// The snapshot and the live stream both drop it; fetch it by event id.
+        result: String,
+        #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
+        coding_agent: CodingAgent,
+        /// Matches the originating `CodingAgentToolCalled.tool_use_id`.
+        /// Empty for legacy DB rows.
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        tool_use_id: String,
+        /// The `Agent` call whose sub-agent made the call this answers. Absent
+        /// for the session's own calls and on rows written before the field
+        /// existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
+    #[serde(alias = "ClaudeCodeUserMessageSent")]
+    CodingAgentUserMessageSent {
+        text: String,
+        #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
+        coding_agent: CodingAgent,
+    },
+    /// Automated prompt sent to a coding agent (e.g., conflict resolution, hardening).
+    /// Persisted for audit trail but not rendered in the chat UI.
+    #[serde(alias = "ClaudeCodePromptSent")]
+    CodingAgentPromptSent {
+        text: String,
+        #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
+        coding_agent: CodingAgent,
+        /// Engine-stamped origin for prompts the engine itself synthesized
+        /// (orphan recovery, hardening retrigger, merge conflict). Surfaced in
+        /// the route popover so users can distinguish engine-driven prompts
+        /// from agent-driven ones. `None` for legacy DB rows and for prompts
+        /// that already carry their origin elsewhere in the chain.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
+    },
+    /// The coding agent read an input the engine forwarded to it. Until then
+    /// the input is owed, and the session keeps its subprocess (ADR 0268).
+    CodingAgentInputRead {
+        /// The event that carried the input: the `MessageReceived` for a
+        /// message, the `ChildThreadCompleted` for a child wake.
+        input_event_id: uuid::Uuid,
+        /// The read opened a turn on a session whose last turn had already
+        /// ended, as when a queued message outlives a Stop. Such a read is a
+        /// start event: the thread runs again (ADR 0268).
+        #[serde(default, skip_serializing_if = "is_false")]
+        started_turn: bool,
+    },
+    /// Emitted when the engine detects that a coding-agent session ended without
+    /// running the required hardening. A recovery hardening session is spawned
+    /// automatically. This is NOT a completion event: the thread stays active
+    /// until hardening finishes.
+    MissingHardeningDetected {
+        /// Engine-stamped origin (always `MessageOrigin::Engine { reason:
+        /// EngineReason::MissingHardening }` for new emits). Optional on the
+        /// wire so legacy DB rows decode cleanly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
+    },
+    #[serde(alias = "ClaudeCodeIdled")]
+    CodingAgentIdled {
+        #[serde(default, skip_serializing_if = "is_false")]
+        has_changes: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_external_repo: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        requires_restart: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cc_session_id: Option<String>,
+        #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
+        coding_agent: CodingAgent,
+        /// Optional short tag describing why this idle was emitted. Most idles
+        /// have no `reason` (the agent simply finished its turn). Recovery
+        /// emits `Some("engine_restart_interrupt")` when a mid-turn-crashed
+        /// session is surfaced to the UI as "interrupted, click to continue"
+        /// instead of being auto-spawned. The frontend reads this field to
+        /// render the continue affordance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Absolute filesystem path of the worktree the agent ran in for this
+        /// turn. Phase 6.1 of the CC resume architecture: persisted so that
+        /// follow-up turns can look up the deterministic per-thread worktree
+        /// directly from the events stream instead of scanning
+        /// `git worktree list`. `None` on legacy rows that predate the field
+        /// and on out-of-band idles emitted without a worktree (e.g. the
+        /// "no branch" recovery path).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_path: Option<String>,
+        /// `git rev-parse HEAD` in the worktree at the moment the agent went
+        /// idle. Phase 8.1 of the CC resume architecture. The next spawn
+        /// diffs against this SHA and checks `git status`, to detect external
+        /// user edits made between turns. It then injects a note into the
+        /// resumed prompt. `None` on legacy rows, on idles emitted
+        /// without a worktree, or when `git rev-parse` fails (e.g. branch
+        /// has zero commits yet).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_head_sha: Option<String>,
+        /// True iff the agent went idle while the chat-agent's
+        /// `run_bash_background` tool still had a task running for this thread.
+        /// **Recorded history only.** As of the bg-bash-gate removal this no
+        /// longer drives any projection or UI. A live event wait, not a
+        /// background task, holds the idle proposal (ADR 0395), and the
+        /// chat-agent bash auto-resumes CC via
+        /// `spawn_bash_completion_watcher`. Kept on the event so the timeline
+        /// still records that an idle overlapped a background task.
+        #[serde(default, skip_serializing_if = "is_false")]
+        bg_bash_pending: bool,
+    },
+    /// Continuation requested, emitted when a CC turn that was interrupted
+    /// (engine restart mid-turn, Q9a recovery path) needs to be resumed
+    /// without a new user message. Four emit sites: HTTP `/continue`
+    /// (user clicks Continue), the *in-loop watchdog* (10-min silence with
+    /// the gate open), the *external watchdog* (12-min wedged `select!`),
+    /// and the missing-hardening recovery sweep. Picked up by the spawn
+    /// dispatcher (Phase 5, Task 5.2), which re-spawns CC via `--resume`
+    /// with no new input. The dispatcher uses the event's id as the
+    /// idempotency key so a single `ContinuationRequested` produces exactly
+    /// one spawn.
+    ///
+    /// Past name was `ContinueSignal`. The rename migration
+    /// (`20260518212540_rename_continue_signal_to_continuation_requested`)
+    /// rewrote existing rows, and the serde alias remains as a safety net
+    /// for any in-flight JSON not yet persisted. Renamed to past-tense
+    /// per the events-only model
+    /// (`AppUiRefreshRequested` not `RefreshAppUI`) and to pair with the
+    /// already-past-tense `ContinuationStarted` terminal that opens the
+    /// resulting exchange.
+    ///
+    /// `reason` is a short tag describing why a continuation was needed
+    /// (e.g. `"engine_restart_interrupt"`); it is purely informational and
+    /// surfaced for debugging / route-popover context.
+    #[serde(alias = "ContinueSignal")]
+    ContinuationRequested {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        reason: String,
+    },
+
+    // Thread lifecycle
+    ThreadTitleGenerated {
+        title: String,
+    },
+    ThreadTitleRenamed {
+        title: String,
+    },
+    ThreadSaved,
+    ThreadUnsaved,
+    ThreadArchived,
+    /// The thread's own agent asked to be archived once its turn ends (ADR 0310).
+    /// The actor names the agent thread. The archive request resolver runs the
+    /// Archive button's cascade after the settle; a newer message closes it.
+    ThreadArchiveRequested,
+    /// The user took a thread back out of the archive: Archive all's Undo
+    /// (ADR 0349). Moves it to the inbox and bumps nothing else.
+    ThreadUnarchived,
+    /// The thread's own agent asked the user to read its latest reply (ADR
+    /// 0409). Sets `read_requested`, which lists the thread in the drawer's
+    /// Review group once its turn ends. The actor names the agent thread, and
+    /// is absent when the turn-end gate forced the decision.
+    ThreadReadRequested,
+    /// The thread's agent decided its reply needs no reading: the no half of
+    /// the turn's *read decision*. Projects nothing, so it never clears an
+    /// unseen request (ADR 0409). The actor names the agent thread, and is
+    /// absent when the turn-end gate forced the decision.
+    ThreadReadNotRequested,
+    /// The user saw the reply a read request pointed at: its end stayed on
+    /// screen for the seen dwell. Clears `read_requested`. Recorded only while
+    /// the thread's summary still reads `seen_version`, so a duplicate or a
+    /// sighting older than a newer request records nothing.
+    ThreadReplySeen {
+        /// The thread's `summary_version` when the client saw the reply.
+        seen_version: i64,
+    },
+    /// The Lucidos Agent proposed a *thread triage* in this thread (ADR 0349).
+    /// `apply_triage` acts only on these entries, and only after the user
+    /// replied to this event.
+    ThreadTriageProposed {
+        entries: Vec<super::TriageProposalEntry>,
+    },
+    /// A thread was created in `composing` state. Emitted by the first
+    /// successful POST /threads (debounced first user input: keystroke,
+    /// image attach, or mode toggle on a fresh compose). The thread can
+    /// be addressed by id immediately after this event lands.
+    ThreadStarted {
+        /// Initial mode the user opened compose with. Mutable while the
+        /// thread is `Composing`; locked on first `MessageReceived`.
+        mode: String,
+        /// Stamped by `api::actor::user_actor` so the timeline
+        /// shows which device started the draft thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A thread in `composing` state was explicitly discarded. Emitted by
+    /// DELETE /threads/:id. Terminal: the state-machine guard rejects
+    /// every subsequent compose PUT and message POST with 410 Gone. That is
+    /// the "make impossible states impossible" lever that replaces the
+    /// old LWW + tombstone machinery.
+    ThreadDiscarded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The workspace's *home thread* was created (ADR 0362): an active chat
+    /// thread titled "Home", with no message yet. `ensure_home_thread`
+    /// emits it once per workspace, at boot. The projection's unique marker
+    /// refuses a second one, which rolls the event back with it.
+    HomeThreadCreated,
+    /// A user attached an image to this thread's compose draft. Emitted by
+    /// POST /api/v1/threads/:id/blobs after the bytes are content-addressed
+    /// to disk under `data/blobs/<hh>/<hash>.<ext>`. The `hash` is the sole
+    /// identity used by every downstream consumer (compose payload, message
+    /// payload, LLM call). `mime` and `byte_size` are convenience fields, so
+    /// SSE subscribers can render the upload entry without fetching the
+    /// blob. One blob attached to two threads leaves two events, one per
+    /// thread. The disk write is a no-op the second time, and the per-thread
+    /// fact stays distinct.
+    ImageUploaded {
+        hash: String,
+        mime: String,
+        byte_size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    TriggerStarted {
+        #[serde(alias = "task_id")]
+        trigger_id: String,
+        #[serde(default, alias = "task_name", skip_serializing_if = "Option::is_none")]
+        trigger_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        /// Which path fired this run. `None` only on legacy DB rows persisted
+        /// before this field existed. New emissions always set it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invocation: Option<TriggerInvocation>,
+        /// Engine-stamped origin for scheduler-fired triggers, always set to
+        /// `Engine { Scheduler { trigger_id, trigger_name } }` so the route
+        /// popover can render "Engine · Scheduled · <name>". `None` only on
+        /// legacy DB rows persisted before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
+        /// Snapshot of the firing trigger's `go_to_review` flag. When true,
+        /// the section transition logic treats this trigger thread as
+        /// top-level so its terminal event surfaces it in REVIEW. Defaults
+        /// to false for backward compat with pre-flag DB rows.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        go_to_review: bool,
+        /// The model this fire actually ran on, resolved from the trigger's own
+        /// pin or the account chat preference. `TriggerStarted` is a trigger
+        /// thread's STARTER event (it has no `MessageReceived`), so this is
+        /// where the *per-thread model memory* reads from: without it the
+        /// thread's in-thread picker would show the account model while the run
+        /// used a different one, and a human follow-up would silently switch.
+        /// `None` on legacy rows persisted before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The reasoning effort this fire actually ran with. Same role and same
+        /// legacy-`None` caveat as [`Self::TriggerStarted::model`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        /// The backend this fire was pinned to, from the trigger's own pin or
+        /// the thread's memory. `None` means nothing was pinned, so the row
+        /// decided.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    TriggerCompleted {
+        #[serde(alias = "task_id")]
+        trigger_id: String,
+        #[serde(default, alias = "task_name", skip_serializing_if = "Option::is_none")]
+        trigger_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_summary: Option<String>,
+    },
+
+    // Changes — change_id is the primary identifier
+    ChangeProposed {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        change_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        requires_restart: bool,
+        /// Engine-stamped origin for change proposals from engine-internal
+        /// recovery paths (stale-session cleanup, orphan worktree cleanup).
+        /// `None` for proposals authored by a live agent session. Those
+        /// inherit their origin from the surrounding `MessageReceived`.
+        /// Surfaced in the route popover so users can render
+        /// "Engine · Stale session cleanup" etc.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
+        /// Legacy: was set by the deleted post-commit git hook on per-commit
+        /// emits (empty `change_id`). Live aggregate emits always set `None`.
+        /// Historical rows still carry it; the projection treats per-commit
+        /// shape (empty `change_id`, `commit_sha: Some(_)`) as inert in
+        /// `thread_summaries` and UPDATE-only on `changes`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit_sha: Option<String>,
+        /// Branch the change lives on. Stamped by the first
+        /// `ChangeProposed` per `change_id`; used by the projection to
+        /// reconstruct the row without consulting the legacy `changes` table.
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        branch_name: String,
+        /// Repo root the change targets. Same lifetime/intent as `branch_name`.
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        repo_root: String,
+        /// `true` if the originating commit landed on a hardened HEAD; surfaced
+        /// in the projection so the apply UI can short-circuit re-hardening.
+        /// Stamped from `is_harden_marker_present` at end-of-turn aggregate
+        /// emit; engine-internal recovery emits resolve it the same way.
+        #[serde(default, skip_serializing_if = "is_false")]
+        hardened: bool,
+        /// `true` when nobody saw the work finish: the archive net's
+        /// set-aside proposals. A pending change is never incomplete
+        /// (ADR 0400), and older rows marked so are withdrawn at boot.
+        #[serde(default, skip_serializing_if = "is_false")]
+        incomplete: bool,
+        /// `true` when the engine proposes the change straight into set-aside:
+        /// work found on an archived thread's branch (ADR 0328). It leaves
+        /// the thread where it is instead of surfacing it for review.
+        #[serde(default, skip_serializing_if = "is_false")]
+        set_aside: bool,
+        // Legacy fields — kept for backward compat with old DB rows
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        path: String,
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        diff: String,
+    },
+    ChangeApplied {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        change_id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        requires_restart: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        client_update: bool,
+        /// Commit subjects merged to main, oldest first. Empty for no-op applies.
+        /// Surfaced in the restart-required toast grouped by thread.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        commits: Vec<String>,
+        /// Title of the originating thread, included so the restart toast can
+        /// group entries without an extra lookup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_title: Option<String>,
+        /// Who applied the change, always the human/HTTP/SDK initiator
+        /// stamped by `api/actor::build_message_origin` from the originating
+        /// HTTP call. None on legacy DB rows, and when the conflict-resolution
+        /// ff-merge path runs. That path drops the original applier's actor
+        /// across the async gap, and the popover then renders "Unknown".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+        /// SHA of `main` before the merge, paired with `post_merge_sha` to
+        /// give Revert the exact commit range to drop. `None` for events
+        /// emitted before the projection rewrite.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_merge_sha: Option<String>,
+        /// SHA of `main` after the merge.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        post_merge_sha: Option<String>,
+        // Legacy
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        path: String,
+    },
+    ChangeDiscarded {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        change_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+        // Legacy
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        path: String,
+    },
+    /// The change was kept for later: out of Review and every bulk path until
+    /// it is brought back (ADR 0328). The actor rides on `EventMeta`.
+    ChangeSetAside {
+        change_id: String,
+    },
+    /// A set-aside change returned to pending, by the user or because its
+    /// thread proposed new work on the same branch.
+    ChangeBroughtBack {
+        change_id: String,
+    },
+    /// A pending or set-aside change went back to unproposed work, and its
+    /// branch kept every commit (ADR 0400). A turn that stopped committed past
+    /// it, or Bring back met work that never finished.
+    ChangeWithdrawn {
+        change_id: String,
+    },
+    /// A turn end left work on the branch and proposed none of it (ADR 0400).
+    /// `files` is what a proposal would have carried.
+    ProposalWithheld {
+        branch_name: String,
+        files: Vec<String>,
+        reason: UnproposedReason,
+    },
+    ChangeReverted {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        change_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+        // Legacy
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        path: String,
+    },
+    ChangeApplyFailed {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        change_id: String,
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+
+    // Merge conflict resolution
+    MergeConflictDetected {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        change_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+        /// Engine-stamped origin (always `MessageOrigin::Engine { reason:
+        /// EngineReason::MergeConflict }` for new emits). Optional on the wire
+        /// so legacy DB rows decode cleanly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
+    },
+    /// A merge-resolution worktree was set up for a change with conflicts.
+    /// The projection treats this as the change's `merge_worktree_path` /
+    /// `merge_temp_branch` until a `MergeResolutionCleared` arrives. Survives
+    /// restart so startup cleanup can find dangling worktrees.
+    MergeResolutionStarted {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        change_id: String,
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        worktree_path: String,
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        temp_branch: String,
+    },
+    /// The merge-resolution worktree was torn down (cleanup finished).
+    MergeResolutionCleared {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        change_id: String,
+    },
+    /// A change's working tree was hardened (`/harden` marker stamped on
+    /// HEAD). Idempotent: re-emitting after an unrelated commit is fine,
+    /// the projection treats only the latest event per `change_id`.
+    /// Downgraded to false implicitly when a fresh `ChangeProposed` arrives
+    /// with `hardened: false`.
+    ChangeHardened {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        change_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A model wrote the *change summary*: one line saying what a change of
+    /// several commits does. `description` is the commit list it summarized.
+    /// The projection keeps the summary only while that still equals the
+    /// change's description, so a summary of an older commit set never lands.
+    ChangeSummarized {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        change_id: String,
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        summary: String,
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        description: String,
+    },
+
+    /// Coding-agent session settings changed mid-session (model or reasoning
+    /// effort). Persisted per-thread so settings survive idle exit and respawn.
+    /// Older stored rows may also carry a `permission_mode` key, so this variant
+    /// must keep ignoring unknown fields.
+    ///
+    /// Also carries `cc_session_id`: the agent emits this event at `Init` (the
+    /// first moment CC reports its session id) with `cc_session_id: Some(..)`,
+    /// so the resume/recovery lookups can find the id even when the session is
+    /// interrupted by an engine restart *before* it ever reaches a
+    /// `CodingAgentIdled` boundary (the only other event that carries it). The
+    /// id is CC's authoritative Init fact, exactly like `model`. Settings-only
+    /// emits (startup persist, mid-session model/effort changes) pass
+    /// `None`; the lookups read the most recent non-null value across both
+    /// event types.
+    #[serde(alias = "CCSettingsChanged")]
+    CodingAgentSettingsChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
+        coding_agent: CodingAgent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cc_session_id: Option<String>,
+        /// Absolute `CLAUDE_CONFIG_DIR` the session was created under, stamped
+        /// alongside `cc_session_id` at the Init emit. It is the authoritative
+        /// session↔config-dir pairing. CC keys each session's transcript on this
+        /// dir (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`). So a follow-up
+        /// resume re-injects it (see `lookup_pinned_cc_config_dir` and
+        /// `SpawnArgs::account_pin`), and a mid-flight user toggle of the
+        /// env var cannot strand the session. `None` on legacy rows,
+        /// on the pre-Init settings emit, and on mid-session settings-only emits
+        /// (model/effort changes). The Init emit is the carrier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_config_dir: Option<String>,
+        /// Whether `CLAUDE_CONFIG_DIR` was actually set for that session, stamped
+        /// beside `claude_config_dir`. `false` means it was unset and the dir is
+        /// Claude Code's default. The two are different logins to Claude Code, so
+        /// a resume must replay which one it was (`AccountPin`). `None` wherever
+        /// `claude_config_dir` is, and on rows written before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_config_dir_explicit: Option<bool>,
+    },
+
+    // A prompt fed into the agentic loop outside the ordinary send path, mid-turn
+    // or as a new turn's opening. `mode` names the sender: a human interjection,
+    // an agent's follow-up into its child thread, or the engine (a resume note,
+    // an event-wait re-entry anchor). `mode` and `origin` default for old rows
+    // that pre-date them.
+    #[serde(alias = "UserPromptInjected")]
+    PromptInjected {
+        text: String,
+        #[serde(default = "default_inject_mode")]
+        mode: ActorMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
+        // None for engine-driven injections (resume notes from chat/rerun.rs)
+        // and for legacy DB rows that pre-date this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        injected_message_id: Option<uuid::Uuid>,
+        // Set ONLY on an event-delivery anchor (ADR 0047): the id of the
+        // `EventWaitDelivered` this injection carries. `text` has to
+        // carry the matched event as prose because it IS the prompt the model
+        // reads, and a transcript that renders that verbatim is a screen of
+        // pretty-printed JSON. The id points at the row that already holds the
+        // same facts structurally (`event_type`, `payload`), so the client can
+        // render a named event with the payload folded away instead of parsing
+        // the prose back apart. None for every other injection, and for legacy
+        // rows, where the prose IS the content.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivered_event_id: Option<uuid::Uuid>,
+    },
+
+    // Interactive (persisted)
+    //
+    // *Form requests*: the agent asked the user to act on something it put in
+    // front of them. Each carries a `request_id` and stays open until one
+    // `FormRequestResolved` names it, so a request survives a reload or a lost
+    // stream frame. `payload` is the JSON the client renders from, and it
+    // never holds a secret.
+    /// Credential form request. Resolved by the credential save or the form's
+    /// Cancel (`POST /api/v1/form-requests/{request_id}/cancel`).
+    #[serde(alias = "CredentialPromptRequested", alias = "CredentialRequest")]
+    CredentialRequested {
+        request_id: uuid::Uuid,
+        payload: String,
+    },
+    /// Plugin install request awaiting user confirmation. It carries the
+    /// JSON preview `install_plugin` emitted: manifest, file list, overwrites
+    /// and an optional `setup`. The frontend renders the install panel from
+    /// it. `request_id` is the preview's `install_id`.
+    /// Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm|cancel}`.
+    #[serde(alias = "PluginInstallRequest")]
+    PluginInstallRequested {
+        request_id: uuid::Uuid,
+        payload: String,
+    },
+    /// Plugin uninstall request awaiting user confirmation. It carries the
+    /// JSON preview `uninstall_plugin` emitted: plugin name and version, plus
+    /// the file list split into still-on-disk and already-missing. The
+    /// frontend renders the uninstall panel from it. `request_id` is the
+    /// preview's `uninstall_id`. Resolved by
+    /// `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm|cancel}`.
+    #[serde(alias = "PluginUninstallRequest")]
+    PluginUninstallRequested {
+        request_id: uuid::Uuid,
+        payload: String,
+    },
+    /// Email send awaiting user confirmation. `payload` is the draft.
+    /// Resolved by `POST /api/v1/email/send` or the form's Cancel.
+    #[serde(alias = "EmailConfirmRequest")]
+    EmailConfirmRequested {
+        request_id: uuid::Uuid,
+        payload: String,
+    },
+    /// The provider's authorization page for `connect_oauth_account`.
+    /// `payload` is the `{target: "url", url, purpose: "oauth"}` navigation
+    /// the client opens, on the device the meta actor names. The flow's
+    /// listener resolves it when its wait ends.
+    OAuthAuthorizationRequested {
+        request_id: uuid::Uuid,
+        payload: String,
+    },
+    /// Closes the form request `request_id` names. Emitted once per request.
+    FormRequestResolved {
+        request_id: uuid::Uuid,
+        outcome: FormRequestOutcome,
+    },
+    McpConsentRequested {
+        tool: String,
+        args: Value,
+    },
+
+    // Interactive question card with selectable options. Emitted by both
+    // CC's built-in `AskUserQuestion` tool and the chat agent's
+    // `ask_user_question` LLM tool. `meta.channel` distinguishes which
+    // agent raised it (`claude_code` / `chat`). Resume goes through
+    // POST /api/v1/threads/{thread_id}/answer-question, which emits
+    // UserQuestionAnswered and dispatches the channel-specific resume:
+    // CC respawns its subprocess with --resume + a matching tool_result;
+    // chat wakes its in-process tool waiting on the question wait registry.
+    //
+    // `cc_session_id` is the Claude Code session id at intercept time, used to pin
+    // `--resume` to the right CLI conversation. **Empty string** when the
+    // chat agent raises the question — chat is in-process and has no
+    // resume token.
+    //
+    // `worktree_path` is the absolute path of the CC worktree at intercept
+    // time. CC stores session JSONLs keyed by CWD
+    // (`~/.claude/projects/<encoded-cwd>/<sid>.jsonl`), so resume MUST
+    // start the new subprocess in the same directory or `--resume` returns
+    // "No conversation found". Branch lookup is unreliable here because CC
+    // is free to `git checkout -b ...` inside the worktree — see
+    // `engine/agent_session/run_session.rs` for how this is used on resume.
+    // **`None`** for chat-channel questions.
+    UserQuestionAsked {
+        tool_use_id: String,
+        cc_session_id: String,
+        question: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<QuestionOption>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_path: Option<String>,
+        #[serde(default)]
+        multi_select: bool,
+        /// Set only on an *owner approval card* (ADR 0387): the act its
+        /// Allow once authorizes. The engine wrote this card's text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_approval: Option<OwnerApproval>,
+    },
+    UserQuestionAnswered {
+        tool_use_id: String,
+        answer: AnswerKind,
+    },
+    /// A thread asked for an *owner approval* (ADR 0387), through `POST
+    /// /api/v1/owner-approvals`. `question` is the card the engine wrote. It
+    /// is shown when the thread asks `AskUserQuestion` with `request_id` as
+    /// its question. A request grants nothing until the owner allows the card.
+    OwnerApprovalRequested {
+        request_id: String,
+        approval: OwnerApproval,
+        question: String,
+    },
+    /// A thread spent an *owner approval* on the clause-4 act it names
+    /// (ADR 0387). Emitted only by `api::owner_approval`, before the act's
+    /// handler writes anything. `tool_use_id` names the approval card, and a
+    /// unique index on it refuses a second spend.
+    OwnerApprovalSpent {
+        tool_use_id: String,
+        verb: ThreadReachVerb,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_thread_id: Option<uuid::Uuid>,
+    },
+
+    /// CC requested permission for a tool call (e.g. Edit/Write/Bash on a path
+    /// outside cwd or under `.claude/`). Renders as a `PermissionCard` in the
+    /// thread; the user's answer resolves the deduped entry keyed by
+    /// `request_id` in `Engine.pending_cc_permission`. Persisted so the card
+    /// survives reload.
+    CodingAgentPermissionRequest {
+        request_id: String,
+        tool_use_id: String,
+        tool_name: String,
+        /// The tool call's arguments, always a JSON object.
+        input: Value,
+        summary: String,
+    },
+    /// User answered (or system timed out) a `CodingAgentPermissionRequest`.
+    /// Emitted by the permission-prompt handler immediately after the oneshot
+    /// resolves, before returning to the MCP subprocess.
+    ///
+    /// `persist_scope` records which scope the user picked when granting an
+    /// "Always allow"-style click (`narrow` / `broad` / `session`). `None`
+    /// covers Allow-once, Deny, and the recovery-emitted orphan resolution
+    /// (engine doesn't know what the user *would* have picked). The frontend
+    /// uses it to render the answered card with a check on the chosen button
+    /// and strike-through on the rest, so reload reproduces the same view.
+    CodingAgentPermissionResolved {
+        request_id: String,
+        allowed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persist_scope: Option<crate::engine::claude_code::AllowScope>,
+    },
+
+    /// The Lucidos Agent's command guard (ADR 0002) paused a bash/python tool
+    /// call to ask the user for permission: the `IrreversibleDanger` lane on a
+    /// `Chat` channel. The chat counterpart of `CodingAgentPermissionRequest`:
+    /// it renders the same `PermissionCard`, but the agent loop blocks
+    /// in-process on `Engine.pending_command_permission` (no MCP subprocess).
+    /// `tool_name` is one of the bash/python tools; `command` is the inspected
+    /// command text (the bash `command` or python `code`); `summary` is the
+    /// card's one-line description. Persisted so the card survives reload.
+    CommandPermissionRequested {
+        request_id: String,
+        tool_use_id: String,
+        tool_name: String,
+        command: String,
+        summary: String,
+    },
+    /// User resolved a `CommandPermissionRequested` (or the engine resolved it
+    /// as superseded / orphaned). Chat counterpart of
+    /// `CodingAgentPermissionResolved`; `persist_scope` records the
+    /// "Always allow" / "Allow for this thread" scope the user picked so reload
+    /// reproduces the answered card. `None` covers Allow-once, Deny, and the
+    /// engine-emitted superseded/orphan resolutions.
+    CommandPermissionResolved {
+        request_id: String,
+        allowed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persist_scope: Option<crate::engine::claude_code::AllowScope>,
+    },
+
+    /// The Lucidos Agent (chat) paused an MCP server tool call to ask the user
+    /// for permission, the chat counterpart of `CommandPermissionRequested` for
+    /// MCP tools. Renders the same `PermissionCard`; the agentic loop blocks
+    /// in-process on `Engine.pending_mcp_permission` until the user resolves it.
+    ///
+    /// `server_id` is the MCP server registry key. It is stable, and the
+    /// persisted `Mcp(server:tool)` / `Mcp(server:*)` grant pattern derives
+    /// from it. `server_name` is the human label shown on the card,
+    /// `tool_name` is the bare MCP tool, and `arguments_summary` is the
+    /// pretty-printed (truncated) args.
+    /// Persisted so the card survives reload. Replaces the legacy transient
+    /// `McpConsentPromptRequested` + `showConfirm` modal. Auto-approved silently
+    /// (no event) in non-interactive trigger threads and when the server's
+    /// `auto_approve` flag is set.
+    McpPermissionRequested {
+        request_id: String,
+        tool_use_id: String,
+        server_id: String,
+        server_name: String,
+        tool_name: String,
+        arguments_summary: String,
+    },
+    /// User resolved an `McpPermissionRequested` (or the engine resolved it as
+    /// superseded / orphaned). Chat counterpart of `CommandPermissionResolved`;
+    /// `persist_scope` records which scope the user picked, so reload
+    /// reproduces the answered card. "Always allow this tool" is `narrow`
+    /// (`Mcp(server:tool)`), "Always allow this server" is `broad`
+    /// (`Mcp(server:*)`), and "Allow for this thread" is `session`.
+    /// `None` covers Allow-once,
+    /// Deny, and the engine-emitted superseded/orphan resolutions.
+    McpPermissionResolved {
+        request_id: String,
+        allowed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persist_scope: Option<crate::engine::claude_code::AllowScope>,
+    },
+
+    /// The command guard bracketed a `ReversibleDanger` command (in-workspace
+    /// destruction) with a snapshot of the workspace's git-visible content: ADR
+    /// 0002, Phase 4 and its counting addendum. The pre image lives on
+    /// `refs/lucidos/command-checkpoints/<checkpoint_id>` and the post image on
+    /// `refs/lucidos/command-post-images/<checkpoint_id>`; `command` is the
+    /// command that ran and `summary` is the one-line card text. Persisted so
+    /// the one-click Undo affordance and the card's diff viewer survive reload.
+    ///
+    /// Emitted **after** the command returns, and only when the two images
+    /// actually differ. A command that changed nothing git-visible (the usual
+    /// cause is destruction inside a gitignored path) emits no event, because
+    /// its Undo could neither restore nor remove anything. A failed snapshot
+    /// likewise emits nothing and lets the command run unguarded, the
+    /// pre-Phase-4 behavior.
+    ///
+    /// `restores` counts the files Undo would put back (deleted or overwritten)
+    /// and `removes` the files it would delete (created by the command); both
+    /// default to 0 so events written before the addendum still deserialize,
+    /// where they mean "counts unknown, restore only".
+    CommandCheckpointed {
+        checkpoint_id: String,
+        command: String,
+        summary: String,
+        #[serde(default)]
+        restores: u32,
+        #[serde(default)]
+        removes: u32,
+    },
+    /// The user clicked Undo on a `CommandCheckpointed` card (or the engine
+    /// resolved it). The workspace working tree was restored from the checkpoint
+    /// ref and the ref deleted; the frontend renders the card as reverted.
+    /// Persisted so the reverted state survives reload.
+    CommandCheckpointReverted {
+        checkpoint_id: String,
+    },
+
+    /// Background worktree cleanup happened on this thread (Phase 10.2).
+    /// `tier=1` means build artifacts (`target/`, `node_modules/`,
+    /// `.lucidos/cache/`) were stripped from a long-idle worktree; the
+    /// worktree itself is still on disk. `tier=2` means the entire worktree
+    /// directory was removed (long-idle, clean, unsaved). `freed_bytes` is
+    /// a best-effort sum of file sizes reclaimed. Where metadata is partly
+    /// unavailable it can read `0` even though real space was freed.
+    /// `branch_deleted` is `true` when Tier 2 also dropped a
+    /// fully-merged branch (Phase 10.3).
+    WorktreeCleaned {
+        tier: u8,
+        freed_bytes: u64,
+        #[serde(default, skip_serializing_if = "is_false")]
+        branch_deleted: bool,
+    },
+
+    /// A child thread spawned by `run_thread` / `run_coding_agent` finished its turn.
+    /// Emitted on the **parent** thread by the EventBus fan-out fan-in path
+    /// when the child reaches a terminal event (CC: `CodingAgentIdled` or
+    /// `SessionEnded`; chat: `ResponseGenerated` / `ResponseFailed`).
+    ///
+    /// Replaces the previous prose-only `[Child thread completed] ...` user
+    /// message that was injected via the `parent_callback_tx` channel. The
+    /// channel still wakes the parent — the payload is now the typed event id
+    /// rather than a prebuilt string.
+    ChildThreadCompleted {
+        child_thread_id: uuid::Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_thread_title: Option<String>,
+        status: ChildCompletionStatus,
+        /// Free-form summary: the prose body of the child's final
+        /// `ResponseGenerated` (truncated to 2000 chars), or the failure error
+        /// for `Failure`. Indexed by [`ThreadEvent::indexable_text`].
+        summary: String,
+        /// IDs of changes the child left in `pending` state on its OWN branch.
+        /// Empty for chat children and for CC children that ended without
+        /// proposing anything.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_change_ids: Vec<String>,
+        /// Pending changes held anywhere below the child: its sub-threads, at
+        /// any depth. Kept apart from `pending_change_ids` so the parent can
+        /// tell whose change is whose. An orchestrator's children hold the
+        /// changes while the orchestrator holds none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sub_thread_pending_changes: Vec<super::SubThreadPendingChange>,
+    },
+
+    /// A user Stop ended a child thread's turn, and the child is now a
+    /// *stopped child*. Emitted on the **parent** by the same fan-in as
+    /// `ChildThreadCompleted`, in its place. It wakes nothing: the child is
+    /// alive, and the parent is still owed the `ChildThreadCompleted` that
+    /// settles it (ADR 0252).
+    ChildThreadStopped {
+        child_thread_id: uuid::Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_thread_title: Option<String>,
+    },
+
+    /// A child thread was moved to top level: it is no longer this thread's
+    /// child. Emitted on the **former parent**, never on the child, so ADR
+    /// 0011's "latest event is a card" predicates stay true on the child.
+    ///
+    /// The projection cuts the edge when it applies this event. The child keeps
+    /// running, and its result goes nowhere but its own timeline (ADR 0278).
+    ChildThreadDetached {
+        child_thread_id: uuid::Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_thread_title: Option<String>,
+    },
+
+    /// The agent (LLM) asked to drop a prior `ToolCalled` (and its matching
+    /// `ToolResult`) or `ChildThreadCompleted` from future resume context.
+    ///
+    /// **Retired by ADR 0109 and still readable.** Nothing emits it any more:
+    /// `dismiss_from_context` is gone, because the swept window now takes a
+    /// result on its own. Existing workspaces hold rows, and the resume helper
+    /// (`build_resume_tool_blocks_with_skip_ids`) still honours every one, so a
+    /// body dropped before the change stays dropped.
+    ContextDismissed {
+        dismissed_event_id: uuid::Uuid,
+    },
+
+    /// The agent asked to set one tool result's clock back to zero, by writing
+    /// its address under `[KEEP OPEN]` in its working understanding.
+    ///
+    /// It names a `ToolCalled` on the same thread, that being the one event
+    /// whose body reaches the model as a `tool_result` block. The keep is
+    /// applied where the span is parsed. So this event is the durable record
+    /// the eval counts dispositions from, never the mechanism.
+    ///
+    /// A keep moves the clock and nothing else. It exempts the item from no
+    /// pass, so the trimmer at the wall can always cut.
+    ContextKeptOpen {
+        kept_open_event_id: uuid::Uuid,
+    },
+
+    /// The model's picture of the job, as it wrote it in its own reply.
+    ///
+    /// The one thing that outlives a turn. It carries the body and the
+    /// constraints, and nothing else. The checklist goes to `TodoListWritten`,
+    /// and the held-open addresses are applied and dropped, so a rewrite
+    /// cannot re-assert a keep it made ten rounds ago.
+    ///
+    /// Two forms reach it. A replace sets the document, and an add appends to
+    /// the body and the constraints. Either way this row carries the whole of
+    /// what the thread now holds, so the newest one is the document.
+    WorkingUnderstandingWritten {
+        document: String,
+    },
+
+    /// A background Flash call produced a text description for one of the
+    /// images attached to a `MessageReceived`. Emitted from the agentic loop
+    /// after iteration 1 of a chat turn, one event per attached image hash,
+    /// all carrying the same description text. Gated by
+    /// `is_bad_image_description` so non-descriptions ("I don't see any
+    /// image") never persist.
+    ///
+    /// Consumers (history projection, title generator) join by
+    /// `source_event_id` to attach the description back to the original user
+    /// message. `MessageReceived.image_description` survives as a serde
+    /// fallback for legacy DB rows; new emissions never set it.
+    ImageDescribed {
+        /// The `MessageReceived` event id this description applies to.
+        source_event_id: uuid::Uuid,
+        /// Sha256 hash of the described blob (matches one entry in
+        /// `MessageReceived.user_image_hashes`).
+        hash: String,
+        /// Flash output, post `is_bad_image_description` filter.
+        description: String,
+        /// The model that produced the description (e.g. `claude-haiku-4-5`,
+        /// `gemini-2.5-flash`). Backfilled rows carry the literal `"backfill"`
+        /// because the original model identity wasn't recorded.
+        model: String,
+    },
+
+    /// An auxiliary model compressed this thread's older assistant turns into
+    /// one paragraph. Cached here so a later turn reuses it (ADR 0102).
+    ///
+    /// The summariser lands on a minority of turns. Before this event each
+    /// miss lost the paragraph and rendered a bare "not shown" line. Cached,
+    /// the first success holds for the rest of the thread.
+    ///
+    /// Consumers join by `covers_through_event_id`, which addresses the newest
+    /// assistant turn the paragraph accounts for. `load_chat_history` compares
+    /// it against the older segment to decide whether a refresh is due.
+    ///
+    /// User turns never reach the summariser, so this only ever stands in for
+    /// assistant work.
+    ConversationSummarized {
+        /// The paragraph, exactly as the history block renders it.
+        summary: String,
+        /// The newest assistant turn this paragraph accounts for.
+        covers_through_event_id: uuid::Uuid,
+        /// How many assistant turns went into it.
+        covered_count: u32,
+        /// The model that produced it.
+        model: String,
+    },
+
+    /// The thread registered an **event wait**. Emitted by the `await_event`
+    /// tool between its `ToolCalled` and that call's `ToolResult`, and it is the
+    /// SOURCE OF TRUTH for the wait. There is no `thread_event_waits` table.
+    /// The dispatcher's live set is a cache rebuilt from these events at
+    /// boot (ADR 0011's shape applied to a new wake).
+    ///
+    /// It does NOT end the turn and it does NOT set a status. Registering a
+    /// subscription is an ordinary tool call, the turn carries on and
+    /// terminates normally, and the thread is then plain `idle` while it
+    /// watches. The delivery arrives later as its own turn.
+    EventWaitStarted {
+        wait_id: uuid::Uuid,
+        /// The `await_event` call this wait is the other half of.
+        tool_use_id: String,
+        /// What the thread is watching for. Same shape and same matcher as a
+        /// trigger's `on:` list (`core::event_subscription`), per-entry OR.
+        on: Vec<EventSubscription>,
+        /// The model's own words for why it is waiting. Shown in the
+        /// waiting indicator and the thread card, so the user can tell an
+        /// asleep thread from a stalled one.
+        reason: String,
+        /// When the subscription was armed.
+        ///
+        /// Recorded rather than derived, because `expires_at - timeout_secs`
+        /// stops being the arming time the moment anything about the deadline
+        /// changes, and the age is exactly what makes `list_event_waits`
+        /// answerable ("armed 3 minutes ago" versus "armed yesterday"). Rows
+        /// written before 2026-08-07 have no such field and fall back to the
+        /// event row's own `created`, which is the same instant to within the
+        /// emit; see `live_wait_from_payload`.
+        #[serde(default = "chrono::Utc::now")]
+        armed_at: chrono::DateTime<chrono::Utc>,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        /// The event `sequence` at registration. Both the registration path and
+        /// the boot rebuild scan forward from here. One mechanism therefore
+        /// closes the restart gap and the live race between this emit and
+        /// the cache insert.
+        watermark: i64,
+    },
+
+    /// A matching event resolved the wait. Carries the event so the delivery is
+    /// self-contained on replay rather than a reference that can dangle.
+    EventWaitDelivered {
+        wait_id: uuid::Uuid,
+        /// The `events` row that matched, for the card's deep-link.
+        event_id: uuid::Uuid,
+        event_type: String,
+        payload: Value,
+        /// Which `on:` entry matched. A wait is a rendezvous, not a stream, so
+        /// naming the entry is how the model learns which of several
+        /// subscriptions fired.
+        matched_index: usize,
+    },
+
+    /// The wait passed its deadline. **Wakes the thread** with an explanatory
+    /// message rather than dropping it: a silently dropped wait is a
+    /// permanently stalled thread, which is strictly worse than the polling it
+    /// replaces.
+    EventWaitExpired {
+        wait_id: uuid::Uuid,
+    },
+
+    /// The subscription was stopped short of its own resolution. Note what is
+    /// NOT a cause: neither an ordinary message into a subscribed thread nor a
+    /// thread-level Stop disturbs a subscription, so neither a passing "how's
+    /// it going?" nor stopping an unrelated turn can silently throw away a long
+    /// watch.
+    ///
+    /// Carries what it stopped, so the transcript entry is self-contained on
+    /// replay, exactly as `EventWaitDelivered` carries its matched event. A
+    /// cancel is the one resolution with no wake, so it renders at its own
+    /// position in the timeline, and the `EventWaitStarted` it resolves is
+    /// routinely a day older and outside the loaded window. Absent on rows
+    /// written before 2026-08-07, which fall back to the in-window lookup.
+    EventWaitCanceled {
+        wait_id: uuid::Uuid,
+        cause: EventWaitCancelCause,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        on: Vec<EventSubscription>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
+
+    /// A voice session opened on this thread (ADR 0148).
+    ///
+    /// Voice is a mode of a thread, so this changes no `source` and opens no
+    /// channel of its own. It is `Metadata`: the thread's status belongs to the
+    /// agent's turn, and a live microphone is not a turn.
+    ///
+    /// `session_id` pairs it with exactly one `VoiceSessionEnded`. That pairing
+    /// is what makes a session countable, and the engine refuses a second
+    /// session on a thread already holding one.
+    VoiceSessionStarted {
+        session_id: uuid::Uuid,
+    },
+
+    /// The voice session closed, and why.
+    ///
+    /// Every start reaches one of these. A killed engine cannot emit its own,
+    /// so the boot sweep settles the survivors with
+    /// [`VoiceSessionEndReason::EngineShutdown`].
+    ///
+    /// Carries no audio and no transcript. Audio is never persisted (parent
+    /// plan, decision 12), and a spoken turn is its own event.
+    VoiceSessionEnded {
+        session_id: uuid::Uuid,
+        reason: VoiceSessionEndReason,
+        /// How long the call lasted. Zero on a sweep-settled row, where the
+        /// engine that held the clock is gone.
+        duration_secs: u64,
+    },
+
+    /// The talker said something out loud, and this is what it said.
+    ///
+    /// One per talker turn, whether the talker composed the words itself or was
+    /// reading the doer's answer. Both are things the caller heard. So both
+    /// belong in the thread, and the doer has to read what was already said
+    /// in its name (ADR 0149).
+    ///
+    /// Authored by the talker, so it carries
+    /// `MessageOrigin::Agent { agent: Guest { .. } }` on its `EventMeta` and
+    /// renders to the doer under its own speaker label (ADR 0150).
+    ///
+    /// `Metadata`: the doer's turn owns the thread's status, and a talker
+    /// turn landing mid-turn must not settle it.
+    ///
+    /// Carries text, never audio (parent plan, decision 12).
+    SpokenReplyGenerated {
+        session_id: uuid::Uuid,
+        text: String,
+        /// The caller took the floor back, so only this much was heard. The
+        /// doer's own answer is in the thread in full either way.
+        ///
+        /// A barge-in, or a provider reporting the cut itself. Talking OVER a
+        /// reply is not one: the talker jumps in on a mid-sentence pause, and
+        /// the rest of their breath cuts nothing off (ADR 0200).
+        interrupted: bool,
+        /// How long the talker had been saying these words when the row was
+        /// written, so the transcript can read the row where they BEGAN.
+        ///
+        /// `created` is when the words stopped, and a step beside them is an
+        /// instant. Placed by the end alone, a reply reads under every step it
+        /// was said over (ADR 0206).
+        ///
+        /// An age rather than an instant, because `created` is Postgres's clock
+        /// and this is read off the monotonic one (ADR 0053). Absent on a reply
+        /// that streamed no deltas, and on every row written before the field:
+        /// both read at `created`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spoken_secs_before: Option<f64>,
+    },
+
+    /// The caller said something on a call.
+    ///
+    /// **Every caller utterance, whatever the talker does with it** (ADR 0201).
+    /// Written the instant the provider ends the caller's turn, so `created` is
+    /// when they stopped speaking and the transcript can read by the clock
+    /// alone. One breath is therefore several rows, which the two readers join
+    /// back together (`core::store::messages::spoken_merge`).
+    ///
+    /// **`Metadata`, and that is the whole reason it exists.** It starts no
+    /// turn. What starts one is the talker's own `WorkDelegated`, which is a
+    /// separate fact and lands after this row.
+    ///
+    /// It carries the caller's own actor, not the talker's. Whoever handles
+    /// it, the caller said it.
+    SpokenMessageReceived {
+        session_id: uuid::Uuid,
+        text: String,
+    },
+
+    /// The talker asked for the doer, and this is why.
+    ///
+    /// Its one tool, written down. The thread then names all three
+    /// participants: what the caller said, what the talker asked for, and what
+    /// the doer did (ADR 0150).
+    ///
+    /// Authored by the talker, so it carries the guest actor on its
+    /// `EventMeta`. The doer reads the reason as that speaker's line, which is
+    /// how it learns what it was woken for.
+    ///
+    /// **`Start`: this row is what begins a delegated call's turn** (ADR 0201).
+    /// The caller's words start nothing, because the talker decides whether the
+    /// doer is wanted and a row written before that decision could not know.
+    WorkDelegated {
+        session_id: uuid::Uuid,
+        /// The talker's own few words on what the caller wants.
+        ///
+        /// Empty where it composed none, which is every ask on a protocol
+        /// whose delegation frame carries no words. The transcript then draws
+        /// no row for it, rather than putting the caller's own sentence in the
+        /// talker's mouth (ADR 0200).
+        reason: String,
+    },
+
+    /// The user asked a side question.
+    ///
+    /// The four side-question events record a card, never a turn. No agent
+    /// ever reads them: every generic reader excludes them through
+    /// [`ThreadEvent::is_side_question_event`], and no allowlist names them. They
+    /// move no thread state (ADR 0320).
+    ///
+    /// The client names `side_question_id`, so its pending card and these
+    /// rows reconcile by id.
+    SideQuestionAsked {
+        side_question_id: uuid::Uuid,
+        question: String,
+        /// Blobs the user attached to the question.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        image_hashes: Vec<String>,
+    },
+    /// The thread's agent answered the side question with this id.
+    SideQuestionAnswered {
+        side_question_id: uuid::Uuid,
+        answer: String,
+    },
+    /// The side question with this id got no answer. Startup recovery writes
+    /// one for every ask a restart left unsettled.
+    SideQuestionFailed {
+        side_question_id: uuid::Uuid,
+        error: String,
+    },
+    /// The user dismissed the card for this side question. The card collapses
+    /// to a row and can be reopened, so the ask stays recorded.
+    SideQuestionDismissed {
+        side_question_id: uuid::Uuid,
+    },
+    /// A widget instance was shown at this point in the thread (ADRs 0402,
+    /// 0407, 0415). Draws its inline card here and adds no chip to the
+    /// thread's widget shelf. The widget's files stay in its app folder.
+    WidgetShown {
+        app_id: String,
+        /// The instance's *widget params*. Absent means none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<BTreeMap<String, Value>>,
+        /// The instance's chip label. Absent means the widget's name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// The user or the agent pinned a widget instance: its chip is now on this
+    /// thread's widget shelf. A pin alone adds the instance, as from an
+    /// embed. No file changes.
+    #[serde(alias = "WidgetRestored")]
+    WidgetPinned {
+        app_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<BTreeMap<String, Value>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// A widget instance was unpinned: its chip left this thread's widget
+    /// shelf. The thread's card stays, and no file changes.
+    #[serde(alias = "WidgetHidden")]
+    WidgetUnpinned {
+        app_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<BTreeMap<String, Value>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+
+    // ---- Transient — never persisted ----
+    // Every transient variant is past-tense (events-only model — no command
+    // concept). Aliases preserve replay of any legacy persisted rows that
+    // slipped in before the projection's transient match arm caught them.
+    // Streaming state
+    #[serde(alias = "TextStreaming")]
+    CumulativeTextUpdated {
+        text: String,
+    },
+    #[serde(alias = "Retrying")]
+    LlmCallRetried {
+        reason: String,
+    },
+    #[serde(alias = "PreambleCompleting")]
+    PreambleCompleted,
+    // Request events: past-tense framing (a request was made; the frontend
+    // chooses whether to act). A request the user must answer is a persisted
+    // *form request* instead, above.
+    #[serde(alias = "PushNotificationRequest")]
+    PushNotificationRequested,
+    #[serde(alias = "RefreshAppUI")]
+    AppUiRefreshRequested {
+        app_id: String,
+    },
+    #[serde(alias = "CaptureAppUI")]
+    AppUiCaptureRequested {
+        app_id: String,
+        request_id: String,
+        /// Set when the agent saves the capture as a file. The frame then
+        /// renders at the device pixel ratio, in this format.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        save_format: Option<CaptureFormat>,
+    },
+    NavigationRequested {
+        payload: String,
+    },
+    #[serde(alias = "CcThreadSpawned")]
+    CodingAgentThreadSpawned {
+        cc_thread_id: String,
+        title: String,
+        #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
+        coding_agent: CodingAgent,
+    },
+    CodingAgentDiffChanged {
+        has_diff: bool,
+    },
+    ChildrenCountChanged {
+        active: i64,
+        total: i64,
+    },
+}

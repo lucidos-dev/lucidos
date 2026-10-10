@@ -1,0 +1,913 @@
+//! Inbound webhooks: configuration, and the verification a delivery must pass.
+//!
+//! Full design:
+//! `docs/plans/2026-08-19-webhooks-and-engines-off-the-network.md`.
+//!
+//! # Signature checking is data, not code
+//!
+//! [`HmacConfig`] describes a sender's scheme in fields: which header carries
+//! the signature, how to pull it out, what string is signed, and how the digest
+//! is encoded. GitHub, Stripe and Slack are all expressible, so none of the
+//! three needs engine code, and a fourth sender is a config change.
+//!
+//! The secret is never here. `credential` names a row in the `credentials`
+//! table, which stays the only home for the value.
+
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+pub use lucidos_local_token::ct_eq;
+
+use crate::core::webhook_refusal::RefusalCause;
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
+
+/// One configured webhook, as stored. Never carries a secret: `token_hash` is a
+/// digest, and [`HmacConfig::credential`] is a name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Webhook {
+    pub id: Uuid,
+    pub name: String,
+    pub event_type: String,
+    #[serde(skip_serializing)]
+    pub token_hash: Option<String>,
+    pub hmac: Option<HmacConfig>,
+    /// `None` means the hook does not dedupe, which is the default. Every
+    /// arrival then emits, so the log keeps the sender's retries.
+    pub dedupe: Option<DedupeConfig>,
+    /// Request headers copied into the event payload. An allow-list, because
+    /// the events table is append-only and a carried secret is a permanent one.
+    pub headers: Vec<String>,
+    pub enabled: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// When a delivery last verified and emitted.
+    pub last_accepted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When a delivery last arrived and was turned away.
+    ///
+    /// This is the diagnostic half. Silence alone cannot tell a rotated secret
+    /// from a dead ingress, and a refusal can.
+    pub last_refused_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// What [`DeliveryRefusal::reason`] said about that refusal.
+    pub last_refusal_reason: Option<String>,
+    /// Every refusal since the last acceptance, tallied by reason.
+    pub refusal_run: RefusalRun,
+}
+
+/// What a webhook has been turning away since it last accepted anything.
+///
+/// The three columns above hold the LAST refusal, which one diagnostic probe
+/// overwrites. This holds the whole run, so a stray probe adds one to its own
+/// reason and leaves the evidence beside it standing.
+///
+/// **A run is homogeneous in its cause**, because a refusal of the other kind
+/// restarts it. So the count, the start and the tally all describe one fault.
+/// Without that, a hook switched off mid-outage would be reported as having
+/// thrown away forty deliveries it had in fact read and rejected.
+///
+/// An acceptance ends a run. So `refusals == 0` is positive evidence that the
+/// hook works, and it is the only thing that produces it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusalRun {
+    /// How many deliveries have been turned away since the run started.
+    pub refusals: i64,
+    /// When the run started. `None` when there is no run.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Which fault the run is evidence of. `None` for a run whose stored cause
+    /// this engine cannot read, which judges nothing rather than guessing.
+    pub cause: Option<RefusalCause>,
+    /// How the run breaks down, keyed by [`DeliveryRefusal::key`].
+    ///
+    /// A `BTreeMap` so the JSON a reader sees is ordered, and so two runs with
+    /// the same contents compare equal.
+    pub reasons: std::collections::BTreeMap<String, i64>,
+    /// How long the run has been going, in seconds. **Measured by Postgres**
+    /// (ADR 0053), because the timestamp above is a database clock reading and
+    /// the engine's own clock is a different one.
+    pub run_secs: Option<i64>,
+    /// How long since the last refusal, in seconds, also measured by Postgres.
+    /// A run nothing has added to for a fortnight stops being news.
+    pub quiet_secs: Option<i64>,
+}
+
+impl RefusalRun {
+    /// Is any delivery being turned away right now?
+    pub fn is_running(&self) -> bool {
+        self.refusals > 0
+    }
+}
+
+/// Everything about a webhook except its identity: how it authenticates, and
+/// what it does with a delivery once one arrives.
+///
+/// Grouped because the three travel together and are the whole of what
+/// distinguishes one hook from another. Separately they push `create` past the
+/// argument count anyone can read at a call site.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WebhookConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hmac: Option<HmacConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe: Option<DedupeConfig>,
+    #[serde(default)]
+    pub headers: Vec<String>,
+}
+
+/// A change to an existing webhook. Every field is optional, and `None` keeps
+/// the stored value.
+///
+/// `dedupe` needs no "clear it" variant, so it stays free of the
+/// `Option<Option<_>>` an optional JSONB column otherwise wants: a config with
+/// `window_secs: 0` switches deduping off.
+///
+/// `hmac` has no such off value, so it takes a named three-state instead. The
+/// same reasoning, one step further: a shape nobody has to decode beats a
+/// nested option.
+#[derive(Debug, Clone, Default)]
+pub struct WebhookPatch {
+    pub name: Option<String>,
+    pub event_type: Option<String>,
+    pub enabled: Option<bool>,
+    pub hmac: HmacChange,
+    pub dedupe: Option<DedupeConfig>,
+    pub headers: Option<Vec<String>>,
+}
+
+/// What an update does to a hook's signature config.
+///
+/// # A hook carries one verifier kind, so a change to either moves both
+///
+/// [`WebhookStore::create`] mints a token only for an unsigned hook, because
+/// [`verify`] requires every verifier a row carries and no signing sender
+/// attaches a bearer token. An update has to hold the same line from both
+/// sides, or it hands the user a hook that refuses everything:
+///
+/// - [`Self::Set`] drops the token. A hook that gained a signature and kept its
+///   token would refuse every delivery GitHub, Slack or Stripe can send.
+/// - [`Self::Clear`] mints one. The table's CHECK says a hook has at least one
+///   verifier, so unsigned with no token is a row that cannot exist. Refusing
+///   the transition was the alternative, and it sends the user back to delete
+///   and recreate, which changes the delivery URL and breaks the sender. That
+///   is the whole reason `hmac` became editable, so minting wins.
+///
+/// The minted token is returned once, on the contract `create` already has.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum HmacChange {
+    /// Keep the stored config, whatever it is.
+    #[default]
+    Keep,
+    /// Sign from now on, with this config.
+    Set(HmacConfig),
+    /// Stop signing, and go back to a bearer token.
+    Clear,
+}
+
+/// Absent keeps, an object sets, and `null` clears.
+///
+/// Hand-written so the request DTO needs no `Option<Option<_>>` either.
+/// `#[serde(default)]` answers the absent case, and this answers the other two.
+impl<'de> Deserialize<'de> for HmacChange {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match Option::<HmacConfig>::deserialize(deserializer)? {
+            Some(cfg) => Self::Set(cfg),
+            None => Self::Clear,
+        })
+    }
+}
+
+/// How a hook recognises a delivery it has already emitted.
+///
+/// Named as data, the same shape [`HmacConfig`] uses: the sender says which
+/// header carries its delivery id, and no provider needs engine code.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DedupeConfig {
+    /// Header carrying the sender's own delivery id, such as
+    /// `X-GitHub-Delivery`. Absent here, or absent from a given request, and
+    /// the key is a digest of the body instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// How long a claim holds a key. `0` switches deduping off, which is also
+    /// how `update` clears the setting.
+    #[serde(default = "default_window_secs")]
+    pub window_secs: i64,
+}
+
+fn default_window_secs() -> i64 {
+    3600
+}
+
+/// The key a delivery is deduped on.
+///
+/// A digest either way, so the ledger stores one fixed-length value rather than
+/// whatever a public caller put in a header. The two sources are prefixed
+/// apart, so a body can never key the same claim as a header value.
+///
+/// Falling back is safe because this key authenticates nothing. It decides only
+/// whether this delivery has been seen, and that decision runs after
+/// [`verify`].
+pub fn dedupe_key(header_value: Option<&str>, body: &str) -> String {
+    match header_value {
+        Some(value) => digest(&format!("header:{value}")),
+        None => digest(&format!("body:{body}")),
+    }
+}
+
+/// Which digest a sender signs with.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacAlgorithm {
+    #[default]
+    Sha256,
+    Sha1,
+}
+
+/// How the digest is written into the header.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DigestEncoding {
+    #[default]
+    Hex,
+    Base64,
+}
+
+/// A sender's signature scheme, in fields.
+///
+/// Worked examples, all three real:
+///
+/// | Sender | header | prefix / key | template |
+/// |---|---|---|---|
+/// | GitHub | `X-Hub-Signature-256` | `prefix: "sha256="` | `{body}` |
+/// | Slack | `X-Slack-Signature` | `prefix: "v0="` | `v0:{timestamp}:{body}` |
+/// | Stripe | `Stripe-Signature` | `signature_key: "v1"` | `{timestamp}.{body}` |
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HmacConfig {
+    /// The credential's `service_name`. The secret itself lives there.
+    pub credential: String,
+    /// Header carrying the signature.
+    pub signature_header: String,
+    #[serde(default)]
+    pub algorithm: HmacAlgorithm,
+    #[serde(default)]
+    pub encoding: DigestEncoding,
+    /// Literal prefix to strip off the header value, such as `sha256=`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Key to read out of a comma-separated `k=v` header, such as Stripe's
+    /// `v1`. Mutually useful with `prefix`, and checked first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_key: Option<String>,
+    /// Header carrying the signed timestamp, when the scheme has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_header: Option<String>,
+    /// Key holding the timestamp inside the SIGNATURE header, for a sender that
+    /// packs both into one, as Stripe does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_key: Option<String>,
+    /// The string that gets signed. `{body}` and `{timestamp}` are substituted.
+    /// Defaults to the body alone.
+    #[serde(default = "default_template")]
+    pub template: String,
+    /// How far the signed timestamp may be from now, in seconds. Read it
+    /// through [`Self::replay_tolerance_secs`], which fills in the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerance_secs: Option<i64>,
+}
+
+/// The replay window for a template that signs `{timestamp}` and names none.
+/// Slack and Stripe both document five minutes.
+pub const DEFAULT_REPLAY_TOLERANCE_SECS: i64 = 300;
+
+impl HmacConfig {
+    /// The window [`verify`] enforces, `None` only for a scheme that signs no
+    /// timestamp.
+    ///
+    /// A signed timestamp exists only to bound replay. With no window, a
+    /// captured delivery verifies forever. So the default applies at read
+    /// time, and a stored hook that never named a tolerance gets it too.
+    pub fn replay_tolerance_secs(&self) -> Option<i64> {
+        self.tolerance_secs.or_else(|| {
+            self.template
+                .contains("{timestamp}")
+                .then_some(DEFAULT_REPLAY_TOLERANCE_SECS)
+        })
+    }
+}
+
+fn default_template() -> String {
+    "{body}".to_string()
+}
+
+/// Why a delivery was refused. Every arm answers 401, so the sender learns
+/// nothing; this is what the log, the row and the refusal run record instead.
+///
+/// [`verify`] produces five of these. `api::webhooks::deliver` produces the
+/// other two before it calls anything. Those two are arms here rather than
+/// hand-written strings, so `refusal_run_reasons` keys on a closed set and
+/// [`Self::examined_the_delivery`] can classify every one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryRefusal {
+    /// The webhook is switched off, so nothing was read.
+    Disabled,
+    /// The body is not UTF-8, so no scheme we express could have signed it.
+    BodyNotUtf8,
+    /// No bearer token, or the wrong one.
+    Token,
+    /// The signature header is missing or unparseable.
+    SignatureMissing,
+    /// The signature did not match.
+    SignatureMismatch,
+    /// The signed timestamp is outside the configured tolerance.
+    TimestampOutsideTolerance,
+    /// The named credential does not exist, so nothing can be verified.
+    CredentialMissing,
+}
+
+impl DeliveryRefusal {
+    /// Every arm, so a test can walk them.
+    #[cfg(test)]
+    pub const ALL: [DeliveryRefusal; 7] = [
+        Self::Disabled,
+        Self::BodyNotUtf8,
+        Self::Token,
+        Self::SignatureMissing,
+        Self::SignatureMismatch,
+        Self::TimestampOutsideTolerance,
+        Self::CredentialMissing,
+    ];
+
+    /// What to write in the log. Never returned to the caller: a public
+    /// endpoint that says WHY it refused is a hint to whoever is guessing.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Disabled => "the webhook is disabled",
+            Self::BodyNotUtf8 => "the body is not UTF-8",
+            Self::Token => "bearer token did not match",
+            Self::SignatureMissing => "signature header missing or unparseable",
+            Self::SignatureMismatch => "signature did not match",
+            Self::TimestampOutsideTolerance => "signed timestamp is too old or too far ahead",
+            Self::CredentialMissing => "the configured credential does not exist",
+        }
+    }
+
+    /// How a [`RefusalRun`] keys this reason.
+    ///
+    /// Stable and kebab-case, because the tally is stored JSON and reaches the
+    /// wire. The log string above is prose and may be reworded; this may not.
+    pub fn key(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::BodyNotUtf8 => "body-not-utf8",
+            Self::Token => "token",
+            Self::SignatureMissing => "signature-missing",
+            Self::SignatureMismatch => "signature-mismatch",
+            Self::TimestampOutsideTolerance => "timestamp-outside-tolerance",
+            Self::CredentialMissing => "credential-missing",
+        }
+    }
+
+    /// Did this refusal look at the delivery at all?
+    ///
+    /// One arm answers no, and it is the whole reason a switched-off hook gets
+    /// its own words. `deliver` checks `enabled` first, before it reads the
+    /// body or looks up the credential. So that 401 is a configuration fact,
+    /// and it says nothing about the signature or the secret.
+    ///
+    /// The mirror of `Stage::measured_the_ingress` in `core/webhook_ingress.rs`
+    /// (ADR 0172): one predicate, read by every consumer, so a reading that
+    /// measured nothing cannot be reported as a measurement.
+    pub fn examined_the_delivery(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Which fault this refusal is evidence of.
+    ///
+    /// Derived from the predicate above and nothing else, so the two can never
+    /// disagree about which arm gets its own words.
+    pub fn cause(&self) -> RefusalCause {
+        if self.examined_the_delivery() {
+            RefusalCause::Verification
+        } else {
+            RefusalCause::Disabled
+        }
+    }
+}
+
+/// Lowercase-hex SHA-256 of `value`, the form `token_hash` stores.
+pub fn digest(value: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    crate::api::hex::hex_lower(&Sha256::digest(value.as_bytes()))
+}
+
+/// A fresh webhook token: 32 bytes of entropy, lowercase hex.
+///
+/// Both this and [`ct_eq`] come from `lucidos-local-token` rather than being
+/// written again here. That crate exists because four hand-copies of a secret's
+/// minting and comparison drifted, and a stale copy is a caller that silently
+/// cannot authenticate.
+pub fn mint_token() -> std::io::Result<String> {
+    lucidos_local_token::mint_hex(32)
+}
+
+/// The bearer token a request presented, if it presented one properly.
+pub fn presented_bearer(authorization: Option<&str>) -> Option<&str> {
+    let value = authorization?.trim();
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Pull the signature out of a header value, per the configured scheme.
+///
+/// `signature_key` wins when set, for a sender packing several fields into one
+/// header. Otherwise a `prefix` is stripped, and a value that lacks the prefix
+/// is refused rather than passed through: matching a bare digest against a
+/// prefixed scheme would accept a signature computed for something else.
+pub fn extract_signature<'a>(cfg: &HmacConfig, header_value: &'a str) -> Option<&'a str> {
+    let header_value = header_value.trim();
+    if let Some(key) = cfg.signature_key.as_deref() {
+        return field_from_pairs(header_value, key);
+    }
+    match cfg.prefix.as_deref() {
+        Some(prefix) if !prefix.is_empty() => header_value.strip_prefix(prefix),
+        _ => Some(header_value),
+    }
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+}
+
+/// The timestamp a request signed, from its own header or from a key inside the
+/// signature header.
+pub fn extract_timestamp<'a>(
+    cfg: &HmacConfig,
+    signature_header_value: &'a str,
+    timestamp_header_value: Option<&'a str>,
+) -> Option<&'a str> {
+    if let Some(key) = cfg.timestamp_key.as_deref() {
+        return field_from_pairs(signature_header_value.trim(), key);
+    }
+    timestamp_header_value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// One value out of a comma-separated `k=v` list, matched on the whole key.
+fn field_from_pairs<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
+    raw.split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| k.trim() == key)
+        .map(|(_, v)| v.trim())
+        .filter(|v| !v.is_empty())
+}
+
+/// Build the string the sender signed.
+pub fn canonical_string(template: &str, timestamp: Option<&str>, body: &str) -> String {
+    template
+        .replace("{timestamp}", timestamp.unwrap_or_default())
+        .replace("{body}", body)
+}
+
+/// Compute the expected signature for `canonical`, encoded as the sender writes
+/// it.
+pub fn sign(cfg: &HmacConfig, secret: &str, canonical: &str) -> String {
+    use base64::Engine as _;
+    use hmac::{Hmac, Mac};
+    let raw: Vec<u8> = match cfg.algorithm {
+        HmacAlgorithm::Sha256 => {
+            let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes())
+                .expect("hmac takes a key of any length");
+            mac.update(canonical.as_bytes());
+            mac.finalize().into_bytes().to_vec()
+        }
+        HmacAlgorithm::Sha1 => {
+            let mut mac = <Hmac<sha1::Sha1> as Mac>::new_from_slice(secret.as_bytes())
+                .expect("hmac takes a key of any length");
+            mac.update(canonical.as_bytes());
+            mac.finalize().into_bytes().to_vec()
+        }
+    };
+    match cfg.encoding {
+        DigestEncoding::Hex => crate::api::hex::hex_lower(&raw),
+        DigestEncoding::Base64 => base64::engine::general_purpose::STANDARD.encode(&raw),
+    }
+}
+
+/// Is a signed timestamp close enough to now?
+///
+/// A missing tolerance means the scheme signs no timestamp, so there is
+/// nothing to check. A tolerance with an unparseable timestamp is a refusal:
+/// the configuration asked for a replay window and did not get one.
+///
+/// The distance is computed unsigned, because the timestamp is a header a
+/// public caller writes. A plain `(now - parsed).abs()` overflows on
+/// `i64::MIN`. That panics in a debug build and silently wraps in a release
+/// one, so a caller would pick which of those this endpoint does.
+pub fn timestamp_within_tolerance(
+    tolerance_secs: Option<i64>,
+    timestamp: Option<&str>,
+    now_unix: i64,
+) -> bool {
+    let Some(tolerance) = tolerance_secs else {
+        return true;
+    };
+    // A negative tolerance admits nothing, and saying so here keeps the
+    // comparison below in one unsigned domain.
+    let Ok(tolerance) = u64::try_from(tolerance) else {
+        return false;
+    };
+    let Some(parsed) = timestamp.and_then(|t| t.trim().parse::<i64>().ok()) else {
+        return false;
+    };
+    now_unix.abs_diff(parsed) <= tolerance
+}
+
+/// Everything a delivery presented, gathered before any of it is trusted.
+pub struct PresentedDelivery<'a> {
+    pub authorization: Option<&'a str>,
+    pub signature_header: Option<&'a str>,
+    pub timestamp_header: Option<&'a str>,
+    /// The request body, verbatim. Signed as-is, so it is never reserialized.
+    pub body: &'a str,
+    pub now_unix: i64,
+}
+
+/// Decide whether a delivery may emit this webhook's event.
+///
+/// Every configured verifier must pass, and a webhook always has at least one
+/// (the table's CHECK constraint is the floor). `secret` is the resolved
+/// credential value, `None` when the named credential is gone.
+pub fn verify(
+    hook: &Webhook,
+    presented: &PresentedDelivery<'_>,
+    secret: Option<&str>,
+) -> Result<(), DeliveryRefusal> {
+    if let Some(expected) = hook.token_hash.as_deref() {
+        let token = presented_bearer(presented.authorization).ok_or(DeliveryRefusal::Token)?;
+        if !ct_eq(&digest(token), expected) {
+            return Err(DeliveryRefusal::Token);
+        }
+    }
+
+    let Some(cfg) = hook.hmac.as_ref() else {
+        return Ok(());
+    };
+    let secret = secret.ok_or(DeliveryRefusal::CredentialMissing)?;
+    let header = presented
+        .signature_header
+        .ok_or(DeliveryRefusal::SignatureMissing)?;
+    let signature = extract_signature(cfg, header).ok_or(DeliveryRefusal::SignatureMissing)?;
+    let timestamp = extract_timestamp(cfg, header, presented.timestamp_header);
+    if !timestamp_within_tolerance(cfg.replay_tolerance_secs(), timestamp, presented.now_unix) {
+        return Err(DeliveryRefusal::TimestampOutsideTolerance);
+    }
+    let canonical = canonical_string(&cfg.template, timestamp, presented.body);
+    if !ct_eq(&sign(cfg, secret, &canonical), signature) {
+        return Err(DeliveryRefusal::SignatureMismatch);
+    }
+    Ok(())
+}
+
+/// The columns every read selects, plus the two ages Postgres measures.
+///
+/// **The ages are computed in SQL on purpose** (ADR 0053). The engine's clock
+/// and the database's are different clocks, and in dev the database's runs in a
+/// VM that drifts. Subtract one from the other and a run reads as negative
+/// seconds old. Every hook would then judge `Clear` for good, silencing the
+/// exact outage this feature exists to catch.
+const WEBHOOK_COLUMNS: &str = "id, name, event_type, token_hash, hmac, dedupe, headers, \
+                               enabled, created_at, updated_at, last_accepted_at, \
+                               last_refused_at, last_refusal_reason, refusal_run_count, \
+                               refusal_run_since, refusal_run_cause, refusal_run_reasons, \
+                               EXTRACT(EPOCH FROM now() - refusal_run_since)::bigint \
+                                   AS refusal_run_secs, \
+                               EXTRACT(EPOCH FROM now() - last_refused_at)::bigint \
+                                   AS refusal_quiet_secs";
+
+/// One row as read, before the JSON columns are decoded.
+///
+/// A struct rather than a tuple, so a column added in the middle of
+/// [`WEBHOOK_COLUMNS`] cannot silently shift every field after it.
+#[derive(sqlx::FromRow)]
+struct WebhookRow {
+    id: Uuid,
+    name: String,
+    event_type: String,
+    token_hash: Option<String>,
+    hmac: Option<serde_json::Value>,
+    dedupe: Option<serde_json::Value>,
+    headers: Vec<String>,
+    enabled: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    last_accepted_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_refused_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_refusal_reason: Option<String>,
+    refusal_run_count: i32,
+    refusal_run_since: Option<chrono::DateTime<chrono::Utc>>,
+    refusal_run_cause: Option<String>,
+    refusal_run_reasons: serde_json::Value,
+    refusal_run_secs: Option<i64>,
+    refusal_quiet_secs: Option<i64>,
+}
+
+fn row_to_webhook(row: WebhookRow) -> Result<Webhook, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(Webhook {
+        id: row.id,
+        name: row.name,
+        event_type: row.event_type,
+        token_hash: row.token_hash,
+        hmac: row.hmac.map(serde_json::from_value).transpose()?,
+        dedupe: row.dedupe.map(serde_json::from_value).transpose()?,
+        headers: row.headers,
+        enabled: row.enabled,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        last_accepted_at: row.last_accepted_at,
+        last_refused_at: row.last_refused_at,
+        last_refusal_reason: row.last_refusal_reason,
+        refusal_run: RefusalRun {
+            refusals: i64::from(row.refusal_run_count),
+            since: row.refusal_run_since,
+            cause: row
+                .refusal_run_cause
+                .as_deref()
+                .and_then(RefusalCause::parse),
+            // A tally that will not parse costs the breakdown alone. The count,
+            // the start and the cause still say what the run is, which is what
+            // decides whether the hook is refusing at all.
+            reasons: serde_json::from_value(row.refusal_run_reasons).unwrap_or_default(),
+            run_secs: row.refusal_run_secs,
+            quiet_secs: row.refusal_quiet_secs,
+        },
+    })
+}
+
+/// The registry of inbound webhooks.
+///
+/// **No caller can skip the event.** Create, update and delete each emit from
+/// here rather than from their call sites, so every mutation path announces by
+/// construction. Registered in `core::announced_surfaces`.
+pub struct WebhookStore;
+
+impl WebhookStore {
+    pub async fn list(
+        pool: &PgPool,
+    ) -> Result<Vec<Webhook>, Box<dyn std::error::Error + Send + Sync>> {
+        let rows: Vec<WebhookRow> = sqlx::query_as(&format!(
+            "SELECT {WEBHOOK_COLUMNS} FROM webhooks ORDER BY created_at"
+        ))
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter().map(row_to_webhook).collect()
+    }
+
+    pub async fn get(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> Result<Option<Webhook>, Box<dyn std::error::Error + Send + Sync>> {
+        let row: Option<WebhookRow> = sqlx::query_as(&format!(
+            "SELECT {WEBHOOK_COLUMNS} FROM webhooks WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        row.map(row_to_webhook).transpose()
+    }
+
+    /// Create a webhook, and mint a token for it unless it signs instead.
+    ///
+    /// **A signed hook gets no token, and that is what makes it usable.** A
+    /// sender like GitHub cannot attach one, so a hook holding both verifiers
+    /// would refuse every real delivery. `verify` requires each verifier the
+    /// row carries, so minting a token here would be pinning a credential the
+    /// sender has no way to present.
+    ///
+    /// `Ok((hook, None))` therefore means signature-only. `Some(token)` is the
+    /// one time that token exists in readable form.
+    pub async fn create(
+        pool: &PgPool,
+        bus: &EventBus,
+        name: &str,
+        event_type: &str,
+        config: WebhookConfig,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(Webhook, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+        let WebhookConfig {
+            hmac,
+            dedupe,
+            headers,
+        } = config;
+        let token = match hmac {
+            Some(_) => None,
+            None => Some(mint_token()?),
+        };
+        let id = Uuid::new_v4();
+        let hmac_json = hmac.as_ref().map(serde_json::to_value).transpose()?;
+        let dedupe_json = dedupe.as_ref().map(serde_json::to_value).transpose()?;
+        let row: WebhookRow = sqlx::query_as(&format!(
+            "INSERT INTO webhooks (id, name, event_type, token_hash, hmac, dedupe, headers) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {WEBHOOK_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(name)
+        .bind(event_type)
+        .bind(token.as_deref().map(digest))
+        .bind(hmac_json)
+        .bind(dedupe_json)
+        .bind(&headers)
+        .fetch_one(pool)
+        .await?;
+        let hook = row_to_webhook(row)?;
+        bus.emit(BusEvent::System(SystemEvent::WebhookCreated {
+            webhook_id: hook.id.to_string(),
+            name: hook.name.clone(),
+            event_type: hook.event_type.clone(),
+            signed: hook.hmac.is_some(),
+            actor,
+        }))
+        .await?;
+        Ok((hook, token))
+    }
+
+    /// Change a webhook. `Ok(None)` means no webhook has that id.
+    ///
+    /// The token comes back for the one update that mints one, which is the
+    /// clear described on [`HmacChange`]. Every other update returns `None`
+    /// beside the hook, since no token changed hands.
+    pub async fn update(
+        pool: &PgPool,
+        bus: &EventBus,
+        id: Uuid,
+        patch: WebhookPatch,
+        actor: Option<MessageOrigin>,
+    ) -> Result<Option<(Webhook, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
+        let WebhookPatch {
+            name,
+            event_type,
+            enabled,
+            hmac,
+            dedupe,
+            headers,
+        } = patch;
+        let dedupe_json = dedupe.as_ref().map(serde_json::to_value).transpose()?;
+        // The verifier moves as one. A single flag writes `hmac` and
+        // `token_hash` together, so no combination of arguments can leave a row
+        // carrying both verifiers or neither.
+        let (verifier_moves, hmac_json, token) = match &hmac {
+            HmacChange::Keep => (false, None, None),
+            HmacChange::Set(cfg) => (true, Some(serde_json::to_value(cfg)?), None),
+            HmacChange::Clear => (true, None, Some(mint_token()?)),
+        };
+        // **Moving the enabled flag ends the run**, in the same statement, the
+        // way an acceptance does. A run is homogeneous in its cause. The flag
+        // is one of the two causes, so a run that outlived a switch describes
+        // a fault that is over.
+        //
+        // Left standing, its count and tally get re-reported under the other
+        // cause's words. A hook switched off after an hour of signature
+        // failures would read "every one was refused before it was read". That
+        // tells its owner the secret is fine, while every one of them failed
+        // exactly that check.
+        //
+        // `IS DISTINCT FROM` against the bare column compares the new value to
+        // the OLD one. So an unrelated PUT resending the same flag keeps a live
+        // run, and the next delivery starts an honest one.
+        let flag_moved = "$4 IS NOT NULL AND $4 IS DISTINCT FROM enabled";
+        let row: Option<WebhookRow> = sqlx::query_as(&format!(
+            "UPDATE webhooks SET name = COALESCE($2, name), \
+             event_type = COALESCE($3, event_type), enabled = COALESCE($4, enabled), \
+             dedupe = COALESCE($5, dedupe), headers = COALESCE($6, headers), \
+             hmac = CASE WHEN $7 THEN $8 ELSE hmac END, \
+             token_hash = CASE WHEN $7 THEN $9 ELSE token_hash END, \
+             refusal_run_count = CASE WHEN {flag_moved} THEN 0 ELSE refusal_run_count END, \
+             refusal_run_since = CASE WHEN {flag_moved} THEN NULL ELSE refusal_run_since END, \
+             refusal_run_cause = CASE WHEN {flag_moved} THEN NULL ELSE refusal_run_cause END, \
+             refusal_run_reasons = CASE WHEN {flag_moved} \
+                 THEN '{{}}'::jsonb ELSE refusal_run_reasons END, \
+             updated_at = NOW() WHERE id = $1 RETURNING {WEBHOOK_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(&name)
+        .bind(&event_type)
+        .bind(enabled)
+        .bind(dedupe_json)
+        .bind(&headers)
+        .bind(verifier_moves)
+        .bind(hmac_json)
+        .bind(token.as_deref().map(digest))
+        .fetch_optional(pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let hook = row_to_webhook(row)?;
+        bus.emit(BusEvent::System(SystemEvent::WebhookUpdated {
+            webhook_id: hook.id.to_string(),
+            name: hook.name.clone(),
+            event_type: hook.event_type.clone(),
+            enabled: hook.enabled,
+            signed: hook.hmac.is_some(),
+            actor,
+        }))
+        .await?;
+        Ok(Some((hook, token)))
+    }
+
+    /// Stamp that a delivery verified and emitted, and end any refusal run.
+    ///
+    /// An observation, so it emits nothing. `updated_at` stays where it is:
+    /// nobody changed the hook, and moving it would make every delivery look
+    /// like an edit.
+    ///
+    /// **Clearing the run here is what makes recovery positive evidence.** A
+    /// verdict on a hook is cleared by a delivery that worked, never by one
+    /// that stopped arriving.
+    pub async fn record_accepted(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::query(
+            "UPDATE webhooks SET last_accepted_at = NOW(), refusal_run_count = 0, \
+             refusal_run_since = NULL, refusal_run_cause = NULL, \
+             refusal_run_reasons = '{}'::jsonb WHERE id = $1",
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Stamp that a delivery arrived and was turned away, and why.
+    ///
+    /// Takes the refusal rather than a string, so the tally keys on
+    /// [`DeliveryRefusal::key`]'s closed set and no caller can invent a reason.
+    /// The prose the owner reads is [`DeliveryRefusal::reason`], and it reaches
+    /// the page and never the sender.
+    ///
+    /// Every write is one statement, so the run's count, start, cause and tally
+    /// cannot disagree. The start is kept while the cause holds. A run that
+    /// restarted its own clock on every refusal could never age past the window
+    /// that declares it.
+    ///
+    /// **A refusal of the other cause restarts the run**, which is what keeps a
+    /// run homogeneous. Without it, a hook switched off after an hour of
+    /// signature failures would be reported as having thrown away every one of
+    /// them unread.
+    pub async fn record_refused(
+        pool: &PgPool,
+        id: Uuid,
+        refusal: DeliveryRefusal,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::query(
+            "UPDATE webhooks SET last_refused_at = NOW(), last_refusal_reason = $2, \
+             refusal_run_count = CASE WHEN refusal_run_cause = $4 \
+                 THEN refusal_run_count + 1 ELSE 1 END, \
+             refusal_run_since = CASE WHEN refusal_run_cause = $4 \
+                 THEN COALESCE(refusal_run_since, NOW()) ELSE NOW() END, \
+             refusal_run_reasons = CASE WHEN refusal_run_cause = $4 \
+                 THEN jsonb_set(refusal_run_reasons, ARRAY[$3], \
+                     to_jsonb(COALESCE((refusal_run_reasons->>$3)::bigint, 0) + 1), true) \
+                 ELSE jsonb_build_object($3, 1) END, \
+             refusal_run_cause = $4 \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(refusal.reason())
+        .bind(refusal.key())
+        .bind(refusal.cause().key())
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete a webhook. `Ok(false)` means no webhook had that id.
+    pub async fn delete(
+        pool: &PgPool,
+        bus: &EventBus,
+        id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let name: Option<(String,)> =
+            sqlx::query_as("DELETE FROM webhooks WHERE id = $1 RETURNING name")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        let Some((name,)) = name else {
+            return Ok(false);
+        };
+        bus.emit(BusEvent::System(SystemEvent::WebhookDeleted {
+            webhook_id: id.to_string(),
+            name,
+            actor,
+        }))
+        .await?;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+#[path = "webhooks_tests.rs"]
+mod tests;

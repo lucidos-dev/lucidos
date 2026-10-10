@@ -1,0 +1,2562 @@
+# Changelog
+
+## Unreleased
+
+### Added
+- Plugins can ship pictures: an icon, screenshots, videos and a README in a `media/` folder. Each Plugins panel row leads with its icon. A tap opens the plugin detail page: every screenshot and video in one strip, and the README. A note there names any media file left out, and why. Installed media stays with the plugin after its marketplace is gone.
+- Plugins can ship reusable widgets. Such a widget belongs to its plugin: it shows in any thread, and it leaves when the plugin is uninstalled.
+- The agent can save a sharp screenshot of an open app as a file. So it takes a plugin's screenshots itself instead of asking you.
+- Every agent reply now says whether it is worth reading. One that is waits under Review, marked with a dot, until you have seen its end. When an agent forgets to say, a background model decides from its reply. Coding agents answer with `lucidos request-read yes|no`. A trigger run that says yes lands in Current rather than Archive.
+- When the Lucidos Agent writes an app or widget file, it is told about three mistakes in the same turn: a hover that sticks on a phone, a sort or filter drawn as a blue button, and a button variant missing its base class. The file is still saved. The workspace audit finds the same mistakes in existing apps.
+
+### Changed
+- The Needs attention tile is now called Blocked, and the Ongoing tiles read Blocked, Review, Drafts, In flight.
+- Opening a thread from Review lands on the change or on the reply to read.
+- On a phone, tapping an Ongoing tile with exactly one thread opens that thread.
+- A ready change shows a diff mark on its row instead of a dot.
+- Every workspace has a home thread, and the Experimental switch for it is gone. A new install opens Home first, with the welcome in it, and the setup interview runs there. A device that has opened a thread before still opens that thread. Home costs nothing while you leave it alone.
+- Picking a Text hit in Search Everywhere also opens Find in file with your search. The match on that line is current, and the arrows step through the rest of the file.
+- Find in file searches only the code in a source preview, never its line numbers.
+
+### Fixed
+- Panning a long file sideways with line wrap off is smooth on an iPhone. The line numbers are now one pinned column instead of one pinned cell per line.
+- On a phone, a button in an app no longer stays grey after a tap, so an unpicked option no longer looks disabled.
+
+## v0.47.1 — 2026-10-07
+
+### Fixed
+- Safari no longer leaves old find highlights painted after the search changes or closes.
+- On a phone, the transcript find bar stays clear of the header and the Dynamic Island, and moves with the header when the keyboard opens. The up chevron steps aside while the find bar is open.
+- On a phone, typing in Search Everywhere or another overlay field no longer makes the header and the thread jump.
+## v0.47.0 — 2026-10-07
+
+### Added
+- The Tree memory module. Each turn gets a memory view of the whole workspace and one of its own thread, and the agent can `recall` any line down to the exact message. Choose it under Settings > Memory: a confirm shows the compactor model and an estimate of calls, cost and time, and a progress bar follows the backfill to Ready. The estimate gives two times: when the tree is usable, and when it is complete. The default compactor model follows the providers you have set up: GPT-6.1 Sol, then Gemini 3.8 Flash, then Sonnet 5.5, else the chat model. Each one runs at the low tier. Classic stays the default.
+- On a Mac, Lucidos keeps the computer awake while work runs: a turn, a coding agent, a background task, a queued thread or a backup. Closing the lid or choosing Sleep still wins.
+- Copy path in the file preview toolbar copies the file's full location on disk.
+- Right-click inside a file preview for its actions menu. Over a selection or a link the system menu shows as before.
+- Alt+Up and Alt+Down (Option on a Mac) open the previous or next thread in the drawer's current list. In a text field Option+Arrow still moves the caret. Both are rebindable.
+- Plugins can require a Lucidos version. Install and Update are disabled when this Lucidos cannot run the plugin, with the reason on the row. A plugin with no requirement shows a No version requirement chip.
+- `lucidos spawn-thread --image` attaches images to the new thread.
+- The command guard and query classification can use TypeSafe Jev, Cloudflare Clef, Clef-flash or your own System One endpoint. Settings > Models > Providers gains rows for Cloudflare Workers AI and a custom endpoint.
+- Notifications that name a Settings page link to it. Agents and apps can link one with `settings:<view>`.
+- In a coding-agent thread, a sub-agent's steps fold under its Agent step. Folded, a running sub-agent shows its latest step on one line, and a finished one shows Done with its outcome mark.
+- Hover a link in a markdown preview to see where it goes: the resolved file, the heading, or the full URL.
+- Apps can keep data with `lucidos.storage`, which works like `localStorage` and is kept apart per app. Deleting an app clears its storage on that device.
+- A question card can carry the agent's message. It shows in full above the card.
+- Each model has a Reads images flag. Toggle it with the image icon on its row under Settings > Models, or in the Add Model form. Image description runs only on a model that reads images, and its picker lists only those.
+- An archived thread offers Move to Current in its menu and its composer row. It brings its sub-threads back too.
+- Cmd+F (Ctrl+F elsewhere) opens a find bar on the focused pane: an app, a text preview (source, Markdown, CSV, slides, diff or HTML) or the thread. It highlights each match and steps through them. In a thread it searches every message, older history included, and opens the turn that holds each match. Find in thread is also in the thread title menu.
+- Search Everywhere has a Text category that searches the contents of workspace files. A hit opens the file at its line.
+- With Tree memory on, Settings > System > Memory shows the summary trees: the workspace tree or any thread's, opened one level at a time down to the exact message.
+- Experimental, off by default: a home thread for each workspace. Turn it on under Settings > Appearance & Behavior > Experimental. It cannot be archived or deleted, and it is where voice calls run. Open it from the Home button at the left of the desktop thread header, or from the Lucidos menu on a phone.
+
+### Changed
+- A send, a tapped answer and a side question retry quietly on a short failure. Only when every attempt fails does Not sent appear, on the message or on the picked option, with Retry.
+- A typed answer that was not sent stays on its question card, and a reload brings it back there.
+- The drawer's Running view is now In flight. It also lists threads waiting on an event or on their sub-threads.
+- A message held behind an open question dims and says the agent reads it after your answer.
+- Popovers glide from one step to the next.
+- Voice calls run in the home thread only, so Voice needs the home thread switched on.
+- An agent answers a permission card only in its own threads. Elsewhere it needs your standing instruction, and no agent ever presses Always allow.
+- Running MCP servers share a fixed part of each request, and the conversation keeps the rest.
+- Button rows put the main action on the right.
+- Holding Send, Submit, Stop or Cancel, or pressing the Side question shortcut, turns on side-question mode and keeps your draft in the box.
+- Folders in the Files tree show a chevron that turns as the folder opens.
+- The chip on a question or permission card opens its popover once the card is answered, and the popover says when and from which device.
+- The privacy policy has a section on the lucidos.dev website and blog, also on docs.lucidos.dev.
+- Background tasks such as titles, memory and the command guard run on the providers you have set up, so they work without Vertex. Each background model picker offers every model, with the recommended ones first.
+- A blocked Archive or Delete stays in the thread menu, dimmed, with its reason. When sub-threads block it, the menu lists each one, strongest blocker first, and a tap opens it. A refused archive or delete toasts the same reason.
+- Archive all says why it kept each thread, in the menu's words.
+- A set-aside thread's Bring back is a split button with Discard behind it.
+- The Context figure in a turn's popup opens the context viewer. In a coding-agent thread, every step of one API call shows that call's context figure.
+- The sub-thread limit counts only live sub-threads, and you set it in the Thread Queue policy.
+- Usage and cost are recorded for every model call, background tasks and proxied calls included.
+- The Tree backfill runs many more calls at once and backs off on a rate limit.
+- On a Mac, Cmd+R refreshes the content pane. In a browser, Cmd+Shift+R still reloads the whole app.
+- The desktop content header shows its action buttons while they fit, and folds them into the overflow menu one at a time as the pane narrows.
+
+### Fixed
+- Typed answers and side questions render as markdown.
+- A stalled send shows Not sent after 20 seconds, and an unsent message no longer takes a turn from the one that is running.
+- An open thread catches up after the computer wakes, even when the first refresh fails.
+- A push tap on iPhone no longer flashes the blue splash screen.
+- Badge counts sit centred and round in every theme, Safari included.
+- Google Drive backups retry opening the upload with a fresh token, and say when the computer slept.
+- The webhook ingress check no longer reports an outage when the computer slept or after one short burst of refusals.
+- The command guard reads quoting the way the shell does, so a quoted path is no longer mistaken for a parent directory.
+- What's New shows a date for every release.
+- Child reports show each change's current status, and mark a change that was deleted.
+- Archiving a thread from Review lands on the next Review row.
+- A divider press that does not move no longer resizes the panes.
+- The embedding model download has time limits and follows redirects only on its own host.
+- A workspace name too long for its database is refused.
+- A health check that fails while the installed app is in the background no longer turns the connection red.
+- Relative links and heading anchors work in markdown previews, repo files included, and images load from the document's own folder.
+- A Send tapped right after a coding-agent menu pick sends the message.
+- A first message shows as in flight while its thread starts.
+- A Claude turn that ends without the tool call it announced is retried.
+- An Always allow on a command wrapped in `timeout` or a similar wrapper no longer allows every program behind that wrapper.
+- A write through a dangling symlink in a worktree is no longer auto-allowed, and a command with no readable program no longer offers Allow for this thread.
+- The local token and paired devices are no longer copied into the git history of `~/.lucidos`. Existing objects are made owner-only.
+- Deleting a thread never deletes a branch its coding agent checked out.
+- Reverting an applied change works when its range holds a merge of main.
+- Backup health reads only this workspace's archives in a shared backup folder.
+- Images sent while the agent works reach it labelled, and a failed turn keeps the images it made.
+- Stopping its own background task no longer wakes a thread.
+- Haiku 4.5 runs at the reasoning tier you pick.
+- An image whose file extension does not match its contents reaches the model with its real type.
+- A picture the agent draws before a question card, such as a mockup, now reaches you. It shows in the card's message.
+- Apply as they settle waits while a running thread's change is still incomplete, and after a Stop it waits until the turn ends.
+- A fresh install knows its models from the first start, so routing and pickers work before any model is edited.
+- A coding-agent worktree whose checkout fails is removed, so a later session cannot commit the deletion of every file.
+- A coding-agent follow-up cut off by a crash keeps its abort panel and Continue.
+- A proxy entry aimed at a local Lucidos engine is refused, so a proxied request can never act as the app.
+- An agent whose earlier sub-threads have all finished can start new ones.
+- Archiving a sub-thread moves its parent out of Current when nothing else keeps it there.
+- Archive moves to the next row, even when the thread already left the list.
+- A new thread with no text and no image is refused before the thread exists.
+- A source install whose dependency install was cut off reinstalls on the next start.
+- In the Changes panel, a click beside the commits fold opens the thread.
+- source-map-js is updated for GHSA-68fv-2mgg-jv7q.
+
+### Removed
+- Search Everywhere tabs no longer show hit counts.
+## v0.46.1 - 2026-10-03
+
+### Added
+- Apps show a load bar along the top of the pane while they open.
+- An app can set `"reveal": "on-ready"` in its manifest and call `lucidos.ui.ready()` when its content is drawn. Lucidos keeps the loading cover up until then, for at most 15 seconds.
+- Apps get a shared `.text-input` class that matches the host's text fields. Custom themes tint it like the other controls.
+- Unsent messages come back after a page reload, as Not sent cards with Retry. A Discard button drops one without sending it.
+- Tap "Recalled N memories" on a step to see each memory it used, with its date and topic. A tap opens the conversation or file it came from.
+
+### Changed
+- `lucidos.ui.Select` uses the host's own dropdown look: the same size, corners and focus ring.
+- Click the text of a task item in the markdown preview to toggle its checkbox. A successful toggle no longer shows a Saved toast.
+- The Plugins panel drops its "Updated" line. It shows a notice only when the last marketplace scan failed, with a Try again link.
+
+### Fixed
+- An unsent first message comes back whole after a reload, not cut short at the last saved draft.
+- A child thread cut off by a restart reports to its parent as interrupted, with how to continue. A coding-agent child no longer reports success, and a chat child no longer leaves its parent waiting.
+- A parent thread no longer starts its turn while the engine is still recovering from a restart.
+- On a phone, the step context counter takes a slightly-off tap.
+- The upload progress ring spins smoothly.
+- The app load bar shows on phones.
+- On an installed iPhone app, the bottom strip fades with the splash screen.
+- On iPhone, the message box no longer shows a second outline behind the focus ring while the keyboard is up.
+## v0.46.0 - 2026-10-03
+
+### Added
+- Archive all on Current. A confirm says how many threads it archives, and the toast has an Undo button.
+- The Lucidos Agent can triage your inbox. It proposes archive, pin or dismiss for each thread with a reason, and applies only what you approve.
+- Click a task-list checkbox in the markdown preview to toggle it in the file.
+- The agent and `lucidos threads` list unsent drafts and held messages, each with a link to its thread. Thread search also matches draft text.
+- Image uploads show progress on each chip, retry on their own after a dropped connection, and offer Retry when they fail. A send pressed during an upload shows a status line until it goes.
+- Pending images and a queued send come back after a page reload.
+- A send that gets no answer shows as Not sent, with Retry.
+- Keyboard shortcuts: Ctrl+Shift+U toggles the thread filter, Ctrl+Shift+K opens thread search, Ctrl+Shift+X opens or closes the menu drawer, and Ctrl+Shift+P refreshes the content pane.
+- Search Everywhere tabs show how many hits each tab has.
+
+### Changed
+- Side questions have their own mode. Hold Stop, or the Side question shortcut, over an empty box. A pill above the composer shows the mode, and its x or Escape leaves it. Holding a waiting card's Cancel starts one too. `/btw` is now ordinary text.
+- Search Everywhere ranks every section by title match, so "settings" leads with the Settings page.
+- Question and permission cards say Sending until the engine confirms your pick.
+- Archived sub-threads with no live work hide under their parent. A toggle on the row shows them again.
+- New changes roll into the Changes view and stay marked until you see them. An unfinished change leads with Continue in its thread banner.
+- The wait card leads with a Waiting for pill and the agent's reason, and the change card leads with a Change chip.
+- Open thread actions works on the open thread when no drawer row has the focus.
+- The live stream no longer carries tool-call arguments. An open file preview refreshes from file events.
+- Hardening merges main before it reviews, so one run covers the work and the merge.
+- The daily device sweep removes one-off devices, such as headless browser runs, after a week.
+- Coding-agent sessions refuse background subagents, which the session would kill at idle.
+
+### Fixed
+- Only Settings can set the local model host, and only to a loopback, private or tailnet address.
+- The gateway refuses a control-plane browser request that hides its Referer.
+- The command guard resolves workspace paths on disk, so a symlink cannot make an outside delete look like an inside one. Quoted, glued, bundled and abbreviated curl body flags all reach the judge.
+- Voice calls treat a permission card's quoted text as data, never as an instruction.
+- A grant pattern with a control character is refused.
+- A long thread's coding agent starts on Linux. The session prompt no longer goes on the command line.
+- A stalled push notification no longer blocks triggers, backups or event triggers.
+- Backup logs a file that changed while it was archived.
+- An allowlist Save keeps an Always allow granted while the editor was open.
+- A failed tool call shows as Failed, not Completed.
+- A trigger run cut off by a restart before it did anything no longer sits in Current.
+- Thread search in Search Everywhere no longer times out on a large workspace.
+- Stop, Edit and Retry return a queued message's images to the composer, not just its text.
+- The agent can reach the builtin provider proxies.
+- A notification tap lands on the step it names, even when the step arrives late.
+- A tap on the Archive all toast no longer undoes the batch.
+- An empty Codex review reports no verdict instead of passing.
+- Focus rings are never clipped, and anchored popovers open in place without a jump.
+- A subscription's condition opens as a popover at its chip.
+- The first turn starts right under the thread title, and the transcript top fade eases in.
+- A large image upload no longer stalls other requests.
+## v0.45.0 - 2026-10-02
+
+### Added
+- A phone can ask the desktop app to update itself. Open What's New on the phone and the running desktop app installs the new version.
+- Apps repaint with the shell. The shell pushes its theme, scale and font to every open app frame as it paints, and the SDK applies them.
+- A pane swipe starts anywhere over an app, including a natively fullscreen one.
+- The Changes panel splits pending changes into Ready and Not finished. The badge counts only changes ready to act on.
+- A Needs attention row opens on the exact event that needs attention.
+- The recommended disk cleanup shows progress, like backup does.
+- On a phone, the composer is frosted and the transcript scrolls under it. A phone in landscape clears the Dynamic Island and rounded corners.
+- A wake-up from an event wait names the engine and the wait that caused it.
+- `lucidos.utils.escapeHtmlAttr` escapes text for use inside an HTML attribute.
+
+### Changed
+- Agent sessions and background tasks run below the engine, and agent compiles use their own sccache daemon.
+- Permission cards, waits and device names use plain words, and say where a turn came from.
+- The Lucidos Agent caption says build and refine.
+- Each MCP server runs in its own process group, and stopping it stops the whole group.
+- Inputs, dialogs and the composer share one soft focus ring.
+
+### Fixed
+- Documents served by the repo and change file routes are sandboxed, and the repo SVG preview renders from a sandboxed engine URL.
+- App proxy responses carry only allowlisted upstream headers. A document hidden behind a second content type is sandboxed.
+- A handshake script receives only well-formed CRED_* and OAUTH_* names.
+- Gate-marker endpoints refuse a plain loopback caller.
+- Critical and high defects from the project-wide harden are fixed, including the apply commit check.
+- Backup key creation no longer clobbers a key, and fails instead of retrying forever when the key path is unreadable.
+- Preference saves and refetches no longer lose or revert a newer write, and the stream re-reads preferences on every open.
+- Search no longer keeps a recent for a deleted thread.
+- A bounded git clone runs off the worker thread, times out, and stops when its caller cancels.
+- A barge-in cancel with no reply no longer drops a voice call.
+- Disk cleanup closes both end races and gates worktree removal on the Discard check.
+- Phone layout fixes: header icons take a 44px tap, title bars and bars follow the layout after rotation, the safe-area insets survive a relaunch or a phone call, modals centre above the keyboard, and Send runs a tap that iOS cancels.
+- The compose destination dropdown matches the prompt box width.
+## v0.44.2 — 2026-10-01
+
+### Changed
+
+- Every composer and canvas toggle has a keyboard chord. Settings lists each chord with its mnemonic.
+- Ember, Harbour and Real computer are built-in themes.
+- Chat cards share one look. Engine, resume, trigger, child-thread and held cards read as a pill, a state and Details.
+- Only agent output wears a turn header. No turn wears a Lucidos Engine header.
+- A resume is a card inside the reply it resumed.
+- Work cards report their turn, and Continue sits in its card. Pills say what happened.
+- An interrupted response names its cause.
+- Each card status word keeps one colour.
+- All text inputs share one box and a glow-only focus ring.
+- The file preview shows markdown frontmatter as a properties card.
+- The path row in the file preview is a breadcrumb. Each folder opens the Files view at that folder.
+- A repeated plain toast counts on one card instead of stacking copies.
+- The theme picker badges workspace themes as Custom.
+- Drawer, Triggers, Changes and Thread queue share one section header and row hairline.
+- Every list panel header has 1rem of space above and below its label.
+- On mobile, the dynamic bars follow only the reader's finger, and they glide into place.
+- The whole panel header is a tap target.
+- Settings, Backup shows what each provider can reach, under the Provider picker. The Drive line describes the permission it needs.
+- The OAuth client form says that saving grants no access. The unused Default Scopes field is gone, and stored values are cleared.
+- Tab stays inside the thread after you enter it, and Tab routes through open overlays, app frames and previews.
+
+### Fixed
+
+- Diff and Apply shortcuts act only on the change row you see.
+- The prompt box takes typing after you open Side question over an empty box.
+- Question options are boxed again.
+- The marketplace Add form wraps on the pane width.
+- On mobile, the first send keeps the transcript on screen, and the keyboard closing after a send no longer cancels the landing.
+- On mobile, a short content view no longer scrolls its top behind the header.
+- On mobile, a data file's document, table or source scrolls in the pane, and the HTML frame and editor keep their full height.
+- The theme picker holds its height while the gallery loads.
+- A revealed folder in Files lands under the phone header. Landing on Files forgets the preview it left.
+- Recently applied in Changes loads more rows when it opens.
+- A restart-killed agent session no longer shows a reply to its own interrupt.
+- The desktop app gives its service teardown the time it needs, and a built window opens at its saved frame.
+- The Backup access line holds its place while the providers load.
+- A page the engine already served no longer bounces on a cold start.
+- A refused first send keeps its draft.
+- The scale panel responds to a pinch from its first paint.
+- A thread's knowhow is replayed after the store drops it.
+- Workspace merges hold the repository lock until the publish and tree sync finish.
+- A session worktree resets only while it is on the session branch.
+- The workspace list reports a failure as an error, not as an empty list.
+- Credentials for auth handshakes no longer carry loader-hook names (OpenSSL, glibc, macOS venv launcher) into the sandbox.
+- App documents stay off the gateway's credentialed routes.
+- The dompurify dependency is updated to 3.4.16 (GHSA-p98j-92pf-mc4p).
+## v0.44.1 — 2026-09-30
+
+### Fixed
+
+- A `repo:` file link in chat opens the file in the app. The link takes a repository id or a repository name.
+- A `repo:` link to a repository that is not in the list retries once with a fresh repository read before it reports the repository missing.
+- The file preview shows a load error when a repository image cannot be read.
+- On mobile, the repo diff preview scrolls the content pane, so the header hides as you scroll.
+- On mobile, a PDF in the diff preview keeps its full height.
+## v0.44.0 — 2026-09-30
+
+### Added
+- Set a pending change aside and bring it back later. Set aside keeps it out of Review and Apply All. It works from the Changes panel and from the thread.
+- Apply all on settle in the Changes panel applies every change as its thread settles.
+- Rename a thread or ask for a suggested name from the thread menu. On desktop and mobile the thread title opens that menu on a click (or right-click on desktop).
+- Send opens into a split pill with a side question half. Alt+Enter slides the side question button out beside Send and focuses it.
+- Hold Stop to start a side question.
+- Claude Code gets the directory grants from a repo's settings, resolved against the main checkout.
+- Dynamic bars on mobile: the prompt slides with the header and footer bars.
+- Dropdown menus in the prompt bar take the keyboard for their filter.
+- A stopped Claude Code thread proposes the work already on its branch as a change.
+- Every search box uses one soft-pill search field with the glyph sized by theme token.
+
+### Changed
+- The Claude Code picker lists models strongest first, each model once, and marks a thread's row by the model it runs.
+- A picked question option is drawn as a rounded card. Question and permission cards are framed.
+- The Changes panel draws Bring back as a split button with Discard behind the caret, and Set aside and Discard fold behind the Apply caret.
+- Markdown shows a spaced em dash as written and spaces an unspaced one.
+- Toasts and banners show notification bodies as plain text.
+- The thread queue alerts on how long a trigger's oldest fire has waited.
+
+### Fixed
+- File search opens fast on mobile. It renders up to 100 rows and keeps pending-change rows above that cap.
+- Sticky filter bars use the menu's own surface colour.
+- The hover fill shows on popovers in four dark themes.
+- Switching a theme or mode repaints in one frame.
+- A mouse Back button no longer strands the desktop window on the boot splash.
+- A message the engine refuses keeps the text you typed.
+- A thread that ends on a crash reports that it was interrupted.
+- Deleting an email password clears the mailbox password.
+- Desktop asks before opening a local file or folder with the OS opener.
+- Plugin updates stop when the merge baselines cannot be read.
+- Dependency update: undici 7.29.0 to 7.30.0 (10 high advisories).
+## v0.43.0 — 2026-09-29
+
+### Added
+- New keyboard shortcuts: search files (Cmd+P), Settings (Cmd+,), keyboard shortcuts (Cmd+/), notifications (Cmd+Shift+I), focus the newest toast (Cmd+Shift+N), focus the composer (Shift+Esc), stop the running thread (Cmd+.), copy the last response (Cmd+Shift+C) and rename the thread (F2). Search everywhere moves to Cmd+K. You can rebind all of them.
+- Host shortcuts work while an app has focus. Cmd+P in an app opens file search, not the print dialog.
+- Edit a queued message before the agent reads it. Edit puts its text and images back in the compose box. This works on Lucidos Agent and Claude Code threads.
+- Show the open thread in the thread list from the title bar menu. The list glides to the row.
+- Side questions carry images, and work in Lucidos Agent threads too. Hold Send (or right-click it) to ask the draft as a side question.
+- A typed answer to a question carries its images to the agent.
+- Claude Sonnet 5.5 and Sonnet 5.5 (1M) in the Claude Code picker and the chat model list.
+- Apps get the shared pill bar (as tabs or a filter), the Settings switch, the spinner, and status tones on labels.
+
+### Changed
+- The Claude Code model picker shows exactly the models your Claude Code install offers, and refreshes when Claude Code updates.
+- Search everywhere shows each category's hits as they land. Settings and shortcut hits appear on the keystroke.
+- A change card, its toasts and the Changes panel row lead with a written summary of the change. The row unfolds to its commits, oldest first.
+- The welcome message retires after you start your third thread. The provider-setup welcome stays until a provider exists.
+- A tap on a toast no longer closes it. The X and the timer still do.
+
+### Fixed
+- HTML, XML and SVG files from the workspace open sandboxed. Their scripts run but cannot act as you.
+- Discard and Discard All in the Changes panel ask first.
+- A backup restore that fails partway now reports the failure.
+- copy_file onto the same file no longer empties it, and two edits to one file at once no longer lose one.
+- An email account linked to a Google or Microsoft sign-in only connects to that provider's own mail servers, over TLS.
+- The command guard catches a delete after a cd out of the workspace.
+- A coding-agent thread whose Claude Code session is gone starts a fresh session instead of failing.
+- A long thread no longer blocks every later coding-agent spawn.
+- run_python output is capped like run_bash.
+- A report or event delivery waits behind a question that survived a restart.
+- On a Mac, Ctrl+letter keeps its text-editing meaning in text fields, including inside HTML artifacts.
+- A shortcut you bound yourself wins over a newer default.
+- The thread list keeps its position after a reload deep in Archive.
+- A headless install (launchd or systemd) gets your login-shell environment, so version-manager tools and keys exported in your profile reach every engine and coding agent.
+- A question card keeps its paragraphs and lists apart, and only the closing question is bold.
+- A withdrawn coding-agent message stays gone after a Stop.
+## v0.42.1 — 2026-09-28
+
+### Changed
+- Settings > Appearance shows every theme in a carousel. Chips filter it by family, and chevrons page through it. On a phone it shows one card at a time, with its neighbours peeking in.
+- Side questions stay in the thread. A card survives a reload and shows on your other devices. A chevron folds it to a row, and the same chevron opens it again.
+- A side question card sits in the turn where you asked it and shows your question as a message bubble.
+- The Refresh notice appears as soon as a new client build is served, and a reconnect checks for one again.
+- Coding agents know the type scale for HTML artifacts, so the reports they build match your chat text.
+
+### Fixed
+- Text in apps and HTML artifacts that sets no size of its own reads at the chat text size, not larger.
+- On an iPhone, opening the agent menu or the model picker keeps the keyboard up.
+- Thread rows in the drawer line up when one label wraps to two lines, with less space under the title.
+- The file picker for installing a workspace font follows your theme.
+## v0.42.0 — 2026-09-28
+
+### Added
+- Ask a side question in a coding-agent thread with `/btw <question>`. Claude Code answers on a card at the end of the thread while its turn keeps running. The answer is not saved, and Codex threads do not offer it.
+- The Ungrouped section on the Triggers page folds like a group. A link to a trigger opens the section when it is folded.
+
+### Changed
+- Search everywhere opens wider on desktop, up to 36rem.
+- A theme card shows the theme count under the name, with the chevron at the right edge. A long theme name wraps onto two lines.
+- A refresh that finishes at once settles in about a second.
+
+### Fixed
+- Opening a dropdown menu keeps the keyboard up on iPhone and iPad, and the menu fits above the keys.
+- A dropdown on iPhone opens below the status bar and stays on the side it opened on. A tall list scrolls and leaves its button in view.
+- A tap on Send just after the iPhone keyboard closes no longer leaves the next tap dead.
+- A tap outside the open theme grid folds it and does not press the control under it. A tap on another theme still picks it, a scroll leaves the grid open, and a keyboard press still reaches its control. Toasts stay tappable over the grid.
+- Settings stays still when the theme grid opens or folds with classic scrollbars shown.
+- Search everywhere on a phone uses its phone size again.
+- The Read label on a message shows when the agent read it. The message details list both Sent and Read.
+- A coding-agent thread that picks up a queued message or a child's result after a Stop shows as running.
+- A coding-agent session that a trigger started asks you for permission once you have answered or written in its thread.
+- An unfolding section lands without a jump.
+- Wrapped thread titles in the drawer have more line spacing.
+## v0.41.1 — 2026-09-28
+
+### Fixed
+- A theme with a block caret shows the block caret in the macOS app, Safari, Firefox and on iPhone. The caret follows the text, and it hides while you select text or type with an input method.
+- Search results wrap a long subtitle onto two lines, and a long unbroken path wraps too.
+- Thread rows in the desktop drawer have more room above the title.
+- A new engine version that builds while you start Lucidos from the dev scripts finishes its build. The toast no longer reports that the build failed.
+## v0.41.0 — 2026-09-28
+
+### Added
+
+- Themes. Pick one in Settings > Appearance, where each card previews its own theme. The built-in themes are grouped by family and include Nord, Catppuccin, Gruvbox, Everforest, Rosé Pine, Solarized, Tokyo Night, Amethyst, Paper, Minimal and Mono.
+- A theme can set colours, the header, the focus marker, a suggested font, square corners, a text glow and retro parts: a block caret, scanlines and double frames. The active theme paints before the first frame and follows live in app frames. Plugins can ship themes.
+- A theme made for only light or only dark offers to switch the theme mode when you pick it.
+- After a pick, the theme picker folds to the active theme's card. Click it to open the gallery again.
+- Permission cards, credential requests and plugin confirmations stay readable under every theme. The engine refuses a theme that would hide them.
+- Workspace fonts. Install your own font in Settings and apps load it too. Plugins can ship fonts. VT323 and eight more fonts are now bundled.
+- Pull to refresh on the content pane on a phone, and a Refresh button at the start of the desktop content row. It works in Files, Settings, Disk Usage, Changes, Notifications, Apps, Plugins and Triggers.
+- Disk Usage has a Free up space card. It cleans every finished worktree in one step and shows how much it will free. Each worktree title links to its thread.
+- Idle threads with nothing pending release their build artifacts, and cleanup starts at once when the disk runs low.
+- Agents can archive threads. They never archive a pinned thread.
+- The Lucidos menu lists work in flight, one row per job. Tap a row to unfold its detail.
+- Apply All sets a conflicting change aside and keeps going.
+- Apply toasts name the thread and the step, and show the time so far, the typical time and the time left.
+- A thread's change actions are in its overflow menu.
+- `lucidos.ui.toast` takes an optional title.
+- A picture with a size hint reserves its space before it loads. Question cards and `lucidos data write` add the hint.
+- Lists and panels draw skeleton rows while they load.
+- The slowness bar says when a stuck database or a full disk is the cause.
+- The drawer's status filter headers show a thread count.
+
+### Changed
+
+- Dialogs, toasts and menus share one layout: a head with an X, a body and a foot. Red means destructive and nothing else.
+- Toasts are one line, with the tone in the icon. A toast with one action is a tap on the whole card.
+- Turn folds and inline disclosures roll open like drawer sections.
+- Drawer rows start the title with the status mark, put the pin on the title line and the chips on the date line.
+- The Plugins panel has a simpler layout, and its install and uninstall panels fold their file lists.
+- The permission card leads with what the agent asks, and coding agents say what a command does and why.
+- A deep link holds its target on screen until you scroll or act.
+- A device has the same name on every screen, taken from its pairing label when nobody typed one.
+- The new-version button reads Switch, and the standing apply reads Apply on settle.
+
+### Fixed
+
+- A chat request that names another workspace can no longer skip the subprocess gate.
+- Undo, discard and apply no longer destroy unrelated work, and undo removes files the command created.
+- A restart no longer commits an agent's half-finished edits.
+- Apply refuses a thread that waits on a question and a worktree with uncommitted changes.
+- A thread with an open question or an event wait stays out of Review.
+- A WASM signer's output, trap backtrace and secrets stay out of error bodies and logs, and a looping signer can no longer hold the engine's workers.
+- A stored email secret cannot be pointed at a new server or port.
+- A memory correction survives a memory rebuild, and the Memory Inspector refreshes when you correct a memory.
+- A backup tells you when it creates an encryption key.
+- A thread that arrives by live update shows its title, not "Untitled".
+- A markdown image that fails to load says so, and a broken image body is fetched again.
+- The boot splash stays still while its status changes.
+- The Disk Usage worktree list loads in seconds.
+- A chatty command no longer floods the agent's context.
+- An OAuth token that never expires no longer breaks refresh, and an empty refresh token no longer replaces a good one.
+- Git still runs when the resolved git binary has gone.
+## v0.40.1 — 2026-09-26
+
+### Changed
+
+- The app shows its first screen sooner. It loads the core UI first, then fetches menus and panels in the background once the splash lifts.
+- The thread drawer switches between Threads and Filters with the same crossfade as the content pane, and each pane's title arrives with its view.
+- The thread filter panel and the thread list behind it fade in and out.
+- The thread filter's checkbox rows have no hover band.
+- The control that folds a turn shows a minus inside a circle, and a plus to unfold it. The full-response toggle shows two speech bubbles, and the step-log glyph has three equal lines.
+- The thread drawer loads deep archive pages much faster on a phone.
+
+### Fixed
+
+- An app can no longer read the Web Push signing key or other engine bookkeeping from preferences.
+- An app can no longer change the local model base URL, and the local model key goes only to the host its credential covers.
+- An app can no longer set the coding-agent program paths or the coding-agent permission mode.
+- Saving a new local model base URL in Settings keeps the saved key working with it.
+- Local model chat keeps its key after an upgrade from an older workspace.
+- A reply that hits a network error after text has appeared no longer streams twice.
+- A Codex prompt that starts with a dash no longer fails the turn.
+- An MCP server id that ends in an underscore is refused, since its tools could not run.
+- Artifact and file links in a notification open when you tap them.
+- A bare `file://` URL in a message becomes a link. A path segment that looks like an email address stays plain text, and sentence punctuation stays out of a link.
+- Pressing a turn control keeps the chat where it was, even when the new render lands late or WebKit nudges the page.
+- A menu or panel that is still loading closes on a second press or a press outside it, and it never opens after its load failed.
+- The thread filter panel stays open when you collapse the drawer, and it takes no input while the drawer is collapsed.
+- A closed filter panel no longer draws a scrollbar over the thread list.
+- A drawer section's count grows smoothly from its baseline when the section opens, and it stays sharp in Chromium.
+- The sub-thread link in the drawer stays on one line.
+- A thread you archive finishes its exit from the drawer, even when another thread changes section at the same moment. A row that comes back, as after a refused archive, never shows beside its leaving copy.
+- Escape cancels an edit in the device name, trigger group rename, marketplace rename and new-group fields. It no longer saves the edit, and it no longer closes the trigger form around it.
+- One Escape in a field no longer also closes the open inline form.
+- A malformed slides deck shows an error instead of a blank app.
+- Renaming a thread cannot rename a different thread after you navigate away.
+- The workspace picker keeps a failed action's error on screen.
+- Disk Usage retries a failed read, and a failed Cancel Update says so.
+- The thread drawer no longer skips older archived threads when a draft sits on an archived thread.
+- A malformed timestamp shows "Invalid Date" and no longer breaks the row.
+- On a phone, a turn's status stays on the header line beside its controls when the timestamp wraps.
+## v0.40.0 — 2026-09-25
+
+### Added
+
+- A Motion setting under Settings > Appearance: System, Reduce or Full, set per device. Reduce stills every animation in the app, the boot splash included, and Lucidos apps get the value through the SDK.
+- Choose how technical the agent's words are: Keep it plain, Technical or I write software. The first chat asks, and you can change it under Settings > Response style. At the two plainer levels, no agent asks you a question you cannot answer.
+- A Learning response style that explains the why as it goes.
+- Move a sub-thread to top level from the thread menu. It keeps running on its own. Agents and the `lucidos` CLI can do the same.
+- A low-memory banner names the apps that hold the memory.
+- A proxy timeout setting (1 to 600 seconds, default 30) for every call through the engine proxy, with a per-entry `timeout_secs` override in `apis.json`.
+- A question card can show a picture or a short text sample under each option.
+- Messages you send to a coding agent or the Lucidos Agent show Sent, then Read.
+
+### Changed
+
+- Thread search puts title matches first, then newer threads.
+- The slowness bar says why Lucidos is slow, or says that it cannot tell.
+- Waiting rows and the waiting panel say in plain words what a thread waits for. Each watched event type gets its own chip, and the condition pop-up shows the event type and its payload filter as a block.
+- An edited shipped response style keeps its own description, and the list and the picker mark it as edited.
+- Credential requests, plugin install confirmations and OAuth pages survive a dropped connection, a reload and an engine restart.
+- A parent thread reads as Waiting while one of its sub-threads waits on you.
+- A message that waited behind your question arrives as one card that names its sender.
+- A card that waits on your answer sits at the bottom of the thread, below later activity. Once you answer, it drops back to its place in the timeline.
+- Startup recovery checks run side by side, so a cold start is faster. The engine log shows how long each startup stage takes.
+- Step through notifications with up and down chevrons, or Cmd+Up and Cmd+Down.
+- The thread drawer toggle is a sidebar icon in the header corner. The Filter button stays pressed while its panel is open, and fills in when a filter narrows the list.
+- A parent thread's "Show / Hide N sub-threads" link sits under its date, right above the sub-threads it controls. Sub-threads unroll from under their parent when you show them, and roll back under it when you hide them.
+- Drawer sections unroll and roll back the same way, and show their thread count while open. Archived and deleted threads slide out of the list.
+- The Filter button, its badge, the drawer title and the filter panel fade in and out together.
+- In the desktop app, right-click a drawer row to open its menu at the pointer. The system context menu shows on content only, and Option+right-click brings it back on a row.
+- Follow keeps you at the live edge while it is on. Scrolling away turns it off while the agent works. On a waiting thread a scroll parks it instead, and it picks up again when the thread goes live.
+- An event wait row shows when the wait started. Once the event arrives, its pill shows a check and the time.
+- A change's diff opens straight onto its file list.
+- A step's outcome mark is a thin drawn icon. A failed step shows its mark without a red box.
+- System comes first in the Theme row, as it does in Motion. The default font comes first in the Font list. Theme, Motion and Network access use the same segmented control.
+- One checkbox style that looks the same in every browser.
+- An aborted turn shows a solid warning triangle.
+- When an agent opens something for you, it goes to the device you used last, and says which one.
+
+### Fixed
+
+- A new window opens offset from the window it came from.
+- The arrow beside an interrupted turn's status sits level with the word in every font.
+- A squeezed settings row wraps instead of crushing its label. A short label keeps its control on the same line, and a wrapped control stays on the right.
+- Lucidos refuses to run from the mounted disk image or a translocated copy, where the engine could not be reached and Update & Restart failed.
+- On the desktop app, arrow keys no longer type squares at the start or end of a text field.
+- A failed app worktree setup no longer removes live work at the same path.
+- A failed trigger replay no longer stops the engine from starting.
+- OpenAI Responses streams end cleanly on an incomplete or error event.
+- A provider's key field in Settings no longer folds away while you type.
+- Retry on a thread that failed to load always fetches it again.
+- A file written while the Files list loads still appears, and the list refreshes after a reconnect.
+- The bell counts a notification that arrives while the page connects. Mark all read clears the list on the tap.
+- Your first keystroke no longer races device registration.
+- Follow-up messages to a coding agent arrive in the order you sent them.
+- A coding-agent session that restarts as its change lands no longer comes back as a crash after Switch to new version, and Stop reaches it again.
+- Pressing or scrolling a picture on a question card never picks its option.
+- A deleted repository is no longer offered as the composer's target.
+- The credential form keeps the service name you typed.
+- A withdrawn permission card never tells the agent that you denied it.
+- An agent that sets up an auto-apply with nothing left to wait for gets told no, and you no longer see a stray warning toast.
+- A thread's auto-apply marker clears when the auto-apply fires or is already gone.
+- Agents no longer promise that Apply restarts Lucidos.
+- The Vite preview server checks your device login before it serves files or the API.
+- A coding agent's separate text blocks show as separate paragraphs.
+- Stop, Discard and Apply Now on a coding-agent session no longer race each other. A refused one says what holds the session.
+- A coding-agent session's final status names the model it ended on.
+- The thread drawer no longer shifts sideways when its scrollbar appears.
+- A drawer row's date stays clear of a wrapped title.
+- On a phone, an event row wraps its time and state below the subject.
+- Count badges stay round and sharp at every UI scale.
+- Screen readers read Settings toggles as pressed or not pressed.
+- Tapping a row in the Filter panel leaves no highlight band behind.
+## v0.39.5 — 2026-09-24
+
+### Changed
+
+- Resize the changed-files list in the diff viewer. Drag the divider, nudge it with the arrow keys, or double-click to reset it. The width is remembered.
+- Coding agents run long commands as background tasks with `lucidos background-task run`, `output` and `stop`. The agent's thread reopens with the result when the task ends. Archiving or discarding the thread stops its tasks.
+- A message sent to a coding agent that waits on your question or permission card is held until you answer. It shows as "Held until you reply" under the card.
+- An Autocorrect switch for iPhone and iPad, under Settings > System > Debugging. Text fields inside apps follow it too.
+- The desktop transcript draws its own scrollbar, sized to the whole thread. The thumb moves only when you scroll.
+- Stopping a sub-thread tells its parent that it stopped. The parent still gets the child's next result, or a canceled note when you archive the child.
+- The Workspaces list in the Lucidos menu opens folded or unfolded, the way you left it on that device.
+- A tap on a toast closes an open popover and still presses the toast's button.
+- Claude Code sessions on Vertex show their progress notes between tool calls.
+- A plan approval card is one short line, and the plan stays in the message. A revised card names only what changed.
+- A permission card that the engine resolved says why.
+- The limit on event waits skips waits another thread ended, so waiting on other threads one by one is never refused. It allows 20 an hour, up from 10.
+
+### Fixed
+
+- Tapping a push notification no longer shows an error when the notification points at an event outside its thread.
+- Reading an email no longer marks it read on the mail server.
+- An image with a side over 8000 px is scaled down before it reaches a model, so the turn does not fail.
+- A thread that waits on your answer is never archived.
+- A sub-thread's report no longer replaces a question you can still answer.
+- A Copy button copies only the text it shows.
+- An app cannot change a preference that only you may set, such as the command guard.
+- A link in rendered content cannot add an attribute to the page.
+- A thread a coding agent starts with `lucidos spawn-thread` asks you about a command the guard cannot settle.
+- Stopping a background task stops every process it started.
+- On a phone, a button below a focused field works on the first tap as the keyboard closes.
+- A form that closes on a phone no longer leaves a blank band at the bottom of the thread.
+- Dragging the scrollbar on macOS scrolls the thread without shaking.
+- A thread you scrolled to the top reopens at the top.
+- A long coding-agent turn with its steps hidden scrolls and loads older turns correctly.
+- A short network drop no longer shows "Could not load the rest of this thread."
+- Links in messages wrap at spaces, not in the middle of a word.
+- Repositories come before apps in the composer's agent list.
+- The "Event arrived" chip shows no jump link for an event that has no row to jump to.
+- An engine build no longer stops when another session runs `cargo check`.
+## v0.39.4 — 2026-09-23
+
+### Changed
+
+- Choose which backend a model runs on. When a model has two configured providers, the model picker adds a provider step. The pick applies to the thread and is remembered for next time.
+- Edit a model's routes in Settings > Models: the backends in the order Lucidos tries them, and which one is remembered. Built-in models take route edits too.
+- A trigger can pin a provider along with its model, from the API, the CLI, `trigger.toml` and the Lucidos Agent.
+- The model picker names the backend each model runs on, even when there is only one.
+- A model shows in the picker when any of its providers is configured.
+- The Lucidos Agent runs independent reads (files, searches, event queries) at the same time, up to four at once. Each step reports live as it starts and ends.
+- A running sub-thread no longer holds back its parent's Apply.
+- A pending change says when its apply is resolving merge conflicts.
+
+### Fixed
+
+- Opus 5, Opus 5.5, Fable 5 and Fable 5.1 use their full 1M context window.
+- Opus 5.5 and Fable show their progress notes between tool calls, on the direct API and on Vertex.
+- Reasoning effort "none" works on every Claude model.
+- Web search no longer fails on models that think by default.
+- A reply the model refuses partway through shows as a failed turn.
+- `http_request` never sends a POST twice when the server may have acted on it.
+- A question card never replaces the agent's answer, in chat, Claude Code or Codex. The agent reports what it found first.
+- Coding agents no longer tell you where to apply a change.
+- A coding agent uses the model and reasoning level defaults set for each spawn.
+- A deleted workspace environment variable stops reaching new coding agents, scripts and commands at once.
+- After an update, the desktop app waits for the old engines to exit, so the new window loads the new version.
+- The macOS window buttons stay in place when a window changes its title.
+- A thread reopens at your reading position without a late jump, including on the iOS home-screen app.
+- A failed engine rebuild in Settings says how it stopped.
+- Every apply clears the change's plan and harden markers.
+- A merge conflict left open on a finished thread keeps its Discard button.
+- Apply as it settles is not offered for a change already resolving its merge conflicts.
+## v0.39.3 — 2026-09-23
+
+### Fixed
+
+- The Claude Code model picker lists models newest version first. Opus 5.5 is at the top.
+- A notification link to a long thread stays on the event it opened while the rest of the history loads, on iPhone and iPad too.
+## v0.39.2 — 2026-09-22
+
+### Changed
+
+- Claude Opus 5.5 in the model picker, for chat and for Claude Code sessions.
+- Discuss a refusing webhook. The refusal bar has a Discuss button beside Open Webhooks. One tap starts a Lucidos Agent thread that quotes the hook, its state, the refusal reasons with their counts, and any other hooks refusing at the same time.
+- `lucidos spawn-thread --reasoning-effort` sets a coding agent's reasoning level. `--cc-model` is now `--coding-agent-model`, and the old name still works.
+- A question the agent types as prose becomes a card. When a chat reply ends on a question, the agent is sent back once to ask it with clickable options.
+- Plugins opens at once from a cached catalog. A small cue shows while the list refreshes in the background.
+- Every model call the engine makes records its token cost, including the command guard's judge, the judge tool, intents, memory corrections and file-import summaries.
+- Settings > Permissions says where the command guard applies, and which check is always on.
+- A Codex command that needs to leave its sandbox goes through the command guard first. Only a command judged safe skips the permission card, and a privileged one is refused.
+- A resumed coding-agent session keeps its worktree as it was. Main merges in at Apply.
+
+### Fixed
+
+- On the iOS home-screen app, a dead Submit recovers sooner. The composer also recovers when the keyboard closes without a resize event, for example when the app resumes.
+- A spawned coding-agent thread keeps the name its caller gave it.
+- A coding-agent spawn refuses a reasoning level its model cannot run, from both the agent and the CLI.
+- The webhook refusal bar follows the hook's live on/off switch, so a switched-off hook no longer reads as failing verification.
+## v0.39.1 — 2026-09-21
+
+### Changed
+
+- A marketplace renames in place from Settings. Its URL stays as it is.
+- The CLI lists registered repositories. `lucidos repositories list` prints the external git repositories available to coding-agent sessions.
+- A coding-agent session raises a finding it will not fix, when that finding reaches users: security, data exposure, or user-visible correctness. It asks before it finishes, rather than leaving the note in a plan file.
+
+### Fixed
+
+- An app loads its own files behind a gateway. A framed app document carries a short-lived read-only pass to its own workspace files and app assets, so separate CSS, JS and images work without inlining them. The host renews the pass while the app is open.
+- A refused app frame shows one short line, not the Lucidos boot splash inside your app.
+- Copy works inside an app. An app frame delegates clipboard-write, so a Copy button in an app puts text on the clipboard.
+- A follow-up sent to a busy thread survives an engine restart. Both resume paths read the queued messages back and announce each one they recover.
+- A confirm is drawn above the modal that asked for it.
+- A standing toast drops below a modal. An error or a warning still paints over one.
+- A seeded sentence, from a release notice, the setup interview or Discuss, opens a fresh draft and leaves the one you are typing in untouched.
+- Got it on a release notice marks it read and leaves its action button live, so the action can still be run afterwards.
+- The steps row names what a changes action is doing. Arming a standing apply, applying as threads settle, and cancelling one each read as themselves.
+- The compose destination picker is the same height as the agent chip beside it.
+- On a phone, the webhook bars give their sentence the whole width.
+## v0.39.0 — 2026-09-21
+
+### Added
+
+- Response styles. Pick how the agent writes, edit a style, or add your own, under Settings. The chosen style reaches the chat system prompt.
+- TypeSafe (Jev) as a judgment backend. It sits in the model picker as its own row with the switch every other provider row has, and it answers closed-set questions with calibrated probabilities. Query classification and the command-safety guard can each run on it, and the agent can ask for a typed judgment itself.
+- Claude Fable 5.1 in the model picker, for chat and for Claude Code sessions.
+- A bar that says webhook deliveries are being thrown away. It names the run, its cause, and how long the refusals have been going on.
+- Filter the plugin catalog by marketplace, from a dropdown that also adds one.
+- Open a previewed file outside Lucidos, in whatever your OS opens it with.
+- `lucidos.request` in the SDK. An app frame reaches the engine through a route table the engine itself publishes, and every route declares whether an app may reach it.
+
+### Changed
+
+- A long thread opens fast. A cold open loads the newest page and knows its floor; scrolling or keying past the loaded edge fetches the page behind it. A position naming a turn the loaded pages do not hold opens at the newest page rather than chasing history.
+- App frames run in their own renderer process, with a host bridge for what an isolated frame cannot do itself. An app loads its own assets with no cookie, reads its own device's preferences, and gets its first-paint appearance from the engine.
+- An app frame reads environment variables and never writes them.
+- The composer's icon row folds its middle into a menu, and the composer rests at one line on a phone.
+- The Update button says what the new version brings before you take it.
+- The todo indicator lights for one state only, the turn opens with the list when anything is unfinished, and the todo tool answers with the list it just wrote.
+- A chat tool call's arguments are stripped from the thread record, as its results already were.
+- The workspace audit runs every check in one pass, can run a single check alone, and prints a receipt for each section it scanned.
+- The composer's press log names a silence. A wedge whose only signature was an empty log now writes one line: checks are running, the keyboard has closed, and nothing has been touched since.
+
+### Fixed
+
+- The composer comes back the moment the keyboard closes, instead of after a minute of tapping. On an iPhone the page sometimes stops receiving touches entirely once the keys go, while every reading the page can take says it is healthy. The shell is relaid out at that exact moment, invisibly, which is what frees it.
+- On a phone, a focused field scrolls back above the keyboard, and the strip iOS floats its keyboard bar over is reserved.
+- Background tools and scheduled scripts redact injected credentials. A child that echoed its environment used to write live credentials into the drain you read, the persisted event, and a trigger's summary.
+- A markdown table or image in a message cannot smuggle an attribute out of a cell, forge a copy control, or splice into a tag a sanitizer guessed at. Each pass parses instead of matching.
+- The reading position follows a fold that renames the top turn, and a deep link lands on the turn it names.
+- Asking the agent to apply a change no longer merges a branch its coding agent is still writing to. It points at "apply as it settles" instead, so the change lands the moment that thread finishes.
+- A notification's toast goes when the notification does. Arriving at the thread a notification points into no longer leaves a toast offering to open what you are already looking at, on any device.
+- A refused preference write is no longer reported as saved.
+- A push subscription names a real push service or is refused.
+- Disk-usage cleanup refuses a worktree a live coding agent is using.
+- A pinch keeps the panel it is steering, and spends distance one step per frame.
+- The tray's unread count sits against the mark rather than a column out, and a toast lives as long as its row is unread.
+- A window is not moved to a desk with no monitor that could hold it, and a frame the client corrected is not recorded as the arrangement.
+- A muted voice answer is muted whole, and a sentence finished inside the connect window still opens the floor.
+- A dev build sees the release notice it is about to ship, and a restarted engine is asked again what it owes the reader.
+
+### Removed
+
+- The composer press log drops five verdicts it can no longer produce: `commit-withheld`, `rescue-stood-down`, `unreachable`, `repaired` and `repair-failed`. The first two belonged to the auto-send that was retired earlier. The last three belonged to a reachability check that answered healthy through every episode it was built for.
+## v0.38.2 — 2026-09-18
+
+### Changed
+
+- A build slot now shapes the build it admits, not just how many run at once. A granted slot runs at nice +10 and gets a share of the cores sized to how many holders there are, so several coding-agent builds at once leave the machine usable. A solo build still gets the whole machine.
+- The call control says what is happening with colour and what a press does with the pointer. A connecting call pulses its handset glyph, every live phase sits on the same green, speaking deepens the fill, and red appears on hover wherever a press ends the call.
+- A call is named from the exchange it holds, at the first answered utterance, rather than from one thing that was said.
+
+### Fixed
+
+- A call opens silent. Nothing the talker volunteers before you speak is played, written down, or handed to running work. A question the engine parked is still put to you.
+- The talker no longer recites a finished call back at you. The conversation it is handed is fenced and marked as already heard, and one greeting buys one answer, so a recitation runs out of floor.
+- One sentence broken by a breath stays one bubble, whatever the talker did in between, and the doer reads the same sentence the transcript shows.
+- Outbound call audio no longer crackles and cuts out for the first minutes. The speaker holds a 200 ms cushion that grows to 600 ms to cover a stall it just heard.
+- A spoken reply reads at the time the talker started saying it, so a reply said over a running step stays where it belongs and stops jumping down the transcript.
+- A relayed turn keeps its row when the provider streamed no words of its own.
+- A turn that is only speech draws no Lucidos Agent header.
+- A short thread holds still. Nothing rests on the bottom of the pane, and the newest turn sits against the composer on desktop and on a phone.
+- The transcript stops scrolling past where the conversation ends. A hidden label under a spoken reply left a 136 px hole on a phone.
+- The reading position finds turns inside the feed box, so a deep link and a restored position land where they should.
+- A tap the composer never received recovers itself. The rescue was blocked three ways and had never run.
+- A toast never takes focus off a field you are typing in, so Enter still sends your message when the engine-update toast pops up mid-compose.
+- What's New takes you to the release it names. A client that can install one offers Update & Restart; every other session is sent to Settings, System.
+- A notification tap carries a real thread id or the notification is refused. Rows already written with a word instead of an id are repaired.
+
+### Removed
+
+- `run_coding_agent` no longer accepts `repo`. Use `folder`.
+- `lucidos spawn-thread` no longer accepts `--parent`. Use `--relation child`.
+
+  Both carried a deprecation warning. A recipe, trigger or script still passing an old form now fails with a rename error instead of running. A workspace audit finds any straggler on disk and names the one-line fix.
+## v0.38.1 — 2026-09-17
+
+### Changed
+
+- The call control and the prompt row paint the phase the call is in. Connecting sweeps, speaking deepens and breathes, ending drains to grey and takes no press. Under reduced motion the colour and shape carry the four states.
+- A connect that is waiting on the browser's microphone prompt says so after two seconds, rather than showing a spinner.
+
+### Fixed
+
+- Answer a waiting question out loud on a GPT Live call. A question card that parks the work is put to you by the talker, and speaking your answer settles it. A permission card is still settled on screen.
+- A call's transcript reads in the order things were said. Your words land under what they followed, one breath is one row, and a pause mid-sentence no longer splits your sentence into two turns with the reply chopped between them.
+- Cutting the talker off stops the reply you were hearing, and the rest of it never reaches the transcript.
+- A thread you only ever spoke on gets a name.
+- The view carries every spoken row while you are on a call, and keeps your standing follow through a scroll. A deep link that lands away from the live edge stays where it landed.
+- A coding-agent turn that dies on a transient provider error and is then resumed no longer reports itself finished to the parent thread, so nothing spawns a second session onto the same files.
+- A notification tap repaints the view it lands on, and routes to the workspace window rather than a popped-out app tab.
+- Uninstalling waits for the gateway and every engine to exit before it deletes the data tree.
+- An append to a file under `data/` from a Python run keeps what the file already held.
+- `fetch_news` no longer promises a country filter it never applied.
+- An ordinary 403 no longer blocklists a whole domain for the headless browser, and clearing browser data clears the blocklist.
+- An MCP server whose process died stops being reported as running, and MCP children are swept when the engine shuts down.
+- An app's proxy call carries the engine's own auth header and framing, refuses a redirect that leaves the configured base URL, and replays a 303 as a GET. A header value that cannot be sent refuses the request instead of going out bare.
+- The nightly backup fires at the hour you set across a daylight-saving change. Its key file is created readable only by you.
+- Two triggers of one name no longer share a directory, and a trigger whose cron can never fire is no longer respawned every thirty seconds.
+- A credential that cannot be read drops its provider, rather than running the turn on a different account's key. Grounded search that comes back blocked falls through to the next provider.
+- A memory correction no longer re-inserts a duplicate entry on every rebuild.
+- `.lucidos/exhaust` is pruned on a seven-day window, so a frequent trigger no longer adds a directory per run forever.
+- A branch delete git refused is logged, so the same work stops being offered for discard again. A follow-up queued while a session is shutting down survives.
+- A cross-install thread link cannot name a different install that shares a port.
+- A discarded draft keeps the destination you chose, so the next send runs against the repository you picked.
+- The Plugins panel no longer polls every five minutes, git-cloning every registered marketplace.
+- A Tailscale auth key is typed into a password field and cleared after a failed sign-in.
+- A fast double tap on the call control cannot leave a call speaking into a closed audio context.
+- An app window's page fills its window, and a window that came up mis-sized corrects itself on the next resize.
+- The main window comes up on the frame it remembers, judged before it is written, and a menu-bar-only login start gets that frame too.
+- A live window the display can no longer hold is refitted when the desk changes, on an undock or a resolution change. A window a display can still hold is left where you put it.
+- Restart from the packaged client runs off the main thread and names the device that asked for it.
+- Reduced motion no longer strands the drawer open and the shell inert.
+- A thread event with no projection behind it no longer conjures a titleless row in the drawer.
+- Enter committing an IME candidate no longer sends the message or renames the thread, and Escape mid-composition cancels the candidate rather than the turn.
+- A link in a user message, an injected prompt, a trigger fold or a child summary routes like every other link.
+- The question mark in a status badge is centred.
+- One emitter owns the changes frame, so Apply stops reappearing on a thread that is still mid-turn. The Diff button stays when a git probe cannot answer.
+- A composed image is capped before it is written to disk, and a malformed paging cursor is refused rather than widening the query.
+- An uploaded plugin archive is reclaimed, a failed mail send reports the OAuth cause, and reordering a single trigger group sticks.
+## v0.38.0 — 2026-09-16
+
+### Added
+
+- **Delete a thread and its family.** Delete sits in the thread overflow menu, in the Archive section too, and removes the thread's events, the memory it taught, its notifications, changes and queue entries in one transaction. Only the owner device can do it, and the confirmation names exactly what goes, including any branch work under the thread.
+- **Every Lucidos install on the machine is listed on System Overview**, with the port each one holds. When another install already holds this port, the client says so once and names it, and the uninstaller names the install it cannot remove.
+- **The talker can explain how a call works.** Ask and it says that you can keep talking while something runs, that each request is a fresh ask, that it cannot see progress, that the answer lands in the conversation too, and that ringing off ends the call rather than the work. It offers this when it clears something up, never as a preamble.
+
+### Changed
+
+- The app icon carries Apple's own macOS shape, so it draws with rounded corners on macOS 15 and older as well as on Tahoe.
+- How to Update on a phone answers on a toast pointing at the desktop, and the update offer and the System attention badge stay quiet there.
+
+### Fixed
+
+- `curl -fsSL https://lucidos.dev/install.sh | sh` runs on macOS again. Both the installer and the uninstaller parse under macOS `/bin/sh`.
+- A backup follows a `data` symlink that relocates the tree to another disk, and skips every other symlink so nothing outside the workspace reaches the archive. A relocated `data` that cannot be resolved fails the backup instead of writing a near-empty one.
+- Six more security and data-integrity defects from the nightly sweep, each with a regression test.
+- A Microsoft or GitHub connection no longer reports `offline_access` as refused when it holds a refresh token.
+- One thing the talker says is one row in the transcript, and it reads inside the block it was said in. A reply is one growing bubble, and a finished sentence stops shimmering.
+- A pause during a call no longer takes the words the next question needs, so a request made just after a pause is acted on.
+- A window no attached display can hold is corrected to fit, on restore and on every other path to the screen. A window you can see is judged, not moved.
+- The What's New release row keeps its date on one line.
+## v0.37.0 — 2026-09-15
+
+### Added
+
+- **GPT Live 1** joins the talker picker as a second voice family. It listens while it speaks, so it takes an interruption well. It holds no tools, so you settle a question card by tapping it and end the call on the button. It bills by the minute, and that spend does not appear in the usage rollup.
+- The talker picker offers GPT Realtime 2.1, 2.1 mini, 2 and 1.5, with 2.1 as the default. A workspace pinned to an older id keeps it.
+- The transcriber picker offers GPT Realtime Whisper, which streams your words as you speak them.
+- Both voice model rows carry an explainer describing what each family does. The transcriber row states that it has no effect on a GPT Live call.
+- **Wrap long lines in the file preview.** A Wrap long lines button sits in the preview header over any source view, in the Files panel and the preview modal alike. With wrapping off you pan a long line sideways and the line-number gutter stays pinned to the left edge.
+
+### Changed
+
+- `request_credential` names every host a credential may be sent to. When a request needs a host an existing credential does not cover, the modal reopens that credential and widens it, so one provider keeps one entry. A reauthorize names the whole request.
+- The unattended command guard sends three more shapes to the judge: a read-only command carrying a flag that runs another program, a Python dynamic import that shells out, and a write to a raw or mapped disk device.
+- Stopping a workspace asks the gateway that owns it, and reports the answer. A stop for a workspace a gateway does not know returns a clear refusal.
+
+### Fixed
+
+- A `javascript:` URL is refused at every opener: a deep link, an agent navigation over the event stream, a notification toast and a notification inbox row.
+- A base URL carrying a newline cannot forge a script approval.
+- A failed backup no longer records the access token in the event it writes.
+- A call's transcript fills in as the call happens. One thing the caller says is one row, and it gets an answer. A call that ends mid-reply keeps what the caller heard.
+- A packaged client that does not come back after an update keeps asking until it does, and writes what happened to a log file next to the service logs.
+- Registering a plugin marketplace adds the row at once. The form no longer sits disabled through a scan of every marketplace already registered.
+- A `[Plugins](plugins)` link in chat opens the Plugins panel.
+- The URL in a credential prompt is a link.
+- On iOS, a tap the composer never saw while the keyboard is up now runs Send.
+- The cited-line highlight in the file preview paints the whole line, not just the width of the viewer.
+- A new thread keeps the focus you gave it until its row appears in the list.
+- Submitting a message lands the view on the first row of the reply and holds it there.
+- A change that fails to apply draws one Change failed card.
+- Each app window is watched on its own, so one healthy window no longer speaks for the rest. A window you have hidden or minimized is left alone and keeps its state.
+- A window opens on the display its saved frame names.
+- The App row in the executor popover reads as one line of value text. The icon sits on the name's line, and a long name wraps in place.
+- The workspace picker's title bar takes the app's own bar height, at every UI scale.
+- The dead-press probe stays quiet while the client is refreshing, so no wedge report is drawn over the Refreshing status.
+- A path traversal advisory in a build-time test dependency is resolved.
+## v0.36.0 — 2026-09-08
+
+### Added
+
+- **GPT-6 Astra** joins the chat model picker as a builtin OpenAI model, with its full 1,050,000 token context window and reasoning tiers up to xhigh. Calls reach it once your OpenAI account is entitled to the model.
+
+### Changed
+
+- The Notifications page draws its toolbar and a skeleton list while the inbox loads, so the page has its shape from the first frame.
+- The Backup page raises every skeleton in a section together, and the health card holds its space from the first render.
+- Collapsed-section counts sit on their label's line with the digits centred, at every UI scale and on both browser engines.
+
+### Fixed
+
+- An app's proxy call no longer carries the engine's own trust headers to the upstream it calls. The whole `x-lucidos-` namespace and the two forwarding headers the gateway owns are stripped from every forwarded request.
+- A credential already present in a proxy URL is masked in the log line, on the first hop and on every redirect that follows it.
+- The webhook socket drops forwarding headers a client supplies, so nothing reaching it from outside can claim to have crossed the gateway.
+- The unattended command guard sees through a wrapper. `nohup bash -c '...'`, `sudo bash -c '...'` and `arch <command>` are resolved to the real command before every danger scan, and a command the guard cannot classify is refused.
+- A command inside a substitution, such as `echo $(curl -X POST ...)`, is categorised by what it actually does, so a trigger grant is checked against the real call.
+- MCP tool arguments are scrubbed before they reach the event log and the live event stream.
+- Installing a plugin never follows a symlink, so a plugin tree cannot reach a file outside itself.
+- Reverting a change, and controlling a coding-agent session, are held to the same thread-reach rule that already covers applying and discarding.
+- A model provider cannot exhaust the engine's memory by sending an oversized index in a streamed response.
+- A coding-agent teardown removes only its own session, so a follow-up session stays reachable by Stop and keeps the worktree it is writing into.
+- The stuck-session watchdog acts only on the session it snapshotted, so a replacement session on the same thread is left alone.
+- A rebase git could not be asked about is left untouched. Apply and Revert report the repository as dirty, and `git rebase --abort` still works.
+- A cancelled chat request releases its queue slot, so the thread queue cannot fill with slots nobody holds.
+- Your words appear in your call bubble the moment you stop speaking, and stay there until the engine's own record of the utterance replaces them.
+- A caller who keeps speaking gets a row per utterance, and a row left over from an earlier call is cleared when the next one starts.
+- Opening a thread that contains a call no longer sweeps the bubble somebody is speaking into.
+- Answering a question card out loud leaves no shimmering bubble behind, and typing during a call no longer collides with the call's own rows.
+- A notification arriving while you scroll the inbox is shown as well as counted, and paging re-reads the list when a reload moves it.
+- Scrolling the thread drawer while you type keeps your draft row on screen.
+- The Thinking spinner clears when the transcript resyncs.
+- A message queued during a running turn leaves that turn its own stream and badge, and Stop returns the queued text to the composer.
+- Searching Files shows the loader while the list is still loading, and offers only change rows it can open.
+- The Browse dialog for adding a repository is drawn as a modal: centred, scrimmed and scrollable.
+- The thread filter measures Include deleted against every trigger, so selecting all of them reads as all.
+- The standing-apply control appears on a paused coding-agent thread, which is still working and can still settle.
+- Four silent failures now speak: a queued message that could not be retracted on Stop, a repository registered moments earlier reading as unregistered, a missing thread saying which one, and Cancel on the app-update dialog.
+- A window keeps its size and position when it moves between monitors of different scale.
+- Apply as they settle lands straight on its armed face when pressed.
+- Fetching news reports an unreadable response as an error, so an unreachable service is never reported as no news.
+- Two identical files uploaded at the same moment both succeed.
+## v0.35.1 — 2026-09-04
+
+### Fixed
+
+- A standing apply can no longer be armed on a coding-agent thread working in an external repository. Lucidos never applies into one, so the arm would wait forever. Apply All passes those threads over, and both the HTTP route and the apply-on-settle tool refuse them.
+- The standing-apply control no longer appears on a coding-agent thread working in an external repository, where there is never a change for it to apply.
+## v0.35.0 — 2026-09-04
+
+### Added
+
+- Answer a waiting question out loud during a call. Speaking the choice settles the card on screen, and a permission card can be answered the same way instead of passing in silence. Saying goodbye ends the call and leaves the work running.
+- Arm Apply before a coding agent has finished. The prompt row and the Changes panel carry a standing apply: press it while a thread is still working and the change lands the moment that thread settles. Apply All gains the same, as one toggle that also turns the whole workspace off again.
+- Pick the live transcription model for calls. **gpt-live-transcribe** leads the list in Settings > Models, built for a live microphone.
+
+### Changed
+
+- Your bubble appears as you start speaking, with three pulsing bars, and fills in as the words arrive.
+- A call reads back as one conversation. Every utterance draws the ordinary user bubble with a call icon, whichever model fielded it, and an answer still on its way draws its response panel straight away instead of leaving the transcript quiet.
+- The pairing screen is a column on the page rather than a card, which gives the install steps the full line length on a phone.
+- A control that cannot act is replaced by the one that can, so no button is drawn faded with its tooltip out of reach.
+
+### Fixed
+
+- A paired iPhone stays paired. A browser may split its cookies across several header fields over HTTP/2, and the gateway read only the first, so the same phone was let in on one request and handed the pairing screen on the next.
+- Reading email works when the server hangs up on the way out. A successful read is kept even if the IMAP LOGOUT that follows it never gets a reply.
+- A handshake token minted for one host is never sent to another. It is now bound to the script, the host and the accounts it was minted with, so repointing a proxy entry cannot replay a live credential somewhere else.
+- **Working** shimmers even when the live step row is below the fold, so a tall coding-agent turn no longer reads as finished.
+- A spoken aside no longer reopens a finished answer, which used to produce a whole second reply seconds after the first.
+- A spoken reply lands under the thing it answers, wherever the bottom of the transcript moved to.
+- The plugin update panel counts a real decision. A file whose content already matches the new version is no longer listed as your local change.
+- The webhook ingress bar tells a blocked local port apart from a dead ingress, and names the families this host could not send for.
+- A caller with no credential is refused rather than recorded as you, and every mutating request under the API is held to the same rule in one place.
+## v0.34.1 — 2026-08-31
+
+### Changed
+
+- A typed answer on a question card is drawn as your own message, in the same bubble the transcript uses for everything you say. The CUSTOM ANSWER label sits above the bubble as a header.
+
+### Fixed
+
+- A call reads back in the order it happened. The reply was written down before the words it answered, so every answer sat above its question.
+- A call makes the thread real. One the assistant handled without doing any work stayed a draft called "Empty draft", with the whole conversation stuck in the compose view. It now joins the thread list as soon as either of you says something, titled by the first thing you said. Calls already stranded that way are recovered.
+- A call that ended reads Done. It carried a red "Aborted" warning, because a conversation with no agent turn in it looks like a turn that crashed.
+- Creating a trigger says so when the timezone preference cannot be read, instead of scheduling the trigger in UTC.
+## v0.34.0 — 2026-08-30
+
+### Added
+
+- Hold the call control to pick which microphone a call uses. The list is the microphones the browser can see, and the choice is remembered.
+- Settings > Models gains a transcriber model and a spoken voice for calls, and the talker model is picked from a list.
+- A question the agent asks mid-call is put to you out loud. You answer by speaking, and the answer settles the question on screen.
+- A call leaves a full record in the thread. What you said takes a Spoken chip and a surface of its own, and what Lucidos said aloud becomes a Said aloud row inside the turn it happened in.
+- What a call is told at the start is a toggle per section, so you choose which of them a call carries.
+
+### Changed
+
+- A call runs on two models. A talker holds the conversation and hands work to the agent through a single tool, so a question the talker can answer from what it already knows costs no agent turn. What the talker says aloud reaches a turn that is already running.
+- The call control is absent when the thread's destination is a coding agent, and moving the destination to one ends a live call and says why.
+- A voice turn records its tokens per modality, so audio and text are priced apart.
+- A notification clears once you have looked at what it points at. The rule is standing rather than one-shot, so the needs-attention list and a resumed app clear the row too.
+- The update check names its version in its user agent.
+
+### Fixed
+
+- Answering a question survives a dropped connection. An iOS home-screen app waking from the background could fail the answer twice before it landed; the tap now retries once, and a failure raises one message that names the cause.
+- A coding-agent thread loads. The snapshot now strips the tool results and arguments that make those threads heavy, fetching them when you open a step, and a cold start no longer prefetches every active and saved thread.
+- A WebSocket handshake proves its origin at the gateway. Chrome and Firefox send no Sec-Fetch-Site on a handshake, and behind the gateway that left every desktop call refused with a 403 the browser hides.
+- A Host header with no port matches the default port and no other. Two gateways on one machine could otherwise wave each other's pages through the same-origin check.
+- A long press on a mobile thread row keeps its actions menu open. The lift that opened it used to close it again.
+- An installed home-screen app can re-pair from the phone it is on. A replayed launch code no longer spends the gateway's wrong-guess budget, and the screen now offers the browser on the same phone.
+- A device credential is matched, not merely found. A cookie left by a gateway that is gone no longer refuses a device whose good credential sits under another name.
+- A call is pinned to the workspace's language. The transcriber used to re-guess on every utterance, which is where Bokmal and Nynorsk flip on a short phrase.
+- Deleting a webhook asks first, naming the hook and saying that a replacement gets a different path.
+- The composer eases to a draft's height instead of snapping to it.
+- A turn control holds the element you pressed, with no clamp carried over to the next press.
+- A cross-workspace call that fails names the protocol it assumed and the ports file that did not say. Every writer of that file now preserves the keys it does not own.
+- The agent can request a secret credential. Its schema is rendered from the engine's own list, so it can no longer fall behind and tell you a type does not exist.
+- The frontend's event types are generated from the engine source, and the union stops declaring fields nothing emits.
+- A project-wide hardening sweep across the engine, the gateway and the frontend, including credentials that could reach a host by inference and an e2e handshake that dropped a header it needed.
+## v0.33.0 — 2026-08-29
+
+### Added
+
+- Call a thread and speak to it. Experimental and off by default: turn on **Voice** in Settings to give the composer a call control. A spoken utterance starts the thread's ordinary turn, the agent's answer comes back out loud, and both sides are written into the transcript as thread events. Settings > Models gains a Voice section for the talker model and for what a call is told at the start.
+- A long press opens a mobile thread row's actions. On a phone the small overflow button in the pane's right corner is gone, and holding the row opens the same menu against the row's leading edge, where your thumb already is.
+- Discuss a webhook ingress outage. The ingress bar gains a Discuss button beside Open Webhooks. One tap starts a Lucidos Agent thread quoting the whole declaration. It names the webhook the probe knocked on, the public host and port, and the families that are down. It also carries the outage age and what each probed address answered.
+
+### Changed
+
+- Settings > System is a drilldown list, like the Settings home one level above it. Ten sub-pages used to sit under a four-row tab strip that took 290px off the top of every one of them. Overview is now a row like the rest.
+- The update-check row says how often the check runs and what it sends, behind its own explainer.
+- The image viewer's chrome fades out instead of snapping away.
+
+### Fixed
+
+- The packaged app no longer dies when a proxy signs a request. The engine compiles a signer module to run it, and macOS killed the process the moment it did, taking the in-flight chat turn with it. The engine now ships with the entitlement that permits it, checked against the signed bytes at build time.
+- One credential can cover several hostnames of a provider. A key pair signing both `api.binance.com` and `fapi.binance.com` used to be refused on the second, because a credential could name only one base URL. It now carries a list, and Settings edits it: the Base URL field became Base URLs, with a row per host. A script reads the same list with `lucidos credentials list` and replaces it with `lucidos credentials set-base-urls`. Nothing widens on upgrade, and nothing is guessed from a hostname's spelling: each host is named, and a request to any other is still refused.
+- Auth handshake proxies work again on a workspace upgraded from 0.32.0. A `script` path written as `data/scripts/auth/x.py` stopped resolving. That spelling only ever worked through a fallback the 0.32.0 hardening removed, so the engine looked for `data/data/...` and answered "auth handshake script not found". The same doubling reached the startup pass that approves the scripts a workspace already runs. It found nothing, approved nothing, and marked the workspace as done. Both spellings now name one file, and a workspace already marked can approve its scripts with `lucidos handshake approve`.
+- An OAuth proxy no longer refuses its own credential. A handshake script is handed a credential and presents it to the provider's token endpoint, not to the API the proxy calls. Requiring the credential to be scoped to that API refused every ordinary OAuth setup: a Google client belongs to `oauth2.googleapis.com` while the calendar API sits on `www.googleapis.com`. The approvals record now pins which secrets an entry may hand each script, in a file no app can write. That is stricter than the check it replaces, and it covers connected OAuth accounts too. Editing `data/config/apis.json` to hand a script a different secret is refused by name.
+- A working webhook ingress is no longer reported as dead. Two faults stacked up. The lookup stopped at the first public resolver that answered, so one resolver's intermittent "no such host" settled it and the second was never asked. That empty answer then became a verdict of unreachable over both address families, from a check that had sent no request at all. The lookup now takes the first resolver that names an address, and a family is only called down after something was actually sent to it.
+- The workspace backup key is no longer readable by an installed app. Revealing it takes a one-shot token, refuses a request coming from an app document, and leaves an audit row naming who asked.
+- Wrong guesses on the device pairing route are rate limited.
+- An error toast never shows a raw response body. A gateway error page used to arrive as eight kilobytes of markup rendered as a bulleted list of its own meta tags.
+- The mobile header's back and forward chevrons sit one slot inboard of the edge controls, at every UI scale. They used to be held a fixed distance apart whenever the row had the room, which parked them inside the space reserved for them.
+- Deep-linking Settings > System Overview lands on the Overview page, and How to Update opens the page it scrolls within.
+- A turn control holds the element you pressed when the transcript is at the live edge, and the scroll correction waits for the height rather than for the target.
+- A project-wide hardening sweep across the engine, the gateway and the frontend, including a gitignore guard that could be walked around one module over, engine credentials that could reach debug output, and a directly-launched engine that now demands a scoped credential when its bind faces a network.
+## v0.32.0 — 2026-08-28
+
+### Added
+
+- Settings > Webhooks can make a signed webhook. Pick GitHub, Slack or Stripe and the signature is configured for you, or choose Custom and set the fields yourself. The form also obtains the shared secret: it generates one for GitHub, which lets you choose it, and takes a pasted one from Slack and Stripe, which issue their own. A generated secret is shown once, with a Copy button, to paste into the sender's own webhook form.
+- A webhook's signature can be changed, rotated and removed, keeping its delivery URL. A rotated credential or a wrong signature header no longer means deleting the hook and re-pointing the sender at a new address. Also on `lucidos webhooks update`, as `--hmac` and `--signing-secret`. A hook carries exactly one verifier, so adding a signature drops its token and removing one mints a fresh token, shown once.
+- A shared secret is its own credential type. Every other type says how a value is sent, and this one is sent nowhere: it is signed with. It takes no base URL, and a webhook signing secret is the first of them.
+- The Webhooks page reports whether the public ingress is reachable. Every resolved address is probed from outside the machine, and each address family is judged on its own, so an IPv4 route that refuses connections while IPv6 answers is named rather than averaged away. A standing outage shows on the page, in a bar, and on the hook's own row, with its age counting up.
+- Discuss a notification that has no thread. The notification detail gains a Discuss button, shown when the notification reaches no thread of its own. One tap starts a Lucidos Agent thread with the notification quoted and sends it.
+- Turn off in-app notification toasts. Settings > Notifications gains an In-app toasts switch. Off, a notification still counts on the bell badge and waits in the Notifications panel, and no OS push arrives in its place. The switch covers every device, so one write silences them all.
+- A link can name a place inside an app. Write `[Some report](app:pr-understanding#pr-1645)` and the app opens on that item, because the fragment reaches the iframe as its `location.hash`. It works from a chat transcript, a notification tap, `navigate_ui`, `lucidos.ui.navigate` and `lucidos notify --fragment`.
+- The menu items are search results. Search Everywhere finds Files, Apps, Plugins, Triggers, Settings, Changes and Notifications themselves, so typing "plugins" offers a way to open the page rather than only what is on it.
+- Each workspace row in the picker states when it last backed up, beside its name and health dot.
+
+### Changed
+
+- A signed webhook's row names the credential it verifies with, as a link into Settings > Accounts, beside its signature header and digest. A credential that no longer exists says so on the row rather than linking nowhere. That is the state which makes the hook refuse every delivery.
+- A signed webhook is described as verified by "signature" rather than "token and signature". It never had a token: a sender that signs cannot present one.
+- An auth handshake script runs only once it is approved. Approval records who wrote the script and the exact bytes checked, so an edit after approval stops it running until it is approved again. Approve one with `lucidos handshake approve`, which a browser cannot call, and the Files panel warns when an open handshake script will not run as it stands.
+- A stored credential is presented only inside its own scope. A config entry naming a credential it has no claim on cannot make the engine forward that credential to an address of its choosing.
+- One SSE event stream per workspace, held by a shared worker, however many tabs, windows and app iframes are open. An app attaches to the shared stream and falls back to its own when it cannot. Presence now means an active shell, which is what decides whether a notification arrives as a push or a toast.
+- The model picker's filter box waits to be typed into rather than appearing on open, and it follows touch rather than screen width.
+- A publisher-model 404 from Vertex names the region and both ways to fix it, and a failed request names the project it was billed to.
+
+### Fixed
+
+- The transcript reopens on the turn you left. A reading position names a turn rather than a pixel, so a reload, a revisit or a re-render lands on the same place instead of near it, and the render window walks its way to that turn.
+- A turn control holds the element you pressed. Expanding or collapsing a turn's steps keeps the control under your finger where it was, including when the browser's own scroll clamp eats part of the correction.
+- A long thread opens filled, and an edge past the end still draws one turn. The render window holds its top edge rather than its size.
+- On iOS, Cancel survives the keyboard. A press that the system took as a scroll or a keyboard dismissal no longer aborts a running turn, and a touch that never becomes a click still cancels.
+- The composer sends the draft it is showing. A send reads the text its button was lit from, so a Send that looks ready dispatches what is in the box.
+- A deep link lands on its target, waiting for that target to be drawn, and says what happened when it cannot.
+- A thread tap leaves app fullscreen, so the thread it opens is on screen.
+- Thread events order by instant rather than by timestamp text, so two events inside the same second no longer swap places.
+- The mobile header recognises an anchor write by position, so it stops hiding on a scroll the reader did not make.
+- A multi-value cron field renders as the several times it means, not one.
+- The Thread Queue panel fetches on open and refreshes on wake, and a cancel waits for output already kept.
+- The workspace picker's animations, three UI transitions and every raw CSS duration honour the reduced-motion scale.
+- The picker's status dot sits on the name, and a row holds its backup line open rather than jumping as it loads.
+- A toast wraps a long path instead of clipping it.
+- Settings > System answers every shape the update route sends it, a release marked newer always carries the route to it, and a running update keeps its own control.
+- A drawer list is one tab stop, not two.
+- Eight correctness defects in the engine found by a project-wide sweep, including two logs that could not name what they dropped and a plugin trigger slug rejected by the create-path guard.
+- A directly-launched engine stays on loopback.
+- A coding-agent session adopts a branch only once it proves the branch is its own, and a failed anchor lookup refuses adoption rather than reading as no commit.
+
+### Removed
+
+- The workspace-root fallback for a `script_handshake` script. A handshake runs only from `<workspace>/data/<script>` now, the documented and git-tracked location. A script still sitting at the workspace root no longer runs, and the call says so, naming the `data/` path to move it to.
+## v0.31.1 — 2026-08-27
+
+### Changed
+
+- A connection notice claims only what a failed health poll proves. It reads "Cannot reach the dev engine", and scopes the consequence to threads and messages in that one window.
+
+### Fixed
+
+- A background task always reaches a terminal event. When the engine stops, restarts or crashes, the task is recorded with the output it had buffered, so an event wait on it resolves and `bash_output` returns a real verdict instead of an unknown task id.
+- A coding agent resumed after a restart hears about a background task that finished while it was away. The note carries the full task id, the task's spawn time, and whether it timed out, was cancelled or was lost.
+- A background task that exited on its own keeps its own verdict. A shutdown no longer relabels a successful run as abandoned, and a task the user cancelled is not attributed to the shutdown.
+- A blank transcript repairs itself in the packaged Mac app. The repaint recovery watches every WebKit client.
+- A reopened workspace wears the frame it was left at. A picker row, a switcher row and a notification tap all read the remembered geometry. Window state is scoped to the main window, so a new window no longer comes up fullscreen from an earlier session.
+- A git call that cannot answer stops authorizing destruction. A branch check that times out refuses the resume, a stale worktree holding uncommitted edits is not force-removed, a failed reset holds back the clean that follows it, and a failed merge cleanup no longer reports success.
+- A refusal inside a coding-agent session stops adopting a branch it never switched to, and a partly failed `git add` still commits everything that staged.
+- A failed read is no longer reported as an empty result. A credential lookup, an environment-variable list, an artifact walk, an OAuth account list and an unreadable history image each say what went wrong.
+## v0.31.0 — 2026-08-26
+
+### Added
+
+- Open a previewed image at full size. Click an image in Files, in a chat transcript or in a repo file preview and it opens in the image popup, on every device. The popup has a zoom cluster (out, a level control that swaps between full size and a fit, in) and the `+`, `-` and `0` keys. On a small image, 1:1 stays reachable.
+- The event-trigger chain depth ceiling is a Thread Queue policy field, `max_event_trigger_depth`, default 5. When a fire is suppressed at the ceiling, a notification names the trigger, the event and the knob to raise.
+
+### Changed
+
+- The update check is consented in Settings, System, and nowhere else. The workspace picker's first-run notice is gone, so a remembered workspace reopens without waiting on it. The System row states what is sent and how often.
+- A trigger is never woken by its own fire. A trigger that subscribes broadly can watch `TriggerCompleted` without waking itself.
+- A workspace name in the picker wraps onto as many lines as it needs instead of being cut, so two rows sharing a long prefix read apart. Manage workspaces stays reachable.
+
+### Fixed
+
+- On iOS, the send button sends. The touch path judges the finger rather than the event, takes every press, and holds focus so the keyboard stays up. No other part of the button can cancel it, and a press that still does nothing reports which half of the stack failed.
+- The UI scale slider answers a touch anywhere on the track, takes arrow keys, and survives a cancel. Its thumb is smaller.
+- A long thread opens straight away, and it opens filled. The transcript render window counts steps rather than turns, so one long turn no longer blocks the first paint, and it fills the pane it opens in, so an old thread no longer paints collapsed and unscrollable.
+- Compose no longer reports a stale mode after a send.
+- The composer follows its pane's width. Resizing or collapsing the Conversation pane no longer leaves the box clipped or too tall.
+- An inline markdown image in a transcript opens the image popup on click.
+- The image viewer shows the image rather than reshaping it: fit to the window, even hairlines around the chrome, and no transform left on the slide you swiped away from. The zoom reads out in screen pixels, so a phone screenshot fitted to the window reads 100%, not 33%.
+- Coding-agent steps whose tool result arrives as a list of blocks render their output instead of painting blank.
+- Opening a workspace, closing a window and quitting all work with a URL preview open. A preview belongs to the window that opened it, so closing one page cannot take another window's preview with it.
+- A reopen after Cmd-Q restores the windows that were parked, and adds no extra one.
+- A right-clicked notification row does not survive its menu closing. A notification row opens its workspace by the same rule the rest of the app uses.
+- A trigger fire that was in flight when the engine restarted no longer runs a second time.
+- A trigger's chain stays its own across a subprocess emit, a handoff and a sub-thread's first event.
+- One malformed entry in `apis.json` no longer aborts the engine boot. The bad entry is refused and named, the rest of the file loads.
+- Proxy config changes announce themselves on boot, and a backup can no longer be lost.
+- Connect URLs and the pairing QR find a Tailscale serve route on any port, not only 443.
+- A gateway that adopts a running engine publishes its ports file, so a cross-workspace call reaches it without a restart.
+- `lucidos spawn-thread --to <name>` resolves a bare workspace name beside the caller's own workspace.
+- Two coding-agent sessions starting at once no longer race: one session's worktree prune cannot delete another's half-built admin directory.
+- Apply no longer wedges on a staged rename.
+- Machine identifiers no longer reach the public mirror.
+- The Lucidos agent draws an image inline when you ask to see one.
+
+### Removed
+
+- Native cursor mirroring. It never reached the screen, and the arrow-cursor symptom it was added for is not ours.
+## v0.30.4 — 2026-08-25
+
+### Changed
+
+- Clicking a workspace opens it the way your client works best. The desktop app opens a window and offers "Switch this window" on right-click. A browser switches in place, and opens a tab on cmd-click or middle-click. An installed PWA stays in one window.
+- A workspace already on screen is focused instead of opened again, so you get one window per workspace, and opening from the picker leaves no stray picker window behind. A browser reuses the tab already showing that workspace.
+- Release notices have their own tab under Settings > System, ahead of What's New. The tab is always there, with an empty state. The attention dot now marks the tab that owes you something: What's New for a waiting update, Release Notices for an unanswered notice.
+- An answered release notice folds into an "Already answered" list, ticked and struck through, so the page opens on what is still owed. Answered and queued notices carry no live button.
+
+### Fixed
+
+- Two Lucidos gateways on one machine each keep their own paired devices. Pairing a phone to one no longer signs it out of the other, and devices paired today stay paired.
+- File > New Window opens on the workspace of the window you are in.
+## v0.30.3 — 2026-08-25
+
+### Changed
+
+- A dot marks the way to What's New when an update is waiting or a release notice is unanswered. It rides the menu button, the Settings row, the System row and the What's New tab, and clears when the update is installed or the notice answered.
+- A plugin setup thread after an update starts from the previous run. It reads what is already wired and asks only about what changed.
+- A trigger or event wait whose condition names a field no event of that type carries says so when you set it up, instead of quietly matching nothing.
+- A workspace audit offers to do every suggested fix in one answer, rather than asking batch by batch.
+
+### Fixed
+
+- A low-disk notification taps through to Settings > System > Disk Usage, and its text names that route.
+- Two Lucidos gateways on one machine each keep their own paired devices, so pairing a phone to one no longer unpairs it from the other.
+- A release notice with no button of its own can be answered from Settings > System > What's New, and an answered notice keeps its button.
+## v0.30.2 — 2026-08-25
+
+### Fixed
+- Downloads work from inside an app UI. A download link in an app saves the file, whether it points at a same-origin URL, a blob, or a data URL.
+- The desktop window shows the cursor the page asks for. A pane divider gives the resize cursor, a text field the I-beam, and a link the pointing hand, however you move the mouse.
+## v0.30.1 — 2026-08-25
+
+### Fixed
+- Navigating back to a pending form returns to the form. Email confirmations, credential requests and plugin install or uninstall prompts all restore over the panel they were raised from.
+- An OAuth authorization page opens in your browser when the experimental in-app browser is on.
+## v0.30.0 — 2026-08-25
+
+### Added
+
+- **Release notices.** The first open after an upgrade shows what the new version needs from you, one notice at a time, each with a button that does it. Everything still owed is listed under Settings > System > What's New, in a "What you need to do" section.
+- **A private or internal git repo works as a plugin marketplace.** Add a row in Settings > Credentials with the clone host as its Base URL (`https://github.com`, Bearer Token) and the marketplace scan, the plugin install and `git_clone` all authenticate with it. A narrower Base URL wins, so an org-scoped token overrides a host-wide one.
+- **Switch a provider off in Settings > Models > Providers.** An off provider leaves the model picker and web search with no restart, and its stored key is kept, so you can park a key and pick it up later.
+- **Choose Claude Code's permission mode in Settings.** Accept edits cards anything outside the session's working directories. Auto lets Claude Code's safety classifier approve routine actions instead. Applies to new sessions.
+- **A launch reopens every workspace window you had open**, each at its own size and position.
+- **Each window is named after its workspace.** The macOS Window menu and the browser tab both carry the workspace name, and the tab keeps its unread count.
+- **What's New offers a release newer than the one running.** Where this session can install it, the row carries Update & restart.
+
+### Changed
+
+- A coding-agent session writes to the workspace data directory and to its scratch directory without a permission card. A symlinked data directory is refused.
+- A new thread carries no other conversation's messages in its prompt. Cross-thread continuity comes from long-term memory, which already runs on the first turn.
+- The conversation summariser runs off the turn's critical path, so a chat turn starts its first step without waiting for it.
+
+### Fixed
+
+- Only the top overlay answers an outside click. A declined pointerdown consumes its paired click, and a cancelled gesture leaves nothing behind to swallow the next tap.
+- The model menu dismisses on an outside click while a reasoning tier row is open.
+- The transcript holds the end of the thread through a step-log reveal, on a transcript that fits its pane as well as one that overflows.
+- A typed answer lands on the question card it answers.
+- A trigger fire says which kind it is: a scheduled occurrence, or an event match naming the matched event type.
+- Check for Updates reports its own verdict, and refuses a second click while one is in flight.
+- The waiting panel's filtered subscription line opens the condition it filters on.
+- Always allow binds the session it was clicked in.
+- A tool call held at a permission card reads as gated, and a refused one reads as refused.
+- The workspace name suggestions on the create form are offered on the first run only.
+- Both welcome screens share the composer's content box.
+## v0.29.0 — 2026-08-25
+
+### Added
+
+- **Pair a device from Settings > Access.** Scan the QR with the phone camera, or type the one-time code into a box per digit. The desktop app pairs its own window with no terminal, and `lucidos pair --qr` draws the code in the terminal. Paired devices are listed with when each was last seen, and each can be revoked from that row.
+- **The gateway authenticates every network caller.** Engines leave the network, and the engine refuses a page served from a foreign origin.
+- **Webhooks.** Register a hook in Settings > Webhooks and an outside service posts to it. Each delivery is verified against the hook's secret and emits the event pinned to that hook, carrying the named delivery headers in its payload. A resend of the same delivery fires the event once. A `lucidos webhooks` CLI domain covers the same verbs.
+- **Self-curated context, behind the `context_mode_experimental` workspace flag.** A context panel sits at the tail of every round. The model keeps a tool result for another round with `keep_in_context`, releases one it is done with, and writes what a result told it into a scratchpad that survives the sweep. A ledger in the first block says what is held and what has gone.
+- **Cost and token accounting for every model call the workspace makes**, auxiliary calls included. Each capture records which call it was, which model ran it, and what it cost.
+- **A two-step model picker: pick the model, then its reasoning tier.** The same picker serves the chat composer and a coding-agent spawn. The list filters by name and pins to the top of the panel, and a model with no tiers offers no reasoning control.
+- **OpenCode Free**, a keyless provider, off by default.
+- **Field paths in the trigger and event-wait condition language**, so a nested payload field can be matched, plus `$nin`, `$regex` and `$or`. An `event_types` action lists what a workspace can subscribe to, the trigger form offers that list as a dropdown, and an event type the catalog does not hold is refused when a trigger or a wait is created.
+- **A trigger is linkable as `trigger:<id>`**, and the link lands on the trigger's row.
+- **Save a file to the OS downloads folder** from an app or a thread export. The export toast names the folder and can open or share it. On iOS the export shares.
+- **The file tools reach a registered repository.** `read_file`, `glob_files` and `grep_files` take a repo name and work over its tree.
+- **A plugin update keeps a local patch**, and offers that patch upstream with the outcome shown.
+- **The agent's todo notes render in the todo panel.**
+- **`events` resolves one event by its id**, and a tool call's address returns the call together with its result.
+- **A thread image carries a stable `img-<hex>` handle** that tools take by name.
+- **`run_coding_agent`'s model argument is a JSON-schema enum**, so an id the backend does not offer is refused by name.
+
+### Changed
+
+- The update check runs in the gateway and carries the release notes with the announced version. A forced check works when the automatic one is off, and the update offer opens the release it announces.
+- A packaged service that crash-loops says so on the splash screen.
+- Each Settings sub-section is its own view. Paired devices sits with Add a device, and search finds it. Every permission-grant change is audited, and revoke says who it locks out before it does it.
+- Permission grants are seeded per workspace. A workspace reads and writes its own copy, with the machine-wide list as the fallback.
+- Revealing a stored credential runs in two audited steps.
+- A WASM signer is handed header names, not the upstream tokens, and a handshake script runs with a cleared environment.
+- A public hook route id is contained to the gateway's own namespace, and one script-path guard is checked at startup.
+- The header carries the unread total on the brand mark, and the menu says where the notifications live.
+- The file editor stays open after Save and gains a Close button. A fast save goes inert at once and looks it only when slow.
+- A parked thread reads as waiting, and its change is not applicable while it is parked.
+- A user restart auto-resumes app coding-agent threads.
+- A running engine the gateway did not start is adopted rather than reported as never started.
+- System theme follows the OS on resume, on every platform, and an app iframe follows it the way the shell does.
+- The knowhow listing walks one group folder deep.
+- `create_app` refuses an id that is already taken.
+
+### Fixed
+
+- Seven command-guard and permission bypasses are closed, and six paths that carried untrusted input into a sink are cut.
+- An OAuth bearer token reaches only the provider's own hosts, over HTTPS. A host that merely carries a provider's name, in a label, a path or a query, gets nothing, and an address that cannot be parsed gets nothing.
+- A proxy request stays inside the base path the operator configured, on every redirect hop and through every layer of percent-encoding. `proxy_request` is held to the same boundary.
+- A partly-stored Google Drive chunk no longer truncates a backup archive, and a large upload cannot fail on a size field that was too narrow.
+- A cron day-of-week range-with-step token is translated and validated, in a mixed list as well as alone.
+- A truncated model stream retries rather than failing the turn, on Claude, OpenAI and a cut tool-argument stream. An adaptive-thinking model gets its own output ceiling, and a character split across two socket reads survives.
+- `run_bash` waits on the shell rather than on pipe EOF, keeps draining a detached process, and never re-polls a finished reader.
+- A brace glob pattern expands rather than matching nothing.
+- The chat transcript holds the reader's own line through a reveal, a fold, a step-log toggle and a settling turn.
+- Every badge on the header bar is ringed clear of the glyph it rides, and the nav chevrons land on one line across the mobile panes.
+- Send and Submit take the first tap with the keyboard up on a phone.
+- A model alias label no longer goes stale when the generation behind it moves.
+- An MCP server holds a per-server lock, caps its frame size, and reports a failed probe. The dispatch gate asks the registry rather than a snapshot.
+- A pasted screenshot that carries no image bytes is refused before the chip is drawn, and the upload refusal names what was uploaded.
+- Opening a trigger's event-type picker retries a failed list rather than turning the failure into a verdict.
+- The trigger detail page, the app edit form and the group rename field repaint from their own event frames, and a re-read in flight cannot eat the draft typed under it.
+- The mobile connection banner spans the window.
+- A notification tap keeps the window it fronted.
+- One child terminal wakes its parent once, and only the turn a waiter waited for may be evicted.
+## v0.28.0 — 2026-08-18
+
+### Added
+
+- **MCP Servers page in Settings.** Every configured server with its state in words, what its tools cost on each request, a Run switch, an Auto-approve switch, and Remove behind a confirm. Expanding a row lists that server's tools by descending cost, each with a switch that keeps the tool out of the model's context and refuses it at dispatch. A matching `lucidos mcp` CLI covers the same verbs.
+- **MCP tool permissions are editable from that page**, as patterns: `Mcp(<server>:<tool>)` for one tool, `Mcp(<server>:*)` for a whole server. The list is machine-wide and shared by every workspace on the install, and it holds whatever the Always allow buttons have written.
+- **xAI as a provider.** Grok models ship as builtins in the picker, Settings gains an xAI key block, `LUCIDOS_XAI_API_KEY` works as an env fallback in the desktop app as well as headless, and an app reaches Grok on the engine's own credential through `lucidos.proxy('xai')`.
+- **Connect URLs on the access page, in any browser and scoped to the workspace you are in.** Each row is an address you can copy straight to another device, including the tailnet MagicDNS name, and the page checks that the gateway answering that address is the one serving you.
+- **`run_thread` can pin a child's model and reasoning effort.** Both are optional and resolve independently, so pinning one leaves the other on the account default.
+- **The subscription panel carries a live list of what a thread is waiting for**, reconciled against the server rather than assembled from events alone.
+
+### Changed
+
+- A thread rides the live edge by default. Only pressing the follow toggle off turns that off, and the preference sticks per device. The toggle is a magnet now, so it no longer wears the same arrow as Download thread one row above it.
+- The current-time reading rides at the end of the user message and is derived from the turn's own anchor, so the cached system block stays byte-stable across a turn boundary and is shared thread to thread. The stated UTC offset is exact, so a half-hour or quarter-hour zone reads correctly.
+- Opening a thread holds a skeleton for as long as the transcript is predicted to take, then crossfades to the content. Submitting a message lands the view on the new turn once the agent starts drawing.
+- A caller on the local API bearing a thread-bound token can archive or cancel itself and its own descendants, and nothing else. Refusals are typed, with the HTTP status beside the taxonomy.
+- The zoom shortcut panel dismisses itself 1.5 seconds after the last change, and reaching for its slider cancels the countdown.
+- Coming back to a thread that finished while you were away keeps you on the live edge.
+- The plugin install receipt states the setup steps once.
+- A finished sub-thread stays in the inbox with the state it ran with. Only an unattended trigger run hides itself on completion.
+
+### Fixed
+
+- A dropdown opened with the mouse in the desktop app takes the keystrokes you filter with. The trigger holds focus until you type, then the filter box takes over.
+- A follow-up sent to a coding agent parked on a question resolves that question rather than deadlocking it with the card's buttons dead and the agent still waiting. A canceled question settles as a cancel.
+- An `ask_user_question` tag that leaks into the stream is recovered whether it carries an array, an object or bare prose, and a tag quoted inside any of the four markdown code forms is left alone.
+- Arrow keys at the end of a text field stop inserting tofu squares in the desktop app.
+- The Conversation cluster in the header can never overlap the drawer toggle, at any UI scale, in the packaged build.
+- The workspace pill holds its chevron on a cold launch rather than shimmering.
+- On iOS, the sticky thread title stays still through the compositor repaint nudge.
+- The MCP servers page reports tool cost against the chat model you saved, and a million tokens renders as 1M.
+- Two MCP switches flipped inside one round trip settle on what you clicked, and a reload in flight never reverts a switch made under it.
+- The Repos and Apps headings in the thread filter line up with the rows they head, and the notification detail nav row owns the gap down to its title.
+- The queued-message trash no longer spaces out the line it sits in.
+- A wait label states its reason once, without a doubled waiting word.
+- The build-only `rand` 0.7.3 dependency is out of the lockfile, resolving GHSA-cq8v-f236-94qc.
+## v0.27.1 — 2026-08-14
+
+### Changed
+
+- A workspace row opens in a second window. Right-click the row, in the picker or in the in-app switcher, and pick Open in New Window. The item also leads the row's overflow menu, so touch and keyboard reach it.
+- What's New lists every release published, including ones newer than the running build. It reads the newest changelog it can reach: the public repository, the local checkout, then the copy baked into the binary.
+- The connection notice names the engine serving the workspace and explains itself once. The header bar and Settings > System carry the full sentence; the Lucidos menu and the mark's tooltip carry the recovery line alone.
+- An MCP server id is capped in length, and a server whose id cannot produce usable tool names refuses to start.
+
+### Fixed
+
+- MCP tool names are wire-safe, so one server can no longer make every model request fail. Two servers offering the same tool name each get a distinct wire name, assigned in a stable order that does not shift when a tool is granted or revoked.
+- An update offer names the release it is offering, instead of reading "Lucidos [object Object] available", and a failed update check reports the reason without an "Error:" prefix.
+- Opening a thread holds the skeleton until the transcript is on screen, not just until the fetch returns, so the iOS PWA no longer flashes a blank screen.
+- A deep link that lands at the live edge keeps following new output, and one that lands further up stops following, including when a second link overtakes the first mid-scroll.
+- The composer keeps the Diff button on the bottom row whenever the row has space for it.
+- Two clients opening What's New at the same moment download the changelog once between them.
+## v0.27.0 — 2026-08-14
+
+### Added
+
+- **Build slots.** A machine-wide pool of permits caps how many heavy builds run at once across every checkout and worktree on the host. `lucidos build-slot <command>` waits for a free permit, runs the build, and frees it on exit or on death, with `--status` naming the current holders and `--set-capacity` setting the number. Make targets, the test harness and the engine's own background rebuild all take a slot.
+- **The communication-surface gallery, under Settings > System.** Every way Lucidos speaks to you on one page, rendered against realistic content: toasts in each type, both banners, and the confirm, prompt and progress dialogs. Nothing on the page performs an operation.
+- **A connection notice under the header.** When the connection goes bad, a bar below the header row states what is wrong in a sentence, in the same words the Lucidos menu uses.
+- **Cross-workspace app-icon badging.** A gateway install badges its icon with the unread total from every workspace it serves, not only the one on screen.
+- **A toast placement picker, under Settings > Debugging.** Compare four shapes for where a toast appears: full-width top, full-width bottom, a centred card, and per-pane columns. The choice is per device.
+
+### Changed
+
+- An event wait's delivery is described by what arrived: the transcript card reads "Event arrived", followed by the event type, and the arming row reads "matched".
+- The model picker offers exactly the reasoning levels the chosen model's provider supports, and an effort the provider does not accept is dropped rather than raised.
+- The toast for an engine version that exists only in source can be dismissed, and the version row badges for it. The dismissal is remembered per announced version.
+- A workspace row in the picker that has lost its connection states the error on its own line, under the name.
+- Settings > System reads out the connection state and what it means, beside the dot.
+- Seven glyphs in the host chrome are drawn from the Lucidos icon set rather than the system emoji font: the trigger chip, the System actor, You, the API caller and both chat marks.
+
+### Fixed
+
+- A turn cannot end with work still open and nothing arranged to re-open the thread, so a watch the assistant says it is holding is actually held.
+- The transcript stays at the live edge while a reply grows, while a pane resizes, and while the on-screen keyboard opens, for a reader who has not scrolled away.
+- A deep link holds the row it lands on, including in a thread that is still working and while the app scrolls elsewhere.
+- Tabbing to a control that is off screen brings it into view and keeps the reader on it.
+- Page Up, Page Down, Home and End scroll the transcript while a control has focus.
+- The progress dialog takes focus, traps it while it is open, and returns it on close.
+- A click inside an overlay that opens a second overlay no longer closes the first.
+- Two writers committing at the same moment both succeed; the one that loses the race retries instead of returning an internal error.
+- Spawning several coding agents at once gives each its own branch.
+- A build reports the commit it actually compiled, so the version row cannot show a stale one.
+- Dismissing a version toast on one device closes it on the others.
+- The connection reads as down whenever the engine stops, not only on a workspace switch.
+- A trigger fire's model and reasoning effort appear in the route popover for the turn it ran.
+- The Canvas pane's title and chevrons sit centred on the header row, with the content actions painting above them.
+- A chevron at the edge of the header's clip keeps its whole focus ring.
+- The header's focus wash fades its tint, leaving the box behind it solid.
+- The Files preview and the changed-file list show the whole path.
+- The inline file editor's toolbar is right-aligned, and Save is available only when there are unsaved changes.
+- The packaged Mac app can reach the camera.
+- The traffic lights are re-placed before a resize is displayed.
+- An info icon stays on the line with the label it belongs to.
+- Row icons, the apps glyph in search and the release notes in What's New all sit on the type scale.
+- On a phone, the transcript's scroll thumb rests below the title bar's fade.
+- A choice card's reveal arrow says the card is the app's own.
+## v0.26.5 — 2026-08-12
+
+### Added
+
+- **What's New, under Settings > System.** Browse the release notes for every version of Lucidos, reachable from the version row and from an update offer.
+
+### Changed
+
+- Fira Code is the default UI font and System the default theme on a fresh install.
+- Fira Code ships inside Lucidos and is served locally, so it renders offline and no request goes to Google.
+- Sending a message lands it at the top of the viewport, so your message and the reply that follows start at the top of the reading area.
+- The Lucidos menu says why the mark is dim, naming the workspace that lost its connection.
+- A thread can hold up to 25 live event waits.
+- The context viewer's rows share one chevron, one box and one right edge, and focus outranks hover on them.
+
+### Fixed
+
+- A wait or a trigger can scope to a single thread. A `thread_id` condition matches any thread event, so `CodingAgentIdled` can name one coding-agent session instead of every session in the workspace.
+- The transcript ends where its content ends, with no empty space below the last turn.
+- A deep link holds the position it lands on, including in a thread that is still working.
+- A queued follow-up is revealed where it sits rather than chased to the live edge.
+- A stored preference value that collides with a JavaScript built-in name no longer breaks the font or the UI scale at startup.
+- Fira Code renders in every browser, and an upgrade picks up the new font bytes instead of a cached copy.
+- A coding-agent turn counts its token usage once per message, so usage and cost totals stop inflating.
+- An event matching more than one of a wait's subscriptions wakes it once.
+- An update offer shows the release notes without the version heading repeated inside them.
+- A step's mark and its text sit together, with the gap between them closed.
+## v0.26.4 — 2026-08-11
+
+### Fixed
+
+- The delete icon on a queued chat message renders at a size that matches the "Queued" label next to it, and keeps its full tap target on mobile.
+## v0.26.3 — 2026-08-11
+
+### Changed
+
+- A coding-agent turn shows a live step row between tool calls and from the moment the session starts, so the transcript keeps a running row for as long as the turn is working.
+- A turn shows its full response and its steps by default. Turning either off is remembered.
+- One embedding-model cache per user instead of one per workspace. A workspace's leftover copy is moved into the shared cache and the space reclaimed, so every workspace after the first costs nothing.
+- The build toast names what it is building by group, and scrolls once the list outgrows it.
+- A trigger group's header actions are icons rather than two pills, and they stack once the row runs out of width.
+- Tool arguments are redacted before a step row describes them.
+
+### Fixed
+
+- `http_request` corrupted every binary download it saved. Images, archives and PDFs now land byte for byte.
+- The live-edge follow stays on through an iOS keyboard opening, an app resumed from the background, and the full-response toggle. Only your own scrolling retires it.
+- The follow carries you only while the agent is live, and resumes on the wake rather than on the next resize.
+- A press inside the transcript keeps the follow: answering a question card, granting a permission or expanding a turn is not a scroll. Movement retires it, and a scroll key counts only on the transcript itself.
+- Turning steps on while riding the live edge holds the newest content still, with the growth appearing above it.
+- Expanding a turn and collapsing it again leaves the transcript where it started, even when the expansion was tall enough to hit the bottom of the scroll.
+- Expanding or collapsing a turn holds that turn exactly where it sat, down to the fraction of a pixel, so the text around it stays on the same rows. Most visible on a phone, where a fraction of a CSS pixel is several device pixels.
+- A wake that arrives mid-turn renders in the place it happened, above the work it woke the thread to do, rather than below everything that turn produced.
+- A Codex step row reads like the Claude Code row for the same work.
+- Applying a change while a conflict resolution is in flight leaves the merge to the resolution that owns it.
+- A canceled subscription settles the todo list it parked, so nothing is left waiting.
+- The Lucidos agent treats a wait on another thread's completion as a supported subscription, so it no longer hedges that such a wait may never fire.
+- The gap under a turn header is tighter, so a turn's first line sits closer to its heading, and a step's mark sits closer to its text.
+- The running step keeps its icon column, so nothing shifts sideways when the check lands, and the success, error and unfinished marks all land in the same column.
+- The last turn sits directly above the composer, with no gap under the running step.
+- The follow-the-live-edge toggle holds the second slot in the prompt bar, directly after the control menu, on every kind of thread.
+- The boot splash keeps one text weight as it hands over to the app, and the brand leaves the stage before the veil does.
+- Tapping a trigger group's actions works on a phone, and a rename opens the keyboard.
+- The workspace switcher's placeholder stands as tall as the list it replaces, so the header does not jump while workspaces load.
+- A trash icon is sized by its ink rather than its box, so it matches the icons beside it.
+- Disk Usage puts a worktree's actions at the bottom of its card and stacks them when the row is narrow.
+## v0.26.2 — 2026-08-11
+
+### Changed
+
+- The setup interview says "we build" rather than "I build", in the welcome hint, the header tooltip and the confirm dialog.
+
+### Fixed
+
+- A workspace restored from a backup starts in the background like a created one, so its triggers, scheduled tasks and push keep working after login without opening it.
+- The follow-the-live-edge toggle in the prompt bar shows its on-state in accent alone, with no frame around the icon.
+## v0.26.1 — 2026-08-10
+
+### Fixed
+
+- **A window restored off-screen or at an unusable size is put back where you can reach it.** The macOS app declares a minimum window size, falls back to the default size when a saved one is smaller, and re-centres a window whose saved position lands outside every attached display. A fullscreen window is left alone.
+- **A wake's jump lands on the event that matched**, and the event's name in the wake card is the link. A card with nowhere to go is plain text.
+- **Sending a message always lands on the turn's agent status line**, including when a previous landing lapsed.
+## v0.26.0 — 2026-08-10
+
+### Added
+
+- **An in-app workspace switcher.** The Workspaces row in the Lucidos menu unfolds the list in place: a state dot, the name, the unread count, and one tap to switch. Create, rename and the rest stay on the picker, linked from the list's last row.
+- **The agent can search what has already happened here.** `memory` gains search and source, `threads` gains search over past conversations, and an `events` query can be narrowed to one thread.
+- **Stand down an event subscription by event type.** `cancel_event_wait` takes an `on` argument, so one answered watch can be dropped while unrelated ones stay live.
+- **A follow toggle in the prompt area.** Arm it and the transcript rides the live edge through a reply, press it again to stop. It sits beside the composer on every thread, a brand-new one included, and your last press decides what the next thread starts as.
+
+### Changed
+
+- **The transcript renders a wait, a wake, a child callback and a trigger as one event row**, with the deadline naming the day when it is not today.
+- **The welcome message offers one action**, a blue button that starts the setup interview.
+- **The agent control in the prompt bar wears the row's gray icon treatment**, and the connect pulse sits on the mark rather than the whole button.
+- **The todo indicator pulses gray while a turn is waiting.**
+- **The turn's controls are three icons in the response header**, on every turn: unfold/fold chevrons for the full response, a log glyph for the steps, and a third that folds the turn itself. The header row is inert, the controls sit beside the executor label, and an active one brightens rather than turning accent.
+- **Lucidos places the macOS traffic lights**, centred on the header bar it measured, and re-centres them when UI scale changes.
+- **The Lucidos menu is wide enough to spell the workspace name whole.**
+- **The thread drawer's filter panel stays open across a reload**, like the drawer's other states.
+- **The Backup settings page ghosts its controls while it loads**, and offers backup setup only once it knows one is needed.
+- **Sending a message, answering a question or permission card, and Continue after an abort all land the same way**: the turn's agent status line rests on the bottom of the viewport, so you watch the agent take what you submitted with the reply growing in underneath. A reader already riding the live edge is carried there instead, and a thread that fits on screen moves nobody.
+- **The transcript chevrons are navigation only.** Riding the live edge belongs to the follow toggle, and only your own scroll ends the ride, while a reply is actually in flight.
+- **The welcome message has room above and below it** before the composer docks underneath.
+- **The System settings page sizes its Path and API values at one shared step**, so a wrapping value stays readable.
+- **The search tab indicator is a plain rounded line**, and stays visible on the active tab.
+- **The macOS app shows its window once the frontend is about to paint**, so a cold launch no longer opens on a frame of bare window tint.
+- **A popover open in the workspace picker stays out of the window drag region**, and the picker row drags the window.
+
+### Fixed
+
+- **Add cards and settings navigation rows are keyboard-reachable buttons**, focusable by Tab and activated by Enter or Space.
+- **Returning to a thread lands you where you left it**, and a deep link's own position survives the arrival instead of being pulled to the bottom.
+- **Sending a message with nowhere to scroll leaves the reader where they are.**
+- **A wake's jump goes to the matched event**, not to the card that armed the wait.
+- **A native notification tap opens the workspace that raised it**, and the banner names that workspace.
+- **A page served on an engine's own port shows the renamed workspace**, not the engine's directory name, and an installed PWA re-resolves the name on resume instead of waiting for a reload it never does.
+- **Claude Code's API error banner renders in the failure card** rather than as a paragraph inside the response.
+- **A coding-agent session answered after it went idle resumes with the answer**, including on the stale-resume retry.
+- **A chat turn no longer ends with background work unwatched.**
+- **An event wait reads the watermark before it decides what to watch for**, so a task that completes while the wait is arming is still delivered.
+- **The turn header's status and date stack in place** instead of dropping a row at narrow widths, and the executor name stays level with the status beside it.
+- **The transcript scrolls while the mobile keyboard is up**, and a question card's options stay tappable with the composer focused.
+- **A user profile written by an app, a trigger script or the CLI shows up in the next chat turn**, without a restart.
+- **The route panel's value column lines up across every row.**
+- **The collapse control is disabled when there is nothing to fold**, and the full-response control keeps its shape when clicked.
+- **Folding or unfolding a turn keeps the ride**, and an armed reader glides back to the live edge rather than being teleported by the growth.
+- **A thread whose change has been applied no longer claims the agent is live**, so one scroll cannot silently end a standing follow on an idle thread.
+- **Answering a card and then scrolling away ends the ride**, instead of hauling the reader back when the reply resumes.
+- **The By thread types checkmark no longer nudges its heading.**
+## v0.25.1 — 2026-08-09
+
+### Changed
+
+- **The thread drawer stops at the same minimum width in every client.** The browser and the packaged macOS app share one floor, so a drag in one cannot reach a width the other refuses.
+- **A todo list left open while the thread is subscribed reads as waiting, not abandoned.** It settles to abandoned once the subscription resolves.
+
+### Fixed
+
+- **Text passed as a tool argument keeps its plain characters.** A trigger group named "Machine & Tooling Health" is created and re-served under that name instead of "Machine &amp; Tooling Health".
+- **A coding-agent thread shows what it is waiting for.** The subscription indicator and its Stop waiting button now render on those threads, not only on Lucidos Agent ones.
+- **The animation speed setting reaches every transition**, including the drawer collapse and the pane maximize, which were pure CSS and ignored it. The mobile panel drawer's exit is scaled to match its entrance.
+- **The composer's destination picker paints over the header** instead of under it, and opens at its trigger's width rather than snapping into place a frame later.
+- **The desktop drawer toggle travels between its two positions** instead of crossfading two half-transparent copies across the same spot.
+- **The maximized Canvas pane's hamburger clears the traffic lights** on the packaged macOS app.
+- **A thread whose change was applied keeps its auto-resume across a restart**, and a thread auto-resumed once is still resumed on later turns.
+- **A restart you triggered yourself is reported as yours.** The withdrawal of a resume promise names the device that restarted instead of showing a system-attributed "Response interrupted" over a red thread.
+## v0.25.0 — 2026-08-09
+
+### Added
+
+- **Frontend preview for a coding-agent worktree.** The engine supervises a Vite dev server rooted in the worktree a coding-agent session is editing, so its frontend is reachable on its own origin while the session runs. A Frontend preview section in the coding-agent menu carries the URL for the device you are on, and `lucidos frontend-preview` drives the same thing from a script.
+- **A trigger picks its own model and reasoning effort.** Set both on the trigger form, and every intent fire runs on them. The fire's model and effort are recorded on `TriggerStarted`, and the trigger row shows the model as a chip.
+- **A thread status filter, so running is askable apart from active.** `--status` on the CLI, a `status` query parameter, an SDK option and an agent tool argument all name exactly the statuses to keep. `--active` keeps its existing union of running and waiting.
+- **Settings shows each coding agent's installed CLI version.** The Binaries section probes `claude` and `codex` live alongside path detection, so an upgrade or a self-update shows up without a restart.
+- **A live style remote.** CSS custom property overrides travel over the preference channel and repaint every open client instantly, so the design tokens can be retuned from a phone while the app is running.
+- **A push switch for the device in your hand, under Settings > Appearance & Behavior.** Turning push on there offers to turn it off on your other devices.
+- **An info icon that opens an explainer.** Prose that used to sit permanently in the layout is behind a shared icon beside the control it describes, on settings rows, trigger forms and credential forms.
+- **The macOS menu bar always carries the unread count**, whether or not a window is open. The Dock badge is unchanged.
+- **The Lucidos menu says when a new version is waiting**, as a New version pill on the Restart row. Refresh and Restart are separate rows, and Restart asks first.
+
+### Changed
+
+- **The transcript never scrolls itself to the bottom.** The reading position belongs to the reader, and the app moves it only when you ask: the chevrons, turn stepping, a deep link, or returning to where you left. Pressing the down chevron or sending a message arms a standing follow that rides the live edge until you scroll away, and it survives leaving the thread and backgrounding the app.
+- **Answering a question card moves the transcript the same way sending a message does**, whichever of the three ways you answer.
+- **Stopping a wait is your own turn in the transcript**, at the point you pressed it, naming what was stopped.
+- **The desktop header is one 48px bar** with the Lucidos mark centred on it, the leading control up beside the traffic lights, and the navigation chevrons bracketing the pane they move. A row folds its actions into a menu when the pane runs out of room.
+- **The Lucidos menu is a centred modal** that opens with what you are running, and it now holds the workspace switcher and a Setup guide row.
+- **The mobile header centres on the Lucidos mark**, with the brand light and the menu in one control, and it reserves the keyboard's band so the composer and header stop moving.
+- **The thread filter opens as a panel in the drawer pane**, closed by an X on its own toggle. All statuses sits at the foot of the Status list, thread types narrow it rather than replacing it, and the row says "(filtered)" only when a setting is actually holding threads back.
+- **Pane dividers clamp at the pane minimums during a drag** instead of correcting after release, and a drag can no longer collapse a pane.
+- **A settings row holding a free-text field puts its label on its own line**, with the field full width beneath it.
+
+### Fixed
+
+- **The gateway no longer leaves defunct engine processes behind** after reloading itself.
+- **The gateway talks to an engine over the scheme that engine actually serves**, so a TLS certificate without a key no longer produces "error sending request for url".
+- **Two command-guard bypasses that auto-allowed writes outside the workspace are closed**: an output file passed to a read-only tool without a redirect, and `git diff --output=`.
+- **A synchronous `run_python` is held to its promised 300 second ceiling**, and the child is killed when it expires.
+- **A long toast no longer swallows the phone viewport.**
+- **Claude Code is offered the question tool it can actually reach over MCP**, instead of the Codex one.
+- **The search modal's category tabs pan instead of collapsing**, keep a clipped tab in view, and resync when the modal is reopened.
+- **The thread drawer refetches when the filter changed while the list was not mounted**, and pagination re-arms from the store when a filter applies.
+- **A merge-conflict toast lands on the turn where the conflict happened.**
+- **A `.htm` artifact previews and edits like a `.html` one.**
+- **A jump from a notification or a link lands on the settings control itself**, not on its info icon.
+- **A promoted coding draft keeps the destination chip it was showing** instead of losing it at send.
+- **The todo indicator in the composer uses one checklist glyph** across its three states.
+- **nanoid updated to 3.3.18** (GHSA-2v37-7h3g-55p8).
+## v0.24.1 — 2026-08-07
+
+### Changed
+
+- **The always-loaded chat context is smaller again.** The static prompt body and the System Knowhow routing list were each rewritten to their shortest correct form, the per-tool schema ceiling is now 1,500 characters, and a test holds the combined always-loaded budget at 103,200.
+- **The connection dot records every transition as a client breadcrumb**, so a red or blinking dot on a phone leaves a trail that can be read back.
+
+### Fixed
+
+- **A coding-agent turn that dies on a transient upstream API error resumes by itself again**, including a Claude Code turn that merged several instructions into one reply.
+- **A message sent to a running coding-agent session is not thrown away.** The session keeps the message when a reply the agent produced before it arrives afterwards, and an unrelated buffered event no longer counts as that message being taken.
+- **The connection dot on iOS stops flickering red on wake.** Overlapping health probes settle on a single verdict, and the probe has its own deadline sized against the poll interval.
+- **A thread list that times out is reported as a delivery failure**, and the sticky refresh card it left on the iOS PWA is gone. Two overlapping thread-list loads now share one result, so a skipped load cannot be read as a fresh list.
+- **An OAuth connection that comes back with fewer scopes than asked for says which ones the provider refused.** The Connect form also shows the console step beside Reconnect and Grant access, and names the Submit step at the bottom of Dropbox's Permissions tab.
+- **The Backup panel updates when a backup preference is changed somewhere else.**
+- **The todo indicator in the composer uses one checklist glyph across its three states**, with the state carried by color and named in its accessible label.
+- **A build whose staged system-knowhow copy has drifted from the source is refused**, and a staged copy that is not a directory counts as drift.
+- **Opening a thread lands on its newest turn.** A saved reading position gives way once the thread has grown, and resizing the window keeps the transcript at the bottom.
+- **Open in new tab and Fullscreen work in the desktop app.** A popout hands the app to the system browser, the app view goes to real fullscreen, and an opener that fails to launch says so.
+- **The marketplace list in the Plugins panel updates as marketplaces are registered and removed**, without a reload.
+- **A thread interrupted by an engine restart names the restart** as the reason it stopped.
+- **The transcript's fade edges stay off the scrollbar.**
+- **The install and uninstall receipts in the Plugins panel no longer show a Close button** that left the panel stranded.
+- **An event subscription's arming window is measured against the database clock**, so a subscription armed under load cannot miss an event that arrived beside it.
+## v0.24.0 — 2026-08-07
+
+### Added
+
+- **The Triggers panel shows when each trigger fires next.** A row lists its upcoming run times, and a trigger whose schedule cannot be evaluated shows an errored state instead of a blank.
+- **A cron expression that can never fire is rejected when you save it.** The offending field is marked in the trigger editor and keeps its red border while you are editing it.
+- **The agent can list and stand down its own event subscriptions.** `list_event_waits` reports what a thread is watching, when it was armed and when it times out; `cancel_event_wait` stops one or all of them. Both are on the `lucidos` CLI as `event-waits list` and `event-waits cancel`.
+- **A stopped subscription leaves a line in the transcript where it stopped**, so a thread that was watching for something shows where the watch ended.
+- **Archiving a thread that still has live subscriptions asks first**, and says how many it will stop.
+- **Connect an OAuth account in one pass.** The engine serves a provider registry, so the Connect form arrives prefilled with a known provider's endpoints, Reconnect widens an existing connection's scopes, and the form says when a provider requires the client secret. A refused connection shows what the provider sent back.
+- **An account records the scope set it was asked for**, alongside the scopes actually granted.
+- **The desktop app's startup splash says what it is waiting for.** It polls the engine's startup status while the gateway comes up, instead of showing a blank window.
+- **A scroll indicator on the mobile transcript.** It tracks position through the windowed transcript, sizes its thumb to the visible fraction, and fades out when scrolling stops.
+- **An app can show a spinning toast and dismiss it by key.** `lucidos.ui.toast` takes a spinning type and a stable `key`, and a later toast with the same key replaces the one on screen.
+
+### Changed
+
+- **The always-loaded chat context is substantially smaller.** Tool schemas, the static prompt body and the per-workspace payload were each trimmed and given a budget that tests hold them to. The workspace file listing now excludes vendored and build directories, lists breadth first, and caps knowhow and app descriptions.
+- **A collapsed run of hidden steps is marked with a faded tick** across the width of the transcript column, in place of a gap.
+- **The checkpoint card groups its actions**, and View changes is a Diff button.
+- **The Schedule Add button sits inside the cron field frame** in the trigger editor.
+- **The workspace picker refuses a duplicate workspace name** on create, rename and restore, and shows the name you gave a workspace from inside that workspace.
+
+### Fixed
+
+- **A data write issued while a change is being applied succeeds.** The write waits out a git index another writer is holding, then commits.
+- **Continue works after a crash**, and the transcript no longer repeats the interrupted turn.
+- **Stop ends the current turn and leaves the thread's event subscriptions running.** The button also releases once no turn is in flight, instead of staying stuck.
+- **The scheduler emits one terminator event per trigger fire**, not two.
+- **The gateway keeps serving loopback when a configured bind address is not up yet**, and the desktop app stops waiting on a gateway that has already died.
+- **Fira Code's ligatures stay off prose**, including the composer, so a typed `...` renders as three dots on all of it.
+- **Each pane has its own toast stack**, so a toast raised in one no longer appears in the other. The toast list also wakes on a layout flip rather than on every drag frame.
+- **A new-chat navigation keeps the open app.** The app stays fullscreen where it was, and stays put when the navigation lands on a split layout.
+- **Credential repair works against the stored credential**, the base URL sticks when you edit it, and the endpoint pair rule applies to edits as well as to new entries.
+- **The workspace picker keeps both entry points visible** and says why Restore is blocked when it is.
+- **The brand badge's superscript lift stays inside its clipping box**, on mobile and desktop.
+## v0.23.1 — 2026-08-06
+
+### Changed
+
+- **Every OAuth callback carries a state parameter** that binds it to the flow that requested it. A redirect arriving on the loopback callback port that does not match the flow in progress is refused.
+
+### Fixed
+
+- **A thread parked on an event subscription reads as Waiting.** The dot appears in the drawer and on the thread header, its status card says Waiting, and it survives a reload.
+- **A second Grant access starts** instead of failing with "Address already in use". A new authorization supersedes a flow still holding the callback port.
+- **Settings > Backup names the permissions a connected provider is missing**, rather than saying only that access is not granted. The engine and the page read the same list.
+- **The Backup section's rows no longer collide.** The blocked-state line, its button and the Back up now row sit on the page's spacing scale, and both blocked states are spaced and sized alike.
+## v0.23.0 — 2026-08-06
+
+### Added
+
+- **A thread can wait for something to happen, then carry on by itself.** `await_event` parks a thread on one or more events (a child thread finishing, a change being proposed, a coding agent going idle, a trigger firing, a domain event the workspace emits) and the engine re-opens that thread with a new turn when a match arrives. The wait costs nothing, survives a restart, and reports back in the chat you asked from. A coding-agent session registers the same wait with `lucidos await-event`.
+- **A guided setup interview.** A button on the welcome screen and in every header asks which parts of your life to help with (work, personal admin, health and training, learning, a side project, a household) and builds a starting kit of apps, triggers and knowhow from the answers.
+- **A checkpointed command shows what it changed.** The card opens a diff of what the command created, overwrote and deleted, and Undo removes the files it created as well as restoring the ones it touched. A command that captured nothing gets no card.
+- **Claude Sonnet 5**, in both the chat registry and the Claude Code picker, with a 1M-context variant beside the standard one.
+
+### Changed
+
+- **One model call is one row.** Thinking folds into the step it produced, and the row's token counter opens the context viewer, now a view of its own.
+- **An event wait reads as a step line**, and the wake that ends it names the matched event with its payload folded. "Show it" opens that event where it lives.
+- **A confirmed plugin install or uninstall leaves a receipt in navigation history.**
+- **An archived sub-thread under a live parent is dimmed**, and stays fully interactive.
+- **A paused thread has its own glyph and a "Paused by restart" label.** Paused means the engine is bringing the turn back.
+- **A Codex permission card names the files a change will touch**, and neither Codex card shows its wire tool identifier.
+- **A backup failure notification leads with what to do** and opens the Backup page, which shows the destination actually configured.
+- **The OAuth callback page is unmistakably Lucidos**, on the brand surface the workspace picker uses.
+- **Markdown tables fit the pane** at every width, with a readable minimum column.
+- **A markdown image pointing at a workspace file renders.**
+- **The navigation focus marker is neutral**, white on dark and grey on light.
+- **The Settings index rows are quieter**, matching the drawer's other list of destinations.
+- **The file tools can address `.lucidos/tmp/` scratch.** Reads and copies resolve against the workspace root; writes there are refused with a pointer to `run_python`.
+- **The Files list and an open file preview re-read themselves** when a tool call or a background task writes to `data/`.
+- **`navigate_ui` reports that it sent the request**, not that the page is open.
+
+### Fixed
+
+- The macOS client comes back to the menu bar at login, and a relaunch or auto-update no longer brings it back hidden.
+- A message that was sent no longer stays behind in the composer.
+- A multiline copy block no longer shows a blank line under every bullet and between every paragraph.
+- Prose shaped like `name=value` is no longer deleted from a rendered message.
+- With two dialogs stacked, one Enter answers only the top one.
+- Push can be enabled on a workspace recreated at the same address.
+- The Diff button works on an external-repo thread whose branch was renamed mid-session.
+- A restart no longer labels a thread both paused and canceled, and pauses a thread only when the engine is going to resume it. A coding-agent session that registers while the engine is already tearing down counts as shutting down, so its turn comes back on the next boot instead of ending as canceled.
+- The engine no longer deletes live coding-agent work when a database probe fails or a rescue commit does not land.
+- A domain event emitted from an app can no longer wedge the engine's boot.
+- Memory extraction, a plugin update check against an unreachable remote, and a Vertex token refresh no longer block the runtime.
+- Command-guard bypasses closed: a wrapped payload in a non-head segment, a decorated command head, and a code-injecting environment assignment. A permission card no longer records a secret from the command it is asking about, and an email search cannot carry a line break into the IMAP session.
+- Every WASM signer host allocation is bounded by the module's own memory before anything is reserved.
+- An unattributed caller cannot claim to be the user. Human attribution requires a device or workspace the engine can resolve.
+- A chat popover stays inside the viewport, never wider than the thread pane, and the prompt bar's popovers fit a phone. The close button sits in its own header with a full tap target.
+- The composer aligns with the gutter the transcript actually reserves.
+- On a phone, the content header title uses the space an empty side leaves it.
+- A blocked popup raises a toast with an Open button.
+- A thread link from the content pane re-expands a collapsed thread pane.
+- Resizing the thread pane holds the transcript still instead of carrying the reader up into older turns, and a reader at the bottom stays at the bottom.
+- A child completion wakes a waiting parent exactly once, and a lagged event bus or a failed emit no longer strands a wait.
+## v0.22.0 — 2026-08-05
+
+### Added
+
+- **An app can show a file without navigating away from itself.** `lucidos.ui.previewFile({ file_path, line, line_end })` opens a read-only preview modal over the app, with the same rendering, highlighting and line numbers the Files panel shows, plus an Open in Files link that promotes the glance into full navigation at the same lines. Dismissed by Esc, a click outside it, or its close control.
+- **A file opens at a line, scrolled to and highlighted.** `lucidos.ui.navigate('file', …)` and the `navigate_ui` tool take `line` and `line_end` (1-based, `line_end` inclusive) alongside `file_path`. The line lands as the same selection a click on the line number makes, so it can be sent into a chat message as context. A format that renders (markdown, CSV, SVG) switches to its source view, and a line the file cannot honour opens the file at the top.
+- **A `repo:` link inside an HTML or markdown artifact opens the file.** An `<a href="repo:<id>:file:<path>#L510-L520">` routes through the same navigation, so an agent-written report full of citations works as a plain artifact rather than having to be an app.
+- **A repository file can be previewed at a named revision.** A locator can say which revision it means: `repo:<repoId>:file#<ref>:<path>`, where `<ref>` is a branch, tag or sha. The same spelling works from `lucidos.ui.previewFile`, from `lucidos.ui.navigate('file', …)`, from the `navigate_ui` tool, and from a `repo:` link, where a line suffix can follow it. Leave the `#<ref>` off and you get `HEAD`.
+- **A repository diff can be read side by side, the original next to the changed file.** A toggle in the preview header switches the unified hunks for two columns aligned row for row, with a filler where one side has no line. It appears over the hunks themselves and only on a surface wide enough for two columns of code, so a phone and a narrow content pane keep the unified view. The choice is remembered across files and reloads.
+- **A thread can follow up on a child thread it spawned.** The `follow_up_child_thread` tool, `lucidos threads follow-up` on the CLI, `lucidos.threads.followUp` in the SDK, and a matching HTTP route all send a message to one of the caller's own direct children: redirect one going the wrong way, hand it something a sibling learned, or tell a stalled one to continue. A follow-up does not consume a child slot, and `lucidos threads list --my-children` lists a parent's own children with their status.
+- **A coding-agent branch is named after the thread that produced it**, so the branch on the repo says which session it came from.
+
+### Changed
+
+- **Settings is grouped into Assistant, Workspace, and This device.** Model, permission and coding-agent settings sit under Assistant; accounts, locale, marketplaces, access, devices and system under Workspace; appearance, behavior and keyboard shortcuts under This device. Links into a retired section are redirected to where the setting now lives.
+- **The workspace file preview shows numbered lines, like the repository preview.** Source, JSON, plain text, and the Source view of a markdown, CSV or SVG file are line-numbered and click-selectable, and a selected range travels with the next chat message.
+- **A diff citation previewed from an app shows the file at that change**, not at `HEAD`.
+- **Landing on a deep link paints a spotlight highlight** over the event or row you were sent to, which fades out on its own.
+- **A credential carries the OAuth provider's own authorize parameters**, so a provider that spells "issue a refresh token" in its own way gets what it needs at authorization time.
+- **A connected OAuth account reports who connected it**, including providers whose userinfo endpoint only answers POST.
+- **The Accounts page says what each of its two sections is for**, and the Backup page links to the one that connects a backup destination.
+- **A pushed notification's body is truncated to what the device will accept**, so a long message still arrives everywhere instead of being dropped by the platform.
+- **A release on the public mirror is created as a draft and published only once every platform tarball is attached**, so a clone or an installer never sees a half-populated release.
+- **A thread interrupted by switching provider or model reads as paused, not failed.** Its dot is neutral rather than red, and Continue appears only when the engine is not going to resume the turn itself.
+
+### Fixed
+
+- An app's text is the size Lucidos's text is. It defaults to the type scale's body step, still in `rem`, so it tracks the UI-scale setting.
+- What an app shows you is visible when the app is fullscreen. A file preview, a confirmation, a prompt or a toast raised by an app now draws above it in both the fallback and the real browser fullscreen, and Escape does one thing per press.
+- An app opened in its own tab reports that it cannot show a preview, which lets the app fall back to opening the file properly.
+- Waking the app no longer fills the screen with thread-refresh toasts. A wake marks non-focused threads stale and refetches on focus, and a fan-out failure raises one card rather than one per thread.
+- Stop is honored during turn setup, and a re-submitted follow-up shows as running.
+- A coding-agent turn survives a dropped API connection: it resumes instead of ending silently, and stands down when a follow-up is already queued.
+- A notification deep link lands on the exact step it names, and says so when the target no longer exists.
+- Backups to Dropbox check their scopes before running, and the Grant access button reconnects with the full set.
+- The OAuth authorization page opens in the browser you configured, and the Connect button keeps its success feedback.
+- Question and permission cards keep a typed answer across a fullscreen change.
+- The composer box aligns with the transcript's content edges, and its text sits on the card content edge.
+- Archive sits second-last in the thread overflow menu, out of reach of a mis-tap.
+- The camera is released when a capture context is refused.
+- When no image provider is configured, the message names the real remedy.
+- A rebuild hands the build lock over instead of racing for it, and collects the temporary files a killed build leaves behind.
+- Memory pagination is clamped at both ends.
+- OAuth tokens stay out of the log, and a sandbox that cannot be enforced fails loudly instead of degrading silently.
+- A resume promised on a provider switch is withdrawn when the boot cannot keep it, so a thread never sits waiting on a resume that will not come.
+- A step row's context counter stays on one line instead of wrapping.
+## v0.21.0 — 2026-08-04
+
+### Added
+
+- Question cards and permission cards are keyboard drivable. One choice holds focus the moment the card appears, so Enter answers it; the arrow keys step between choices, and the focus ring is visible wherever a choice is seeded.
+- A reminder bar appears when backups are off, with a link straight to the backup setting. Dismiss it and it stays dismissed.
+
+### Changed
+
+- Live question cards name the two escapes on the card itself: type any reply in the prompt, or cancel the question. The dead-end "Other" option is gone from every question the model can ask.
+- The workspace picker setting says what it decides, that the workspace keeps working while no window is open. New workspaces default to it, and existing workspaces are lifted to that default once.
+- Mobile Access reports the engine host's tailnet state separately from the device you are reading on, and stops offering an install to a browser that will refuse it.
+- Lucidos tells you when its database is unreachable. Health reports the database separately from the process, the boot splash stops waiting instead of hanging, one toast names the outage, and the launcher offers to start Docker when Docker is what is down.
+- Toasts are anchored to the bottom edge of the header, so they clear whatever the header is currently showing.
+- Each published release on the public mirror is now a child of the previous one. Clones of the repository keep working across releases instead of breaking on every publish.
+
+### Fixed
+
+- The prompt no longer jumps a line as its placeholder changes; the placeholder is measured, and the measurement stands down while the card animation eases.
+- The hint on a question card reads in the prompt, where the answer is typed, instead of under the answers.
+- A link in the chat can no longer reload the whole workspace.
+- Prose detail rows in Settings flow inline instead of being laid out as fields.
+- A generated image is described by what it shows, not by its position in the thread.
+- On mobile, archiving from the thread drawer stays in the drawer instead of swiping to the thread pane.
+- The scroll pin at the bottom of a thread cannot spin when its suppression timer is lost.
+- Quitting the desktop app parses the quit intent instead of matching a substring, saves window geometry on the way out, and comes back frontmost after a relaunch.
+- Restarting the gateway brings back the workspaces it stopped.
+- A background task stays drainable after it completes, so a drain that lands on the finish still returns the output.
+- Concurrent ADR writes no longer collide on the same number.
+- The backup reminder measures against the root font size at measure time, so it follows the UI scale.
+- Dependency: rand 0.8.5 to 0.8.7 (GHSA-cq8v-f236-94qc).
+## v0.20.1 — 2026-08-03
+
+### Fixed
+
+- Waking the installed iOS PWA no longer fills the screen with error toasts. A wake runs one reconciliation pass, and a dropped connection is reported by the connection dot rather than by a stale-unread-count card.
+- A compose draft that fails to reach the engine is queued and re-sent on the next resume or reconnect, so text typed on a phone survives an iOS eviction of the app. Repeat failures collapse into a single card instead of stacking.
+## v0.20.0 — 2026-08-03
+
+### Added
+
+- **Max tool calls.** Set how many tool calls the agent may make in one turn, under Settings > Models > Chat & Triggers. Presets or your own number, with an estimate of how long a turn that size can run.
+- **Background activity on the brand badge.** The marker beside the Lucidos title now covers any background work and is tappable, opening a status toast naming what is running.
+- **Embedding model download progress.** A fresh workspace fetches about 465 MB before vector memory works, and the status toast now shows it byte by byte.
+- **The build toast shows elapsed time and the commits the new version will bring.**
+
+### Changed
+
+- Mobile Access recognises a phone already on the tailnet as set up, with no install prompt or setup steps.
+- Expose is narrated on the brand badge, uses the current `tailscale serve` syntax with the older form as a fallback, and bounds each attempt with a deadline.
+- A Mobile Access failure toast shows the CLI's own error.
+- The macOS DMG ships a notarized and stapled app, so Gatekeeper clears it on first launch without contacting Apple.
+- Notifications open instantly, from the list already in memory, with a skeleton on a cold push tap.
+- The Origin popover on an engine-issued turn names the engine and why the turn resumed.
+
+### Fixed
+
+- A phone held sideways no longer gets a rotate-to-portrait lock. The layout follows the viewport, so most phones get the desktop split in landscape.
+- A preference change survives an iOS PWA suspend instead of raising "request cancelled", and writes to one key stay in order.
+- A left-edge swipe no longer exits an app that is fullscreen on the installed iOS PWA.
+- An auto-update keeps the app's macOS permission grants, and the build refuses an updater payload that is not Developer ID signed.
+- A failed update swap reports the failure instead of restarting into a destroyed bundle.
+- The update manifest's platform key comes from the built artifact, and it is uploaded only after its payload is present.
+- A coding-agent session survives a long silent turn instead of dying with "Stream idle timeout, no chunks received".
+- Pausing, creating or deleting a trigger takes effect for the very next request.
+- A tool call killed mid-execution renders as unfinished instead of spinning forever.
+- A coding-agent worktree is reclaimed only on positive evidence that it is dead, so a slow git probe can no longer destroy live work.
+- A workspace whose database provisioning fails transiently, such as the gateway starting before Docker, is retried instead of staying dead.
+- An apply refused for incomplete hardening no longer discards the coding agent's commits.
+- Streaming turn text no longer double-renders, the applied-changes list scrolls again, and a failed thread-list fetch no longer aborts the resync.
+- The command guard reads the real command out of `sh -c '<script>' <args>`.
+- An embedding model that does not fit the vector column is refused at load instead of failing every memory write later.
+## v0.19.0 — 2026-08-02
+
+### Added
+
+- **Run once.** Fire an existing trigger immediately, off-schedule, from the trigger row or the triggers tool. Not available for paused or event-only triggers.
+- **External link target on iOS.** Choose where external links open: Safari, ask each time, or the in-app web view. Set it under Settings > Links.
+
+### Changed
+
+- Mobile Access reads Tailscale state from the machine itself and needs no Tailscale CLI. A CLI is required only for the Sign in and Share actions.
+- The Mobile Access page is reachable from a phone, and Get Tailscale opens the App Store or Play Store for the device reading it.
+- A coding agent is told what happened to its work between turns: applies, discards, reverts, failed applies and worktree reclamation.
+- Every write to credentials, repositories, env vars, models, devices, pinned apps, MCP servers, OAuth accounts, preferences and notifications emits its event.
+- A trigger-failure notification links to the trigger.
+- The trigger-block message names the blocked command, and a blocked command containing a code fence renders as code.
+- Four off-scale font sizes are back on the type scale, and the composer's type scale applies only to the composer.
+
+### Fixed
+
+- Mobile Access publishes a tailnet URL only once something answers on it, and the tailnet HTTP row follows the gateway's network bind rather than tailnet membership, so the page never shows a dead address or the same address twice.
+- The Get Tailscale button works outside the desktop app.
+- A coding agent parked on an unanswered question survives an engine restart, instead of leaving the thread reading "Working" with a struck-through question card.
+- The SDK warms its link-target cache without a theming flash.
+- The RC front-door version check retries past Cloudflare POP lag.
+## v0.18.5 — 2026-07-31
+
+### Changed
+
+- **A refresh or a notification tap no longer replays the cold-launch animation.** Both loads continue a session the user was in one moment ago, but each arrives as a full document load, so the app answered with the brand launch: the mark building itself, "Opening your workspace…", the gradient, and a 1200ms minimum reveal before anything could dismiss it. Tapping a push on an installed iOS PWA got that treatment every single time, because WebKit implements neither `launchQueue` nor `launch_handler: focus-existing` nor a same-document declarative navigate, leaving a cross-document reload as the only channel that actually carries the deep link. Those documents now paint a quiet cover instead: no mark, no launch ceremony, the app's own flat background rather than the brand gradient, and no reveal floor to wait out, so the reload reads as the app redrawing rather than relaunching. Quiet is not silent, the delayed status still writes, so a genuinely stuck load says so. Three cases deliberately stay launches because each really can be one: the cross-workspace `#thread=` landing hop and a gateway handover can both lazy-start a stopped engine, and a deep link whose value is empty routes nothing at all. The gate mirrors the hash router branch for branch, so what the cover believes and what the app then routes cannot disagree. The cover carries its own light-theme foregrounds, since the delayed status and the escape link out of a stopped workspace are hardcoded white and would otherwise be white on white at exactly the moment boot has given up. The flat repaint reaches both canvas layers, because a fixed inset:0 element never covers the iOS standalone bottom safe-area strip. Reduced motion is honoured on the shorter fade.
+
+### Fixed
+
+- **The pre-paint scripts now read an absolute base href the way the rest of the app does.** `normalizeBasePath` explicitly tolerates a `<base href>` that is a full URL and reduces it to its pathname, but the inline scripts that run before the bundle exists (the anti-FOUC theme resolver and the boot watchdog) each slash-stripped the raw attribute instead. Against an absolute value that yields a slug like `https:/host/myws`, so every per-workspace key the app wrote under `ws:myws:` was invisible to them: the saved theme was not found and first paint used the fallback until the bundle loaded and corrected it, and the boot watchdog namespaced its one-shot retry marker somewhere the app never looks. The same raw comparison also failed to recognise the picker context, whose own no-preference behaviour then did not apply. All three derivations in the document now normalize first and strip second, which is also what keeps a slash-less `~` from being taken for a workspace slug.
+## v0.18.4 — 2026-07-31
+
+### Fixed
+
+- **A stopped direct-port workspace is no longer a dead end.** A per-workspace PWA installed on a direct engine port had no way out once that engine was stopped: nothing on that origin lazy-starts a workspace, the gateway is a different origin, and the service worker just replays its cached shell, so the user sat on the boot splash with no explanation and nothing to tap. The splash now offers the workspace's own gateway URL, whose navigation is exactly what makes the gateway start it. The href is built from two stamped metas plus location, so it needs no engine, no network and no bundle, which is precisely what a cached document against a dead origin still has. The engine stamps the workspace slug into the served shell to make that possible, HTML-escaped since the value arrives through an env var and lands in an attribute; a shell predating the stamp falls back to the workspace list. The escape is offered only where it is the only thing that can help, a direct-port document that knows a gateway port, and it replaces tap-to-retry rather than joining it, since a reload cannot start a stopped engine anyway. Revealing it also drops the splash's `aria-hidden`, so the status naming the problem is announced and the focusable link is not stranded in a hidden subtree.
+- **A dead engine no longer reads as a running workspace.** `kill -0` succeeds for a process that has already exited and is only waiting to be reaped, so `status.sh --json` reported `engine_running: true` for a workspace whose engine was defunct, with an empty `engine_version` from the health probe in the same call. The control-panel switcher renders that row as a healthy dot with the peer's port, so tapping it sent a direct-port PWA to a dead port, where the service worker serves the cached shell and the boot splash never dismisses. `engine_running` is now reachability and nothing else: the health probe is its only source, which is the only question either consumer is actually asking. The human-readable status output keeps the pidfile as detail, reads it through a new zombie-aware liveness check, and gives an alive-but-not-serving engine its own line instead of claiming RUNNING.
+- **A zombie engine is now reaped on the spot instead of blocking respawn forever.** The gateway signal-probed the pidfile pid for a re-adopted engine (the state after a gateway self re-exec, where no child handle is held), so a defunct engine read as alive indefinitely. The respawn decision never culls an alive engine, so the workspace meta-refreshed its boot splash forever instead of being restarted, and nothing else was going to reap it either, since the gateway is its parent. Liveness now answers and repairs in one call, with a `waitpid` scoped to that single pid: reaped-now for our own exited child, alive for a running one, existence probe for a pid that is not ours. Pid 0 is rejected up front, because `waitpid(0, WNOHANG)` means "any child in my process group" and would let the probe reap an unrelated engine and swallow the exit status its own handle is waiting on.
+- **A failed boot bundle recovers immediately instead of waiting out the 15 second timer.** Opening a direct engine port with nothing listening left the user on "Opening your workspace…" for the full watchdog window, then again after the silent retry, before the tappable recovery appeared, even though the bundle had already reported it could not load. The inline watchdog now also recovers from the entry module's own error event, caught in the capture phase at window so it needs no attribute on the tag and survives the build rewriting its `src`. It is keyed on the event and never on elapsed time, so a slow but working load is untouched and still owned by the timer, and boot handover removes the listener so a module failing later in the session belongs to the application and cannot reload the page under the user. The single automatic retry now also counts the marker the retry puts on the URL, not just `sessionStorage`, so a browser that refuses storage can no longer reload on a loop.
+- **The dark band under the boot splash on iOS standalone is gone.** iOS fills the strip below the layout viewport with the flat base colour of the document canvas, never with the background image, so the base is butted straight against the gradient the splash paints above it. The base was the gradient's 100% stop, but along the bottom edge the gradient has only travelled 62% to 84% of the way there, so the strip read as a distinctly darker band. The canvas is now the gradient's own colour at 70% progress, the mean across that edge, which holds the seam within 4% per channel everywhere along it, on every device, since both progress figures are aspect-independent. The gradient itself is unchanged, and the gateway splash carries the same paint with a test that reads the value out of the `index.html` it already embeds, so the two surfaces cannot drift apart.
+- **The engine restart control has one home per install mode.** A packaged install (the macOS app or the headless tarball) ships its binary and has no source, so its restart only respawns a service, yet System > Overview offered it as "Rebuild & Restart" and named an operation that cannot happen there. Dev keeps "Rebuild & Restart" under Overview > Maintenance, where the restart really does re-run the dev script, and packaged gets a "Restart Engine" row under System > Debugging alongside the other diagnostics. Returning the home rather than handing each site a boolean makes "both render" and "neither renders" unrepresentable, both sites call the same shared confirm-and-restart path so the dialog cannot drift between them, and the settings search index gains a packaged-only gate so a dev search never offers a Debugging row that does not render there.
+## v0.18.3 — 2026-07-31
+
+### Fixed
+
+- **A packaged client notices a new release without being restarted.** The app updater was the one update surface that window resume did not reconcile: the client re-checked the service worker, the frontend build id, the engine build state and the unread set on focus, but never the app release. A 0.18.0 client started at 08:54 ran its single startup check while 0.18.0 was still current, then sat there while 0.18.1 and 0.18.2 shipped, with the next unattended check not due until 14:54. It reported itself up to date all morning even though a manual check from Settings resolved 0.18.2 immediately. The release recheck now joins the other resume rechecks, throttled to one network round trip per five minutes because focus and visibilitychange fire on every window switch, and the background poll interval drops from 6 hours to 1 hour. The throttle stamp is only taken when a check actually reaches the release host, so a resume landing mid install cannot defer the next real check. A guard test pins the resume reconciliation set so a future refactor cannot quietly drop a surface out of it again.
+- **The boot splash stops resizing and replaying itself during launch.** Both splash surfaces sized themselves in rem, but they live in documents with different roots: the app document scales with the user's UI scale preference while the gateway splash is an isolated document at the browser default. At 137.5% scale the same cap painted a 330px mark in the app and a 240px one on the gateway, with the status line 9px further down, so the brand jumped the moment the workspace document took over on the same URL. The mark also rebuilt its reveal at every hop, since the gateway replays it on each 2 second refresh and the app document then played its own on top. Splash geometry is now pinned in px and defined exactly once: the gateway lifts the stylesheet and the mark markup out of the app document verbatim at compile time and overrides only the four things it genuinely needs (a wrapping status line, no idle animation under its meta refresh, a tappable escape link, its own label). A per tab handover marks the mark as already standing, so it is revealed once per boot and then simply stays, which also drops the minimum reveal floor that was holding a finished splash up for an extra second at the end of a slow cold boot.
+- **The gateway build id counts the embedded app document.** With the splash markup now compiled into the gateway, the build id was still derived from the gateway crate and the lockfile alone. An uncommitted edit to the app document rebuilt the binary with a new splash under the running gateway's old id, so the workspace picker's reload status reported no update and kept serving the old splash with no signal. The embedded file is now named once and feeds all three consumers: the rebuild trigger, the dirty diff pathspec and the no git fallback hash.
+- **The gateway escape link renders in the product typeface again.** Consolidating onto one stylesheet dropped the page level font declaration, and the shared sheet scoped the stack to the status line only, so "Back to workspaces" inherited the browser serif. The typeface, size, line height and letter spacing are now declared once on the splash container and inherited by every line on both surfaces.
+## v0.18.2 — 2026-07-31
+
+### Fixed
+
+- **Uninstalling on macOS actually removes the LaunchAgent.** `launchctl bootout` is asynchronous: it returns 0 the moment launchd accepts the request, not when the job is gone. The gateway ignores `SIGTERM` by design, so launchd has to wait out its exit timeout and `SIGKILL` it, and for that whole window (measured at about five seconds) the job is still bootstrapped. The uninstaller took the exit code as the answer and reported "Stopped launchd agent" over a job that was still registered and, because the agent carries `KeepAlive`, still respawning a gateway until the next logout. Both wrappers now decide by observing the domain rather than by reading an exit code, bounded by a timeout that `LUCIDOS_LAUNCHD_TIMEOUT` overrides.
+- **Re-installing over a running instance no longer silently unregisters the service.** The load path booted the old job out and bootstrapped immediately, into a domain that still held it. launchd refused with `Bootstrap failed: 5: Input/output error`, the legacy `load -w` fallback also failed while exiting 0, and the loaded check still saw the old job, so the install reported success. Seconds later there was no job in the domain at all, which meant an upgrade or a `--port` change left the LaunchAgent gone until the next login. The unload now completes before the bootstrap, and a failure to unload is reported instead of being bootstrapped on top of.
+- **A failed stop no longer leads to destructive follow-up steps.** With the failure finally detectable, three downstream assumptions were wrong: the uninstaller killed engines that a live `KeepAlive` gateway just respawns, `--purge` deleted an instance's data while its Postgres was still writing to it, and `--all --purge` deleted the shared runtime out from under the running binaries. Each of those is now skipped when a service could not be stopped, with the manual `launchctl bootout` command printed so the user can finish the job.
+- **The uninstall summary no longer claims a purge it did not perform.** A refused purge printed the same "uninstalled + purged" banner as a completed one. It now names the data that is still on disk and why.
+## v0.18.1 — 2026-07-31
+
+### Changed
+
+- **OpenAI Responses API requests are sent with `store: false`.** Every request now opts out of server-side response retention rather than relying on the API's `store: true` default, so prompt and response bodies are not kept by the provider. Full conversation history is rebuilt locally as `input` on each call, which is what makes the opt-out possible.
+- **Running Lucidos from source is documented as a development guide** rather than as an installation route, so the quickstart stays about installing and a separate develop page covers the source workflow.
+- **The two front doors are gated on serving the same routes.** A piped `curl | sh` fetches its helper libraries back from whatever origin served it, so an origin that quietly stops serving one of them turns the next install into "execute a web page". A route-parity harness now checks production and the release candidate against the same expected route set, and the front-door CI jobs fail when the two diverge instead of only when production breaks on its own.
+- **The Access service token is sent only to the origin that is gated.** The front-door jobs attached the release-candidate credential to every origin, including the public one that does not want it, and reported having sent a token in cases where none applied. The precheck now scopes to any gated origin and says what it actually did.
+- **A front-door check waits for the release assets instead of racing them.** The job downloads the per-platform tarball from the release being tested, and a check dispatched before the upload finished failed on a missing asset after burning its full health timeout. It now waits for the assets within a bounded window, and a genuine download failure is reported as such rather than as a timeout.
+- **A release-candidate origin arriving on a dispatched run is refused.** The candidate front door is owned by the `rc/**` push arm and is payload-checks-only, since the tarballs for an unreleased version do not exist yet. A dispatch naming that origin is a caller error, and absorbing it into a passing run would hide exactly what the job exists to surface, so it is rejected before any fetch.
+- **Dependabot no longer retries a security update that cannot resolve.** The advisory range for `glib` is bounded below the versions this tree can move to, so the update was reopened and failed on every run. The ignore is scoped to that unresolvable range rather than to the package, so a future advisory fixed inside the reachable range still alerts.
+- **`lettre` updated from 0.11.19 to 0.11.22.**
+
+### Fixed
+
+- **The Tailscale IP is detected in the packaged app.** The probe resolved the binary by name, which works in a terminal but not inside a bundled `.app` where the user's shell PATH is absent, so Network access came up without the tailnet address. It now resolves by path across the known install locations, skips the macOS GUI binary that is not a CLI, and logs a detection failure when a real CLI was found but did not answer.
+- **The workspace picker's Network access popover opens on the saved bind.** It previously opened on a default and settled onto the stored value a moment later. The Save control is also sized to the longer of its two labels so the button no longer resizes as its state changes.
+- **The Browser row in the menu drawer follows the experimental in-app browser setting.** The row was always present regardless of the toggle. A single availability gate now governs the drawer row, the settings entry and the navigation path, so the three cannot disagree.
+- **The README no longer uses em dashes.** Thirty-three of them were rewritten as commas, colons, parentheses or separate sentences, with no content added or removed.
+
+### Removed
+
+- **The dead documentation deploy workflow.** Documentation publishes from the maintainer's machine off a workspace trigger, not from CI, so the workflow could only ever fail. ADR 0031 records why deploys do not run in CI: the available credential form carries broader zone permissions than a CI job should hold.
+## v0.18.0 — 2026-07-31
+
+### Added
+- **A packaged update narrates itself, and the download can be cancelled.** Clicking *Update & restart* on a packaged install produced nothing visible for as long as the whole update took (a ~100 MB download, a signature check, a bundle swap and a service restart), then the app vanished and came back. Tauri hands the updater per-chunk byte progress and a download-finished hook; both callbacks were empty, so the entire run was one silent `await`. Every step now reports itself over an `app-update-progress` event and the page narrates it live: *Checking for updates*, *Downloading* (with bytes transferred and a real progress bar), *Verifying*, *Installing*, *Restarting background services*, *Relaunching*, in the toast and in Settings, System, which share one derivation so they cannot disagree. The download is **cancellable**, since nothing is on disk until it is verified, so abandoning it costs nothing and the update stays on offer; the phases past that point withhold the affordance rather than offer a cancel that could not work. A failure names its reason instead of leaving a spinner, and a download whose size the server does not declare shows bytes with no fabricated percentage. The bundle swap also moved off the async runtime worker, so the progress it reports keeps flowing while it runs.
+- **A coding agent no longer asks permission to write inside its own worktree, and its session allows survive a restart.** Every file write a coding agent made raised a permission card, including writes to the isolated worktree the session was created to edit, which is the one place its writes are already contained. Those are now auto-allowed (with symlinks resolved first, so a link out of the worktree is still a real write outside it and still asks). Separately, a session allow the user granted lived only in engine memory, so an engine restart mid-session made the agent re-ask for everything it had already been permitted. Allows are now rehydrated per thread on boot.
+- **An app can open a file from a registered repository in the preview pane.** `lucidos.ui.navigate('file', ...)` previously reached only workspace data paths. It now also accepts the repo-encoded form `repo:<repoId>:file:<repo-relative path>`, read at the clone's current `HEAD`, and the preview binds itself to that repository so the Files panel and the changed-files sidebar stay on the same repo. A malformed `repo:` string is treated as an ordinary artifact path rather than an error.
+
+### Changed
+- **The mobile thread pane header is bracketed by its two drawer controls.** The thread drawer toggle leads the row and the hamburger moves to the far trailing edge, so the two drawers mirror each other across the header and both stay one tap from the conversation: reaching Settings no longer costs a swipe over to the content pane. The menu drawer now slides out from whichever edge its opener sits nearest, so a tap on the trailing hamburger produces a panel from the right instead of one crossing the whole screen. The content pane header keeps its leading hamburger and its left-side panel, and desktop is pinned left, since its panel emerges from the split divider rather than a viewport edge.
+- **A status-filter view offers "See all statuses" when it has rows, not only when it's empty.** Filtering the thread drawer to Needs attention, Review, Running or Drafts narrows it to a handful of threads, and the shortcut back to the unfiltered list only appeared under the "nothing here" message. So the moment one thread landed in the filter, the exit vanished and the way out was back up in the filter control. The same link now closes out the list in both states, at the end of what the user just read.
+- **`make lint` now fails on unformatted Rust, and the tree was swept clean once so it can (ADR 0030).** Formatting was pure convention: `make fmt` existed, nothing ran it, and 424 of 614 tracked `.rs` files (69%, 1,940 hunks) had drifted. A new `lint-fmt` target runs `cargo fmt --all --check` between the ShellCheck and clippy passes, ordered cheapest-first like the rest of the gate, and points a failure at `make fmt`. Because `/harden` Phase 4.5 already routes `.rs` and `Makefile` diffs to `make lint`, every future change picks it up with no further wiring, and nothing was added to GitHub Actions. The sweep landed as its own commit containing no hand edit, so `git blame --ignore-rev` can skip it wholesale. Three decisions are recorded in the ADR rather than left to be rediscovered: there is deliberately no `rustfmt.toml` (on a stable channel rustfmt warns and continues on a nightly-only key, so a config file would read as active while being inert, and the existing toolchain pin already makes stock defaults reproducible); the CLI codegen emitter now formats its own output, because a tracked generated file is squeezed between its staleness test demanding byte-equality with the emitter and the gate demanding rustfmt-cleanliness, and neither `ignore` nor `#![rustfmt::skip]` can exclude it on stable; and this one cargo call carries no `--locked`, against ADR 0020's blanket rule, because `cargo fmt` rejects the flag and resolves no dependencies. One consequence worth knowing: a toolchain bump that moves rustfmt's output now reds the gate, so such a commit may have to carry a reformat.
+- **Uninstalling is a real CI gate now, not a teardown attempt whose result was thrown away.** The front-door jobs ran an uninstall at the end of the run and ignored what it did. Four asserting rungs were added on both Linux and macOS: the advertised `install.sh | sh -s -- --list` delegation actually fetches `<origin>/uninstall.sh` and gets a script rather than HTML; the direct `uninstall.sh | sh -s -- --list` path (the only leg that exercises the dash re-exec) does the same; `--uninstall --all` leaves the data directory intact while booting the agent and deleting the service definition; and `--all --purge` removes the data directory and the shared runtime. The payload sniff in rung 1 covers `<origin>/uninstall.sh` and its self-URL pin too, which closes the client half of a soft-404 on that route.
+- **The release candidate front door moved to its own gated origin.** `/rc` is published in the same Cloudflare Pages deployment as production (a deploy replaces the whole manifest, so a separate RC publish would take the real front door down) and the installer copy served there is pinned at the RC URL, so its helper libraries resolve under `/rc/` instead of silently verifying main's installer.
+- **A release tag now names the real main-line commit locally, and the stripped public commit on the mirror (ADR 0029).** The mirror tag is pushed by SHA, so no local ref is created or clobbered, and only a tag the run actually settled is eligible to be published to `origin`. The release also lands its own bump on live main (cherry-picking when main moved during the build) instead of warning and continuing, which is what previously let a successful publish leave the site serving the previous version.
+- **Em dashes are banned in this repo, enforced at write time and at harden time.** A shared scanner backs a write-time hook and a diff-scoped gate; it is added-lines-only on purpose, because roughly 29,000 existing lines carry the character and a whole-tree scanner would be switched off within a day. U+2013 EN DASH is deliberately not banned, since it is legitimate in numeric ranges.
+- **The docs say what a stranger would actually need.** The quickstart leads with the signed, notarized macOS `.dmg` rather than burying it under the one-liner; install instructions point at `lucidos.dev/install.sh` instead of raw GitHub URLs; `--purge` states what it destroys and stops naming a file piped users do not have; the README no longer claims a bare `uninstall.sh` is a dry run (it uninstalls); and `PRIVACY.md` now discloses the desktop app's update check against GitHub Releases.
+
+### Fixed
+- **The iOS PWA no longer wakes up to a blank panel, or flashes white when an app opens.** Two halves of the same WKWebView compositing problem, both surfacing only in the installed PWA. First, `.content-pane-body` is an `overflow-y: auto` scroll container, so WebKit gives it its own compositing layer, and a backgrounded PWA (the phone locked) leaves that layer frozen on a stale or empty backing texture: the panel is fully rendered and laid out in the DOM, and nothing is on screen. Waking changes no signal, so no render produces DOM changes and only an explicit repaint can un-blank it. The same root cause was already fixed for the thread body; this container was the surviving half. The repaint is now wired to the shared page-resume signal (`pageshow`, `focus` and `visibilitychange`, since iOS often restores a PWA through `pageshow` alone) and fires **on resume only**: a per-view version was tried and reverted, because the recovery nudge writes `scrollTop`, which the mobile header's hide-on-scroll listens to, so every panel switch moved the header and forced repeated synchronous layouts while the incoming view was still mounting. It also skips a mounted app-ui iframe, which composites out of reach anyway and whose pseudo-fullscreen panel would be snapped back to the pane's box by the transform. Second, an iframe with no document yet paints its base canvas, which WKWebView fills **white**, so on a dark theme every app open flashed white until the app's stylesheet and `/api/v1/sdk-prefs.js` (a second request, and the thing that actually applies the theme) arrived. Neither gap is reachable from the host, so the host now covers the frame with an opaque themed surface from mount and crossfades it out on load, with a three-second fuse so a hung frame reveals whatever it managed to paint rather than staying covered forever. An app switch re-covers.
+- **`install.sh` and `uninstall.sh` refuse to execute a fetched payload that is not a script.** Both scripts fetch helper libraries and, when piped, re-fetch themselves, then hand the result to `exec bash -c` or to `.` (source). `curl -f` cannot catch the dangerous case: a static host that answers an unknown path with its landing page returns HTTP **200**, so a missing library became "execute a web page as shell" on the user's machine. All four sites now sniff the payload for a shebang before running it and refuse with a clear message otherwise.
+- **Rapid chat messages keep the order they were sent in.** A second message dispatched before the first had been acknowledged could overtake it, because the ordering slot was claimed at POST time rather than at call time. Sends are now serialized per thread, a follow-up's `MessageReceived` is persisted before its POST is acknowledged, and a lone send is no longer deferred by a microtask.
+- **A link in a previewed file navigates inside Lucidos instead of hijacking the pane.** Opening an HTML artifact renders it into a `srcdoc` iframe, and such a document has no URL of its own: it resolves every relative and fragment href against the *host page's* URL. So a report's own table-of-contents link `#section` resolved to `https://<gateway>/<slug>/#section` and the iframe dutifully loaded the entire Lucidos app into the content pane; relative image and stylesheet refs reached for the app shell the same way. Preview iframes are same-origin, so link clicks are now bridged from the iframe's own document the way keyboard chords already were: an in-page anchor scrolls the preview, a `thread:` link opens the thread, an artifact, app or panel link routes through the host (which is what gives it a content-pane history entry), and an external link opens in a new tab. The document is also stamped with a `<base>` pointing at the artifact's own folder, so its relative assets resolve to its siblings. Markdown artifacts got the same routing: they render into the host document, where a sibling link like `notes.md` resolved to `/<slug>/notes.md` and reloaded the whole workspace through the SPA fallback.
+- **A cross-workspace thread link works on the first click.** Opening `[title](thread:<ws>/<uuid>)` sends the browser to the peer workspace at `#thread=<uuid>`, and the gateway lazy-starts that engine on the same request. The landing page consumed the hash *before* trying to open the thread and gave up after one attempt, so the bootstrap that raced a still-booting engine lost the only record of where the user wanted to go. The second click, hitting a warm tab, worked. The hash is now consumed only once the thread is actually focused, with bounded retries while the peer engine comes up; a thread that genuinely is not there says so instead of retrying.
+- **A registered Python script runs from its real path, not from a copy.** Trigger and app scripts were executed out of a staging copy, so `__file__`-relative state and data directories resolved somewhere nobody had created, and a script would report "no X recorded" for something plainly on disk. Scripts now run in place, with the workspace root as the working directory.
+- **An update that is cancelled at the last moment stays cancelled.** An accepted cancel could lose a race against the download-to-install commit and install anyway.
+- **Screenshots captured inline from an app no longer bloat every read of the thread.** The capture payload is stubbed on every read path rather than only the first, and the model-facing and persisted forms of a tool result are now derived separately instead of one being a copy of the other.
+- **The boot splash stops claiming "Workspace not started" when nothing failed.** The message was shown on a slow probe as readily as on a failed one.
+- **An overflowing thread title is ellipsised in the desktop header** instead of running under the action icons, and it recovers its full width when the pane widens.
+- **Settings, Accounts rows match the Apps and Triggers geometry.** The action buttons bottom-align at any pane width, a long OAuth provider name wraps, and the empty scopes span is gone.
+- **The installer records its instance port marker on a foreground launch too,** not only when it registered a background service, so `--list` reports the instance either way.
+## v0.17.0 — 2026-07-29
+
+### Added
+- **A workspace that cannot boot now says why, instead of spinning forever.** A downgrade onto a database a newer Lucidos had already migrated made the engine exit on every spawn; the gateway respawned it five times, marked the workspace unhealthy, and showed "Workspace starting…" for four minutes before settling on "This is taking longer than expected." The actionable cause lived only in `engine-service.err.log`. The engine now classifies the migration error, builds a message naming the version gap (how many unknown migrations, and the newest one), and reports it to the gateway before exiting. The gateway stops respawning — a version mismatch never heals by retrying — and renders the message on the splash with no auto-refresh and an escape link.
+- **A packaged update is reachable after the toast is dismissed.** The remedy for a too-old app is "install a newer version", and the only surface offering it was a transient toast. Settings → System could never show one in a packaged build: it read the engine's `/health` version, which the engine derives from the repo, so a packaged install reported `unknown` and the comparison always came out false. That surface is now fed from the packaged updater, with a persistent System notice and **Update & Restart** / **Check for Updates** buttons. The update check also runs on every workspace mount rather than only the first of a client process, so a release cut mid-session no longer stays invisible until a full quit.
+
+### Changed
+- **The first-run workspace suggestions are now "personal" and "work".** The name-your-first-workspace chips offered "home" and "team" — "team" implies a shared, multi-user space that Lucidos does not provide, and "home" reads as a location rather than a purpose. The new pair splits on the axis people actually organise by, and neither one over-promises.
+
+### Fixed
+- **A mid-turn message is treated as an interjection, not a plan override.** Every human message injected into a running turn was wrapped in "USER CORRECTION — prioritize this over your current plan", so a bare "status?" read as a course change: the agent answered and ended the turn, dropping the work in progress. The framing now states both readings and defaults to resuming — answer, then carry on in the same turn — while a genuine redirect still overrides.
+- **A re-processed orphan is no longer told to resume work that already ended.** The same framing reached a second caller that builds the *opening* text of a brand-new turn, where "carry on with the work you had in progress, in this same turn" named a turn that had already terminated. Delivery is now explicit at each builder; the new-turn path reports only when the message was sent and carries no resume directive.
+- **A transient construction fault no longer kills a workspace permanently.** Reporting a boot failure stops the gateway respawning, so the catch-all around engine construction turned a Postgres that wasn't ready yet — or a connection dropped during schema init — into a dead workspace the supervisor would otherwise have recovered. Only errors that re-run identically forever are reported as terminal; everything else keeps its retry.
+- **The updater no longer clobbers a version it didn't set.** In a Tauri dev client the update check no-ops to null, which is indistinguishable from "up to date" — assigning it blindly wiped the version read from the engine, and the two fought on every poll. The notice, the button label and the button's action now share one source, so they cannot disagree, and the terminal-failure splash no longer leaves the tab title claiming "Starting…" while the page says the workspace cannot open.
+- **An install without a Lucidos source checkout no longer offers to edit the platform.** A packaged or headless install had nothing in its chat context saying it has no source tree, so the agent claimed it had read engine source, spawned a coding-agent session that *succeeded*, and told the user to Apply and rebuild — the session had branched the user's own workspace git and called it platform source. The spawn path now refuses at both the tool and the session, and the system prompt splits into two variants selected by whether a checkout is actually present, so the model learns the limit in-turn instead of narrating a capability it doesn't have. The refusal is scoped to *local* spawns: routing platform work to another workspace whose engine does run from a checkout stays available, and tests pin both directions.
+## v0.16.0 — 2026-07-29
+
+### Added
+- **Provider-native web search** — `web_search` now resolves over the configured provider set instead of a single hardcoded backend. Adds a `WebSearchProvider` trait, a fallback chain, and three backends (Anthropic, OpenAI, Vertex/Gemini grounding), each pinned to a model its own provider actually serves. Prompt and result formatting are shared across backends, and `max_uses` is decoupled from the chain. (ADR 0023)
+- **Per-model context windows** — every builtin model now declares a *verified* context window, editable in Settings, and that value drives the context-trim budget instead of a guess derived from the model id. The reported token total counts tool schemas, and truncation is surfaced honestly as *trimmed*. Bare Claude rows stay on the prefix map since they send no 1M beta header.
+- **GPT-5.6 (Sol / Terra / Luna)** — added to the chat model picker and the Codex coding-agent `/model` picker, with the `max` reasoning tier enabled for the family. Max effort is validated server-side and filtered by the selected model in the picker.
+- **Claude Opus 5** — added to both the chat and Claude Code pickers and set as the default model (via `cc-settings.json`).
+- **Built-in model-provider proxies** — `vertex`, `openai`, `openrouter`, `anthropic`, and `local` are available as proxy targets out of the box, so an app can call a model provider without hand-registering it in `apis.json`. Bearer credentials get the Anthropic OAuth beta header injected automatically.
+- **Packaged system-knowhow** — `system-knowhow/` ships as the 7th runtime resource and is resolved at runtime via `LUCIDOS_SYSTEM_KNOWHOW_DIR`, so a packaged install has the same authoritative reference docs as a source checkout.
+- **Codex parity work** — Codex sessions stream reasoning summaries, load `CLAUDE.md`, validate the effort tier, surface plan-tool progress over the app-server protocol, and map slash commands to playbook files.
+- **Chat threads auto-resume after a version switch** — a chat *or* trigger thread interrupted by *Switch to new version* now resumes on the next boot, matching what coding-agent threads already did, instead of leaving a device-attributed abort and a manual Continue button. A dedicated boot pass handles them (the switch teardown always lands a terminal event, so the orphan sweep structurally can't see them), and the shared cause gate now requires an engine-shutdown cause so a user Stop is never mistaken for a switch.
+- **Stranded-Apply visibility** — a frontend Apply that can't reach the served dist is now surfaced instead of failing silently, and the engine warns once when the dist it's serving is pinned to a coding-agent worktree.
+- **Zero-file Apply refusal** — Apply is refused server-side on a change whose branch diff has gone empty, and such a change is reconciled (without discarding its siblings) rather than left blocking the panel.
+- **Compose-clear announcements** — every clear of the compose box is announced to other devices, whether it came from an ordinary send or from answering a question card.
+- **App Store Connect API key notarization** — the release build prefers an ASC API key over an Apple ID app-specific password when one is configured, so notarization runs cleanly headless.
+- **One source of truth for the release version, enforced** — `RELEASE` is the only place the version is written by hand; everything else derives from it (the build reads it, the release flow rewrites `install.sh`'s baked constant, the site publisher pins the landing page's download links at publish time). A new offline suite scans the tree for a version literal nothing keeps in sync, pins both halves of the `install.sh` mechanism so deleting the substitution fails immediately rather than at the next bump, and flags prose that announces which release line the project is on. Historical narration stays exempt — the changelog, plans, and ADRs are correct precisely because they don't move. Phase A runs the suite against the worktree after the bump, so a stale literal fails the release instead of reaching the mirror.
+- **Resumable notarization** — the release build submits with `--no-wait` and writes a resume handle (submission id, DMG path + sha256, source commit, submit time) to disk *before* it starts polling, so losing the waiting process costs a poll instead of a full rebuild. A build-grade run auto-resumes when a handle matches the DMG on disk, `--adopt-submission <uuid>` picks up a submission that's already in flight, stapling is idempotent, and the handle is cleared once staging succeeds. Backed by a pure, offline-testable state library (`scripts/lib/release_notarize.sh`) with atomic writes and a checksum gate that refuses to resume against a changed DMG.
+- **A re-fold on unchanged bytes no longer burns a notarization submission** — one release spent 16 Apple submissions in two days, several of them on byte-identical compiled input, because *any* movement on `main` forced a rebuild + resign + resubmit. The build now fingerprints only what actually reaches the bundle — the seven compiled-input paths (`crates`, `Cargo.lock`, `Cargo.toml`, `packages`, `package.json`, `package-lock.json`, `system-knowhow`) — and Phase A consults that gate before rebuilding, reusing the already-notarized DMG when every hash matches. A docs-, plans-, or `scripts/`-only re-fold is now free. The fingerprint deliberately excludes the driver scripts themselves (a one-word comment edit in `build-dmg.sh` was enough to flip a coarser hash and re-break the very case this fixes); a separate recipe fingerprint tracks those, and both are recorded in the staging manifest. Also fixes a concurrent-poller miscount where a resume's own subshell was reported as a second poller.
+- **Shellcheck gate on every shell script** — `scripts/lint-shell.sh` + `make lint-shell`, wired into `lint` so `make check` covers it. Discovery is `git ls-files '*.sh'` rather than a hand-written path list, so a script added in any directory is gated the day it's committed. Fails closed on all three ways it could be disarmed (no shellcheck on PATH, empty discovery, a silently-skipped file). The sweep that brought the tree clean fixed the findings at the source rather than suppressing them — the `SC2155` masking bugs below were found by it.
+
+- **A release no longer waits on Apple** — notarization verdicts have taken anywhere from ten minutes to fourteen-plus hours, and a wedged notary used to hold the whole release. `--defer-notarization` stages the DMG *unstapled* (recorded as `notarized: false` in the staging manifest) and publishes with a "notarization pending" banner on the release body, so the in-app update, the headless tarball and `curl … | sh` — none of which touch Gatekeeper — ship immediately, while the download button deliberately stays on the previous notarized DMG. Against a submission already in flight it stages without polling at all, which rescues a Phase A stuck on a slow verdict with no rebuild. `--attach-notarized` then staples, swaps the published asset in place, removes the banner, and fires the clean-machine DMG gate against the published tag. (ADR 0027)
+
+### Changed
+- **The release candidate is the published artifact** — the rc branch is now a pre-stripped, validated tree that gets *promoted* to `main` rather than rebuilt at publish time, so the commit CI gates is byte-identical to the commit that ships. Adoption requires a parentless candidate (a candidate carrying ancestry would push every reachable object while the private-data scan only inspects the tip tree), and the promote step re-asserts that at the irreversible push. The exclusion list, the `WORKSPACES.md` stub, and the fail-closed private-data scan are now single-sourced. (ADR 0024)
+- **`bash_output(wait_secs)` actually blocks** — the drain now waits the full requested window (server-side) rather than returning immediately, and reports a real elapsed clock. A user message cuts the block short so their follow-up isn't stuck behind it.
+- **Background tasks report their true exit status** — the completion summary no longer masks a failing pipeline stage; `pipefail` semantics are documented (rightmost failing stage wins), `128+signum` exit codes are decoded, and a trigger script killed by a signal is named as such.
+- **Accent palette** — `--accent-yellow` retheming to a muted sand, with the "notable state" role split off into its own `--accent-notable` token. Dead `--initiator-*` tokens dropped.
+- **Client build id** — the frontend shows the client's *own* build id instead of the engine's frozen CalVer, and launch binaries are published per build variant rather than through cargo's shared uplift path. (ADR 0022)
+- **Dev stack refuses worktree pinning** — a dev stack can no longer be launched from a coding-agent worktree, in either the shell path or the gateway; the opt-out no longer buys a machine-global gateway. (ADR 0021)
+- **Picker tooltips** — native `title` tooltips replaced with the shared `data-tooltip` system, keeping the status dot's accessible name intact.
+- **Rules layout** — the monolithic scripts rule split into `dev-runtime` and `build-release`, with path-scoped frontmatter so rules load conditionally; env-var reference moved out of `CLAUDE.md` into a lazy-loaded skill.
+
+### Fixed
+- **The packaged macOS app could not talk to its own backend** — upgrading to Tauri 2.11 broke every webview→Rust IPC call in the shipped bundle, and with it native notifications, window dragging, and the durable device id. The packaged window loads over the gateway rather than `tauri://localhost`, which Tauri treats as a *remote* origin; 2.11 tightened the ACL so a remote origin gets no permissions unless a capability names it explicitly. Every command failed the ACL check, the startup health probe never completed, and the reload watchdog re-loaded the WKWebView every 60 seconds forever — a loop that could not possibly help, since the origin's permissions don't change on reload. Fixed with an app-level ACL manifest (`allow-app-ipc`) granting the gateway origin its permissions, a watchdog that backs off when reloading demonstrably isn't the cure, per-command IPC health tracking, and an honest report to the engine log when the bridge is down. (ADR 0028)
+- **New installs get persistent notification banners** — macOS assigns every newly-authorized app the *Banners* alert style, which auto-dismisses after about five seconds, so a Lucidos notification could vanish before it was read. The bundle now declares `NSUserNotificationAlertStyle = alert`, the same first-launch default request Chrome and iMovie ship, so a fresh install starts on the sticky *Alerts* style. It is only a default: once macOS has created the app's Notification Center entry, the user's own choice in System Settings wins permanently.
+- **A cron slot no longer double-fires after a restart** — catch-up re-ran a slot that had already run, and the recorded run time is now resolved in Rust rather than in SQL.
+- **The repositories picker no longer sticks on a cancelled read** — an aborted fetch was latched as a permanent error state instead of a transient one.
+- **Codex can write to the workspace again** — the sandbox denied `EPERM` on `data/` because the writable root was derived from the git common dir rather than the actual workspace data directory. The root is now canonicalized, and a `data` symlink may *relocate* the sandbox hole but never widen it.
+- **An auto-resume after a version switch no longer wedges the thread** — a confirmed resume attach was being classified as stale, and a failed continuation left no recovery arm. Losing the spawn race to a live session no longer settles it.
+- **The real published front door is tested in CI** — a job now runs the exact advertised command (`curl -fsSL https://lucidos.dev/install.sh | sh`) against the live origin rather than a checkout, with the origin parameterised so an RC can be gated the same way. The installer also rejects a soft-404 HTML payload before sourcing a fetched helper lib, instead of executing a web page.
+- **Autocorrect on prose text fields** — a JSX `autocorrect="off"` inverts to *on*; the shared stamp now owns the attribute.
+- **The focused pane paints through the reclaimed macOS title-bar band** instead of stopping short of it.
+- **Rust toolchain pinned** (1.94.1) so a "clean" build stops drifting between machines.
+- **The `curl … | sh` install one-liner works again** — the baked `LUCIDOS_DEFAULT_VERSION` fallback in `install.sh` had been stranded at `0.14.0` while `RELEASE` moved on, and it is precisely the value a *piped* install resolves (no checkout ⇒ no adjacent `RELEASE` file to read). Since v0.14.0 predates the headless tarballs, the advertised one-liner was not installing an old version — it was 404ing. The release flow now rewrites that constant in the same step that bumps `RELEASE`, failing loudly if the substitution doesn't match, and a guard test asserts the two can never diverge by hand.
+- **…and it works on Linux too** — a real clean-machine test (fresh `ubuntu:22.04`, the exact command the README and landing page advertise) found two more blockers, neither visible to CI, which runs the installer from a checkout and so never takes the piped-dash path. On Debian/Ubuntu `/bin/sh` is dash, so the bash re-exec guard re-fetched the script from `LUCIDOS_INSTALL_URL` and exec'd *that* — discarding the copy the user piped and re-resolving its own baked version, so piping lucidos.dev's 0.15.0 installer actually installed 0.14.0. The guard now pins the resolved version across the re-exec (an explicit `LUCIDOS_VERSION` still wins) and the constant moved above the guard so both branches read the same value.
+- **A wedged coding-agent thread no longer needs an engine restart to clear** — membership in the session table was treated as liveness by every reader, but only the run loop ever set `process_exited`. A run future *dropped* rather than completed (cancelled caller, aborted task) left the entry behind with that flag false and its receiver gone. One such phantom fooled three readers at once: worktree cleanup logged "live agent session active" forever, the chat fast path sent follow-ups into a dead channel, and the resume guard refused every follow-up with "A coding agent is already running for this thread". Liveness is now derived (`!process_exited && !msg_tx.is_closed()`), and a drop guard marks the session dead on every abnormal exit path.
+- **Apply's merge session survives the browser disconnecting** — Tier 2 awaited a whole coding-agent merge inline, so the session's lifetime was the caller's HTTP future. iOS Safari dropping the connection 72 s into a conflict resolution killed the merge mid-tool. Tier 2 now detaches through the same guarded spawn Tier 1 and Tier 3 already use and answers immediately with a conflict result. Hardening review caught two consequences of the detach and fixed both: the orphan-sibling reconcile (which stops a stale pending change on another branch from blocking Archive) now runs inside the spawned task, gated on the change actually reaching `applied` so a failed or handed-off merge can't discard a newer sibling's work; and the drop guard no longer claims an abort for an entry it doesn't own.
+- **An interrupted thread keeps its red status dot** — an interrupted Lucidos Agent thread kept its `failed` status; an interrupted Claude Code / Codex thread silently lost it. Both channels emit the same abort, so the abort was never the problem — what lands *after* it was. The restart teardown emits the boundary abort while the subprocess is still alive, and the duplicate-terminal suppressor doesn't stop the activity stream, so tool results still arriving milliseconds later (~13 ms in the observed trace) hit the "bump back to running" arm and overwrote the verdict. The chat mirror of the same bug: the shutdown sweep emitted an abort with no request id, so the loop's own cancel couldn't be paired with it and the phantom cancel walked the red dot back to idle — `thread_summaries.status` is last-write-wins, which the old docstring's "abort takes precedence" claim only held for the exchange label.
+- **A test run can no longer kill the machine's live dev engine** — the host-pid kill guard read caller-owned state in both its arms, so any caller could switch it off. `ports_test.sh` does exactly that as part of being a well-behaved sandboxed test (it unsets the host/frontend pid vars and points `HOME` at a temp dir), which left the live engine invisible to the guard, matching `*lucidos-engine*` on cmdline, and reachable by the stale-port reclaim. It died twice on 2026-07-28. Two additive arms were added — the guard gains reasons to refuse, never reasons to permit — and the test suite is now structurally unable to signal the host. (ADR 0025)
+- **Silently-swallowed command failures in the workspace scripts** — nine `SC2155` instances of `local x="$(cmd)"`, where the exit status is `local`'s rather than the command's, so a failing `date` / container lookup / database-URL resolution passed silently. Split into declare-then-assign. Three globals with zero readers anywhere in the repo were deleted rather than suppressed.
+- **`CONTRIBUTING.md` describes how contributing here actually works** — the guide read like a conventional upstream repo, so a contributor had no way to know this repository is a *published mirror*: `main` is one parentless commit force-pushed per release, successive releases share no history, and a PR is *imported* (squashed onto the previous tag with a `Co-authored-by:` trailer, then closed with a link to the release that carries it) rather than merged. It now says so up front, including what to do with a fork whose ancestor no longer exists, and notes that CI never runs on PRs so contributors should report what they ran locally. Two documents separately announced that Lucidos was "currently on the 0.9.x line" — a claim nobody re-reads at release time; both now point at the newest tag.
+- **A first-run install no longer races the PostgreSQL init server** — a clean-machine install could die at "Creating shared PostgreSQL database" with `psql: connection to server on socket … failed`, seconds after the readiness probe printed `ready!`. The pgvector image's entrypoint runs `initdb` against a *temporary* server and stops it before starting the real one; a single `pg_isready` over the unix socket is answered by that temporary server, so the probe could succeed inside the window and the next command would find the socket gone. A warm volume skips `initdb` entirely, which is why only a genuinely clean machine ever hit it. The probe now runs over TCP (the init server doesn't listen on TCP at all) and requires three consecutive successes, resetting if the server stops answering.
+- **A clean tree no longer aborts the release** — the private-data guard read `git grep`'s status with a bare `out=$(…); rc=$?`. The release script runs under `set -Eeuo pipefail` with an ERR trap that exits, and `-E` propagates that trap into the command substitution — so rc=1, which is the guard's *clean* "no matches" case, killed the subshell before the status was ever classified, and a spotless tree surfaced as "the denylist could not load". The guard was inverted: the cleaner the tree, the more reliably the release aborted. The status is now read in a condition context, where neither errexit nor the trap sees it. The existing suite ran under plain `set -u`, which is exactly why it stayed green while the release failed; new cases re-run the guard in a child shell wearing the release script's own flags, and pin that the trap must keep reaching subshells (bash does not fire a parent's ERR trap for a failing `( … )` block, and every build step is one).
+- **Private data no longer leaks into the system prompt** — browser-login domains and the home directory are kept out of the chat system prompt, home-rooted paths are abbreviated in LLM-visible tool output and in coding-agent folder-resolution errors, and the release guard's private-data denylist moved out of tracked source (fails closed on an unterminated block or a grep error, and keeps git's stderr out of the hit list). The tracked heuristic is now shape-only and names nobody: contributor names moved into a separate exceptions list that denies each name outright and enumerates its legitimate attribution sites — strictly stronger than the old pattern, which had been walking straight past a bare personal GitHub org in CI config.
+- **Compose drafts** — a draft whose text was already submitted is dropped rather than resurrected; an answer never consumes an image-bearing draft; a draft the server still holds is never superseded; only a server report proves what the server holds; the pending flag is held until the last write settles.
+- **Agent vision** — explicitly-requested and injected images stay in the model's vision instead of being stripped by the context trimmer, with a bound on how many stay pinned.
+- **Background-task drain internals** — closes the lost-wakeup window in the `bash_output` injection wake, makes the finish wake durable for every concurrent waiter, reserves the pending-injection count before sending, scopes the injection-drain decrement to its own registration, reports the real wait when a task is evicted mid-drain, and accounts for buffer-cap loss in the truncation marker.
+- **Version status** — an older on-disk binary (engine *or* gateway) is no longer read as a *new* version; an abbreviated same-commit id counts as not-older; the self-heal give-up is announced once instead of every tick; the frontend announces a new version only when one exists.
+- **Changes / Apply** — the engine rebuild starts on every apply path, never fires for a non-Lucidos-source change, and the post-apply refresh runs only for the accepted `ChangeApplied` (not a suppressed duplicate), with the decision logged.
+- **Thread type survives a continuation** — `ContinuationStarted` no longer relabels a chat thread as a coding-agent thread, threads already flipped are repaired on boot, and the channel gate is documented. A resumed *trigger* thread now continues on its own channel instead of having its source rewritten to `chat`, resolved through a shared channel decoder that also accepts the legacy alias.
+- **Question-parked threads survive restart** — preserved across every abort path, resumed on their originating channel when answered, with no stale restart reminder posted on resume.
+- **Question dividers** — an answered question divider re-anchors below a child-completion card, and only an *unresolved* divider is exempted from the child-completion redirect.
+- **Orphaned Thinking marker** — a Thinking marker left stranded when a child-thread completion takes the turn is now dropped, with the Thinking-only finalize folded into the shared pending-step resolution rather than living as a special case.
+- **Notifications** — the app-icon badge is re-asserted rather than diffed; the badge and unread list are single-sourced; the unread set reconciles after a cold-start mark-read; toasts stop gluing the notification title onto a structured body's first line.
+- **Credentialed proxy** — `Sec-Fetch-Site` is authoritative in the guard (superseding the reverted `x-forwarded-host` reconstruction), and the gateway strips inbound `x-forwarded-host`.
+- **Email** — network phases are bounded (IMAP 120s ops, SMTP 80s send under a 120s client budget) so a send surfaces the real error instead of a 10s client timeout; duplicate sends are guarded; the confirm modal remounts when a different draft replaces the open form.
+- **Stop & queued messages** — Stop returns queued messages to compose instead of re-running them, awaits in-flight queued-message removal (trash-then-Stop race), and excludes mid-trash messages from the queue clear.
+- **Mobile / iOS** — welcome suggestions stay tappable while composing, the wider header reserve is scoped to the brand row, `viewportIsMobile` self-corrects so an iOS PWA can't strand the desktop layout, and a stale entry bundle no longer wedges boot.
+- **Coding-agent recovery** — conflict resolution survives a stray-kill auto-recovery with a session-branch-keyed hand-off; an app coding-agent resume reuses its surviving branch instead of failing on `-b`; the restart auto-resume race is closed by subscribing before backfill, with an orphaned-continuation startup safety net.
+- **Boot** — the embedding model loads in the background and never blocks boot, with the memory rebuild and extraction guarded against the empty-embedder window.
+- **Todo panel** — strikethrough applies to the item text rather than the row chrome, and abandoned items aren't struck through at all.
+- **SDK bundle** resolves from the checkout instead of a fixed hop count above the binary.
+- **LLM serialization** — tool results are ordered before user text in the OpenAI-compatible serializer; Gemini grounding is pinned to the global endpoint.
+- **Intent sub-loops** surface their narrative text to the parent thread.
+- **Security & dependencies** — `serde_with` 3.17.0 → 3.21.0 (GHSA-7gcf-g7xr-8hxj) and an npm audit fix for the postcss path-traversal advisory (GHSA-r28c-9q8g-f849).
+- **CI & tests** — repaired the docs strict build and the Linux/aarch64-darwin release-tarball jobs; guaranteed the gitignored `VERSION` on all `build.rs` paths; the e2e database is rebuilt from zero on every run; 19 clippy lints cleared so the warnings-as-errors gate passes; build-lock tests no longer flake on a forked child's inherited fd; the channel decoder is pinned to its serde representation; every project's failure artifacts are kept for the whole browser run; the e2e worktree prune stays reachable on every cleanup path and the pre-kill hook reports its real exit code. The release scripts gained 66 new offline assertions covering the notarize resume handle and the credential-resolution path, plus 45 more for the compiled-input fingerprint gate, the re-fold reuse decision, and the staple-time DMG hash pin.
+
+### Removed
+- The card-less chat-redesign sandbox page (`chat-redesign.html`).
+- Dead `--initiator-*` theme tokens.
+## v0.15.0 — 2026-07-03
+
+### Added
+- **New-version / Switch flow** — Apply now auto-builds the engine in the background and splits *build* from *switch*: a unified "new version available" surface, an `ENGINE_BUILD_ID` + `/engine/version-status` endpoint, cause-gated resume that preserves pending questions, and switch-as-respawn with boundary events deferred to teardown. The Apply button reads **Apply\*** when a restart is required; the brand badge shows a "!"/spinning build icon instead of a count; version toasts defer on dismiss with a persistent update badge; a hint toast explains when a frontend-only Apply is deferred to Switch. The engine also surfaces when its source is *behind* the running binary and self-heals a failed background rebuild; the pending-Rebuild toast only shows when no switchable binary already exists.
+- **Keyboard navigation of thread content** — arrow-key scrolling and turn-by-turn traversal (Cmd+Up/Down), Enter to collapse/expand the navigated turn, a unified deep-link "navigate to element" + chevron-scroll model with perceptible deceleration, and a persistent deep-link focus marker ("focus stick").
+- **Focused-pane cue** — the focused pane's header segment gets a subtle lighter-blue wash (extended over the divider seams) so the active pane reads at a glance, mirrored on the mobile active-pane dot. (The earlier header focus *pill* was tried and dropped in favor of the wash.)
+- **Animated compose height** — the prompt textarea animates its height (and position) on send and on draft↔draft / draft↔blank compose-view switches, with in-flight/rapid-switch frames cancelled cleanly.
+- **Thread drawer overhaul** — the compose-draft tooltip becomes a ⋯ menu (Delete + Info), fully keyboard-drivable; a keyboard shortcut expands/collapses the focused thread's sub-threads; single-focus (aria-activedescendant) model.
+- **Remote access & Linux install** — `install.sh` downloads a prebuilt cross-platform headless tarball by default and registers the gateway as a user service; opt-in TLS (`--tls-cert`/`--tls-key`) and network bind (`--bind` via `network.toml`); a user-facing `scripts/run.sh` entry point; `build-headless.sh` + CI matrix for the Linux tarball; post-extract execution smoke + runtime-dep preflights.
+- **Self-skeletonizing loading system** — skeleton primitives with a fill helper, tree-shaped skeletons for files/repos, self-skeletonized list rows, drawer search, and triggers; retires the generic `ListSkeleton`.
+- **Per-thread model memory** — each thread remembers its last model + reasoning effort; coding-agent threads are pinned to their first account.
+- **Native dock badge & notification actions** — a nudgeable dock-badge loop driven by notification SSE, an on-demand unread-total endpoint, and `[Open]`/`[OK]` action buttons on in-app notification toasts (web links in toasts are now clickable).
+- **Pane-anchored toasts** — each toast is pinned to and centered over the pane it appeared on.
+- **`--font-size-*` type scale** — host + app-iframe type-scale tokens, with all font-size literals migrated onto them.
+- **Per-draft compose state** — compose-view dropdown selections and attachments persist per draft in the DB.
+- **macOS menu-bar mode** — the desktop client goes menu-bar-only when its windows close.
+- **Durable native device id** — the packaged desktop app persists its device id natively, so reinstalls keep a single device instead of spawning duplicates.
+- **Trigger last-run status** — triggers surface last-run OK/failed status and a build-on-top pointer.
+- **Codex key auto-detect** — the engine auto-detects an OpenAI key from the Codex CLI auth file; the chat agent is nudged to emit clickable `[Name](app:<id>)` app links.
+- **Graceful memory degradation** — the engine boots with memory degraded (instead of failing) when the embedding model can't download, with an actionable error.
+
+### Changed
+- **Apply/Discard** — the Diff button is permanently pulled out of the split button; frontend-only Applies propagate to peer dev workspaces and re-snapshot the served frontend without a respawn.
+- **App-name links** — stopped auto-linking bare app-name mentions in chat/notifications in favor of the explicit `[Name](app:<id>)` form.
+- **Plugin setup threads** — setup instructions moved to knowhow with a short seed message.
+- **Navigation focus marker** unified across chat, settings, and plugins (drops the entrance flash, fades on any user action).
+- **Lockfile determinism** — builds use `npm ci` and `cargo --locked`; the `lucidos` CLI is bundled as a runtime resource in the packaged app.
+- **Vertex** — `eu` multi-region added as a prefilled region option.
+- **Spacing & type consistency** — content-pane padding unified onto a `--space-*` scale (Files tree + cards are deliberate carve-outs); prompt/confirm modal font sizes normalized with a codified no-magic-font-size rule.
+
+### Fixed
+- **Security** — closes a CRITICAL CVE via wasmtime 25→36; blocks cross-origin browser-proxy requests; hardens `http_request` credential redirects; `git2` 0.20.4 + safe Rust security bumps; scrubs credentials from the packaged env.
+- **Vertex Gemini 3 reasoning** — uses `thinkingLevel` + `includeThoughts` so reasoning stops leaking into the answer, and never sends `thinkingBudget` to Gemini 3 (clamps `thinkingLevel` per model).
+- **Coding-agent reliability** — stops a Fable false stale-resume from spawning duplicate CC processes / deleting live worktrees; an external watchdog kills a wedged coding-agent subprocess on recovery; preserves genuine CC API-drop failures instead of fabricating "Unknown error"; recovery reuses a worktree only when it's on the branch being recovered; a startup lease serializes restart recovery; `CLAUDE_CONFIG_DIR` is pinned per session so a mid-flight provider toggle can't strand a resume; reads CC `thinking_delta` from the correct field.
+- **Packaged runtime** — packaged PATH floor + agent-binary detection (psql on the coding-agent PATH); resolves user-installed tools under the service-manager minimal PATH; boot preflights (git, PG client, embedding model, required resources) with actionable warnings; Docker entrypoint aligned to the PG18 binary path.
+- **Changes/Archive** — reconciles an orphaned pending change that blocked Archive; gates apply-time reconcile on Applied and advances Apply-All on discard; the Apply-All merge-conflict toast no longer dangles.
+- **Streaming resilience** — bounds the streaming send-header phase so a stalled LLM connection can't hang a turn; idempotent thread pin/unpin so a double-submit can't 409.
+- **iOS/mobile** — repaint scroll-nudge no longer cancels momentum scroll; reliable scroll-to-top; boot-splash covers the iOS safe-area strip; mobile header titles centered without overlapping leading icons.
+- **Chat** — repaired leaked inline tool-call XML in the agentic loop; the title model no longer executes instruction-style prompts; the agent is told its reasoning isn't shown to the user and is forbidden from claiming a repeated action without a fresh tool call; the coding agent must not ask post-work confirmations that block Apply (scoped to Apply-based prompts).
+- **Cancel** — releases a stuck "Canceling" state when a running-turn cancel is superseded into waiting-for-answer, and clears the awaiting-bit on cancel rollback.
+- **Build lock** — fails open (rather than reporting SkippedLocked) when the checkout is unresolvable; scoped to engine-triggered builds.
+- **Drawer / notifications** — restored the normal drawer scrollbar and dropped the right-inset selection gap; channel/error tags keep their dark-mode hairline and red outline; notifications panel toolbar padding aligned with the plugins panel.
+- **Toast / focus** — collapsed-pane toasts recenter over the surviving pane; toast focus/tab handling hardened for touch and overlays.
+
+### Removed
+- Retired the generic `ListSkeleton` component (replaced by the self-skeletonizing system) and a stale `crates/lucidos-app/package-lock.json`.
+## v0.14.0 — 2026-06-29
+
+### Added
+- **Network access UI** — configure the engine/gateway network bind from Settings and the workspace picker; durable scope-split bind (gateway machine-global, engine per-workspace), with click-to-fill of the detected Tailscale IP.
+- **Plugin Modified badge** — the Plugins list now shows a per-plugin *Modified* state derived from the install commit, and warns before an update would overwrite local edits.
+- **App-icon unread badges** — native dock-icon badge with the aggregate unread total, per-workspace PWA app-icon badges, and gateway-aggregated per-workspace counts.
+- **Cross-device native notification dismiss** — dismissing a notification on one device removes the delivered native banner(s) on your other desktop devices.
+- **Documentation site** — mkdocs-material docs site with anti-drift transclusion and deploy-on-release.
+- **Public-repo RC gate (CI)** — clean-machine source install + signed-DMG verification on fresh macOS/Ubuntu runners before publish.
+
+### Changed
+- **Vertex AI region** moved into the Settings → Providers section.
+- **OAuth account resolution** — provider tokens now resolve to the newest connected account; the Accounts UI shows a created date per account.
+- Sleeker Network access modal; skeletons fill the full content height; notification-detail title sized to match the list row.
+
+### Fixed
+- **Security hardening** — engine API now defaults to a loopback bind (opt in to all-interfaces via `LUCIDOS_BIND_ALL`); gateway control plane is authorized against app iframes; WASM signer execution budget + credential-leak scrubbing; scoped credential-URL matching.
+- **Networking** — retain loopback when binding a specific address; bounded gateway boot-splash escape; route us/eu Vertex multi-region locations to the `rep.googleapis.com` host.
+- **Workspace storage** — workspace-scope *all* browser storage (theme, device-id) with an idempotent namespacing override and a regression guard.
+- **Frontend recovery** — recover gracefully from navigating into an unreachable workspace; gate the picker skeleton behind a 300ms delay to stop the fast-load flash.
+- **iOS PWA** — fix the blank thread body (compositor paint loss) via a scroll-nudge + forced layout flush.
+- **Notifications** — reliable native desktop banners with durable deeplink; the agent is now aware it's running in the Tauri desktop app.
+- **Cross-platform install** — OS-aware sleep/clamshell prevention so Linux source installs run clean.
+- Muted-gold light-mode warning toast.
+## v0.13.1 — 2026-06-28
+
+### Fixed
+- **Toast in light mode** — toasts read gray on a light background; now use a white fill so they render cleanly.
+## v0.13.0 — 2026-06-28
+
+### Added
+- **Capability-parity manifest + grouped agent tools** — a single capability manifest is the source of truth for the agent's tool surface, with Rust→TS codegen keeping the LLM tools, the `lucidos` CLI, and the JS SDK in sync. Many narrow tools are consolidated into grouped tools — `triggers`, `trigger_groups`, `preferences`, `events`, `changes`, `mcp`, `plugins`, `threads`, `thread_queue`, `memory`, `manage_models`, `manage_repositories`, `env_vars`, `notifications`, and an `apps` domain — each gaining matching CLI subcommands and SDK methods.
+- **Agent-configurable settings** — the agent reads and changes user preferences via `get_preferences` / `set_preference` (theme, language, timezone, push, welcome message, chat model, reasoning effort, UI scale, font, …), validated against one catalog and routed through a single write chokepoint so per-device scope and live-apply are handled automatically. The narrow `set_language` / `set_timezone` / `enable_push_notifications` tools fold into `set_preference`. A `manage_models` tool adds/enables/disables/removes chat models in the picker. Language + timezone also get human controls under **Settings → System → Locale** (with IANA timezone validation). The command guard stays human-only.
+- **Dedicated Plugins panel** — browse, install, and update plugins with an "Installed only" filter (default shows all), controlled-vocabulary categories, plugin updates appliable from the list, and provenance-tracked auto-registration of plugin triggers. Installed/uninstalled files are git-committed into the workspace repo.
+- **Coding-agent reasoning in the timeline** — streamed model reasoning is captured as `CodingAgentThoughtStreamed` and rendered as a live "Thinking" step with full persisted text.
+- **Loading-state overhaul** — a `ListSkeleton` primitive plus skeleton-by-default loaders, a 300/500 minimum-visible standard (retiring `DelayedSpinner`), and skeleton + fade-in + prefetch for the thread-open transition; loaders crossfade out via `LoadingFade`.
+- **Settings → System → Debugging** panel with a default-off perf-instrumentation toggle; thread-open render/paint timing is instrumented and flushed via a batched `/internal/client-logs` telemetry endpoint.
+- **Thread overflow (⋯) menu** with a separate pin icon — Archive and thread Info (moved out of the hover tooltip) live in the menu; Archive first, Info last.
+- **SDK `ui.toast` + `ui.prompt`** host-bridged components for apps.
+- **Fira Code font option** with programming ligatures.
+- **`get_backup_status` tool + backups knowhow** — timezone-aware backup scheduling, agent-readable/writable backup settings, and persisted run history.
+- **Targetable memory entries** — entry IDs surface in the `[Long-term Memory]` block and the Memory settings view (copyable), plus `correct_memory_by_id` to delete/replace one memory by id.
+
+### Changed
+- **Welcome screen redesign** — compact "Hi, there!" hero with a chevron suggestion carousel (one idea at a time), conversational clickable starter suggestions that prefill the prompt, and a top-right dismiss pill.
+- **Toast redesign** — elevated surface with a thin per-type category-colored border on a plain theme background, clean amber warning in light mode, full-width centering, per-theme tint strength, and the "New version available" toast replaced by the refreshing spinner.
+- Files panel: "Drop or click to import" pinned to the top-right of the source-switcher row; Expand/Collapse-all removed; empty repo Files toolbar no longer rendered.
+- Settings: Animation speed moved from Appearance to System → Debugging; Environment Variables indexed in search; redundant subpanel titles dropped.
+- Notifications: detail chevron navigation walks the whole inbox (not one page); detail panel uses larger body text and primary color; chevron layout refined for two-line titles and the iOS-PWA back-swipe gutter.
+- Drawer/Archive: Archive pile is a single global created-at window (gap-free, chronological); long context-name chips wrap instead of truncating; tree-style ←/→ keyboard navigation.
+- Mobile pane state persists in localStorage so a PWA close reopens where you left off.
+- "App Store" wording retired in favor of the plugin **Store**; English recommended in the language setup prompt and under the Language setting.
+- E2E suite runs against a release build by default.
+
+### Fixed
+- **Security hardening** — guard path traversal in the intent loader and browser screenshot path; floor char boundaries on OpenAI streaming token slices; scrub private/internal data from public-shipping sources, docs, system-knowhow, and test fixtures, backed by a fail-closed private-data release guard.
+- **Drafts** — a locally-edited draft is no longer blanked by a `MessageReceived` echo or a bulk SSE resync (drafts:65 `value=''`).
+- **Coding agent** — worktree `node_modules` provisioned from the hoisted root (npm workspaces); engine restart during a resumed session no longer read as a user rejection; idle-termination and question-answer-resume races closed; run-loop flags reset on resume.
+- **Gateway** never respawns an alive engine, only a dead one.
+- **Apply** — an already-merged branch is marked applied (instead of stranded as failed) and pushes main on a no-op.
+- Chat: no spurious "No changes" flash in Changes-mode; no open-jump on change-applied threads; pending messages survive a transient safety-refetch failure; iOS open-path repaint hardened.
+- macOS app menu derived from the system default so arrow keys move the cursor; About item labeled "About Lucidos".
+- Numerous UI fixes: dark-mode green confirm buttons, boot-splash label/sizing aligned to the gateway, header divider/tooltip behavior, and welcome carousel chevron/height stability.
+
+### Removed
+- Retired flat/narrow agent tools now superseded by grouped tools; dead components (`DelayedSpinner`, `StoreTab`, `ExportThreadButton`, `CopyThreadRefButton`).
+## v0.12.5 — 2026-06-25
+
+### Added
+- **Welcome screen redesign** — compact "Hi, there!" hero with a chevron suggestion carousel (one idea at a time), conversational de-quoted starter ideas, and a top-right dismiss pill. New starter suggestions: app store, mobile-access setup, daily scraper, weekday email summary.
+- **Targetable memory entries** — memory entry IDs now surface in the `[Long-term Memory]` block and the Memory settings view (copyable), plus a new `correct_memory_by_id` tool to delete/replace one specific memory by id.
+- **Thread Queue moved into Settings → System.**
+- Files import hint relabeled to "Drop or click to import" in a dashed drop box.
+
+### Changed
+- Gateway boot-splash phase renamed to "Downloading memory model".
+- Settings: Environment Variables now indexed in search; redundant subpanel titles dropped.
+- Notifications: a trayed/unfocused Tauri window now counts as not-in-use, so push is delivered when the window isn't actually visible (device-presence re-sync deduped on native focus change).
+
+### Fixed
+- macOS app menu derived from the system default so arrow keys move the cursor; About item labeled "About Lucidos".
+- Tauri: nav-history popover renders above the internal browser; app menu placed below the header strip; window drag and thread-toggle no longer steal the focused pane.
+- Settings: API URL renders at normal row size (not page-base); system subpanel tabs render on the Environment Variables view.
+- Threads: thread-link hover shows the real destination; cross-workspace thread links route through the gateway; stopped peers aren't lazy-started just to read a title.
+- Update badge + toast unified on the build-id check; switcher reload icon badged.
+- Welcome surface shows until dismissed and no longer clips the empty compose box.
+## v0.12.4 — 2026-06-25
+
+**Fixed**
+- **Desktop window state persists across launches** — Tauri window size, position, and screen are restored on relaunch, and the window-state save is marshalled onto the main thread.
+- **Welcome message** now shows until dismissed and no longer clips the empty compose box; added top padding and dropped the tagline.
+- **App menu** "About" item is labelled **"About Lucidos"** instead of "Lucidos".
+## v0.12.3 — 2026-06-25
+
+**Added**
+- **"See all statuses" shortcut** — empty status-filter views in the thread drawer now offer a one-click way to clear the filter and see every thread.
+
+**Changed**
+- **macOS menu-bar tray icon** rendered as a proper monochrome template glyph that fills the canvas (correct light/dark menu-bar appearance, no padding frame).
+- **Window dragging** works from the whole header strip, with maximize-on-strip and a focused-pane accent line under the header.
+- **Focused-pane marker** tuned to a full-width underline, muted in dark mode; navigating now activates the focused pane group.
+- **Quit menu item renamed**, and the app confirms before stopping the background service.
+- Chat agent now anchors on the currently open app/file for UI/copy requests.
+- README tagline sentence-cased ("If you can describe it, it exists").
+
+**Fixed**
+- Packaged builds no longer register the workspace as a "Lucidos source" repository.
+- Repo HTML shows as source (not a live render) in the file/diff preview.
+
+## v0.12.2 — 2026-06-25
+
+**Added**
+- **Menu-bar tray model (macOS)** — the always-on service now survives closing the client window; the engine keeps running in the menu bar.
+- **In-app "Uninstall Lucidos" command (macOS)** — clears WKWebView web storage and hides client windows on confirm, with a keep-vs-delete data choice, so a reinstall is clean.
+- **First run shows the workspace picker** — no more silently auto-created default workspace; offers personal/work name suggestions.
+- **`view_image` chat tool** — reprocess images posted earlier in a thread back into the agent's vision.
+- **macOS title-bar tinting** — the native title-bar strip is reclaimed as a blue drag-band matching the app header.
+- **Gateway boot-phase progress** — the workspace boot splash now renders engine-reported boot phases instead of a blank wait.
+- **Keyboard pane navigation** — focus the Conversation drawer (Cmd+Shift+1) and maximize the focused pane group (Cmd+Shift+Enter).
+- **`.gs` (Google Apps Script) files** highlighted as JavaScript in the file preview.
+- **Unattended trigger-spawned coding agents** — trigger-spawned sessions inherit the side-effect grant and auto-resolve permission prompts.
+- **Two-phase release pipeline** — `release.sh --verify-build` / `--publish-verified` and an `--attach-staged` path that builds once and verifies before publishing.
+
+**Changed**
+- **Security: permissive CORS disabled by default**, and the **gateway default bind address secured** (no longer binds broadly out of the box).
+- **Resolved npm-audit vulnerabilities** — vite 6.4.2→6.4.3, @babel/core 7.29.0→7.29.7.
+- Packaged update now restarts the whole service and surfaces inside the workspace; the dev-only gateway reload is hidden on packaged builds.
+- JSON API responses are gzip/brotli-compressed via tower-http.
+- Deterministic root-commit repository identity, with orphaned-thread backfill.
+- Per-parent child-thread fan-out cap raised 3 to 10.
+- Single-file changes open directly into their diff; added files render as the whole file.
+- User-facing thread "Saved" renamed to **"Pinned"**.
+- Cron fires coalesce so a trigger holds at most one queue entry (idempotent recovery).
+- "Lucidos source" coding target hidden on packaged builds; capture-context debug toggle defaults off.
+- Unified focus ring across buttons/dropdowns via a `--focus-ring` token (collapsed to a single soft band).
+- Perf: windowed thread render, faster exchange sort + incremental pending-message fold, memoized drawer categorization — fixes dev-workspace input lag.
+
+**Fixed**
+- Engine no longer culls alive-but-busy engines (gateway respawn-storm fix).
+- Graceful coding-agent process-group teardown so Playwright reaps its browsers.
+- Concurrent worktree spawns no longer collide on `.git/config.lock`; backoff sleep skipped on the final retry.
+- Attached images stay visible to the agent for the whole turn; image message protected from context pass 2.
+- Avoid a UTF-8 panic when truncating memory context.
+- Coding agent treats relative `..` targets as out-of-workspace; unwraps `shell -c` before classifying Codex commands.
+- Globally disable browser autofill on host-app text inputs.
+- Render binary images in the repo file viewer.
+- Archive drawer ordered by created_at; inbox threads excluded from the archive pagination cursor.
+- Hard-exit after uninstall so the window-state plugin can't re-create the deleted data dir.
+- Various: picker boot-splash text, "Manage workspaces" link on a direct engine port, app-thread change-row Diff, legacy workspace switcher list, per-pane Tab trap, thread-row "Waiting" tooltip.
+## v0.12.1 — 2026-06-23
+
+**Added**
+- **Hot-swap LLM provider on credential change** — adding or changing a provider key takes effect on the next chat, no restart required.
+- **Provider-aware first-run onboarding** — a fresh workspace with no LLM provider configured guides you to Settings → Models → Providers instead of silently serving mock output; the engine reports `llm_configured` via `/health`.
+- **Vertex AI in packaged builds** — Application Default Credentials (ADC) auto-read; the model list is filtered to only configured providers.
+- **Workspace-picker boot recovery** — a wedged boot splash now reveals an escape link to the picker; health-gated auto-open and first-run workspace naming.
+- **Notification detail in the content panel** instead of a modal.
+- **Action-toast keyboard support** — focus, Tab cycling, and a visible focus ring.
+
+**Changed**
+- Prompt answer/follow-up SplitButton unified into one frosted, same-width frame.
+- History-navigation arrow defaults swapped: Forward = Up, Back = Down.
+- Setup copy corrected to Settings → Models → Providers; stale "restart" wording dropped.
+
+**Fixed**
+- Bundled engine is now self-contained — OpenSSL is statically vendored, so the packaged build no longer depends on Homebrew OpenSSL (the crash-loop that blocked packaged startup).
+- Self-healing embedded Postgres lifecycle — stops on shutdown, adopts a healthy running instance, version-guarded.
+- Never serve mock LLM output on a no-provider boot.
+- Toast button focus ring no longer shows on mobile/touch.
+- Laggy repeat-tap can no longer cancel a just-sent turn.
+- Question/permission divider no longer mislabels system aborts as "Canceled".
+- Diff view resets to hunks on each new diff.
+- Stranded "Apply Now" toast is cleared on resume.
+- Workspace selector renders above toasts.
+- In-body notification app links open via openAppById, so disk-backed apps no longer falsely report as missing.
+- Keyboard-shortcuts label font size normalized.
+## v0.12.0 — 2026-06-22
+
+### Added
+- **In-thread MCP permission cards** — MCP tool calls in regular chat now prompt with an inline permission card (remember-per-thread, silenced for triggers), replacing the old consent-prompt flow.
+- **Official Lucidos marketplace suggestion** — the App Store suggests the official marketplace when none is registered.
+- **Gateway reload control** — reload the gateway from the workspace picker with a new-build badge and status/reload endpoints, plus a refresh/restart control on the current workspace row.
+- **Whole-file end-state diff toggle** — toggle any diff to view the full merged end-state of a file, not just the change hunks.
+- **Plugin-ownership-aware app delete** — deleting a plugin-owned app is blocked and redirects you to uninstall the plugin.
+- **"Include deleted" thread filter** and a dedicated **Running** view in the thread drawer.
+
+### Changed
+- Thread drawer consolidated — view selector + channel filter merged into one **Filter** dropdown (Lucidos / Coding Agent / Triggers icons), attention-only badging, a unified running spinner, and section-header icons.
+- Compose flow refined — auto-open the coding-agent dropdown after picking a coding destination, a round Send/Stop button, and a mobile split button for change actions.
+- Engine-restart UX softened — no more full-UI deactivation; a light, dismissible toast driven by a reliable build-id check instead of the fragile service-worker event.
+- Dual Submit/Cancel control for a pending question or permission; the Lucidos brand mark now represents the Lucidos Engine actor.
+
+### Fixed
+- Large hardening wave — 110+ fixes across iOS-PWA boot splash and push deep-linking, the gateway cold-start picker redirect (deep-link query+hash preserved, per-workspace localStorage via the Storage prototype), drawer / compose / mobile layout, MCP permission-denial accounting, trigger-CRUD actor preservation, zombie-thread recovery, Apply-All batch-toast rehydration, light-theme token drift, and dropdown / filter interactions.
+
+### Removed
+- App-UI time-travel (serving, versions/restore endpoints, and the frontend), the cc-edit-preread Read-before-Edit guard, and the prompt cancel confirmation.
+
+## v0.11.0 — 2026-06-18
+
+### Added
+- **Multi-workspace gateway** — standalone `lucidos-gateway` crate plus `lucidos-engine --gateway` mode, `/<slug>/` + `/~/` routing, engine-served frontend with base-path awareness, one shared dev gateway with per-workspace auto-start, and a brand-blue card-less workspace picker with animated mark, in-app switcher, and management UI (ADR 0013/0014).
+- **Self-contained macOS desktop app** — single `.app` bundling PostgreSQL 18 + engine + JS SDK, `build-dmg.sh` packaging, signed + notarized DMG + updater artifacts, auto-update from GitHub Releases, always-on LaunchAgent service + Tailscale mobile access, `File -> New Window` (Cmd+N), one-click `curl | sh` installer.
+- **DB-backed environment variables** — store, API, injection, and `request_credential` LLM tool with custom env-var-name pre-fill; Settings subview, nav router, and live SSE updates.
+- **Restore-from-backup in the workspace picker** + `restore-archive` engine subcommand (old Settings restore surface removed).
+- **App Store folded into Apps** — Installed/Store tabs, marketplaces, and auto-update for marketplace installs.
+- **Per-workspace localStorage namespacing** behind the gateway.
+- **Brand identity** — Lucidos mark as a brand component, regenerated native Tauri icon set, boot splash + workspace-starting splash, dark-blue (logo-hue) theme, logo-reveal animation, favicon on the boot splash.
+- **OpenRouter (GLM 5.2) + local OpenAI-compatible LLM backends.**
+- **Pane/keyboard focus system** — focus panel on header click, prompt-focus drives thread pane, per-pane Tab trap, focused-pane Back/Forward nav.
+- **Nav-history dropdowns** — history list on long-press / right-click of the Back/Forward chevrons, with thread-type and content-category icons.
+
+### Changed
+- Codex mid-turn follow-ups interrupt-and-redirect the live turn.
+- Tighter coding-agent commit cadence + post-commit diff display.
+- Thread drawer toggle is now a plain show/hide (not a focus stage); Current threads sorted by creation time.
+- Bundled PostgreSQL 17 -> 18 with automatic data migration; shared Postgres `max_connections` raised to 500.
+- Brand-blue header bar with light foreground inversion; dark theme retinted to very dark blue.
+- Markdown parsing cached so a re-render doesn't re-parse the whole thread.
+
+### Fixed
+- macOS notarization — sign loose bundled PostgreSQL Mach-O binaries inside-out so the notary accepts the DMG.
+- PWA shows the gateway boot/stopped (503) splash instead of the stale cached shell.
+- Queued-message trash icon rendered inline within the status label.
+- Stored env vars applied to the engine process at startup; credential custom env-name is additive.
+- Large hardening wave — 130+ fixes across the gateway, desktop packaging, auto-update, notifications, drawer/mobile layout, focus handling, changes/apply, and engine recovery.
+## v0.10.0 — 2026-06-15
+
+### Added
+- **Codex as a second coding-agent backend** — per-thread backend selection (Claude Code or Codex), app-server driver with permission cards, streaming and graceful interrupt; Codex taught the `lucidos` CLI + `ask_user_question` MCP tool (ADR 0005).
+- **Thread Queue** — system-wide admission control for all thread work; background spawns and user-initiated work share one capacity pool (ADR 0008), with a Thread Queue panel (Run now / Drop / edit policy) and policy tools.
+- **App coding-agent threads** — folder-scoped CC/Codex threads scoped to `data/apps/<id>` with a compose scope picker, WIP preview, app branch chip, and app-building knowhow served via the `lucidos knowhow` CLI.
+- **Command Safety** — interactive permission lane for chat commands, an LLM judge for the ambiguous middle, a static catastrophic-command block, checkpoint + undo for the reversible lane, and trigger side-effect grants (ADR 0002); grouped under Settings -> Permissions.
+- **Model providers** — OpenAI direct provider in Settings -> Providers, background tasks routed to OpenAI, a DB-backed model registry, direct Anthropic provider, Claude Opus 4.8 (now default, incl. 1M), and Fable 5.
+- **New agent tools** — `run_python_background` for long-running scientific-Python work, and `count_events` plus byte-budgeted `query_events`.
+- **Inline file editing** in the file preview.
+- **Backup** — persistent backup status on Settings -> Backup, `data/.backupignore` support, auto-generated key on scheduled backups, and a "View backups folder" link.
+- **Notifications** — native macOS push for the Tauri desktop app, Declarative Web Push for iOS, and structured `Tap` deep-link routing from the inbox.
+- **New-workspace welcome** with clickable starter suggestions; a single compose **destination picker** replacing the mode toggle + scope/agent chain.
+- Lucidos **theme inheritance is now the default** for new apps.
+- Wake-question (single-option ask) for genuinely unbounded waits.
+
+### Changed
+- Thread drawer reworked: needs-attention sorting by review tier, sort by last user action, context chips, status-dot tooltips, merged Active + Review into one **Current** section.
+- Every overlay migrated onto a unified `<Overlay>` component owning the dismiss contract; UI behind an open overlay is now inert.
+- Mobile navigation is swipe-only (drawer/content toggle icons dropped); raised the per-turn tool cap to 500 with a banner when reached.
+- Knowhow no longer stamped into app `manifest.json` / SDK `App` type.
+
+### Fixed
+- Large stability sweep: iOS-PWA blank/black thread recovery, deep-link scroll, auto-scroll re-pin, restart-overlay layering, notification badge/unread sync, change apply/discard idempotency and thread-state gating, worktree cleanup of stranded/orphaned worktrees, and many e2e flakes (WebKit reaper, Playwright 1.60).
+- Project-wide clippy/harden passes and large module splits (files-under-1k refactor).
+
+### Removed
+- Legacy `ModalOverlay` component (everything migrated to `<Overlay>`), the CC allowed-tools settings section, separator dividers app-wide, the compose mode toggle and "Discard draft" button.
+## v0.9.9 — 2026-06-05
+
+### Added
+- Inline text-file editing in the file preview pane.
+- "Thread" button on changes-panel rows to jump to the originating thread.
+- `--built` frontend dev mode (now the default; `--hmr` opts back into the live Vite dev server) to kill the iOS PWA cold-load black screen.
+- Clickable links rendered inside AskUserQuestion question text.
+- Mobile: "Keep header visible" now defaults to on.
+- Active service-worker BUILD_ID surfaced in the control panel.
+
+### Changed
+- PWA caches the navigation shell so a notification-tap reload boots from disk; faster iOS notification-tap reload overall.
+- Restart-overlay z-ordering: only toasts sit above the overlay; fullscreen app, landscape lock, drawer threads, and tooltips drop below it during restart.
+
+### Fixed
+- CC: Cancel now acts like Esc (interrupt + resume) instead of kill + respawn.
+- CC: external-repo agents stay on the worktree branch so the Diff tracks their PR.
+- CC: only set `RUSTC_WRAPPER=sccache` when sccache is on PATH; set it to `""` (not unset) when absent.
+- Diff button gated on the same algorithm the viewer uses (hidden when empty); falls back to `origin/<default>` when the local default branch has diverged.
+- Steps: redact ToolCalled description from masked args; friendlier progress labels for generic-fallback tools.
+- Backup: "Show backup key" is read-only; key generation is explicit and never overwrites.
+- Notifications: route warm Chrome push taps via postMessage instead of fragment navigate.
+- File preview: freeze the editor fetch URL at mount so revision bumps don't tear out the textarea.
+- Scroll: chevron re-engages the tail; snap before resize so big chunks keep following.
+- dev script: mode-aware `show_banner`, kill stale `--built` build-watch, guard `${BUILT:-}`.
+## v0.9.8 — 2026-06-03
+
+### Added
+- **Per-workspace environment overrides.** The engine now loads `<workspace>/data/.env` at startup via `dotenvy::from_path_override` (override semantics) and injects the result into every subprocess it spawns (`run_bash`, `run_python`, Claude Code, triggers). The motivating case is a per-workspace GitHub identity — point `GH_CONFIG_DIR` / `GIT_SSH_COMMAND` at the right account so `gh` / `git push` from agent subprocesses use the correct credentials. The file is gitignored (`data/.env` added to the workspace gitignore).
+
+### Changed
+- Documented the per-workspace `.env` behavior in `README.md` and corrected the "git-tracked under `data/`" rule in `docs/taxonomy.md` to list the real gitignored exceptions (`postgres/`, `blobs/`, `.env`).
+- Added agent-facing knowhow for `data/.env` setup in `system-knowhow/best-practices.md` (override semantics, subprocess inheritance, the GitHub-account recipe, and the ⚠️ restart-required-after-edit callout), with `system-knowhow/workspace-audit.md` kept aligned.
+## v0.9.7 — 2026-06-03
+
+Three weeks of work since v0.9.6 (1111 non-merge commits). Headline themes: a full rebuild of notification/push delivery around a live presence protocol, app coding-agent threads, collapsible thread families + groups in the drawer, a customizable keyboard-shortcut system, structured notification taps, and several new chat-agent tools.
+
+### Added
+- **Live presence-based push delivery.** New `PresenceCheck` SSE protocol: engine pings devices and waits for a `POST /api/presence-pong` before deciding whether to push, replacing stale-heartbeat guesses. Fan-out rewritten around a pure `decide_push_allowed`; per-device dismiss-on-read; daily auto-disable of push on stale devices.
+- **Declarative Web Push for iOS** plus engine-scheduled wake-push and a periodic service-worker liveness probe to work around the macOS-Chrome SW wedge.
+- **Structured notification `Tap`** — `{kind, to?}` discriminated union replacing the old `'modal'|'open_app'|'open_thread'|'none'` strings, with `tap=none` passive auto-read notifications and event-anchored deep-links.
+- **App coding-agent threads** — spawn a Claude Code session scoped to a single `data/apps/<id>/` folder (sparse-checkout worktree, ff-merge on apply, no engine restart). Compose-view scope picker, WIP preview, app-branch chip, and a two-layer guard so a CC thread can't kill its host engine.
+- **Collapsible thread families in the drawer** — child threads render under their parent with a toggle row, saved-section attention badges, and `blocking_descendant_count` plumbed through the projection.
+- **Trigger groups** — `TriggerGroup` entity + events, HTTP API, LLM tools, collapsible group sections in the triggers panel, and a group picker in the trigger detail modal.
+- **Customizable keyboard shortcuts** — registry-driven keybindings with override persistence (synced as a workspace preference), an interactive recorder, a cheat-sheet searchable by combo, and a non-destructive Escape/close-cascade dispatcher (Cmd/Ctrl+W, Cmd/Ctrl+Shift+W).
+- **New chat-agent tools**: `todo_write` (live todo list + `TodoListWritten` event), `run_python_background` (long-running scientific-python), `count_events` (byte-budgeted event queries), `list_changes`/`apply_change`, and `lucidos changes list/apply <id>` + `--folder` app targeting on `spawn-thread`.
+- **Models**: Claude Opus 4.8 (now default, plus 1M-context variant in the CC picker), Gemini 3.5 Flash, Haiku 4.5.
+- **OAuth provider registry** — credential modal pre-fills auth/token/userinfo URLs from a built-in registry (`well_known_provider` renamed to `known_provider`) and auto-expands a custom-URL section for unknown providers; registry extended with Spotify. New `lucidos.oauth.getAccessToken(provider)` SDK method + `GET /api/v1/oauth/{provider}/access-token` for in-browser SDKs (e.g. Spotify Web Playback).
+- **Full credential editing** with email settings and masked secret reveal.
+- **`.backupignore` support**, persistent backup status on Settings → Backup, and auto-generated backup key with a store-this-key prompt.
+- **Per-thread loaded-knowhow tracking** — `[LOADED KNOWHOW]` injected each turn, recovered from events on restart, body stripped from history.
+- Actor-stamped events across 13 mutating endpoints; `ImageDescribed`, `EngineSupervisorRespawned`, `PreferencesChanged`, `EmailSent`, `ProxyModulesReloaded` events.
+- Cross-workspace `run_claude` (`workspace` param) and a watchdog that auto-resumes stuck/hung CC sessions.
+- Configurable, collision-aware Vite port selection pinned to `lucidos.toml`.
+
+### Changed
+- Raised the per-turn tool-call cap to 500 with a banner when reached.
+- Chat agent nudged to use `ask_user_question` for choice-shaped follow-ups; forbidden from parallel-calling it; AskUserQuestion card shows single- vs multi-select mode and renders option descriptions as markdown; wake-question single-option variant for unbounded waits.
+- Cascade-archive the whole thread family in a single transaction.
+- SPA overlay surfaces lazy-loaded (~40% smaller main bundle); context modal/sections lazy-fetched after snapshot strip.
+- Diff/Apply button driven by a single `ccBranchHasDiff` signal instead of a three-way union; `branch_has_diff` seeded on session bootstrap and refreshed by the startup recovery sweep.
+- Editable subject/body in the email confirm dialog; cross-workspace Origin popover shows thread name + link.
+
+### Fixed
+- Hundreds of fixes across chat, drawer, notifications, backup, archive, service worker, coding-agent, mobile/PWA, and e2e. Highlights: thread-title Escape cancels without saving; backup auto-key on scheduled runs; iOS edge-navigation gesture suppression; macOS-Chrome SW notification wedge mitigations; active-children count reconciliation; CC watchdog recovery from internet outages.
+
+### Removed
+- Page-side notification wedge-recovery Layers 3+4 (superseded by the engine PresenceCheck path).
+- Temporary iOS push-tap diagnostic breadcrumbs; broken chat model-fit guard (reverted); dead `SHORTCUT_IDS` export and assorted dead code; sync `run_python` write-guard.
+
+## v0.9.6 — 2026-05-14
+
+### Fixed
+- **Triggers:** only human `MessageReceived` events promote a trigger thread to REVIEW; engine-driven follow-ups no longer falsely resurrect/re-route trigger threads (event_bus_projection now filters by `mode = human`).
+- **Title generation:** reject LLM titles that echo the system instruction back as the title.
+- **Commit hook:** match engine TLS scheme so per-commit `ChangeProposed` fires reliably (was using wrong scheme on HTTPS-only engines).
+- **Release script:** harden `-c FILE` mode and the deleted-files drift check; use `printf` instead of `echo` for grep input to avoid word-splitting on changelog bullets.
+- **E2E:** rename test `event_type` `SessionRecovered` → `ContinuationStarted` to match the post-v0.9.5 event rename.
+
+### Changed
+- **Cleanup:** complete `app_id` rebind cleanup; lift dirty check out of merged arm.
+- **Harden:** project-wide harden pass; tighten projection SQL comment around `ActorMode::Human`; drop commit-SHA references from title echo-validator comments.
+## v0.9.5 — 2026-05-13
+
+### Added
+- **Pluggable proxy auth pipeline + WASM signers** — `apis.json` migrated from a 6-variant `ProxyAuth` enum to a `Vec<AuthLayer>` pipeline (`static_credential`, `script_handshake`, `hmac_signed`, `wasm_signer`); same-host redirect re-signing; cross-host refused with 502; 1MB body threshold + manifest-declared `body_mode`; pipeline-aware 401 retry across opted-in cache hits; `WasmSignerLayer` with sign-only ABI, `SignInput`/`SignOutput`, capability gating, host imports for crypto + opaque secret handles, module-loader sidecars; first-class **Binance HMAC** signer; `reload_proxy_modules` LLM tool + HTTP endpoint; plugins can ship signers via `auth-modules/`.
+- **`script_handshake` proxy auth** — token cache with singleflight gate, retry on cached-token 401; OAuth tokens injected into handshake env; `script_handshake` follower no longer flags `cache_was_hit`; replaces `credential_bundle`.
+- **Background bash trio** — `run_bash_background` / `bash_output` / `bash_kill` chat tools backed by a new `BackgroundBashRegistry`; `BackgroundBashStarted/Completed` thread events wired through the lifecycle.
+- **`ContextSnapshot` event + unified context modal** — per-LLM-iteration snapshot with sections + real provider usage; frontend collapses Step + Context tabs into one `ContextSnapshot` panel; estimated token count surfaced; legacy `ContextTokensMeasured` / `ContextAssembled` / `Thinking` events deleted.
+- **Typed `ChildThreadCompleted` + child-completion card** — exchange-starter event with status, summary, link, disclosure; auto-resume callback for sub-threads; `dismiss_from_context` tool to drop prior tool results / child completions from resume context.
+- **`run_thread` / `run_claude` `relation: sub|top`** — sub spawns auto-resume parent; top is fire-and-forget; CLI gains `--relation sub|top` on `spawn-thread` (replaces `--parent`); typed `top`-relation pathway through `notify_parent_if_child`.
+- **Multi-select `AskUserQuestion`** — `AnswerKind::MultiSelected`, `multi_select` flag on `UserQuestionAsked`, multi-select toggle + Submit in the prompt action row; CC hook joins selected labels; option-id + compatibility validation.
+- **CC stop-hook plaintext-question redirect** — detects plaintext questions in the CC transcript and redirects them through `AskUserQuestion`; UUID sentinel path; question-redirect reason text.
+- **Per-trigger knowhow** — `data/triggers/{slug}/knowhow/`; LLM uses `load_knowhow` like chat instead of inlined preload turns; end-to-end ID validation across core, HTTP, LLM tools, and the scheduler.
+- **Plugin uninstall + lifecycle** — real uninstall with `PluginUninstallPanel` confirm UI, deletes recorded files, stamps actor on confirm/cancel; `uninstall_plugin` resolves by id, name, or installed app folder; install-via-chat drag-and-drop; `delete_file` refuses plugin-owned paths; refresh apps + triggers on `Plugin{Installed,Uninstalled}`; install-state keyed by canonical plugin id.
+- **`lucidos.ui.startThread` SDK API** — prefilled new-chat from app code.
+- **Step detail modal** — clickable CC step rows on desktop, hover/tap tooltip on mobile, event timestamp; renders TodoWrite todos.
+- **Notification → originating thread** — notifications link back to the thread that spawned them; standard 0.5rem gap between detail action buttons.
+- **Permission card answer state** — keeps prompt buttons after answer with picked/struck styling.
+- **Vertex prompt caching** — caches tools, system, and conversation prefix on Claude requests.
+- **CC nightly-pipeline + run-tests + run-e2e skills** — per-batch CC orchestration recipes.
+- **Image popup wraparound + slot rendering** — true carousel feel, n=2 black flash on swipe fixed, tap toggles chrome.
+- **Code-block ellipsis highlighting** — visible elision in tool descriptions.
+- **Tooltip-on-scroll + capture-phase listeners** — open tooltips follow target on scroll, passive capture for global scroll/touch.
+- **Capture-context settings toggle** — opt-in deletion of unused `saved_contexts`.
+- **Files panel surfaces `config/` + `auth-modules/`**.
+- **Restart toast Dismiss action** — hides until a new change arrives, JSON fingerprint excluding engine version.
+- **`/app/<id>/` route move** — app UI routes off `/api/`.
+
+### Changed
+- **System-knowhow doc set expanded** — `system-knowhow/coding-agent-events`, `system-knowhow/thread-events`, `system-knowhow/intent-registry`, `system-knowhow/workspace-audit`, `system-knowhow/workspace-learning`, rewritten `system-knowhow/building-an-auth-handshake` for the pipeline + WASM signer architecture; `building-a-trigger` rewritten for the post-preload model; tools docs clarified that `run_claude` is same-workspace only and that `run_bash` `timeout_secs` should be bumped for long jobs.
+- **`read_file` archive support** — line-range slicing + transparent zip traversal; tighter `validate_archive_entry_path`; clear message for binary entries inside archives; zip-entry decompression capped at 10MB; schema mins on line args; deduped extension sniff.
+- **CC stop-reminder hook** — plaintext-question detection, `LUCIDOS_SESSION_KIND=interactive` for chat-style CC sessions, `transcript_path` parsed from hook payload, sentinel-write failures surfaced on stderr; CC PreToolUse coerces Read offset/limit and forces Read-before-Edit.
+- **CC Bash kill-pattern guard** — blocks kill patterns that would catch sibling CC subprocesses.
+- **Typed `CancelCause` / `AbortCause` on `Response{Canceled,Aborted}`** — emit centralized through helpers; stale-settle moved from `CancelCause` to `AbortCause` (idle status, no Continue surfacing).
+- **`SessionRecovered` → `ContinuationStarted`** — rename + lifecycle violation fixed; duplicate restart abort suppressed.
+- **`grep_files` capping** — per-line and total result size capped to prevent context overflow.
+- **Credential UX** — copy buttons for all credential types; rows wrap at narrow widths; LLM asked for one credential at a time; mobile autofocus skipped.
+- **CC banner Diff button** — always rendered, disabled when no signal; lifted Save into Diff row when Apply gains the "& Restart" suffix; merged Diff into actions row when there's room.
+- **Scheduler refactor** — backup pipeline extracted to `backup.rs`; task runner free fns extracted to `task_runner.rs`; tighter visibility.
+- **Inline tests lifted to sibling files** across plugins, threads, change_ops, claude_code, agentic_loop, agent_recovery, changes_projection, thread_events, chat/process, engine mod.rs/run_session.rs, memory, llm/tools, email, change_ops, event_bus.
+- **Project-wide harden + simplify passes** — narrative comments trimmed; helper extractions; redundant guards dropped; `responseCanceledSummary` JSDoc tightened; many small DRY wins.
+- **Workspace data walker now includes `scripts/`**.
+
+### Fixed
+- **Postgres password leak through Bash tool calls** — redactor short-circuited on no-match; PG env bundle cached.
+- **Orphan `tool_use` repair** — single source of truth + tighter validator; engine LLM repairs orphan blocks before they reach Anthropic.
+- **CC phantom `ResponseCanceled`** — stopped emitting on Apply/Discard/Archive/idle and on conflict-resolution session ends; safety-net firings treated as crashes (error state, no `ChangeProposed`).
+- **Engine cancel mid-tool-execution** — chat honors cancel; SIGKILL hung subprocesses; `emit_response_canceled` made idempotent against pre-emitted terminators.
+- **System-actor activity events no longer resurrect terminated threads** (projection fix).
+- **`changes_projection` flake** — cutoff/order tests de-flaked; constant for cutoff gap.
+- **Apply ordering** — serialize against concurrent data writes; `delete_file` locked against apply dirty check; helper method on `workspace_repo_lock`; gate apply on real marker, not session-end.
+- **Backup** — Google Drive resumable upload protocol; O(1) chunk-body clone; deduped Drive PUT helpers.
+- **Wasmtime test isolation** — own binary to avoid macOS Mach IPC abort; shared engine between WASM compile + instantiate; loader returns empty for missing dir.
+- **CC questions** — orphaned `UserQuestionAsked` skipped during pending-question lookup; archive still cancel-stamps orphaned questions; orphan-of-orphan re-process; frontend `req_id` routing.
+- **Title generation** — skip opaque IDs (UUIDs, hashes), reject empty LLM responses, reject titles that echo the prompt instruction, instruction moved to system prompt.
+- **Compose race** — await thread-create before pasting an image; await thread-start POST before debounced compose PUT; `pendingComposePuts` leak plugged; PUT skipped on discarded thread.
+- **Drawer pagination** — gated on `archive` (renamed from `history` since v0.7.2); regression tests tightened.
+- **`HEAD` is current** — re-applied lost contributor fixes (Ctrl+Shift+O on Mac, history-collapsed pagination guard) with regression tests.
+- **`ResponseFailed` on empty CC Result text** — surfaced explicitly.
+- **CC context** — sums `input + cache_read + cache_write` for total prompt size.
+- **Stale `apply` timeouts** — extended so backend doesn't outlive client `AbortController`.
+- **File preview download attribute** — uses real basename; deduped basename derivation.
+- **Permission card** — Allowed badge right-aligned on resolved card.
+- **z-index** — `--z-modal` lifted above `--z-control-panel` so modals block the header; `.toast-container` routed through `--z-toast` token.
+- **iOS** — shake-to-undo blocked from wiping focused input (then reverted as iOS popup is system UI); landscape allowed when image popup is open.
+- **Worktree cleanup** — skips threads with live agent session; deterministic stale-dir reuse on lost-session recovery; chat repo resolver narrowed to names only; `repo_root` fallback when default Lucidos row missing.
+- **Image popup** — gesture lock release on pinch end, lock-before-flush; cancel commit timer when pinch starts; flush pending swipe-commit on follow-up gesture; render every image at fixed slot, signal-driven transform.
+- **Plugin install** — per-route body cap; install sentinel redacted from LLM; confirm panels closed in `finally` so failures don't wedge UI.
+- **`refreshChangesState`** — retried once on `AbortError`.
+- **Email + OAuth row deserialization** — `sqlx::FromRow` derive replaces hand-rolled impls.
+- **`throwIfNotOk`** — falls through to `statusText` when JSON has no error field; mutating handlers routed through it.
+- **Triggers UI** — Delete/Edit kept at full opacity when paused; dead `trigger-toggle-btn` class dropped.
+- **Header** — only opens control panel when clicking visible brand elements.
+- **Notifications** — `optional chain` restored on `detail.thread_id`.
+- **Tools** — `generate_image` misuse guard (warn when called for analysis instead of synthesis); type-driven tool dispatch.
+- **Release wrapper** — refuses Mode 1 release while Mode 2 PRs are unmerged to main; deleted-files-vs-PREV_TAG drift check; `--accept-drift` escape hatch.
+
+### Removed
+- Six-variant legacy `ProxyAuth` enum (single-release migration to pipeline).
+- `credential_bundle` proxy auth (superseded by `script_handshake`).
+- Legacy `ContextTokensMeasured` / `ContextAssembled` / `Thinking`-tokens events (replaced by `ContextSnapshot`).
+- `wake_text` from `ParentCallback` (typed event is the source of truth).
+- Skill: `run-nightly-pipeline` (Lucidos territory, not a CC skill).
+## v0.9.4 — 2026-05-08
+
+### Added
+- **Content-addressed image blob store** — backend foundation, one-shot startup migration of legacy base64 payloads, `image_hashes` over the chat HTTP and event payloads, frontend uploads-on-attach with blob-URL preview, downscaled iOS-Safari preview endpoint, EXIF handling.
+- **Image popup navigation** — single-finger mobile swipe between images, desktop chevrons pinned to viewport, smooth swipe-commit, prev/current/next slot rendering for true carousel feel.
+- **Save / Archive prompt actions** — Save button on Active threads, ✓ Saved unsave toggle on running Saved threads, section-aware Save/Archive in prompt area, collapsed Active+Saved action area, "Thread saved" toast, smooth mount/unmount fades.
+- **API proxy auth modes** — `query_param`, `hmac_signed` (Binance-shape signing), and `credential_bundle` (with `/api/v1/proxy-credentials` endpoint and `lucidos proxy <name> --credentials` CLI). `proxy_request` LLM tool refuses `credential_bundle` for safety.
+- **Plugin install via chat drag-and-drop** — drop a `.lucidos-plugin` archive into the chat to install.
+- **CC AskUserQuestion nudge** — system prompt nudges CC to use `AskUserQuestion` for choice-shaped questions.
+- **Real input-token counts in the thinking chip** — uses provider usage instead of estimates, applied to inline chip too.
+- **CLI `spawn-thread`** — renamed from `send-thread`, added `--repo` selector.
+- **Title generation keeps ticket/issue identifiers** — preserves identifiers like `ABC-123` in generated thread titles.
+- **Restarting-engine toast** — non-dismissable flag, hides the X on the restart toast.
+
+### Changed
+- **Mobile copy-button** — bigger tap area on copyable + code blocks, ::before tap area, snap-aligned with `.action-btn` pattern.
+- **Code-block header** — collapsed into one overlay row, copy button visible on touch devices, hover-reveal restored on desktop, isolated from scroll via inner wrapper.
+- **Send button morphs into Cancel** — single morph instead of unmount/remount; `--duration-emphasis` token; 500ms fade so the color change is perceptible.
+- **Image popup nav buttons** — darker close/delete buttons.
+- **Mobile cold launch** — active pane scoped to sessionStorage so cold launch lands on the focused thread.
+- **iOS PWA navigation** — app switches no longer pollute session history.
+- **Knowhow id resolution** — app-scoped ids (`<app>/<rest>`) resolve in trigger validator; absolute `rest` blocked from path escape; trigger knowhow ids validated end-to-end.
+- **Internal: `ProxyAuth` is now a tagged enum**; credential lookup consolidated; `query_param` credentials redacted from logs.
+
+### Fixed
+- **Image popup** — pinch-zoom no longer thrashes layout, gesture conflicts cleared, swipe flicker removed (decode-before-swap), pending swipe-commit flushed on follow-up gesture, gesture lock released on pinch end, stale pinch rAF dropped before swipe.
+- **Chat send / cancel flow** — Send disabled while CC awaits a question/permission; awaiting-answer gate closes during send→SSE round-trip; prompt re-enabled while CC awaits a question; mode toggle allowed on composing threads before first send.
+- **Chat scroll** — observers gated on element visibility; `awayFromBottom` reconciled on scroll-to-bottom loop exit; escalated on resize so panel-expand shows the chevron; pinned to bottom when answering a CC question.
+- **Save/Archive UI** — hidden mid-turn and when Apply is pending; double Archive button on saved-thread prompt removed; Save no longer flashes before Send when only pending image uploads are content; `✓ Saved` toggle always shown on Saved threads; right-aligned lone section button.
+- **Image popup overlay** — covers header so controls are disabled during preview.
+- **Restart overlay** — covers header so controls are disabled during restart.
+- **Drawer exchange count** — stabilized by trusting server `messageCount`; inlined helper.
+- **Plugins** — per-route body cap; tighter sanitize; upload logs; tokio::fs upload; shared `PLUGIN_ARCHIVE_EXT` constant.
+- **Title generation** — emits `"Image"` / `"Images"` instead of LLM-hallucinating on empty input.
+- **Changes panel** — already-applied branches treated as no-op instead of erroring.
+- **CC** — toast suppression for "Failed to load CC commands" during engine restart; `engineRestarting` refetch effect scoped to compose view; never surfaces "success" as `ResponseFailed.error`; tags partial-run changes.
+- **File preview** — knowhow-list fetch errors surfaced instead of swallowed.
+- **Thread title** — re-fits display height when container width changes.
+- **Recovery** — reuses deterministic worktree path when rebuilding lost CC sessions; clears stale dir before `worktree_add`.
+- **Blobs** — `resolve_thread_image_refs` surfaces missing-blob with a clear error; `thread:N` references stay stable; dropped hashes logged; bad-encoding distinguished; in-memory blob URL kept alive for confirmed previews; preload server URL before swapping preview src; per-call nonce in preview tmp filename; `ImageUploaded` added to `thread_lifecycle` section-transition allowlist; compose-image migration doesn't wipe already-migrated drafts.
+- **Mobile** — keyboard state preserved across image picker; image picker keyboard-restore reverted (iOS won't honor it).
+- **Diff** — always offered for external-repo CC threads.
+- **Header** — pointer cursor only on visible brand children; full-width dblclick on brand-label empty space allowed; brand-area toggle skips full-width dblclick; tooltip dropped when it just repeats the visible label.
+- **Tooltip** — `cursor:help` dropped; redundant tooltips suppressed in the global system; `currentTarget` cleared on suppression.
+- **Theme** — `matchMedia` change listener re-enabled off iOS.
+- **Releases tooling** — ancestry check tightened (HEAD, surface git errors); local main fast-forwarded after Mode 1 release.
+
+### Removed
+- Stale narrative comments and historical SHA references across chat, blobs, recovery, plugins, image popup, drawer, and proxy modules (project-wide harden + simplify passes).
+## v0.9.3 — 2026-05-06
+
+### Fixed
+- Lucidos Agent icon: swapped 🤖 robot for ✨ sparkles in initiator and executor chips
+- Mobile send: action button now blurs on click instead of pointerdown, so the keyboard no longer eats the tap
+
+## v0.7.1 — 2026-04-27
+
+### Highlights
+- **CC Resume Architecture rewrite** — process exits on every idle (including permission prompts), resumes cleanly on user input, and reconstructs context when the prior session is stale. Replaces the always-alive CC loop; resume-by-id (`--resume <session_id>`) is still the mechanism for normal resumes, but the user-answer flow now always starts fresh and reconstructs context instead of resuming by id.
+
+### Added
+- **CC resume / coding-agent lifecycle**
+  - Process-exits-on-idle model with reconstruct-on-resume; "Cancel" treated as a resumable turn boundary.
+  - `AskUserQuestion` now routed via a `PreToolUse` hook + `/api/internal/ask-user-question` long-poll endpoint (replaces the brittle reconstruct path).
+  - Detects external edits and branch drift on resume; catches worktree up to `main` automatically.
+  - Coalesces rapid-fire idle messages into a single resume spawn.
+  - Reconstructs conversation summary on stale resume; preserves worktree CWD across `AskUserQuestion` resume.
+  - Renamed user-facing label from "Session resumed" → "Thread auto-resumed".
+- **Trigger pause/resume** — `pause_trigger` / `resume_trigger` LLM tools and a `paused` field on `update_trigger`.
+- **Mode-driven actor chips & Engine Explainer popover** — initiator panels show the right "[icon] WHO — WHAT" with proper device labels and engine-vs-agent attribution.
+- **`lucidos data-store add` CLI** — move directories into `~/.lucidos/data/` for persistent bulk reference corpora outside the workspace.
+- **Free-disk-driven worktree cleanup** — replaces the hardcoded 50 GB cap with live volume monitoring; stacked disk-usage bar + per-row % of worktree usage; dedup'd disk-low alerts with auto-cleanup notifications; new `GET /api/disk-usage/summary` endpoint.
+- **Rendered/source toggle for markdown change diffs** (`bf804d8f` + harden) — preview rendered markdown alongside raw diff in the changes panel.
+- **Bulk-import size guard** — `git_clone` and file uploads refuse >500 files / >100 MB into `data/artifacts/` with a pointer to `.lucidos/tmp/` or `~/.lucidos/data/`.
+- **Versioning polish** — Client version row in Tauri + web; Lucidos version asterisked when there are commits since the last release.
+- **CodingAgent (CC) pluggable refactor — Phase 1** (per `docs/plans/2026-04-20-cc-to-coding-agent-refactor.md`).
+
+### Changed
+- **Harden state is DB-backed** — Phase 0 and `pre-push.sh` consult `lucidos hardened query` instead of filesystem markers.
+- **Knowhow injection moved to execution time** — engine concatenates formatted knowhow onto intent text in `scheduler/user_tasks.rs` / `core/knowhow.rs`.
+- **`/api/v1/data` no longer exposes system-docs** (`list_data`, `read_data`, `validate_data_path`).
+- **CC follow-ups use auto-resume via `chat_submit`** — removed the dedicated CC idle waiting loop and the silent-CC-auto-resume-on-focus path.
+- **Major refactors** — `engine/claude_code.rs` (5,804 lines) split into `engine/cc/`; `engine/cc_runtime.rs` (3,098 lines) split into 10 sub-files (`spawn`, `io_helpers`, `parsing`, `lifecycle`, `runtime_helpers`, `prompts`, `resume`, `apply_now`, `run_session`).
+
+### Fixed
+- **CC panic-on-resume** — answering a question on a trigger thread no longer panics; resume path dropped from the user-answer flow (`762fd6fb`); always start fresh and reconstruct context.
+- **Stale resume edge cases** — don't delete branch when discarding stale change; `SessionEnded(stale_resume)` no longer changes thread status; `stale_resume` added to `NORMAL_SESSION_END_REASONS`; clean up worktree on stale CC resume.
+- **Resume detection** — detect idled-then-resumed CC sessions as actively running; resume actively running sessions even with a pending change; resume running CC sessions after restart even without git changes.
+- **Resume race conditions** — emit `MessageReceived` before routing CC/chat follow-ups; emit `ClaudeCodePromptSent` when CC resumes while waiting; prevent SSE race, debounce resume, re-fetch on empty thread; resolve model/effort before `spawn_or_resume`; skip `ResponseGenerated` during silent resume.
+- **Apply path** — reuse existing CC worktree on locked branch (`73dce58e`); surface `timestamp out of range` and `worktree git_ops` errors that were leaving changes pending behind a 200 OK.
+- **Message attribution** — spawned threads and child→parent callbacks were labeled "Lucidos Engine" instead of "Lucidos Agent"; fixed across `agentic_loop`, `claude_code`, and thread-events paths (`ParentThread` origin stamped on `run_thread` / `run_claude` child messages).
+- **Threads stuck in `running`** — `get_recent_threads()` was dropping threads with pending changes due to a 15-row partition limit.
+- **Image-only messages froze threads** — sending an image with no text no longer leaves the thread at `running`.
+- **Large image payloads** — strip `[IMAGE_CONTENT:]` markers at write-time (`agentic_loop.rs`) and read-time (`/api/threads/{id}/events`, ToolResult payloads).
+- **Interrupting a spawned chat thread** now cancels model/tool calls and transitions the thread to `aborted`.
+- **Diff rendering** — restore diff context after reload via path-encoded `changeId`; merge adjacent strips; persist source-toggle scoped to reload only; full-width bg highlight covers margin gaps; track lines by actual newline count.
+- **Mobile** — keep pin button tappable while keyboard active; elevate `.thread-content` above `.edge-swipe-zone`; reverted brittle `contain` isolation in favor of memoized linkify; preserve mobile header in scale modal; long thread titles wrap in disk-usage view.
+- **Performance** — memoize response-text `linkifyPaths` to fix swipe jank (`eb3dfa91`); batched path regex to dodge WebKit "regex too large"; stable empty-array fallbacks in chat.
+- **iOS Safari Service Worker `TypeError`** in `crates/lucidos-app/public/sw.js`.
+- **`run_claude` origin** — replaced raw struct construction with `make_message_received` in `claude_code.rs`.
+- **Permission card** — right-align actions, Allow rightmost.
+
+### Tests
+- New coverage for the CC resume rewrite: process-exits-on-idle lifecycle, `AskUserQuestion` PreToolUse hook + long-poll endpoint, stale-resume / branch-drift / external-edit detection, and reconstruct-on-resume context building.
+- Effort/model persistence + `opus[1m]` case (`crates/cognos-app/src/components/chat/__tests__/cc-reasoning-effort-persistence.test.ts`, 12 tests).
+- Mode-driven actor chip + Engine Explainer popover coverage (backend attribution + frontend rendering).
+- Trigger pause/resume tools and `paused` field on `update_trigger`.
+- Image-only message handling and `[IMAGE_CONTENT:]` strip at write-time and read-time.
+- Free-disk-driven worktree cleanup and `/api/disk-usage/summary`.

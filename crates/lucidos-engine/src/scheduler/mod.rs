@@ -1,0 +1,1936 @@
+//! Scheduler module for Lucidos periodic triggers
+//!
+//! Provides two categories of triggers:
+//! - **System triggers**: Silent/internal (session summaries, maintenance)
+//! - **User triggers**: Visible (morning brief, scheduled research)
+//!
+//! ## Reliability Features
+//! - JoinHandle tracking for spawned tasks
+//! - Automatic crash detection and task restart
+//! - Panic-safe task execution
+//! - Fresh task data fetch on each execution
+
+pub(crate) mod notification_plain_text;
+pub mod notifications;
+pub(crate) mod plugin_updates;
+pub mod push;
+#[cfg(feature = "e2e-test-hooks")]
+pub mod push_test_log;
+#[cfg(test)]
+mod tasks;
+pub mod user_tasks;
+pub(crate) mod webhook_ingress;
+pub(crate) mod webhook_refusal;
+
+pub use notifications::{Notification, NotificationStore};
+pub use push::{PushSubscription, PushSubscriptionStore};
+
+use crate::api::SharedEngine;
+use crate::core::{prefs, PreferenceStore};
+use crate::engine::event_bus::EventBus;
+use crate::triggers::{
+    replay_trigger_events, replay_trigger_group_events, TriggerConfig, TriggerEventRow,
+    TriggerGroup, TriggerGroupEventRow, TriggerRun,
+};
+use sqlx::PgPool;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio_cron_scheduler::{Job, JobScheduler};
+use tokio_util::sync::CancellationToken;
+
+/// Grace period for missed task execution (applies to both startup catch-up and late wake)
+const MISSED_TASK_GRACE_MINUTES: i64 = 60;
+
+/// Days of `last_seen_at` inactivity after which a push-enabled device gets
+/// auto-disabled. Tuned to skip biweekly-use devices while catching obvious
+/// PWA-reinstall ghosts.
+const STALE_DEVICE_DAYS: i64 = 30;
+
+/// Days after which a device never seen past its first day is removed (see
+/// `DeviceStore::remove_one_off`). Long enough that a device used again within
+/// a week keeps its per-device preferences.
+const ONE_OFF_DEVICE_DAYS: i32 = 7;
+
+/// Namespace UUID for deriving trigger UUIDs via v5 (SHA-1). The byte
+/// sequence spells the historical "cognos-trigger-n" — DO NOT change it;
+/// the bytes are part of the v5 hash input, so every trigger UUID derived
+/// from a `trigger_id` string depends on this exact namespace. Renaming the
+/// product to Lucidos doesn't get to invalidate persisted trigger ids.
+const TRIGGER_UUID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0x63, 0x6f, 0x67, 0x6e, 0x6f, 0x73, 0x2d, 0x74, 0x72, 0x69, 0x67, 0x67, 0x65, 0x72, 0x2d, 0x6e,
+]); // "cognos-trigger-n" — frozen for v5 namespace stability; see doc above.
+
+/// Derive a deterministic UUID from a trigger ID string (uuid v5 / SHA-1).
+pub(crate) fn trigger_id_to_uuid(trigger_id: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&TRIGGER_UUID_NAMESPACE, trigger_id.as_bytes())
+}
+
+/// Tracks how many user tasks are executing concurrently. Incremented /
+/// decremented by the Thread Queue executor around each trigger run
+/// (`engine::thread_queue::executor`); the scheduler reads it for the
+/// shutdown drain wait. Informational — capacity enforcement lives in the
+/// Thread Queue's own accounting.
+pub(crate) static ACTIVE_TASK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// What the trigger matcher is handed for one bus event.
+///
+/// The subscriber sees two carriers, and they used to be answered in two
+/// places with two different ideas of depth. One function now decides for
+/// both, which is what makes the answer testable.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TriggerDispatch {
+    pub(crate) event_type: String,
+    /// The *matchable payload*: the same view the event-wait dispatcher
+    /// matches against, so one `condition` cannot mean different things to a
+    /// trigger and to a wait. That parity is what `core::event_subscription`
+    /// exists to hold, and it is what makes `thread_id` a usable `on_event:`
+    /// filter.
+    pub(crate) payload: serde_json::Value,
+    /// The depth to dispatch at, so `MAX_EVENT_TRIGGER_DEPTH` engages.
+    pub(crate) depth: u32,
+    /// Which trigger's fire emitted this, so the matcher can drop it from the
+    /// matches. Always read off the frame, including for a domain event, which
+    /// reads its depth off the variant instead. See the arm's own comment.
+    pub(crate) emitting_trigger_id: Option<String>,
+    /// The thread the firing event lives on. `None` for a domain event, which
+    /// belongs to no thread.
+    pub(crate) origin_thread_id: Option<uuid::Uuid>,
+}
+
+/// Decide what one bus event gives the trigger matcher, or `None` when it is
+/// not a trigger carrier.
+///
+/// Thread events are gated by a **blocklist**
+/// (`core::event_subscription::is_subscribable`): a workspace can `on_event:` any
+/// persisted `ThreadEvent` by default, and new lifecycle and per-action
+/// variants are triggerable automatically. High-cardinality per-action
+/// variants flow through, scoped by `condition:` filters.
+///
+/// System frames are gated by an **allowlist**,
+/// `core::event_subscription::is_subscribable_system_event`: a domain event,
+/// plus any persisted frame (ADR 0113). The event-wait dispatcher offers from
+/// that same function, which is what invariant I8 requires.
+///
+/// **The depth is the emitting task's, never zero by assumption.** An event
+/// emitted inside a trigger fire is one link along that fire's chain.
+/// Dispatching it at zero disengaged `MAX_EVENT_TRIGGER_DEPTH` for the whole
+/// `BusEvent::Thread` carrier. A trigger subscribed to an event its own run
+/// emits then re-fired without bound. A domain event reads the depth off its
+/// own variant, the persisted value a replay reconstructs.
+///
+/// **The emitting trigger comes off the frame, in every arm.** The cap above
+/// only ends that chain after three fires. Naming the trigger lets the matcher
+/// drop it outright, so it is never woken by its own fire.
+pub(crate) fn trigger_dispatch(
+    emitted: &crate::engine::event_bus::EmittedEvent,
+) -> Option<TriggerDispatch> {
+    use crate::core::event_subscription::{
+        is_subscribable, is_subscribable_system_event, matchable_system_payload,
+        matchable_thread_payload,
+    };
+    use crate::engine::event_bus::{BusEvent, SystemEvent};
+
+    match &emitted.typed {
+        BusEvent::Thread {
+            thread_id,
+            event,
+            meta,
+        } => {
+            if !is_subscribable(event) {
+                return None;
+            }
+            Some(TriggerDispatch {
+                event_type: event.event_type().to_string(),
+                payload: matchable_thread_payload(event, meta, *thread_id),
+                depth: emitted.depth,
+                emitting_trigger_id: emitted.emitting_trigger_id.clone(),
+                origin_thread_id: Some(*thread_id),
+            })
+        }
+        // A domain event reads its depth off the variant, not off the frame.
+        // That copy is persisted, so a replay reconstructs it. Everything else
+        // about it is the arm below.
+        //
+        // The emitting trigger is the exception: it comes off the frame here
+        // too, because there is no persisted copy to read. See
+        // `docs/adr/0137-a-trigger-never-wakes-itself.md`.
+        BusEvent::System(se @ SystemEvent::DomainEvent { depth, .. }) => Some(TriggerDispatch {
+            event_type: se.stored_event_type().to_string(),
+            payload: matchable_system_payload(se),
+            depth: *depth,
+            emitting_trigger_id: emitted.emitting_trigger_id.clone(),
+            origin_thread_id: None,
+        }),
+        BusEvent::System(se) if is_subscribable_system_event(se) => Some(TriggerDispatch {
+            // The stored name and the stored payload, so a `condition` reads
+            // the same fields live and on replay.
+            event_type: se.stored_event_type().to_string(),
+            payload: matchable_system_payload(se),
+            depth: emitted.depth,
+            emitting_trigger_id: emitted.emitting_trigger_id.clone(),
+            origin_thread_id: None,
+        }),
+        BusEvent::System(_) => None,
+    }
+}
+
+/// Manages all triggers in Lucidos
+pub struct SchedulerManager {
+    scheduler: JobScheduler,
+    engine: SharedEngine,
+    pool: PgPool,
+    /// Track spawned task handles for lifecycle management
+    /// Key: task_id, Value: JoinHandle and metadata
+    tracked_tasks: Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
+    /// Cancel token of the running backup loop (so we can stop or replace it).
+    /// Shared (`Arc<Mutex>`) so the EventBus subscriber task can re-arm the loop
+    /// without owning `&mut self`, on a `timezone` change or an agent/HTTP
+    /// backup-pref write. Only ever held briefly (take/store a token), never
+    /// across an `.await`.
+    backup_runner: BackupRunner,
+    /// Shared flag signaling task runners to stop scheduling new executions
+    shutdown_flag: Arc<AtomicBool>,
+    /// In-memory trigger configs, rebuilt from events on startup and kept
+    /// up-to-date via EventBus subscription. Source of truth for trigger
+    /// listing — replaces DB queries to trigger_crons table.
+    trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
+    /// In-memory trigger groups, rebuilt from events on startup and kept
+    /// up-to-date via EventBus subscription. Source of truth for the panel's
+    /// "Group" sections.
+    trigger_groups: Arc<std::sync::RwLock<HashMap<String, TriggerGroup>>>,
+}
+
+impl SchedulerManager {
+    /// Create a new scheduler manager.
+    /// `trigger_configs` is a shared Arc that the engine also holds, so both
+    /// the scheduler and engine tools see the same in-memory trigger state.
+    pub async fn new(
+        engine: SharedEngine,
+        pool: PgPool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let scheduler = JobScheduler::new().await?;
+
+        // Share the same trigger_configs Arc as the engine
+        let trigger_configs = engine.trigger_configs.clone();
+        let trigger_groups = engine.trigger_groups.clone();
+
+        Ok(Self {
+            scheduler,
+            engine,
+            pool,
+            tracked_tasks: Arc::new(RwLock::new(HashMap::new())),
+            backup_runner: Arc::new(std::sync::Mutex::new(None)),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            trigger_configs,
+            trigger_groups,
+        })
+    }
+
+    /// Start the scheduler and register all tasks
+    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Register system tasks (hardcoded)
+        self.register_system_tasks().await?;
+
+        // Migrate legacy trigger_crons table to events (idempotent)
+        self.migrate_db_triggers_to_events().await?;
+
+        // Replay trigger lifecycle events to rebuild in-memory state
+        self.replay_triggers_from_events().await?;
+
+        // Name any replayed schedule that can never fire. Create and update
+        // reject those now, so these are triggers stored before the guard
+        // existed: they keep their config and stay registered (the runner exits
+        // cleanly on "no more occurrences"), but they would otherwise sit in the
+        // panel looking healthy while doing nothing forever.
+        self.warn_on_dead_schedules();
+
+        // Rebuild the on-disk trigger.toml projection from the replayed set
+        // (derived read-model — ADR 0019): ensure it's git-ignored, write every
+        // current definition, and prune orphans from renames/deletes that
+        // happened while the engine was down. Best-effort (logs on failure).
+        {
+            let ws = self.engine.workspace_path().to_path_buf();
+            let configs: Vec<crate::triggers::TriggerConfig> = self
+                .trigger_configs
+                .read()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect();
+            tokio::task::spawn_blocking(move || {
+                crate::triggers::definition::ensure_trigger_toml_gitignored(&ws);
+                crate::triggers::definition::rebuild_trigger_definitions(&ws, &configs);
+            })
+            .await
+            .ok();
+        }
+
+        // Replay trigger-group lifecycle events into the parallel registry.
+        // Groups don't schedule anything, but the panel reads this registry to
+        // render the collapsible sections.
+        self.replay_trigger_groups_from_events().await;
+
+        // Fix stale placeholder trigger prompts (one-time, idempotent)
+        self.migrate_stale_trigger_prompts().await;
+
+        // Register all enabled triggers from in-memory state
+        self.register_triggers_from_configs().await?;
+
+        // Subscribe to EventBus for live trigger CRUD updates
+        self.start_trigger_event_subscriber();
+
+        // Load backup schedule from preferences (if any)
+        self.load_backup_schedule().await;
+
+        // Start the scheduler
+        self.scheduler.start().await?;
+        log!("[Scheduler] Started");
+
+        Ok(())
+    }
+
+    /// Register all system tasks
+    async fn register_system_tasks(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tracked_tasks = self.tracked_tasks.clone();
+        let engine_health = self.engine.clone();
+        let health_shutdown = self.shutdown_flag.clone();
+        let trigger_configs = self.trigger_configs.clone();
+
+        let health_job = Job::new_async("*/30 * * * * *", move |_uuid, _lock| {
+            let tracked = tracked_tasks.clone();
+            let engine = engine_health.clone();
+            let shutdown = health_shutdown.clone();
+            let configs = trigger_configs.clone();
+            Box::pin(async move {
+                check_task_health_and_restart(tracked, engine, shutdown, configs).await;
+            })
+        })?;
+
+        self.scheduler.add(health_job).await?;
+        log!("[Scheduler] Registered system task: task_health_monitor");
+
+        // Daily 03:00 UTC: disable push on devices not seen in 30 days. UTC
+        // because `Job::new_async` schedules there, and a staleness sweep needs
+        // no local hour (unlike the backup job below). Catches phantom
+        // subscriptions left behind by PWA reinstalls whose Apple/Google
+        // endpoint never returned 410 (so the per-fan-out 410 cleanup never ran).
+        // Disable-not-delete: zero data loss, fully reversible from Settings, no
+        // event spam beyond one DevicePushChanged per actually-flipped row.
+        // The same tick removes one-off devices, which hold no push at all.
+        let engine_prune = self.engine.clone();
+        let pool_prune = self.pool.clone();
+        let prune_job = Job::new_async("0 0 3 * * *", move |_uuid, _lock| {
+            let engine = engine_prune.clone();
+            let pool = pool_prune.clone();
+            Box::pin(async move {
+                prune_devices(&pool, &engine.event_bus).await;
+            })
+        })?;
+        self.scheduler.add(prune_job).await?;
+        log!(
+            "[Scheduler] Registered system task: prune_devices (daily 03:00 UTC, push off >{}d, one-off removed >{}d)",
+            STALE_DEVICE_DAYS,
+            ONE_OFF_DEVICE_DAYS
+        );
+
+        // Also run once at startup so accumulated rows get caught right after
+        // deploy without waiting for the first 03:00 tick. Awaited inline (not
+        // spawned) so a shutdown mid-prune cannot emit Device* events into a
+        // tearing-down EventBus. The work is bounded by the rows it matches.
+        prune_devices(&self.pool, &self.engine.event_bus).await;
+
+        // Daily 03:10 UTC: drop expired webhook delivery claims. Ten minutes
+        // after the device sweep so two DELETE-heavy jobs do not share a tick.
+        let pool_claims = self.pool.clone();
+        let claims_job = Job::new_async("0 10 3 * * *", move |_uuid, _lock| {
+            let pool = pool_claims.clone();
+            Box::pin(async move {
+                prune_webhook_delivery_claims(pool).await;
+            })
+        })?;
+        self.scheduler.add(claims_job).await?;
+        log!("[Scheduler] Registered system task: prune_webhook_delivery_claims (daily 03:10 UTC)");
+
+        let engine_plugin_updates = self.engine.clone();
+        let pool_plugin_updates = self.pool.clone();
+        let plugin_update_job =
+            Job::new_async(MARKETPLACE_UPDATE_CHECK_CRON, move |_uuid, _lock| {
+                let engine = engine_plugin_updates.clone();
+                let pool = pool_plugin_updates.clone();
+                Box::pin(async move {
+                    run_plugin_marketplace_update_check(engine, pool, ScanCause::Routine).await;
+                })
+            })?;
+        self.scheduler.add(plugin_update_job).await?;
+        log!(
+            "[Scheduler] Registered system task: plugin_marketplace_update_check ({})",
+            MARKETPLACE_UPDATE_CHECK_CRON
+        );
+
+        let startup_engine = self.engine.clone();
+        let startup_pool = self.pool.clone();
+        tokio::spawn(async move {
+            run_plugin_marketplace_update_check(startup_engine, startup_pool, ScanCause::Routine)
+                .await;
+        });
+
+        // Probe the public webhook path, so an ingress that stopped carrying
+        // deliveries is reported rather than silently dropping them.
+        let engine_ingress = self.engine.clone();
+        let pool_ingress = self.pool.clone();
+        let ingress_job = Job::new_async(WEBHOOK_INGRESS_CRON, move |_uuid, _lock| {
+            let engine = engine_ingress.clone();
+            let pool = pool_ingress.clone();
+            Box::pin(async move {
+                run_webhook_ingress_check(engine, pool).await;
+            })
+        })?;
+        self.scheduler.add(ingress_job).await?;
+        log!(
+            "[Scheduler] Registered system task: webhook_ingress_check ({})",
+            WEBHOOK_INGRESS_CRON
+        );
+
+        // Read what each hook did with the deliveries that DID arrive. Its own
+        // job rather than a step inside the ingress check, because that one
+        // stops when no webhook is enabled. That is the very state a disabled
+        // hook still taking deliveries is in.
+        let engine_refusal = self.engine.clone();
+        let pool_refusal = self.pool.clone();
+        let refusal_job = Job::new_async(WEBHOOK_REFUSAL_CRON, move |_uuid, _lock| {
+            let engine = engine_refusal.clone();
+            let pool = pool_refusal.clone();
+            Box::pin(async move {
+                run_webhook_refusal_check(engine, pool).await;
+            })
+        })?;
+        self.scheduler.add(refusal_job).await?;
+        log!(
+            "[Scheduler] Registered system task: webhook_refusal_check ({})",
+            WEBHOOK_REFUSAL_CRON
+        );
+
+        Ok(())
+    }
+
+    /// Migrate legacy `trigger_crons` table rows to event-sourced TriggerCreated events.
+    /// Idempotent: skips if trigger events already exist or the table does not exist.
+    /// After successful migration, drops the legacy table.
+    ///
+    /// Per-query errors propagate so a DB failure aborts startup loudly
+    /// instead of leaving the legacy table in place with no events emitted.
+    ///
+    /// DEPRECATED — landed 2026-04-06 (commit 02515f4d9). Temporary measure,
+    /// registered in docs/temporary-measures.md § "Scheduler one-time startup
+    /// migrations". Dead-on-arrival for any
+    /// install created after that date (the `trigger_crons` table never exists).
+    /// Removal blocked on confirming every live install has started up at least
+    /// once since the migration shipped. Once verified, drop this function and
+    /// its call site in `start()`. Keep the `ScheduledTrigger*` arms in
+    /// `triggers/replay.rs`: they replay immutable historical events.
+    /// Safe target: drop after the next major release that
+    /// requires a fresh install (or after telemetry confirms zero workspaces
+    /// retain the legacy table).
+    async fn migrate_db_triggers_to_events(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn drop_legacy_trigger_crons(pool: &PgPool) {
+            if let Err(e) = sqlx::query("DROP TABLE IF EXISTS trigger_crons")
+                .execute(pool)
+                .await
+            {
+                log!(
+                    "[Scheduler] Failed to drop legacy trigger_crons table: {}",
+                    e
+                );
+            }
+        }
+
+        use crate::engine::trigger_writes::TriggerWrite;
+
+        // Check if trigger_crons table exists
+        let table_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'trigger_crons'
+            )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        if !table_exists {
+            return Ok(());
+        }
+
+        // Check if TriggerCreated events already exist (idempotency)
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'TriggerCreated' AND aggregate = 'trigger'"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        if event_count > 0 {
+            drop_legacy_trigger_crons(&self.pool).await;
+            return Ok(());
+        }
+
+        // Read all rows from legacy table
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<serde_json::Value>, serde_json::Value, String, bool, Option<chrono::DateTime<chrono::Utc>>)>(
+            "SELECT id, name, skill_id, args, cron_expressions, timezone, enabled, last_run FROM trigger_crons ORDER BY created_at ASC"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            drop_legacy_trigger_crons(&self.pool).await;
+            return Ok(());
+        }
+
+        let count = rows.len();
+        for (id, name, legacy_target, _args, cron_json, timezone, enabled, _last_run) in rows {
+            let schedule: Vec<String> = serde_json::from_value(cron_json).unwrap_or_default();
+            let trigger_id_str = id.to_string();
+            let payload = serde_json::json!({
+                "trigger_id": trigger_id_str,
+                "name": name,
+                "schedule": schedule,
+                "timezone": timezone,
+                "run": serde_json::to_value(TriggerRun::Intent { intent: format!("Run trigger {}", legacy_target) }).unwrap(),
+            });
+
+            self.engine
+                .emit_trigger_write_or_log(
+                    TriggerWrite::Created,
+                    &trigger_id_str,
+                    payload,
+                    None,
+                    "[Scheduler] (legacy migration)",
+                )
+                .await;
+
+            // If the row was disabled, also record the pause.
+            if !enabled {
+                self.engine
+                    .emit_trigger_write_or_log(
+                        TriggerWrite::Disabled,
+                        &trigger_id_str,
+                        serde_json::json!({ "trigger_id": trigger_id_str }),
+                        None,
+                        "[Scheduler] (legacy migration)",
+                    )
+                    .await;
+            }
+        }
+
+        log!(
+            "[Scheduler] Migrated {} trigger(s) from trigger_crons to events",
+            count
+        );
+
+        drop_legacy_trigger_crons(&self.pool).await;
+        Ok(())
+    }
+
+    /// Replay trigger lifecycle events from the events table to rebuild in-memory state.
+    ///
+    /// A failed read aborts startup. Read as empty, it would run the session
+    /// with no triggers and prune every `trigger.toml` in the rebuild after it.
+    async fn replay_triggers_from_events(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let rows = sqlx::query_as::<_, (String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
+            "SELECT event_type, payload, created FROM events
+             WHERE aggregate = 'trigger'
+             ORDER BY sequence ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("Failed to replay trigger events: {e}"))?;
+
+        let event_rows: Vec<TriggerEventRow> = rows
+            .into_iter()
+            .map(|(event_type, payload, created)| TriggerEventRow {
+                event_type,
+                payload,
+                created,
+            })
+            .collect();
+
+        let count = event_rows.len();
+        let triggers = replay_trigger_events(event_rows);
+        let active = triggers.values().filter(|t| !t.paused).count();
+
+        let total = triggers.len();
+        {
+            let mut configs = self.trigger_configs.write().unwrap();
+            *configs = triggers;
+        }
+
+        if count > 0 {
+            log!(
+                "[Scheduler] Replayed {} trigger events → {} triggers ({} active)",
+                count,
+                total,
+                active
+            );
+        }
+        Ok(())
+    }
+
+    /// Replay trigger-group lifecycle events from the events table to rebuild
+    /// the in-memory registry.
+    ///
+    /// Unlike `replay_triggers_from_events`, a failed read degrades to no
+    /// groups: they schedule nothing and prune nothing, so the panel shows
+    /// flat sections and startup goes on.
+    async fn replay_trigger_groups_from_events(&self) {
+        let rows = sqlx::query_as::<_, (String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
+            "SELECT event_type, payload, created FROM events
+             WHERE aggregate = 'trigger_group'
+             ORDER BY sequence ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            log!("[Scheduler] Failed to replay trigger_group events: {}", e);
+            vec![]
+        });
+
+        let event_rows: Vec<TriggerGroupEventRow> = rows
+            .into_iter()
+            .map(|(event_type, payload, created)| TriggerGroupEventRow {
+                event_type,
+                payload,
+                created,
+            })
+            .collect();
+
+        let count = event_rows.len();
+        let groups = replay_trigger_group_events(event_rows);
+        let total = groups.len();
+        {
+            let mut g = self.trigger_groups.write().unwrap();
+            *g = groups;
+        }
+
+        if count > 0 {
+            log!(
+                "[Scheduler] Replayed {} trigger_group events → {} groups",
+                count,
+                total
+            );
+        }
+    }
+
+    /// Migrate triggers whose prompt text is a stale placeholder like `"Run trigger ..."` or `"Run skill ..."`.
+    ///
+    /// The legacy DB migration set all trigger prompts to a placeholder which is
+    /// meaningless. This replaces the text with actual prompt content by matching
+    /// the trigger's display name to prompt file frontmatter names.
+    ///
+    /// Idempotent: only matches triggers whose text starts with `"Run skill "` or `"Run trigger "`.
+    ///
+    /// DEPRECATED — landed 2026-04-07 (commit d32b2a518). Temporary measure,
+    /// registered in docs/temporary-measures.md § "Scheduler one-time startup
+    /// migrations". Dead-on-arrival for any
+    /// install created after that date (no triggers ever carry the stale placeholder).
+    /// Removal blocked on confirming every live install has started up at least
+    /// once since the fix shipped. Safe to drop together with
+    /// `migrate_db_triggers_to_events` once telemetry confirms zero workspaces
+    /// still hold the placeholder prompts.
+    async fn migrate_stale_trigger_prompts(&self) {
+        use crate::engine::trigger_writes::TriggerWrite;
+
+        let stale_configs: Vec<TriggerConfig> = {
+            let configs = self.trigger_configs.read().unwrap();
+            configs.values()
+                .filter(|c| matches!(&c.run, TriggerRun::Intent { intent, .. } if intent.starts_with("Run skill ") || intent.starts_with("Run trigger ")))
+                .cloned()
+                .collect()
+        };
+
+        if stale_configs.is_empty() {
+            return;
+        }
+
+        let data_dir = self.engine.workspace_path().join(crate::core::DATA_DIR);
+        let all_intents = crate::core::IntentStore::load_all(&data_dir);
+        let intents_by_name: HashMap<&str, &crate::core::intents::Intent> =
+            all_intents.iter().map(|p| (p.name.as_str(), p)).collect();
+
+        let mut updated = 0;
+        for config in &stale_configs {
+            let new_run = if let Some(intent) = intents_by_name.get(config.name.as_str()) {
+                Some(TriggerRun::Intent {
+                    intent: intent.content.clone(),
+                })
+            } else {
+                find_matching_script(&data_dir, &config.name)
+                    .map(|path| TriggerRun::Script { path })
+            };
+
+            if let Some(new_run) = new_run {
+                let payload = serde_json::json!({
+                    "trigger_id": config.id,
+                    "run": serde_json::to_value(&new_run).unwrap(),
+                });
+
+                // The chokepoint persists the event AND applies it to the
+                // registry, which this migration needs doubly: it runs before
+                // the subscriber starts, so nothing else would.
+                if let Err(e) = self
+                    .engine
+                    .emit_trigger_write(TriggerWrite::Updated, &config.id, payload.clone(), None)
+                    .await
+                {
+                    log!(
+                        "[Scheduler] Failed to emit TriggerUpdated for {}: {}",
+                        config.id,
+                        e
+                    );
+                    continue;
+                }
+
+                updated += 1;
+                log!(
+                    "[Scheduler] Fixed stale trigger prompt: {} ({})",
+                    config.name,
+                    config.id
+                );
+            } else {
+                log!("[Scheduler] WARN: Trigger '{}' ({}) has stale prompt — no matching prompt or script found",
+                    config.name, config.id);
+            }
+        }
+
+        if updated > 0 {
+            log!("[Scheduler] Migrated {} stale trigger prompt(s)", updated);
+        }
+    }
+
+    /// Log one warning per replayed trigger whose cron schedule can never fire.
+    ///
+    /// Covers paused triggers too, which is why it does not live in
+    /// `register_trigger_from_config`: registration skips them, and a paused
+    /// trigger with a dead schedule is exactly as broken as an active one.
+    fn warn_on_dead_schedules(&self) {
+        let configs = self.trigger_configs.read().unwrap();
+        for config in configs.values() {
+            if let Some(problem) = config.schedule_error() {
+                log!(
+                    "[Scheduler] Trigger '{}' ({}) has a schedule that can never fire: {}. It stays registered but will not run until its cron is fixed.",
+                    config.name,
+                    config.id,
+                    problem
+                );
+            }
+        }
+    }
+
+    /// Register all active (non-paused) triggers from in-memory configs with the cron scheduler.
+    async fn register_triggers_from_configs(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let configs: Vec<TriggerConfig> = {
+            let configs = self.trigger_configs.read().unwrap();
+            configs
+                .values()
+                .filter(|t| !t.paused && !t.schedule.is_empty())
+                .cloned()
+                .collect()
+        };
+
+        for config in configs {
+            self.register_trigger_from_config(&config).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Register a single trigger from its in-memory config.
+    async fn register_trigger_from_config(
+        &mut self,
+        config: &TriggerConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Generate a deterministic UUID from the trigger ID for tracking
+        let task_id = trigger_id_to_uuid(&config.id);
+
+        // Check if already tracked
+        if self.tracked_tasks.read().await.contains_key(&task_id) {
+            return Ok(());
+        }
+
+        register_and_track(
+            config,
+            &self.tracked_tasks,
+            &self.engine,
+            &self.shutdown_flag,
+            &self.trigger_configs,
+        )
+        .await;
+
+        log!(
+            "[Scheduler] Registered trigger: {} ({} in {})",
+            config.name,
+            config.schedule.join(", "),
+            config.timezone
+        );
+
+        Ok(())
+    }
+
+    /// Start a background task that subscribes to EventBus for trigger lifecycle
+    /// events AND domain events (to fire event-based triggers).
+    fn start_trigger_event_subscriber(&self) {
+        let mut rx = self.engine.event_bus.subscribe();
+        let trigger_configs = self.trigger_configs.clone();
+        let trigger_groups = self.trigger_groups.clone();
+        let tracked_tasks = self.tracked_tasks.clone();
+        let engine = self.engine.clone();
+        let shutdown_flag = self.shutdown_flag.clone();
+        // For re-arming the backup loop when the timezone or a backup
+        // preference changes. The agent/HTTP write path is event-driven,
+        // because a tool cannot reach the scheduler directly.
+        let backup_runner = self.backup_runner.clone();
+        let pool = self.pool.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(emitted) => {
+                        if let crate::engine::event_bus::BusEvent::System(se) = &emitted.typed {
+                            use crate::engine::event_bus::SystemEvent;
+                            match se {
+                                SystemEvent::TriggerCreated {
+                                    trigger_id,
+                                    payload,
+                                    ..
+                                }
+                                | SystemEvent::TriggerUpdated {
+                                    trigger_id,
+                                    payload,
+                                    ..
+                                }
+                                | SystemEvent::TriggerDeleted {
+                                    trigger_id,
+                                    payload,
+                                    ..
+                                }
+                                | SystemEvent::TriggerEnabled {
+                                    trigger_id,
+                                    payload,
+                                    ..
+                                }
+                                | SystemEvent::TriggerDisabled {
+                                    trigger_id,
+                                    payload,
+                                    ..
+                                }
+                                | SystemEvent::TriggerExecuted {
+                                    trigger_id,
+                                    payload,
+                                } => {
+                                    handle_trigger_event(
+                                        se.event_type(),
+                                        trigger_id,
+                                        payload,
+                                        &trigger_configs,
+                                        &tracked_tasks,
+                                        &engine,
+                                        &shutdown_flag,
+                                    )
+                                    .await;
+                                }
+                                SystemEvent::TriggerGroupCreated {
+                                    group_id, payload, ..
+                                }
+                                | SystemEvent::TriggerGroupRenamed {
+                                    group_id, payload, ..
+                                }
+                                | SystemEvent::TriggerGroupReordered {
+                                    group_id, payload, ..
+                                }
+                                | SystemEvent::TriggerGroupDeleted {
+                                    group_id, payload, ..
+                                } => {
+                                    handle_trigger_group_event(
+                                        se.event_type(),
+                                        group_id,
+                                        payload,
+                                        &trigger_groups,
+                                    );
+                                }
+                                // Re-arm the backup loop when the user's
+                                // timezone changes, so the next fire is
+                                // resolved in the new zone.
+                                SystemEvent::TimezoneSet { .. } => {
+                                    reload_backup_schedule(
+                                        &backup_runner,
+                                        &engine,
+                                        &shutdown_flag,
+                                        &pool,
+                                    )
+                                    .await;
+                                }
+                                // Re-arm when the backup schedule or provider
+                                // changes via any write path: the agent's
+                                // `set_preference` (the tool layer cannot reach
+                                // the scheduler) or the HTTP handler. Idempotent
+                                // with the handler's own direct call.
+                                SystemEvent::PreferencesChanged { key, .. }
+                                    if key == prefs::BACKUP_SCHEDULE.key()
+                                        || key == prefs::BACKUP_PROVIDER.key() =>
+                                {
+                                    reload_backup_schedule(
+                                        &backup_runner,
+                                        &engine,
+                                        &shutdown_flag,
+                                        &pool,
+                                    )
+                                    .await;
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Every trigger carrier, decided in one place. See
+                        // `trigger_dispatch`.
+                        if let Some(dispatch) = trigger_dispatch(&emitted) {
+                            handle_domain_event(
+                                &dispatch.event_type,
+                                &dispatch.payload,
+                                dispatch.depth,
+                                dispatch.emitting_trigger_id.as_deref(),
+                                dispatch.origin_thread_id,
+                                Some(emitted.event_id),
+                                &trigger_configs,
+                                &engine,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        crate::log!("[Scheduler] EventBus subscriber lagged by {} events", n);
+                        rearm_after_lag(&trigger_configs, &tracked_tasks, &engine, &shutdown_flag)
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        crate::log!("[Scheduler] EventBus closed, stopping trigger subscriber");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// List all trigger configs from in-memory state.
+    pub fn list_trigger_configs(&self) -> Vec<TriggerConfig> {
+        let configs = self.trigger_configs.read().unwrap();
+        configs.values().cloned().collect()
+    }
+
+    /// Get a specific trigger config by ID.
+    pub fn get_trigger_config(&self, id: &str) -> Option<TriggerConfig> {
+        let configs = self.trigger_configs.read().unwrap();
+        configs.get(id).cloned()
+    }
+
+    /// Load backup schedule from preferences on startup. Delegates to the shared
+    /// reload path so startup, a timezone change, and an agent/HTTP pref write
+    /// all arm the loop identically (in the user's timezone).
+    async fn load_backup_schedule(&mut self) {
+        reload_backup_schedule(
+            &self.backup_runner,
+            &self.engine,
+            &self.shutdown_flag,
+            &self.pool,
+        )
+        .await;
+    }
+
+    /// Set or clear the automatic backup schedule.
+    ///
+    /// `cron`: A 6-field cron expression (e.g., "0 0 3 * * *" for daily at 3am),
+    ///         or `None` to disable.
+    /// `provider`: The backup provider ID (e.g., "google_drive").
+    /// `actor` is stamped on the `PreferencesChanged` events the store emits
+    /// for the keys this writes. Those emits are load-bearing rather than
+    /// cosmetic: the scheduler's own `PreferencesChanged` subscriber
+    /// re-registers the backup cron from them, and the Settings page reloads on
+    /// them. They used to be hand-rolled by the one HTTP caller, which left the
+    /// next caller of this method silently un-announced.
+    pub async fn set_backup_schedule(
+        &mut self,
+        cron: Option<&str>,
+        provider: &str,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let schedule_key = prefs::BACKUP_SCHEDULE.key();
+        let provider_key = prefs::BACKUP_PROVIDER.key();
+
+        match cron {
+            Some(expr) => {
+                // Validate cron expression before persisting
+                crate::engine::tools::scheduler::parse_standard_cron(expr)
+                    .map_err(|e| format!("Invalid cron expression '{}': {}", expr, e))?;
+
+                let bus = &self.engine.event_bus;
+                PreferenceStore::set(&self.pool, bus, schedule_key, expr, actor.clone()).await?;
+                PreferenceStore::set(&self.pool, bus, provider_key, provider, actor).await?;
+
+                arm_backup_runner(
+                    &self.backup_runner,
+                    &self.engine,
+                    &self.shutdown_flag,
+                    expr,
+                    provider,
+                )
+                .await?;
+            }
+            None => {
+                // Disable schedule. The PROVIDER is still written: it is the
+                // configured destination, not a property of the cron, and the
+                // Backup page reads it back to know which provider it is
+                // talking about. Skipping it here made the destination
+                // unwritable with the schedule off, so a user who picked
+                // Dropbox while backups were manual-only kept whatever the
+                // preference happened to hold.
+                let bus = &self.engine.event_bus;
+                PreferenceStore::set(&self.pool, bus, schedule_key, "off", actor.clone()).await?;
+                PreferenceStore::set(&self.pool, bus, provider_key, provider, actor).await?;
+                stop_backup_runner(&self.backup_runner);
+                log!("[Scheduler] Backup schedule disabled");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Shutdown the scheduler gracefully.
+    ///
+    /// 1. Signals all task runners to stop scheduling new executions
+    /// 2. Waits up to 60s for in-flight task executions to complete
+    /// 3. Aborts any remaining task handles
+    pub async fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        log!("[Scheduler] Shutting down...");
+
+        // Signal all task runners to stop — they'll exit after their current execution finishes
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        // The backup loop reads the same flag, but the token wakes it now
+        // instead of on its next 30-second poll.
+        stop_backup_runner(&self.backup_runner);
+
+        // Wait for in-flight task executions to complete (up to 60 seconds)
+        let active = ACTIVE_TASK_COUNT.load(Ordering::Relaxed);
+        if active > 0 {
+            // Log which tasks are still running
+            {
+                let tracked = self.tracked_tasks.read().await;
+                let running: Vec<_> = tracked
+                    .values()
+                    .filter(|t| !t.handle.is_finished())
+                    .map(|t| t.task_name.as_str())
+                    .collect();
+                log!(
+                    "[Scheduler] {} task(s) still executing ({}), waiting for completion...",
+                    active,
+                    running.join(", ")
+                );
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if ACTIVE_TASK_COUNT.load(Ordering::Relaxed) == 0 {
+                    log!("[Scheduler] All in-flight tasks completed");
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    let remaining = ACTIVE_TASK_COUNT.load(Ordering::Relaxed);
+                    log!(
+                        "[Scheduler] Timeout waiting for {} task(s), aborting",
+                        remaining
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+
+        // Abort all tracked task handles (runners that are sleeping between executions)
+        {
+            let mut tracked = self.tracked_tasks.write().await;
+            for (_, task) in tracked.drain() {
+                task.handle.abort();
+            }
+        }
+
+        self.scheduler.shutdown().await?;
+        log!("[Scheduler] Shutdown complete");
+        Ok(())
+    }
+}
+
+/// Shared `Arc<Mutex>` holding the running backup loop's cancel token (or
+/// `None`). Aliased for the free backup-scheduling helpers below, which the
+/// methods and the EventBus subscriber both call.
+type BackupRunner = Arc<std::sync::Mutex<Option<CancellationToken>>>;
+
+/// Resolve the user's IANA timezone for backup scheduling, falling back to UTC.
+/// Mirrors `task_runner`'s per-trigger timezone handling so the backup cron
+/// fires at the configured wall-clock time in the user's timezone — not UTC.
+async fn backup_timezone(engine: &SharedEngine) -> chrono_tz::Tz {
+    let tz = engine.user_timezone().await;
+    if tz.is_empty() {
+        return chrono_tz::UTC;
+    }
+    tz.parse().unwrap_or_else(|_| {
+        log!(
+            "[Scheduler] Invalid timezone '{}' for backup schedule, using UTC",
+            tz
+        );
+        chrono_tz::UTC
+    })
+}
+
+/// The next UTC instant `schedule` fires at in `tz`, strictly after `after`.
+///
+/// Pure, which is the point: it takes the clock as an argument, so the DST
+/// behaviour is assertable without waiting six months. `chrono_tz` resolves the
+/// local time against the zone's rules at that date, so a 03:00 backup stays at
+/// 03:00 across a change of offset.
+///
+/// A `FixedOffset` cannot do that. `tokio_cron_scheduler::Job::new_async_tz`
+/// freezes one at registration, and an engine started in winter then ran every
+/// nightly backup an hour off from the last Sunday in March.
+fn next_backup_fire(
+    schedule: &cron::Schedule,
+    tz: chrono_tz::Tz,
+    after: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    crate::engine::tools::scheduler::next_occurrences_after(
+        std::slice::from_ref(schedule),
+        tz,
+        after,
+        1,
+    )
+    .into_iter()
+    .next()
+    .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Run the scheduled backup on `cron_expr`, resolving each fire through `tz` at
+/// the moment it is computed.
+///
+/// The idiom is `task_runner::run_task_loop`'s, deliberately: short polls rather
+/// than one long sleep, because a monotonic timer does not advance across macOS
+/// system sleep. Exits on the shared shutdown flag or on `cancel`, whichever
+/// comes first.
+async fn run_backup_loop(
+    engine: SharedEngine,
+    schedule: cron::Schedule,
+    tz: chrono_tz::Tz,
+    provider_id: String,
+    shutdown_flag: Arc<AtomicBool>,
+    cancel: CancellationToken,
+) {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    loop {
+        if shutdown_flag.load(Ordering::Relaxed) || cancel.is_cancelled() {
+            return;
+        }
+        let Some(next) = next_backup_fire(&schedule, tz, chrono::Utc::now()) else {
+            log!("[Scheduler] Backup schedule has no further occurrences, stopping");
+            return;
+        };
+        loop {
+            if shutdown_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            let now = chrono::Utc::now();
+            if now >= next {
+                break;
+            }
+            let remaining = (next - now)
+                .to_std()
+                .unwrap_or(std::time::Duration::from_secs(1));
+            tokio::select! {
+                _ = tokio::time::sleep(remaining.min(POLL_INTERVAL)) => {}
+                _ = cancel.cancelled() => return,
+            }
+        }
+        run_scheduled_backup(engine.clone(), provider_id.clone()).await;
+    }
+}
+
+/// Arm (or re-arm) the backup loop, in the user's timezone. Cancels any running
+/// loop first, so it is idempotent: calling it twice with the same schedule
+/// converges on exactly one runner.
+///
+/// Re-run at engine startup (`load_backup_schedule`) and on a `TimezoneSet` or
+/// backup-pref change (the EventBus subscriber), which is what picks up a
+/// changed ZONE. A changed OFFSET needs nothing, because the loop re-resolves
+/// every fire through `chrono_tz`. See [`next_backup_fire`].
+async fn arm_backup_runner(
+    backup_runner: &BackupRunner,
+    engine: &SharedEngine,
+    shutdown_flag: &Arc<AtomicBool>,
+    cron_expr: &str,
+    provider_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let schedule = crate::engine::tools::scheduler::parse_standard_cron(cron_expr)?;
+    let tz = backup_timezone(engine).await;
+
+    // Swap under ONE guard. Two arms race here in practice: the preference
+    // write emits `PreferencesChanged`, whose subscriber re-arms, while the
+    // handler that wrote it arms too. Taking the lock twice lets the second
+    // store overwrite the first token before anyone cancels it. That leaves a
+    // backup loop nothing can stop, and two uploads per tick.
+    let cancel = CancellationToken::new();
+    {
+        let mut slot = backup_runner.lock().unwrap();
+        if let Some(prev) = slot.replace(cancel.clone()) {
+            prev.cancel();
+            log!("[Scheduler] Stopped backup runner");
+        }
+    }
+
+    tokio::spawn(run_backup_loop(
+        engine.clone(),
+        schedule,
+        tz,
+        provider_id.to_string(),
+        shutdown_flag.clone(),
+        cancel,
+    ));
+    log!(
+        "[Scheduler] Armed backup runner: {} (provider: {}, tz: {})",
+        cron_expr,
+        provider_id,
+        tz
+    );
+    Ok(())
+}
+
+/// Stop the backup loop if one is running (used when the schedule is disabled,
+/// no longer active, or about to be replaced).
+fn stop_backup_runner(backup_runner: &BackupRunner) {
+    let prev = backup_runner.lock().unwrap().take();
+    if let Some(cancel) = prev {
+        cancel.cancel();
+        log!("[Scheduler] Stopped backup runner");
+    }
+}
+
+/// Re-read the persisted backup schedule + provider and (re-)arm the loop in
+/// the user's CURRENT timezone, or stop it when the schedule is disabled/unset.
+/// Idempotent. This is the single registration path shared by startup
+/// (`load_backup_schedule`) and the EventBus subscriber (which calls it on a
+/// `TimezoneSet` or a `backup_schedule` / `backup_provider` `PreferencesChanged`,
+/// so an agent write, an HTTP write or a timezone change takes effect with no
+/// engine restart).
+pub(crate) async fn reload_backup_schedule(
+    backup_runner: &BackupRunner,
+    engine: &SharedEngine,
+    shutdown_flag: &Arc<AtomicBool>,
+    pool: &PgPool,
+) {
+    use crate::core::backup::is_schedule_active;
+
+    let read_schedule = prefs::BACKUP_SCHEDULE.try_stored(pool).await;
+    if let Err(e) = &read_schedule {
+        // A preference read that could not run is UNKNOWN, not "the user turned
+        // backups off". It still falls through to the disabled branch below, so
+        // say so loudly: otherwise a DB hiccup ends scheduled backups in silence.
+        log!(
+            "[Scheduler] Could not read {}, treating the backup schedule as \
+             disabled for this reload: {}",
+            prefs::BACKUP_SCHEDULE.key(),
+            e
+        );
+    }
+    let cron = match read_schedule {
+        Ok(Some(c)) if is_schedule_active(&c) => c,
+        _ => {
+            // Disabled or unset, so make sure no stale runner lingers.
+            stop_backup_runner(backup_runner);
+            return;
+        }
+    };
+    let read_provider = prefs::BACKUP_PROVIDER.try_stored(pool).await;
+    if let Err(e) = &read_provider {
+        log!(
+            "[Scheduler] Could not read {}, so the backup runner stays disarmed \
+             for this reload: {}",
+            prefs::BACKUP_PROVIDER.key(),
+            e
+        );
+    }
+    let provider = match read_provider {
+        Ok(Some(p)) if !p.is_empty() => p,
+        // The schedule is active but has no provider to upload to. Stop any
+        // running loop, rather than leave one firing at a now-absent provider.
+        _ => {
+            stop_backup_runner(backup_runner);
+            return;
+        }
+    };
+    if let Err(e) = arm_backup_runner(backup_runner, engine, shutdown_flag, &cron, &provider).await
+    {
+        log!("[Scheduler] Failed to reload backup schedule: {}", e);
+    }
+}
+
+mod task_runner;
+use task_runner::{
+    check_task_health_and_restart, handle_domain_event, handle_trigger_event, rearm_after_lag,
+    register_and_track, TrackedTask,
+};
+
+/// Apply a trigger-group lifecycle event to the in-memory registry. Groups
+/// don't schedule anything, so this is just a write to the shared map. Called
+/// from the EventBus subscriber so every connected SSE consumer (and the
+/// engine's own registry) converges on the same state.
+///
+/// The `create` and `rename` helpers in
+/// [`crate::engine::trigger_group_writes`] also call this synchronously,
+/// under [`crate::engine::LucidosEngine::trigger_group_write_lock`], so the
+/// case-insensitive unique-name invariant survives concurrent requests — the
+/// broadcast subscriber's apply happens too late for that. The reorder
+/// handler (`POST /trigger-groups/reorder`) also calls this synchronously
+/// after each emit, because callers expect a follow-up `GET /trigger-groups`
+/// to reflect the new ordering. Delete still rides only on the broadcast
+/// subscriber today (no read-after-write API contract on delete); if one is
+/// added, route it through this same function as well.
+pub(crate) fn handle_trigger_group_event(
+    event_type: &str,
+    group_id: &str,
+    payload: &serde_json::Value,
+    trigger_groups: &Arc<std::sync::RwLock<HashMap<String, TriggerGroup>>>,
+) {
+    match event_type {
+        "TriggerGroupCreated" => {
+            if let Ok(group) = TriggerGroup::from_created_payload(payload, chrono::Utc::now()) {
+                let mut g = trigger_groups.write().unwrap();
+                g.insert(group_id.to_string(), group);
+            }
+        }
+        "TriggerGroupRenamed" => {
+            let mut g = trigger_groups.write().unwrap();
+            if let Some(group) = g.get_mut(group_id) {
+                group.apply_renamed_payload(payload);
+            }
+        }
+        "TriggerGroupReordered" => {
+            let mut g = trigger_groups.write().unwrap();
+            if let Some(group) = g.get_mut(group_id) {
+                group.apply_reordered_payload(payload);
+            }
+        }
+        "TriggerGroupDeleted" => {
+            let mut g = trigger_groups.write().unwrap();
+            g.remove(group_id);
+        }
+        _ => {}
+    }
+}
+
+mod backup;
+use backup::run_scheduled_backup;
+pub(crate) use backup::{ensure_backup_key, run_backup, BackupGuard};
+use plugin_updates::{
+    run_plugin_marketplace_update_check, ScanCause, MARKETPLACE_UPDATE_CHECK_CRON,
+};
+use webhook_ingress::{run_webhook_ingress_check, WEBHOOK_INGRESS_CRON};
+use webhook_refusal::{run_webhook_refusal_check, WEBHOOK_REFUSAL_CRON};
+
+/// Drop webhook delivery claims nothing can still be waiting on.
+///
+/// The ledger's horizon IS the largest window a hook may configure, so a claim
+/// this deletes cannot still be deciding a duplicate. Silent by design: the
+/// table is a nonce ledger, and expiring a claim is not a state change anyone
+/// made.
+pub(crate) async fn prune_webhook_delivery_claims(pool: PgPool) {
+    match crate::core::DeliveryLedger::prune(&pool).await {
+        Ok(0) => {}
+        Ok(gone) => log!(
+            "[Scheduler] Pruned {} expired webhook delivery claim(s)",
+            gone
+        ),
+        Err(e) => log!("[Scheduler] prune_webhook_delivery_claims failed: {}", e),
+    }
+}
+
+/// The daily device sweep: one-off devices removed, then push off on stale
+/// devices. Order matters: removal reads the push flag, so it must see the flag
+/// as the day began, never one this sweep just turned off.
+async fn prune_devices(pool: &PgPool, event_bus: &EventBus) {
+    remove_one_off_devices(pool, event_bus, ONE_OFF_DEVICE_DAYS).await;
+    disable_push_on_stale_devices(pool, event_bus, STALE_DEVICE_DAYS).await;
+}
+
+/// Remove every device never seen past its first day, once older than
+/// `older_than_days`. `DeviceStore::remove_one_off` announces each removal.
+/// Engine-internal: emits `actor: None`.
+async fn remove_one_off_devices(pool: &PgPool, event_bus: &EventBus, older_than_days: i32) {
+    match crate::core::DeviceStore::remove_one_off(pool, event_bus, older_than_days).await {
+        Ok(removed) if removed.is_empty() => {}
+        Ok(removed) => log!(
+            "[Scheduler] Removed {} one-off device(s) (>{}d)",
+            removed.len(),
+            older_than_days
+        ),
+        Err(e) => log!("[Scheduler] remove_one_off_devices failed: {}", e),
+    }
+}
+
+/// Flip `push_enabled` to false on every device whose `last_seen_at` is older
+/// than `cutoff_days`. Devices already disabled are filtered at the SELECT
+/// layer so a re-run produces no events. Engine-internal: emits `actor: None`.
+async fn disable_push_on_stale_devices(pool: &PgPool, event_bus: &EventBus, cutoff_days: i64) {
+    let stale = match crate::core::DeviceStore::list_stale_push_enabled(pool, cutoff_days).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            log!(
+                "[Scheduler] disable_push_on_stale_devices: list failed: {}",
+                e
+            );
+            return;
+        }
+    };
+    if stale.is_empty() {
+        return;
+    }
+    log!(
+        "[Scheduler] Disabling push on {} stale device(s) (>{}d)",
+        stale.len(),
+        cutoff_days
+    );
+
+    for device_id in stale {
+        // `set_push_enabled` announces `DevicePushChanged` itself, and only when
+        // a row actually flipped, so this sweep cannot report a device it missed.
+        match crate::core::DeviceStore::set_push_enabled(pool, event_bus, &device_id, false, None)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                // Disappeared between SELECT and UPDATE — benign race.
+            }
+            Err(e) => {
+                log!("[Scheduler] set_push_enabled({}) failed: {}", device_id, e);
+            }
+        }
+    }
+}
+
+/// Try to find a script matching a trigger name by keyword overlap.
+///
+/// Searches `data/triggers/*/scripts/` and `data/apps/*/scripts/` for `run.py`.
+/// Returns the data-relative script path (e.g. `triggers/oura-import/scripts/run.py`).
+fn find_matching_script(data_dir: &std::path::Path, trigger_name: &str) -> Option<String> {
+    let name_lower = trigger_name.to_lowercase();
+    for (subdir, prefix) in &[("triggers", "triggers"), ("apps", "apps")] {
+        let search_dir = data_dir.join(subdir);
+        if let Ok(entries) = std::fs::read_dir(&search_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !path.join("scripts").join("run.py").exists() {
+                    continue;
+                }
+                // Drop empty segments so a trailing/leading/double dash (e.g.
+                // "foo-" -> ["foo", ""]) doesn't contribute a "" keyword that
+                // `name_lower.contains("")` matches unconditionally. An
+                // all-dash dir name yields no keywords and must not match
+                // everything, so require at least one keyword.
+                let dir_keywords: Vec<&str> =
+                    dir_name.split('-').filter(|kw| !kw.is_empty()).collect();
+                if !dir_keywords.is_empty() && dir_keywords.iter().all(|kw| name_lower.contains(kw))
+                {
+                    return Some(format!("{}/{}/scripts/run.py", prefix, dir_name));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
+    use crate::engine::thread_events::{EventMeta, ThreadEvent};
+
+    /// One broadcast frame, at a stated chain depth, emitted by no trigger.
+    fn emitted(typed: BusEvent, depth: u32) -> EmittedEvent {
+        EmittedEvent {
+            event_id: uuid::Uuid::new_v4(),
+            seq: Some(1),
+            created: chrono::Utc::now(),
+            typed,
+            aggregate: None,
+            depth,
+            emitting_trigger_id: None,
+        }
+    }
+
+    fn thread_frame(thread_id: uuid::Uuid, event: ThreadEvent, depth: u32) -> EmittedEvent {
+        emitted(
+            BusEvent::Thread {
+                thread_id,
+                event,
+                meta: EventMeta::NONE,
+            },
+            depth,
+        )
+    }
+
+    fn response_generated() -> ThreadEvent {
+        ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        }
+    }
+
+    /// The hole Bug 2 lived in. The thread arm passed a literal `0`. A trigger
+    /// fire's own `ResponseGenerated` therefore looked like a top-level event,
+    /// and `MAX_EVENT_TRIGGER_DEPTH` never engaged for the whole carrier.
+    #[test]
+    fn a_thread_event_dispatches_at_the_emitting_runs_depth() {
+        let thread_id = uuid::Uuid::new_v4();
+        let dispatch = trigger_dispatch(&thread_frame(thread_id, response_generated(), 2))
+            .expect("a lifecycle event is a trigger carrier");
+
+        assert_eq!(dispatch.depth, 2, "the fire's depth, not zero");
+        assert_eq!(dispatch.event_type, "ResponseGenerated");
+        assert_eq!(dispatch.origin_thread_id, Some(thread_id));
+        assert_eq!(
+            dispatch.payload.get("thread_id").and_then(|v| v.as_str()),
+            Some(thread_id.to_string().as_str()),
+            "the matchable payload carries thread_id, which is what makes it \
+             a usable on_event filter"
+        );
+    }
+
+    /// A condition on a meta field gives one verdict live and on replay. The
+    /// live view dropped the carrier's meta, so `channel` matched the stored
+    /// row and never the live frame.
+    #[test]
+    fn a_condition_on_meta_gives_the_same_verdict_live_and_stored() {
+        use crate::core::event_subscription::{matchable_payload, EventSubscription};
+        use crate::engine::thread_events::EventChannel;
+
+        let thread_id = uuid::Uuid::new_v4();
+        let meta = EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        };
+        let event = response_generated();
+        let stored =
+            matchable_payload(event.event_type(), event.to_payload(&meta), Some(thread_id));
+        let live = trigger_dispatch(&emitted(
+            BusEvent::Thread {
+                thread_id,
+                event,
+                meta,
+            },
+            0,
+        ))
+        .expect("a lifecycle event is a trigger carrier")
+        .payload;
+
+        let on_coding_agent = EventSubscription {
+            event_type: "ResponseGenerated".into(),
+            condition: Some(serde_json::json!({"channel": "claude_code"})),
+        };
+        assert!(on_coding_agent.matches("ResponseGenerated", &stored));
+        assert!(
+            on_coding_agent.matches("ResponseGenerated", &live),
+            "the live frame must match what its stored row matches"
+        );
+        assert_eq!(live, stored);
+    }
+
+    #[test]
+    fn an_ordinary_turn_dispatches_at_zero() {
+        // Nothing outside a trigger fire is a link in anyone's chain, so the
+        // cap must stay out of the way of normal use.
+        let dispatch =
+            trigger_dispatch(&thread_frame(uuid::Uuid::new_v4(), response_generated(), 0))
+                .expect("a lifecycle event is a trigger carrier");
+        assert_eq!(dispatch.depth, 0);
+    }
+
+    #[test]
+    fn per_token_streaming_never_reaches_the_matcher() {
+        assert_eq!(
+            trigger_dispatch(&thread_frame(
+                uuid::Uuid::new_v4(),
+                ThreadEvent::TextStreamed { text: "tok".into() },
+                0,
+            )),
+            None,
+            "the blocklist still gates the thread carrier"
+        );
+    }
+
+    #[test]
+    fn a_side_question_never_reaches_the_matcher() {
+        for event in crate::test_support::every_side_question_event() {
+            let name = event.event_type();
+            assert_eq!(
+                trigger_dispatch(&thread_frame(uuid::Uuid::new_v4(), event, 0)),
+                None,
+                "{name} reached the trigger matcher"
+            );
+        }
+    }
+
+    #[test]
+    fn a_domain_event_dispatches_at_its_own_persisted_depth() {
+        // The envelope depth is the emitting task's; the variant's is the one
+        // a replay reconstructs, so the domain carrier keeps reading its own.
+        let frame = emitted(
+            BusEvent::System(SystemEvent::DomainEvent {
+                event_type: "BuildObserved".into(),
+                payload: serde_json::json!({"summary": "green"}),
+                depth: 1,
+                transient: false,
+                actor: None,
+            }),
+            0,
+        );
+        let dispatch = trigger_dispatch(&frame).expect("a domain event is a trigger carrier");
+        assert_eq!(dispatch.depth, 1);
+        assert_eq!(dispatch.event_type, "BuildObserved");
+        assert_eq!(
+            dispatch.origin_thread_id, None,
+            "a domain event belongs to no thread"
+        );
+    }
+
+    /// Invariant I8 over the payload, not just the verdict. Both fan-outs have
+    /// to hand the matcher the same object, or a `condition` matches a wait and
+    /// misses a trigger on the same event.
+    ///
+    /// `actor` is the field that makes the difference visible: the stored
+    /// payload carries it, and the variant's own `payload` does not.
+    #[test]
+    fn a_domain_event_dispatches_the_same_payload_the_wait_matcher_sees() {
+        use crate::core::event_subscription::matchable_system_payload;
+        use crate::engine::thread_events::MessageOrigin;
+
+        let se = SystemEvent::DomainEvent {
+            event_type: "BuildObserved".into(),
+            payload: serde_json::json!({"summary": "green"}),
+            depth: 0,
+            transient: false,
+            actor: Some(MessageOrigin::Device {
+                device_id: "device-1".into(),
+            }),
+        };
+        let dispatch = trigger_dispatch(&emitted(BusEvent::System(se.clone()), 0))
+            .expect("a domain event is a trigger carrier");
+
+        assert_eq!(
+            dispatch.payload,
+            matchable_system_payload(&se),
+            "the trigger matcher reads the stored payload, the same one the \
+             event-wait dispatcher offers"
+        );
+        assert!(
+            dispatch.payload.get("actor").is_some(),
+            "the actor the emit recorded is matchable: {}",
+            dispatch.payload
+        );
+    }
+
+    /// Persisted means triggerable (ADR 0113). `BackupCompleted` has no thread
+    /// event and no domain event beside it, so this arm is the only path to it.
+    #[test]
+    fn a_persisted_system_event_is_a_carrier() {
+        let now = chrono::Utc::now();
+        let frame = emitted(
+            BusEvent::System(SystemEvent::BackupCompleted {
+                filename: "lucidos-backup-2026.tar.zst".into(),
+                size_bytes: 42,
+                started_at: now,
+                finished_at: now,
+            }),
+            0,
+        );
+        let dispatch = trigger_dispatch(&frame).expect("a persisted frame is a trigger carrier");
+        assert_eq!(dispatch.event_type, "BackupCompleted");
+        assert_eq!(
+            dispatch.payload.get("filename").and_then(|v| v.as_str()),
+            Some("lucidos-backup-2026.tar.zst"),
+            "the adjacent-tag envelope is flattened, so a condition names the \
+             event's own field"
+        );
+        assert_eq!(
+            dispatch.origin_thread_id, None,
+            "a system frame belongs to no thread"
+        );
+    }
+
+    /// A trigger's own run emits persisted frames, and a trigger may subscribe
+    /// to one it emits. That chain ends only if the frame keeps the emitting
+    /// task's depth.
+    #[test]
+    fn a_persisted_system_event_dispatches_at_the_emitting_runs_depth() {
+        let frame = emitted(
+            BusEvent::System(SystemEvent::TriggerExecuted {
+                trigger_id: "t-1".into(),
+                payload: serde_json::json!({}),
+            }),
+            2,
+        );
+        let dispatch = trigger_dispatch(&frame).expect("TriggerExecuted is persisted");
+        assert_eq!(dispatch.depth, 2, "the fire's depth, not zero");
+    }
+
+    /// All three carriers read the emitting trigger off the frame, the domain
+    /// arm included, which takes its depth off the variant instead. Miss one
+    /// and a trigger subscribed to that carrier still wakes itself.
+    #[test]
+    fn every_carrier_reports_the_trigger_whose_fire_emitted_it() {
+        let carriers = [
+            thread_frame(uuid::Uuid::new_v4(), response_generated(), 0),
+            emitted(
+                BusEvent::System(SystemEvent::DomainEvent {
+                    event_type: "BuildObserved".into(),
+                    payload: serde_json::json!({}),
+                    depth: 0,
+                    transient: false,
+                    actor: None,
+                }),
+                0,
+            ),
+            emitted(
+                BusEvent::System(SystemEvent::TriggerExecuted {
+                    trigger_id: "t-1".into(),
+                    payload: serde_json::json!({}),
+                }),
+                0,
+            ),
+        ];
+
+        for mut frame in carriers {
+            frame.emitting_trigger_id = Some("t-1".into());
+            let dispatch = trigger_dispatch(&frame).expect("a trigger carrier");
+            assert_eq!(
+                dispatch.emitting_trigger_id.as_deref(),
+                Some("t-1"),
+                "the {} carrier dropped the emitter",
+                dispatch.event_type
+            );
+        }
+    }
+
+    #[test]
+    fn a_transient_system_event_is_not_a_carrier() {
+        let frame = emitted(
+            BusEvent::System(SystemEvent::BackupProgress {
+                phase: "archiving".into(),
+                progress: 1,
+                total: 3,
+            }),
+            0,
+        );
+        assert_eq!(
+            trigger_dispatch(&frame),
+            None,
+            "a transient frame writes no row, so neither matcher may see it"
+        );
+    }
+
+    /// Regression: a backup at a wall time inside the repeated hour finished,
+    /// and its next fire resolved to the instant it had just used. The loop has
+    /// no grace, so it uploaded again and again until the hour was over. The
+    /// next fire is that wall time's second pass, then tomorrow.
+    #[test]
+    fn a_backup_in_the_repeated_hour_does_not_repeat_its_instant() {
+        let schedule = crate::engine::tools::scheduler::parse_standard_cron("0 30 2 * * *")
+            .expect("a daily 02:30 parses");
+        let oslo: chrono_tz::Tz = "Europe/Oslo".parse().expect("a known IANA zone");
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("a literal timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+        // 02:30 CEST is 00:30 UTC, and the run finished in the repeated hour.
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-10-25T01:05:00Z")),
+            Some(at("2026-10-25T01:30:00Z"))
+        );
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-10-25T01:31:00Z")),
+            Some(at("2026-10-26T01:30:00Z"))
+        );
+    }
+
+    /// The backup fire time follows the zone's DST rules, not a frozen offset.
+    ///
+    /// `Job::new_async_tz` resolved 03:00 against one `FixedOffset` computed at
+    /// registration, and the job was re-registered only on startup or a
+    /// preference write. A 03:00 Oslo backup therefore ran an hour out from the
+    /// last Sunday in March until the next engine restart.
+    #[test]
+    fn the_backup_fire_time_crosses_a_dst_boundary() {
+        let schedule = crate::engine::tools::scheduler::parse_standard_cron("0 0 3 * * *")
+            .expect("the Daily (03:00) preset parses");
+        let oslo: chrono_tz::Tz = "Europe/Oslo".parse().expect("a known IANA zone");
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("a literal timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+
+        // Winter: 03:00 CET is 02:00 UTC.
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-01-15T12:00:00Z")),
+            Some(at("2026-01-16T02:00:00Z"))
+        );
+        // The day the clocks go forward: 03:00 CEST is 01:00 UTC.
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-03-28T12:00:00Z")),
+            Some(at("2026-03-29T01:00:00Z"))
+        );
+        // Summer stays there.
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-07-15T12:00:00Z")),
+            Some(at("2026-07-16T01:00:00Z"))
+        );
+        // And back again once the clocks go back.
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-10-26T12:00:00Z")),
+            Some(at("2026-10-27T02:00:00Z"))
+        );
+
+        // The bug, stated: an offset frozen in winter puts the summer fire an
+        // hour late, at 04:00 local.
+        let frozen = chrono::FixedOffset::east_opt(3600).expect("+01:00");
+        let frozen_summer = schedule
+            .after(&at("2026-07-15T12:00:00Z").with_timezone(&frozen))
+            .next()
+            .map(|t| t.with_timezone(&chrono::Utc));
+        assert_eq!(frozen_summer, Some(at("2026-07-16T02:00:00Z")));
+    }
+
+    /// A private fixture root, removed when the guard drops.
+    ///
+    /// `tempfile`, never a fixed `temp_dir()/lucidos_test_…` name. Several
+    /// worktrees run this suite at once on one machine, and each test here
+    /// used to open with `remove_dir_all` on a path they all shared. That
+    /// deletes a concurrent run's fixture mid-assertion.
+    fn fixture_root() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn find_matching_script_in_triggers() {
+        let tmp = fixture_root();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("triggers/oura-import/scripts")).unwrap();
+        std::fs::write(dir.join("triggers/oura-import/scripts/run.py"), "# oura").unwrap();
+        std::fs::create_dir_all(dir.join("triggers/google-calendar-sync/scripts")).unwrap();
+        std::fs::write(
+            dir.join("triggers/google-calendar-sync/scripts/run.py"),
+            "# cal",
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_matching_script(dir, "Oura Data Import"),
+            Some("triggers/oura-import/scripts/run.py".to_string())
+        );
+        assert_eq!(
+            find_matching_script(dir, "Google Calendar sync (script, dynamisk)"),
+            Some("triggers/google-calendar-sync/scripts/run.py".to_string())
+        );
+        // No match — "google" not in trigger name
+        assert_eq!(
+            find_matching_script(dir, "Kalender: 30 min påminnelse (script, dynamisk)"),
+            None
+        );
+    }
+
+    #[test]
+    fn find_matching_script_no_run_py() {
+        let tmp = fixture_root();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("oura-import")).unwrap();
+        // No run.py in the dir
+
+        assert_eq!(find_matching_script(dir, "Oura Data Import"), None);
+    }
+
+    #[test]
+    fn find_matching_script_empty_segments_dont_match_all() {
+        // A trailing dash splits to an empty segment; it must not contribute a
+        // "" keyword that matches every trigger name. The real keyword still
+        // constrains, and a name without it does not match.
+        let tmp = fixture_root();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("triggers/weather-/scripts")).unwrap();
+        std::fs::write(dir.join("triggers/weather-/scripts/run.py"), "# w").unwrap();
+        assert_eq!(
+            find_matching_script(dir, "weather report"),
+            Some("triggers/weather-/scripts/run.py".to_string())
+        );
+        assert_eq!(find_matching_script(dir, "unrelated task"), None);
+
+        // An all-dash dir name yields no keywords and must match nothing
+        // (previously ["",""] -> contains("") -> matched everything).
+        let tmp2 = fixture_root();
+        let dir2 = tmp2.path();
+        std::fs::create_dir_all(dir2.join("triggers/--/scripts")).unwrap();
+        std::fs::write(dir2.join("triggers/--/scripts/run.py"), "# x").unwrap();
+        assert_eq!(find_matching_script(dir2, "literally anything"), None);
+    }
+
+    /// A one-off device that began the sweep with push on survives it. The
+    /// push prune turns that flag off in the same sweep. Removal must run
+    /// first, or it reads the fresh flag and deletes the device.
+    #[tokio::test]
+    async fn prune_devices_keeps_a_device_whose_push_it_just_turned_off() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        crate::test_support::seed_device(&pool, "push-on", Some("UA"), None).await;
+        crate::core::DeviceStore::set_push_enabled(&pool, &bus, "push-on", true, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE devices SET created_at = now() - make_interval(days => 40), \
+             last_seen_at = now() - make_interval(days => 40) WHERE id = 'push-on'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        prune_devices(&pool, &bus).await;
+
+        let push_enabled: Option<bool> =
+            sqlx::query_scalar("SELECT push_enabled FROM devices WHERE id = 'push-on'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            push_enabled,
+            Some(false),
+            "the device stays, with push turned off by the stale prune"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+}

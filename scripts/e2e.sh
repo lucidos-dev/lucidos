@@ -1,0 +1,146 @@
+#!/bin/bash
+# Run the full e2e suite: API tests, the heavy integration suites that need
+# external setup (WASM signer artifacts; real fastembed model), then the
+# browser tests.
+#
+# PHASE ORDER IS A MEMORY DECISION. The browser phase used to run second, and
+# inside it mobile-webkit ran first. That one project costs about 15 GB of
+# macOS VM compressor; api, chromium and mobile cost about 0.6 GB between
+# them. `set -e` below means a browser-phase memory stop ends the run, so wasm
+# and embedder sat behind the most expensive thing in the suite and two
+# consecutive nightlies never reached them. Cheapest first, so a stop can only
+# cost the work that caused it.
+#
+# Usage:
+#   ./scripts/e2e.sh [--no-webkit]                   # on GitHub's runners when it can, ADR 0386
+#   ./scripts/e2e.sh --local [--packaged] [--no-webkit]   # on this host
+#
+# --no-webkit skips the mobile-webkit browser project. The compressor does not
+# drain between projects, so mobile-webkit spends the session's whole budget
+# whenever it runs. Splitting it out is what lets the other five finish and
+# lets it start from a cold host:
+#
+#   ./scripts/e2e.sh --local --no-webkit          # the five cheap projects
+#   ./scripts/e2e-browser.sh --local --webkit     # then mobile-webkit, on a cold host
+#
+# --packaged (or LUCIDOS_E2E_PACKAGED=1) appends the macOS packaged-build boot
+# smoke test (scripts/e2e-packaged.sh) as a final phase. OFF by default: it does a
+# full release + DMG build (heavy + a Postgres download), too costly for every
+# run, so only the nightly opts in. It boots the bundle's own embedded stack on
+# its own port — independent of the e2e-test workspace below.
+#
+# Holds the e2e lock and the workspace lifecycle (engine + Vite) for the
+# duration of the API + browser phases — sub-scripts detect
+# $LUCIDOS_E2E_UMBRELLA and skip their own lifecycle work, so the workspace
+# is booted once instead of twice. The wasm + embedder phases don't need
+# the workspace, but run inside the same lock so a second concurrent
+# `./scripts/e2e.sh` doesn't race the WASM build. `set -e` means an early
+# failure short-circuits the rest.
+#
+# For granular runs (single suite, single test), use the sub-scripts directly:
+#   ./scripts/e2e-api.sh [-f filter]
+#   ./scripts/e2e-browser.sh [-h] [-f file] [--webkit]
+#   ./scripts/e2e-wasm.sh
+#   ./scripts/e2e-embedder.sh
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/e2e_github.sh
+source "$SCRIPT_DIR/lib/e2e_github.sh"
+e2e_github_handoff all "$@"
+set -- ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}
+
+# Opt-in: append the packaged-build boot smoke test as a final phase (default off).
+RUN_PACKAGED="${LUCIDOS_E2E_PACKAGED:-0}"
+# Passed straight through to the browser phase. Kept as an array so the flagless
+# case adds no argument at all rather than an empty one.
+BROWSER_ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --packaged) RUN_PACKAGED=1; shift ;;
+        --no-webkit) BROWSER_ARGS+=(--no-webkit); shift ;;
+        *) echo "e2e.sh: unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+
+source "$SCRIPT_DIR/lib/e2e.sh"
+
+# The browser phase's projects, named in this hold's E2ELockAcquired.
+# shellcheck disable=SC2034 # read by _e2e_announce_lock_acquired in scripts/lib/e2e_lock.sh
+E2E_LOCK_PROJECTS="$(e2e_browser_projects ${BROWSER_ARGS[@]+"${BROWSER_ARGS[@]}"} | paste -sd, -)"
+acquire_e2e_lock e2e || exit 1
+kill_orphan_simulator
+teardown_e2e() {
+    # Belt-and-suspenders: e2e-browser.sh stops its own reaper and host-load
+    # sampler on exit, but if it died on an untrapped signal those loops are
+    # orphaned — reap them here via their pidfiles. No-op when nothing is running.
+    stop_e2e_background_guards
+    cleanup_e2e_worktrees
+    stop_e2e_workspace
+    # After the engine is down, so the coding-agent subprocesses the suite
+    # spawned are leftovers rather than its live children. Without this a run
+    # that ended cleanly left them alive until some LATER run happened to find a
+    # stale lock, which is how four reached 55 minutes on 2026-08-07.
+    sweep_e2e_orphans
+    release_e2e_lock
+}
+trap teardown_e2e EXIT
+trap 'exit 130' INT TERM
+
+cleanup_e2e_worktrees
+# Recreates the workspace database from zero, resets the workspace tree, and
+# boots the engine on both, so the whole migration chain (seeds included) runs
+# against an empty database in a brand-new workspace. The engine has to start
+# AFTER the recreate, so the reset owns the boot — there is deliberately no
+# ensure_workspace_running before this.
+reset_e2e_database --fresh-workspace
+
+# Read by setup_e2e_session in sub-scripts to skip their own lifecycle work.
+export LUCIDOS_E2E_UMBRELLA=1
+
+echo "═══════════════════════════════════════════════════"
+echo "  Running API e2e tests"
+echo "═══════════════════════════════════════════════════"
+"$SCRIPT_DIR/e2e-api.sh"
+
+echo ""
+echo "═══════════════════════════════════════════════════"
+echo "  Running wasm signer e2e tests"
+echo "═══════════════════════════════════════════════════"
+"$SCRIPT_DIR/e2e-wasm.sh"
+
+echo ""
+echo "═══════════════════════════════════════════════════"
+echo "  Running real-embedder integration tests"
+echo "═══════════════════════════════════════════════════"
+"$SCRIPT_DIR/e2e-embedder.sh"
+
+echo ""
+echo "═══════════════════════════════════════════════════"
+echo "  Running browser e2e tests"
+echo "═══════════════════════════════════════════════════"
+# The API phase populated the workspace DB with throwaway threads. The browser
+# phase's FIRST project deliberately skips its own DB reset on the assumption
+# the workspace was just freshly booted (see e2e-browser.sh: only projects 2+
+# reset). Under this umbrella that assumption is false, so the first project
+# would inherit hundreds of API-phase threads and fail drawer-order-sensitive
+# specs. One did: threads.spec.ts "thread loads with correct messages when
+# clicked" picked an API thread as the first drawer row.
+#
+# Reset here so the first project gets the clean DB it expects. This restarts
+# the engine, since the recreated database is only migrated at boot, onto the
+# same binary the API phase ran against (build_e2e_engine_once never recompiles
+# mid-suite). The wasm and embedder phases above do not touch this database.
+reset_e2e_database
+"$SCRIPT_DIR/e2e-browser.sh" ${BROWSER_ARGS[@]+"${BROWSER_ARGS[@]}"}
+
+# Packaged-build boot smoke test — opt-in (--packaged / LUCIDOS_E2E_PACKAGED=1).
+# Heavy (full release + DMG build); it boots the bundle's own embedded stack on
+# its own port and cleans up after itself, independent of the e2e-test workspace.
+if [ "$RUN_PACKAGED" = "1" ]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════"
+    echo "  Running packaged build boot smoke test"
+    echo "═══════════════════════════════════════════════════"
+    "$SCRIPT_DIR/e2e-packaged.sh"
+fi
