@@ -1,0 +1,1171 @@
+/* File preview styles (used by FilePreviewInline) */
+
+/* highlight.js syntax theme — maps to --syntax-* CSS variables */
+.hljs-keyword,
+.hljs-literal { color: var(--syntax-keyword); }
+
+.hljs-built_in,
+.hljs-title.class_,
+.hljs-type { color: var(--syntax-type); }
+
+.hljs-title.function_,
+.hljs-title.invoke__ { color: var(--syntax-function); }
+
+.hljs-title { color: var(--syntax-key); }
+
+.hljs-attr,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-property,
+.hljs-selector-id { color: var(--syntax-key); }
+
+.hljs-string,
+.hljs-symbol,
+.hljs-regexp { color: var(--syntax-string); }
+
+.hljs-number { color: var(--syntax-number); }
+
+.hljs-comment,
+.hljs-doctag { color: var(--syntax-comment); font-style: italic; }
+
+.hljs-meta,
+.hljs-meta .hljs-keyword { color: var(--syntax-control); }
+
+.hljs-operator,
+.hljs-punctuation { color: var(--text-secondary); }
+
+.hljs-tag,
+.hljs-name,
+.hljs-selector-tag { color: var(--syntax-keyword); }
+
+.hljs-selector-class,
+.hljs-selector-pseudo { color: var(--syntax-type); }
+
+.hljs-section { color: var(--syntax-function); font-weight: 600; }
+
+.hljs-addition { color: var(--accent-green); }
+.hljs-deletion { color: var(--accent-red); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }
+
+/* CSV table */
+.csv-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-size-sm);
+}
+
+.csv-table th,
+.csv-table td {
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    border: 1px solid var(--border-color);
+}
+
+.csv-table th {
+    background: var(--bg-tertiary);
+    color: var(--accent);
+    font-weight: 600;
+}
+
+@media (hover: hover) {
+    .csv-table tr:hover {
+        background: var(--bg-hover);
+    }
+}
+
+/* Context-scoped override: shrink markdown inside the file-preview pane. The
+ * base `.markdown-content` rules (headings, lists, links, code, hr, strong, …)
+ * live ONCE in styles/global/shared-components.css — the single source of truth
+ * that's also served to app iframes. Don't re-add base markdown rules here. */
+.file-preview-content .markdown-content {
+    font-size: var(--font-size-md);
+    line-height: 1.4;
+    color: var(--text-primary);
+}
+
+/* ===== Credentials Panel ===== */
+
+.settings-panel {
+    /* --space-lg (1rem) gutter shared across content-pane views — the Settings
+       view lines its content up with the notification/apps/plugins/list views.
+       This is the side room the settings-row nav-focus marker clears within (see
+       settings/base.css). The pane sets the top spacing and the end space
+       below (panels/content.css). */
+    padding-inline: var(--space-lg);
+}
+
+
+/* ===== Inline Form (panel pane forms) ===== */
+
+.inline-form {
+    padding: 1rem;
+    overflow-y: auto;
+    height: 100%;
+}
+
+/* ===== Email confirm modal ===== */
+
+/* Read-only recipient metadata (From / To / CC) as a compact grouped card.
+   The value cells set an explicit type-scale size — without it they inherit the
+   root font-size (100% × the user UI scale), which reads oversized next to the
+   token-sized labels and inputs. */
+.email-confirm-meta {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.375rem 0.75rem;
+    align-items: baseline;
+    margin-bottom: 1rem;
+    padding: 0.75rem 0.875rem;
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-surface) * 0.5);
+}
+
+.email-confirm-meta-row {
+    display: contents;
+}
+
+.email-confirm-meta-label {
+    font-size: var(--font-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
+}
+
+.email-confirm-meta-value {
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    word-break: break-word;
+}
+
+/* Attachment names as compact chips instead of one comma-joined blob. */
+.email-confirm-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+}
+
+.email-confirm-attachment {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-control) * 0.5);
+    padding: 0.125rem 0.5rem;
+    word-break: break-all;
+}
+
+/* Receipt status line: a chip plus a timestamp, with no left accent bar. The
+   sent email uses the whole line. A completed plugin install or uninstall
+   puts the badge and time in its own header line (.plugin-install-status). */
+.panel-receipt-status {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+}
+
+.panel-receipt-badge {
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--accent-green);
+    background: color-mix(in srgb, var(--accent-green) 14%, transparent);
+    border-radius: calc(var(--radius-control) * 0.5);
+    padding: 0.125rem 0.5rem;
+}
+
+.panel-receipt-time {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
+/* The sent body, read-only. `pre-wrap` keeps the paragraph breaks the recipient
+   got; the textarea it replaces preserved them too. */
+.email-confirm-body-sent {
+    white-space: pre-wrap;
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    word-break: break-word;
+}
+
+
+/* The credential form's four prose blocks all sit at --font-size-sm, the same
+   step as the form's own labels and as the settings prose around them
+   (.settings-section-desc, .settings-row-note, .system-notice).
+
+   They were each an `em` fraction (0.9em / 0.85em), and nothing between them and
+   the root sets a font-size, so 0.9em resolved against the root itself: 14.4px
+   at 100% UI scale, larger than every label, input and hint on the same form,
+   and larger even than --font-size-lg. An `em` is only worth having when it is
+   relative to something deliberate; here it tracked the browser default and read
+   as oversized at every scale. Same trap the .email-confirm-meta comment above
+   records. */
+
+/* Instructions callout: raised neutral surface only, no left accent bar (see
+   .claude/rules/frontend.md, left-accent stripes on callouts are forbidden). */
+.credential-instructions {
+    margin: 0 0 0.75rem 0;
+    padding: 0.625rem 0.875rem;
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-surface) / 3);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    /* Engine emits multi-line prompts (numbered steps), so preserve newlines. */
+    white-space: pre-wrap;
+}
+
+.credential-oauth-endpoints {
+    margin-top: 0.5rem;
+    margin-bottom: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-surface) / 3);
+}
+
+.credential-oauth-endpoints > summary {
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    padding: 0.25rem 0;
+    user-select: none;
+}
+
+.credential-oauth-endpoints[open] > summary {
+    margin-bottom: 0.5rem;
+}
+
+/* The credential-scope editor stacks `.removable-input-row`s (skills.css), the
+   same field-plus-Remove shape the trigger form uses. Only the vertical rhythm
+   and the input's slack are local. */
+.credential-scope-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.credential-scope-rows input {
+    flex: 1;
+    min-width: 0;
+}
+
+.credential-scope-add {
+    margin-top: 0.5rem;
+}
+
+/* The one raised box every note in this form sits in. Tone and spacing are
+   what the three below vary; the box itself is shared, so re-padding it is one
+   edit rather than three. */
+.credential-scope-notice,
+.credential-repair-notice,
+.credential-console-help {
+    padding: 0.625rem 0.875rem;
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-surface) / 3);
+    font-size: var(--font-size-sm);
+}
+
+/* Which hosts a scope widening adds. Neutral-toned, unlike the repair notice
+   below: nothing is broken here, and the user is confirming a grant rather
+   than fixing a registration. */
+.credential-scope-notice {
+    margin: 0 0 0.5rem 0;
+    color: var(--text-primary);
+}
+
+/* Why the form reopened on a repair: which required fields the saved OAuth
+   Client was missing. Warning-toned because the registration is broken until
+   it is filled in, but not an error: the fix is right here. */
+.credential-repair-notice {
+    margin: 0 0 0.75rem 0;
+    color: var(--accent-yellow);
+}
+
+/* Saving an OAuth client grants nothing; the consent screen does. Said before
+   the form, so no one reads Save as handing over access. */
+.credential-grant-note {
+    margin: 0 0 0.75rem 0;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+/* Where to get the Client ID: the provider's own app console, which is the one
+   step this form cannot perform. Every value comes from the OAuth provider
+   registry. */
+.credential-console-help {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.credential-console-help p {
+    margin: 0;
+}
+
+/* The URI must be registered with the provider character for character, so it
+   gets its own row with a copy button rather than living inside a sentence. */
+.credential-redirect-uri {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.credential-redirect-uri code {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    padding: 0.25rem 0.5rem;
+    background: var(--bg-primary);
+    border-radius: calc(var(--radius-control) * 0.5);
+    color: var(--text-primary);
+}
+
+/* ===== Plugin install panel ===== */
+
+/* Shared by the install and uninstall panels and both receipts. One column,
+   with the confirm panels' actions in the header, above lists that start
+   folded. */
+.plugin-install-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    max-width: 50rem;
+}
+
+/* Actions sit top right at every width. The text keeps at least its
+   flex-basis beside them, so it is never squeezed into a sliver. On a narrower
+   pane the row wraps, and `wrap-reverse` puts the wrapped actions on the top
+   line while the title stays first in the DOM. `wrap-reverse` also flips the
+   cross axis, so `flex-end` is what aligns a single line to the top. */
+.plugin-install-header {
+    display: flex;
+    flex-wrap: wrap-reverse;
+    align-items: flex-end;
+    gap: var(--space-md);
+}
+
+.plugin-install-header-text {
+    flex: 1 1 18rem;
+    min-width: 0;
+}
+
+.plugin-install-actions {
+    display: flex;
+    gap: var(--space-sm);
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+.plugin-install-status {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-xs);
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+/* Same step as the notification detail title, the other content-pane page
+   heading. */
+.plugin-install-name {
+    margin: 0;
+    font-size: var(--font-size-lg);
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--text-primary);
+}
+
+.plugin-install-version {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    font-weight: 400;
+    font-family: monospace;
+    white-space: nowrap;
+}
+
+.plugin-install-description {
+    margin: var(--space-sm) 0 0;
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+}
+
+.plugin-install-section {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
+    padding: var(--space-md);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.plugin-install-section-danger {
+    border-color: color-mix(in srgb, var(--accent-red) 40%, var(--border-color));
+}
+
+.plugin-install-label {
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+}
+
+.plugin-install-section-danger .plugin-install-label {
+    color: var(--accent-red);
+}
+
+/* The whole heading row is the tap target, so the fold opens from anywhere on
+   it rather than from the chevron alone. */
+.plugin-install-section-toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    width: 100%;
+    margin: calc(-1 * var(--space-xs)) 0;
+    padding: var(--space-xs) 0;
+    background: none;
+    border: none;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.plugin-install-chevron {
+    display: flex;
+    flex: 0 0 auto;
+    color: var(--text-muted);
+    transition: transform var(--duration-normal) ease;
+}
+
+.plugin-install-section-toggle[aria-expanded="true"] .plugin-install-chevron {
+    transform: rotate(90deg);
+}
+
+.plugin-install-count {
+    margin-left: auto;
+    padding: 0 var(--space-sm);
+    border-radius: var(--radius-control);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-variant-numeric: tabular-nums;
+}
+
+@media (hover: hover) {
+    .plugin-install-section-toggle:hover .plugin-install-label,
+    .plugin-install-section-toggle:hover .plugin-install-chevron {
+        color: var(--text-primary);
+    }
+}
+
+.plugin-install-source-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+}
+
+.plugin-install-source-type {
+    font-size: var(--font-size-xs);
+    padding: 0.125rem var(--space-sm);
+    border-radius: var(--radius-control);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.plugin-install-source-value {
+    background: var(--bg-tertiary);
+    padding: 0.375rem var(--space-sm);
+    border-radius: var(--radius-control);
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+    overflow-x: auto;
+    white-space: nowrap;
+}
+
+.plugin-install-files {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 15rem;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+}
+
+.plugin-install-file {
+    font-family: monospace;
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+.plugin-install-file-merged,
+.plugin-install-file-conflict,
+.plugin-install-file-replaced,
+.plugin-install-file-restored {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.plugin-install-outcome {
+    font-family: inherit;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+.plugin-install-file-merged .plugin-install-outcome {
+    color: var(--accent-green);
+}
+
+.plugin-install-file-conflict .plugin-install-outcome,
+.plugin-install-file-replaced .plugin-install-outcome {
+    color: var(--accent-yellow);
+}
+
+.plugin-install-note {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+}
+
+.plugin-install-keep-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-sm);
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+}
+
+.plugin-install-setup-body {
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+}
+
+.plugin-install-setup-body p:first-child {
+    margin-top: 0;
+}
+
+.plugin-install-setup-body p:last-child {
+    margin-bottom: 0;
+}
+
+/* ===== Apps panel + Plugins panel shared controls ===== */
+
+/* Plugins panel top filter row — holds the All | Installed segmented toggle
+   (.segmented-control, from shared-components.css) that narrows the one unified
+   catalog list. Shares the content-pane --space-lg (1rem) horizontal gutter so
+   the toggle lines up with the .list-row plugin rows below (and the
+   .apps-search-bar / .app-store-filter-pills, all on --space-lg). */
+.plugins-filter-bar {
+    display: flex;
+    align-items: stretch;
+    gap: var(--space-sm);
+    margin: 0 var(--space-lg) var(--space-md);
+}
+
+.plugins-filter-bar .segmented-control {
+    flex-shrink: 0;
+}
+
+/* The marketplace filter sits at the row's right end, at the toggle's height.
+   A dropdown rather than a pill bar because the marketplace names are arbitrary
+   repo names: they can be long, and there can be many. It is as wide as its
+   widest name up to the cap, and a longer name ellipsizes. The bar never wraps:
+   on a narrow pane the dropdown shrinks beside the toggle instead of dropping
+   to a line of its own. */
+.plugins-marketplace-filter {
+    display: flex;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 16rem;
+    margin-left: auto;
+}
+
+.plugins-marketplace-filter .dropdown-trigger {
+    flex: 1;
+    min-width: 0;
+    justify-content: space-between;
+}
+
+.plugins-marketplace-filter .dropdown-sizer {
+    min-width: 0;
+}
+
+.plugins-marketplace-filter .dropdown-sizer > * {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.plugins-scan-failure {
+    margin: 0 var(--space-lg) var(--space-md);
+    font-size: var(--font-size-xs);
+    line-height: 1.5;
+}
+
+.apps-search-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+    margin: 0 var(--space-lg) var(--space-sm);
+}
+
+.apps-search-field {
+    flex: 1;
+}
+
+/* An app or widget row leads with its app icon. The lead takes the row's
+   width, so the actions still wrap under it on a narrow pane. */
+.app-row-lead {
+    --app-icon-size: 2.25rem;
+    --app-icon-radius: calc(var(--radius-control) * 1.2);
+    display: flex;
+    gap: 0.75rem;
+    flex: 1;
+    min-width: 0;
+}
+
+.app-row-lead > .app-icon {
+    margin-top: 0.125rem;
+}
+
+/* Installed-app marketplace + update labels */
+.app-row-title-line {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    min-width: 0;
+}
+
+.app-row-title-line .list-row-name {
+    min-width: 0;
+}
+
+/* ===== Store tab (plugin catalog) + Marketplaces settings ===== */
+
+/* Wraps on the pane's width, not the viewport's: a narrow Canvas pane on a
+   wide screen must still fit. Name and Add wrap as one unit, so Add never
+   lands alone on a line. The button keeps its own height and width. */
+.app-store-marketplace-form,
+.app-store-marketplace-form-tail {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+}
+
+.app-store-marketplace-form {
+    flex-wrap: wrap;
+    margin-bottom: 0.625rem;
+}
+
+.app-store-marketplace-form .settings-text-input {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.app-store-marketplace-form .app-store-source-input {
+    flex: 3 1 14rem;
+}
+
+.app-store-marketplace-form-tail {
+    flex: 1 1 14rem;
+}
+
+.app-store-marketplace-form .action-btn {
+    flex: none;
+}
+
+.app-store-empty {
+    padding: var(--space-md) var(--space-lg);
+    color: var(--text-muted);
+}
+
+.app-store-empty p {
+    margin: 0;
+}
+
+/* Empty-state suggestion: prompt text, the one-click "official marketplace"
+ * button, then the "register your own" fallback link, stacked and left-aligned.
+ * Reused in the Plugins panel catalog empty state and (with extra top spacing)
+ * under the Settings → Marketplaces "No marketplaces registered." row. */
+.app-store-empty-suggest {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.625rem;
+}
+
+.app-store-empty-suggest-settings {
+    margin-top: 0.5rem;
+}
+
+.app-store-empty-alt {
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
+}
+
+.app-store-muted-row {
+    padding: var(--space-sm) var(--space-lg);
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
+}
+
+.app-store-source-value {
+    display: block;
+    max-width: min(42rem, 100%);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    background: transparent;
+}
+
+/* The rename pencil carries a 2.25rem tap target, taller than the Remove button
+   beside it. Centre the pair, or the default stretch pulls Remove up to the
+   pencil's height. */
+.app-store-marketplace-row .list-row-actions {
+    align-items: center;
+}
+
+/* Holds a marketplace's name and its rename field in one box, so the field can
+   sit exactly over the name while idle. */
+.app-store-marketplace-name-slot {
+    position: relative;
+    display: block;
+    min-width: 0;
+}
+
+.app-store-marketplace-renaming .list-row-name {
+    display: none;
+}
+
+/* Same text as the .title .list-row-name it stands in for, spelled out rather
+   than `font: inherit`, which would also reset the weight. The margin is that
+   row's own, so the URL under it does not move when the field opens. */
+.app-store-marketplace-name-input {
+    width: 100%;
+    min-width: 0;
+    margin-bottom: 0.25rem;
+    padding: 0.125rem 0.25rem;
+    font-family: inherit;
+    font-size: var(--font-size-lg);
+    font-weight: 500;
+}
+
+/* The idle field, laid over the name at the name's own size. Invisible and
+   taking no pointer, so the row looks and behaves as it did. It is mounted
+   rather than absent so the pencil can focus it inside the tap, the only way
+   iOS raises the keyboard (see MarketplacesSection). Deliberately NOT sized to
+   nothing: iOS scrolls the focused element into view, and that should be the
+   box the field is about to occupy. */
+.app-store-marketplace-row:not(.app-store-marketplace-renaming) .app-store-marketplace-name-input {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* A plugin card's buttons sit top right, beside the title line only, as on the
+   install panel header (.plugin-install-header). The description and meta
+   below span the full card width. The info wrapper dissolves into the grid so
+   its children can take their own areas. On a narrow list the buttons move to
+   a line above the name. `.list-row` in the selector outranks the mobile
+   `.list-row` stacking rules, which would otherwise set this grid's gap. */
+.app-store-plugins {
+    container-type: inline-size;
+}
+
+.list-row.app-store-plugin-row {
+    position: relative;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+        "title actions"
+        "description description"
+        "meta meta";
+    align-items: center;
+    gap: 0 var(--space-md);
+    padding-top: var(--space-lg);
+    padding-bottom: var(--space-lg);
+}
+
+.app-store-plugin-row .list-row-info {
+    display: contents;
+}
+
+.app-store-plugin-row .list-row-actions {
+    grid-area: actions;
+    align-self: center;
+    justify-self: end;
+}
+
+@container (max-width: 30rem) {
+    .list-row.app-store-plugin-row {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+            "actions"
+            "title"
+            "description"
+            "meta";
+    }
+
+    .app-store-plugin-row .list-row-actions {
+        margin-bottom: var(--space-sm);
+    }
+}
+
+/* A hairline between cards, inset to the gutter so it lines up with the text. */
+.app-store-plugin-row + .app-store-plugin-row::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: var(--space-lg);
+    right: var(--space-lg);
+    border-top: 1px solid var(--border-color);
+}
+
+/* Uniform gap for the navigation focus marker on a plugin row (a plugins
+   deep-link / Search-Everywhere jump). The marker (.nav-focus-stuck wash + glow,
+   host-components.css) fills the row's padding box, and a plugin row is padded
+   1rem all round, which would run the wash to the pane edge. So every side
+   shrinks to 0.75rem, and an equal margin cancels it for layout. The row is a
+   flex item in .list-rows, so the margins do not collapse and the content stays
+   put. The box only shrinks inward, so the WASH (the hard-edged part, and the whole
+   of what the eye reads as the highlight) is comfortably inside the row's clip
+   ancestor, .content-pane-body { overflow-x: hidden }. The soft halo around it is a
+   different matter and IS cut there: a plugin row is full-bleed against that clip,
+   the shrink buys only 0.25rem, and the wide glow layer's 1.5rem blur reaches
+   further. That is accepted. What gets terminated at the pane edge is the tail of a
+   15%-alpha gaussian, already near-invisible where it meets a boundary the eye
+   reads as a boundary anyway. It is NOT the failure 4f901b586 fixed, which was a
+   crisp 0.1875rem accent outline having its side edges and rounded corners sliced
+   flat. Do not "fix" it by shrinking the box further: that would pull the wash off
+   the row's content for a halo nobody can see. The wash is an inset box-shadow, so
+   the row's own hover background still shows through beneath it. */
+.app-store-plugin-row.nav-focus-stuck {
+    padding: var(--space-md);
+    margin: var(--space-xs);
+}
+
+.app-store-plugin-title-row {
+    grid-area: title;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-xs) var(--space-sm);
+    min-width: 0;
+}
+
+.app-store-plugin-title-row .list-row-name {
+    min-width: 0;
+    margin-bottom: 0;
+}
+
+/* Status and Modified badges: a soft tint, no outline, so they label the card
+   without competing with its name. badges.css centres the word on its cap band
+   inside --badge-height. */
+.app-store-status,
+.app-store-modified-chip {
+    flex: 0 0 auto;
+    padding: 0.125rem 0.5rem;
+    border-radius: var(--radius-round);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    line-height: 1.4;
+    --badge-height: calc(1lh + 0.25rem);
+}
+
+.app-store-status-update_available {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--accent);
+}
+
+.app-store-status-installed {
+    background: color-mix(in srgb, var(--accent-green-soft) 14%, transparent);
+    color: var(--accent-green-soft);
+}
+
+/* The plugin's shipped content has been locally edited. Amber reads as
+   caution. */
+.app-store-modified-chip {
+    background: color-mix(in srgb, var(--accent-yellow) 16%, transparent);
+    color: var(--accent-yellow);
+    cursor: default;
+}
+
+.app-store-plugin-description {
+    grid-area: description;
+    margin-top: var(--space-sm);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+}
+
+.app-store-plugin-meta {
+    grid-area: meta;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-xs) var(--space-sm);
+    margin-top: var(--space-sm);
+    color: var(--text-muted);
+    font-size: var(--font-size-2xs);
+}
+
+
+/* The catalog's category filter: the shared .pill-bar, laid out for this list.
+   Categories are the only pills: a category vocabulary is short and
+   controlled, where marketplace names are arbitrary repo names and take the
+   dropdown in the filter bar instead.
+
+   On touch, one line that scrolls sideways under a swipe, so the bar never
+   grows taller than a pill. Its padding carries the --space-lg gutter, and the
+   mask fades a pill out as it passes under either gutter. At rest the gutters
+   are empty, so nothing fades. The scroll padding keeps a pill reached by
+   keyboard out of the fade. The padding is the ring room as well, so the
+   margin hands back only the touch reach. A mouse wheel cannot scroll a line
+   sideways, so a fine pointer gets the wrapping bar below instead. */
+.app-store-filter-pills {
+    scroll-padding-inline: var(--space-lg);
+    padding: calc(var(--focus-ring-width) + var(--pill-bar-hit-slop, 0rem)) var(--space-lg)
+        calc(var(--space-sm) + var(--pill-bar-hit-slop, 0rem));
+    margin: calc(-1 * var(--pill-bar-hit-slop, 0rem)) 0;
+    -webkit-mask: linear-gradient(to right, transparent, #000 var(--space-lg),
+        #000 calc(100% - var(--space-lg)), transparent);
+    mask: linear-gradient(to right, transparent, #000 var(--space-lg),
+        #000 calc(100% - var(--space-lg)), transparent);
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .app-store-filter-pills {
+        flex-wrap: wrap;
+        overflow-x: visible;
+        -webkit-mask: none;
+        mask: none;
+    }
+}
+
+/* A plugin row deep-link (navigate_ui target `plugins`) scrolls to the row and
+   applies the shared NAVIGATION FOCUS MARKER (.nav-focus-stuck,
+   styles/global/host-components.css, via components/shared/focusMarker.ts) — same
+   sticky background wash that fades on dismiss as chat and settings. See
+   StoreTab.tsx. */
+
+/* Error rows read from the red error text — no left accent stripe (see
+   .claude/rules/frontend.md — left-accent stripes on notices are forbidden). */
+.app-store-error-row .list-row-details {
+    color: var(--accent-red);
+}
+
+.app-store-marketplaces + .app-store-errors,
+.app-store-muted-row + .app-store-errors {
+    margin-top: 0.625rem;
+}
+
+.form-group {
+    margin-bottom: 1rem;
+}
+
+.form-group label {
+    display: block;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    margin-bottom: 0.375rem;
+}
+
+/* A checkbox keeps the shared control look (shared-components.css), not a
+   text field's box. `:where` adds no specificity, so overrides still win. Box
+   and focus: global/text-input.css. */
+.form-group input:where(:not([type="checkbox"])) {
+    width: 100%;
+    padding: 0.625rem 0.75rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+}
+
+.form-group .dropdown {
+    width: 100%;
+}
+
+.form-group .dropdown-input-wrap {
+    width: 100%;
+    background: var(--bg-secondary);
+    border-radius: calc(var(--radius-control) * 0.5);
+}
+
+.form-group .dropdown-input {
+    padding: 0.625rem 0.75rem;
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+}
+
+.form-group label.form-checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    cursor: pointer;
+    margin-bottom: 0;
+}
+
+/* Vertical stack of checkbox rows (e.g. the trigger side-effect grant). */
+.form-group .form-checkbox-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    margin-top: 0.25rem;
+}
+
+.form-group .dropdown-trigger {
+    width: 100%;
+    padding: 0.625rem 0.75rem;
+    background: var(--bg-secondary);
+    border-radius: calc(var(--radius-control) * 0.5);
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+}
+
+.form-group input:where(:not([type="checkbox"])):disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* Masked secret field with reveal toggle (SecretInput) */
+.secret-input {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.secret-input input {
+    /* leave room for the eye toggle so text doesn't slide under it */
+    padding-right: 2.25rem;
+}
+
+.secret-input-toggle {
+    position: absolute;
+    right: 0.375rem;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: color var(--duration-normal);
+}
+
+@media (hover: hover) {
+    .secret-input-toggle:hover {
+        color: var(--text-primary);
+    }
+}
+
+.secret-input-toggle svg {
+    width: 1rem;
+    height: 1rem;
+}
+
+.form-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 1.25rem;
+    padding-top: 1rem;
+}
+
+/* Form CTAs track the shared .action-btn metrics (size / padding / weight) so a
+   modal's Cancel/Save read identically to the app's standard action buttons —
+   they used to be a notch larger (font-size-sm, heavier padding + weight). */
+.form-actions .btn-cancel {
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.5);
+    min-width: 3.5rem;
+    padding: 0.25rem 0.625rem;
+    color: var(--text-secondary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    cursor: pointer;
+    transition: all var(--duration-fast);
+}
+
+@media (hover: hover) {
+    .form-actions .btn-cancel:hover {
+        color: var(--text-primary);
+        border-color: var(--text-secondary);
+    }
+}
+
+.form-actions .btn-save {
+    /* Shared action-button blue (see .action-btn) so every filled blue CTA
+       tracks one token across themes. */
+    background: var(--accent-action);
+    border: none;
+    border-radius: calc(var(--radius-control) * 0.5);
+    min-width: 3.5rem;
+    padding: 0.25rem 0.625rem;
+    color: var(--text-on-accent);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    cursor: pointer;
+    transition: all var(--duration-fast);
+}
+
+@media (hover: hover) {
+    .form-actions .btn-save:hover {
+        background: color-mix(in srgb, var(--accent-action) 80%, #fff);
+    }
+}
+
+/* Shared accent focus glow, matching .action-btn:focus-visible. */
+.form-actions .btn-cancel:focus-visible,
+.form-actions .btn-save:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+/* Same as the thread-filter row: this label is a flex line with its own `gap`,
+   which already separates the explainer from the text, so drop the icon's base
+   `margin-left` rather than stacking the two. It sits on `.explainer-slot`, the
+   wrapper that glues the icon to its label, which is the flex item here. */
+.form-group label.form-checkbox-row > .explainer-slot {
+    margin-left: 0;
+}
+
+/* A field label with its explainer beside it (<FieldLabel>). The button sits
+   OUTSIDE the <label> on purpose: a <button> is a labelable element, so inside a
+   label whose control is a sibling it would become that label's control and a
+   click on the label text would open the popover. See Explainer.tsx.
+   The row takes over the label's bottom margin so the field spacing is
+   unchanged from a bare `.form-group label`. */
+.form-label-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 0.375rem;
+}
+
+.form-label-row > label {
+    margin-bottom: 0;
+}

@@ -1,0 +1,643 @@
+//! E2E coverage for the `/api/v1/models` registry, focused on `context_window`
+//! — the field that sizes the engine's context trim budget.
+//!
+//! Why this matters: the window is only inferred from the model id when the row
+//! doesn't declare one, and that fallback recognises just `claude-*` and a
+//! `gpt-` major of 5 or newer. Every OpenRouter / xAI / Gemini / local model is treated as 200k until
+//! this field is set, which trims their context far earlier than needed. So the
+//! HTTP surface has to carry the value in both directions and has to keep the
+//! absent-vs-explicit-null distinction that lets a caller clear it.
+
+use crate::support::{base_url, unique_marker, user_client};
+use serde_json::json;
+
+/// Fetch one model from `GET /models`, or `None` if absent.
+async fn find_model(client: &reqwest::Client, api: &str, id: &str) -> Option<serde_json::Value> {
+    let resp = client
+        .get(format!("{}/api/v1/models", api))
+        .send()
+        .await
+        .expect("list models failed");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    body["models"]
+        .as_array()
+        .expect("models array")
+        .iter()
+        .find(|m| m["id"] == id)
+        .cloned()
+}
+
+async fn delete_model(client: &reqwest::Client, api: &str, id: &str) {
+    client
+        .delete(format!("{}/api/v1/models", api))
+        .query(&[("id", id)])
+        .send()
+        .await
+        .expect("delete failed");
+}
+
+/// The full lifecycle of a declared context window over HTTP: set it on create,
+/// read it back, change it, and clear it with an explicit `null`.
+#[tokio::test]
+async fn context_window_round_trips_over_http() {
+    let client = user_client().await;
+    let api = base_url();
+    let id = unique_marker("e2e-model");
+
+    let resp = client
+        .post(format!("{}/api/v1/models", api))
+        .json(&json!({
+            "id": id,
+            "label": "E2E Model",
+            "provider": "openrouter",
+            "context_window": 1_048_576,
+        }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
+
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert_eq!(
+        listed["routes"][0]["context_window"], 1_048_576,
+        "the declared window must survive the create round trip"
+    );
+
+    // Change it.
+    let resp = client
+        .put(format!("{}/api/v1/models", api))
+        .query(&[("id", &id)])
+        .json(&json!({ "context_window": 262_144 }))
+        .send()
+        .await
+        .expect("update failed");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert_eq!(listed["routes"][0]["context_window"], 262_144);
+
+    // A PUT that doesn't mention the field must LEAVE IT ALONE — otherwise
+    // toggling `enabled` from the Settings row would silently wipe the window
+    // and drop the model back to the 200k fallback.
+    let resp = client
+        .put(format!("{}/api/v1/models", api))
+        .query(&[("id", &id)])
+        .json(&json!({ "enabled": false }))
+        .send()
+        .await
+        .expect("update failed");
+    assert_eq!(resp.status(), 200);
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert_eq!(
+        listed["routes"][0]["context_window"], 262_144,
+        "an unrelated PUT must not clear the declared window"
+    );
+    assert_eq!(listed["enabled"], false);
+
+    // An explicit null DOES clear it, back to inferring from the id.
+    let resp = client
+        .put(format!("{}/api/v1/models", api))
+        .query(&[("id", &id)])
+        .json(&json!({ "context_window": null }))
+        .send()
+        .await
+        .expect("update failed");
+    assert_eq!(resp.status(), 200);
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert!(
+        listed["routes"][0]["context_window"].is_null(),
+        "an explicit null must clear the declaration"
+    );
+
+    delete_model(&client, &api, &id).await;
+}
+
+/// Every row carries the reasoning tiers its provider supports, and the picker
+/// filters against exactly this list.
+///
+/// It is derived, not stored: `llm::reasoning::supported_efforts` keyed on the
+/// row's provider and id, the SAME function `RoutingProvider` clamps a request
+/// with. That shared derivation is the point. When the picker derived its own
+/// answer from the model id, it offered a local model `max`, the wire layer
+/// rewrote that into `xhigh` because the id was not `gpt-5.6`, and the local
+/// server rejected it (400, 2026-08-12).
+///
+/// The sharp case is `local` / `openrouter`: `xhigh` is OpenAI-proprietary, so
+/// an arbitrary third-party server must never be offered it whatever its id
+/// looks like. Asserted here rather than only in the unit tests because the
+/// wire shape is what the picker consumes, and `#[serde(flatten)]` means a
+/// refactor could nest or drop the field without any Rust test noticing.
+#[tokio::test]
+async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
+    let client = user_client().await;
+    let api = base_url();
+
+    for (id, expected) in [
+        // Adaptive Claude sends the effort verbatim, so every tier is distinct.
+        (
+            "claude-opus-5",
+            vec!["none", "low", "medium", "high", "xhigh", "max"],
+        ),
+        (
+            "claude-haiku-5-5",
+            vec!["none", "low", "medium", "high", "xhigh", "max"],
+        ),
+        // A model that always thinks has no `none`, on the direct Anthropic
+        // provider as on Vertex.
+        (
+            "claude-fable-5-1",
+            vec!["low", "medium", "high", "xhigh", "max"],
+        ),
+        (
+            "claude-opus-5-5",
+            vec!["low", "medium", "high", "xhigh", "max"],
+        ),
+        (
+            "claude-sonnet-5-5",
+            vec!["low", "medium", "high", "xhigh", "max"],
+        ),
+        // The Claude budget path deliberately omits xhigh.
+        (
+            "claude-sonnet-4-6",
+            vec!["none", "low", "medium", "high", "max"],
+        ),
+        // Gemini collapses everything above high onto high.
+        (
+            "gemini-3-flash-preview",
+            vec!["none", "low", "medium", "high"],
+        ),
+        // Gemini 3.8 Flash always reasons, so it has no `none` either.
+        ("gemini-3.8-flash", vec!["low", "medium", "high"]),
+        // GPT-5.6 and GPT-6 Astra have a real max; earlier OpenAI families top
+        // out at xhigh.
+        (
+            "gpt-5.6-sol",
+            vec!["none", "low", "medium", "high", "xhigh", "max"],
+        ),
+        (
+            "gpt-6-astra",
+            vec!["none", "low", "medium", "high", "xhigh", "max"],
+        ),
+        ("gpt-5.5", vec!["none", "low", "medium", "high", "xhigh"]),
+        // A third-party OpenAI-compatible server: no xhigh, no max.
+        ("z-ai/glm-5.2", vec!["none", "low", "medium", "high"]),
+        // xAI is the same shape: OpenAI-compatible, but not OpenAI.
+        ("grok-4.6", vec!["none", "low", "medium", "high"]),
+        // The keyless free tier is the one provider whose set varies per model.
+        // Ox Alpha rejects none, medium and xhigh with a 400, so the picker
+        // must offer exactly the three it accepts.
+        ("x-preview-f-free", vec!["low", "high", "max"]),
+        ("laguna-s-2.1-free", vec!["none", "low", "medium", "high"]),
+    ] {
+        let m = find_model(&client, &api, id)
+            .await
+            .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
+        let tiers: Vec<&str> = m["routes"][0]["reasoning_efforts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{id} must carry reasoning_efforts on its route"))
+            .iter()
+            .map(|v| v.as_str().expect("tier is a string"))
+            .collect();
+        assert_eq!(tiers, expected, "{id}");
+    }
+}
+
+/// A retired builtin stays listed, so past turns keep its label, but no
+/// picker offers it, and it names the model the engine sends instead.
+#[tokio::test]
+async fn a_retired_builtin_is_disabled_and_names_its_successor() {
+    let client = user_client().await;
+    let api = base_url();
+    let retired = find_model(&client, &api, "gemini-3.5-flash")
+        .await
+        .expect("the retired row stays in the registry");
+    assert_eq!(retired["enabled"], false);
+    assert_eq!(retired["successor"], "gemini-3.8-flash");
+    let current = find_model(&client, &api, "gemini-3.8-flash")
+        .await
+        .expect("the successor is seeded");
+    assert_eq!(current["enabled"], true);
+    assert!(current["successor"].is_null());
+}
+
+/// A user-added local model gets the conservative set the moment it is created,
+/// with nothing for the user to declare. Asking someone adding a local server
+/// to name the reasoning tiers it validates would be asking for something they
+/// cannot know, and a wrong answer would fail their turns.
+#[tokio::test]
+async fn a_new_local_model_is_offered_only_the_universally_safe_tiers() {
+    let client = user_client().await;
+    let api = base_url();
+    let id = unique_marker("e2e-model-local");
+
+    let resp = client
+        .post(format!("{}/api/v1/models", api))
+        .json(&json!({ "id": id, "label": "Local", "provider": "local" }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert_eq!(
+        listed["routes"][0]["reasoning_efforts"],
+        json!(["none", "low", "medium", "high"])
+    );
+
+    delete_model(&client, &api, &id).await;
+}
+
+/// The Grok family is seeded on the xAI provider, and every row declares its
+/// real window over the wire. The id-shape fallback has no rule for a `grok-`
+/// id, so an undeclared row would budget the 2M model at 200k.
+///
+/// Grok 4.5 and 4.3 are switched off by the prior-generation prune, and are
+/// asserted here precisely BECAUSE they are: `GET /models` serves every row,
+/// enabled or not, and a disabled row still has to carry a true window. Routing
+/// resolves it for a saved `chat_model`, and the picker filters on `enabled`
+/// separately.
+#[tokio::test]
+async fn seeded_grok_models_report_xai_and_their_declared_windows() {
+    let client = user_client().await;
+    let api = base_url();
+
+    for (id, window, enabled) in [
+        ("grok-4.6", 500_000, true),
+        ("grok-4.5", 500_000, false),
+        ("grok-4.20", 2_000_000, true),
+        ("grok-4.3", 1_000_000, false),
+    ] {
+        let m = find_model(&client, &api, id)
+            .await
+            .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
+        assert_eq!(m["routes"][0]["provider"], "xai", "{id}");
+        assert_eq!(m["source"], "builtin", "{id}");
+        assert_eq!(m["enabled"], enabled, "{id}");
+        assert_eq!(m["routes"][0]["context_window"], window, "{id}");
+    }
+}
+
+/// Grok reaches the registry two ways at once, and the two must not collide.
+/// The bare id is xAI direct; OpenRouter prefixes the same model. Adding the
+/// xAI provider must leave an existing OpenRouter Grok row routing where it
+/// always did, which is what this asserts at the HTTP surface.
+#[tokio::test]
+async fn a_bare_xai_grok_and_an_openrouter_grok_coexist() {
+    let client = user_client().await;
+    let api = base_url();
+    let prefixed = "x-ai/grok-4.6";
+
+    let resp = client
+        .post(format!("{}/api/v1/models", api))
+        .json(&json!({
+            "id": prefixed,
+            "label": "Grok 4.6 (OpenRouter)",
+            "provider": "openrouter",
+        }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+    // The models API answers a rejected create with 200 and `success: false`.
+    // The status alone would let a failed create reach the row assertions
+    // below, which would then fail for the wrong reason.
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true,
+        "creating the OpenRouter-prefixed Grok row must succeed"
+    );
+
+    let bare = find_model(&client, &api, "grok-4.6")
+        .await
+        .expect("the seeded bare id must still be listed");
+    let via_openrouter = find_model(&client, &api, prefixed)
+        .await
+        .expect("the prefixed id must list as its own row");
+    assert_eq!(bare["routes"][0]["provider"], "xai");
+    assert_eq!(via_openrouter["routes"][0]["provider"], "openrouter");
+
+    delete_model(&client, &api, prefixed).await;
+    assert!(
+        find_model(&client, &api, "grok-4.6").await.is_some(),
+        "removing the OpenRouter row must not touch the xAI one"
+    );
+}
+
+/// `opencode-free` is accepted wherever a provider name is, and its seeded rows
+/// are real rows over HTTP. Four lists validate a provider name in this repo, so
+/// a value that parses in Rust can still be refused at the API.
+#[tokio::test]
+async fn the_keyless_provider_is_accepted_at_the_models_api() {
+    let client = user_client().await;
+    let api = base_url();
+    let id = unique_marker("e2e-free-model");
+
+    let resp = client
+        .post(format!("{}/api/v1/models", api))
+        .json(&json!({
+            "id": id,
+            "label": "E2E Free Model",
+            "provider": "opencode-free",
+        }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true,
+        "the models API must accept the opencode-free provider"
+    );
+
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert_eq!(listed["routes"][0]["provider"], "opencode-free");
+
+    // The seed ships six of these, with their windows declared.
+    let seeded = find_model(&client, &api, "laguna-s-2.1-free")
+        .await
+        .expect("the seeded free models must be listed");
+    assert_eq!(seeded["routes"][0]["provider"], "opencode-free");
+    assert_eq!(seeded["routes"][0]["context_window"], 256_000);
+
+    delete_model(&client, &api, &id).await;
+}
+
+/// A model added without the field is simply undeclared — the engine infers a
+/// window from the id. This is the back-compat path every existing row takes.
+#[tokio::test]
+async fn omitted_context_window_is_null() {
+    let client = user_client().await;
+    let api = base_url();
+    let id = unique_marker("e2e-model-nowin");
+
+    let resp = client
+        .post(format!("{}/api/v1/models", api))
+        .json(&json!({ "id": id, "label": "No Window", "provider": "local" }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert!(listed["routes"][0]["context_window"].is_null());
+
+    delete_model(&client, &api, &id).await;
+}
+
+/// The migration seeds are really there. `scripts/lib/e2e.sh` recreates the
+/// workspace database from zero on every run, so the whole migration chain —
+/// and the builtin rows it inserts — runs against an empty database. When the
+/// reset merely truncated every table but `_sqlx_migrations`, sqlx saw the
+/// migrations as applied, their seeds never re-ran, `models` was empty, and
+/// `llm::model_registry` fell back to the prefix heuristic for everything.
+/// This asserts the seeds survive all the way to the HTTP surface.
+#[tokio::test]
+async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
+    let client = user_client().await;
+    let api = base_url();
+
+    // Every group below mirrors one decision in the two seeding migrations
+    // (20260725200708 + 20260725211150). Read their comments for the full
+    // rationale; the short version is repeated per group.
+    //
+    // Declared, because the prefix map has no rule for these ids at all and
+    // silently hands them the bare 200k default.
+    for id in [
+        "z-ai/glm-5.2",
+        "gemini-3.1-pro-preview",
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
+    ] {
+        let m = find_model(&client, &api, id)
+            .await
+            .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
+        assert_eq!(m["source"], "builtin");
+        assert_eq!(
+            m["routes"][0]["context_window"], 1_048_576,
+            "{id} must declare its real 1M window — the prefix map gives it 200k"
+        );
+    }
+
+    // Declared, because the prefix map's 400k guess for a `gpt-` major of 5 or
+    // newer UNDERSTATES these. The OpenAI path has no context opt-in, so the
+    // model's full window applies to every request and there is nothing to
+    // under-declare for.
+    for id in [
+        "gpt-5.5",
+        "gpt-5.5-pro",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-6-astra",
+    ] {
+        let m = find_model(&client, &api, id)
+            .await
+            .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
+        assert_eq!(m["source"], "builtin");
+        assert_eq!(
+            m["routes"][0]["context_window"], 1_050_000,
+            "{id} must declare its real window — the prefix map understates it at 400k"
+        );
+    }
+
+    // Declared, even though the `[1m]` suffix already infers the same number:
+    // these rows DO request 1M mode, so the declaration matches the request and
+    // Settings can show a real value instead of "inferred".
+    for id in [
+        "claude-fable-5-1[1m]",
+        "claude-fable-5[1m]",
+        "claude-opus-5-5[1m]",
+        "claude-sonnet-5-5[1m]",
+        "claude-opus-5[1m]",
+        "claude-opus-4-8[1m]",
+        "claude-opus-4-7[1m]",
+        "claude-opus-4-6[1m]",
+        "claude-sonnet-5[1m]",
+        "claude-sonnet-4-6[1m]",
+        // Bare rows of the families whose DEFAULT window is 1M: their bare
+        // request needs no beta, so it is 1M as well.
+        "claude-fable-5-1",
+        "claude-fable-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-opus-5",
+        "claude-haiku-5-5",
+    ] {
+        let m = find_model(&client, &api, id)
+            .await
+            .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
+        assert_eq!(m["source"], "builtin");
+        assert_eq!(
+            m["routes"][0]["context_window"], 1_000_000,
+            "{id} runs a 1M window, so its declared window must say so"
+        );
+    }
+
+    // Undeclared on purpose, and this is the load-bearing half of the contract:
+    //   * the other bare `claude-*` rows: 1M mode is gated on Lucidos's own
+    //     `[1m]` suffix, and 1M is not their default. So 200k really is the
+    //     window of the request the engine makes. Declaring 1M here would let
+    //     the packer build a prompt the provider then rejects outright.
+    //   * the older GPT rows — windows unverified, and under-declaring only trims
+    //     early while over-declaring breaks the request.
+    // (`claude-opus-4-5@20251101` is deliberately absent: it is the row
+    // `builtin_accepts_context_window_but_keeps_its_identity` mutates, and these
+    // tests share one database within a run.)
+    for id in [
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "gpt-5.4",
+        "gpt-5.3-codex",
+        "gpt-5.3-codex-spark",
+        "gpt-5.2-codex",
+    ] {
+        let m = find_model(&client, &api, id)
+            .await
+            .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
+        assert!(
+            m["routes"][0]["context_window"].is_null(),
+            "{id} must stay undeclared — the prefix map is authoritative for it"
+        );
+    }
+}
+
+/// A **builtin** must accept a context-window correction while keeping its
+/// identity fields. The window is a factual property of the model — the vendor
+/// can raise it, and a seeded value can simply be wrong — so refusing the edit
+/// would strand a builtin on a bad window forever. Identity (label and
+/// sort_order) stays engine-owned. Its routes are not identity, so the test
+/// leaves them alone rather than asserting a provider edit is ignored.
+///
+/// Runs against a real migration-seeded builtin, and restores its declared
+/// window at the end: the database is recreated per run, but the registry is
+/// shared by every test within a run.
+#[tokio::test]
+async fn builtin_accepts_context_window_but_keeps_its_identity() {
+    let client = user_client().await;
+    let api = base_url();
+    // A seeded builtin that no other test asserts on, so these edits can't race
+    // one. Identity is read from the row rather than hardcoded, so a future
+    // migration relabelling it doesn't turn into a spurious failure here.
+    let id = "claude-opus-4-5@20251101";
+
+    let seeded = find_model(&client, &api, id)
+        .await
+        .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
+    assert_eq!(seeded["source"], "builtin");
+    let label = seeded["label"].clone();
+    let provider = seeded["routes"][0]["provider"].clone();
+    let sort_order = seeded["sort_order"].clone();
+    let seeded_window = seeded["routes"][0]["context_window"].clone();
+
+    let resp = client
+        .put(format!("{}/api/v1/models", api))
+        .query(&[("id", id)])
+        .json(&json!({
+            "context_window": 1_048_576,
+            // Ignored: a builtin's label is engine-owned. Its routes are not,
+            // so a `provider` here would re-route it, and this test sends none.
+            "label": "Hijacked",
+        }))
+        .send()
+        .await
+        .expect("update failed");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
+
+    let listed = find_model(&client, &api, id).await.expect("model listed");
+    assert_eq!(
+        listed["routes"][0]["context_window"], 1_048_576,
+        "a builtin's context window must be correctable"
+    );
+    assert_eq!(listed["label"], label, "identity must not change");
+    assert_eq!(
+        listed["routes"][0]["provider"], provider,
+        "a window edit must not move the route"
+    );
+    assert_eq!(listed["sort_order"], sort_order, "identity must not change");
+    assert_eq!(listed["source"], "builtin");
+
+    // A bad value is rejected for builtins too, not silently swallowed.
+    let resp = client
+        .put(format!("{}/api/v1/models", api))
+        .query(&[("id", id)])
+        .json(&json!({ "context_window": 0 }))
+        .send()
+        .await
+        .expect("update failed");
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        false
+    );
+    let listed = find_model(&client, &api, id).await.expect("model listed");
+    assert_eq!(
+        listed["routes"][0]["context_window"], 1_048_576,
+        "rejected edit changes nothing"
+    );
+
+    // Put the seeded value back (an explicit null clears the declaration).
+    let resp = client
+        .put(format!("{}/api/v1/models", api))
+        .query(&[("id", id)])
+        .json(&json!({ "context_window": seeded_window }))
+        .send()
+        .await
+        .expect("restore failed");
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
+    let listed = find_model(&client, &api, id).await.expect("model listed");
+    assert_eq!(
+        listed["routes"][0]["context_window"], seeded_window,
+        "the seeded window must be restored for the rest of the run"
+    );
+}
+
+/// A non-positive window is rejected rather than stored. A zero would produce a
+/// zero trim budget (everything trimmed); a negative one, cast to `usize`,
+/// an enormous one.
+#[tokio::test]
+async fn non_positive_context_window_is_rejected() {
+    let client = user_client().await;
+    let api = base_url();
+
+    for bad in [0, -1] {
+        let id = unique_marker("e2e-model-bad");
+        let resp = client
+            .post(format!("{}/api/v1/models", api))
+            .json(&json!({
+                "id": id,
+                "label": "Bad",
+                "provider": "openrouter",
+                "context_window": bad,
+            }))
+            .send()
+            .await
+            .expect("create failed");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["success"], false,
+            "context_window {bad} must be rejected"
+        );
+        assert!(
+            find_model(&client, &api, &id).await.is_none(),
+            "a rejected create must not leave a row behind"
+        );
+    }
+}

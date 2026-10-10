@@ -1,0 +1,30 @@
+# Scope for the `cargo tauri dev` watcher that scripts/tauri-dev.sh runs over
+# crates/lucidos-app.
+#
+# This is an allow-list: ignore everything, then re-include what the Rust app
+# compiles from. The TS frontend shares src/ with the Rust code, and the engine
+# serves frontend changes from dist/ (ADR 0014), so a frontend edit must never
+# restart the window. build.rs writes VERSION and .version_stamp into the crate,
+# and tauri-build writes gen/, so those must stay ignored or a build retriggers
+# itself. Folders under src/ stay ignored too, so a new TS folder restarts
+# nothing. Entitlements.plist is left out: only `cargo tauri build` reads it.
+#
+# Tauri's watcher reads this file, never .gitignore, when it filters change
+# events. The path crates the app depends on are watched in full, because
+# tauri-cli finds them through `cargo metadata`.
+# Plan: docs/plans/2026-09-25-tauri-dev-window-rebuilds-on-app-changes.md
+#
+# It lives here, one level up, because tauri-cli also tests the watched folder
+# itself against the file. Inside the crate, `/*` matches the crate root's own
+# empty relative path, so the whole crate would go unwatched.
+/lucidos-app/*
+!/lucidos-app/Cargo.toml
+!/lucidos-app/build.rs
+!/lucidos-app/tauri.conf.json
+!/lucidos-app/Info.plist
+!/lucidos-app/capabilities/
+!/lucidos-app/permissions/
+!/lucidos-app/icons/
+!/lucidos-app/src/
+/lucidos-app/src/**
+!/lucidos-app/src/**/*.rs

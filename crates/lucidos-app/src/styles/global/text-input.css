@@ -1,0 +1,83 @@
+/* The one text-input look: every free-text field shares this box and this
+   focus ring. A component file adds only layout, padding and type size, never
+   its own background, border or focus.
+
+   Inside a .form-group, this rule skips two fields whose frame draws the box:
+   the Intent textarea (.prompt-box, whose frame wears the same focus ring)
+   and an editable dropdown's input.
+
+   `.text-input` is the app-facing opt-in: this file is `include_str!`'d into
+   the served `/api/v1/sdk-iframe.css` (crates/lucidos-engine/src/api/sdk.rs),
+   so `<input class="text-input">` in an app gets this exact box, placeholder
+   colour and focus ring, with nothing to keep in sync. See
+   docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md. */
+.text-input,
+.settings-text-input,
+.form-group input:where(:not([type="checkbox"], .dropdown-input)),
+.form-group textarea:where(:not(.prompt-textarea)),
+.repo-add-input,
+.oauth-provider-input,
+.allowlist-row-input,
+.device-name-input,
+.style-editor-instruction,
+.app-store-marketplace-name-input,
+.trigger-group-name-input,
+.dir-picker-path-input,
+.panel-url-input,
+.prompt-input,
+.file-editor-textarea,
+.pairing-input {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.5);
+    color: var(--text-primary);
+    outline: none;
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
+}
+
+.text-input::placeholder,
+.settings-text-input::placeholder,
+.form-group input::placeholder,
+.form-group textarea::placeholder,
+.repo-add-input::placeholder,
+.oauth-provider-input::placeholder,
+.allowlist-row-input::placeholder,
+.device-name-input::placeholder,
+.style-editor-instruction::placeholder,
+.app-store-marketplace-name-input::placeholder,
+.trigger-group-name-input::placeholder,
+.dir-picker-path-input::placeholder,
+.panel-url-input::placeholder,
+.prompt-input::placeholder,
+.file-editor-textarea::placeholder,
+.pairing-input::placeholder {
+    color: var(--text-muted);
+}
+
+/* Focus is the shared --focus-ring glow alone, as on .icon-btn. A 1px accent
+   border aliases unevenly under fractional UI scaling, so the border goes
+   transparent and the glow sits flush on the field. The transparent outline is
+   the forced-colors fallback, where box-shadow is stripped. Frames that wrap a
+   bare input (.input-with-action, .dropdown-input-wrap) light up the same way. */
+.text-input:focus,
+.settings-text-input:focus,
+.form-group input:where(:not([type="checkbox"], .dropdown-input)):focus,
+.form-group textarea:where(:not(.prompt-textarea)):focus,
+.repo-add-input:focus,
+.oauth-provider-input:focus,
+.allowlist-row-input:focus,
+.device-name-input:focus,
+.style-editor-instruction:focus,
+.app-store-marketplace-name-input:focus,
+.trigger-group-name-input:focus,
+.dir-picker-path-input:focus,
+.panel-url-input:focus,
+.prompt-input:focus,
+.file-editor-textarea:focus,
+.pairing-input:focus,
+.input-with-action:focus-within,
+.dropdown-input-wrap:focus-within {
+    border-color: transparent;
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}

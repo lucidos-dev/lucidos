@@ -1,0 +1,1364 @@
+.thread-drawer {
+    /* The pane's CONTENT COLUMN: the x every row's text starts at, whether the
+       pane is showing the thread list or the filter panel that covers it. It
+       is one token because those two have to land on the same column. On two
+       columns they read as two surfaces, not as one pane showing something
+       else. A nested row also derives its indent from it. Everything that uses
+       it lives inside `.thread-drawer`, so it needs no fallback; nothing
+       outside the pane may claim it. The status mark sits inside the title
+       line, so this column reserves no room for it. */
+    --drawer-row-inset: 0.75rem;
+    /* Where a thread row's content column ends. A var because the row divider
+       and a collapsed section's divider stop at the same x. The mobile block
+       below moves it: two hand-synced copies drifted the moment one did. */
+    --thread-row-pad-right: 0.5rem;
+    width: var(--thread-drawer-width, 18.75rem);
+    flex-shrink: 0;
+    background: var(--bg-primary);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+    transition: width var(--duration-slow) ease;
+}
+
+.thread-drawer-collapsed {
+    width: 0 !important;
+}
+
+/* --- Drawer resize divider --- */
+
+.drawer-divider {
+    width: var(--divider-width);
+    cursor: col-resize;
+    background: var(--border-color);
+    flex-shrink: 0;
+    position: relative;
+    z-index: 2;
+    transition: background-color var(--duration-fast), width var(--duration-slow) ease, opacity var(--duration-slow) ease;
+    touch-action: none;
+}
+
+.drawer-divider-collapsed {
+    width: 0;
+    opacity: 0;
+    cursor: default;
+}
+
+/* Filter active indicator — no color override; count badge shows state */
+
+/* The list and the layers over it (ThreadDrawer). Its own positioned box, so
+   the filter cover, the leaving drawing and the navigation cover all inset to
+   the list. */
+.thread-drawer-body {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Filter cover, the box the filter panel shows in: a VIEW INSIDE THIS PANE (see
+   ThreadFilterPanel and ThreadFilterCover), covering the thread list while it
+   is up, on both layouts. The desktop drawer column and the
+   mobile threads pane are the same component, so `inset: 0` against
+   `.thread-drawer-body` lands it correctly on each without a media query. It deliberately wears the pane's OWN background and no card
+   chrome (no border, radius, shadow or min-width), since that chrome is exactly
+   what made the previous anchored dropdown read as something floating over the
+   app rather than as the pane showing something else.
+
+   z-index 3 keeps the panel above the list. `.thread-drawer-list` is a stacking
+   context, so its rows' own layers (the nested-row accent bar, at 1) and the
+   leaving-row copies stay inside it. The list is also
+   `visibility: hidden` while the panel is up (below). It carries neither a
+   title row nor a footer: the pane header above says
+   "Filters" while this is up, and the same header's Filter button is the way
+   out, held down while the panel is open (Escape closes it too).
+
+   With nothing docked above or below it, the cover IS the pane's scroller while
+   the panel is up, which is what lets it take `.thread-drawer-list`'s own padding
+   below: the same list geometry, showing filters instead of threads. A block
+   scroller, not a flex column, for the same reason the list is one: flex
+   children shrink to fit rather than overflow, so a long filter list in a
+   column would compress instead of scroll. */
+.thread-filter-cover {
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    background: var(--bg-primary);
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
+    overscroll-behavior: contain;
+    /* Mirrors `.thread-drawer-list` exactly: the same always-reserved scroll
+       gutter, and a hair below the last row. */
+    padding-bottom: 0.25rem;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+/* The swap dips through the pane background: the navigation cover over both
+   (below) rises over the leaving view, holds, and clears off the arriving one.
+   Never a crossfade: the panel wears the list's geometry, so both drawn at
+   once print rows and options on the same lines. */
+.thread-filter-cover[data-open] {
+    visibility: visible;
+    pointer-events: auto;
+}
+
+.thread-drawer-body:has(> .thread-filter-cover[data-open]) > .thread-drawer-list {
+    visibility: hidden;
+}
+
+/* The leaving rows stop taking taps at once, as the leaving panel does. On the
+   rows, never the scroller: a scroller out of hit-testing stops panning. */
+.thread-drawer-body:has(> .thread-filter-cover[data-open]) > .thread-drawer-list > * {
+    pointer-events: none;
+}
+
+/* Each view shows or hides at the dip's midpoint, where the cover is opaque.
+   Only `visibility` is delayed. Opacity never animates on the views, since
+   WebKit re-compositing content up from transparent is the iOS paint-loss
+   shape. The cover is the one fade. */
+.thread-drawer-body > .thread-drawer-list,
+.thread-filter-cover {
+    transition: visibility 0s linear calc(var(--duration-slow) / 2);
+}
+
+:root[data-motion="reduce"] .thread-drawer-body > .thread-drawer-list,
+:root[data-motion="reduce"] .thread-filter-cover {
+    transition: none;
+}
+
+/* The leaving list, held as a drawing when only the grouping changes
+   (components/drawer/LeavingViewDrawing.tsx). It plays the closing panel's
+   part: on screen until the dip's midpoint, then hidden, so the arriving list
+   shows only under the opaque cover. A fresh element per change, so its
+   animation starts with the fresh cover's. It rests visible: a first frame the
+   animation misses still shows the leaving view, never the arriving one.
+   Over the rows (1) and under the filter cover (3): the two never show at once,
+   and the panel stays the top local layer. It takes the pointer while it shows,
+   as the hidden arriving list does on the panel path. Hidden, it takes none. */
+.thread-view-drawing {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    background: var(--bg-primary);
+    overflow: hidden;
+    animation: thread-view-drawing-leave var(--duration-slow) step-end forwards;
+}
+
+/* Both step at 50%. `visibility` alone is not enough: a descendant that sets
+   its own `visibility: visible` (a collapsed header's count badge,
+   section-header.css) outlives an inherited `hidden`. No descendant can undo
+   its ancestor's `opacity: 0`. */
+@keyframes thread-view-drawing-leave {
+    0% { visibility: visible; opacity: 1; }
+    50%, 100% { visibility: hidden; opacity: 0; }
+}
+
+:root[data-motion="reduce"] .thread-view-drawing {
+    animation: none;
+    visibility: hidden;
+    opacity: 0;
+}
+
+/* The drawn list keeps the scroller's geometry (`.thread-drawer-list`), so it
+   lines up with the list it stands for. */
+.thread-view-drawing-list {
+    position: absolute;
+    inset: 0;
+}
+
+/* The navigation cover's host (global/host-components.css). Over the filter
+   cover, so it hides both views' swap frame. */
+.thread-drawer-body > .nav-cover {
+    z-index: 4;
+}
+
+/* The panel opens straight on its rows, with no heading. This lead keeps the
+   first row off the band above, as a section header's padding does for the
+   list's first heading. */
+.thread-filter-panel {
+    padding-top: var(--space-sm);
+}
+
+/* Filter rows sit on the pane's content column (`--drawer-row-inset`, the same
+   token `.thread-row` and the list's section headers take their left padding
+   from) and 0.5rem from the trailing edge. The panel covers that list, so a row
+   here and a row there have to land on the same grid. No hover band: a
+   checkbox toggles one setting. */
+.thread-filter-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.375rem 0.5rem 0.375rem var(--drawer-row-inset);
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+/* One indent step deeper, the same 1rem step the drawer's nested sub-threads
+   take per level (`--thread-depth` in `.thread-row`). */
+.thread-filter-option-child {
+    padding-left: calc(var(--drawer-row-inset) + 1rem);
+    font-size: var(--font-size-sm);
+}
+
+/* The Repos / Apps grouping inside an expanded Coding Agent row. It heads the
+   CHILD rows, so it stands on THEIR column: the same indent step they take.
+   The words then start where the checkboxes under them do. The panel's own
+   left edge is outside every row it heads, and left of the parent row it
+   belongs to. Smaller and quieter than the rows themselves, being a divider
+   between two runs of them rather than one of them. */
+.thread-filter-group-title {
+    padding: 0.375rem 0.5rem 0.125rem calc(var(--drawer-row-inset) + 1rem);
+    font-size: var(--font-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+}
+
+/* Leading channel glyph on the thread type rows (Lucidos / Coding Agent /
+   Triggers), mirroring the per-thread source marks (ThreadTypeIcon). One quiet,
+   muted icon column. The Lucidos mark self-sizes via its own
+   inline style; the line glyphs (CodeIcon, the triggers CategoryIcon) size here. */
+.thread-filter-channel-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    flex-shrink: 0;
+    color: var(--text-secondary);
+}
+
+.thread-filter-channel-icon svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+/* The Lucidos mark renders in full brand color (the gradient tile) everywhere
+   else, but in the filter's channel column it reads as a monochrome source glyph
+   alongside the line icons. `channelIcon` drops the tile (`background={false}`);
+   here we override the mark's baked white fill so the squares + spark inherit the
+   row's text color, matching the Coding Agent and Triggers glyphs beside it. */
+.thread-filter-channel-icon .lmk-tile,
+.thread-filter-channel-icon .lmk-spark {
+    fill: currentColor;
+}
+
+.thread-filter-option-deleted {
+    color: var(--text-secondary);
+}
+
+.thread-filter-deleted {
+    font-size: 0.75em;
+    font-style: italic;
+}
+
+.thread-drawer-list,
+.thread-view-drawing-list {
+    flex: 1;
+    /* Reserve the scrollbar's width even while the list fits. Otherwise the bar
+       comes and goes as sections and sub-threads expand or collapse, and every
+       row re-flows sideways. The same engine-covering pair as `.thread-content`
+       (chat/input-messages.css): Chromium honours the stable gutter on a
+       non-overflowing box, WebKit only reserves once `scroll` draws the bar. Both
+       are no-ops for overlay scrollbars, and the empty track is --bg-primary.
+       The bar is the app's normal one (components.css), and row backgrounds run
+       full width up to it, so a selection sits flush against it. */
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
+    /* A stacking context, so the scroller paints its positioned rows itself.
+       Without one, iOS WebKit lifts every row into a layer above the scroller,
+       and the focused row's fill covers the native scroll indicator. */
+    isolation: isolate;
+    /* The first section header's own top padding keeps it off the threads
+       header chrome above the list. */
+    padding-bottom: 0.25rem;
+}
+
+.thread-row {
+    cursor: pointer;
+    position: relative;
+    /* `--thread-depth` inherits from the row wrapper for nested children (set
+     * via depthStyle() in ThreadDrawer.tsx); 0 keeps top-level rows aligned.
+     * `--thread-row-pad-left` is the row's left padding, where the title line
+     * starts. Shared so the bottom-edge divider `::after` below can begin at
+     * the same x.
+     *
+     * `--thread-row-title-line` is the height of ONE line of the row title,
+     * stated rather than left at `line-height: normal`, which is font metrics.
+     * The row actions sit in a line of this height too. 1.0625rem
+     * is about 1.3x the title's 0.8125rem, so a wrapped title has room
+     * between its two lines. */
+    --thread-row-pad-left: calc(var(--drawer-row-inset) + var(--thread-depth, 0) * 1rem);
+    --thread-row-title-line: 1.0625rem;
+    padding-left: var(--thread-row-pad-left);
+    /* Right padding gives the action icons breathing room inside the row. */
+    padding-right: var(--thread-row-pad-right);
+    /* The space above the title must stay clearly larger than the gap under
+     * it, so each row reads as one group, not as loose lines. */
+    padding-top: var(--space-lg);
+    /* No right MARGIN: the focused / hover / highlighted background runs full
+     * width to the drawer's right edge (or up to the scrollbar when the list
+     * overflows), so the selection reads flush with no `--bg-primary` gap strip.
+     * No left margin either: nested sub-thread selections reach the left
+     * edge. */
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+/* Override `.list-row:hover` (global.css) — its `--bg-hover` (#eaeef2) is
+ * almost the same gray as `--border-color` (#d0d7de), so the hovered row's
+ * top edge of bg-hover visually merges with the 1px divider above it and the
+ * pair reads as one thick band (~5x the apparent thickness of an unhovered
+ * divider). `--bg-secondary` is light enough vs the border color to keep the
+ * divider visually separate while still signalling hover.
+ *
+ * `:not()` exclusions keep this from outranking the focused / highlighted
+ * rules below — without them, this selector's (0,4,0) specificity beats
+ * `.thread-row-focused:hover` (0,3,0) and the selected row would lose its
+ * `bg-selected` background whenever the user hovers it. */
+@media (hover: hover) {
+    .thread-drawer .list-row.thread-row:not(.thread-row-focused):not(.thread-row-highlighted):hover {
+        background: var(--bg-secondary);
+    }
+}
+
+/* Each thread row's hairline (styles/section-header.css) starts just left of
+ * its own title text, so a nested row's line tracks its indent. It stops at
+ * the content column. The hover override above keeps the hovered-row
+ * background clear of the line colour. */
+.thread-drawer .thread-row {
+    --row-hairline-left: calc(var(--thread-row-pad-left) - 0.25rem);
+    --row-hairline-right: var(--thread-row-pad-right);
+}
+
+/* x-position of the lifted-child accent bar: one indent step deeper per level,
+ * so each nesting level's accent bar starts a step further right than its
+ * parent. It is its own column, left of the title, which indents by the
+ * same step from a different origin. `--thread-depth` is set inline by
+ * depthStyle() in ThreadDrawer.tsx and inherits down to the row + its
+ * pseudo-elements. */
+.thread-row-wrap.is-nested {
+    --thread-indent: calc(0.8125rem + (var(--thread-depth, 0) - 1) * 1rem);
+    --rail-x: var(--thread-indent);
+}
+
+/* No vertical sub-thread rail: nested rows read as indented via their title
+ * offset alone, with no gray guide line. The status mark indents with that
+ * title, so depth is already legible without a rail. The `::before` is kept
+ * (transparent) purely so the lifted-child accent BAR below can light it —
+ * that's a state cue, not a divider. */
+.thread-row-wrap.is-nested .thread-row::before {
+    content: '';
+    position: absolute;
+    left: var(--rail-x);
+    top: 0;
+    bottom: 0;
+    width: 0.125rem;
+    background: transparent;
+    pointer-events: none;
+    z-index: 1;
+    transition: background var(--duration-fast) ease;
+}
+
+/* Lifted-family cue: a descendant whose own natural section matches the
+ * routed section (i.e. it earned the lift). Lights the accent bar so the eye
+ * lands on it while scanning the section, then traces up to the lifted
+ * family. */
+.thread-row-wrap.is-nested .thread-row.thread-row-lifted-child::before {
+    background: var(--accent);
+}
+
+/* Lifted-family root: render the parent muted so it reads as "I'm here
+ * because of one of my children". The native-section style is not modeled per
+ * section in the drawer today — opacity is a strong-enough demotion cue
+ * without needing per-section row treatments. */
+.thread-row.thread-row-lifted-parent .thread-row-title,
+.thread-row.thread-row-lifted-parent .thread-row-created,
+.thread-row.thread-row-lifted-parent .thread-row-context,
+.thread-row.thread-row-lifted-parent .message-channel-tag {
+    opacity: 0.6;
+}
+
+/* Archived sub-thread cue: this thread's own natural section is Archive, but
+ * its family routed to Current / Pinned, so it renders under a parent that
+ * still has live work. Render it dimmed at the drawer's own dim opacity
+ * (`--drawer-dim-opacity`, which an empty Ongoing tile uses too) so a
+ * sub-thread the user has already archived can't be mistaken for pending work.
+ * Dimmer than the lifted-parent cue above, which says "I'm here because of a
+ * child", not "I'm already put away" (and which owns the root row, so the two
+ * never land on the same row). Visual only: the row still opens on click,
+ * keeps its hover background, and keeps its actions usable.
+ *
+ * The status mark dims with the rest. An archived thread is never running,
+ * since `displaySection` keeps it in Current. It can still carry a failed or
+ * paused dot, and that loud cue must dim. */
+.thread-row-wrap.is-archived .thread-status,
+.thread-row-wrap.is-archived .thread-row-title,
+.thread-row-wrap.is-archived .thread-row-created,
+.thread-row-wrap.is-archived .thread-row-context,
+.thread-row-wrap.is-archived .message-channel-tag {
+    opacity: var(--drawer-dim-opacity);
+}
+
+/* Sub-thread toggle: a "Show / Hide N sub-threads" link on its own line under
+ * the date. It flows in the title column, so a long title can never run into
+ * it, and it sits directly above the sub-threads it opens and closes. The
+ * accent is mixed toward grey so the link stays quieter than the title but
+ * brighter than the date. Light mode keeps more accent, since its darker blue
+ * mixed half-and-half turns slate grey. Hover lifts it to a stronger blue, with
+ * no underline. One chevron rotates between the two states. The chevron turn
+ * is the only tap feedback, so this rule turns off iOS's grey tap flash.
+ *
+ * The link never wraps. A button centres wrapped text, so on a narrow drawer
+ * "threads" would land alone under "Hide 2 sub-".
+ *
+ * The negative margins let the tap padding overlap its neighbours, so the
+ * spacing around the link comes from `.thread-row-family-line` alone. */
+.family-disclosure {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.1875rem;
+    white-space: nowrap;
+    --disclosure-pad-y: 0.125rem;
+    padding: var(--disclosure-pad-y) 0;
+    margin-block: calc(-1 * var(--disclosure-pad-y));
+    background: none;
+    border: none;
+    font-size: var(--font-size-2xs);
+    line-height: 1.2;
+    --disclosure-accent-share: 50%;
+    --disclosure-hover-color: var(--accent);
+    color: color-mix(in srgb, var(--accent) var(--disclosure-accent-share), var(--text-secondary));
+    cursor: pointer;
+    transition: color var(--duration-fast) ease;
+}
+
+/* Sets only variables, so the :hover rule below still wins on colour. Hover
+ * darkens past the accent, since 80% to the full accent is too small to see. */
+html[data-theme-mode="light"] .family-disclosure {
+    --disclosure-accent-share: 80%;
+    --disclosure-hover-color: color-mix(in srgb, var(--accent) 70%, var(--text-primary));
+}
+
+/* The chevron holds its own compositing layer in both states. WebKit drops the
+ * layer when the rotation ends, and repaints the chevron into the row at a
+ * different sub-pixel spot. In the packaged macOS app it then jumped right
+ * after landing on Hide. `will-change` keeps the layer, so the end of the turn
+ * paints exactly where the turn left it. Same fix as `.brand-mark-glyph`. */
+.family-disclosure svg {
+    width: 0.75rem;
+    height: 0.75rem;
+    flex-shrink: 0;
+    transform: rotate(0deg);
+    will-change: transform;
+    transition: transform var(--duration-normal) cubic-bezier(0.22, 0, 0, 1);
+}
+
+.family-disclosure[aria-expanded="true"] svg {
+    transform: rotate(90deg);
+}
+
+/* Keyboard focus: the shared soft accent ring (--focus-ring, see base.css /
+ * .icon-btn:focus-visible). :focus-visible keeps a mouse click quiet. The
+ * transparent outline is the forced-colors fallback, where box-shadow is
+ * stripped. */
+.family-disclosure:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+    border-radius: calc(var(--radius-control) * 0.5);
+}
+
+@media (hover: hover) {
+    .family-disclosure:hover {
+        color: var(--disclosure-hover-color);
+    }
+}
+
+
+/* Focus is shown by the `bg-selected` fill alone — no leading accent bar.
+ * The fill spans the full row width at every depth — nested rows are NOT
+ * clipped to the indent rail — so a focused/highlighted sub-thread's
+ * background runs all the way to the drawer's left edge, like a top-level
+ * row. The title still reads as indented via its `padding-left`. */
+.thread-row.thread-row-focused,
+.thread-row.thread-row-focused:hover {
+    background: var(--bg-selected);
+}
+
+/* Keyboard highlight (arrow-key nav) reads exactly like a mouse hover — the
+ * `--bg-secondary` fill, no accent outline. (`--bg-secondary` not `--bg-hover`
+ * for the same reason the hover rule above uses it: `--bg-hover` is dark enough
+ * to merge with the row's hairline divider into one thick band.) */
+.thread-row.thread-row-highlighted {
+    background: var(--bg-secondary);
+}
+
+.thread-row.thread-row-highlighted.thread-row-focused {
+    background: var(--bg-selected);
+}
+
+/* Dark mode: the name chip's fill --bg-tertiary (#163052) is nearly identical to
+ * the selected-row fill --bg-selected (#163356) — only ~3-4 levels apart on G/B —
+ * so the repo/app/trigger name chip loses its edge on a selected row. Fill colour
+ * alone can't fix it: the whole row ramp is dark navy, so any fill light enough to
+ * separate the chip from the rows is too light for the muted gray --text-secondary
+ * text, and any fill dark enough for the text sits on top of the rows. So keep the
+ * dark fill (text stays readable) and delineate the chip with a 1px --border-color
+ * outline (#2c456a, lighter than EVERY row fill incl. selected) — it reads as a
+ * distinct pill on every row state regardless of how close its fill is to the row.
+ * The channel/type tag stacked above it (.message-channel-tag) gets the SAME
+ * outline so the two chips in a row read consistently — an outline on only one of
+ * the pair looks like a mistake. (.message-channel-tag is only rendered in the
+ * drawer row today, but scope it to .thread-row so a future chat-header reuse of
+ * the class stays borderless.) box-sizing is border-box and ContextChip's width
+ * pin already includes border widths (ThreadDrawer.tsx), so the outline doesn't
+ * shift layout. Light mode's fills are already well clear of --bg-tertiary
+ * (#eff2f5 vs #e1e4e8), so both chips keep the plain fill there. */
+html[data-theme-mode="dark"] .thread-row-context,
+html[data-theme-mode="dark"] .thread-row .message-channel-tag {
+    border: 1px solid var(--border-color);
+}
+
+/* The error channel tag (.channel-error, an unknown-channel row) declares its own
+ * red border-color in response.css but never rendered it — it set no width/style,
+ * so the border was inert. The shorthand above now supplies the width/style AND a
+ * neutral colour that (being more specific + loaded later) would repaint the error
+ * tag neutral. Restore its red outline so the error tag keeps its identity — which
+ * also finally realizes .channel-error's original intent. */
+html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
+    border-color: var(--accent-red);
+}
+
+.thread-row-left {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    /* The one gap between title, meta line and sub-thread link. */
+    gap: 0.375rem;
+    /* Descent room under the row's last line. */
+    padding-bottom: 0.25rem;
+}
+
+/* A family row ends on the sub-thread line, which gets extra room below. */
+.thread-row-left:has(> .thread-row-family-line) {
+    padding-bottom: var(--space-sm);
+}
+
+/* The title text, then the row's actions at the line's right end. The bottom
+ * margin adds to the column gap, so the title has 0.75rem below it. The font
+ * size sits here rather than on the title, so the status mark's `ex` and `cap`
+ * units measure the title's own letters.
+ *
+ * The row actions overhang a one-line title. The min-height gives that title
+ * extra room below. The extra must stay under one line, so a wrapped title
+ * outgrows it and keeps its height. */
+.thread-row-title-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    min-height: calc(var(--thread-row-title-line) + var(--space-xs));
+    margin-bottom: 0.375rem;
+    font-size: var(--font-size-md);
+    line-height: var(--thread-row-title-line);
+}
+
+.thread-row-title-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.thread-row-title {
+    font-weight: 400;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+/* The thread icon (`ThreadIcon`), after the status mark in a drawer row and in
+ * the title band. The band's icon matches its title's type size. */
+.thread-icon {
+    display: inline-flex;
+    margin-right: var(--space-sm);
+    vertical-align: -0.1em;
+}
+
+.thread-row-title-text > .thread-icon svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+.thread-title-text > .thread-icon svg {
+    width: var(--font-size-md);
+    height: var(--font-size-md);
+}
+
+/* The date at the left, then the channel tag and the name chip at the right
+ * end of the same line. On a narrow drawer the chips wrap to a second line,
+ * still right-aligned; nothing shrinks, so the date never truncates. The gap
+ * is the only spacing. `.message-channel-tag` brings a margin from its
+ * chat-header use, and that margin would push the chips off the shared line.
+ * Items align on their last baseline, so a name chip that wraps grows
+ * upward. The chips keep one bottom edge and the date reads with their last line. */
+.thread-row-meta {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: last baseline;
+    gap: 0.25rem 0.375rem;
+}
+
+.thread-row-meta > * {
+    flex-shrink: 0;
+    margin: 0;
+}
+
+/* The sub-thread link, then the archived-reveal toggle, under the date and
+ * chips. The two share a text baseline. The link's negative margins cancel its
+ * padding, so its text sets the line's height. The line sits a step lower than
+ * the column gap alone would put it.
+ *
+ * Nothing on this line may overflow the row, since that scrolls the whole
+ * drawer sideways. On a narrow drawer the archived toggle wraps under the
+ * link instead. */
+.thread-row-family-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: last baseline;
+    gap: 0.375rem var(--space-md);
+    margin-top: var(--space-xs);
+}
+
+/* `.family-disclosure`'s own base rule sets `align-self: flex-start`, which
+ * would lift its text off the archived label's baseline. */
+.thread-row-family-line > .family-disclosure {
+    align-self: auto;
+}
+
+/* The switch and its "N archived" text wrap as one unit, and a tap on either
+ * flips it. Inline flow keeps the text's baseline as the unit's own, and
+ * `middle` centres the switch on the text's lowercase letters. */
+.archived-reveal {
+    display: inline-block;
+    white-space: nowrap;
+    font-size: var(--font-size-2xs);
+    cursor: pointer;
+}
+
+/* The "N archived" reveal toggle: a smaller switch than the settings-page
+ * default, sized to sit on the sub-thread line without dominating it. Same
+ * dim-then-accent treatment as `.family-disclosure`'s label text, so the two
+ * controls read as one family of quiet, secondary links. */
+.archived-reveal-toggle {
+    --toggle-width: 1.75rem;
+    --toggle-knob: 0.6875rem;
+    vertical-align: middle;
+    margin-right: 0.375rem;
+}
+
+.archived-reveal-label {
+    color: var(--text-secondary);
+}
+
+/* The skeleton's chip is a bare shimmer bar with no text, so it has no
+ * baseline. Aligned by its bottom edge instead, it would make the skeleton
+ * line taller than the loaded one. */
+.thread-row-meta > .sk-bar {
+    align-self: center;
+}
+
+.thread-row-meta > .thread-row-created {
+    margin-right: auto;
+}
+
+.thread-row-created {
+    display: block;
+    font-size: var(--font-size-2xs);
+    line-height: 1.2;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The chip rides the title's first line, so it must not be taller than that
+ * line. It is an inline-block, so it would inherit `--thread-row-title-line` as
+ * its content height and add its padding on top. That would make the draft
+ * row taller than every other row. Its own tight line-height keeps the chip
+ * shorter than the line, and `vertical-align: top` keeps its top inside it. */
+.draft-indicator {
+    display: inline-block;
+    font-size: var(--font-size-2xs);
+    line-height: 1.2;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    padding: 0.0625rem 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+    white-space: nowrap;
+    vertical-align: top;
+    margin-left: 0.375rem;
+}
+
+/* The repo / app / trigger NAME chip, shown after the channel/type tag. Muted
+ * so the type tag stays the primary label; a long name (e.g. a trigger like
+ * "NIGHTLY BUILD → HARDEN → E2E") WRAPS onto extra lines within the chip's
+ * max-width rather than truncating to an ellipsis or forcing the row wider — the
+ * chip grows taller, not wider. The max-width is kept deliberately narrow so a
+ * long name breaks early (the trigger above wraps after "NIGHTLY BUILD →")
+ * instead of running most of the row's width before wrapping; because both this
+ * max-width and the `.label` font-size are in rem, the wrap point stays the same
+ * across UI scales. Once wrapped, the chip is pinned to its WIDEST line by
+ * ContextChip (ThreadDrawer.tsx) — CSS can't shrink a constrained box to the
+ * longest line of wrapped text, so the JS measures the line boxes and sets an
+ * explicit width, removing the dead space beside the shorter lines. */
+.thread-row-context {
+    max-width: 7rem;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+}
+
+/* One title line, inheriting the title row's font and line height, so it sits
+ * on the title's baseline. The buttons inside center on the title's capital
+ * letters with the status mark's rule below. */
+.thread-row-actions-line {
+    flex-shrink: 0;
+}
+
+.thread-row-actions {
+    /* The row's title line already ends with this box. */
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* Action buttons (copy) reveal on hover/focus on desktop, always visible on touch. */
+.thread-row-action {
+    opacity: 0;
+    transition: opacity calc(0.12s * var(--duration-scale)) ease-in-out;
+}
+
+@media (hover: hover) {
+    .thread-row:hover .thread-row-action,
+    .thread-row-action:focus-visible {
+        opacity: 1;
+    }
+}
+
+@media (hover: none) {
+    .thread-row-action {
+        opacity: 1;
+    }
+}
+
+/* Keep the overflow trigger visible while its menu is open: the open overlay
+ * makes `.app-shell` inert, suppressing `:hover`, so the trigger would otherwise
+ * fade out from under its own popover. */
+.thread-row-action[aria-expanded="true"] {
+    opacity: 1;
+}
+
+.thread-status {
+    display: flex;
+    align-items: center;
+}
+
+/* Drawer-row copy glyph uses --icon-size-md at every viewport — the
+ * button shrinks on desktop (see @media block) but the SVG inside doesn't. */
+.thread-row-actions .icon-btn.header-icon svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+}
+
+/* The pin's head and body fill the top of its box, and the needle hangs
+ * below. The eye reads the body, so the glyph moves down by the 2.5 of 24
+ * units between the body's center and the box's. The body then centers on
+ * the caps. */
+.thread-row-actions .pin-thread-btn svg {
+    translate: 0 calc(100% * 2.5 / 24);
+}
+
+/* The mark starts the title's first line, and a wrapped title continues under
+ * it, flush with the row's content column. That keeps the drawer's left margin
+ * free of a column reserved for the mark.
+ *
+ * The mark centers on the capital letters, where the eye puts a title's middle.
+ * The line box's middle sits lower by an amount that differs per font.
+ * `vertical-align: middle` centers the box half an x-height above the baseline.
+ * The bottom margin of `1cap - 1ex` lifts that center to half a cap height.
+ * The box itself is zero tall, and the flex rule centers the drawn mark on it,
+ * so the mark never grows the line. An idle thread draws no mark, so it takes
+ * no room either.
+ *
+ * The row's pin and ⋯ take the same box. They are taller than the line, so
+ * they overhang it both ways and still take no room.
+ *
+ * The thread pane's title draws its mark the same way, so the two read alike. */
+.thread-row-title-text > .thread-status,
+.thread-title-text > .thread-status,
+.thread-row-actions {
+    display: inline-flex;
+    vertical-align: middle;
+    height: 0;
+    margin-bottom: calc(1cap - 1ex);
+}
+
+.thread-row-title-text > .thread-status,
+.thread-title-text > .thread-status {
+    margin-right: 0.375rem;
+}
+
+/* Under the question badge's size, which suits a mark beside a title. The row
+ * and the pane title set the same text, so they share one spinner. */
+.thread-row-title-text > .thread-status .mini-spinner,
+.thread-title-text > .thread-status .mini-spinner {
+    width: 0.5rem;
+    height: 0.5rem;
+}
+
+.thread-row-title-text > .thread-status-idle,
+.thread-title-text > .thread-status-idle {
+    display: none;
+}
+
+@media (--desktop-layout) {
+    .thread-row-actions {
+        gap: 0.125rem;
+    }
+
+    .thread-row-actions .icon-btn.header-icon {
+        width: 1.25rem;
+        height: 1.25rem;
+    }
+
+    /* Keeps the last line off the row's bottom divider. */
+    .thread-row {
+        padding-bottom: 0.5rem;
+    }
+}
+
+@media (--phone-layout) {
+    .thread-row-actions .icon-btn.header-icon {
+        width: 1.75rem;
+        height: 1.5rem;
+    }
+
+    /* 1rem below the date (this bottom plus `.thread-row-left`'s descent
+     * room), matching the 1rem above the title. */
+    .thread-row {
+        padding-bottom: var(--space-md);
+    }
+
+    /* The pin is the row's ONLY control here: the ⋯ is gone and a long press on
+     * the row opens its menu instead (useRowActionsGesture). So the pin moves
+     * in from the row's far corner to the shared --space-lg gutter, and both
+     * dividers track the same var. */
+    .thread-drawer {
+        --thread-row-pad-right: var(--space-lg);
+    }
+
+    /* The footer link is a finger's tap target here, so it gets a larger font
+     * and more padding. */
+    .family-disclosure {
+        font-size: var(--font-size-xs);
+        --disclosure-pad-y: 0.25rem;
+    }
+}
+
+/* --- Thread search bar (inline in threads-header) --- */
+/* Always in DOM so iOS can focus() synchronously within a user gesture.
+   No width/height constraints — composeHandlers focuses before toggling
+   .search-active, so the input must have natural dimensions for the caret
+   to render at the correct size. clip-path hides it visually. */
+.thread-search-bar {
+    position: absolute;
+    overflow: hidden;
+    clip-path: inset(50%);
+    pointer-events: none;
+}
+
+/* When search is active, show the search bar and hide title/buttons */
+.search-active > .thread-search-bar {
+    position: static;
+    overflow: visible;
+    clip-path: none;
+    pointer-events: auto;
+    display: flex;
+    align-items: center;
+    flex: 1;
+    gap: 0.25rem;
+    min-width: 0;
+}
+
+.threads-header.search-active > *:not(.thread-search-bar) {
+    display: none !important;
+}
+
+.thread-search-bar .search-field {
+    flex: 1;
+}
+
+.thread-search-close {
+    flex-shrink: 0;
+}
+
+.thread-drawer-load-more {
+    min-height: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* --- Drawer sections (Running / Pinned) --- */
+
+/* Positioned so a disclosure mask (below) lays out against its own section,
+   and scrolls and clips with the list. */
+.drawer-section {
+    position: relative;
+    padding: 0;
+}
+
+/* A family or section showing or hiding its rows (useFlipAnimation): copies of
+   the rows slide inside this box, whose top edge is the parent's or header's
+   bottom edge. The overflow clip hides every copy above that edge. */
+.flip-disclosure-mask {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    overflow: hidden;
+    pointer-events: none;
+}
+
+/* Copies of rows that just left the list (useFlipAnimation's departures) lay
+   out against the row container, so they scroll and clip with the list. */
+.thread-drawer-rows {
+    position: relative;
+}
+
+.flip-departure-layer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 0;
+    pointer-events: none;
+}
+
+/* A collapsed section's hairline (styles/section-header.css), and the line
+   that carries it while the rows roll (useFlipAnimation's `carryHairline`).
+   Both take the row hairline's insets, so the carried line lands on it
+   exactly. */
+.thread-drawer .list-section-title-collapsible,
+.thread-drawer .flip-disclosure-hairline {
+    --row-hairline-left: calc(var(--drawer-row-inset) - 0.25rem);
+    --row-hairline-right: var(--thread-row-pad-right);
+}
+
+.thread-drawer .flip-disclosure-hairline {
+    position: absolute;
+    left: var(--row-hairline-left);
+    right: var(--row-hairline-right);
+    border-bottom: 1px solid var(--border-color);
+    pointer-events: none;
+}
+
+/* The carried line narrows toward a nested closing row's indent by scaling,
+   and both lines end at the same right edge. */
+.thread-drawer .flip-disclosure-hairline {
+    transform-origin: right center;
+}
+
+/* While the rows roll, the carried line stands in for the divider. */
+.drawer-section:has(> .flip-disclosure-mask) > .list-section-title-collapsible.collapsed::after {
+    visibility: hidden;
+}
+
+/* Every drawer header (styles/section-header.css) starts its label on the
+   pane's content column, where the thread-name text starts. The collapsible
+   lifecycle headers and the Drafts / Blocked / Results headers all
+   render inside `.thread-drawer`. */
+.thread-drawer {
+    --section-inset-left: var(--drawer-row-inset);
+    --section-inset-right: var(--thread-row-pad-right);
+    /* The drawer's one dim: an archived sub-thread, an empty Ongoing tile. */
+    --drawer-dim-opacity: 0.45;
+}
+
+/* The In flight split on its tile, in words beside the icon, one count per
+   line. */
+.in-flight-breakdown {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    font-size: var(--font-size-2xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+}
+
+.in-flight-breakdown-part {
+    white-space: nowrap;
+}
+
+/* Keyboard highlight on a section header — the ←/→ tree nav lands here when a
+   section is collapsed (or descended from / ascended to). Reads exactly like the
+   thread-row keyboard highlight: the subtle --bg-secondary fill (not --bg-hover,
+   which is dark enough to merge with the row divider into one band). Equal
+   specificity to the header rule's `background: none` in section-header.css,
+   which main.tsx imports before this sheet, so source order makes it win. */
+.thread-drawer .list-section-title-highlighted {
+    background: var(--bg-secondary);
+    border-radius: calc(var(--radius-control) * 0.5);
+}
+
+/* The Current header's Archive all (ADR 0349): muted text at the row's right
+   end, so it reads as a quiet action beside the label rather than a button. */
+.thread-drawer .drawer-section-actions {
+    margin-left: auto;
+    padding-top: 0;
+    padding-bottom: 0;
+}
+
+.drawer-archive-all {
+    background: none;
+    border: none;
+    padding: 0.125rem 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.5);
+    color: var(--text-muted);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    cursor: pointer;
+    transition: color var(--duration-fast), background-color var(--duration-fast);
+}
+
+.drawer-archive-all:focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
+}
+
+@media (hover: hover) {
+    .drawer-archive-all:hover {
+        color: var(--text-primary);
+        background: var(--bg-hover);
+    }
+}
+
+/* The Ongoing tiles: a 2x2 grid, one tile per group. It sticks, so it stays
+   in view while the selected group's rows scroll under it. The phone lets it
+   scroll (styles/mobile.css). Opaque, so rows scrolling under it are covered. */
+.drawer-ongoing-tiles {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-auto-rows: 1fr;
+    gap: var(--space-sm);
+    padding: var(--space-sm) var(--space-sm) var(--space-md);
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-primary);
+}
+
+/* A tile rests on a quiet neutral. The selected one lifts to a lighter
+   neutral, and only its count and icon take the accent, so the theme's accent
+   never floods a whole tile. */
+.ongoing-tile {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    min-width: 0;
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-surface);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    cursor: pointer;
+    transition: background var(--duration-fast) ease, opacity var(--duration-fast) ease;
+}
+
+@media (hover: hover) {
+    .ongoing-tile:not(.ongoing-tile-selected):hover {
+        background: var(--bg-hover);
+    }
+}
+
+.ongoing-tile-selected {
+    background: var(--bg-quaternary);
+    color: var(--text-primary);
+}
+
+/* The selected tile stays at full strength, empty or not, so the selection
+   always reads. */
+.ongoing-tile-empty:not(.ongoing-tile-selected) {
+    opacity: var(--drawer-dim-opacity);
+}
+
+/* The ↑/↓ highlight, which a tile's own fill already uses for state. */
+.ongoing-tile-highlighted {
+    box-shadow: var(--focus-ring);
+}
+
+.ongoing-tile-top {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-sm);
+}
+
+.ongoing-tile-count {
+    flex: 1;
+    font-size: var(--font-size-xl);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
+}
+
+.ongoing-tile-icon {
+    display: flex;
+    color: var(--text-secondary);
+}
+
+.ongoing-tile-selected .ongoing-tile-count,
+.ongoing-tile-selected .ongoing-tile-icon {
+    color: var(--accent);
+}
+
+.ongoing-tile-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* A row the keyboard highlights scrolls clear of the tiles above it, not
+   under them. The grid publishes its height (`OngoingTiles`). On the row
+   that `scrollIntoView` targets, the one carrying `data-thread-nav`. */
+.ongoing-grouping .thread-row {
+    scroll-margin-top: var(--drawer-ongoing-tiles-height, 0px);
+}
+
+
+/* --- Thread focused view --- */
+
+.thread-view {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+}
+
+/* The title rows: this desktop one and the mobile `.mobile-thread-title-row`.
+ *
+ * The desktop pin centres on the title's FIRST line, as a drawer row's does,
+ * so a wrapped title does not drag it down to its middle. The row aligns to
+ * the top, and whichever of the two is shorter, the title's first line or the
+ * icon box, is pushed down by half the difference. A one-line title lands
+ * exactly where a centred row put it.
+ *
+ * The mobile row has no icons. Its title pads by
+ * the same half difference on both sides, so the row keeps its height and the
+ * button's hit area fills it. */
+.thread-view-header,
+.mobile-thread-title-row {
+    --title-line-box: calc(var(--title-line-height) * var(--font-size-md));
+    --title-line-height: 1.3;
+}
+
+.thread-view-header .thread-view-header-actions {
+    margin-top: max(0px, calc((var(--title-line-box) - var(--title-icon-box)) / 2));
+}
+
+.mobile-thread-title-row .thread-title-menu {
+    padding-block: max(0px, calc((var(--title-icon-box) - var(--title-line-box)) / 2));
+}
+
+/* The title type. It never edits in place: Rename… lives in the thread menu
+   it opens. */
+.thread-title {
+    font-weight: 600;
+    font-size: var(--font-size-md);
+    line-height: var(--title-line-height);
+    color: var(--text-primary);
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+/* A hold on the title opens its menu, so it must not select the text. Copy
+ * thread title, in that menu, stands in for a selection. */
+.thread-title-menu {
+    display: block;
+    margin: 0;
+    padding: 0;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    text-align: left;
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.thread-title-menu:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+/* Shown whether or not the drawer is open. The open thread's drawer row can be
+ * scrolled, folded or filtered away, and this row's title opens the menu with
+ * Show in Folders. */
+.thread-view-header {
+    --title-icon-box: 1.75rem;
+    --title-column-gap: 0.75rem;
+    flex-shrink: 0;
+    display: flex;
+    align-items: flex-start;
+    gap: 0.25rem var(--title-column-gap);
+    /* Right padding matches `.pane-header`'s `--header-padding-x` so the action
+     * icons land in the same horizontal slot as the AppHeader icons above. */
+    padding: 0.25rem 0.625rem 0.25rem 1rem;
+    /* On the page while the transcript rests at its top. Once it scrolls, the
+     * faint --bg-secondary band fades in to say there is more above. */
+    background: transparent;
+    transition: background-color var(--duration-normal) ease;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.thread-view-header.scrolled {
+    background: var(--bg-secondary);
+}
+
+/* The desktop title hugs its text on one line, so the pin sits right beside
+ * it, and ellipsises once the row is too narrow. Its cap leaves the pin's box
+ * and the row's column gap, so in a row that wraps for the widget shelf
+ * (chat/widgets.css) only the shelf ever moves to a second line. */
+.thread-view-header .thread-title {
+    margin-top: max(0px, calc((var(--title-icon-box) - var(--title-line-box)) / 2));
+    flex: 0 1 auto;
+    max-width: calc(100% - var(--title-icon-box) - var(--title-column-gap));
+}
+
+/* A thread that cannot be pinned draws no pin, so its title takes the row. */
+.thread-view-header:not(:has(.thread-view-header-actions)) .thread-title {
+    max-width: 100%;
+}
+
+/* The inner span clips, not the button: the button rounds its corners for the
+ * focus ring, and a rounded clip shaves the first glyph's top-left. */
+.thread-view-header .thread-title-text {
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Desktop title-bar icons run smaller than the AppHeader slot, keeping the
+ * thread title row compact rather than matching the 2.25rem header-icon. */
+.thread-view-header .icon-btn.header-icon {
+    width: var(--title-icon-box);
+    height: var(--title-icon-box);
+}
+
+.thread-view-header .icon-btn.header-icon svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+}
+
+.thread-view-header-actions {
+    display: flex;
+    /* Shrink-wrapped, and placed by the header right after the title text. */
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* The pin hides until the row is hovered or it takes focus, right beside the
+ * title's text. (hover: none) keeps it visible on touch. */
+.thread-view-header .thread-view-header-actions .icon-btn {
+    opacity: 0;
+    transition: opacity var(--duration-fast) ease-in-out;
+}
+
+@media (hover: hover) {
+    .thread-view-header:hover .thread-view-header-actions .icon-btn,
+    .thread-view-header .thread-view-header-actions .icon-btn:focus-visible {
+        opacity: 1;
+    }
+}
+
+@media (hover: none) {
+    .thread-view-header .thread-view-header-actions .icon-btn {
+        opacity: 1;
+    }
+}
+
+/* Shared by the loading shimmers in components.css and chat/response.css. */
+@keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+.thread-view .thread-content-wrap {
+    flex: 1;
+    min-height: 0;
+}
+
+/* Mobile: overlay below app header with slide animation */
+@media (--phone-layout) {
+    .thread-drawer {
+        position: fixed;
+        top: var(--mobile-header-height, calc(2.75rem + var(--safe-area-top)));
+        left: 0;
+        bottom: 0;
+        width: 100% !important;
+        z-index: var(--z-drawer);
+        padding-top: 0;
+        transition: transform var(--duration-slow) ease;
+        transform: translateX(0);
+    }
+
+    .thread-drawer.thread-drawer-collapsed {
+        transform: translateX(-100%);
+        width: 100% !important;
+    }
+
+    .drawer-divider {
+        display: none;
+    }
+
+    /* The filter panel needs no geometry override here: it fills
+       `.thread-drawer`, which IS the threads pane on mobile, so the desktop
+       `inset: 0` already spans the phone. The old anchored dropdown needed a
+       `position: fixed` breakout because it hung off a tiny header slot at the
+       screen's edge.
+
+       What spanning the phone does NOT give it is clearance from the fixed
+       mobile header, which overlays the panes: the panel is its own scroll
+       container, so it carries the shared `::before` header spacer alongside
+       the drawer list and the transcript (mobile.css, the
+       `.mobile-swipe-pane …::before` group). Without it the Ongoing rows at the
+       panel's top sat behind the header. */
+
+}
+
+/* Reduced motion: disable decorative animations */
+:root[data-motion="reduce"] .thread-drawer,
+:root[data-motion="reduce"] .drawer-divider {
+    transition: none;
+}
+
+/* The row already separates its items with its own `gap`, so the explainer's
+   base `margin-left` (for the ordinary case of an icon following inline text)
+   would double it here. The row owns its gap, so the row owns the correction.
+   It goes on `.explainer-slot`, the wrapper carrying that margin, which is also
+   the flex item the gap applies to. */
+.thread-filter-option > .explainer-slot {
+    margin-left: 0;
+}

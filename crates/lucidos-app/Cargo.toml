@@ -1,0 +1,136 @@
+[package]
+name = "lucidos-app"
+version = "0.1.0"
+edition = "2021"
+
+# The macOS window-lifecycle probe (src/window_probe.rs), off by default so the
+# shipped client carries none of it. It drives AppKit and a bare WKWebView with
+# no Tauri, no engine and no workspace, which is what makes it safe to run from
+# a worktree. See docs/plans/2026-09-10-on-screen-is-a-fact-the-client-owns.md.
+[features]
+window-probe = [
+    "dep:objc2-web-kit",
+    "objc2-app-kit/NSAppearance",
+    "objc2-app-kit/NSColor",
+    "objc2-app-kit/NSEvent",
+    "objc2-app-kit/NSGraphics",
+    "objc2-app-kit/NSScreen",
+    "objc2-foundation/NSDate",
+    "objc2-foundation/NSRunLoop",
+    "objc2-foundation/NSURL",
+]
+
+[[example]]
+name = "window_lifecycle_probe"
+required-features = ["window-probe"]
+
+[dependencies]
+# Tailnet state (CLI-free) + Tailscale CLI resolution for Mobile Access.
+lucidos-tailscale = { path = "../lucidos-tailscale" }
+lucidos-local-token = { path = "../lucidos-local-token" }
+# Enumerating the machine's Lucidos installs, shared with `lucidos-gateway`. The
+# client needs it before any gateway answers: at startup, where it is the only
+# thing that can tell a trapped user why their engine is ten releases old, and
+# at uninstall, where it names what this uninstaller cannot remove.
+lucidos-installs = { path = "../lucidos-installs" }
+# image-png: decode the embedded PNG menu-bar template icon via Image::from_bytes
+# (install_tray in lib.rs). Not in tauri's default feature set.
+#
+# macos-private-api: turns on WebKit's Fullscreen API in the packaged window. It
+# forwards to `wry/fullscreen`, whose only effect is setting the `fullScreenEnabled`
+# key on WKPreferences for every webview wry creates; without it `requestFullscreen`
+# is unavailable and the app view's Fullscreen control silently degrades to its CSS
+# pseudo-fullscreen fallback (see ADR 0054 for why a private key is acceptable here
+# and what happens if Apple removes it). It also enables `wry/transparent`, which we
+# do not use. Paired with `macOSPrivateApi` in tauri.conf.json: the Cargo feature is
+# what compiles the preference in, the config flag is what the Tauri CLI reads, and
+# setting only one leaves `cargo tauri build` and a plain `cargo build` disagreeing
+# about what is in the binary.
+tauri = { version = "2", features = [
+    "unstable",
+    "tray-icon",
+    "image-png",
+    "macos-private-api",
+] }
+tauri-plugin-window-state = "2"
+# Auto-update from GitHub Releases ("update available -> restart") + the confirm
+# dialog it shows. See src/updater.rs and tauri.conf.json plugins.updater.
+tauri-plugin-updater = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Native macOS notifications via Apple's modern UserNotifications framework
+# (UNUserNotificationCenter), driven directly through objc2. Replaces the
+# deprecated NSUserNotification path (mac-notification-sys / notify-rust), which
+# no longer delivers on recent macOS. Requires a packaged .app bundle to work
+# (no-op in tauri-dev). See src/notifications.rs and
+# system-knowhow/notifications.md §4. Versions track Tauri 2's own objc2 stack
+# (objc2 0.6 / framework crates 0.3).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+# NSEnumerator is what gates `NSArray::iter()` (used by the scoped dismiss-all in
+# notifications.rs). It compiles without it today only because a transitive Tauri
+# dep (tao / tray-icon / wry) enables it and cargo unifies features, so a Tauri
+# bump that dropped it would break this crate from an unrelated upgrade. Declare
+# what we use.
+#
+# NSNotification + NSOperation + block2 are the traffic-light resize observer
+# (src/traffic_lights.rs): `addObserverForName:object:queue:usingBlock:` lives on
+# NSNotificationCenter, takes an NSOperationQueue (we pass nil, but the
+# parameter type has to exist for the binding to be generated) and a block.
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSError",
+    "NSArray",
+    "NSEnumerator",
+    "NSNotification",
+    "NSOperation",
+    "block2",
+] }
+objc2-user-notifications = { version = "0.3", features = [
+    "UNUserNotificationCenter",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotification",
+    "UNNotificationTrigger",
+    "block2",
+] }
+# Dock-tile app-icon badge (set_dock_badge): NSApplication.sharedApplication()
+# (behind NSResponder) → dockTile() (behind NSDockTile) → setBadgeLabel. Carries
+# the aggregate unread total across running workspaces (see desktop.rs poll).
+#
+# NSWindow/NSView/NSButton/NSControl are the traffic-light placement
+# (src/traffic_lights.rs): NSWindow.standardWindowButton() is gated on all three
+# of NSButton, NSControl and NSView, and the placement then reads and writes
+# NSView frames on the buttons and on their NSTitlebarContainerView. Tauri
+# exposes no runtime setter for this, so we drive AppKit directly; the module
+# doc says why.
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSDockTile",
+    "NSWindow",
+    "NSView",
+    "NSControl",
+    "NSButton",
+] }
+block2 = "0.6"
+# The `window-probe` feature only: a bare WKWebView for the window-lifecycle
+# probe. wry already pulls this crate in, so it costs no extra compilation, and
+# the optional flag keeps the probe out of every shipped build.
+objc2-web-kit = { version = "0.3", optional = true, features = [
+    "WKWebView",
+    "WKWebViewConfiguration",
+    "WKNavigation",
+] }
+
+# uid lookup + signal handlers for the always-on launchd service (desktop.rs):
+# `launchctl` domain targets need the numeric uid, and the service supervisor
+# catches SIGTERM/SIGINT to tear the embedded stack down gracefully.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
