@@ -1,0 +1,1460 @@
+/* ── The Lucidos mark, its menu, and the centred header clusters ──────────
+ *
+ * Every quantity here is a CSS custom property on :root, deliberately: the live
+ * style remote overrides custom properties by writing them inline on <html>,
+ * which beats a :root rule, so anything declared below can be retuned on a
+ * running app with no rebuild and no Apply. A magic number written straight
+ * into a rule is out of the remote's reach, which is the one thing this file
+ * must not do.
+ *
+ * See docs/plans/2026-08-08-header-mark-as-brand-connection-and-menu.md.
+ */
+
+:root {
+    /* The mark itself */
+    --header-mark-size: 1.6rem;      /* the glyph, inside its tap target */
+    --header-mark-tap: 2.1rem;       /* the tap target */
+    --header-nav-gap: 0.35rem;       /* minimum chevron to mark, see the span */
+    --header-mark-pair-gap-max: 1rem; /* Home to mark at most, see .header-mark-pair */
+    /* How much of its own viewBox the mark's artwork fills. `LucidosMarkIcon`
+       draws inside a `translate(13 13) scale(0.74)` group, so the ink is inset
+       by 13% on every side and the glyph reads smaller than a stroke icon given
+       the same box. Two rules compensate for that, in opposite directions (the
+       menu row scales the paint up, the icon-run mark draws at the mark's own
+       size inside the run's box), and both used to spell the number out. */
+    --header-mark-art-scale: 0.74;
+
+    /* Where the nav chevrons sit. The cluster is a centred box and the chevrons
+       are pinned to its outer edges, so these two values ARE the chevron
+       positions, and they are the same on the thread pane and the content pane
+       by construction: one formula, whatever each row happens to put between
+       them.
+       - edge reserve: exactly the widest edge cluster either pane can hold,
+         with no clearance on top of it. That cluster is the content row's
+         overflow trigger plus the bell: two icon boxes and the one gap between
+         them. It is a slot HELD, not room spent. On a row whose edge carries
+         one control the outer box is the bell (or the hamburger) and the inner
+         one stands empty, so the chevron reads one icon slot in from it. Open a
+         view that has context actions and the overflow trigger fills that empty
+         slot, and the chevron does not move. The thread pane's edges are
+         narrower and could spare more, but spending it there is what would
+         break the two panes' placements matching.
+       - min span: the floor, the thread row's narrowest width. That is two
+         chevrons around the Home and mark pair with no gap inside the pair, so
+         no control in it squeezes. It engages past ~140% ui-scale on a 375px
+         phone, where the row cannot fit the cluster and both edge clusters. */
+    /* Arithmetic on the button box, never a rem constant, so retuning the
+       button moves the chevrons with it. That is also why
+       --mobile-header-icon-box is declared for every width (styles/mobile.css)
+       rather than inside the mobile breakpoint. The gap term stays a literal:
+       --pane-header-gap is declared on .pane-header, and a custom property is
+       substituted on the element that declares it, so :root cannot read it.
+       styles/__tests__/header-mark-geometry.test.ts holds it to the trailing
+       cluster's own gap. */
+    --header-nav-edge-reserve: calc(2 * var(--mobile-header-icon-box) + 0.25rem);
+    --header-nav-min-span: calc(
+        3 * var(--mobile-header-icon-box) + var(--header-mark-tap)
+        + 2 * var(--header-nav-gap)
+    );
+    /* The two above, resolved into the one width every cluster takes. Named
+       because the width is not only the cluster's own business: the threads
+       row's title is bounded by where that row's mark lands, and the mark lands
+       on the cluster's trailing edge (see .header-mark-end-cluster and
+       .mobile-header-title). A second copy of this expression is exactly how
+       the title and the mark would drift apart at some ui-scale and nowhere
+       else.
+
+       There is deliberately NO preferred span here, and its absence is the
+       whole rule: the cluster takes everything the row has left once each end
+       keeps its reserve. A third `clamp()` arm holding the chevrons a fixed
+       11rem apart used to win on any phone below ~124% ui-scale, which parked
+       them well inside the slot the reserve had already held for them and left
+       nearly two empty icon boxes against the bell. Then the reserve governed
+       above that scale and the span below it, so the placement answered to a
+       different rule depending on the user's setting.
+
+       The `100%` is substituted, not resolved here: it means "the containing
+       block", and every element reading this property lives in the same one,
+       `.mobile-header-row`. */
+    --header-nav-cluster-width: max(
+        var(--header-nav-min-span),
+        calc(100% - 2 * var(--header-nav-edge-reserve))
+    );
+    /* The chevrons' TAP target, as distinct from their 1.75rem button box,
+       which is drawn and placed. 44px at the 16px root, the platform's minimum
+       touch target. See .header-nav-cluster > .nav-chevron::before. */
+    --header-nav-hit-target: 2.75rem;
+
+    /* The badge riding the mark's corner (see .brand-mark-slot below).
+       - offset: a NUDGE away from the glyph's corner, on top of the derived
+         inset the badge rule computes. Zero means "on the corner", which is
+         where it belongs; it is here so the remote can move it without
+         reaching into the geometry. */
+    --header-mark-badge-offset: 0rem;
+    /* The box BOTH badges take: the unread count, and the state badge on the
+       opposite corner (`.brand-badge` in panels/shell.css). One size, so they
+       read as a pair in one column. Smaller than the base `.badge` (0.875rem),
+       because that one is sized for a roomy icon button and here it covers
+       most of a 1.6rem glyph. The count still has to be READ, unlike the
+       pending dot, so it keeps a line box and its padding. */
+    --header-mark-count-size: 0.75rem;
+    /* NO ring token here, deliberately. Both of the mark's badges are ringed
+       away from the glyph by `.app-header .badge` (panels/shell.css), the same
+       rule that paints every badge on the bar white. The fusing it fixes is a
+       property of the BAR, not of the mark, so the bell owns it too. */
+
+    /* Connection cues, expressed as STRENGTH. Connected is the brand at full
+       light, the same --header-fg an active control in the bar takes, because
+       that is the state the user looks at all day and the mark is the one glyph
+       in the row that should not be muted while we are live. The two states
+       worth saying something about recede from it, which keeps the whole signal
+       in one dimension and leaves the mark's colour the brand's rather than a
+       status light's: no ring and no hue, since a frame around the mark reads
+       as an alert or a selection. Motion separates the two: connecting breathes
+       between the values below, disconnected sits still at the lower one, so
+       "we are trying" and "we have stopped" are distinguishable at a glance.
+       Neither is the whole signal on its own, see the aria-label in
+       BrandMenuButton. */
+    --header-mark-disconnected-opacity: 0.35;
+    --header-mark-connecting-opacity-min: 0.35;
+    --header-mark-connecting-opacity-max: 0.7;
+    --header-mark-breathe-duration: 2s;
+
+    /* Menu. A centred modal rather than a panel hanging off the mark, so it
+       lands in the same place whichever header opened it and whichever edge the
+       mark sits on. The inner radius is DERIVED from the outer one so the rows'
+       corners stay concentric with the panel's at any retune: a row inset by the
+       frame needs its own radius reduced by exactly that inset, and a constant
+       here would go visibly wrong the moment either value moves.
+       The tint matches the workspace switcher's scrim (styles/panels/shell.css)
+       because it is the same gesture: one surface the user opened deliberately,
+       everything else pushed back.
+       The gap below the header is NOT here: it is --header-surface-gap in
+       global/base.css, beside the --app-header-bottom it pairs with, because
+       every surface hung from the header shares it.
+       The panel's width is --header-surface-width (global/base.css), shared
+       with the other header palettes. The Workspaces row is the widest thing it
+       holds (its glyph, the word "Workspaces", and a value pill carrying the
+       workspace name). Everything in it is rem-sized in a monospace face whose
+       advance is ~0.6em, so the room a name gets is arithmetic. 15rem left the
+       name 7 characters and ellipsised "development" down to "develo…". 17.5rem
+       held 13, and the shared width holds more. */
+    --brand-menu-frame: 0.375rem;
+    --brand-menu-item-radius: calc(var(--radius-surface) - var(--brand-menu-frame));
+    /* Every row states its line-height rather than inheriting, because the rows
+       are not all the same ELEMENT: a <button>, an <a> and a <div> all wear
+       `.brand-menu-item`, and a button does not inherit the document's
+       line-height (the UA gives it `normal`, ~1.2, against the 1.4 on body). So
+       the div rows computed ~3px taller than the button rows, and the panel
+       visibly grew the moment the Restart confirm replaced the Refresh row. */
+    --brand-menu-row-line-height: 1.4;
+    /* One height for every row, in every state, so the panel never resizes
+       under the user. The line-height above makes the ROW ELEMENTS agree; this
+       covers the other axis, a row whose CONTENT is taller than its text: the
+       Restart confirm puts a padded button in the row, and that button's box
+       exceeds a bare text line even at the smaller font. Sized to clear it
+       (border-box, so this includes the row's own padding). */
+    --brand-menu-row-min-height: 2.5rem;
+    /* A workspace row is a satellite of the row above it, so it is shorter than
+       a menu item and reads at the value pill's size. */
+    --brand-menu-ws-row-min-height: 2rem;
+    /* The connection notice's dot. Named because two rules need the same number
+       and neither may guess it: the dot's box, and the offset that lands it on
+       the notice's FIRST line rather than in the middle of a wrapped sentence. */
+    --brand-menu-notice-dot: 0.5rem;
+    /* Where a row's label starts: its padding, the icon box every row glyph
+       takes, and its gap. An action hung under a notifications row starts
+       here too. */
+    --brand-menu-text-column: calc(var(--space-md) + var(--icon-size-md) + var(--space-sm));
+    /* How much of the screen the unfolded workspace ROWS may take before they
+       scroll inside the panel. Manage workspaces sits outside that box and is
+       never counted here, so it cannot be scrolled away from.
+       Derived from the row height rather than eyeballed: seven and a half rows,
+       so a machine with half a dozen workspaces shows all of them without
+       scrolling, and anything past that cuts a row in half, which is what says
+       there is more below. The vh term is the one that holds on a phone in
+       landscape, where the rem term alone would overrun the viewport. */
+    --brand-menu-ws-list-max-height: min(
+        calc(7.5 * var(--brand-menu-ws-row-min-height)),
+        40vh
+    );
+}
+
+/* ── The centred cluster ──────────────────────────────────────────────────
+ * Absolutely centred on the row's MIDDLE, not midway between the edge
+ * clusters: an in-flow cluster drifts off the viewport axis whenever the two
+ * edges differ in width, which is the off-centre look the header titles already
+ * avoid this way (see .mobile-header-title in mobile.css).
+ *
+ * FIXED WIDTH with the chevrons pushed to its edges, so the chevrons land at
+ * the same two positions on the thread pane and the content pane. What sits
+ * between them differs (the mark, or the title) and no longer moves them: a
+ * cluster sized to its contents put the content pane's chevrons wherever the
+ * current title's width happened to leave them, which is the drift this
+ * replaces.
+ *
+ * The width cannot be a plain rem constant. The row is a fixed device width
+ * while every control in it is rem-sized, so a span that clears both edge
+ * clusters at 100% ui-scale overlaps them at 150%. The clamp says that in one
+ * line: hold the span when it fits, give way to the edge reserve when it does
+ * not, never squeeze below the cluster's own natural width. (That is the same
+ * fact `useHeaderActionCollapse` used to MEASURE for; it is expressible here
+ * only because the trailing cluster is now bounded, see ContentHeaderActions.)
+ *
+ * `e2e/mobile-threads-title-alignment.spec.ts` pins both the cross-pane
+ * agreement and the clearance; any control added to either edge spends the
+ * reserve.
+ *
+ * VERTICALLY it spans the row instead of centring on it, and that is the same
+ * agreement on the other axis. `top: 50%` plus a `translateY(-50%)` places the
+ * box by its OWN height, so each row's chevrons inherited whatever rounding
+ * that row's tallest member produced: the thread row's box is the mark's
+ * 2.1rem, the content row's is a chevron's 1.75rem, and at the 18px mobile root
+ * WebKit landed the two 0.14px apart. That is a fifth of a device pixel on a
+ * phone, enough to shift the anti-aliasing of a hairline chevron, and the user
+ * saw it as the chevrons hopping as they swiped between panes. Spanning the row
+ * takes the box's own height out of the placement entirely, so flexbox centres
+ * the members against one identical box on all three rows. Pinned by
+ * e2e/mobile-threads-title-alignment.spec.ts. */
+.header-nav-cluster {
+    position: absolute;
+    /* Placed by `left` rather than `translateX(-50%)`: same spot, no
+       transform. At an odd width that translate is a half pixel, and WebKit
+       then snaps the mark's badge pill and its digit apart by a device pixel. */
+    left: calc(50% - var(--header-nav-cluster-width) / 2);
+    top: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: var(--header-nav-cluster-width);
+    gap: var(--header-nav-gap);
+    /* The box is a fixed span with its members at the ends, so most of it is
+       empty, and a transparent div is a hit target all the same. Raised over
+       the row by `position: absolute`, that empty middle sits on top of
+       whatever the row packs against its edges, and a tap landing there does
+       nothing at all rather than reaching the control the user aimed at. The
+       threads row is the worst case (one member, so the whole span but its
+       trailing 1.75rem is empty) and the clamp's min-span arm is where the ends
+       actually reach an edge control, but the fix is the same at any span and
+       costs nothing at the ones where they do not.
+       Exactly the rule `.mobile-dot-indicator` learned (mobile.css): none on
+       the band, auto on the things that are actually targets. `> *` rather than
+       naming them, so a member added later is a target by default; the badge's
+       own pass-through rule is on a grandchild and is untouched by it. */
+    pointer-events: none;
+}
+
+/* The chevrons and the mark hold their size; only a title, or the gap inside
+   the Home and mark pair, may shrink. Without this, the flex default
+   (shrink: 1) lets a long title squeeze a chevron. That moves the very thing
+   the fixed span exists to hold still. */
+.header-nav-cluster > .icon-btn,
+.header-nav-cluster > .brand-mark-slot,
+.header-nav-cluster > .header-mark-pair {
+    flex: 0 0 auto;
+}
+
+/* The thread row's middle member: Home and the mark as one box. The chevrons
+   are equal width, so `space-between` centres the PAIR on the row. The mark
+   then sits right of the axis by half of Home's box plus the gap. Without a
+   home thread the pair is the mark alone, back on the axis. */
+.header-nav-cluster > .header-mark-pair {
+    display: flex;
+    align-items: center;
+}
+
+/* With Home in it, the pair asks for the max gap and may shrink. It shrinks
+   only once the chevrons reach it, down to no gap at all, which is the floor
+   --header-nav-min-span counts. So a roomy row spaces the pair out, and a
+   narrow phone or a high ui-scale closes it up before anything else gives. */
+.header-nav-cluster > .header-mark-pair:has(> .home-thread-btn) {
+    flex: 0 1 calc(
+        var(--mobile-header-icon-box) + var(--header-mark-tap) + var(--header-mark-pair-gap-max)
+    );
+    justify-content: space-between;
+}
+
+/* Each chevron's tap target reaches past its button into the empty space
+   around it. A near miss then navigates instead of landing on the bare row.
+   The button box stays 1.75rem, because it is what the edge reserve places.
+
+   Transparent and positioned, like `.icon-btn.inline-icon::before`. The inward
+   reach is double the outward one: the outer slot can fill with the content
+   row's overflow trigger, and the reach toward the middle is still 44px wide.
+
+   At a high ui-scale the reach overlaps its neighbours, and every neighbour
+   must win the tap. The two rules below raise them, so no z-index goes here:
+   a disabled chevron's opacity makes it a stacking context, which would trap
+   a negative z-index inside the button. */
+.header-nav-cluster > .nav-chevron::before {
+    --nav-chevron-reach: calc((var(--header-nav-hit-target) - var(--mobile-header-icon-box)) / 2);
+    content: '';
+    position: absolute;
+    top: calc(-1 * var(--nav-chevron-reach));
+    bottom: calc(-1 * var(--nav-chevron-reach));
+}
+
+/* The chevrons' neighbours inside the cluster: the mark (alone, or paired
+   with Home) and the content title. */
+.header-nav-cluster > .brand-mark-slot,
+.header-nav-cluster > .header-mark-pair,
+.header-title-cluster > .mobile-content-title {
+    position: relative;
+    z-index: 1;
+}
+
+/* …and outside it: the row's own edge controls, the drawer toggle and the
+   hamburger. The transformed cluster otherwise paints over any that come
+   before it in the DOM. The content row's trailing actions are raised the same
+   way in mobile.css. */
+.mobile-header-row > .icon-btn {
+    z-index: 1;
+}
+
+.header-nav-cluster > .nav-chevron:first-child::before {
+    left: calc(-1 * var(--nav-chevron-reach));
+    right: calc(-2 * var(--nav-chevron-reach));
+}
+
+.header-nav-cluster > .nav-chevron:last-child::before {
+    left: calc(-2 * var(--nav-chevron-reach));
+    right: calc(-1 * var(--nav-chevron-reach));
+}
+
+/* …and the members are targets again, EXCEPT while the app is deliberately
+   inert. The gate is load-bearing rather than cautious: both inert regimes work
+   by setting `pointer-events: none` on an ANCESTOR and letting it inherit down
+   (`:root[data-keyboard-active] .app-header` in mobile.css, so a stray thumb
+   while the keyboard is up cannot navigate the thread being typed in;
+   `:root[data-overlay-open] .app-shell > *` in global/modal-overlay.css, the
+   inert-behind half of the overlay contract). A value applied DIRECTLY to a
+   child beats an inherited one at any specificity, so an ungated `auto` here
+   would quietly punch both of them out over this box, and the chevrons would
+   stay live behind an open menu and under a raised keyboard.
+
+   Gating instead of naming the cluster in those two rules is what keeps the
+   overlay's ANCHOR exemption working. A chevron is itself an overlay anchor
+   while its long-press history menu is open, and `[data-overlay-anchor]` is
+   (0,2,0): it can beat inheritance, but it would lose to a rule reaching in
+   here to re-assert `none`. With this rule simply not applying, the anchor is
+   the only declaration on the element and re-tapping it still closes its own
+   menu, which is the exemption's whole point. */
+:root:not([data-keyboard-active]):not([data-overlay-open]) .header-nav-cluster > * {
+    pointer-events: auto;
+}
+
+/* The content pane's variant: same box, same chevron positions, with the title
+   as its one shrinkable member. `space-between` centres a short title exactly
+   (the two chevrons are equal width), and a long one ellipsises at the span
+   rather than pushing a chevron into an edge control. A tighter gap than the
+   mark's, since here every rem of it is a rem off the title. */
+.header-title-cluster {
+    gap: 0.15rem;
+}
+
+/* The threads pane's variant: same box, one member. That row has no chevrons,
+   so the mark takes the cluster's TRAILING edge, which is the exact point the
+   other two rows put their forward chevron on. It used to ride the trailing
+   icon run beside Search, where its position was whatever that run's width left
+   over: about 45px right of the chevron column at 375px, so the one glyph
+   present on all three rows was the one that moved as the user swiped between
+   them. Pinned by e2e/mobile-threads-title-alignment.spec.ts.
+   `flex-end` rather than `space-between`, which puts a lone member at the
+   START. */
+.header-mark-end-cluster {
+    justify-content: flex-end;
+}
+
+.header-title-cluster .mobile-content-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    padding: 0 0.15rem;
+}
+
+/* ── The mark ─────────────────────────────────────────────────────────────
+ * Brand, connection light and menu trigger in one control. */
+/* The mark and its update badge. The badge is a sibling rather than a child
+   (see BrandMenuButton), so this slot is what it positions against. */
+.brand-mark-slot {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    /* Half the difference between the host's box and the glyph, which IS the
+       glyph's corner at any tuning. Declared HERE rather than on a badge,
+       because both badges inherit it and place themselves against it: the state
+       one at the top corner, the count at the bottom. The rules below own the
+       reasoning; this owns the arithmetic. */
+    --brand-badge-corner: calc((100% - var(--header-mark-size)) / 2);
+}
+
+/* ON the mark, not beside it. The badge's own rules (panels/shell.css) put it
+   in a FLEX slot, lifted on a bottom margin, because its first host was the
+   desktop "Lucidos" label and there it is a superscript tucked over the
+   trailing character. The mark is an icon, so here the badge wears the icon
+   convention instead: absolutely positioned on the glyph's top-right corner,
+   the same place the count badge sits on the bell and on the filter button.
+   Taking it out of flow is also what keeps the mark CENTRED. The slot is the
+   cluster's middle member, so an in-flow badge widened it and slid the glyph
+   off the row's axis whenever an engine build or an update was pending, which
+   is a mark that moves for reasons the user cannot see.
+
+   The corner is DERIVED, and that is the whole of this rule. It used to be a
+   bare `top/right: 0`, which is the TAP TARGET's corner, on the assumption that
+   the target hugs the glyph with 0.25rem of clearance. Both quantities are
+   style-remote tunables: retuned to a 2.6rem target around a 1.8rem glyph the
+   clearance is 0.4rem, and the badge sat 8px up and 8px right of the glyph box,
+   clear of the drawn ink and reading as a badge floating beside the mark rather
+   than on it. Half the difference between the host's box and the glyph is
+   exactly the glyph's corner, at any tuning.
+
+   `100%` is the slot's own box, which IS the host control's box on every
+   placement: the 2.1rem `.brand-mark` in a nav cluster, and the 1.75rem
+   `.icon-btn` on the mobile threads row. One rule covers both, and neither
+   needs to name its own size. Percentages resolve against the containing
+   block's height for `top` and its width for `right`; the slot is square in
+   both cases.
+
+   No transform, deliberately: the badge stays INSIDE the host's box, so it
+   cannot be shaved by the clip `.pane-header-brand-label` takes on the packaged
+   macOS webview, and it does not widen the slot's `scrollWidth`, which
+   WorkspaceNameLabel measures to decide whether the workspace name still fits.
+
+   Doubled up (`.badge.brand-badge`) so it wins on SPECIFICITY rather than
+   source order: this file is imported before both panels/shell.css, which
+   resets `top`/`right` at (0,2,0), and mobile.css, which re-corners every
+   `.badge` for the smaller mobile icon buttons. */
+.brand-mark-slot .badge.brand-badge {
+    position: absolute;
+    top: calc(var(--brand-badge-corner) + var(--header-mark-badge-offset));
+    right: calc(var(--brand-badge-corner) + var(--header-mark-badge-offset));
+    /* This badge stays inside its host, so it keeps whatever veil the slot
+       carries. mobile.css drops the veil along with the corner it re-corners,
+       because a badge it has pushed onto the button's edge straddles the bar.
+       This one it never moves. */
+    --header-control-veil: inherit;
+    /* The flex-slot lift and tuck, which mean nothing out of flow and would
+       otherwise offset the corner placement above. */
+    margin: 0;
+    /* Purely visual in every state: the tap belongs to the mark, which opens
+       the menu that explains the badge. A positioned span is a hit target
+       whether or not it listens, and what is under it is the mark's button, a
+       SIBLING, so a tap on the corner would have nothing to bubble to. */
+    pointer-events: none;
+}
+
+/* The UNREAD COUNT, on the mark's BOTTOM-right corner.
+   Same derived inset as the state badge above, so the two share one geometry
+   and neither names a size. What differs is which corner, and that is the whole
+   rule: the artwork's sparkle sits TOP-right (LucidosMarkIcon draws it inside a
+   `translate(13 13) scale(0.74)` group), so a badge parked there erases it and
+   leaves the brand as three plain squares. The state badge covers it too, but
+   only while a build runs or an update waits. A count is resident, so it takes
+   the corner the artwork can spare.
+   `top: auto` is required, not tidiness: the base `.badge` sets `top`, and an
+   absolutely positioned box given both `top` and `bottom` stretches between
+   them into a tall pill.
+   Compact, because the mark is 1.6rem of glyph and the full badge box covers
+   most of it. Doubled up (`.badge.brand-unread-badge`) for the specificity
+   reason the rule above documents.
+   The size goes in as the design height and nothing else. At this weight a
+   `min-height` or `padding` would outrank styles/badges.css. That rule rounds
+   the box to whole pixels, which is what keeps the count centred. */
+.brand-mark-slot .badge.brand-unread-badge {
+    position: absolute;
+    top: auto;
+    bottom: calc(var(--brand-badge-corner) + var(--header-mark-badge-offset));
+    right: calc(var(--brand-badge-corner) + var(--header-mark-badge-offset));
+    /* Inside its host too, for the reason the rule above gives. */
+    --header-control-veil: inherit;
+    --badge-height: var(--header-mark-count-size);
+    /* The tap belongs to the mark underneath, which opens the menu holding the
+       matching rows. Same reason the state badge above is click-through: this
+       is a positioned span over a SIBLING button, so its own taps would die. */
+    pointer-events: none;
+    margin: 0;
+}
+
+/* The mark dressed as a member of an icon run (the threads header), keeping
+   that run's BOX so it reads at the size Search and Filter do, but drawing at
+   the mark's own size rather than the run's glyph size. The box only, not the
+   position: the mark sits on the nav cluster's trailing edge, a column of its
+   own, see .header-mark-end-cluster.
+   The two differ because the artwork is INSET inside its own viewBox:
+   `LucidosMarkIcon` translates and scales its shapes to about half the box, so
+   a mark and a stroke icon given the same width do not read as the same size,
+   and at `--icon-size-lg` the mark came out visibly smaller than its
+   neighbours. Compensating on the glyph rather than on the button is what keeps
+   the alignment: the box is still exactly the run's. Sized off
+   `--header-mark-size` on purpose, so the mark draws identically on both
+   headers however that value is retuned. */
+.icon-btn.brand-mark-row svg {
+    width: var(--header-mark-size);
+    height: var(--header-mark-size);
+}
+
+/* …and the run's colour is where it stops taking the run's dressing: the brand
+   holds the bar's FULL foreground, not the muted glyph colour Search and Filter
+   take at the row's edges. That is the strength the thread pane's mark reads at
+   while we are connected, and the two panes carry the same mark, so a muted one
+   on this row read as a dimmer copy of the same thing. It stays out of the connection
+   ladder (no `data-conn`, see BrandMenuButton), so this is one flat colour in
+   every state rather than the cluster mark's colour-and-motion.
+
+   `.app-header` is load-bearing, not decoration: this file is imported BEFORE
+   panels/shell.css, whose `.app-header .icon-btn` muted rule is (0,2,0), so a
+   bare `.icon-btn.brand-mark-row` would tie on specificity and lose on source
+   order. */
+.app-header .icon-btn.brand-mark-row {
+    color: var(--header-fg);
+}
+
+.brand-mark {
+    width: var(--header-mark-tap);
+    height: var(--header-mark-tap);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    padding: 0;
+    border: none;
+    background: none;
+    border-radius: var(--radius-round);
+    cursor: pointer;
+    position: relative;
+}
+
+/* The glyph, flat in the header's own foreground scale. There is ONE rendering
+   of the mark, on every row that carries it: the artwork in `--header-fg-muted`
+   and brightening to `--header-fg` on hover and while the menu is open, which
+   is exactly what every other `.icon-btn` in the blue bar does (see the
+   "Brand-blue header" block in panels/shell.css). The mark's one departure from
+   that language is the connected state, which holds `--header-fg` standing
+   still, see the connection block below. A filled gradient tile was tried first
+   and read as a badge stuck onto the row rather than as one of its controls, so
+   the mark now speaks the header's glyph language and earns its prominence from
+   size and position instead of from paint. */
+.brand-mark-glyph {
+    width: var(--header-mark-size);
+    height: var(--header-mark-size);
+    display: block;
+    color: var(--header-fg-muted);
+    /* ALWAYS transformed, and the identity matrix is the whole point. The press
+       cue below scales this box, and `transform: none` to `scale(0.93)` is not a
+       change of VALUE, it is a change of KIND: a box with no transform is
+       neither a stacking context nor a containing block nor a candidate for its
+       own compositing layer, and one with a transform is all three. So every
+       press built that structure inside the brand cluster and every release tore
+       it down again.
+       Safari, and therefore the packaged macOS app, re-rasterised the enclosing
+       cluster when that happened, and the whole brand label (the mark, both
+       thread chevrons and the workspace name) visibly shifted while the button
+       was held and dropped back on release. Reported three times against that
+       build. Starting from `scale(1)` leaves the press a plain matrix
+       interpolation with no structural change to make, and `will-change` says
+       the same thing to the compositor a frame earlier, so the layer exists
+       before the finger lands rather than being conjured by it.
+       Nothing here is defensive: the mark is the ONLY control in the header with
+       an `:active` transform, and it was the only one that moved. The identity
+       matrix changes no geometry, so there is nothing to see at rest.
+       Pinned by styles/__tests__/header-mark-geometry.test.ts. */
+    transform: scale(1);
+    will-change: transform;
+    transition: color var(--duration-normal) ease,
+                opacity var(--duration-normal) ease,
+                transform var(--duration-fast) ease;
+}
+
+.brand-mark-glyph svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+.brand-mark:active .brand-mark-glyph {
+    transform: scale(0.93);
+}
+
+.brand-mark.is-open .brand-mark-glyph {
+    color: var(--header-fg);
+}
+
+/* Hover only where a pointer can hover. On touch, `:hover` latches after a tap
+   and stays until the next tap elsewhere, so an unguarded rule leaves a
+   RECEDED mark sitting at full strength long after the tap, which reads as a
+   stuck selection and, worse, as a connection the user does not have. Same
+   guard, for the same reason, as `.app-header .icon-btn:hover` in
+   panels/shell.css. */
+@media (hover: hover) {
+    .brand-mark:hover .brand-mark-glyph {
+        color: var(--header-fg);
+    }
+
+    /* The row mark's badges are SIBLINGS of its button (HeaderMark.tsx). The
+       veil the button raises on itself never reaches them, so their rings
+       would stay bar-coloured over a washed square. Raise it on the slot the
+       three share. The cluster mark is not an `.icon-btn` and never washes, so
+       this leaves it alone. See --header-control-veil in panels/shell.css. */
+    .app-header .brand-mark-slot:has(.icon-btn:hover) {
+        --header-control-veil: var(--header-control-veil-hover);
+    }
+}
+
+/* Connected: the brand at full light, and that is the whole of it. Colour is
+   the only thing this rule may carry. A ring, a tint or a motion cue on the
+   state the user looks at all day is a frame around the mark by another name,
+   which is what the muted-in-every-state version was avoiding when it wrote no
+   rule here at all. Lifting the strength instead says "live" in the dimension
+   the other two states already speak in, and it lets the brand stop hiding
+   among the muted glyphs it sits between. */
+.brand-mark[data-conn="connected"] .brand-mark-glyph {
+    color: var(--header-fg);
+}
+
+/* Disconnected: receded to the muted base and dimmed on top of it, standing
+   still. */
+.brand-mark[data-conn="disconnected"] .brand-mark-glyph {
+    opacity: var(--header-mark-disconnected-opacity);
+}
+
+/* Connecting: dimmed and breathing, so it is not mistaken for the settled
+   disconnected state at a glance. */
+.brand-mark[data-conn="connecting"] .brand-mark-glyph {
+    animation: brand-mark-breathe var(--header-mark-breathe-duration) ease-in-out infinite;
+}
+
+@keyframes brand-mark-breathe {
+    0%, 100% { opacity: var(--header-mark-connecting-opacity-min); }
+    50%      { opacity: var(--header-mark-connecting-opacity-max); }
+}
+
+/* Respect a reduced-motion preference: connecting keeps the dim, and holds it
+   at the breath's dim end rather than animating to it. Without the explicit
+   opacity, killing the animation would leave the connecting mark at full
+   strength, i.e. indistinguishable from connected.
+ *
+ * The selector REPEATS the connecting rule's exactly, behind the `data-motion`
+ * prefix, and that is load-bearing rather than tidy. A broader override such as
+ * `.brand-mark .brand-mark-glyph { animation: none }` can lose to the state rule
+ * above, since an attribute selector scores as a class, and the mark keeps
+ * pulsing for a user who asked for no motion. Pinned by
+ * styles/__tests__/header-mark-geometry.test.ts. */
+:root[data-motion="reduce"] .brand-mark[data-conn="connecting"] .brand-mark-glyph {
+    animation: none;
+    opacity: var(--header-mark-connecting-opacity-min);
+}
+
+/* ── The menu ─────────────────────────────────────────────────────────────
+ * A menu hung from the header. It dims nothing: only a surface that blocks
+ * until it is answered takes a scrim, and a menu is not one.
+ *
+ * It is portaled to <body> (see BrandMenuButton), and that is structural rather
+ * than tidy: the mark renders inside the mobile `.pane-header`, which carries
+ * `will-change: translate`, and such an ancestor becomes the containing block
+ * for its `position: fixed` descendants. Left in place, every offset below
+ * would resolve against that header instead of the viewport.
+ *
+ * It sits above --z-toast, not at --z-modal, for the reason the switcher
+ * documents in styles/panels/shell.css: a surface the user explicitly opened
+ * must paint over a persistent toast ("Restart needed", "New version
+ * available"), and --z-toast (2400) is deliberately above --z-modal (2300). */
+/* Centred on the HORIZONTAL axis of the pane the mark belongs to, and hung from
+   the header's bottom edge: the menu belongs to the mark, so it reads as coming
+   out of the row it was opened from rather than as a dialog that took over the
+   screen. `--app-header-bottom` is the shared anchor every below-the-header
+   surface uses (global/base.css, and the mobile override that tracks
+   hide-on-scroll and the safe-area inset), so this follows the header instead of
+   restating its height.
+
+   The base is the viewport axis, which is the thread pane's own axis on mobile,
+   where the pane IS the screen. Desktop narrows it to the thread pane below. */
+.brand-menu {
+    position: fixed;
+    top: calc(var(--app-header-bottom) + var(--header-surface-gap));
+    left: 50%;
+    transform: translateX(-50%);
+    width: var(--header-surface-width);
+    padding: var(--brand-menu-frame);
+    /* The panel hangs from the header, so the room it has is whatever is left
+       below it, and it must never claim more: it is `position: fixed`, so
+       anything past the bottom edge is simply unreachable. Seven rows already
+       overrun a phone held in landscape, before the workspace list unfolds
+       under one of them. `hidden auto` keeps the horizontal clip the rounded
+       corners rely on and lets the panel scroll on the axis it can grow in;
+       `contain` stops that scroll chaining out to the app behind it. The list's
+       own cap is the inner bound and normally the only one in play, so this is
+       the floor rather than the mechanism. */
+    max-height: calc(var(--app-height, 100dvh) - var(--app-header-bottom) - 2 * var(--header-surface-gap));
+    overflow: hidden auto;
+    overscroll-behavior: contain;
+    z-index: calc(var(--z-toast) + 50);
+    animation: modal-in var(--duration-fast) ease;
+}
+
+/* Desktop: centre it on the THREAD PANE, not the window. The mark sits in that
+   pane's header segment and the menu is its panel, so a window-centred one hangs
+   over the content pane the user is not acting on, and drifts further off the
+   mark the narrower the split gets.
+   The pane spans from the drawer edge to the split divider, and the header
+   already publishes both ends as :root properties for its own regions to track
+   (--co + --ddo is the leading edge, --divider-x is the divider), so this reads
+   the same geometry rather than restating it, and slides with the divider for
+   free. Those properties exist only inside this breakpoint, which is also why
+   the rule is scoped to it: on the phone layout the calc would be invalid and
+   the base viewport centring is what the phone wants anyway.
+   The panel is `position: fixed` and portaled to <body>, so the percentages in
+   --divider-x resolve against the viewport, which is exactly the width the
+   full-bleed header measured them against. */
+@media (--desktop-layout) {
+    .brand-menu {
+        left: calc((var(--co) + var(--ddo) + var(--divider-x)) / 2);
+    }
+}
+
+.brand-menu-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    width: 100%;
+    min-height: var(--brand-menu-row-min-height);
+    padding: var(--space-sm) var(--space-md);
+    border: none;
+    background: none;
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: var(--font-size-md);
+    /* Explicit, so a button row and a div row are the same height. See the
+       token's own note. */
+    line-height: var(--brand-menu-row-line-height);
+    text-align: left;
+    /* The Workspaces row is an <a href> wherever the picker is reachable but the
+       control plane is not (a direct engine port), and the rest are <button>s.
+       Without this it is the one row wearing the user agent's link underline,
+       which reads as a different KIND of row rather than as the one that can
+       navigate. */
+    text-decoration: none;
+    border-radius: var(--brand-menu-item-radius);
+    cursor: pointer;
+}
+
+/* Pointer hover only: on touch a `:hover` latches onto the row just tapped.
+   A static row and the confirm row do nothing themselves, so they never band. */
+@media (hover: hover) {
+    .brand-menu-item:not(.brand-menu-item-static, .brand-menu-confirm-row):hover {
+        background: var(--bg-hover);
+    }
+}
+
+/* ── The connection notice ────────────────────────────────────────────────
+ * Why the mark is dim, at the head of the panel, in words. Present for exactly
+ * the two states the glyph recedes in (see the connection block above) and
+ * absent while it is lit, so the panel always has an answer when the brand does
+ * not read as live. The mark's own colour-and-motion says THAT something is
+ * wrong and cannot say what; the accessible name and the desktop tooltip say
+ * it, but a phone has neither, so opening the menu was the one move left and it
+ * answered nothing. It is keyed on the STATE rather than on which mark opened
+ * the panel, which matters on the mobile threads row: that mark deliberately
+ * carries no connection light, so the notice is the only place the state
+ * appears there. It states the SHORT detail, this panel being too narrow for
+ * the explainer the connection bar carries. See `utils/connectionNotice.ts`.
+ *
+ * An earlier revision of this panel led with a status band, and the commit that
+ * made the menu a centred modal dropped it on the grounds that the mark already
+ * carries the state as colour and motion. That was true of THAT band, which was
+ * unconditional: it spelled out "Connected, dev" all day beside a glyph already
+ * at full strength, which is restating the thing above it. This one is absent in
+ * exactly that case. What is left is the case colour and motion cannot carry:
+ * which state it is, which workspace it is about, and what it means for the
+ * app. So this is not the band coming back, it is the half of it that was never
+ * a restatement.
+ *
+ * A RAISED surface, not a framed one. `--bg-tertiary` is the app's lifted step
+ * and is what the rows' own value pills already sit on, so this reads as part of
+ * the panel with something to say. A coloured left edge is banned outright
+ * (.claude/rules/frontend-css.md), and a border would make the panel look like
+ * two panels, which is the same thing the separator below avoids by insetting to
+ * the text column instead of spanning the frame. Its radius is the rows', so its
+ * corners stay concentric with the panel's at any retune.
+ *
+ * A statement rather than a control: no hover, no cursor, nothing to press. It
+ * needs no `pointer-events: none` guard the way `.brand-menu-item-static` does,
+ * because it wears none of the row classes that would promise a tap. */
+.brand-menu-notice {
+    display: flex;
+    /* Not `center`: see the dot's own rule. */
+    align-items: flex-start;
+    gap: var(--space-sm);
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--brand-menu-item-radius);
+    background: var(--bg-tertiary);
+    font-size: var(--font-size-sm);
+    /* Stated for the reason every row in this panel states it: this is a <div>
+       among <button>s and a button does not inherit the document's
+       line-height. Here it is load-bearing twice over, since the dot's offset
+       below is derived from it. */
+    line-height: var(--brand-menu-row-line-height);
+    color: var(--text-secondary);
+}
+
+/* The dot rides the FIRST LINE, not the middle of the block. This is a sentence
+   in a fixed-width panel, so it wraps to two or three lines, and centring the
+   dot against the whole box floats it into the middle of them where it reads as
+   a bullet that lost its list. Half the difference between the first line box
+   and the dot IS that line's centre, so the offset is derived from the two
+   quantities that decide it rather than nudged until it looked right. `1em` is
+   this element's own font size, which is the notice's, so the line box it
+   measures is the one beside it. */
+.brand-menu-notice .status-dot {
+    width: var(--brand-menu-notice-dot);
+    height: var(--brand-menu-notice-dot);
+    margin-top: calc(
+        (1em * var(--brand-menu-row-line-height) - var(--brand-menu-notice-dot)) / 2
+    );
+}
+
+.brand-menu-notice-text {
+    min-width: 0;
+    /* It wraps, unlike a row: this is a reason, and a clipped reason is not a
+       reason. Same rule, for the same reason, as `.brand-menu-ws-note`. The
+       `anywhere` is what keeps a long workspace name inside a panel that is
+       fixed-width by construction. */
+    overflow-wrap: anywhere;
+}
+
+/* The state itself, at the panel's full strength, so the sentence around it
+   reads as the explanation rather than as more of the same weight. */
+.brand-menu-notice b {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+/* Disconnected is the one state worth colouring. It is SETTLED: connecting
+   resolves on the next tick and is already saying so by breathing, where this
+   one holds until something changes, and the mark it explains is at the dimmest
+   end of its ladder. The dot beside it takes the same red from the shared
+   `.status-dot` scale (panels/shell.css) rather than restating it, so the
+   colour is stated once per state instead of once per element. */
+.brand-menu-notice-disconnected b {
+    color: var(--accent-red);
+}
+
+/* The identity row leading the panel: the product, and the version it is
+   running. Its value pill is the same shape the Workspaces row uses, so the two
+   pieces of "where am I" line up on one trailing edge. */
+
+/* The mark's artwork is INSET in its own viewBox (--header-mark-art-scale), so
+   at the size every other row's glyph uses it reads visibly smaller than its
+   neighbours. Scale the PAINT rather than the box: the box is what puts the
+   row's text on the same column as the rows above and below it, and the
+   reciprocal of the inset is exactly what cancels it. The row mark in the
+   threads header compensates for the same thing the other way, by drawing at
+   --header-mark-size inside the run's box. */
+.brand-menu-version > svg {
+    transform: scale(calc(1 / var(--header-mark-art-scale)));
+}
+.brand-menu-version .brand-menu-value-name {
+    /* Tabular, so a version that grows a digit does not shift the pill's text
+       around under the one above it. */
+    font-variant-numeric: tabular-nums;
+}
+
+/* It names rather than acts, so it is fenced off from the rows that do
+   something. Inset to the rows' own text column rather than spanning the frame,
+   which would read as the panel being two panels. */
+.brand-menu-separator {
+    height: 1px;
+    margin: var(--space-xs) var(--space-md);
+    background: var(--border-color);
+}
+
+.brand-menu-item > svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+    flex: 0 0 auto;
+    color: var(--text-secondary);
+}
+
+/* The row's trailing value, reading as the CURRENT selection rather than as a
+   caption: a raised pill carrying the accent check the retired workspace
+   switcher used to mark the workspace you were on. Muted grey text said "extra
+   information about Workspaces"; this says "Workspaces, and you are in dev".
+   `max-width` + the ellipsis on the name keep a long workspace name from
+   widening the panel, which is fixed-width by construction.
+
+   The cap is what a pill may take of the row, not what it does take: a pill is
+   sized to its content and only a long name ever reaches this. So the cap is
+   the second thing rationing the name, beside the panel width, and at 50% it
+   was the one that bound: it held back room the row's own label had already
+   left free. 60% hands that back, and still stops a pill from reading as the
+   row rather than as its value. */
+.brand-menu-value {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+    min-width: 0;
+    max-width: 60%;
+    padding: 0.125rem var(--space-sm);
+    border-radius: var(--brand-menu-item-radius);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+}
+
+/* An unread release's dot, in the version pill. Sized and coloured like the
+   accent check beside it (same slot, same job of marking the pill's value) but
+   round and unglyphed, because it marks a release as UNREAD rather than as
+   chosen. It leaves with the state it reports, so nothing holds its space. */
+.brand-menu-unread-dot {
+    width: 0.375rem;
+    height: 0.375rem;
+    flex: 0 0 auto;
+    border-radius: var(--radius-round);
+    background: var(--accent);
+}
+
+/* The accent check marking what you are on: in the collapsed row's value pill,
+   and on the current workspace's row in the unfolded list. One rule, because
+   they are the same mark at the same size doing the same job. */
+.brand-menu-value-check,
+.brand-menu-ws-check {
+    width: 0.75rem;
+    height: 0.75rem;
+    flex: 0 0 auto;
+    color: var(--accent);
+}
+
+.brand-menu-value-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ── The workspace switcher ───────────────────────────────────────────────
+ * The Workspaces row unfolds the list of workspaces this gateway serves, so
+ * switching costs a tap instead of a trip out to the picker page and back. The
+ * rows below are SATELLITES of that row rather than more menu items: inset from
+ * its text column, shorter, and at the value pill's size, so the panel still
+ * reads as four or seven items with a list hanging off one of them.
+ */
+
+/* Which way the list is about to go, in the pill and at exactly the check's
+   footprint. It is not beside the pill: the panel width is a budget (see
+   --header-surface-width). At the old 17.5rem an extra 0.75rem plus its gap
+   overspent it by about a character and a half, which ellipsised "development"
+   the first time this was built. Taking the marker slot instead is free, and the check it
+   replaces is not lost, the unfolded list marks the current workspace with
+   one. */
+.brand-menu-value-chevron {
+    flex: 0 0 auto;
+    display: inline-flex;
+    width: 0.75rem;
+    height: 0.75rem;
+    color: var(--text-secondary);
+    transition: transform var(--duration-fast) ease;
+}
+
+.brand-menu-value-chevron svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+.brand-menu-ws-toggle.is-expanded .brand-menu-value-chevron {
+    transform: rotate(180deg);
+}
+
+.brand-menu-ws-list {
+    display: flex;
+    flex-direction: column;
+    /* Hangs under the row's text column, so the list belongs to the row above
+       it rather than reading as more menu items. */
+    margin-left: var(--space-md);
+}
+
+/* Holds the unfolded list's height while it loads, before the skeleton's delay
+   gate opens. Hidden rather than absent, so a fast load swaps it for the list
+   with no growth: the menu can open already unfolded. */
+.brand-menu-ws-reserve {
+    visibility: hidden;
+}
+
+/* The workspace rows, and ONLY them. Manage workspaces is a sibling of this box
+   rather than its last child (see `workspaceSwitcherList`), so it stays on
+   screen whatever the row count: inside, it was the row you had to scroll to
+   reach, which put the way out of an unreadably long list at the bottom of that
+   list.
+
+   The cap is what makes this a scroller at all. The panel is `position: fixed`
+   under the header and `overflow: hidden`, so an uncapped list is CLIPPED
+   rather than scrolled. `contain` stops the scroll chaining out to the page
+   behind the menu once it bottoms out. Pinned by
+   styles/__tests__/header-mark-geometry.test.ts. */
+.brand-menu-ws-scroll {
+    display: flex;
+    flex-direction: column;
+    max-height: var(--brand-menu-ws-list-max-height);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+.brand-menu-ws-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    width: 100%;
+    min-height: var(--brand-menu-ws-row-min-height);
+    /* Asymmetric on purpose. The left is the indent that makes these satellites
+       of the row above; the right resolves to the SAME column that row's value
+       pill ends on (--space-md from the panel frame, which the list's own
+       margin does not eat into), so the check here lines up under the pill
+       rather than sitting a few pixels outside it. */
+    padding: 0 var(--space-md) 0 var(--space-sm);
+    border: none;
+    background: none;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: var(--font-size-md);
+    /* Stated for the reason the menu rows state theirs: a <button>, an <a> and
+       a <div> all wear this class, and a button does not inherit the document's
+       line-height. */
+    line-height: var(--brand-menu-row-line-height);
+    text-align: left;
+    /* Two of these rows are <a href>s (an unhealthy workspace, and Manage
+       workspaces). Without this they are the rows wearing the user agent's link
+       underline, which reads as a different KIND of row rather than as the ones
+       that navigate. */
+    text-decoration: none;
+    border-radius: var(--brand-menu-item-radius);
+    cursor: pointer;
+}
+
+/* Only the rows that DO something react. The current workspace and an
+   unreachable one render as <div>s, so the element selector is what tells them
+   apart without a modifier class. */
+@media (hover: hover) {
+    button.brand-menu-ws-row:hover,
+    a.brand-menu-ws-row:hover {
+        background: var(--bg-hover);
+        color: var(--text-primary);
+    }
+}
+
+div.brand-menu-ws-row {
+    cursor: default;
+}
+
+/* Where you are: at the panel's full strength, with the accent check the pill
+   above carries. */
+.brand-menu-ws-row.is-current {
+    color: var(--text-primary);
+}
+
+.brand-menu-ws-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* A workspace's unread count, on the notifications group's rows
+   (`NotificationsMenuRows.tsx`). The same blue every count in the app uses (see
+   `.badge` in header.css), but not that rule: `.badge` is `position: absolute`,
+   for pinning to an icon's corner, and this one sits in the row's flow. */
+.brand-menu-ws-badge {
+    flex: 0 0 auto;
+    /* As tall as the row's line. styles/badges.css rounds it to whole pixels,
+       which keeps the count centred. */
+    --badge-height: 1lh;
+    min-width: 1.125rem;
+    padding: 0 var(--space-xs);
+    background: var(--accent);
+    color: var(--text-on-accent);
+    font-size: var(--font-size-2xs);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+}
+
+/* ── The activity group ───────────────────────────────────────────────────
+ * One row per job in flight (ActivityMenuRows.tsx): a spinner where the other
+ * rows draw an icon, the job on one line, its elapsed time or count at the
+ * trailing edge, and a chevron because the row unfolds the job's detail. */
+
+/* An unfolded label wraps, and the mark, the time and the chevron stay on its
+   FIRST line. Every item is top-aligned in a box one line tall, and the
+   padding is what a single-line row keeps of the shared min-height. */
+.brand-menu-activity-row {
+    --brand-menu-activity-line: calc(var(--font-size-md) * var(--brand-menu-row-line-height));
+    align-items: flex-start;
+    padding-block: calc((var(--brand-menu-row-min-height) - var(--brand-menu-activity-line)) / 2);
+}
+
+/* The leading slot is an icon's width, so the label lands on the same text
+   column as every other row in the panel. */
+.brand-menu-activity-mark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: var(--icon-size-md);
+    height: var(--brand-menu-activity-line);
+}
+
+/* Smaller than the icon slot it sits in, so it reads as a status mark beside
+   the label rather than as a glyph louder than the row icons below it. The
+   thinner ring keeps its hole open at this size. It takes the label's colour,
+   so it reads as part of the job's line rather than as an alert. */
+.brand-menu-activity-mark .mini-spinner {
+    --spinner-color: currentColor;
+    width: 0.625rem;
+    height: 0.625rem;
+    border-width: 0.09375rem;
+}
+
+/* A job waiting its turn: the badge's still hourglass, the spinner's size. */
+.brand-menu-activity-mark svg {
+    width: 0.625rem;
+    height: 0.625rem;
+}
+
+/* The pending row's mark: the badge's own dot, since it stands for the dot. */
+.brand-menu-activity-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: var(--radius-round);
+    background: var(--accent);
+}
+
+.brand-menu-activity-row.is-wedged .brand-menu-activity-dot {
+    background: var(--accent-yellow);
+}
+
+/* One line while folded: a long thread title ellipsizes rather than wrapping
+   the row, which is the "one line per job" the group promises. Unfolded, the
+   row shows its whole title. */
+.brand-menu-activity-label {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.brand-menu-activity-row.is-expanded .brand-menu-activity-label {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+/* Tabular, so a ticking counter does not jitter the label beside it. */
+.brand-menu-activity-detail {
+    flex: 0 0 auto;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    /* The label's line box, so the smaller text centres on its first line. */
+    line-height: var(--brand-menu-activity-line);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+/* The pending row's trailing chevron. That row never wraps, so its one line
+   is the whole content box. */
+.brand-menu-activity-row > svg {
+    align-self: center;
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+/* Which way the detail is about to go, turned the way the Workspaces row
+   turns its own. */
+.brand-menu-activity-chevron {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    width: 0.75rem;
+    height: var(--brand-menu-activity-line);
+    color: var(--text-secondary);
+    transition: transform var(--duration-fast) ease;
+}
+
+.brand-menu-activity-chevron svg {
+    width: 100%;
+    height: 0.75rem;
+    display: block;
+}
+
+.brand-menu-activity-row.is-expanded .brand-menu-activity-chevron {
+    transform: rotate(180deg);
+}
+
+/* A job's detail, unfolded under its row (ActivityMenuRows.tsx). It takes the
+   rows' own padding on both sides, so its text starts under the row icons and
+   every line in the panel shares one margin. */
+.brand-menu-activity-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    padding: 0 var(--space-md) var(--space-sm);
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
+}
+
+.brand-menu-activity-note,
+.brand-menu-activity-housekeeping {
+    margin: 0;
+}
+
+.brand-menu-activity-progress {
+    position: relative;
+}
+
+/* The Apply All member in flight, beside the filled span of finished ones. It
+   pulses because the step has no fraction of its own, and an empty slot read
+   as a stalled apply. */
+.brand-menu-activity-working {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: var(--accent);
+    border-radius: calc(var(--radius-control) * 0.375);
+    animation: progress-pulse 2s ease-in-out infinite;
+    transition: left var(--duration-slow) ease, width var(--duration-slow) ease;
+}
+
+:root[data-motion="reduce"] .brand-menu-activity-working {
+    animation: none;
+    opacity: 0.5;
+}
+
+.brand-menu-activity-position {
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+
+/* A build's changelog can run long, and the menu is clipped rather than
+   scrolled, so the list scrolls inside its own cap. */
+.brand-menu-activity-changes {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    max-height: var(--brand-menu-ws-list-max-height);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+.brand-menu-activity-headline,
+.brand-menu-activity-group-title {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.brand-menu-activity-group-section ul {
+    margin: var(--space-xs) 0 0;
+    padding-left: 1.25rem;
+    font-size: var(--font-size-sm);
+}
+
+/* The thread an apply is on, as a link to the step: the phase and its times
+   on one line, the title in full under it, and the chevron beside both. The
+   title wraps here, where the row above ellipsizes it. */
+.brand-menu-activity-link {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: var(--space-sm);
+    width: 100%;
+    padding: var(--space-xs) 0;
+    border: none;
+    background: none;
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: inherit;
+    line-height: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.brand-menu-activity-phase {
+    grid-column: 1;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+}
+
+.brand-menu-activity-thread {
+    grid-column: 1;
+    color: var(--accent);
+    overflow-wrap: anywhere;
+}
+
+.brand-menu-activity-link > svg {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+@media (hover: hover) {
+    .brand-menu-activity-link:hover .brand-menu-activity-thread {
+        text-decoration: underline;
+    }
+}
+
+.brand-menu-activity-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-sm);
+}
+
+/* The way to everything the menu deliberately cannot do: create, rename,
+   delete, restore, start, stop, auto-start. Quieter than the workspaces above
+   it, since it is the list's footer rather than one of its entries. */
+.brand-menu-ws-manage {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+/* The action a right-click unfolds under a workspace, dressed as a satellite of
+   that row: muted and at the smaller step, the same way Manage workspaces is.
+   It is a row of the panel rather than a popover over it, and
+   `WorkspaceActionRow.tsx` owns why.
+
+   Its GLYPH starts on the name column of the row above it, so the action hangs
+   under the workspace it belongs to. Which column that is depends on the host,
+   so the indent comes from the modifier below and never from here. The label
+   lands one glyph further in again, which is the indent that says satellite. */
+.brand-menu-ws-action {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+/* Under a SWITCHER row, which leads with a status dot. Derived, not guessed:
+   the row's own padding, plus that dot, plus the row's gap. The picker indents
+   its fault note off the same two tokens. */
+.brand-menu-ws-action-under-dot {
+    padding-left: calc(var(--space-sm) + var(--ws-picker-dot-size) + var(--space-sm));
+}
+
+/* Under a NOTIFICATIONS row, which is a `.brand-menu-item` leading with the
+   bell, so the action starts on that row's label column. */
+.brand-menu-ws-action-under-icon {
+    padding-left: var(--brand-menu-text-column);
+}
+
+/* Sized here rather than left to the icon, so it cannot reshape a row whose
+   height every other row in this list shares. */
+.brand-menu-ws-action svg {
+    flex: 0 0 auto;
+    width: 0.875rem;
+    height: 0.875rem;
+}
+
+.brand-menu-ws-note {
+    margin: 0;
+    padding: var(--space-xs) var(--space-sm);
+    font-size: var(--font-size-sm);
+    /* Wraps, unlike a row: an error names what failed and why, and a clipped
+       reason is not a reason. */
+    overflow-wrap: anywhere;
+}
+
+.brand-menu-ws-error {
+    color: var(--accent-red);
+}
+
+/* ── The Refresh and Restart rows ─────────────────────────────────────────
+ * Two rows now, one action each: Refresh reloads the client, Restart stops and
+ * starts the engine behind a `Sure?` confirm. They were one control where a
+ * HOLD on Refresh revealed the confirm, which is why this rule set carried a
+ * `touch-action: none` (the browser claims a hold for scrolling): with two
+ * plain taps there is no gesture to protect. */
+
+/* A new engine version is ready to switch onto. Only the glyph lights, so the
+   row still reads as one of the menu's items rather than as a call to action:
+   the accent here means "there is something to switch to", not "press me". */
+.brand-menu-item.is-pending > svg {
+    color: var(--accent);
+}
+
+/* And the words for it, in the pill shape the rows above use. The colour is the
+   glyph's, not the neutral a value pill carries: this is news about the row, not
+   the row's current setting the way "dev" is for Workspaces. It shares that
+   pill's ellipsis, so a scaled-up root or a wide monospace shortens the text
+   instead of widening a panel that is fixed-width by construction. */
+.brand-menu-restart-badge {
+    color: var(--accent);
+}
+
+/* A newer client bundle is served. Trailing, in the slot the Workspaces row
+   puts its value pill in, so the two rows agree on where a row's own status
+   lives. Non-interactive: the tap belongs to the row. */
+.brand-menu-refresh-badge {
+    margin-left: auto;
+    width: 0.4375rem;
+    height: 0.4375rem;
+    flex: 0 0 auto;
+    background: var(--accent);
+    pointer-events: none;
+}
+
+/* A row with nowhere to go: the Workspaces row on a bundle the engine did not
+   stamp, where there is no gateway picker to link to but the workspace is still
+   worth naming. It keeps the row's shape and drops every affordance that would
+   promise a tap.
+   Muted AND inert, not just cursor-and-hover: those two say nothing on a phone,
+   which has neither, so the row still looked exactly like the four tappable
+   ones and answered a tap with nothing. Dimming states that it is a label, and
+   `pointer-events: none` means a stray tap lands on the panel instead of
+   flashing a highlight on something that will not respond. The value pill keeps
+   its own colour, since the workspace name is the point of the row. */
+.brand-menu-item-static {
+    cursor: default;
+    pointer-events: none;
+    color: var(--text-muted);
+}
+
+.brand-menu-item-static > svg {
+    opacity: 0.6;
+}
+
+/* The confirm replaces the row in place, so the panel does not change height
+   and the two buttons land under the finger that was already holding here. */
+.brand-menu-confirm-row {
+    cursor: default;
+}
+
+.brand-menu-confirm-actions {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+    flex: 0 0 auto;
+}
+
+/* There is no Cancel beside it: dismissing the menu is the cancel (see
+   WorkspaceRestartRow), which is also what keeps this row inside the panel's
+   fixed width instead of clipping against its `overflow: hidden`. */
+.brand-menu-confirm {
+    border: none;
+    border-radius: var(--brand-menu-item-radius);
+    padding: 0.1875rem var(--space-sm);
+    /* base.css gives a button its family and ligature setting; the UA font
+       leaves only the line height at `normal`. */
+    line-height: inherit;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+    background: var(--accent-action);
+    color: var(--text-on-accent);
+    transition: background var(--duration-fast), color var(--duration-fast);
+}
+
+@media (hover: hover) {
+    .brand-menu-confirm:hover {
+        background: color-mix(in srgb, var(--accent-action) 80%, #fff);
+    }
+}

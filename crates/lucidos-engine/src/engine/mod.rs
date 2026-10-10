@@ -1,0 +1,1628 @@
+pub(crate) mod agent_context;
+pub(crate) mod agent_question;
+pub mod agent_recovery;
+pub(crate) mod agent_session;
+mod agentic_loop;
+mod apply_all_batches;
+pub(crate) mod apply_all_driver;
+pub(crate) mod apply_estimate;
+mod archive_request;
+pub(crate) mod aux_purpose;
+mod background_build;
+pub mod cc_permission;
+pub mod cc_question_wait;
+pub(crate) mod cc_settings;
+mod change_ops;
+pub mod change_summary_consumer;
+pub mod changelog;
+pub(in crate::engine) mod chat;
+pub(crate) mod claude_code;
+pub(crate) mod command_guard;
+pub(crate) mod command_judge;
+pub use command_judge::{classify_for_eval as classify_command_for_eval, EvalVerdict};
+pub(crate) mod command_judge_questions;
+pub mod command_permission;
+/// `pub(crate)` for the cost helpers: `tool_definitions_chars`,
+/// `estimate_tokens_from_chars` and `agent_context_char_budget` are what the
+/// MCP surface is capped and reported by, and it lives outside `engine`. The
+/// cap, the report and the request packer must share one definition of cost.
+pub(crate) mod context;
+pub mod db_health;
+pub mod engine_version;
+/// The eval-only full-capture gate (ADR 0110). Inert without
+/// `LUCIDOS_EVAL_FULL_CAPTURE`, which only the eval harness sets.
+pub(crate) mod eval_capture;
+pub mod event_bus;
+pub mod event_wait;
+pub mod form_requests;
+pub mod frontend_preview;
+mod frontend_refresh;
+pub(crate) mod git_ops;
+pub mod home_thread;
+pub mod http;
+pub(crate) mod image_size_hint;
+pub(crate) mod inline_question_repair;
+pub(crate) mod inline_tool_call_repair;
+pub(crate) mod loaded_knowhow;
+pub mod mcp_permission;
+/// `pub(crate)` for `relevance_score` / `age_in_days`: the `/memory/search`
+/// endpoint ranks with the SAME formula as the pre-turn injection, so a
+/// follow-up search cannot come back in a different order from the facts
+/// already in context. Two orderings for one corpus is a thing the agent would
+/// have to reconcile, and nothing would tell it which to trust.
+pub(crate) mod memory;
+pub mod memory_consumer;
+pub mod model_call;
+mod pending_apply_actors;
+pub mod pending_change_watch;
+pub(crate) mod preferences;
+pub(crate) mod question_card_gate;
+pub(crate) mod read_request;
+pub mod release_notices;
+pub(crate) mod repo_directory_grants;
+mod session_seed;
+pub mod standing_apply;
+pub mod startup_lease;
+pub mod summary_tree;
+pub mod supervisor_respawn_sidecar;
+pub(crate) mod text_search;
+pub mod thread_events;
+pub mod thread_lifecycle;
+pub mod thread_queue;
+pub(crate) mod thread_search;
+pub mod thread_state;
+pub(crate) mod thread_triage;
+pub(crate) mod title_match;
+pub mod todo_consumer;
+pub(crate) mod tool_arg_entity_repair;
+pub(crate) mod tools;
+pub(crate) mod trigger_group_writes;
+pub(crate) mod trigger_writes;
+pub mod types;
+pub(crate) mod user_profile;
+pub mod widgets;
+pub mod worktree_cleanup;
+
+pub(crate) use agentic_loop::{
+    coalesced_images_for_reprocess, coalesced_user_text_for_reprocess, emit_prompt_injected_event,
+    filter_removed_queued_prompts, strip_app_capture_marker,
+};
+#[cfg(test)]
+pub(crate) use change_ops::bind_in_place_conflict_resolution;
+pub(crate) use change_ops::now_epoch_millis;
+pub(crate) use model_call::AuxCapture;
+// Re-exported for `api::claude_code`, which classifies an `apply_now` refusal
+// into an HTTP status by identity against this const (a 404 there means "no
+// live session" to the frontend, so misclassifying it runs the wrong fallback).
+pub(crate) use change_ops::MERGE_OWNED_BY_RESOLVER_MESSAGE;
+pub(crate) use change_ops::SET_ASIDE_APPLY_REFUSAL;
+// The child-follow-up vocabulary, re-exported for the HTTP route in
+// `api::threads::follow_up`, which is outside `engine`. Only the ack and the
+// refusal taxonomy: the delivery half stays reachable solely as
+// `LucidosEngine::follow_up_child_thread`, so there is no way to assemble a
+// second delivery path out of its parts.
+pub(crate) use chat::accepted_messages::chat_event_id_is_recorded;
+pub(crate) use chat::agent_archive::{AgentArchiveAck, AgentArchiveError};
+pub(crate) use chat::child_detach::{ChildDetachError, DetachAck, DetachCaller};
+pub(crate) use chat::child_follow_up::{
+    ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpReach, FollowUpUrgency,
+};
+pub(crate) use chat::follow_up_order::{FollowUpOrder, FollowUpTurn};
+pub(crate) use chat::PreEmittedOrigin;
+pub(crate) use chat::{generate_thread_title, title_call, IMAGE_DESCRIPTION_PROMPT};
+#[cfg(test)]
+pub(crate) use context::format_history_steps;
+// `core` resolves the schedule's two numbers, and `chat` is not reachable from
+// there. One type crossing beats two bare `usize` a caller can transpose in
+// silence.
+pub(crate) use chat::process::context_mode::SweepSchedule;
+// Public because the eval's `guidance_hash` has to cover the text a model
+// actually saw, and two arms swept at different values must hash differently.
+pub use chat::process::context_mode::rendered_context_mode_prompt;
+pub use types::*;
+
+/// Public re-export so binaries (notably `main.rs`) can start the CC spawn
+/// dispatcher at engine startup. The rest of `agent_session` stays
+/// crate-private — only this background task entry point is public.
+pub mod spawn_dispatcher {
+    pub use super::agent_session::spawn_dispatcher::{SpawnDispatcher, SpawnRequest};
+}
+
+use crate::core::{AppManager, ArtifactManager, CredentialStore, EventStore};
+use crate::llm::LlmProvider;
+use crate::memory::{EmbedderSlot, PgVectorIndex};
+use crate::runtime::{
+    AgentRuntime, BrowserRuntime, ClaudeCodeRuntime, CodexRuntime, CodingAgent, PythonRuntime,
+};
+use git_ops::auto_commit_safe_files_if_dirty;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+/// A mid-flight prompt injected into the agentic loop.
+/// Also used as `OrphanedInjection` (type alias) for injections that arrived
+/// after the loop exited but before the ThreadGuard dropped.
+#[derive(Clone, Debug)]
+pub struct InjectedPrompt {
+    pub text: String,
+    /// Client-provided UUID for the injecting message. Carried through the
+    /// channel for callers that need correlation, but NOT reused as the
+    /// persisted `PromptInjected.id` — the chat fast-path emits a
+    /// `MessageReceived` row with this UUID first, so reusing it would
+    /// collide on `events_pkey`. Frontend reconciles pending messages via
+    /// `MessageReceived.id`; the PromptInjected link back to the request is carried
+    /// by `EventMeta::request_event_id`.
+    pub event_id: Option<Uuid>,
+    /// Semantic mode of the actor that generated this injection — Human (user
+    /// typed), Agent (parent thread's LLM), or Engine (recovery / scheduler).
+    pub mode: thread_events::ActorMode,
+    /// Event in the parent thread that triggered this injection (mode != Human).
+    pub spawning_event_id: Option<Uuid>,
+    /// Optional images attached to the injected message.
+    pub images: Option<Vec<crate::api::ChatImage>>,
+    /// Structured origin describing the actor (e.g. ThreadLink::Child for a
+    /// child→parent callback). Stamped onto the persisted PromptInjected
+    /// event so the chip can render the right initiator label.
+    pub origin: Option<thread_events::MessageOrigin>,
+    pub kind: InjectedPromptKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum InjectedPromptKind {
+    /// Synthesised user message — emits `PromptInjected` and pushes the
+    /// framed text into the next agentic-loop turn.
+    UserText,
+    /// Engine re-entry on an existing thread, the child-completion case being
+    /// the headline one. The parent's `ChildThreadCompleted` event is
+    /// already the exchange-starter on the wire (caller passed its id as
+    /// `prompt.spawning_event_id`); the loop projects `prompt.text` inline
+    /// as the next user-channel block WITHOUT emitting `PromptInjected`
+    /// — otherwise the response would split into a duplicate exchange and
+    /// strand the rich child-completion card.
+    ReentryFromEngine,
+    /// Event-wait delivery or expiry (see `engine::event_wait`). Same
+    /// projection rule as `ReentryFromEngine` and for the same reason:
+    /// `emit_delivery` has already put the re-entry's exchange-starter on the
+    /// wire (a `PromptInjected` carrying the matched event), so the loop
+    /// must project the text inline rather than emit a second one.
+    ///
+    /// **Named for the resolved WAIT, not for a sleeping thread.** Reaching
+    /// this arm at all means the thread was running, since an idle one has no
+    /// loop to inject into, and the model is then told the event arrived "while
+    /// you were working" (see `framed_injected_prompt`). It was `WakeFromEvent`
+    /// until 2026-08-13, which named the one case it cannot be.
+    ///
+    /// Distinct from `ReentryFromEngine` rather than folded into it because the
+    /// two come from different places and say so in the log; the *layout* they
+    /// share is expressed once, by [`InjectedPromptGroup::Standalone`].
+    ReentryFromWait,
+    /// What the *talker* said out loud while this turn was running.
+    ///
+    /// Same projection rule again, and here the reason is that the exchange
+    /// starter is somebody ELSE's. A spoken reply is `Metadata` and starts no
+    /// turn (ADR 0149): it lands beside the one already running. Emitting a
+    /// `PromptInjected` for it would claim the talker interrupted the
+    /// user, and `SpokenReplyGenerated` is already the record.
+    ///
+    /// **It never wakes an idle thread.** With no live handle there is nothing
+    /// to inject into, and history carries the turn to the next round anyway.
+    SpokenAside,
+}
+
+impl InjectedPromptKind {
+    /// True for every kind that must NOT emit its own exchange-starter.
+    ///
+    /// The two re-entries already put one on the wire. A spoken aside belongs
+    /// to somebody else's, which comes to the same rule from the other side.
+    pub(crate) fn is_engine_reentry(&self) -> bool {
+        matches!(
+            self,
+            Self::ReentryFromEngine | Self::ReentryFromWait | Self::SpokenAside
+        )
+    }
+
+    /// Whether a prompt of this kind can be the REASON a turn runs.
+    ///
+    /// A spoken aside cannot, and is the only kind that cannot. It reports
+    /// what the talker said out loud, so it starts nothing (ADR 0149) and only
+    /// rides a round that was running anyway. Two paths ask this: one decides
+    /// whether a finished answer reopens, the other whether an orphan is
+    /// re-submitted.
+    pub(crate) fn can_carry_a_turn(&self) -> bool {
+        !matches!(self, Self::SpokenAside)
+    }
+}
+
+/// Per-thread state: cancellation token + injection channel for mid-flight prompts.
+pub struct ThreadHandle {
+    pub token: CancellationToken,
+    /// Private so every send from outside this module goes through
+    /// [`ThreadHandle::inject`], which also counts and wakes. A bare `.send()`
+    /// would enqueue the user's message without waking a tool parked waiting
+    /// for it. (The module's own tests do drive the raw channel — they're
+    /// exercising the channel plumbing itself, a level below `inject`.)
+    injection_tx: mpsc::UnboundedSender<InjectedPrompt>,
+    /// Fires whenever a prompt is injected into this thread. The agentic
+    /// loop picks injections up with `try_recv` *between* iterations, so a
+    /// tool that blocks — `bash_output(wait_secs=120)` is the one that
+    /// really can — would otherwise sit on its full budget while the user's
+    /// follow-up waits. Blocking tools select on this and come back early.
+    /// `notify_waiters` is right here (not `notify_one`): a stored permit
+    /// would make the NEXT wait return instantly for an injection the loop
+    /// has already consumed.
+    ///
+    /// A notification alone is not enough — see [`Self::pending_injections`].
+    pub injection_notify: Arc<tokio::sync::Notify>,
+    /// Prompts delivered to `injection_tx` that the loop has not drained yet.
+    ///
+    /// `notify_waiters` reaches only waiters that are *already* registered, so
+    /// on its own it covers the narrow "injected during the wait" case and
+    /// misses the wide one: a message that arrives while the LLM call is in
+    /// flight sits in the channel until the next iteration's `try_recv`, and a
+    /// blocking tool started in *this* iteration would see no notification at
+    /// all and sit out its whole budget. A blocking tool therefore registers
+    /// its waiter first and then reads this counter, so an injection either
+    /// shows up here or wakes the registered waiter — never neither.
+    pub pending_injections: Arc<std::sync::atomic::AtomicUsize>,
+    /// Monotonic generation counter — incremented on each registration.
+    /// Used by ThreadGuard::drop to avoid removing a newer registration.
+    pub generation: u64,
+    /// Set by `cancel_thread` so the agentic-loop cancel arm can stamp the
+    /// emitted `ResponseCanceled` with the actor that clicked Stop. Drained
+    /// once via `take_cancel_actor` to avoid reusing a stale device across
+    /// requests. The `CancellationToken` itself remains signal-only.
+    pub cancel_actor: Arc<std::sync::Mutex<Option<thread_events::MessageOrigin>>>,
+    /// Set by `cancel_thread_for_followup` when an urgent child follow-up
+    /// preempts this turn, so the cancel arm classifies it as
+    /// `CancelCause::SupersededByFollowup` (rendered neutrally, and excluded
+    /// from the parent-callback terminal set) instead of `UserStop` ("Canceled
+    /// x"). A real Stop click leaves it false.
+    ///
+    /// The Lucidos Agent analog of `AgentSession::redirect_followup`, and
+    /// drained on read for the same reason `cancel_actor` is: a stale flag
+    /// must not relabel the next turn on the same thread.
+    pub redirect_followup: Arc<std::sync::atomic::AtomicBool>,
+    /// The `EventMeta::request_event_id` this turn stamps on every event it
+    /// emits, including its own terminator. Recorded by
+    /// [`LucidosEngine::set_thread_request_event_id`] as soon as the turn's
+    /// originating event is resolved, and read back by
+    /// [`in_flight_request_event_id`] so an abort emitted from OUTSIDE the loop
+    /// (restart teardown, stuck-turn eviction, shutdown sweep) names the turn
+    /// that is actually running.
+    ///
+    /// This is authoritative over `agent_session::latest_originating_event_id`,
+    /// which only guesses: that query returns the NEWEST originating-type event
+    /// on the thread, which is the wrong turn whenever the user queued a
+    /// follow-up mid-turn (the queued `MessageReceived` is newer but never
+    /// anchors a turn) or the running turn was started by an event the query's
+    /// list does not name (`ContinuationStarted` for a chat Continue,
+    /// `ContinuationRequested` for a coding-agent resume). A mis-stamped abort
+    /// defeats the idempotency gate in `thread_events::emit_response_canceled`,
+    /// so the loop's own cancel lands as a SECOND boundary and the transcript
+    /// reads "Paused by restart" and "Response canceled" stacked together
+    /// (`docs/plans/2026-08-06-restart-abort-anchors-on-the-in-flight-turn.md`).
+    ///
+    /// Never needs clearing: the handle IS the turn, and `ThreadGuard::drop`
+    /// removes it, so the value cannot outlive what it describes.
+    pub request_event_id: Arc<std::sync::Mutex<Option<Uuid>>>,
+}
+
+impl ThreadHandle {
+    pub fn new(
+        token: CancellationToken,
+        injection_tx: mpsc::UnboundedSender<InjectedPrompt>,
+        generation: u64,
+    ) -> Self {
+        ThreadHandle {
+            token,
+            injection_tx,
+            injection_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_injections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            generation,
+            cancel_actor: Arc::new(std::sync::Mutex::new(None)),
+            redirect_followup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_event_id: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Deliver a prompt to the running agentic loop and wake anything
+    /// blocking on this thread. Returns false when the receiver is gone
+    /// (the turn ended between the caller's lookup and this send) — the
+    /// caller then falls back to starting a fresh turn.
+    ///
+    /// Count BEFORE sending, and wake after. Both orderings are load-bearing:
+    ///
+    /// - **Count before send.** `send` publishes the prompt to the loop at
+    ///   once, so a drain can report it consumed before a post-send increment
+    ///   lands. The saturating decrement would then no-op against a zero
+    ///   count and the late `+1` would strand a phantom unread forever —
+    ///   every later `bash_output(wait_secs=…)` on the thread would refuse to
+    ///   block, which is the polling storm all of this exists to stop.
+    /// - **Wake after count.** A blocking tool registers its waiter and then
+    ///   reads the counter, so it must never see "no notification AND no
+    ///   pending work".
+    pub fn inject(&self, prompt: InjectedPrompt) -> bool {
+        self.pending_injections
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        if self.injection_tx.send(prompt).is_ok() {
+            self.injection_notify.notify_waiters();
+            true
+        } else {
+            // Nothing was delivered, and no drain can be racing us — the
+            // receiver is gone. Give the reservation back.
+            self.injections_drained(1);
+            false
+        }
+    }
+
+    /// Record that the agentic loop took `n` prompts off the channel.
+    /// Saturating: the counter tracks the channel, and an underflow would wrap
+    /// to `usize::MAX` and stop every later wait from blocking, forever.
+    pub fn injections_drained(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        // Infallible by construction — `fetch_update` only returns `Err` when
+        // the closure returns `None`, and this one always returns `Some`.
+        let _ = self.pending_injections.fetch_update(
+            std::sync::atomic::Ordering::Release,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| Some(cur.saturating_sub(n)),
+        );
+    }
+}
+
+/// Global counter for ThreadHandle generations.
+static THREAD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub struct LucidosEngine {
+    artifact_manager: ArtifactManager,
+    event_store: EventStore,
+    python_runtime: PythonRuntime,
+    browser_runtime: BrowserRuntime,
+    app_manager: Arc<AppManager>,
+    /// Active LLM provider behind a swappable handle. The config subscriber
+    /// (`spawn_provider_config_subscriber`) hot-swaps it when a provider is
+    /// configured or removed, with no engine restart. All reads go
+    /// through [`LucidosEngine::current_provider`], which clones the inner `Arc`
+    /// out under a short read guard (never held across an `.await`). Mirrors the
+    /// `Arc<RwLock<…>>` convention of `ModelRegistry` / `LocationHandle`.
+    llm: Arc<std::sync::RwLock<Arc<dyn LlmProvider>>>,
+    /// Backends for the `web_search` tool, in preference order. Held behind the
+    /// same swappable handle as `llm` and rebuilt by the same credential
+    /// subscriber, so adding a provider key enables search without a restart.
+    ///
+    /// Deliberately NOT derived from the chat model's provider: search resolves
+    /// over the whole configured provider set, which is what lets a user on a
+    /// provider with no search tool (OpenRouter, a local endpoint) still search
+    /// via another configured one. See `llm::web_search`.
+    web_search: Arc<std::sync::RwLock<Arc<crate::llm::WebSearchChain>>>,
+    /// Late-binding embedder slot: boots EMPTY (so boot never waits on the
+    /// multi-hundred-MB model), and the background loader
+    /// (`spawn_embedder_load`) installs the model without a restart once it
+    /// lands. Until then memory features degrade descriptively. See
+    /// `memory::EmbedderSlot`.
+    embedder: Arc<EmbedderSlot>,
+    memory_index: Option<PgVectorIndex>,
+    /// Vertex project ID — used to build image providers on demand.
+    vertex_project_id: String,
+    /// Shared region handle, updated in place when `vertex_region` changes.
+    vertex_location: crate::llm::vertex::LocationHandle,
+    vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
+    /// Shared model routing map (provider + declared context window), reloaded
+    /// in place by `spawn_models_registry_subscriber` on any `Model*` event.
+    /// The engine holds it — not just `RoutingProvider` — because the context
+    /// trimmer needs the declared context window to size its budget.
+    model_registry: crate::llm::model_registry::ModelRegistry,
+    openai_api_key: Option<String>,
+    /// Threads with a *conversation summary* refresh in flight, claimed by
+    /// `SummaryInFlight`.
+    ///
+    /// The refresh is detached, so it outlives the turn that started it and a
+    /// later turn can arrive while it runs. Without this the same region is
+    /// summarised twice, which one thread did five turns running.
+    ///
+    /// Ephemeral by design. Losing it on restart permits a duplicate call and
+    /// nothing worse: the cache is the `ConversationSummarized` event.
+    summarizing_threads: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    rebuilding_memory: AtomicBool,
+    cancel_rebuild: AtomicBool,
+    /// Set once the engine has begun graceful shutdown or a restart (`main.rs`
+    /// signal handler and `abort_in_flight_for_restart`). The scheduler's event
+    /// subscriber reads it to stop firing event-triggers: the terminator events
+    /// emitted during cleanup (`ResponseAborted{EngineShutdown}`,
+    /// `CodingAgentIdled`, `SessionEnded`) otherwise fan out to triggers whose
+    /// scripts call back into the HTTP API being torn down — `lucidos ...` gets
+    /// connection-refused and the script dies, surfacing a spurious
+    /// "<trigger> failed" push. Never reset; the process is on its way out.
+    /// An `Arc` so a detached task can hold it. The background-bash completion
+    /// watcher outlives its turn and holds no engine handle. It must not wake a
+    /// coding-agent session on an engine that is leaving. See
+    /// `tools/bash.rs::spawn_bash_completion_watcher`.
+    shutting_down: Arc<AtomicBool>,
+    /// Acquired via `scheduler::BackupGuard::try_acquire`. POST /api/v1/backup
+    /// returns 409 when the guard is held; the scheduled cron skips its tick.
+    pub backup_in_progress: AtomicBool,
+    /// Is the workspace database answering, and if not, why? Only the background
+    /// probe (`db_health::spawn_db_health_probe`) writes it. `GET /api/v1/health`
+    /// reads it per request, so an outage adds no latency to the endpoint the
+    /// gateway health-checks. See `engine::db_health` and ADR 0037.
+    database_health: db_health::DatabaseHealthCell,
+    /// Dev-only background-rebuild state driving the "new version available"
+    /// surface. Set by the Apply-triggered rebuild (Phase 2); read by
+    /// `GET /api/v1/engine/version-status`. Idle in packaged (no source rebuild).
+    /// See `engine/engine_version.rs`.
+    build_state: std::sync::RwLock<engine_version::BuildState>,
+    /// Whether newer builds of the checkout count as new versions, or this
+    /// engine stays pinned to its own (the e2e engine). Fixed at construction.
+    version_tracking: engine_version::VersionTracking,
+    /// Memoized "is a newer engine binary on disk?" verdict, keyed by the running
+    /// binary's last-seen mtime, so a polling client doesn't fork
+    /// `current_exe --build-id` every tick (mirrors the gateway's `UpdateCheck`).
+    update_check: std::sync::Mutex<engine_version::UpdateCheck>,
+    /// Throttled cache of "is the engine SOURCE behind HEAD with a
+    /// restart-requiring change pending?" (the `engine_source_matches_head` git
+    /// check). Read by `GET /api/v1/engine/version-status` (polled every ~4s per
+    /// client) and the self-heal driver, so the underlying `git diff` runs at most
+    /// once per TTL regardless of client count. Dev-only; always false packaged.
+    /// See `engine_version::source_behind_head`.
+    source_behind_cache: std::sync::Mutex<engine_version::SourceBehindCache>,
+    /// Memoized "is the on-disk binary's commit an ANCESTOR of the running
+    /// engine's?" verdict, keyed by the on-disk build id. Answers the direction
+    /// question `update_available` needs — a DIFFERENT binary is only an update
+    /// when it isn't an older one — without forking `git merge-base` on every
+    /// ~4s version-status poll. Dev-only. See
+    /// `engine_version::disk_binary_is_upgrade`.
+    disk_direction_cache: std::sync::Mutex<engine_version::DiskDirectionCache>,
+    /// Throttled cache of the commits a switch would bring (see
+    /// `engine_version::PendingCommits`), which the status toast lists while a
+    /// rebuild runs. Same reason as
+    /// `source_behind_cache`: version-status is polled every ~4s per client and
+    /// this forks `git log`. Only read when a build is in flight or the source is
+    /// behind HEAD, so an idle workspace never populates it. Dev-only. See
+    /// `engine_version::pending_commits`.
+    pending_commits_cache: std::sync::Mutex<engine_version::PendingCommitsCache>,
+    /// Throttled cache of the checkout's HEAD sha. Three callers now need it on
+    /// the hot path (the version-status response's pending-version identity, the
+    /// wedged-rebuild verdict, and the self-heal driver's per-HEAD budget), and
+    /// each used to fork its own `git rev-parse`. Same TTL rationale as
+    /// `source_behind_cache`. Dev-only. See `engine_version::head_sha`.
+    head_sha_cache: std::sync::Mutex<engine_version::HeadShaCache>,
+    /// Self-heal bookkeeping: how many background rebuilds this engine has
+    /// auto-triggered for the current HEAD, so a genuinely broken `main` can't
+    /// spin builds forever (bounded per HEAD; reset when HEAD moves). Dev-only.
+    /// See `engine_version::self_heal_engine_version_if_needed`.
+    self_heal_state: std::sync::Mutex<engine_version::SelfHealState>,
+    /// The in-flight background rebuild task (dev): a later Apply joins it, an
+    /// explicit Rebuild restarts it. See `background_build`.
+    background_build: background_build::BackgroundBuild,
+    /// Process group of THIS engine's in-flight rebuild, or 0 when none runs.
+    /// Published only while the build's `BuildProcessGroupGuard` is armed, so
+    /// it never names a group whose leader has been reaped.
+    build_process_group: std::sync::atomic::AtomicU32,
+    /// Dev-only: swappable served-frontend dir. `api::serve_frontend` reads the
+    /// current snapshot path per request; a *frontend-only* Apply re-snapshots
+    /// `dist/` and swaps this so the served client advances WITHOUT an engine
+    /// respawn (INV-A: only when the engine binary is unchanged — a mixed change
+    /// still advances only via a Switch). `None` in packaged / headless (no
+    /// `LUCIDOS_STATIC_DIR`). Set once by `api::create_router` via
+    /// `init_served_frontend`. See `engine::frontend_refresh`.
+    served_frontend: std::sync::OnceLock<Arc<std::sync::RwLock<PathBuf>>>,
+    /// The source dir (`LUCIDOS_STATIC_DIR` = live `dist/`) that served-frontend
+    /// snapshots are taken from. Set alongside `served_frontend`.
+    served_frontend_source: std::sync::OnceLock<PathBuf>,
+    /// The trunk HEAD the served snapshot was taken at, or `None` when unknown
+    /// or when an engine change sits between it and the running commit. `None`
+    /// at boot, and written on each successful swap. `engine_version::pending_commits_since` reads
+    /// it to leave out what that client already carries. In memory like the
+    /// snapshot itself: a restart re-pins and records again.
+    served_frontend_commit: std::sync::Mutex<Option<String>>,
+    /// Monotonic generation for served-frontend re-snapshots: coalesces rapid
+    /// frontend-only Applies (only the latest generation swaps) AND names the
+    /// snapshot subdir. Boot pins generation 0; the first refresh is generation 1.
+    frontend_refresh_generation: std::sync::atomic::AtomicU64,
+    /// Handle to the in-flight served-frontend refresh task, so a later Apply can
+    /// abort + supersede it. A snapshot is cheap to redo, unlike an engine build.
+    frontend_refresh_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The generation and start time of the last applying frontend refresh.
+    /// It counts as in flight only while that generation is still current, so
+    /// a task the peer sync aborted cannot leave the indicator on. See
+    /// `engine::frontend_refresh::live_refresh_elapsed`.
+    frontend_refresh_started: std::sync::Mutex<Option<(u64, std::time::Instant)>>,
+    /// Has the worktree-pinned-frontend warning already fired this process? The
+    /// check runs on the ~10s peer-sync tick, so without this it would log every
+    /// tick forever. A field rather than a `static` so tests that build several
+    /// engines each get their own latch. See
+    /// `engine::frontend_refresh::warn_once_if_frontend_worktree_pinned`.
+    frontend_worktree_pin_warned: std::sync::atomic::AtomicBool,
+    /// The Tree memory module's compactor, once the workspace first chose
+    /// Tree. Runtime only: the backfill's durable state is in the database.
+    summary_tree: crate::engine::summary_tree::Runtime,
+    /// Dev-only: the one supervised Vite dev server showing a coding-agent
+    /// worktree's frontend before Apply. One slot per workspace by design (see
+    /// `engine::frontend_preview`). Ephemeral by the statelessness rule: it is a
+    /// process handle, the child dies with this engine, and the on-disk sidecar
+    /// is what lets the NEXT engine reap an orphan rather than a claim to
+    /// restore. A `tokio` mutex because every operation on it awaits (spawn,
+    /// readiness probe, kill, wait).
+    frontend_preview: tokio::sync::Mutex<Option<frontend_preview::RunningPreview>>,
+    /// Serializes a WHOLE start or stop of the frontend preview, which the slot
+    /// mutex above cannot: a start releases the slot between stopping the old
+    /// preview, taking a port, spawning and waiting for readiness, so two
+    /// concurrent starts would both spawn and one child would be overwritten and
+    /// orphaned with nothing left tracking its pid. Separate from the slot rather
+    /// than held across it, because `stop` needs the slot too.
+    frontend_preview_lifecycle: tokio::sync::Mutex<()>,
+    /// Device actor stashed at restart-REQUEST time and read by the
+    /// graceful-shutdown boundary emit at ACTUAL teardown: the HTTP handler has
+    /// the device, the SIGUSR1 signal handler does not. Present → a user asked
+    /// for this teardown (attributes "You" / enables auto-resume on recovery);
+    /// absent → nobody did (System attribution, manual Continue). `take`n once
+    /// at teardown so a later unrequested stop can't reuse a stale actor.
+    ///
+    /// Two writers, one per way a user can ask: the in-workspace *Switch to new
+    /// version* (`/api/v1/restart`) and the gateway's restart-intent notify
+    /// (`/api/v1/internal/restart-intent`), which fires just before the picker's
+    /// Restart / Stop signals this process. First writer wins. See
+    /// `engine_version::stash_first_restart_actor`.
+    restart_actor: std::sync::Mutex<Option<thread_events::MessageOrigin>>,
+    /// The actor of the teardown currently under way: `restart_actor` above
+    /// taken ONCE by `engine_version::begin_teardown` and then readable for the
+    /// rest of the process, by every `EngineShutdown` abort the teardown emits.
+    ///
+    /// `restart_actor` answers "did a user ask for this?", which is a question
+    /// about the teardown. This field is what stops the ANSWER from depending on
+    /// when a thread happened to become in-flight. Until 2026-08-07 there was no
+    /// such field: `main.rs` handed the only copy to the pre-emit, so the two
+    /// emits that run after it (`shutdown_active_threads` and the
+    /// `emit_stop_terminal` abort arm) hardcoded a system actor. A chat thread
+    /// re-entered by an event 1.5s into a *Switch to new version* therefore settled
+    /// `failed` with a manual Continue while its two siblings settled `paused`
+    /// and auto-resumed, because the device actor is half the switch fingerprint
+    /// (`agent_recovery::SWITCH_TEARDOWN_ABORT_SQL`).
+    ///
+    /// `None` means either "no teardown yet" or "a teardown nobody requested".
+    /// Neither needs distinguishing: both stamp `MessageOrigin::system()`, and
+    /// nothing reads this outside a teardown.
+    teardown_actor: std::sync::Mutex<Option<thread_events::MessageOrigin>>,
+    /// Thread ids `recover_orphaned_worktrees` decided to auto-resume after a
+    /// user-initiated *Switch to new version* (in-flight coding-agent threads with
+    /// a device-attributed teardown boundary). Drained by `main.rs` AFTER the spawn
+    /// dispatcher subscribes — recovery runs before it, so emitting
+    /// `ContinuationRequested` during recovery would be missed. A crash-interrupted
+    /// thread is NOT enqueued here (it keeps the manual Continue affordance) — the
+    /// loop-safety guarantee.
+    pending_switch_resumes: std::sync::Mutex<Vec<Uuid>>,
+    /// Per-thread handles (cancellation token + injection channel). Key = thread_id.
+    /// Uses std::sync::Mutex since operations are trivial (insert/remove),
+    /// and this allows the ThreadGuard to clean up synchronously in Drop (even on panic).
+    active_threads: Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    /// Per-thread completion notifiers for queuing follow-up requests.
+    /// When a thread finishes (guard drops), it notifies waiters so queued
+    /// requests can proceed instead of cancelling in-progress work.
+    thread_completion: Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    workspace_path: PathBuf,
+    /// Lucidos source repo root (resolved at startup via `git_ops::main_worktree`).
+    /// Stored so the API surface can fall back to a known path when the
+    /// `repositories` row is missing (e.g. e2e tests truncate the table).
+    repo_root: PathBuf,
+    /// User-level Lucidos directory (~/.lucidos), git-tracked for shared knowhow
+    user_dir: Option<PathBuf>,
+    /// Engine-shipped reference knowhow (the staged `LUCIDOS_SYSTEM_KNOWHOW_DIR`
+    /// on packaged builds, `<repo_root>/system-knowhow/` on a dev checkout —
+    /// see `core::system_knowhow::resolve_system_knowhow_dir`).
+    /// Read-only; never overrideable by a workspace's local knowhow.
+    system_knowhow_dir: Option<PathBuf>,
+    /// User profile - always included in context for broad queries.
+    /// Kept coherent with `artifacts/user_profile.md` by every write route that
+    /// can touch the file: see [`user_profile::UserProfileCache`].
+    user_profile: user_profile::UserProfileCache,
+    /// User's timezone (IANA format, e.g., "America/New_York")
+    user_timezone: tokio::sync::RwLock<String>,
+    /// User's preferred language (e.g., "English", "Spanish")
+    user_language: tokio::sync::RwLock<String>,
+    /// Database pool for credentials and preferences
+    pool: sqlx::PgPool,
+    /// In-memory cache of `script_handshake` proxy auth headers, shared
+    /// across both the HTTP proxy and the `proxy_request` LLM tool so the
+    /// handshake script runs once per expiry window regardless of caller.
+    proxy_token_cache: Arc<crate::api::proxy_token_cache::ProxyTokenCache>,
+    /// Compiled WASM signer modules (`data/auth-modules/<name>.wasm`)
+    /// loaded at startup. Keyed by file basename (without `.wasm`). Wrapped
+    /// in `RwLock` so the Phase-9 reload endpoint can swap the map atomically.
+    proxy_modules: Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<String, Arc<crate::api::proxy_wasm_signer::CompiledModule>>,
+        >,
+    >,
+    /// Shared wasmtime engine. Module compilation + per-request
+    /// instantiation must use the SAME engine (wasmtime forbids
+    /// cross-engine instantiation), so we hold it on the engine and hand
+    /// it out via `wasm_engine()`.
+    wasm_engine: Arc<wasmtime::Engine>,
+    /// App UI captures waiting for an answer. `capture_app` / `refresh_app`
+    /// insert one; `POST /api/v1/app-capture` resolves it.
+    pub(crate) pending_captures: Arc<tools::app_capture::PendingCaptures>,
+    /// Plugin installs awaiting user confirmation in the install panel.
+    /// Key: install_id (UUID). Value: staged plugin tree + manifest. Inserted
+    /// when `install_plugin` returns the `[PLUGIN_INSTALL_REQUEST]` sentinel;
+    /// removed when the user clicks Confirm or Cancel in the panel (or when
+    /// the engine restarts — the staged temp dir is dropped on shutdown).
+    /// Allowed-ephemeral per CLAUDE.md (same justification as
+    /// `pending_captures`).
+    pub pending_installs: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::engine::tools::plugins::PendingInstall>,
+        >,
+    >,
+    /// Pending plugin uninstalls awaiting confirm/cancel from the uninstall
+    /// panel. Mirrors `pending_installs` exactly — entry registered when
+    /// `uninstall_plugin` returns the `[PLUGIN_UNINSTALL_REQUEST]` sentinel,
+    /// removed on Confirm/Cancel (or engine restart). Allowed-ephemeral.
+    pub pending_uninstalls: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::engine::tools::plugins::PendingUninstall>,
+        >,
+    >,
+    /// Frontend origin URL (e.g., "https://lucidos.example.com"), set from first request's Origin header
+    pub frontend_origin: std::sync::Mutex<Option<String>>,
+    /// Active coding-agent sessions keyed by thread_id.
+    pub(crate) agent_sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
+    /// Per-thread loaded knowhow set — populated when `load_knowhow` is called,
+    /// consumed when assembling the user message + stubbing resume tool blocks.
+    /// Reconstructable from `ToolResult` events on engine restart (task 2.3).
+    pub(crate) loaded_knowhow: Arc<crate::engine::loaded_knowhow::LoadedKnowhowStore>,
+    /// The live workspace *view snapshots* of the Tree memory module, one per
+    /// view budget. A cache: a restart folds them afresh.
+    pub(crate) view_snapshots: crate::engine::summary_tree::view::ViewSnapshots,
+    /// Cached verdicts of the recall tool's `find`, by query and line.
+    pub(crate) find_cache: crate::engine::tools::recall::FindCache,
+    /// Registered coding-agent backends (Claude Code, Codex, …).
+    /// Engine code spawns agents via this registry instead of naming a concrete runtime.
+    pub(crate) agent_runtimes: HashMap<CodingAgent, Arc<dyn AgentRuntime>>,
+    /// Per-thread time of the last coding-agent spawn, for the spawn debounce.
+    /// Keyed by thread_id so concurrent starts on different threads are not blocked.
+    last_spawn: std::sync::Mutex<HashMap<Uuid, std::time::Instant>>,
+    /// The system prompt each thread's latest Claude Code spawn appended. A
+    /// side question's session copy appends the same one, so its prompt prefix
+    /// matches and the transcript reads from the prompt cache. Memory only: a
+    /// thread missing from it, after a restart or an eviction, answers every
+    /// side question uncached and without that prompt until its next spawn.
+    pub(crate) cc_system_prompts: std::sync::Mutex<HashMap<Uuid, String>>,
+    /// Spawns past the spawn debounce that have not returned yet. Together with
+    /// `agent_sessions` this answers whether anybody owns a thread. Shared with
+    /// the worktree cleanup's liveness probe.
+    spawns_in_flight: Arc<agent_session::SpawnsInFlight>,
+    /// Pre-spawn map of `cc_thread_id` → `app_id` for app coding-agent
+    /// threads. `spawn_agent_thread` stashes the app id here before
+    /// `process_message_with_steps` runs; `run_direct_agent` pops it in to
+    /// dispatch sparse-checkout worktree creation. Cleared when the first
+    /// `SessionStarted` event lands (the value is then persisted on the
+    /// event payload and in `thread_summaries.coding_agent_kind`).
+    pub(crate) pending_app_spawn: std::sync::Mutex<HashMap<Uuid, String>>,
+    /// Keeps a thread's coding-agent follow-ups in the order they were sent.
+    /// See `chat::follow_up_order`.
+    pub(crate) follow_up_order: FollowUpOrder,
+    /// Client event ids `POST /chat/stream` already accepted, so a re-post
+    /// starts nothing. See `chat::accepted_messages`.
+    pub(crate) accepted_messages: chat::accepted_messages::AcceptedMessages,
+    /// Per-thread spawn-coalescer. Phase 2 made every Claude Code subprocess exit on
+    /// idle, so two rapid follow-ups (within ~250ms) used to either race two
+    /// subprocesses or drop the second message with a "duplicate request"
+    /// error. The coalescer elects one leader per thread; followers within
+    /// the debounce window queue their messages for the leader to drain into
+    /// a single combined CC input. Phase 5's event-driven dispatcher will
+    /// subsume this. See `agent_session/cc_spawn_coalesce.rs`.
+    pub(crate) cc_spawn_coalesce: agent_session::CcSpawnCoalescer,
+    /// Limits concurrent CC process startups to prevent CPU contention.
+    /// Acquired before spawn_or_resume(), released after Init event.
+    cc_startup_semaphore: Arc<tokio::sync::Semaphore>,
+    /// MCP server manager — handles lifecycle, tool discovery, and tool calls
+    pub mcp_manager: crate::mcp::McpManager,
+    /// Pending CC permission prompts, deduped by `(thread, tool, input)` so
+    /// CC's parallel/repeat tool calls collapse onto one card. See
+    /// `cc_permission` module docs.
+    pub pending_cc_permission: Arc<std::sync::Mutex<cc_permission::PermissionState>>,
+    /// Pending command-guard permission prompts (ADR 0002) — the chat mirror of
+    /// `pending_cc_permission`, using the same dedup / session-allow mechanism.
+    /// The chat agent's loop blocks in-process on the entry's broadcast rather
+    /// than over MCP. See `command_permission` + `command_guard`.
+    pub pending_command_permission: Arc<std::sync::Mutex<cc_permission::PermissionState>>,
+    /// Pending MCP permission prompts (chat) — the chat mirror of
+    /// `pending_command_permission` for MCP server tool calls, using the same
+    /// dedup / session-allow mechanism. The chat agent's loop blocks in-process
+    /// on the entry's broadcast. See `mcp_permission`.
+    pub pending_mcp_permission: Arc<std::sync::Mutex<cc_permission::PermissionState>>,
+    /// Rendezvous map for the AskUserQuestion PreToolUse hook — the hook's
+    /// long-poll handler waits on a receiver here; `answer_pending_question`
+    /// notifies it when the user picks an answer. See `cc_question_wait` docs.
+    pub question_wait_registry: cc_question_wait::QuestionWaitRegistry,
+    /// Per-`change_id` stash for the actor of an in-flight Apply that hands
+    /// the merge off to a fresh Claude Code subprocess (Tier 3 slow path / conflict
+    /// resolution). The cleanup in `agent_session::run_session` takes the
+    /// actor back out so `ChangeApplied` / `ChangeApplyFailed` carry the
+    /// device that clicked Apply instead of collapsing to "Lucidos Engine".
+    pub(crate) pending_apply_actors: pending_apply_actors::PendingApplyActors,
+    /// In-flight Apply All batches (see `apply_all_batches`). Each entry is
+    /// the live state of one batch — what's been applied, what's failed,
+    /// what's still pending. The driver advances the batch from inside
+    /// `emit_change_applied` / `emit_apply_failed` so the conflict-recovery
+    /// suspension+resume happens organically: the recovery CC's eventual
+    /// `ChangeApplied` for the conflict member triggers the next apply
+    /// via the same hook the happy path uses.
+    pub(crate) apply_all_batches: Arc<tokio::sync::Mutex<apply_all_batches::ApplyAllRegistry>>,
+    /// How long hardening and conflict resolution usually take, served to the
+    /// Changes panel and its apply toasts. A cache over the events table.
+    pub(crate) apply_estimates: Arc<apply_estimate::ApplyEstimateCache>,
+    /// Sender for the apply-all driver task. `emit_change_applied` /
+    /// `emit_apply_failed` push `Applied` / `Failed` messages here; the
+    /// driver task (spawned at engine startup via `start_apply_all_driver`)
+    /// is the only consumer. The channel decouples the recursive
+    /// `apply_change → emit_change_applied → driver → apply_change` cycle —
+    /// without it the futures form an async recursion the compiler can't
+    /// auto-trait-check for Send.
+    pub(crate) apply_all_drive_tx:
+        tokio::sync::mpsc::UnboundedSender<apply_all_driver::ApplyAllDriveMsg>,
+    /// Threads carrying a *standing apply*: the owner's instruction to apply a
+    /// change once the thread settles (ADR 0168 clause 5). The in-memory half
+    /// of `standing_applies`, so the bus subscriber filters on a lock rather
+    /// than a query. See `engine::standing_apply`.
+    pub(crate) standing_applies: Arc<standing_apply::ArmedThreads>,
+    /// Weak self-reference for spawning background tasks that need Arc<Self>
+    self_arc: std::sync::OnceLock<std::sync::Weak<LucidosEngine>>,
+    /// EventBus — single emission point for all domain events.
+    /// Producers call typed methods, consumers subscribe to the broadcast channel.
+    pub event_bus: event_bus::EventBus,
+    /// In-memory pong inbox for the PresenceCheck protocol — owned here so
+    /// both the API handler (`POST /api/v1/presence-pong`) and the fan-out
+    /// code (`send_push_to_all_with_app`) share the same tracker.
+    /// See `system-knowhow/notifications.md` §3. Transient by design;
+    /// cleared on engine restart (no recovery is meaningful — in-flight
+    /// pongs from a previous process are stale).
+    pub presence_tracker: crate::api::presence_pong::PresenceTracker,
+    /// Live count of open SSE connections (`GET /api/v1/events`). The push
+    /// fan-out gates the PresenceCheck on this — a connected page can pong
+    /// even when its `device_presence` heartbeat has gone stale (iOS suspends
+    /// the 30s timer while the PWA is foregrounded). See
+    /// `system-knowhow/notifications.md` §3. Transient — reset on restart.
+    pub sse_connections: crate::api::sse_connections::SseConnectionCounter,
+    /// Which threads have a live *voice session*. One per thread, so a second
+    /// upgrade is refused and every start stays paired with one end. Transient:
+    /// a call cannot outlive the process holding its socket, and the boot sweep
+    /// settles what a dead one left behind.
+    pub voice_sessions: crate::voice::registry::LiveVoiceSessions,
+    /// Threads with a name being generated right now.
+    ///
+    /// A thread is named once, and `thread_has_title` alone cannot hold that:
+    /// naming takes a model call, so two askers a second apart both read "no
+    /// name yet" and both write one. Two follow-up messages sent a second
+    /// apart are exactly that.
+    ///
+    /// Transient, like every other guard here. A process that dies mid-name
+    /// simply leaves the thread nameable again, which is the safe direction.
+    pub(crate) threads_being_named: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    /// CC commands cache keyed by repo root — each repo has different tools.
+    /// Populated from CC Init events, persisted to `.lucidos/cc-commands.json`.
+    pub(crate) cc_commands_cache: tokio::sync::RwLock<HashMap<String, CcCommandsInfo>>,
+    /// Shared in-memory trigger configs — same Arc as SchedulerManager's.
+    /// Allows engine tools to read trigger state without going through the scheduler.
+    pub(crate) trigger_configs:
+        Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>>,
+    /// Shared in-memory trigger groups — user-visible folders shown in the
+    /// triggers panel. Same Arc-sharing pattern as `trigger_configs`. Groups
+    /// don't schedule anything; the SchedulerManager just owns the loader for
+    /// startup-replay symmetry with triggers, while HTTP / LLM tool callers
+    /// read this registry directly.
+    pub(crate) trigger_groups:
+        Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerGroup>>>,
+    /// Serializes invariant-bearing writes (create, rename) on
+    /// `trigger_groups`. The std `RwLock` on the registry above can't be held
+    /// across `.await`, which leaves a TOCTOU window between the read-time
+    /// case-insensitive dedup check and the projection apply — two parallel
+    /// POSTs with the same name can both pass dedup and both insert. This
+    /// async mutex closes the window: helpers in `trigger_group_writes`
+    /// acquire it for the full read-dedup + emit + apply span, so the
+    /// unique-name invariant holds even under concurrent requests. Reads,
+    /// delete, and reorder don't acquire it (they can't violate the
+    /// invariant; delete-then-create false-positive 409 is a separate,
+    /// known-quirk).
+    pub(crate) trigger_group_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes emit + registry-apply on `trigger_configs`, so the order the
+    /// registry is written in is the order the event log records. Same shape as
+    /// the group lock above, for a different invariant.
+    ///
+    /// Without it the two steps of a write can interleave with another writer's:
+    /// `EventBus::emit` broadcasts before it returns, so writer A can be
+    /// preempted between its emit and its apply while writer B emits AND
+    /// applies, leaving A's older payload on top of B's newer one. Nothing
+    /// repairs that afterwards. The scheduler subscriber re-applies both events
+    /// in log order, but it is free to have run before A's late apply, so it is
+    /// not the backstop it looks like. Holding this across the pair means every
+    /// direct apply lands in sequence order, and the subscriber's ordered
+    /// replay can then only agree with it.
+    pub(crate) trigger_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Tasks for the `run_bash_background` chat tool: the running ones, plus
+    /// completions retained briefly so a `bash_output` drain arriving at the
+    /// completion instant still gets the final tail. Every finish is persisted
+    /// to the events stream as `BackgroundBashCompleted`, which is what serves
+    /// a drain after the retention window closes. See
+    /// `tools/bash_background.rs`.
+    pub(crate) bash_background: tools::bash_background::BackgroundBashRegistry,
+    /// The *Thread Queue* — system-wide admission control for background
+    /// spawns (event-trigger fires, cron fires, agent-driven sub-thread /
+    /// coding-agent spawns). User-initiated chat never routes through it.
+    /// In-memory queue/active state mirrors the `thread_queue` projection
+    /// and is rebuilt from it at boot (`recover_persisted_entries`).
+    pub thread_queue: Arc<thread_queue::ThreadQueue>,
+    /// Live *event waits* (`engine::event_wait`): the threads currently parked
+    /// on, or watching for, an event. One `Arc` so the bus subscriber, the
+    /// deadline sweep, the `await_event` tool (registration, the duplicate
+    /// refusal and the live-wait cap) and the cancel sites all address the same
+    /// cache.
+    ///
+    /// Allowed-ephemeral per CLAUDE.md, and unusually strictly so: the
+    /// persisted `EventWaitStarted` **is** the wait (ADR 0047), and
+    /// `rebuild_event_waits` reconstructs this whole map from the event store
+    /// at boot. There is no `thread_event_waits` table and must not be one.
+    pub(crate) live_waits: Arc<event_wait::LiveWaits>,
+    /// Sender for the event-wait re-entry task. A resolved wait pushes a
+    /// [`event_wait::WaitReentryRequest`] here and the consumer (started at boot
+    /// via `start_wait_reentry_consumer`) runs the actual turn.
+    ///
+    /// The indirection is required, not stylistic: see `WAIT_REENTRY_RX`.
+    pub(crate) wait_reentry_tx: tokio::sync::mpsc::UnboundedSender<event_wait::WaitReentryRequest>,
+}
+
+/// RAII guard that removes a thread from active_threads when dropped.
+/// This ensures cleanup happens even if the processing task panics.
+/// Also notifies any queued requests waiting for this thread to finish.
+pub struct ThreadGuard {
+    active_threads: Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    thread_id: Uuid,
+    completion_notify: Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    /// Generation when this guard was created. Drop only removes the
+    /// active_threads entry if the generation still matches — prevents a
+    /// force-evicted guard from removing a newer registration.
+    generation: u64,
+    /// Keeps the computer awake for the turn, released on every exit path.
+    _awake: crate::core::keep_awake::AwakeHold,
+}
+
+impl ThreadGuard {
+    /// The registration this guard owns. Anything that reaches back into
+    /// `active_threads` on behalf of *this* turn must check it, or it will act
+    /// on a newer registration that replaced this one — see
+    /// [`LucidosEngine::note_injections_drained`] and `Drop` below.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for ThreadGuard {
+    fn drop(&mut self) {
+        let owned = if let Ok(mut threads) = self.active_threads.lock() {
+            // Only remove if the generation matches — a force-evicted guard must
+            // not remove a newer registration for the same thread_id.
+            if threads
+                .get(&self.thread_id)
+                .is_some_and(|h| h.generation == self.generation)
+            {
+                threads.remove(&self.thread_id);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // Only notify completion waiters if we owned this thread
+        if owned {
+            if let Ok(mut completions) = self.completion_notify.lock() {
+                if let Some(notify) = completions.remove(&self.thread_id) {
+                    notify.notify_waiters();
+                }
+            }
+        }
+    }
+}
+
+// Thread-local to pass parent_callback_rx from EventBus::new() (inside LucidosEngine::new)
+// to start_parent_callback_listener() (called after Arc::new(engine)).
+thread_local! {
+    static PARENT_CALLBACK_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<event_bus::ParentCallback>>> = const { std::cell::RefCell::new(None) };
+    /// Apply-All driver receiver — same pattern as PARENT_CALLBACK_RX. The
+    /// channel is created inside `LucidosEngine::new`; the tx is stored on
+    /// the engine struct, and the rx is stashed here so
+    /// `start_apply_all_driver` (called after `Arc::new(engine)`) can pick
+    /// it up.
+    static APPLY_ALL_DRIVE_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<apply_all_driver::ApplyAllDriveMsg>>> = const { std::cell::RefCell::new(None) };
+    /// Event-wait re-entry receiver, same pattern again. Here the channel is
+    /// load-bearing rather than a convenience: registration runs its catch-up
+    /// scan inline, so without it `run_agentic_loop` awaits a delivery which
+    /// awaits a re-entry into `run_agentic_loop`, a cyclic future whose
+    /// `Send`-ness rustc cannot infer (exactly as noted on
+    /// `apply_all_drive_tx`). A plain-data message over a channel has no cycle.
+    static WAIT_REENTRY_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<event_wait::WaitReentryRequest>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn spawn_vertex_region_subscriber(
+    mut rx: tokio::sync::broadcast::Receiver<event_bus::EmittedEvent>,
+    location: crate::llm::vertex::LocationHandle,
+) {
+    tokio::spawn(async move {
+        use event_bus::{BusEvent, SystemEvent};
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            let emitted = match rx.recv().await {
+                Ok(e) => e,
+                // Lag = subscriber fell behind. Skip the dropped events but
+                // keep listening; without this the loop would exit on a
+                // single lag and stop tracking vertex_region changes for the
+                // rest of the engine's lifetime.
+                Err(RecvError::Lagged(n)) => {
+                    log!(
+                        "[Preferences] vertex_region subscriber lagged by {} events — continuing",
+                        n
+                    );
+                    continue;
+                }
+                Err(RecvError::Closed) => break,
+            };
+            let BusEvent::System(SystemEvent::PreferencesChanged { key, value, .. }) =
+                &emitted.typed
+            else {
+                continue;
+            };
+            if key != crate::core::prefs::VERTEX_REGION.key() {
+                continue;
+            }
+            let Some(new_region) = value else { continue };
+            match location.write() {
+                Ok(mut guard) => {
+                    let old = std::mem::replace(&mut *guard, new_region.clone());
+                    log!(
+                        "[Preferences] vertex_region updated live: {} → {}",
+                        old,
+                        new_region
+                    );
+                }
+                Err(e) => log!(
+                    "[Preferences] vertex_region update skipped (lock poisoned): {}",
+                    e
+                ),
+            }
+        }
+    });
+}
+
+/// Keep the in-memory model→provider [`ModelRegistry`] in sync with the `models`
+/// table. On any `Model{Created,Updated,Deleted}` event the whole table is
+/// re-queried and the map swapped wholesale — the table is tiny, and a wholesale
+/// swap avoids incremental-update drift. Mirrors `spawn_vertex_region_subscriber`.
+fn spawn_models_registry_subscriber(
+    mut rx: tokio::sync::broadcast::Receiver<event_bus::EmittedEvent>,
+    registry: crate::llm::model_registry::ModelRegistry,
+    pool: sqlx::PgPool,
+) {
+    tokio::spawn(async move {
+        use event_bus::{BusEvent, SystemEvent};
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            let emitted = match rx.recv().await {
+                Ok(e) => e,
+                // Lag = subscriber fell behind. Skip the dropped events but keep
+                // listening, so a single lag doesn't stop tracking model changes
+                // for the rest of the engine's lifetime.
+                Err(RecvError::Lagged(n)) => {
+                    log!(
+                        "[ModelRegistry] registry subscriber lagged by {} events — continuing",
+                        n
+                    );
+                    continue;
+                }
+                Err(RecvError::Closed) => break,
+            };
+            if !matches!(
+                &emitted.typed,
+                BusEvent::System(
+                    SystemEvent::ModelCreated { .. }
+                        | SystemEvent::ModelUpdated { .. }
+                        | SystemEvent::ModelDeleted { .. }
+                )
+            ) {
+                continue;
+            }
+            crate::llm::model_registry::reload(&registry, &pool).await;
+        }
+    });
+}
+
+/// What in this event changed the LLM provider configuration, if anything.
+///
+/// `Some(label)` means rebuild, and the label names the source for the log.
+/// Everything else on the bus is ignored, including a preference the provider
+/// build never reads.
+fn provider_config_trigger(event: &event_bus::BusEvent) -> Option<String> {
+    use event_bus::{BusEvent, SystemEvent};
+    match event {
+        BusEvent::System(
+            SystemEvent::CredentialCreated { service_name, .. }
+            | SystemEvent::CredentialUpdated { service_name, .. }
+            | SystemEvent::CredentialDeleted { service_name, .. }
+            // The boot pass scopes a legacy `local` key after the first
+            // provider build, and the build sends a key only inside its scope.
+            | SystemEvent::CredentialScopeInferred { service_name, .. },
+        ) if crate::llm::PROVIDER_CREDENTIAL_SERVICES.contains(&service_name.as_str()) => {
+            Some(format!("the '{service_name}' credential"))
+        }
+        BusEvent::System(SystemEvent::PreferencesChanged { key, .. })
+            if crate::llm::PROVIDER_PREFERENCE_KEYS.contains(&key.as_str()) =>
+        {
+            Some(format!("the '{key}' preference"))
+        }
+        _ => None,
+    }
+}
+
+/// Hot-swap the engine's active LLM provider when its configuration changes.
+///
+/// Two kinds of change qualify, because a provider is configured two ways. A
+/// `Credential{Created,Updated,Deleted}` for a service in
+/// [`crate::llm::PROVIDER_CREDENTIAL_SERVICES`], and a `PreferencesChanged` for
+/// a key in [`crate::llm::PROVIDER_PREFERENCE_KEYS`]. The keyless OpenCode Free
+/// tier has no credential at all, so a credential-only watch would leave its
+/// toggle needing a restart.
+///
+/// Either way, re-resolve `select_provider` against current DB state via
+/// [`crate::llm::build_active_provider`] and swap the shared provider handle in
+/// place. A first-run user who configures a provider in Settings → Models →
+/// Providers then gets a working chat with NO restart. Removing the last one
+/// swaps back to the unconfigured sentinel, when `LUCIDOS_BOOT_WITHOUT_PROVIDER`
+/// is set. Mirrors `spawn_models_registry_subscriber`.
+///
+/// **Mock isolation:** the caller does not spawn this under `LUCIDOS_MODEL=mock`,
+/// and `ctx.model_is_mock` is `false`, so `build_active_provider` can never
+/// return `MockProvider` here — the mock stays reachable only via the explicit
+/// env opt-in. A `FailFast` rebuild (no provider, gate off) keeps the current
+/// provider rather than panicking the running engine.
+fn spawn_provider_config_subscriber(
+    mut rx: tokio::sync::broadcast::Receiver<event_bus::EmittedEvent>,
+    llm_handle: Arc<std::sync::RwLock<Arc<dyn crate::llm::LlmProvider>>>,
+    web_search_handle: Arc<std::sync::RwLock<Arc<crate::llm::WebSearchChain>>>,
+    pool: sqlx::PgPool,
+    ctx: crate::llm::ProviderBuildContext,
+) {
+    tokio::spawn(async move {
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            let emitted = match rx.recv().await {
+                Ok(e) => e,
+                // Lag = subscriber fell behind. Skip the dropped events but keep
+                // listening, so a single lag doesn't stop tracking provider
+                // config changes for the rest of the engine's lifetime.
+                Err(RecvError::Lagged(n)) => {
+                    log!(
+                        "[Providers] config subscriber lagged by {} events, continuing",
+                        n
+                    );
+                    continue;
+                }
+                Err(RecvError::Closed) => break,
+            };
+            let Some(trigger) = provider_config_trigger(&emitted.typed) else {
+                continue;
+            };
+            match crate::llm::build_active_provider(Some(&pool), &ctx).await {
+                Ok(crate::llm::ProviderBuildOutcome::Install {
+                    llm,
+                    web_search,
+                    selection,
+                }) => {
+                    match llm_handle.write() {
+                        Ok(mut guard) => {
+                            *guard = llm;
+                            log!(
+                                "[Providers] active LLM provider swapped to {:?} after {} changed, no restart",
+                                selection,
+                                trigger
+                            );
+                        }
+                        Err(e) => {
+                            log!("[Providers] provider swap skipped (lock poisoned): {}", e)
+                        }
+                    }
+                    // Swapped in the same pass as the LLM provider: adding an
+                    // Anthropic or OpenAI key must enable web_search without a
+                    // restart, exactly as it enables chat.
+                    match web_search_handle.write() {
+                        Ok(mut guard) => {
+                            let ids = web_search.backend_ids();
+                            *guard = web_search;
+                            log!(
+                                "[Providers] web search backends now: {}",
+                                if ids.is_empty() {
+                                    "none configured".to_string()
+                                } else {
+                                    ids.join(" → ")
+                                }
+                            );
+                        }
+                        Err(e) => {
+                            log!("[Providers] web search swap skipped (lock poisoned): {}", e)
+                        }
+                    }
+                }
+                Ok(crate::llm::ProviderBuildOutcome::FailFast) => {
+                    log!(
+                        "[Providers] {} changed and left no provider configured, with LUCIDOS_BOOT_WITHOUT_PROVIDER off. Keeping the current provider (a restart would fail-fast)",
+                        trigger
+                    );
+                }
+                Err(e) => {
+                    log!(
+                        "[Providers] provider rebuild after {} changed failed: {}. Keeping current provider",
+                        trigger,
+                        e
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// One-shot migration: WASM auth signers used to live under
+/// `data/artifacts/auth-modules/`; they now live at `data/auth-modules/` so
+/// plugin bundles can ship them under their own top-level `auth-modules/`
+/// directory mirroring the new path. Renames the legacy dir if and only if
+/// the new path is absent — never merges, never clobbers. Filesystem errors
+/// are logged but non-fatal: the load step that follows surfaces a stale
+/// path as an empty module map.
+pub(crate) fn migrate_legacy_auth_modules_dir(workspace_path: &Path) {
+    let legacy = workspace_path.join("data/artifacts/auth-modules");
+    let new_dir = workspace_path.join("data/auth-modules");
+    if !legacy.is_dir() {
+        return;
+    }
+    if new_dir.exists() {
+        log!(
+            "[Startup] both legacy {} and new {} auth-modules dirs exist; \
+             leaving both alone (engine reads new path only)",
+            legacy.display(),
+            new_dir.display()
+        );
+        return;
+    }
+    if let Some(parent) = new_dir.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log!(
+                "[Startup] could not create parent {} for auth-modules migration: {}",
+                parent.display(),
+                e
+            );
+            return;
+        }
+    }
+    match std::fs::rename(&legacy, &new_dir) {
+        Ok(()) => log!(
+            "[Startup] migrated auth-modules dir: {} -> {}",
+            legacy.display(),
+            new_dir.display()
+        ),
+        Err(e) => log!(
+            "[Startup] auth-modules migration failed ({} -> {}): {}",
+            legacy.display(),
+            new_dir.display(),
+            e
+        ),
+    }
+}
+
+mod engine_impl;
+
+/// `processing_thread_ids - all_cc_thread_ids`. Idle coding-agent sessions stay in
+/// `active_threads` between turns, so the exclusion set must cover them or
+/// they get misclassified as chat threads.
+fn partition_chat_thread_ids(
+    processing_thread_ids: &[Uuid],
+    all_cc_thread_ids: &std::collections::HashSet<Uuid>,
+) -> Vec<Uuid> {
+    processing_thread_ids
+        .iter()
+        .filter(|tid| !all_cc_thread_ids.contains(tid))
+        .copied()
+        .collect()
+}
+
+/// What a caller gets when it wins admission for a thread: the turn's cancel
+/// token, its injection receiver, and the guard whose drop releases the thread.
+pub(crate) type ThreadRegistration = (
+    CancellationToken,
+    mpsc::UnboundedReceiver<InjectedPrompt>,
+    ThreadGuard,
+);
+
+/// Build the handle and its guard, and put the handle in the map.
+///
+/// The shared body of the two admission functions below. Never call it
+/// directly: on its own it is the unconditional insert they exist to prevent.
+fn install_thread_handle(
+    threads: &mut HashMap<Uuid, ThreadHandle>,
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    completion_notify: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    thread_id: Uuid,
+) -> ThreadRegistration {
+    let token = CancellationToken::new();
+    let (injection_tx, injection_rx) = mpsc::unbounded_channel();
+    let generation = THREAD_GENERATION.fetch_add(1, Ordering::Relaxed);
+    threads.insert(
+        thread_id,
+        ThreadHandle::new(token.clone(), injection_tx, generation),
+    );
+    let guard = ThreadGuard {
+        active_threads: active_threads.clone(),
+        thread_id,
+        completion_notify: completion_notify.clone(),
+        generation,
+        _awake: crate::core::keep_awake::hold(
+            crate::core::keep_awake::Work::ThreadTurn,
+            thread_id.to_string(),
+        ),
+    };
+    (token, injection_rx, guard)
+}
+
+/// The answer to one admission attempt.
+pub(crate) enum Admission {
+    /// The caller owns the turn.
+    Admitted(ThreadRegistration),
+    /// A turn already owns the thread, at this registration generation.
+    ///
+    /// The number is what makes an eviction safe later: it names the turn the
+    /// caller waited for. Two waiters whose budgets expire together would
+    /// otherwise take turns removing each other's replacement.
+    Busy { generation: u64 },
+}
+
+impl Admission {
+    /// The registration, or `None` when a turn already owns the thread. For a
+    /// caller that coalesces instead of waiting, and so has no use for the
+    /// blocking generation.
+    pub(crate) fn admitted(self) -> Option<ThreadRegistration> {
+        match self {
+            Self::Admitted(registration) => Some(registration),
+            Self::Busy { .. } => None,
+        }
+    }
+}
+
+/// Admit one run on `thread_id`, or refuse because a turn already owns it.
+///
+/// **This is the single-flight point for the whole engine.** The question "is a
+/// turn already live here?" and the insert that answers it for the next caller
+/// happen under ONE lock acquisition, through a vacant entry. Nothing else may
+/// put a handle in `active_threads`.
+///
+/// The predecessor asked and inserted separately, and inserted unconditionally.
+/// Two wakes for one logical event both read "free", both inserted, and the
+/// second overwrote the first's handle. Both agentic loops then ran, and the
+/// first one's `ThreadGuard::drop` no-oped on the generation check, so nothing
+/// observed that a thread was running twice. See
+/// `docs/plans/2026-08-24-one-event-one-run-and-a-depth-that-reaches-thread-events.md`.
+///
+/// A refusal is not an error. The caller coalesces into the live turn by
+/// injecting (`chat::process`), or waits for it to release the thread
+/// ([`admit_with_stuck_turn_eviction`]).
+pub(crate) fn try_register_thread(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    completion_notify: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    thread_id: Uuid,
+) -> Admission {
+    let mut threads = active_threads.lock().unwrap();
+    if let Some(handle) = threads.get(&thread_id) {
+        return Admission::Busy {
+            generation: handle.generation,
+        };
+    }
+    Admission::Admitted(install_thread_handle(
+        &mut threads,
+        active_threads,
+        completion_notify,
+        thread_id,
+    ))
+}
+
+/// Evict the turn holding `thread_id` and take the slot in the same breath.
+/// `None` when `stuck_generation` no longer owns the slot.
+///
+/// The stuck-turn backstop, reached only after the caller's wait budget has
+/// expired. Removal and re-insert share one lock acquisition on purpose. A
+/// remove that let go of the lock first would free the slot for another
+/// waiter. This caller would then insert over a turn that had just started.
+///
+/// `stuck_generation` closes the same hole one step out. Several waiters can
+/// queue behind one wedged turn, so their budgets expire together. The first
+/// evicts and installs a replacement, and the next must NOT remove that live
+/// replacement in turn. Refusing sends it back to waiting, this time on work
+/// that is actually running.
+///
+/// The evicted turn keeps unwinding with a stale generation, so its guard's
+/// drop no-ops and cannot remove the replacement.
+pub(crate) fn evict_and_register(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    completion_notify: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    thread_id: Uuid,
+    stuck_generation: u64,
+) -> Option<ThreadRegistration> {
+    let (evicted, registration) = {
+        let mut threads = active_threads.lock().unwrap();
+        match threads.get(&thread_id) {
+            Some(handle) if handle.generation == stuck_generation => {}
+            // Already released, or already replaced by another waiter's
+            // eviction. Either way this caller has nothing to evict.
+            _ => return None,
+        }
+        let evicted = threads.remove(&thread_id);
+        let registration =
+            install_thread_handle(&mut threads, active_threads, completion_notify, thread_id);
+        (evicted, registration)
+    };
+    // Outside the lock: cancelling wakes the evicted loop, which reaches for
+    // the same map on its way out.
+    if let Some(handle) = evicted {
+        handle.token.cancel();
+    }
+    if let Some(notify) = completion_notify.lock().unwrap().remove(&thread_id) {
+        notify.notify_waiters();
+    }
+    Some(registration)
+}
+
+/// Wait for the thread to come free, and evict the turn holding it once this
+/// caller's budget expires. The body of
+/// [`LucidosEngine::register_thread_queued`], as a free function so the engine
+/// method and its tests exercise one implementation rather than two.
+///
+/// `announce_eviction` runs once, immediately before the eviction, and is
+/// where the engine emits its `ResponseAborted`. It runs even when the
+/// eviction is then refused. That costs at most a duplicate terminator on the
+/// wedged exchange, which the emit gate drops, and never a missed one.
+///
+/// **The budget is per HOLDER, not per caller.** Each time a different turn
+/// takes the thread, the wait starts again against that turn. A caller must
+/// not inherit impatience earned against work that has already finished.
+pub(crate) async fn admit_with_stuck_turn_eviction<F, Fut>(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    completion_notify: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    thread_id: Uuid,
+    stuck_turn_timeout: std::time::Duration,
+    announce_eviction: F,
+) -> ThreadRegistration
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    /// Re-ask this often even without a notification, so a completion that
+    /// landed between the refusal and the park cannot hold a caller up.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let mut waited_for: Option<u64> = None;
+    let mut deadline = tokio::time::Instant::now() + stuck_turn_timeout;
+
+    loop {
+        let (generation, notify) =
+            match try_register_thread(active_threads, completion_notify, thread_id) {
+                Admission::Admitted(registration) => return registration,
+                Admission::Busy { generation } => {
+                    if waited_for != Some(generation) {
+                        waited_for = Some(generation);
+                        deadline = tokio::time::Instant::now() + stuck_turn_timeout;
+                    }
+                    let notify = completion_notify
+                        .lock()
+                        .unwrap()
+                        .entry(thread_id)
+                        .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+                        .clone();
+                    (generation, notify)
+                }
+            };
+
+        if tokio::time::Instant::now() >= deadline {
+            log!(
+                "[Chat] Thread {} stuck for {}s, force-cancelling and evicting",
+                thread_id,
+                stuck_turn_timeout.as_secs()
+            );
+            announce_eviction().await;
+            if let Some(registration) =
+                evict_and_register(active_threads, completion_notify, thread_id, generation)
+            {
+                return registration;
+            }
+            log!(
+                "[Chat] Thread {} was handed to another waiter first, queuing behind its turn",
+                thread_id
+            );
+            continue;
+        }
+
+        log!(
+            "[Chat] Thread {} is busy, queuing follow-up request",
+            thread_id
+        );
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = tokio::time::sleep(POLL) => {}
+        }
+    }
+}
+
+/// Record `request_event_id` on `thread_id`'s handle, unless the registration
+/// has moved on. The write half of [`in_flight_request_event_id`]; a free
+/// function so it can be exercised against a bare `active_threads` map instead
+/// of being re-implemented by its own test. `LucidosEngine::set_thread_request_event_id`
+/// is the production entry point.
+///
+/// `generation` is the caller's own registration ([`ThreadGuard::generation`]).
+/// It matters for the same reason it does in `note_injections_drained`: a turn
+/// force-evicted after the 60 s timeout keeps unwinding while its replacement is
+/// already registered under the same `thread_id`, and a bare thread_id lookup
+/// would let the dying turn stamp its anchor over the live one. The next abort
+/// would then terminate the turn the user already abandoned.
+pub(crate) fn record_request_event_id(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    thread_id: Uuid,
+    generation: u64,
+    request_event_id: Uuid,
+) {
+    if let Some(handle) = active_threads
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .filter(|h| h.generation == generation)
+    {
+        *handle.request_event_id.lock().unwrap() = Some(request_event_id);
+    }
+}
+
+/// The `request_event_id` an abort emitted from OUTSIDE the agentic loop must
+/// carry, so it terminates the turn that is actually in flight.
+///
+/// Reads [`ThreadHandle::request_event_id`] first, which the running turn
+/// recorded itself and is therefore the same id the loop will stamp on its own
+/// terminator. That agreement is the whole point: it is what lets the
+/// idempotency gate in [`thread_events::emit_response_canceled`] recognise this
+/// abort and skip the loop's follow-up cancel, instead of leaving two
+/// terminators on two different exchanges.
+///
+/// Falls back to `agent_session::latest_originating_event_id` when there is no
+/// live handle, or in the narrow window between registration and the turn
+/// resolving its originating event. The fallback is a guess (see the field's
+/// docs for how it goes wrong), but a guessed anchor still beats none: a
+/// `NULL` `request_event_id` breaks `chat/rerun.rs`'s Continue window and the
+/// frontend's exchange grouping alike.
+pub(crate) async fn in_flight_request_event_id(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    fallback_event_types: &[&str],
+) -> Option<Uuid> {
+    let recorded = active_threads
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .and_then(|h| *h.request_event_id.lock().unwrap());
+    match recorded {
+        Some(id) => Some(id),
+        None => {
+            crate::engine::agent_session::latest_originating_event_id(
+                pool,
+                thread_id,
+                fallback_event_types,
+            )
+            .await
+        }
+    }
+}
+
+/// Emit a `ResponseAborted` (actor=System) for a thread the engine is
+/// force-evicting after the `register_thread_queued` 60s timeout. Without
+/// this pre-emit, the run-loop's stop arm would default to `ResponseCanceled`
+/// (`is_shutdown=false`, no user-action suppress flag set) and the user would
+/// see a misleading "Canceled". Coding-agent sessions also get `external_terminal_emitted`
+/// set so the run-loop arm skips its duplicate emit.
+///
+/// Chat threads are covered by the anchor: [`in_flight_request_event_id`] names
+/// the evicted turn, so the gate in `thread_events::emit_response_canceled`
+/// suppresses the loop's own cancel rather than stacking a second boundary. The
+/// frontend's `Aborted`-before-`Canceled` check in `exchangeStatus` only ever
+/// deflated the duplicate when both landed on the SAME exchange; with a
+/// mis-anchored abort they landed on two, and both rendered.
+pub(crate) async fn emit_stuck_thread_eviction_abort(
+    bus: &event_bus::EventBus,
+    pool: &sqlx::PgPool,
+    agent_sessions: &tokio::sync::Mutex<HashMap<Uuid, types::AgentSession>>,
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    thread_id: Uuid,
+) {
+    use thread_events::{EventChannel, EventMeta, MessageOrigin};
+
+    let channel = {
+        let guard = agent_sessions.lock().await;
+        if let Some(s) = guard.get(&thread_id) {
+            s.external_terminal_emitted
+                .store(true, std::sync::atomic::Ordering::Release);
+            Some(EventChannel::ClaudeCode)
+        } else {
+            None
+        }
+    };
+
+    // The evicted turn recorded its own anchor on the handle, which is still
+    // registered at this point (the caller evicts AFTER this emit). The lists
+    // below are only the fallback for a turn that never got that far. CC
+    // threads fall back on `MessageReceived` / `CodingAgentUserMessageSent` /
+    // `TriggerStarted` / `ChildThreadCompleted` (any can start a CC turn:
+    // CCUMS for live follow-ups, CTC for parents re-entered from a finished
+    // child via `notify_parent_of_child_completion`). Chat threads use the
+    // same list minus CCUMS. The shared constants live in
+    // `agent_session::resume`.
+    let originating_types: &[&str] = if channel == Some(EventChannel::ClaudeCode) {
+        crate::engine::agent_session::CC_ORIGINATING_EVENT_TYPES
+    } else {
+        crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES
+    };
+    let request_event_id =
+        in_flight_request_event_id(active_threads, pool, thread_id, originating_types).await;
+
+    thread_events::emit_response_aborted(
+        bus,
+        thread_id,
+        thread_events::AbortCause::SafetyNet,
+        String::new(),
+        vec![],
+        None,
+        None,
+        EventMeta {
+            channel,
+            request_event_id,
+            actor: Some(MessageOrigin::system()),
+            ..EventMeta::NONE
+        },
+        "[Engine] ResponseAborted (stuck-thread eviction)",
+    )
+    .await;
+}
+
+#[cfg(test)]
+#[path = "mod_tests/common.rs"]
+mod common;
+
+#[cfg(test)]
+#[path = "mod_tests/migration.rs"]
+mod migration_tests;
+
+#[cfg(test)]
+#[path = "mod_tests/provider_config_trigger.rs"]
+mod provider_config_trigger_tests;
+
+#[cfg(test)]
+#[path = "mod_tests/lifecycle.rs"]
+mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "mod_tests/injection.rs"]
+mod injection_tests;
+
+#[cfg(test)]
+#[path = "mod_tests/restart_anchor.rs"]
+mod restart_anchor_tests;
+
+#[cfg(test)]
+mod value_pins_tests;

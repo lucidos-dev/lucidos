@@ -1,0 +1,608 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import type { ComponentChildren, VNode } from 'preact';
+import { getBannerActions, getWaitingState, getStandaloneActions, DiffButton } from '../WaitingBanner';
+import type { HeaderActionSpec } from '../../layout/headerActions';
+import {
+  threadMap,
+  focusedThreadId,
+  archivingThreadIds,
+  applyingNowThreadIds,
+  applyingChangeIds,
+  discardingCCThreadIds,
+  cancelingThreadIds,
+  changes,
+  setAsideChanges,
+} from '../../../store/store';
+import type { ThreadState } from '../../../store/thread-events';
+import type { TaggedAction } from '../../../store/actions/threadActions';
+
+// Stub repositories actions so we can assert which one the Diff button click
+// calls. Importing the real module would pull in panel/router state.
+vi.mock('../../../store/actions/repositories', () => ({
+  viewChangeDiff: vi.fn(),
+  viewThreadCcDiff: vi.fn(),
+}));
+
+import { viewChangeDiff, viewThreadCcDiff } from '../../../store/actions/repositories';
+
+/** Build a close-set TaggedAction the way resolveThreadActions would. */
+function ta(kind: TaggedAction['kind'], label: string, category: TaggedAction['category'] = 'close'): TaggedAction {
+  return { kind, category, label, invoke: () => {} };
+}
+const DISCARD_APPLY = [ta('discard', 'Discard'), ta('apply', 'Apply', 'primary')];
+const ARCHIVE_ONLY = [ta('archive', 'Archive')];
+
+function makeCCThread(id: string, overrides: Partial<ThreadState['meta']> = {}): ThreadState {
+  return {
+    meta: {
+      id,
+      title: 'test',
+      channel: 'claude_code',
+      initiator: 'user',
+      saved: false,
+      createdAt: '',
+      updatedAt: '',
+      status: 'waiting',
+      summaryVersion: 0,
+      messageCount: 0,
+      section: 'inbox',
+      activeChildrenCount: 0,
+      totalChildrenCount: 0,
+      blockingDescendantCount: 0, attentionDescendantCount: 0,
+      codingAgentChangeState: { kind: 'none' },
+      codingAgentIsExternalRepo: false,
+      lastRevivedAt: '',
+      state: 'active',
+      latestTodoList: null,
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
+      ...overrides,
+    },
+    events: new Map(),
+    streamingBuffer: '',
+    eventsLoaded: true,
+    eventsLoadFailed: false,
+    lastDbSeq: 0,
+    pendingUserMessages: [],
+  };
+}
+
+beforeEach(() => {
+  threadMap.value = new Map();
+  focusedThreadId.value = null;
+  archivingThreadIds.value = new Set();
+  applyingNowThreadIds.value = new Map();
+  applyingChangeIds.value = new Set();
+  discardingCCThreadIds.value = new Set();
+  cancelingThreadIds.value = new Set();
+  changes.value = { status: 'loaded', data: [] };
+  setAsideChanges.value = { status: 'loaded', data: [] };
+  vi.mocked(viewChangeDiff).mockReset();
+  vi.mocked(viewThreadCcDiff).mockReset();
+});
+
+function vnodeText(n: ComponentChildren): string {
+  if (n === null || n === undefined || typeof n === 'boolean') return '';
+  if (typeof n === 'string' || typeof n === 'number') return String(n);
+  if (Array.isArray(n)) return n.map(vnodeText).join('');
+  return vnodeText((n as VNode<{ children?: ComponentChildren }>).props.children);
+}
+
+// Diff is a COMPONENT rather than a bare <button>, because it holds a
+// touch-activation hook. A vnode walker cannot look inside one without a
+// renderer, so it is matched by identity and answers for its own label. What it
+// DOES on a press is covered by `diff-button-touch.test.tsx`, which renders it.
+// These slots are about composition: which face lands where.
+function buttonLabels(node: ComponentChildren): string[] {
+  if (node === null || node === undefined || typeof node === 'boolean') return [];
+  if (typeof node === 'string' || typeof node === 'number') return [];
+  if (Array.isArray(node)) return node.flatMap(buttonLabels);
+  const v = node as VNode<{ children?: ComponentChildren }>;
+  if (v.type === DiffButton) return ['Diff'];
+  if (v.type === 'button') return [vnodeText(v.props.children).trim()];
+  return buttonLabels(v.props.children);
+}
+
+/** The Diff faces in a slot, matched by component identity. */
+function diffNodes(node: ComponentChildren): VNode<{ threadId: string }>[] {
+  if (node === null || node === undefined || typeof node === 'boolean') return [];
+  if (typeof node === 'string' || typeof node === 'number') return [];
+  if (Array.isArray(node)) return node.flatMap(diffNodes);
+  const v = node as VNode<{ children?: ComponentChildren }>;
+  if (v.type === DiffButton) return [v as unknown as VNode<{ threadId: string }>];
+  return diffNodes(v.props.children);
+}
+
+function buttonNodes(node: ComponentChildren): VNode<{ disabled?: boolean }>[] {
+  if (node === null || node === undefined || typeof node === 'boolean') return [];
+  if (typeof node === 'string' || typeof node === 'number') return [];
+  if (Array.isArray(node)) return node.flatMap(buttonNodes);
+  const v = node as VNode<{ children?: ComponentChildren; disabled?: boolean }>;
+  if (v.type === 'button') return [v];
+  return buttonNodes(v.props.children);
+}
+
+// The split button is a function-component VNode; with no DOM/render harness
+// here we assert the props it is handed (the same data the desktop buttons
+// render from), not the rendered menu. The component's interaction contract is
+// covered by the Overlay contract tests + e2e.
+type SplitProps = {
+  primary: { key: string; label: string; className: string };
+  menuActions: TaggedAction[];
+};
+function splitProps(node: ComponentChildren): SplitProps {
+  return (node as VNode<SplitProps>).props;
+}
+
+/** What the composer row stamps on each member it renders. */
+const ROW_ATTRS = { 'data-row-item': 'fold' };
+
+/** A member's ROW rendering, which is what the assertions below look at. */
+function rowOf(member: HeaderActionSpec): ComponentChildren {
+  return member.render ? member.render(ROW_ATTRS) : null;
+}
+
+/** Every member's row rendering, in fold order. */
+function rows(members: HeaderActionSpec[]): ComponentChildren[] {
+  return members.map(rowOf);
+}
+
+describe('getBannerActions', () => {
+  it('marks every thread action, so the dead-press probe never warns about one', () => {
+    const split = getBannerActions({
+      type: 'actions', actions: DISCARD_APPLY, threadId: 'tid', isArchiving: false, showDiff: false,
+    });
+    const splitAttrs = (rowOf(split[0]) as VNode<{ attrs: Record<string, string> }>).props.attrs;
+    expect(splitAttrs).toHaveProperty('data-thread-action', '');
+    expect(splitAttrs).toHaveProperty('data-row-item', 'fold');
+
+    const plain = getBannerActions({
+      type: 'actions', actions: [ta('discard', 'Discard')], threadId: 'tid', isArchiving: false, showDiff: false,
+    });
+    const [discard] = buttonNodes(rowOf(plain[0])) as VNode<Record<string, unknown>>[];
+    expect(discard.props['data-thread-action']).toBe('');
+  });
+
+  it('keeps Diff its own member, ahead of the change actions', () => {
+    const members = getBannerActions({
+      type: 'actions',
+      actions: DISCARD_APPLY,
+      threadId: 'tid',
+      isArchiving: false,
+      showDiff: true,
+    });
+
+    // Diff folds FIRST: looking is cheaper to postpone than doing. It is never
+    // folded into the Apply caret menu, which is a different thing entirely.
+    expect(members.map((m) => m.key)).toEqual(['thread-diff', 'change-actions']);
+    expect(buttonLabels(rowOf(members[0]))).toEqual(['Diff']);
+    const props = splitProps(rowOf(members[1]));
+    expect(props.primary.key).toBe('apply');
+    expect(props.menuActions.map((a) => a.kind)).toEqual(['discard']);
+  });
+
+  it('drops the Diff member when the branch has no diff', () => {
+    const members = getBannerActions({
+      type: 'actions',
+      actions: DISCARD_APPLY,
+      threadId: 'tid',
+      isArchiving: false,
+      showDiff: false,
+    });
+
+    expect(members.map((m) => m.key)).toEqual(['change-actions']);
+    const props = splitProps(rowOf(members[0]));
+    expect(props.primary.key).toBe('apply');
+    expect(props.menuActions.map((a) => a.kind)).toEqual(['discard']);
+  });
+
+  it('hides the Diff member on a thread whose branch has none', () => {
+    const members = getBannerActions({
+      type: 'actions',
+      actions: ARCHIVE_ONLY,
+      threadId: 'tid',
+      isArchiving: false,
+      showDiff: false,
+    });
+
+    expect(members.map((m) => m.key)).toEqual(['archive']);
+    expect(buttonLabels(rows(members))).toEqual(['Archive']);
+  });
+
+  it('gives each close-set button its own member when there is no Apply', () => {
+    // Archive-only keeps the separate-button path, so the row can fold one
+    // button without the other rather than treating the set as one thing.
+    const members = getBannerActions({
+      type: 'actions',
+      actions: ARCHIVE_ONLY,
+      threadId: 'tid',
+      isArchiving: false,
+      showDiff: true,
+    });
+
+    expect(members.map((m) => m.key)).toEqual(['thread-diff', 'archive']);
+    expect(buttonLabels(rows(members))).toEqual(['Diff', 'Archive']);
+    // Diff has no disabled form: every call site renders it only when the
+    // branch has a diff to show. The face takes a thread id and nothing else.
+    expect(diffNodes(rowOf(members[0])).map((v) => v.props.threadId)).toEqual(['tid']);
+  });
+
+  /** A request in flight is ONE member, and it folds like any other. A busy row
+   *  is not a reason to let a button leave the box. */
+  it('gives an archiving thread a disabled Archive... member', () => {
+    const members = getBannerActions({
+      type: 'actions',
+      actions: [],
+      threadId: 'tid',
+      isArchiving: true,
+      showDiff: false,
+    });
+    expect(members.map((m) => m.key)).toEqual(['archiving']);
+    expect(buttonLabels(rows(members))).toEqual(['Archive...']);
+    expect(buttonNodes(rowOf(members[0]))[0].props.disabled).toBe(true);
+    // `disabledTooltip` is what makes the FOLDED row aria-disabled rather than
+    // a live action.
+    expect(members[0].disabledTooltip).toBe('Archive...');
+  });
+
+  it('gives an applying thread a disabled Apply... member', () => {
+    const members = getBannerActions({ type: 'applying' });
+    expect(members.map((m) => m.key)).toEqual(['applying']);
+    expect(buttonLabels(rows(members))).toEqual(['Apply...']);
+  });
+
+  it('gives a discarding thread a disabled Discard... member', () => {
+    const members = getBannerActions({ type: 'discarding' });
+    expect(members.map((m) => m.key)).toEqual(['discarding']);
+    expect(buttonLabels(rows(members))).toEqual(['Discard...']);
+  });
+
+  /** The caret's actions would go with the fold, so the composite contributes
+   *  one menu row per action rather than one for the face. */
+  it('folds the split button into a row per action', () => {
+    const members = getBannerActions({
+      type: 'actions',
+      actions: DISCARD_APPLY,
+      threadId: 'tid',
+      isArchiving: false,
+      showDiff: false,
+    });
+    const ctx = { run: (fn: () => void) => () => fn(), anchor: null };
+    const menu = members[0].menuRows!(ctx);
+    expect(buttonLabels(menu)).toEqual(['Apply', 'Discard']);
+  });
+});
+
+describe('showDiff follows the change state', () => {
+  it('Diff is shown for unproposed work with no pending change', () => {
+    const thread = makeCCThread('t1', {
+      status: 'idle',
+      section: 'inbox',
+      codingAgentChangeState: { kind: 'unproposed', reason: null },
+      codingAgentIsExternalRepo: false,
+    });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('actions');
+    if (state!.type === 'actions') {
+      expect(state!.showDiff).toBe(true);
+    }
+  });
+
+  // The engine can empty a pending change (the branch no longer differs from
+  // main) and the thread still reads proposed. Its file list hides Diff.
+  it('Diff is hidden for a proposal whose pending change lists no files', () => {
+    const thread = makeCCThread('t1', {
+      status: 'waiting',
+      section: 'inbox',
+      codingAgentChangeState: { kind: 'proposed', requires_restart: false },
+      codingAgentIsExternalRepo: false,
+    });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+    changes.value = {
+      status: 'loaded',
+      data: [{ id: 'c1', thread_id: 't1', status: 'pending', file_count: 0, files: [] } as never],
+    };
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('actions');
+    if (state!.type === 'actions') {
+      expect(state!.showDiff).toBe(false);
+    }
+  });
+
+  it('Diff is shown for a proposal whose pending change lists files', () => {
+    const thread = makeCCThread('t1', {
+      status: 'waiting',
+      section: 'inbox',
+      codingAgentChangeState: { kind: 'proposed', requires_restart: false },
+    });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+    changes.value = {
+      status: 'loaded',
+      data: [{ id: 'c1', thread_id: 't1', status: 'pending', file_count: 1, files: ['a.rs'] } as never],
+    };
+
+    const state = getWaitingState();
+    expect(state?.type === 'actions' && state.showDiff).toBe(true);
+  });
+
+  it('Diff is hidden when the branch holds no work', () => {
+    const thread = makeCCThread('t1', { status: 'idle', section: 'inbox' });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state?.type).toBe('actions');
+    expect(state?.type === 'actions' && state.showDiff).toBe(false);
+  });
+
+  it('shows disabled "applying" for a QUEUED Apply All member (change applying, thread idle/waiting)', () => {
+    // Apply All marks every batch member's change as applying (change-level
+    // applyingChangeIds → reverse-mapped by applyingChangeThreadIds). A member
+    // still waiting its turn has no live session (status 'waiting', not mid-turn)
+    // — nothing to interrupt — so it shows the disabled "Apply...".
+    const thread = makeCCThread('t1', { status: 'waiting', codingAgentChangeState: { kind: 'unproposed', reason: null }});
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+    changes.value = { status: 'loaded', data: [{ id: 'c1', thread_id: 't1' } as never] };
+    applyingChangeIds.value = new Set(['c1']);
+
+    const state = getWaitingState();
+    expect(state).not.toBeNull();
+    expect(state!.type).toBe('applying');
+  });
+
+  it('shows Cancel (not disabled applying) when this thread\'s change is actively hardening', () => {
+    // The in-flight Apply All member runs /harden as a live CC turn (status
+    // 'running' = mid-turn). The user must be able to cancel it — the mid-turn
+    // branch wins over the applyingChangeThreadIds disabled state.
+    const thread = makeCCThread('t1', { status: 'running' });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+    changes.value = { status: 'loaded', data: [{ id: 'c1', thread_id: 't1' } as never] };
+    applyingChangeIds.value = new Set(['c1']);
+
+    const state = getWaitingState();
+    expect(state!.type).toBe('canceling');
+  });
+
+  it('shows Cancel (not disabled applying) while a merge-conflict resolution runs', () => {
+    // Status 'running' during an apply-driven merge. Cancel
+    // is best-effort but must be offered (regression fix: it used to be disabled).
+    const thread = makeCCThread('t1', { status: 'running' });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state!.type).toBe('canceling');
+  });
+
+  it('does not show "applying" when the applying change belongs to a different thread', () => {
+    const thread = makeCCThread('t1', { status: 'waiting' });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+    changes.value = { status: 'loaded', data: [{ id: 'c2', thread_id: 't2' } as never] };
+    applyingChangeIds.value = new Set(['c2']);
+
+    const state = getWaitingState();
+    expect(state!.type).not.toBe('applying');
+  });
+
+  it('Diff click always routes to viewThreadCcDiff', () => {
+    // Pin down that the WaitingBanner Diff button has a different conceptual
+    // identity from the historical Change-row Diff buttons: it always asks
+    // "show me the diff for this thread's branch", never "show me what this
+    // specific Change contained". viewChangeDiff stays for ChatExchange and
+    // ChangesView; the WaitingBanner does not call it anymore. Diff is the
+    // own member on every actions path (Apply or not), so this asserts the one
+    // `diffAction` face both paths share.
+    const members = getBannerActions({
+      type: 'actions',
+      actions: ARCHIVE_ONLY,
+      threadId: 'tid',
+      isArchiving: false,
+      showDiff: true,
+    });
+
+    // One face, carrying the THREAD id. What it calls with that id is asserted
+    // against the rendered component in `diff-button-touch.test.tsx`.
+    expect(diffNodes(rows(members)).map((v) => v.props.threadId)).toEqual(['tid']);
+    expect(viewChangeDiff).not.toHaveBeenCalled();
+  });
+});
+
+describe('getStandaloneActions', () => {
+  // The standalone members are what PromptInput carries when the in-banner set
+  // (from getBannerActions) is not in play, most importantly during
+  // mid-turn (waitingState='canceling'), where the banner is suppressed but
+  // the branch already has commits to diff. "Branch has commits → Diff
+  // visible" is the user-facing rule; the data layer already exposes that
+  // truth via meta.codingAgentChangeState, this helper just surfaces it.
+
+  it('renders Diff button for a focused CC thread holding unproposed work', () => {
+    const thread = makeCCThread('t1', {
+      status: 'running',
+      codingAgentChangeState: { kind: 'unproposed', reason: null },
+    });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const members = getStandaloneActions();
+    expect(members.map((m) => m.key)).toContain('thread-diff');
+    expect(diffNodes(rows(members)).map((v) => v.props.threadId)).toEqual(['t1']);
+  });
+
+  it('returns null when the branch holds no work', () => {
+    const thread = makeCCThread('t1', {
+      status: 'running',
+      codingAgentChangeState: { kind: 'none' },
+    });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    expect(getStandaloneActions().map((m) => m.key)).not.toContain('thread-diff');
+  });
+
+  it('returns null for non-CC (chat) thread even when something thinks it has a diff', () => {
+    // chat threads cannot have CC diffs; guard belt-and-braces.
+    const thread = makeCCThread('t1', {
+      channel: 'chat',
+      status: 'idle',
+      codingAgentChangeState: { kind: 'unproposed', reason: null },
+    });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    expect(getStandaloneActions().map((m) => m.key)).not.toContain('thread-diff');
+  });
+
+  it('returns null when no thread is focused', () => {
+    focusedThreadId.value = null;
+    expect(getStandaloneActions()).toEqual([]);
+  });
+
+  it('hands the FOCUSED thread id to the Diff face', () => {
+    // The standalone path resolves the thread itself, where the banner path is
+    // handed one. Both must reach the same face with the same id.
+    const thread = makeCCThread('tid', {
+      status: 'running',
+      codingAgentChangeState: { kind: 'unproposed', reason: null },
+    });
+    threadMap.value = new Map([['tid', thread]]);
+    focusedThreadId.value = 'tid';
+
+    expect(diffNodes(rows(getStandaloneActions())).map((v) => v.props.threadId)).toEqual(['tid']);
+    expect(viewChangeDiff).not.toHaveBeenCalled();
+  });
+});
+
+// A set-aside change keeps a way back on its own thread, even once the thread
+// is archived and offers nothing else (ADR 0328).
+describe('a thread holding a set-aside change', () => {
+  it('offers Bring back, archived or not', () => {
+    const thread = makeCCThread('t-aside', { status: 'idle', section: 'archived' });
+    threadMap.value = new Map([['t-aside', thread]]);
+    focusedThreadId.value = 't-aside';
+    setAsideChanges.value = {
+      status: 'loaded',
+      data: [{ id: 'c-aside', thread_id: 't-aside', status: 'set_aside' } as never],
+    };
+    const state = getWaitingState();
+    expect(state).toMatchObject({ type: 'actions', setAside: { changeId: 'c-aside', discardable: true } });
+    const keys = getBannerActions(state as Parameters<typeof getBannerActions>[0]).map((m) => m.key);
+    expect(keys).toContain('bring-back');
+  });
+
+  /** The Bring back member for a set-aside change, with its caret's items and
+   *  the rows it folds into. */
+  function bringBackMember(discardable: boolean) {
+    const members = getBannerActions({
+      type: 'actions',
+      actions: [],
+      threadId: 't-aside',
+      isArchiving: false,
+      showDiff: false,
+      setAside: { changeId: 'c-aside', discardable },
+    });
+    const bringBack = members.find((m) => m.key === 'bring-back')!;
+    const split = bringBack.render!({}) as VNode<{ primaryLabel: string; menuItems: { label: string; className: string }[] }>;
+    const ctx = { run: (fn: () => void) => () => fn(), anchor: null };
+    return { split: split.props, folded: buttonLabels(bringBack.menuRows!(ctx)) };
+  }
+
+  // The same control the Changes panel's set-aside row wears.
+  it('draws Bring back as a split button with Discard behind the caret', () => {
+    const { split, folded } = bringBackMember(true);
+    expect(split.primaryLabel).toBe('Bring back');
+    expect(split.menuItems.map((i) => [i.label, i.className])).toEqual([
+      ['Discard', 'action-btn action-btn-danger'],
+    ]);
+    expect(folded).toEqual(['Bring back', 'Discard']);
+  });
+
+  it('withholds Discard while the thread is unsettled', () => {
+    const { split, folded } = bringBackMember(false);
+    expect(split.menuItems).toEqual([]);
+    expect(folded).toEqual(['Bring back']);
+  });
+
+  // A thread watching an event is idle, so the banner shows, but the engine
+  // refuses the discard until the thread settles.
+  it('reads a thread watching an event as unsettled', () => {
+    const thread = makeCCThread('t-watch', { status: 'idle', liveEventWaitCount: 1 });
+    threadMap.value = new Map([['t-watch', thread]]);
+    focusedThreadId.value = 't-watch';
+    setAsideChanges.value = {
+      status: 'loaded',
+      data: [{ id: 'c-watch', thread_id: 't-watch', status: 'set_aside' } as never],
+    };
+    expect(getWaitingState()).toMatchObject({ setAside: { changeId: 'c-watch', discardable: false } });
+  });
+
+  it('offers nothing to bring back when the thread has no set-aside change', () => {
+    const thread = makeCCThread('t-none', { status: 'idle', section: 'archived' });
+    threadMap.value = new Map([['t-none', thread]]);
+    focusedThreadId.value = 't-none';
+    const state = getWaitingState();
+    const keys = getBannerActions(state as Parameters<typeof getBannerActions>[0]).map((m) => m.key);
+    expect(keys).not.toContain('bring-back');
+  });
+});
+
+// A blocked or finished Archive never leaves the composer row silent (ADR 0378).
+describe('the composer row when Archive is not on offer', () => {
+  it('offers Move to Current on an archived thread', () => {
+    threadMap.value = new Map([['t-arch', makeCCThread('t-arch', { status: 'idle', section: 'archived' })]]);
+    focusedThreadId.value = 't-arch';
+    const state = getWaitingState();
+    expect(state).toMatchObject({ type: 'actions', unarchive: true });
+    const members = getBannerActions(state as Parameters<typeof getBannerActions>[0]);
+    expect(members.map((m) => m.key)).toEqual(['unarchive']);
+    expect(buttonLabels(rows(members))).toEqual(['Move to Current']);
+  });
+
+  it('shows Archive held back, with its reason, when a sub-thread blocks it', () => {
+    threadMap.value = new Map([
+      ['t-parent', makeCCThread('t-parent', { status: 'idle', blockingDescendantCount: 1 })],
+      ['t-child', makeCCThread('t-child', { status: 'waiting_for_user_answer', parentThreadId: 't-parent' })],
+    ]);
+    focusedThreadId.value = 't-parent';
+    const state = getWaitingState();
+    expect(state).toMatchObject({
+      type: 'actions',
+      blockedArchive: { blocker: 'descendant_question', subThreadId: 't-child' },
+    });
+    const members = getBannerActions(state as Parameters<typeof getBannerActions>[0]);
+    expect(members.map((m) => m.key)).toEqual(['archive-blocked']);
+    const [button] = buttonNodes(rowOf(members[0])) as VNode<Record<string, unknown>>[];
+    expect(button.props['aria-disabled']).toBe('true');
+    expect(button.props['data-tooltip']).toBe('A sub-thread is waiting for your answer.');
+  });
+
+  it('offers Archive on a stored-archived thread a stale count keeps in Current', () => {
+    // Shown in Current, so Move to Current would be a lie. Archive makes the
+    // engine recount the family, which lets it go to Archive.
+    threadMap.value = new Map([
+      ['t-coord', makeCCThread('t-coord', { status: 'idle', section: 'archived', activeChildrenCount: 12 })],
+    ]);
+    focusedThreadId.value = 't-coord';
+    const state = getWaitingState();
+    expect(state).toMatchObject({ type: 'actions', unarchive: false });
+    const members = getBannerActions(state as Parameters<typeof getBannerActions>[0]);
+    expect(members.map((m) => m.key)).toEqual(['archive']);
+  });
+
+  it('draws nothing extra when the thread itself holds Archive back', () => {
+    // Its own blocker already draws the control that resolves it.
+    threadMap.value = new Map([['t-run', makeCCThread('t-run', { status: 'running' })]]);
+    focusedThreadId.value = 't-run';
+    expect(getWaitingState()).toMatchObject({ type: 'canceling' });
+  });
+});

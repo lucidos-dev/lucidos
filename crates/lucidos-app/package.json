@@ -1,0 +1,30 @@
+{
+  "name": "lucidos-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@lucidos/sdk": "*",
+    "@preact/signals": "^2.11.2",
+    "@tauri-apps/api": "^2.11.1",
+    "dompurify": "^3.4.15",
+    "highlight.js": "^11.12.0",
+    "jsqr": "^1.4.0",
+    "marked": "^17.0.3",
+    "preact": "^10.29.8"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@preact/preset-vite": "^2.10.6",
+    "jsdom": "^29.1.1",
+    "typescript": "^5.7.3",
+    "vite": "^6.4.3",
+    "vitest": "^4.1.0"
+  }
+}

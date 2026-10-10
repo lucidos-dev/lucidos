@@ -1,0 +1,682 @@
+/* --- Settings --- */
+
+/* Inline validation error under a settings field (e.g. a bad IP in Network
+   access). Muted-size, danger-colored. */
+.settings-field-error {
+    font-size: var(--font-size-md);
+    color: var(--accent-red);
+}
+
+/* A Search-Everywhere jump to a settings item scrolls to it and applies the
+   shared NAVIGATION FOCUS MARKER (.nav-focus-stuck,
+   styles/global/host-components.css, via components/shared/focusMarker.ts) — same
+   sticky background wash that fades on dismiss as chat and plugins. See
+   SettingsView.tsx. */
+
+.settings-section {
+    padding: 0;
+    margin-bottom: 1rem;
+    /* Block formatting context so a focused row's compensating vertical margin
+       (the .nav-focus-stuck rule below shrinks the row's feed padding and hands it
+       back as margin) stays CONTAINED — otherwise a first/last row's margin
+       collapses through this padding-less section and its content shifts. No-op
+       for unfocused rows (zero vertical margin); flow-root doesn't clip the
+       marker's glow (unlike overflow: hidden). */
+    display: flow-root;
+}
+
+.settings-section:last-child {
+    margin-bottom: 0;
+}
+
+/* --text-muted, the lightest grey, washes out in both themes and reads as
+   disabled, so the eyebrow rests one step up: still quiet against the (primary)
+   setting labels it sits over, but legible. Declared plainly here rather than
+   behind a :not(.settings-nav-row) carve-out, which is what this was until the
+   carve-out went dead: the one other role wearing this class, the
+   .settings-nav-row destination below, states its own colour on its own rule. */
+.settings-section-title {
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+    margin-bottom: 0.5rem;
+}
+
+.settings-section-desc {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    margin: 0 0 0.5rem;
+}
+
+/* The Settings home rows are DESTINATIONS, not section eyebrows. They reuse
+   .settings-section-title for its spacing, but with a group heading now sitting
+   above them (.settings-nav-group-title, which owns the uppercase-eyebrow role)
+   an uppercase muted row would compete with its own heading and read as the
+   quieter of the two. Normal case, body size, primary colour: heading first,
+   then the rows under it.
+
+   The WEIGHT and the COLOUR answer to different things here, and two attempts
+   that moved them together bracketed this one. At 500 the rows shouted in both
+   themes: a page that is nothing BUT these rows has no quieter text to be
+   emphatic against, and the default font is a monospace whose 500 already reads
+   as a semibold. Taking them to --text-secondary as well then flattened the
+   page the other way, because the group heading buys back in weight what it
+   gives up in tone (uppercase at 600) and the two landed as one grey however
+   the tokens compare. So: the weight drop is what takes the shout out, and the
+   colour gap against --text-muted is what keeps a destination distinguishable
+   from the heading of the group it sits in. Don't grey these rows without
+   giving .settings-nav-group-title somewhere quieter to go, and there is
+   nowhere: muted is already the dimmest token. */
+.settings-section-title.settings-nav-row {
+    margin-bottom: 0;
+    font-size: var(--font-size-md);
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: normal;
+    color: var(--text-primary);
+}
+
+/* Heading over a contiguous run of Settings home rows (Assistant / Workspace /
+   This device). Presentational grouping only: it adds no navigation level, so a
+   category is still one tap away. The first group's heading needs no top gap
+   (the panel's own padding provides it); later ones separate their group from
+   the run above. */
+.settings-nav-group-title {
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: var(--space-xs);
+}
+
+/* Rows within a group sit at the nav row's own 0.625rem padding, not the 1rem
+   .settings-section gap: a group has to read as one block, which it cannot if
+   the space inside it matches the space around it. The gap BETWEEN groups is
+   the heading's top margin below. */
+.settings-nav-item {
+    margin-bottom: 0;
+}
+
+.settings-nav-item:not(:first-child) > .settings-nav-group-title {
+    margin-top: var(--space-lg);
+}
+
+/* A real <button> (see SettingsView), so the first block is the UA button
+   reset. `font-feature-settings` is re-inherited straight after `font:
+   inherit`, which resets it to initial and would hand ligatures back to a Fira
+   Code user. The font-size and weight this reset inherits are then overridden
+   by `.settings-section-title.settings-nav-row` above, which outranks it.
+
+   `width: 100%` is belt and braces, not the thing holding the layout up: the
+   `display: flex` below already makes the box block-level, so `width: auto`
+   fills the row and parks the chevron at the far edge on its own. It is stated
+   anyway because a UA button is `inline-block`, and that is what the row would
+   fall back to if the display ever changed.
+
+   No `color` here, unlike `.list-row-add-card`, which does reset it: the UA's
+   `buttontext` never reaches this row because
+   `.settings-section-title.settings-nav-row` above already colours it at higher
+   specificity. Adding one would put a fourth colour declaration back into a
+   cascade that 55a8143c4 deliberately collapsed, and it would win nothing. */
+.settings-nav-row {
+    background: none;
+    border: none;
+    width: 100%;
+    font: inherit;
+    font-feature-settings: inherit;
+    text-align: left;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.625rem 0;
+    cursor: pointer;
+}
+
+.settings-nav-row:focus-visible {
+    /* Shared --focus-ring (see .icon-btn:focus-visible in
+       global/shared-components.css). Drawn OUTWARD, unlike .list-row-add-card:
+       the row has no horizontal padding to inset a band into, and it sits
+       inside .settings-panel's 1rem gutter, so there is room for one. The
+       transparent outline is the forced-colors fallback, where box-shadow is
+       stripped. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+/* Hover LIFTS the row, to the accent (the same direction .settings-option
+   takes) rather than by stepping the grey. Stepping is what the row used to do
+   (muted → secondary) and it is no longer available: the row rests at
+   --text-primary, so a step up the greys has nowhere to go and a step down
+   would DIM it. Equal specificity with the row's colour rule above (0,2,0 both
+   ways), so this must stay after it. */
+@media (hover: hover) {
+    .settings-nav-row:hover {
+        color: var(--accent);
+    }
+}
+
+.settings-nav-row svg {
+    color: var(--text-muted);
+}
+
+/* Wraps, so a control too wide to sit beside its label drops under it. The
+   label's flex-basis below is what decides when. Packed to the end, not spaced
+   between: the growing label fills its own line either way, and a control that
+   wraps alone stays on the right instead of jumping to the left edge. */
+.settings-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: var(--space-xs) var(--space-md);
+    padding: 0.5rem 0;
+}
+
+/* Uniform gap on all four sides for the navigation focus marker on a settings row
+   (a Search-Everywhere jump). The marker (.nav-focus-stuck wash + glow,
+   host-components.css) fills the row's padding box, and a .settings-row is padded
+   0.5rem TOP/BOTTOM but 0 LEFT/RIGHT (its flex content sits flush) — so the
+   marker's top/bottom gap dwarfs its sides. Normalize every side to 0.375rem:
+     - LEFT/RIGHT: grow the box outward (padding 0 → 0.375rem, cancelled by
+       margin: -0.375rem) so content and row width stay put.
+     - TOP/BOTTOM: shrink the 0.5rem feed padding to 0.375rem and hand the
+       0.125rem back as margin (contained by .settings-section's flow-root), so
+       content and neighbours don't move.
+   Why 0.375rem and not the row's 0.5rem: the row's clip ancestor is
+   .content-pane-body { overflow-x: hidden } — the reachable side room is
+   .settings-panel's --space-lg (1rem) gutter, and the box must grow into it by
+   little enough that the WASH stays whole. 0.375rem gap + the 0.375rem
+   --nav-focus-reach leaves a quarter of the gutter spare. That budget covers the
+   hard-edged wash and its rounded corners, which is what it is for; the wide glow
+   layer's 1.5rem blur overruns it and its outer tail is clipped, accepted for the
+   reason spelled out at .app-store-plugin-row.nav-focus-stuck in pages.css. (Kept
+   at the marker's own 0.375rem reach, a pinned marker-geometry value, not the
+   shared gutter: back when the panel gutter was 0.75rem an earlier 0.5rem grow
+   overran it by 0.125rem and clipped the marker's side edges.) SettingsView lands
+   the marker on the
+   enclosing .settings-row, so a row- or label-anchored jump both arrive here; a
+   .settings-section-title (padded 0 all round) is already uniform. */
+.settings-row.nav-focus-stuck {
+    padding: 0.375rem;
+    margin: 0.125rem -0.375rem;
+}
+
+/* A nested row (.settings-row-child) is indented via padding-left: 1rem, but the
+   two-class rule above outranks that single-class indent and would pull the child's
+   content back to the parent alignment while focused. That rule sets padding-left
+   to the 0.375rem gap, so shift the box RIGHT by (indent − gap) instead of the
+   default −0.375rem pull, landing the content back at its 1rem indent with the same
+   0.375rem gap on every side. margin-left = 1rem − 0.375rem = 0.625rem. Must follow
+   the rule above (equal specificity → source order wins). */
+.settings-row-child.nav-focus-stuck {
+    margin-left: 0.625rem;
+}
+
+/* The setting name is the legible anchor of the row in both themes — the old
+   secondary grey made it read as greyed-out next to its control. */
+.settings-row-label {
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    padding-top: 0.375rem;
+}
+
+/* The label's basis is its own text, so the control shares its line exactly
+   when the whole label fits beside it, and drops under it otherwise. A label
+   is never crushed beside a control that does not shrink. A fixed floor here
+   reserved as much room for "Mode" as for a long label, and wrapped a short
+   label's control with room to spare. Growing keeps the control on the right.
+
+   Direct children only: a readout inside .settings-row-options wears the class
+   for its type, and must stay the width of its text. */
+.settings-row > .settings-row-label {
+    flex: 1 1 auto;
+}
+
+/* An empty label is a spacer. As a flex item it would claim a line of its own
+   above a control that wraps, so the row drops it. */
+.settings-row > .settings-row-label:empty {
+    display: none;
+}
+
+/* A row whose control is a FREE-TEXT FIELD stacks: label on its own line, field
+   full width underneath. Side by side is right for a toggle, a chip row or a
+   dropdown (short control, short label), and wrong for a text field, which wants
+   the whole row to show what was typed. Squeezed into the leftover half of a
+   phone-width pane, the field truncates a pasted key or URL while the label wraps
+   into a two-line stack beside it ("API key (optional)" under Providers).
+
+   Matched on the FIELD rather than a per-callsite modifier class, so every
+   provider form and the add-model form get it and a new field can't forget to opt
+   in. `:has()` takes the specificity of its argument, making this (0,2,0): equal
+   to .settings-row.nav-focus-stuck above, which sets only padding/margin, so the
+   two never contend. The child rules are (0,3,0) and outrank the base
+   .settings-row-label / .settings-text-input declarations whatever the order. */
+.settings-row:has(> .settings-text-input) {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-xs);
+}
+
+/* The base label's padding-top optically centers it against a control sitting to
+   its right. Stacked there is nothing to center against, and it just opens a gap
+   above the label. Its flex-basis goes too: in a column it would be a height. */
+.settings-row:has(> .settings-text-input) > .settings-row-label {
+    padding-top: 0;
+    flex: none;
+}
+
+/* min-width is what the field defends when it shares the row; stacked it has the
+   full width, so release it or the 14rem floor overflows a narrow pane. */
+.settings-row:has(> .settings-text-input) > .settings-text-input {
+    min-width: 0;
+    width: 100%;
+}
+
+/* The label's padding-top suits a control as tall as a dropdown. A lone
+   .settings-option button is shorter, so pinned to the top it sits above the
+   label's text. Centre the two on each other instead. Only a label and its
+   button: a note beside a button keeps its layout. */
+.settings-row:has(> .settings-row-label + .settings-option) {
+    align-items: center;
+}
+
+.settings-row:has(> .settings-row-label + .settings-option) > .settings-row-label {
+    padding-top: 0;
+}
+
+/* A sub-setting nested under the row above it (e.g. the command-guard judge
+   controls under the master "Command guard" toggle). Indented so the hierarchy
+   reads at a glance. */
+.settings-row-child {
+    padding-left: 1rem;
+}
+
+.settings-row-options {
+    display: flex;
+    gap: 0.25rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.mobile-access-url-button {
+    background: none;
+    border: none;
+    font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
+    padding: 0;
+}
+
+/* A button that opens something from a settings row (the UI scale readout).
+   A pick among options is a .segmented-control instead. */
+.settings-option {
+    background: none;
+    /* The border stays 1px in every state so the box never shifts; hover only
+       swaps its colour for a glow ring. */
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.75);
+    padding: 0.1875rem 0.5rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    cursor: pointer;
+    /* `all` also animates box-shadow, so the glow fades in rather than snaps. */
+    transition: all var(--duration-normal);
+}
+
+/* A blurred ring rather than a hard accent border: a stroked border aliases at
+   this small radius under fractional UI scaling. */
+@media (hover: hover) {
+    .settings-option:hover {
+        color: var(--accent);
+        border-color: transparent;
+        box-shadow:
+            0 0 0.1875rem 0.03125rem color-mix(in srgb, var(--accent) 45%, transparent),
+            0 0 0.5rem color-mix(in srgb, var(--accent) 22%, transparent);
+    }
+
+    /* Restrained on white, where the dark-mode bloom reads as a blue smudge. */
+    html[data-theme-mode="light"] .settings-option:hover {
+        box-shadow:
+            0 0 0.125rem 0.03125rem color-mix(in srgb, var(--accent) 32%, transparent),
+            0 0 0.3125rem color-mix(in srgb, var(--accent) 12%, transparent);
+    }
+}
+
+/* Text/password input for settings rows. Box and focus: global/text-input.css. */
+.settings-text-input {
+    padding: 0.25rem 0.5rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    min-width: 14rem;
+}
+
+/* Muted help text under a settings group (e.g. the Providers note). */
+.settings-row-note {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+    padding: 0.25rem 0 0.5rem;
+    line-height: 1.4;
+}
+
+/* One row in the Settings → Models manager list.
+
+   The row WRAPS rather than squeezing its text. A model is identified by its
+   name and its id, so a row that clips either identifies nothing: at phone
+   width the info column was the only flexible child against a provider chip, a
+   "not set up" chip and the builtin marker, and both lines ellipsized. Below
+   the info column's 14rem basis the metadata cluster drops to its own line and
+   the name gets the full width. */
+.model-manager-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.375rem 0;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.model-manager-row .model-manager-info {
+    flex: 1 1 14rem;
+    min-width: 0;
+}
+
+.model-manager-row .model-manager-name {
+    font-size: var(--font-size-lg);
+    font-weight: 500;
+    line-height: 1.2;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+/* `anywhere` rather than `break-word`: a model id is one long unbroken token
+   (`nemotron-3.5-lightning-free`), and only `anywhere` lets it break mid-token
+   AND counts that break when the flex line is measured. */
+.model-manager-row .model-manager-id {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-sm);
+    line-height: 1.2;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+
+/* The chips and the builtin marker or Delete button travel as ONE unit. As
+   separate row children they wrap one at a time, stranding "not set up" on a
+   line of its own under its own provider chip. */
+.model-manager-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-left: auto;
+}
+
+/* Provider chip (vertex / anthropic / openai) on a model manager row. */
+.model-provider-badge {
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.5);
+    padding: 0.0625rem 0.3125rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+/* A bare text button carrying a chevron, opening a group of rows below it:
+   an MCP row's tool list, the switched-off models. Lives here
+   rather than beside any one of them, because this file is where the
+   settings-wide classes are (.settings-section-title, .settings-text-input,
+   .model-provider-badge). */
+.settings-disclosure-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-top: var(--space-sm);
+    padding: 0;
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    /* No `font` shorthand: base.css already hands a button the inherited
+       family, and the shorthand would reset font-feature-settings with it
+       (.claude/rules/frontend-css.md). Only the size differs from the body. */
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .settings-disclosure-toggle:hover {
+        color: var(--text-primary);
+    }
+}
+
+.settings-disclosure-toggle:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+    border-radius: calc(var(--radius-control) * 0.5);
+}
+
+.settings-disclosure-toggle svg {
+    flex-shrink: 0;
+}
+
+/* The remembered backend's chip reads as the one a turn will reach. */
+.model-provider-badge[data-preferred='true'] {
+    color: var(--text-primary);
+    border-color: var(--text-secondary);
+}
+
+/* Settings → Models: a row's vision flag, accent while the model reads images. */
+.model-vision-toggle {
+    color: var(--text-muted);
+}
+
+.model-vision-toggle[aria-pressed='true'] {
+    color: var(--accent);
+}
+
+/* Settings → Models: one model's route editor, opened under its row. */
+.model-routes-editor {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    padding: var(--space-sm) 0 var(--space-md);
+    border-bottom: 1px solid var(--border-color);
+}
+
+/* One route: backend, wire id, window, then its move and remove buttons. The
+   id takes the spare width, since it is the long field. */
+.model-route-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-xs);
+}
+
+.model-route-row .settings-text-input {
+    flex: 1 1 10rem;
+    min-width: 0;
+}
+
+.model-route-row .model-route-window {
+    flex: 0 1 7rem;
+}
+
+/* Shown next to the provider chip when that backend isn't configured, so the
+   model is hidden from the picker. Muted + dashed to read as "inactive". */
+.model-provider-unconfigured {
+    color: var(--text-muted);
+    border-style: dashed;
+    text-transform: none;
+}
+
+/* ── Settings → Access → Add a device ──────────────────────────────────────
+   A live pairing code, as the three ways to use it: scan the QR, type the
+   digits, open the address. The QR is the point of the section, so it is the
+   big card and the two fallbacks stack beside it. Above them sit the countdown
+   and the button that replaces the code. */
+
+.add-device {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    /* The Connect URLs rows above sit at .list-row's --space-lg gutter. This
+       block stands in for a row, so it keeps that edge rather than opening a
+       second one halfway down the page. */
+    padding: var(--space-sm) var(--space-lg);
+    /* The whole group is a QR, eight digits and one address. Past this width it
+       stops laying anything out and just spreads the cards over the pane. The
+       cap is on the block rather than on the cards, so the New code button lands
+       on the same right edge the cards do. */
+    max-width: 44rem;
+}
+
+/* What is true of the CODE, rather than of one way to spend it. */
+.add-device-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+}
+
+/* Tabular figures: the seconds tick once a second, and proportional digits
+   would shuffle the whole line sideways on every one of them. */
+.add-device-expiry {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+.add-device-cards {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: var(--space-md);
+}
+
+/* The two fallbacks, stacked in the space the QR leaves. They share that column
+   evenly, so each rests against the QR's own height. */
+.add-device-alts {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    flex: 1 1 16rem;
+    min-width: 0;
+}
+
+.add-device-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    /* Internal card padding, not the pane gutter: the raised surface is the
+       card, and .add-device above already holds the shared left edge. */
+    padding: var(--space-md);
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-surface) * 2 / 3);
+    min-width: 0;
+    /* Inside the stack this divides the column's height. The zero basis is what
+       makes the split EVEN: from their own heights the two fallbacks would only
+       share the surplus, and land as different-sized cards. */
+    flex: 1 1 0;
+}
+
+/* The QR asks for its own width and keeps it. It may still SHRINK, which is
+   what carries it onto a phone: the image caps at the card and stays square. */
+.add-device-card-qr {
+    flex: 0 1 auto;
+}
+
+/* A container, so the digits below can size against this card rather than
+   against the root. See .add-device-code for what that buys. */
+.add-device-card-code {
+    container-type: inline-size;
+}
+
+/* The caption row. Its floor is the action button's own height, so a caption
+   with a button beside it sits at the same height as one without. That is what
+   keeps the QR's caption level with the code's. */
+.add-device-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    min-height: 1.5rem;
+}
+
+/* Free to wrap, and to shrink. It never does at a workable width: the caption
+   is a few short words against a card of 16rem or more. At the top of the UI
+   scale on a phone it must, though, or a nowrapped caption holds the row open
+   and pushes its own Copy button off the card. */
+.add-device-card-label {
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    min-width: 0;
+}
+
+/* The QR is a server-rendered SVG in an `img`, sized here rather than in the
+   markup so it scales with the UI. It carries its own white field: a scanner
+   wants dark modules on a light one, whatever the app's theme is. The padding
+   extends that field past the code's own quiet zone, so a dark surface never
+   crowds the edge. */
+.add-device-qr {
+    width: 15rem;
+    /* Never wider than the card, and square whatever that leaves: a narrow pane
+       shrinks the QR rather than pushing it off the edge. */
+    max-width: 100%;
+    height: auto;
+    aspect-ratio: 1;
+    padding: 0.5rem;
+    background: #fff;
+    border-radius: calc(var(--radius-surface) * 0.5);
+    /* A vector at one unit per module. Without this the browser smooths the
+       squares and a marginal camera loses the small ones. */
+    image-rendering: pixelated;
+}
+
+/* The digits, for the scan that did not work. Read across a desk, so they get
+   the display step, and monospaced with a little tracking so 0 and 8 stay
+   apart.
+
+   Capped against the card's own width, the same way the pairing screen caps its
+   code boxes, so eight digits fit a phone at every UI scale. Eight of them need
+   5.5em, and the rem arm alone would keep growing with the root while the card
+   could not: the pane has no horizontal scroll and a code has nowhere to break,
+   so the overflow is CLIPPED, taking the first and last digit with it. */
+.add-device-code {
+    font-family: var(--font-mono, monospace);
+    font-size: min(var(--font-size-display), 17cqi);
+    letter-spacing: 0.1em;
+    color: var(--text-primary);
+    text-align: center;
+    /* Centred both ways in the space under the caption: the auto block margins
+       do the vertical half, `text-align` the horizontal. The negative inline end
+       cancels the tracking CSS adds AFTER the last digit, which would otherwise
+       sit the row half a space left of centre. */
+    margin-block: auto;
+    margin-inline-end: -0.1em;
+}
+
+/* A pairing URL carries no spaces, so it has nowhere to break: without
+   `anywhere` it sets one unbreakable line and pushes the card past the pane. */
+.add-device-url {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-xs);
+    line-height: 1.5;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+    margin: auto 0;
+}
+
+/* Shown in place of the two address cards when no reachable origin was found. */
+.add-device-note {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}

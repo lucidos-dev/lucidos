@@ -1,0 +1,11 @@
+-- Optional custom environment variable name for a credential's injected secret.
+--
+-- By default a credential `foo` is injected into spawned subprocesses as
+-- `CRED_FOO` (see `core::credentials::credential_env_vars`). When `env_var_name`
+-- is set, the secret is ALSO injected under that exact name (e.g. `GITHUB_TOKEN`)
+-- IN ADDITION to `CRED_FOO` — an extra alias for a CLI/SDK that expects a
+-- specific variable name, without removing the canonical `CRED_` form. NULL =
+-- only the default `CRED_<NAME>`.
+-- The name is validated (uppercase/digits/underscore, not engine-reserved) at
+-- the API boundary via `environment_variables::validate_name`.
+ALTER TABLE credentials ADD COLUMN IF NOT EXISTS env_var_name TEXT;

@@ -1,0 +1,1411 @@
+use super::super::types::*;
+use super::collect_dismissed_event_ids;
+use super::spoken_merge::{is_one_utterance, join_spoken};
+use crate::core::changes::ChangeStatus;
+use crate::core::EventRow;
+use crate::engine::thread_events::{AgentParticipant, MessageOrigin};
+use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+use uuid::Uuid;
+
+/// Who said a spoken row, and under whose label the doer reads it.
+///
+/// The two sides never merge into each other, so this is the identity
+/// [`push_spoken`] compares. The talker carries its own agent (ADR 0150), so
+/// the doer never reads a spoken reply as its own prior turn.
+enum SpokenSide {
+    Caller,
+    Talker(Option<AgentParticipant>),
+}
+
+/// The spoken row most recently pushed, so the next one can ask whether the
+/// two are one thing said.
+struct SpokenTail {
+    index: usize,
+    from_caller: bool,
+    created: DateTime<Utc>,
+    /// Which CALL it belonged to. A dropped line redialled within the gap
+    /// bound would otherwise glue the end of one call onto the start of the
+    /// next: nothing between them reaches `messages`, so adjacency alone reads
+    /// them as neighbours.
+    session: Option<String>,
+    /// Rows written after a CALLER row that are a note about what they said.
+    /// Not more of the conversation, so the row is still growable.
+    ///
+    /// One row qualifies: the talker's delegation. It says why the talker
+    /// asked for the turn, and it lands within milliseconds of the fragment
+    /// that prompted it. That is mid-sentence whenever the speaker is still
+    /// talking. Counting it as a neighbour split `Just spawn the coding agent`
+    /// from `, please` here, while the transcript joined them.
+    ///
+    /// **The caller's rule only, which is the transcript's split too.** A reply
+    /// is judged on timing instead (ADR 0206): the talker had stopped, so a row
+    /// in the silence after its words does separate them. Exempting it here
+    /// merged two replies the transcript draws apart.
+    ///
+    /// **A DOER step between two fragments still merges here.** The transcript
+    /// splits there, and that gap predates this field. A step reaches
+    /// `pending_steps`, never `messages`, so no count of rows can see it.
+    /// Closing it means asking what the reader met, at every record site, and
+    /// proving the two alike through the fixture.
+    notes_after: usize,
+}
+
+/// The call a spoken row belongs to, as its payload names it.
+fn session_of(event: &EventRow) -> Option<String> {
+    event
+        .payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Add one spoken row, folding it into the row before it when the two are one
+/// thing said.
+///
+/// One breath is several rows (ADR 0201), and the doer must read the sentence
+/// rather than the pieces. The rule is [`super::spoken_merge`]; this places it.
+///
+/// **Only a row still at the end folds.** Another turn reaching `messages`
+/// between the two means they are not neighbours, however close their clocks
+/// are. The talker's own note about the words is not another turn: see
+/// [`SpokenTail::notes_after`].
+fn push_spoken(
+    messages: &mut Vec<SessionMessage>,
+    tail: &mut Option<SpokenTail>,
+    side: SpokenSide,
+    event: &EventRow,
+    text: &str,
+    current_thread_id: Option<String>,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let from_caller = matches!(side, SpokenSide::Caller);
+    let session = session_of(event);
+    if let Some(prev) = tail.as_mut() {
+        let adjacent = prev.index + 1 + prev.notes_after == messages.len();
+        let gap = (event.created - prev.created).num_milliseconds() as f64 / 1000.0;
+        let same_speaker = prev.from_caller == from_caller && prev.session == session;
+        if adjacent && is_one_utterance(gap, same_speaker) {
+            let merged = join_spoken(&messages[prev.index].content, text);
+            messages[prev.index].content = merged;
+            // Measured between NEIGHBOURS, so a long run of quick pieces stays
+            // one utterance rather than timing out against its own first word.
+            prev.created = event.created;
+            return;
+        }
+    }
+    let (role, agent, completed) = match side {
+        SpokenSide::Caller => ("user", None, None),
+        SpokenSide::Talker(agent) => ("assistant", agent, Some(true)),
+    };
+    messages.push(SessionMessage {
+        role: role.to_string(),
+        content: text.trim().to_string(),
+        created_at: event.created,
+        channel: None,
+        steps: vec![],
+        image_handles: vec![],
+        user_image_hashes: vec![],
+        image_description: None,
+        completed,
+        canceled: false,
+        aborted: false,
+        text_chunks: vec![],
+        events: vec![],
+        request_event_id: None,
+        event_id: Some(event.id.to_string()),
+        thread_id: event
+            .thread_id
+            .map(|uuid| uuid.to_string())
+            .or(current_thread_id),
+        agent,
+    });
+    *tail = Some(SpokenTail {
+        index: messages.len() - 1,
+        from_caller,
+        created: event.created,
+        session,
+        notes_after: 0,
+    });
+}
+
+/// Which agent authored this event, when its actor names one (ADR 0150).
+///
+/// Read from the persisted actor rather than inferred from position, because
+/// two agents can interleave on one thread. A row from before the actor
+/// existed, or one whose actor names a human, yields `None`.
+fn authoring_agent(event: &EventRow) -> Option<AgentParticipant> {
+    serde_json::from_value::<MessageOrigin>(event.payload.get("actor")?.clone())
+        .ok()?
+        .agent()
+        .cloned()
+}
+
+/// The status each change a child report names has now, keyed by change id.
+///
+/// A report freezes its change list as the child left it. This map is how a
+/// rebuilt report says what became of each change since. `None` means the row
+/// is gone: deleting a thread deletes its changes. An id missing from the map
+/// was not looked up, and reads as the report left it.
+pub type ChangeStatuses = HashMap<Uuid, Option<ChangeStatus>>;
+
+/// Every change id this thread's child reports name: their own and their
+/// sub-threads'.
+pub(crate) fn reported_change_ids(events: &[EventRow]) -> Vec<Uuid> {
+    let parse = |v: &serde_json::Value| v.as_str().and_then(|s| Uuid::parse_str(s).ok());
+    events
+        .iter()
+        .filter(|event| event.event_type == "ChildThreadCompleted")
+        .flat_map(|event| {
+            let own = event
+                .payload
+                .get("pending_change_ids")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(parse);
+            let below = event
+                .payload
+                .get("sub_thread_pending_changes")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.get("change_id").and_then(parse));
+            own.chain(below).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// What became of a reported change since the report, or `None` while it
+/// still waits in Review.
+fn moved_on_since(statuses: &ChangeStatuses, change_id: Uuid) -> Option<&'static str> {
+    match statuses.get(&change_id)? {
+        Some(ChangeStatus::Pending) => None,
+        Some(ChangeStatus::SetAside) => Some("now set aside"),
+        Some(ChangeStatus::Applied) => Some("now applied"),
+        Some(ChangeStatus::Discarded) => Some("now discarded"),
+        Some(ChangeStatus::Reverted) => Some("now reverted"),
+        Some(ChangeStatus::Withdrawn) => Some("now withdrawn"),
+        None => Some("now deleted"),
+    }
+}
+
+/// Follows a report that names a change which moved on since. The child's
+/// summary and the parent's own later turns still call it pending, and the
+/// model repeats them unless the card says otherwise.
+pub(crate) const CHANGES_MOVED_ON_NOTE: &str =
+    "A change marked \"now ...\" left Review after this report and no longer waits for \
+     Apply. Anything in this conversation that calls it pending is out of date.";
+
+/// Format a persisted `ChildThreadCompleted` event row as the `[CHILD THREAD
+/// COMPLETED]` user-channel block the parent LLM sees in its conversation
+/// history. Shared by [`build_session_messages_with`] (projects every typed
+/// completion at LLM call setup) and the fan-in wake (projects a single event
+/// inline as the next user message). Both paths produce identical text.
+pub fn format_child_thread_completed_block(event: &EventRow, statuses: &ChangeStatuses) -> String {
+    use crate::engine::thread_events::ChildCompletionStatus;
+
+    let child_thread_id = event
+        .payload
+        .get("child_thread_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let title = event
+        .payload
+        .get("child_thread_title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // Exhaustive match against the typed enum so a new ChildCompletionStatus
+    // variant becomes a compile error here, not a silent fall-through to
+    // bare "completed".
+    let status = match serde_json::from_value::<ChildCompletionStatus>(
+        event
+            .payload
+            .get("status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    ) {
+        Ok(ChildCompletionStatus::Success) => "completed (success)",
+        Ok(ChildCompletionStatus::Failure) => "completed (failure)",
+        Ok(ChildCompletionStatus::NoChanges) => "completed (no changes)",
+        // The child is not continuing: the user ended it, or an agent canceled
+        // its own child. The summary says which. A person's Stop never lands
+        // here: it sends `ChildThreadStopped` (ADR 0252).
+        Ok(ChildCompletionStatus::Canceled) => "canceled",
+        // Not finished: a restart cut the turn. The summary says how to
+        // continue it.
+        Ok(ChildCompletionStatus::Interrupted) => "interrupted by an engine restart",
+        Err(_) => "completed",
+    };
+    let summary = event
+        .payload
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let pending_change_ids: Vec<String> = event
+        .payload
+        .get("pending_change_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let pending_section = if pending_change_ids.is_empty() {
+        "none".to_string()
+    } else {
+        pending_change_ids
+            .iter()
+            .map(|id| {
+                match Uuid::parse_str(id)
+                    .ok()
+                    .and_then(|uuid| moved_on_since(statuses, uuid))
+                {
+                    Some(since) => format!("{id} ({since})"),
+                    None => id.clone(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let sub_thread_section = sub_thread_pending_section(event, statuses);
+    let any_moved_on = reported_change_ids(std::slice::from_ref(event))
+        .iter()
+        .any(|id| moved_on_since(statuses, *id).is_some());
+    let moved_on_note = if any_moved_on {
+        format!("\n{CHANGES_MOVED_ON_NOTE}")
+    } else {
+        String::new()
+    };
+    let title_line = if title.is_empty() {
+        String::new()
+    } else {
+        format!("\nTitle: {}", title)
+    };
+    let summary_section = if summary.is_empty() {
+        String::new()
+    } else {
+        format!("\nSummary: {}", summary)
+    };
+    // The event_id (not child_thread_id) is the lookup key the event-reading
+    // tools accept, so surface it. The LLM can then pass it back verbatim
+    // without inventing a synthetic prefix. `dismiss_from_context` was the
+    // original reader and is retired (ADR 0109); the `events` tool's
+    // `event_id` argument takes the same form.
+    format!(
+        "[CHILD THREAD COMPLETED] {} {}\nevent_id: {}{}\nPending changes: {}{}{}{}\n\
+         Note: phrases like \"session can finish\" or \"## Session Summary\" in \
+         the summary describe the child subprocess only — if you were following \
+         a multi-step procedure, continue with the next step. Otherwise use \
+         run_thread to refine.",
+        child_thread_id,
+        status,
+        event.id,
+        title_line,
+        pending_section,
+        sub_thread_section,
+        moved_on_note,
+        summary_section
+    )
+}
+
+/// The block's lines for pending changes held below the child, or nothing when
+/// there are none. The `Pending changes:` line above names the child's own
+/// branch only, so without this an orchestrator whose children hold every
+/// change reads "none".
+fn sub_thread_pending_section(event: &EventRow, statuses: &ChangeStatuses) -> String {
+    use crate::engine::thread_events::SubThreadPendingChange;
+
+    let entries: Vec<SubThreadPendingChange> = event
+        .payload
+        .get("sub_thread_pending_changes")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    if entries.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            // Once the change has moved on, the sub-thread's state when the
+            // card was sent says nothing about it.
+            let state = match moved_on_since(statuses, entry.change_id) {
+                Some(since) => since,
+                None if entry.thread_unsettled => "still working",
+                None => "settled",
+            };
+            let title = entry.thread_title.as_deref().unwrap_or(UNTITLED_SUB_THREAD);
+            format!(
+                "\n- {} from sub-thread \"{}\" ({}): {}",
+                entry.change_id, title, entry.thread_id, state
+            )
+        })
+        .collect();
+    format!(
+        "\nPending changes in its sub-threads (state when this card was sent):{}",
+        lines.concat()
+    )
+}
+
+/// How the block names a sub-thread whose title is not generated yet.
+const UNTITLED_SUB_THREAD: &str = "untitled";
+
+/// Format a persisted `ChildThreadStopped` event row as the `[CHILD THREAD
+/// STOPPED]` user-channel block the parent LLM sees in its history.
+///
+/// It says in plain words that the child is alive, what arrives next, and what
+/// not to do meanwhile (ADR 0252). A parent must not read a Stop as the end.
+pub fn format_child_thread_stopped_block(event: &EventRow) -> String {
+    let child_thread_id = event
+        .payload
+        .get("child_thread_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let title_line = match event
+        .payload
+        .get("child_thread_title")
+        .and_then(|v| v.as_str())
+    {
+        Some(title) if !title.is_empty() => format!("\nTitle: {title}"),
+        _ => String::new(),
+    };
+    format!(
+        "[CHILD THREAD STOPPED] {child_thread_id}\nevent_id: {}{title_line}\n\
+         The user stopped this child's turn. The child is NOT finished and NOT \
+         dead: it is waiting for the user, who may send it a new message. You \
+         will get a [CHILD THREAD COMPLETED] block when it next finishes, or one \
+         with status canceled if the user archives or discards it. Until then, \
+         do not roll back its work, respawn it, or send it a follow-up.",
+        event.id
+    )
+}
+
+/// Format a persisted `ChildThreadDetached` event row as the `[CHILD THREAD
+/// MOVED OUT]` user-channel block the parent LLM sees in its history.
+///
+/// The move wakes nothing, so this block is how the parent learns it. Without
+/// it the parent reads a spawn that never reports back, and respawns it
+/// (ADR 0278).
+pub fn format_child_thread_detached_block(event: &EventRow) -> String {
+    let child_thread_id = event
+        .payload
+        .get("child_thread_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let title_line = match event
+        .payload
+        .get("child_thread_title")
+        .and_then(|v| v.as_str())
+    {
+        Some(title) if !title.is_empty() => format!("\nTitle: {title}"),
+        _ => String::new(),
+    };
+    format!(
+        "[CHILD THREAD MOVED OUT] {child_thread_id}\nevent_id: {}{title_line}\n\
+         This child was moved to top level. It keeps running on its own, but it is \
+         no longer your child: you will not get its result, and you cannot follow up \
+         on it. Do not wait for it or respawn it.",
+        event.id
+    )
+}
+
+/// Handles of the thread images `event` adds, by the resolver's own rule.
+fn thread_image_handles_of(event: &EventRow) -> Vec<String> {
+    crate::core::events::thread_image_refs_of(&event.event_type, &event.payload)
+        .into_iter()
+        .map(|(_, image_ref)| crate::core::events::image_handle(image_ref))
+        .collect()
+}
+
+/// [`build_session_messages_with`] with no change statuses, so each child
+/// report reads as the child left it.
+#[cfg(test)]
+pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage> {
+    build_session_messages_with(events, &ChangeStatuses::new())
+}
+
+/// Build session messages from a list of events (pure function, no DB access).
+///
+/// `statuses` says what became of each change a child report names. Load it
+/// with `EventStore::build_messages_now` rather than passing an empty map.
+///
+/// Interruption semantics:
+/// - `completed: Some(false)` — the response was interrupted by a follow-up user message
+///   arriving mid-stream (a `MessageReceived` event flushed the text buffer before the
+///   response could complete with `ResponseGenerated`).
+/// - `completed: None` — still in progress or unknown (trailing buffer flush at end of events).
+/// - `completed: Some(true)` — completed normally (`ResponseGenerated` or `ResponseFailed`).
+pub(crate) fn build_session_messages_with(
+    events: &[EventRow],
+    statuses: &ChangeStatuses,
+) -> Vec<SessionMessage> {
+    let mut messages: Vec<SessionMessage> = Vec::new();
+    let mut pending_steps: Vec<Step> = Vec::new();
+    let mut pending_image_handles: Vec<String> = Vec::new();
+    let mut claude_code_text_buf = String::new();
+    let mut claude_code_text_last_ts: Option<DateTime<Utc>> = None;
+    let mut text_buf = String::new();
+    let mut text_last_ts: Option<DateTime<Utc>> = None;
+    let mut pending_text_chunks: Vec<String> = Vec::new();
+    let mut last_cc_chunk_len: usize = 0;
+    let mut last_text_chunk_len: usize = 0;
+    let mut pending_events: Vec<ResponseEvent> = Vec::new();
+    let mut last_cc_event_len: usize = 0;
+    let mut last_text_event_len: usize = 0;
+    let mut current_request_event_id: Option<String> = None;
+    let mut current_thread_id: Option<String> = None;
+    let mut spoken_tail: Option<SpokenTail> = None;
+
+    // `ContextDismissed` records ask the projection to drop the corresponding
+    // history entry on every future read. They came from the retired
+    // `dismiss_from_context` tool (ADR 0109), so every row is historical. The
+    // set is collected up-front so a dismissal that landed out of order,
+    // before the event it names, is still respected.
+    let dismissed_event_ids = collect_dismissed_event_ids(events);
+
+    // `ImageDescribed` events carry the Flash-generated description for an
+    // earlier `MessageReceived`'s attached images, keyed by `source_event_id`.
+    // Pre-walk so the description is available whether the events arrive in
+    // emission order or get reshuffled by replay (the agentic loop emits
+    // ImageDescribed AFTER MessageReceived but a strict-chronological read
+    // shouldn't be assumed). The latest event per source wins — if a future
+    // path retries the description on the same source, the most recent
+    // wording is what consumers see. Falls back to legacy
+    // `MessageReceived.image_description` when no event is present (covers
+    // pre-backfill rows in the deprecation window).
+    let image_descriptions = collect_image_descriptions(events);
+
+    // Helper: extract thread_id from the event column
+    let get_thread_id =
+        |event: &EventRow| -> Option<String> { event.thread_id.map(|uuid| uuid.to_string()) };
+
+    for event in events {
+        // Skip dismissed entries before any per-event handling so accumulated
+        // text buffers / pending steps stay untouched. Today this only fires
+        // for `ChildThreadCompleted` (`ToolCalled` + `ToolResult` skipping
+        // happens at the resume helper level so the projection can still show
+        // step rows in the UI).
+        if event.event_type == "ChildThreadCompleted"
+            && dismissed_event_ids.contains(&event.id.to_string())
+        {
+            continue;
+        }
+        match event.event_type.as_str() {
+            "MessageReceived" | "UserMessage" => {
+                // Flush any accumulated streaming text as a response
+                // before starting a new user message (e.g. follow-up sent mid-stream).
+                // completed: false — the exchange was interrupted, no ResponseGenerated.
+                if !claude_code_text_buf.is_empty() {
+                    // Snapshot remaining text delta as a final chunk
+                    if claude_code_text_buf.len() > last_cc_chunk_len {
+                        pending_text_chunks
+                            .push(claude_code_text_buf[last_cc_chunk_len..].to_string());
+                    }
+                    // Snapshot remaining text as event
+                    if claude_code_text_buf.len() > last_cc_event_len {
+                        pending_events.push(ResponseEvent::Text {
+                            md: claude_code_text_buf[last_cc_event_len..].to_string(),
+                        });
+                    }
+                    let created_at = claude_code_text_last_ts.take().unwrap_or(event.created);
+                    messages.push(SessionMessage {
+                        role: "assistant".to_string(),
+                        content: std::mem::take(&mut claude_code_text_buf),
+                        created_at,
+                        channel: Some("claude_code".to_string()),
+                        steps: std::mem::take(&mut pending_steps),
+                        image_handles: std::mem::take(&mut pending_image_handles),
+                        user_image_hashes: vec![],
+                        image_description: None,
+                        completed: Some(false),
+                        canceled: false,
+                        aborted: false,
+                        text_chunks: std::mem::take(&mut pending_text_chunks),
+                        events: std::mem::take(&mut pending_events),
+
+                        request_event_id: current_request_event_id.clone(),
+                        event_id: None,
+                        thread_id: current_thread_id.clone(),
+                        agent: None,
+                    });
+                    last_cc_chunk_len = 0;
+                    last_cc_event_len = 0;
+                }
+                if !text_buf.is_empty() {
+                    // Snapshot remaining text delta as a final chunk
+                    if text_buf.len() > last_text_chunk_len {
+                        pending_text_chunks.push(text_buf[last_text_chunk_len..].to_string());
+                    }
+                    // Snapshot remaining text as event
+                    if text_buf.len() > last_text_event_len {
+                        pending_events.push(ResponseEvent::Text {
+                            md: text_buf[last_text_event_len..].to_string(),
+                        });
+                    }
+                    let created_at = text_last_ts.take().unwrap_or(event.created);
+                    messages.push(SessionMessage {
+                        role: "assistant".to_string(),
+                        content: std::mem::take(&mut text_buf),
+                        created_at,
+                        channel: None,
+                        steps: std::mem::take(&mut pending_steps),
+                        image_handles: std::mem::take(&mut pending_image_handles),
+                        user_image_hashes: vec![],
+                        image_description: None,
+                        completed: Some(false),
+                        canceled: false,
+                        aborted: false,
+                        text_chunks: std::mem::take(&mut pending_text_chunks),
+                        events: std::mem::take(&mut pending_events),
+
+                        request_event_id: current_request_event_id.clone(),
+                        event_id: None,
+                        thread_id: current_thread_id.clone(),
+                        agent: None,
+                    });
+                    last_text_chunk_len = 0;
+                    last_text_event_len = 0;
+                }
+
+                let content = event
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                // Hashes are written by the API layer (or backfilled by the
+                // startup migration). Old DB rows whose payload still carries
+                // the legacy `images: [{base64, mime_type}, ...]` shape have
+                // been rewritten to `user_image_hashes` before HTTP binds —
+                // see `core::image_migration`. Reading from `images` is
+                // therefore a dead fallback and intentionally not implemented.
+                let user_image_hashes: Vec<String> = event
+                    .payload
+                    .get("user_image_hashes")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|h| h.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                pending_steps.clear();
+                pending_image_handles.clear();
+                pending_events.clear();
+
+                // Prefer the typed `ImageDescribed` event (post-refactor) and
+                // fall back to the legacy `MessageReceived.image_description`
+                // payload field for pre-backfill rows in the deprecation
+                // window. Both carry the same Flash output; the new event
+                // additionally records which model produced it.
+                let image_description = image_descriptions
+                    .get(&event.id.to_string())
+                    .cloned()
+                    .or_else(|| {
+                        event
+                            .payload
+                            .get("image_description")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    });
+
+                let channel = event
+                    .payload
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                current_request_event_id = Some(event.id.to_string());
+                current_thread_id = get_thread_id(event);
+
+                messages.push(SessionMessage {
+                    role: "user".to_string(),
+                    content,
+                    created_at: event.created,
+                    channel,
+                    steps: vec![],
+                    image_handles: thread_image_handles_of(event),
+                    user_image_hashes,
+                    image_description,
+                    completed: None,
+                    canceled: false,
+                    aborted: false,
+                    text_chunks: vec![],
+                    events: vec![],
+                    request_event_id: None,
+                    event_id: Some(event.id.to_string()),
+                    thread_id: current_thread_id.clone(),
+                    agent: None,
+                });
+            }
+            // "Thinking" is the legacy DB string; T7 renamed the variant to
+            // ThoughtStreamed. New rows store "ThoughtStreamed"; old rows are
+            // unchanged. Both must hit this arm so legacy threads still render.
+            "Thinking" | "ThoughtStreamed" => {
+                let context_tokens = event
+                    .payload
+                    .get("context_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let context_messages = event
+                    .payload
+                    .get("context_messages")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let trimmed = event.payload.get("trimmed").and_then(|v| v.as_bool());
+                pending_steps.push(Step {
+                    description: "Requesting".to_string(),
+                    tool_name: None,
+                    success: true,
+                    context_tokens,
+                    context_messages,
+                    trimmed,
+                    tool_called_event_id: None,
+                });
+                pending_events.push(ResponseEvent::Step {
+                    description: "Requesting".to_string(),
+                    tool_name: None,
+                    success: true,
+                    detail: None,
+                    context_tokens,
+                    context_messages,
+                    trimmed,
+                    tool_called_event_id: None,
+                });
+            }
+            // "MemorySearched" is the legacy DB string; the variant was renamed
+            // to MemoryRecalled so it stops mirroring the `memory` tool's own
+            // "Searching memory" step. New rows store "MemoryRecalled"; old
+            // rows are unchanged. Both must hit this arm so legacy threads
+            // still render.
+            "MemorySearched" | "MemoryRecalled" => {
+                let results = event
+                    .payload
+                    .get("results")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let queries: Vec<String> = event
+                    .payload
+                    .get("queries")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let desc = crate::core::store::memory_recalled_label(results);
+                let detail = if queries.is_empty() {
+                    None
+                } else {
+                    Some(queries.join(", "))
+                };
+                pending_steps.push(Step {
+                    description: desc.clone(),
+                    tool_name: None,
+                    success: true,
+                    context_tokens: None,
+                    context_messages: None,
+                    trimmed: None,
+                    tool_called_event_id: None,
+                });
+                pending_events.push(ResponseEvent::Step {
+                    description: desc,
+                    tool_name: None,
+                    success: true,
+                    detail,
+                    context_tokens: None,
+                    context_messages: None,
+                    trimmed: None,
+                    tool_called_event_id: None,
+                });
+            }
+            "ToolCalled" => {
+                // Snapshot new text since last chunk as a delta before the tool call.
+                // Skip if the delta is trivially small (< 80 chars) — merge it into the
+                // next chunk instead, so the More/Less toggle only appears when collapsing
+                // would hide meaningful content.
+                if claude_code_text_buf.len() > last_cc_chunk_len {
+                    let delta = &claude_code_text_buf[last_cc_chunk_len..];
+                    if delta.len() >= 80 {
+                        pending_text_chunks.push(delta.to_string());
+                        last_cc_chunk_len = claude_code_text_buf.len();
+                    }
+                } else if text_buf.len() > last_text_chunk_len {
+                    let delta = &text_buf[last_text_chunk_len..];
+                    if delta.len() >= 80 {
+                        pending_text_chunks.push(delta.to_string());
+                        last_text_chunk_len = text_buf.len();
+                    }
+                }
+
+                // For events: snapshot text delta (no minimum size — interleaving
+                // with step events matters more than avoiding small text blocks)
+                if claude_code_text_buf.len() > last_cc_event_len {
+                    let delta = &claude_code_text_buf[last_cc_event_len..];
+                    pending_events.push(ResponseEvent::Text {
+                        md: delta.to_string(),
+                    });
+                    last_cc_event_len = claude_code_text_buf.len();
+                } else if text_buf.len() > last_text_event_len {
+                    let delta = &text_buf[last_text_event_len..];
+                    pending_events.push(ResponseEvent::Text {
+                        md: delta.to_string(),
+                    });
+                    last_text_event_len = text_buf.len();
+                }
+
+                let (tool_name, description) = super::super::describe_tool_event(event);
+                pending_steps.push(Step {
+                    description: description.clone(),
+                    tool_name: Some(tool_name.clone()),
+                    success: true,
+                    context_tokens: None,
+                    context_messages: None,
+                    trimmed: None,
+                    tool_called_event_id: Some(event.id.to_string()),
+                });
+                pending_events.push(ResponseEvent::Step {
+                    description,
+                    tool_name: Some(tool_name),
+                    success: true,
+                    detail: None,
+                    context_tokens: None,
+                    context_messages: None,
+                    trimmed: None,
+                    tool_called_event_id: Some(event.id.to_string()),
+                });
+            }
+            "ToolResult" => {
+                let success = event
+                    .payload
+                    .get("success")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true); // missing field = legacy or pre-Phase-0; bias to success
+
+                // A result names its call, since a parallel run answers in
+                // completion order. A legacy row falls to the newest step.
+                let call_id =
+                    super::tool_called_event_id_of(&event.payload).map(|id| id.to_string());
+                let answers = |step_call: &Option<String>| match &call_id {
+                    Some(id) => step_call.as_deref() == Some(id.as_str()),
+                    None => true,
+                };
+                if let Some(step) = pending_steps
+                    .iter_mut()
+                    .rev()
+                    .find(|step| answers(&step.tool_called_event_id))
+                {
+                    step.success = success;
+                }
+
+                let tool_name = event
+                    .payload
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let result_text = event
+                    .payload
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let detail =
+                    super::super::super::describe_tool_result(tool_name, result_text, success);
+
+                if let Some(ResponseEvent::Step {
+                    success: ref mut s,
+                    detail: ref mut d,
+                    ..
+                }) = pending_events.iter_mut().rev().find(|e| match e {
+                    ResponseEvent::Step {
+                        tool_called_event_id,
+                        ..
+                    } => answers(tool_called_event_id),
+                    _ => false,
+                }) {
+                    *s = success;
+                    *d = detail;
+                }
+
+                pending_image_handles.extend(thread_image_handles_of(event));
+            }
+            "CodingAgentTextStreamed" | "TextStreamed" => {
+                if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
+                    let is_cc = event.event_type == "CodingAgentTextStreamed"
+                        || event.payload.get("channel").and_then(|v| v.as_str())
+                            == Some("claude_code");
+                    if is_cc {
+                        claude_code_text_buf.push_str(text);
+                        claude_code_text_last_ts = Some(event.created);
+                    } else {
+                        text_buf.push_str(text);
+                        text_last_ts = Some(event.created);
+                    }
+                }
+            }
+            "ResponseAborted" | "ResponseCanceled" | "ResponseGenerated" | "AssistantResponse" => {
+                let is_canceled = event.event_type == "ResponseCanceled";
+                let is_aborted = event.event_type == "ResponseAborted";
+
+                let result_text = event
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                // Snapshot remaining text after the last tool call as a final chunk
+                if claude_code_text_buf.len() > last_cc_chunk_len {
+                    pending_text_chunks.push(claude_code_text_buf[last_cc_chunk_len..].to_string());
+                    last_cc_chunk_len = claude_code_text_buf.len();
+                } else if text_buf.len() > last_text_chunk_len {
+                    pending_text_chunks.push(text_buf[last_text_chunk_len..].to_string());
+                    last_text_chunk_len = text_buf.len();
+                }
+
+                // Snapshot remaining text as event
+                if claude_code_text_buf.len() > last_cc_event_len {
+                    pending_events.push(ResponseEvent::Text {
+                        md: claude_code_text_buf[last_cc_event_len..].to_string(),
+                    });
+                } else if text_buf.len() > last_text_event_len {
+                    pending_events.push(ResponseEvent::Text {
+                        md: text_buf[last_text_event_len..].to_string(),
+                    });
+                }
+
+                // Capture any result_text content not covered by streaming events.
+                // The CC Result event may contain text beyond what was streamed via
+                // Message events (e.g., a final summary). Events-based rendering uses
+                // only events, so uncovered text would be invisible in the UI.
+                let is_cc_channel =
+                    event.payload.get("channel").and_then(|v| v.as_str()) == Some("claude_code");
+                if is_cc_channel && !result_text.is_empty() && !claude_code_text_buf.is_empty() {
+                    let buf = claude_code_text_buf.trim();
+                    let result = result_text.trim();
+                    if result.len() > buf.len() && result.starts_with(buf) {
+                        let extra = result[buf.len()..].trim();
+                        if !extra.is_empty() {
+                            pending_events.push(ResponseEvent::Text {
+                                md: extra.to_string(),
+                            });
+                        }
+                    }
+                } else if !is_cc_channel && !result_text.is_empty() && !text_buf.is_empty() {
+                    let buf = text_buf.trim();
+                    let result = result_text.trim();
+                    if result.len() > buf.len() && result.starts_with(buf) {
+                        let extra = result[buf.len()..].trim();
+                        if !extra.is_empty() {
+                            pending_events.push(ResponseEvent::Text {
+                                md: extra.to_string(),
+                            });
+                        }
+                    }
+                } else if !result_text.is_empty()
+                    && pending_events
+                        .iter()
+                        .any(|e| matches!(e, ResponseEvent::Step { .. }))
+                    && !pending_events
+                        .iter()
+                        .any(|e| matches!(e, ResponseEvent::Text { .. }))
+                {
+                    // No streaming occurred but step events exist (e.g. Thinking).
+                    // The frontend uses the events-based rendering path when events
+                    // are present, but without a text event the response is invisible.
+                    pending_events.push(ResponseEvent::Text {
+                        md: result_text.clone(),
+                    });
+                }
+
+                // For Claude Code responses, the streaming text (CodingAgentTextStreamed)
+                // and the result contain the same content. Avoid duplication:
+                // - If streamed text exists and differs from result, prepend it (legacy compat)
+                // - If they're the same content, just use the result text
+                let channel = event
+                    .payload
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                let content = if channel.as_deref() == Some("claude_code")
+                    && !claude_code_text_buf.is_empty()
+                {
+                    // Dedup: if the streamed text is a prefix of or equal to the result, skip it
+                    if result_text.starts_with(claude_code_text_buf.trim())
+                        || claude_code_text_buf.trim() == result_text.trim()
+                    {
+                        claude_code_text_buf.clear();
+                        claude_code_text_last_ts = None;
+                        last_cc_chunk_len = 0;
+                        result_text
+                    } else {
+                        let full = format!("{}\n\n{}", claude_code_text_buf, result_text);
+                        claude_code_text_buf.clear();
+                        claude_code_text_last_ts = None;
+                        last_cc_chunk_len = 0;
+                        full
+                    }
+                } else if !text_buf.is_empty() {
+                    // Dedup TextStreamed against ResponseGenerated
+                    if result_text.starts_with(text_buf.trim())
+                        || text_buf.trim() == result_text.trim()
+                    {
+                        text_buf.clear();
+                        text_last_ts = None;
+                        last_text_chunk_len = 0;
+                        result_text
+                    } else {
+                        let full = format!("{}\n\n{}", text_buf, result_text);
+                        text_buf.clear();
+                        text_last_ts = None;
+                        last_text_chunk_len = 0;
+                        full
+                    }
+                } else {
+                    result_text
+                };
+
+                // Prefer explicit request_event_id from payload; fall back to positional tracking
+                let user_eid = event
+                    .payload
+                    .get("request_event_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| current_request_event_id.clone());
+
+                messages.push(SessionMessage {
+                    role: "assistant".to_string(),
+                    content,
+                    created_at: event.created,
+                    channel,
+                    steps: std::mem::take(&mut pending_steps),
+                    image_handles: std::mem::take(&mut pending_image_handles),
+                    user_image_hashes: vec![],
+                    image_description: None,
+                    completed: Some(true),
+                    canceled: is_canceled,
+                    aborted: is_aborted,
+                    text_chunks: std::mem::take(&mut pending_text_chunks),
+                    events: std::mem::take(&mut pending_events),
+
+                    request_event_id: user_eid,
+                    event_id: Some(event.id.to_string()),
+                    thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                    agent: authoring_agent(event),
+                });
+                last_cc_event_len = 0;
+                last_text_event_len = 0;
+            }
+            "ResponseFailed" => {
+                let error = event
+                    .payload
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown error");
+
+                // Prefer explicit request_event_id from payload; fall back to positional tracking
+                let user_eid = event
+                    .payload
+                    .get("request_event_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| current_request_event_id.clone());
+
+                // Append the error text as a text event so events-based
+                // rendering shows the error alongside any accumulated steps.
+                let error_content = format!("[ERROR] **Error:** {}", error);
+                let mut events = std::mem::take(&mut pending_events);
+                if !events.is_empty() {
+                    events.push(ResponseEvent::Text {
+                        md: error_content.clone(),
+                    });
+                }
+                messages.push(SessionMessage {
+                    role: "assistant".to_string(),
+                    content: error_content,
+                    created_at: event.created,
+                    channel: None,
+                    steps: std::mem::take(&mut pending_steps),
+                    image_handles: std::mem::take(&mut pending_image_handles),
+                    user_image_hashes: vec![],
+                    image_description: None,
+                    completed: Some(true),
+                    canceled: false,
+                    aborted: false,
+                    text_chunks: std::mem::take(&mut pending_text_chunks),
+                    events,
+
+                    request_event_id: user_eid,
+                    event_id: Some(event.id.to_string()),
+                    thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                    agent: None,
+                });
+            }
+            "TriggerStarted" => {
+                let prompt = event
+                    .payload
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                pending_steps.clear();
+                pending_image_handles.clear();
+                pending_events.clear();
+
+                let channel = event
+                    .payload
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                current_request_event_id = Some(event.id.to_string());
+                current_thread_id = get_thread_id(event);
+
+                messages.push(SessionMessage {
+                    role: "user".to_string(),
+                    content: prompt,
+                    created_at: event.created,
+                    channel,
+                    steps: vec![],
+                    image_handles: vec![],
+                    user_image_hashes: vec![],
+                    image_description: None,
+                    completed: None,
+                    canceled: false,
+                    aborted: false,
+                    text_chunks: vec![],
+                    events: vec![],
+
+                    request_event_id: None,
+                    event_id: Some(event.id.to_string()),
+                    thread_id: current_thread_id.clone(),
+                    agent: None,
+                });
+            }
+            "TriggerCompleted" => {
+                // TriggerCompleted is a bookkeeping event — the actual response
+                // is already captured by the ResponseGenerated event in the same session.
+                // Attach any pending steps to the existing assistant message instead of
+                // creating a duplicate that would overwrite it.
+                if !pending_steps.is_empty() {
+                    if let Some(last_assistant) =
+                        messages.iter_mut().rev().find(|m| m.role == "assistant")
+                    {
+                        last_assistant.steps.append(&mut pending_steps);
+                    } else {
+                        pending_steps.clear();
+                    }
+                }
+            }
+            "ChildThreadCompleted" => {
+                // Render the typed event as a user-channel block so the parent's
+                // resume LLM sees a clearly-attributed structured callback in
+                // its conversation history.
+                let content = format_child_thread_completed_block(event, statuses);
+
+                messages.push(SessionMessage {
+                    role: "user".to_string(),
+                    content,
+                    created_at: event.created,
+                    channel: None,
+                    steps: vec![],
+                    image_handles: vec![],
+                    user_image_hashes: vec![],
+                    image_description: None,
+                    completed: None,
+                    canceled: false,
+                    aborted: false,
+                    text_chunks: vec![],
+                    events: vec![],
+                    request_event_id: None,
+                    event_id: Some(event.id.to_string()),
+                    thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                    agent: None,
+                });
+            }
+            "ChildThreadStopped" | "ChildThreadDetached" => {
+                // Same user-channel shape as the completion block above, so
+                // the parent's next turn knows the child is alive, or no
+                // longer its own.
+                let content = if event.event_type == "ChildThreadStopped" {
+                    format_child_thread_stopped_block(event)
+                } else {
+                    format_child_thread_detached_block(event)
+                };
+                messages.push(SessionMessage {
+                    role: "user".to_string(),
+                    content,
+                    created_at: event.created,
+                    channel: None,
+                    steps: vec![],
+                    image_handles: vec![],
+                    user_image_hashes: vec![],
+                    image_description: None,
+                    completed: None,
+                    canceled: false,
+                    aborted: false,
+                    text_chunks: vec![],
+                    events: vec![],
+                    request_event_id: None,
+                    event_id: Some(event.id.to_string()),
+                    thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                    agent: None,
+                });
+            }
+            "SpokenReplyGenerated" => {
+                // What the talker said out loud. It reaches the doer under
+                // the talker's own speaker label. So the doer reads what
+                // was already said in its name, never as its own turn.
+                //
+                // It consumes NOTHING pending. A spoken reply lands mid-call,
+                // often while the doer's turn is still running, and those
+                // steps and text belong to that turn.
+                let text = event
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                push_spoken(
+                    &mut messages,
+                    &mut spoken_tail,
+                    SpokenSide::Talker(authoring_agent(event)),
+                    event,
+                    text,
+                    current_thread_id.clone(),
+                );
+            }
+            "SpokenMessageReceived" => {
+                // Something the caller said on a call. It started no turn, so
+                // it is not a `MessageReceived`. The doer still has to read it:
+                // the next question can lean on it.
+                //
+                // A `user` message, because the caller said it. Consumes
+                // nothing pending, exactly as a spoken reply does.
+                let text = event
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                push_spoken(
+                    &mut messages,
+                    &mut spoken_tail,
+                    SpokenSide::Caller,
+                    event,
+                    text,
+                    current_thread_id.clone(),
+                );
+            }
+            "WorkDelegated" => {
+                // Why the talker asked for this turn, in its own words. Under
+                // the talker's speaker label, so the doer reads it as the
+                // request it is rather than as its own earlier thought.
+                let reason = event
+                    .payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !reason.trim().is_empty() {
+                    messages.push(SessionMessage {
+                        role: "assistant".to_string(),
+                        content: format!("[Asked for you] {}", reason.trim()),
+                        created_at: event.created,
+                        channel: None,
+                        steps: vec![],
+                        image_handles: vec![],
+                        user_image_hashes: vec![],
+                        image_description: None,
+                        completed: Some(true),
+                        canceled: false,
+                        aborted: false,
+                        text_chunks: vec![],
+                        events: vec![],
+                        request_event_id: None,
+                        event_id: Some(event.id.to_string()),
+                        thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                        agent: authoring_agent(event),
+                    });
+                    // A note about what the CALLER said, not more of the
+                    // conversation, so their sentence can still grow. Never
+                    // the talker's own row: see `SpokenTail::notes_after`.
+                    if let Some(tail) = spoken_tail.as_mut() {
+                        if tail.from_caller {
+                            tail.notes_after += 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Flush any remaining streaming text or pending events as a single assistant message.
+    // Both text_buf (outer LLM preamble) and claude_code_text_buf (CC output) may
+    // have content when the user reloads mid-Claude Code session. They're part of the same
+    // response and must be combined — creating separate messages would orphan one.
+    // Also flush when pending_events exist without text (e.g. CC made tool calls
+    // before sending any text) — without this, step events are lost on reload and
+    // the frontend has no events to show in the More/Less and Steps toggles.
+    // completed: None — still in progress, not an interruption.
+    let has_cc_text = !claude_code_text_buf.is_empty();
+    let has_text = !text_buf.is_empty();
+    let has_pending_events = !pending_events.is_empty();
+    if has_cc_text || has_text || has_pending_events {
+        // Snapshot remaining text deltas as final chunks
+        if claude_code_text_buf.len() > last_cc_chunk_len {
+            pending_text_chunks.push(claude_code_text_buf[last_cc_chunk_len..].to_string());
+        }
+        if text_buf.len() > last_text_chunk_len {
+            pending_text_chunks.push(text_buf[last_text_chunk_len..].to_string());
+        }
+        // Snapshot remaining text as events
+        if claude_code_text_buf.len() > last_cc_event_len {
+            pending_events.push(ResponseEvent::Text {
+                md: claude_code_text_buf[last_cc_event_len..].to_string(),
+            });
+        }
+        if text_buf.len() > last_text_event_len {
+            pending_events.push(ResponseEvent::Text {
+                md: text_buf[last_text_event_len..].to_string(),
+            });
+        }
+
+        // Combine content — outer LLM preamble + CC text are part of the same response
+        let content = if has_text && has_cc_text {
+            format!("{}\n\n{}", text_buf, claude_code_text_buf)
+        } else if has_cc_text {
+            claude_code_text_buf.clone()
+        } else if has_text {
+            text_buf.clone()
+        } else {
+            String::new() // Events-only: no text yet (e.g. CC tool calls before text)
+        };
+        let channel = if has_cc_text || (!has_text && has_pending_events) {
+            Some("claude_code".to_string())
+        } else {
+            None
+        };
+        let created_at = claude_code_text_last_ts
+            .or(text_last_ts)
+            .unwrap_or_else(|| messages.last().map(|m| m.created_at).unwrap_or_default());
+
+        claude_code_text_buf.clear();
+        text_buf.clear();
+
+        messages.push(SessionMessage {
+            role: "assistant".to_string(),
+            content,
+            created_at,
+            channel,
+            steps: std::mem::take(&mut pending_steps),
+            image_handles: std::mem::take(&mut pending_image_handles),
+            user_image_hashes: vec![],
+            image_description: None,
+            completed: None,
+            canceled: false,
+            aborted: false,
+            text_chunks: std::mem::take(&mut pending_text_chunks),
+            events: std::mem::take(&mut pending_events),
+            request_event_id: current_request_event_id.clone(),
+            event_id: None,
+            thread_id: current_thread_id.clone(),
+            agent: None,
+        });
+    }
+
+    // If there are pending steps (tool events after the last user message but before any
+    // response), attach them to the last user message so the frontend can display them
+    // in the "still working" state during reconnection.
+    if !pending_steps.is_empty() {
+        if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
+            last_user.steps = pending_steps;
+        }
+    }
+
+    messages
+}
+
+/// The thread's cached *conversation summary*, or `None` before its first
+/// successful summarisation (ADR 0102).
+///
+/// The newest `ConversationSummarized` wins. Events arrive in chronological
+/// order, so the last one seen is it. A row missing either field is skipped
+/// rather than trusted: a summary with no boundary cannot be checked for
+/// staleness, and a boundary with no text is not a summary.
+pub(crate) fn newest_conversation_summary(events: &[EventRow]) -> Option<CachedSummary> {
+    let mut found: Option<CachedSummary> = None;
+    for event in events {
+        if event.event_type != "ConversationSummarized" {
+            continue;
+        }
+        let Some(summary) = event
+            .payload
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(covers_through) = event
+            .payload
+            .get("covers_through_event_id")
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        found = Some(CachedSummary {
+            summary: summary.to_string(),
+            covers_through_event_id: covers_through.to_string(),
+        });
+    }
+    found
+}
+
+/// A `ConversationSummarized` payload, reduced to what the history builder
+/// reads. The count and model live on the event for the audit trail only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedSummary {
+    pub summary: String,
+    /// The `SessionMessage::event_id` of the newest turn this paragraph covers.
+    pub covers_through_event_id: String,
+}
+
+/// Walk every `ImageDescribed` event and collect the latest description per
+/// `source_event_id`. Latest-wins because the source can in principle be
+/// described more than once (the current emit site fires only on iteration 1
+/// of the agentic loop, so re-describes don't happen today, but a future retry
+/// path should produce the most recent text without history projection
+/// rewrites). Multi-image messages emit one `ImageDescribed` per attached
+/// hash all carrying the same description text — collapsing on
+/// `source_event_id` joins them back into the single per-message description
+/// that consumers expect.
+fn collect_image_descriptions(events: &[EventRow]) -> std::collections::HashMap<String, String> {
+    let mut by_source: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for event in events {
+        if event.event_type != "ImageDescribed" {
+            continue;
+        }
+        let Some(source_id) = event
+            .payload
+            .get("source_event_id")
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let Some(desc) = event.payload.get("description").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Last write wins — `events` arrives in chronological order from
+        // the loader, so the most recently emitted description survives.
+        by_source.insert(source_id.to_string(), desc.to_string());
+    }
+    by_source
+}

@@ -1,0 +1,338 @@
+import { effect, untracked } from '@preact/signals';
+import { pageTitle, visibleWorkspaceName, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, collapsedExchanges, collapsedInitiators, openSubAgentGroups, OPEN_SUB_AGENT_GROUPS_KEY, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, engineRestarting, focusedThreadId, threadMap, isThreadStreaming, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
+import { clientRefreshing } from '../hooks/sw-update';
+import { handleRestartTimeout } from './actions/connection';
+import { onNotificationDetailClosed } from './actions/notifications';
+import { installAppAppearanceSync } from './actions/app-appearance';
+import { installNotificationToastLifetime } from './actions/in-app-notification-toast';
+import { installUnregisteredRepoTargetReset } from './actions/compose';
+import { installLiveUtteranceRow } from './liveUtterance';
+import { watchTranscriptLiveness } from './transcriptLiveness';
+import { setTranscriptLive } from '../components/chat/scrollState';
+import { voiceCall } from './voiceCall';
+import { isOnCall } from '../voice/callState';
+import { syncWorkspaceAppBadge } from './actions/app-badge';
+import { pushNativeWindowTitle } from '../utils/windowTitle';
+import { installMotionAttribute } from '../utils/motion';
+import { installThemeEffectsAttribute } from '../utils/themeEffects';
+import { ANIMATION_SPEED_STORAGE_KEY } from '@lucidos/appearance';
+import { drawerGrouping, appsList } from './store';
+import { threadFilterPanelOpen, closeThreadFilterPanel } from './threadFilterPanel';
+import { appIdsMissingFromFacets } from './appFilters';
+import { reloadFacetsForApps } from './actions/thread-loading';
+import { appById } from './appsById';
+import { forgetAppById, readAppsById } from './actions/appsById';
+
+// Sync page title with unread count and workspace name
+effect(() => {
+  document.title = pageTitle.value;
+});
+
+// Names the packaged window after the workspace it shows, so the macOS Window
+// menu lists two workspaces rather than "Lucidos" twice. A no-op in the
+// browser. Its own effect rather than a line in the one above. This title
+// carries no unread count, so it must not re-push on every count change. See
+// utils/windowTitle.ts.
+effect(() => {
+  void pushNativeWindowTitle(visibleWorkspaceName.value);
+});
+
+// PWA app-icon badge: mirror the unread count onto the installed PWA icon. What
+// that count covers depends on the origin (behind the gateway one icon covers
+// every workspace, so this workspace's count is summed with the others); the
+// composition and the context gates (picker / Tauri) both live inside
+// `syncWorkspaceAppBadge`, which also runs at module init here, clearing an icon
+// badge a push left behind before the unread set has loaded. Live while the app
+// is open; the service worker keeps a CLOSED PWA fresh via the push payload's
+// `app_badge`.
+//
+// This effect covers only count CHANGES — a computed doesn't notify when its
+// recomputed value is equal. The no-change case (a reload landing the same
+// count, a mark-read for a row this device never had) is covered by the explicit
+// re-asserts in actions/notifications.ts and on resume; see the
+// `syncWorkspaceAppBadge` doc comment for why both are needed.
+effect(() => {
+  syncWorkspaceAppBadge();
+});
+
+// The thread filter shapes the Folders grouping only, so a switch to Ongoing
+// closes its panel. At load too, for a panel restored open.
+effect(() => {
+  if (drawerGrouping.value === 'ongoing' && untracked(() => threadFilterPanelOpen.value)) closeThreadFilterPanel();
+});
+
+// The engine labels the app filter's facets (ADR 0404). A new thread's app
+// it does not list yet, such as a widget, earns one reload.
+effect(() => {
+  const ids = appIdsMissingFromFacets.value;
+  if (ids.length > 0) untracked(() => reloadFacetsForApps(ids));
+});
+
+// Opening a notification retries its app's failed read, once per open: this
+// effect reads nothing but the notification.
+effect(() => {
+  const appId = viewingNotification.value?.app_id;
+  if (appId && untracked(() => appById(appId).status) === 'failed') forgetAppById(appId);
+});
+
+// A notification may link a widget, which the apps list never holds (ADR
+// 0402). Read it by id, so only a 404 makes it "Unknown app".
+effect(() => {
+  const appId = viewingNotification.value?.app_id;
+  const apps = appsList.value;
+  if (!appId || apps.status !== 'loaded' || apps.data.some(a => a.id === appId)) return;
+  if (appById(appId).status === 'not-loaded') untracked(() => void readAppsById([appId]));
+});
+
+// The retired status filter's choice, and the open group of the grouping once
+// called Status. A device that held either lands on Folders. A temporary
+// measure: docs/temporary-measures.md § Retired drawer keys cleared at load.
+localStorage.removeItem('lucidos-alt-view');
+localStorage.removeItem('lucidos-drawer-open-status-group');
+
+// Clean up stale localStorage keys — model/effort are now per-thread, not persisted
+localStorage.removeItem('lucidos-model');
+localStorage.removeItem('lucidos-reasoning-effort');
+// The unread count is now derived from the loaded unread set (store.ts
+// `unreadCount` computed), not a cached number — drop the legacy persisted key
+// so a stale value can't linger in storage.
+localStorage.removeItem('lucidos-unread-count');
+// Legacy key from when the toggle used a different shape — drop so it can't
+// shadow the current 'lucidos-input-mode' payload.
+localStorage.removeItem('lucidos-input-target');
+
+// Persist the compose actor toggle (Lucidos / Claude). Restored on init in
+// store.ts so a Claude pick survives reload.
+effect(() => {
+  localStorage.setItem('lucidos-input-mode', JSON.stringify(inputMode.value));
+});
+
+// Persist animation speed
+effect(() => {
+  localStorage.setItem(ANIMATION_SPEED_STORAGE_KEY, String(animationSpeed.value));
+});
+
+// Publish the resolved motion as `data-motion` on <html>, which every reduced
+// motion rule in the stylesheets keys on. The boot script set the first value.
+installMotionAttribute();
+
+// Publish the resolved theme effects as `data-theme-effects`, which the generated
+// theme part rules key on to drop part shadows and filters.
+installThemeEffectsAttribute();
+
+// Persist the toast-placement pick, device-local like the slider above.
+// Temporary, and it goes when the shape is chosen (docs/temporary-measures.md).
+effect(() => {
+  localStorage.setItem('lucidos-toast-placement', toastPlacement.value);
+});
+
+// Publish the animation-speed slider to CSS. Every --duration-* token in
+// styles/global/base.css is its 1x literal times this, so a plain CSS
+// transition scales with the slider the same way the JS-driven animations
+// (FLIP, toasts) already did. Reduced motion collapses it. Unitless, because
+// the tokens multiply it into a time. The boot script publishes the first
+// value, and base.css defaults it to 1 for any document without either.
+effect(() => {
+  document.documentElement.style.setProperty('--duration-scale', String(durationScale.value));
+});
+
+// Persist the two transcript-wide turn controls. Both keys and the write itself
+// come from `store.ts`, beside the seeds that read them back: absent means ON,
+// so a bare `setItem(key, String(value))` here would record the default in
+// every browser that merely opened the app and make the default unchangeable
+// without renaming the keys, which is the trap the `-v2` names paid for once.
+effect(() => {
+  persistTurnControl(STEPS_EXPANDED_KEY, stepsExpanded.value);
+});
+
+effect(() => {
+  persistTurnControl(DETAILS_EXPANDED_KEY, detailsExpanded.value);
+});
+
+// Persist expanded folders
+effect(() => {
+  localStorage.setItem('lucidos-expanded-folders', JSON.stringify([...expandedFolders.value]));
+});
+
+// Persist thread drawer open state
+effect(() => {
+  localStorage.setItem('lucidos-thread-drawer-open', String(threadDrawerOpen.value));
+});
+
+// Persist selected coding-agent scope (Lucidos / external repo / app). Legacy
+// `lucidos-cc-last-repo` / `lucidos-cc-last-scope` are migrated once at
+// signal-restore time inside store.ts; this effect only ever writes the new key.
+effect(() => {
+  localStorage.setItem('lucidos-coding-agent-last-scope', JSON.stringify(selectedScope.value));
+});
+
+// Persist notifications filter
+effect(() => {
+  localStorage.setItem(NOTIFICATIONS_FILTER_STORAGE_KEY, notificationsFilter.value);
+});
+
+effect(() => {
+  localStorage.setItem('lucidos-collapsed-exchanges', JSON.stringify([...collapsedExchanges.value]));
+});
+
+effect(() => {
+  localStorage.setItem('lucidos-collapsed-initiators', JSON.stringify([...collapsedInitiators.value]));
+});
+
+effect(() => {
+  localStorage.setItem(OPEN_SUB_AGENT_GROUPS_KEY, JSON.stringify([...openSubAgentGroups.value]));
+});
+
+// Persist source-vs-rendered preview toggle (md/html/csv/svg + diff view)
+effect(() => {
+  localStorage.setItem('lucidos-file-preview-source', String(filePreviewSource.value));
+});
+
+// Persist the side-by-side diff toggle. Deliberately NOT in the reset below: it
+// is a way of reading diffs, not a per-file override like diffWholeFile.
+effect(() => {
+  localStorage.setItem('lucidos-diff-side-by-side', String(diffSideBySide.value));
+});
+
+// Persist the soft-wrap toggle. Same class as the one above, and out of the
+// reset below for the same reason: it is a way of reading a file.
+effect(() => {
+  localStorage.setItem('lucidos-file-preview-wrap', String(filePreviewWrap.value));
+});
+
+// Reset transient preview toggles whenever the previewed file changes (or the
+// preview closes): inline edit mode AND the diff whole-file *override*. Clearing
+// the override to `null` re-derives each new diff's default from file status (see
+// `diffWholeFileEffective`: added → whole file, otherwise the hunks) instead of
+// dragging the prior file's explicit toggle along. Restore-from-history
+// (navigation.restoreState) sets panelOverlay directly without going through
+// openFilePreview, so resetting here — keyed on the previewed path — covers every
+// entry point, not just the click path. Both signals are non-persisted, so even
+// if this effect doesn't fire on the initial hydration tick they start reset.
+let lastPreviewFile: string | null = previewFile.value;
+effect(() => {
+  const path = previewFile.value;
+  if (path !== lastPreviewFile) {
+    lastPreviewFile = path;
+    filePreviewEditing.value = false;
+    diffWholeFile.value = null;
+  }
+});
+
+// Reset the notification view-dedup guard (and refresh the inbox list when it's
+// the active panel) whenever the notification detail closes. The overlay is
+// cleared by panel Back nav / menu switch / restore — none of which run an
+// explicit close action — so keying on the open notification's id here covers
+// every close path, mirroring the `lastPreviewFile` reset above. Only the
+// →null edge counts as a close; a prev/next walk (X→Y) must not reset the guard
+// or reload mid-walk. `untracked` keeps the effect's sole dependency
+// `viewingNotification` (onNotificationDetailClosed reads activeMenuItem and
+// writes the notifications/toasts signals, which would otherwise be tracked).
+let lastViewingNotificationId: string | null = viewingNotification.value?.id ?? null;
+effect(() => {
+  const id = viewingNotification.value?.id ?? null;
+  if (id === lastViewingNotificationId) return;
+  const closed = id === null && lastViewingNotificationId !== null;
+  lastViewingNotificationId = id;
+  if (closed) untracked(() => onNotificationDetailClosed());
+});
+
+// Persist selected change so the Diff view survives reload — without this,
+// reloading on the Changes tab silently drops the selection and the toggle
+// snaps back to All Files. Restored at startup via restoreRepoSelectionFromStorage.
+effect(() => {
+  const id = repoSelectedChangeId.value;
+  if (id) {
+    localStorage.setItem(SELECTED_CHANGE_KEY, id);
+  } else {
+    localStorage.removeItem(SELECTED_CHANGE_KEY);
+  }
+});
+
+// Show a spinner toast the instant a client refresh starts, mirroring the
+// "Restarting engine..." banner an engine restart raises. `refreshClient`
+// (hooks/sw-update.ts) flips `clientRefreshing` true before its async SW swap +
+// reload, and never clears it (the reload tears the page down), so this fires
+// once per refresh and the spinner stays until the new page loads. Lives here as
+// an effect rather than in `refreshClient` so showing it doesn't pull `showToast`
+// into sw-update.ts — the store ↔ sw-update import cycle `clientRefreshing`'s
+// home deliberately avoids. dismissable/showWhileUnavailable match the restart
+// toast: it can't be closed mid-reload, and it survives the showToast
+// engine-restart suppression in the rare refresh-during-restart overlap.
+//
+// A refresh always supersedes the "New version available" prompt — that prompt's
+// whole job is to start a refresh, which is now in flight — so dismiss it here
+// rather than leaving it stacked above the spinner. This covers every refresh
+// entry point (the toast's own Refresh button, the control panel, the
+// applied-change / reconnect toasts), so the update prompt is replaced by the
+// spinner regardless of how the refresh was triggered.
+//
+// `untracked` keeps the effect's only dependency `clientRefreshing` — showToast /
+// dismissToast read AND write the `toasts` signal, so tracking them here would
+// make the effect re-trigger itself (a signals "Cycle detected").
+effect(() => {
+  if (!clientRefreshing.value) return;
+  untracked(() => {
+    dismissToast('update-available');
+    showToast('Refreshing...', 'info', { key: 'refreshing', spinning: true, dismissable: false, showWhileUnavailable: true });
+  });
+});
+
+// Engine-restart safety timeout. The initiating tab no longer mounts the
+// UiBlockingOverlay during a restart (the gateway boot splash + GET-gate + SSE
+// reconnect handle recovery), but the GET-gate `awaitEngineReady` still blocks
+// reads on `engineRestarting` — so if the engine never comes back, something must
+// clear the flag or reads hang forever. This effect carries the timeout the
+// overlay used to own: arm it on the false→true edge, cancel on the true→false
+// edge (reconnect via started_at, or a restart spawn-failure that reverts the
+// flag). handleRestartTimeout probes health before declaring a timeout, so a
+// frozen timer firing on iOS PWA resume (engine already restarted) doesn't show a
+// false error — see its doc comment in connection.ts. The effect's only
+// dependency is `engineRestarting`; handleRestartTimeout runs async (out of the
+// tracking scope) so flipping the flag inside it can't form a cycle.
+const RESTART_TIMEOUT_MS = 300_000;
+let restartTimer: ReturnType<typeof setTimeout> | null = null;
+effect(() => {
+  if (engineRestarting.value) {
+    if (restartTimer === null) {
+      restartTimer = setTimeout(() => {
+        restartTimer = null;
+        void handleRestartTimeout();
+      }, RESTART_TIMEOUT_MS);
+    }
+  } else if (restartTimer !== null) {
+    clearTimeout(restartTimer);
+    restartTimer = null;
+  }
+});
+
+installAppAppearanceSync();
+
+// A toast is the third projection of the unread set, beside the bell badge and
+// the Unread tab. So a row that has been read can hold no toast. The *seen
+// target* rule (shellStartup.ts) is the loudest reason it exists: reaching a
+// tap target drops the notification, and the toast has to go with it. Wired
+// beside its own toasts. See actions/in-app-notification-toast.ts and
+// system-knowhow/notifications.md §4.
+installNotificationToastLifetime();
+
+// A deleted repository stops being the composer's target. See
+// actions/compose.ts `installUnregisteredRepoTargetReset`.
+installUnregisteredRepoTargetReset();
+
+// The caller's bubble appears as they start speaking, rather than when the
+// words finally land. Its own module for the same reason as the watch above:
+// the rule belongs beside the call it reads. See store/liveUtterance.ts.
+installLiveUtteranceRow();
+
+// The transcript's follow parks on a scroll unless the thread on screen is
+// live streaming: the agent running, or a call up on it. A call writes no
+// turn, so the projection alone reads it as quiet. See transcriptLiveness.ts.
+watchTranscriptLiveness({
+  focused: focusedThreadId,
+  threads: threadMap,
+  isLive: (thread) => isThreadStreaming(thread)
+    || (isOnCall(voiceCall.value.phase) && voiceCall.value.threadId === thread.meta.id),
+  setLive: setTranscriptLive,
+});
+

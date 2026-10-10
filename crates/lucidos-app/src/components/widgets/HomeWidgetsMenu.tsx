@@ -1,0 +1,107 @@
+import type { ComponentChildren } from 'preact';
+import { useRef } from 'preact/hooks';
+import type { ThreadWidget } from '../../api/client/widgets';
+import { useLongPress, type LongPressHandlers } from '../../hooks/useLongPress';
+import { homeThreadId } from '../../store/actions/homeThread';
+import type { Loadable } from '../../store/types';
+import { threadWidgetsFor } from '../../store/widgets';
+import { openWidgetWindow } from '../../store/widgetWindows';
+import { viewportIsMobile } from '../../utils/viewport';
+import { AppIcon } from '../shared/AppIcon';
+import { OverflowMenu, type OverflowMenuContext, type OverflowMenuOpener } from '../shared/OverflowMenu';
+
+/** The header rows a Home entry can sit in. A window opens under its row. */
+const HEADER_ROWS = '.mobile-header-row, .pane-header-brand';
+
+export const NO_HOME_WIDGETS = 'No widgets are pinned to Home.';
+
+/** The long-press menu's rows: one per widget pinned to Home, in shelf order.
+ *  Drawn from the first frame under its label, so nothing resizes when Home's
+ *  widgets land. */
+export function homeWidgetsMenuItems(
+  { run }: OverflowMenuContext,
+  widgets: Loadable<ThreadWidget[]>,
+  onPick: (appId: string) => void,
+): ComponentChildren {
+  const pinned = widgets.status === 'loaded' ? widgets.data.filter((w) => w.pinned) : [];
+  return (
+    <>
+      <div class="control-section-label">Pinned to Home</div>
+      {pinned.map((w) => (
+        <button
+          key={w.app_id}
+          type="button"
+          role="menuitem"
+          class="thread-overflow-item"
+          data-home-widget={w.app_id}
+          onClick={run(() => onPick(w.app_id))}
+        >
+          <AppIcon appId={w.app_id} name={w.name} icon={w.icon} />
+          <span class="thread-overflow-label">{w.name}</span>
+        </button>
+      ))}
+      {widgets.status === 'loaded' && pinned.length === 0 && (
+        <div class="thread-overflow-note">{NO_HOME_WIDGETS}</div>
+      )}
+      {widgets.status === 'failed' && (
+        <div class="thread-overflow-note thread-overflow-note-error" role="alert">
+          Couldn't read Home's widgets: {widgets.error}
+        </div>
+      )}
+    </>
+  );
+}
+
+/** Open a Home widget's window under the header row `near` sits in. */
+export function openHomeWidgetWindow(appId: string, near: HTMLElement | null): void {
+  const home = homeThreadId.value;
+  if (!home) return;
+  const remPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
+  const row = near?.closest(HEADER_ROWS)?.getBoundingClientRect();
+  const gap = 0.5 * remPx;
+  const at = row ? { x: row.left + gap, y: row.bottom + gap } : { x: gap, y: gap };
+  openWidgetWindow(home, appId, at, 1.5 * remPx);
+}
+
+/** Where a Home entry's pick opens its window, when the entry itself is not in
+ *  a header row, and what else the pick does first. */
+export interface HomeWidgetsPressOptions {
+  /** An element in the header row the window opens under. Defaults to the
+   *  entry itself. */
+  near?: () => HTMLElement | null;
+  /** Runs before the window opens, such as closing the menu the entry is in. */
+  onPick?: () => void;
+}
+
+/** A Home entry's gesture (ADR 0362): a tap runs `onTap`, and a hold or a
+ *  right-click opens the menu of widgets pinned to Home. A pick opens the
+ *  widget's window and leaves the user where they are.
+ *
+ *  Returns the handlers for the entry's element and the menu to render beside
+ *  it. The menu draws nothing in place: it is portaled while open. */
+export function useHomeWidgetsPress(
+  onTap: (e: MouseEvent) => void,
+  { near, onPick }: HomeWidgetsPressOptions = {},
+): { press: LongPressHandlers; menu: ComponentChildren } {
+  const openMenu = useRef<OverflowMenuOpener | null>(null);
+  const press = useLongPress(
+    (el, at) => openMenu.current?.(el, viewportIsMobile.value ? undefined : at),
+    onTap,
+  );
+  const menu = (
+    <OverflowMenu
+      ariaLabel="Widgets pinned to Home"
+      hostOpener={{ ref: openMenu, trigger: false }}
+      items={(ctx) => {
+        const home = homeThreadId.value;
+        if (!home) return null;
+        return homeWidgetsMenuItems(ctx, threadWidgetsFor(home), (appId) => {
+          const at = near ? near() : ctx.anchor;
+          onPick?.();
+          openHomeWidgetWindow(appId, at);
+        });
+      }}
+    />
+  );
+  return { press, menu };
+}

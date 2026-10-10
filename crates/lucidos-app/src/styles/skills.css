@@ -1,0 +1,507 @@
+/* ===== Triggers ===== */
+
+.trigger-row .list-row-name,
+.app-row .list-row-name {
+    white-space: normal;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+/* Trigger rows can grow tall (cron/event lists); the row top-aligns its
+ * children, so pin the action buttons to the bottom edge. */
+.trigger-row .list-row-actions {
+    align-self: flex-end;
+}
+
+/* On desktop an app row's actions sit level with its app icon and text
+ * block. A phone row stacks, with its actions bottom-right. */
+@media (--desktop-layout) {
+    .app-row .list-row-actions {
+        align-self: center;
+    }
+}
+
+/* Gated on the ROW's own width, not the viewport's. The two differ constantly on
+   a desktop: the row is only as wide as the content pane the split divider was
+   dropped at, and that width is the whole question here. Named, so the query
+   cannot silently resolve to some outer container (`.repo-preview-split` and
+   `step-row` are the others in this app) and match never or always. Safe to
+   contain: a row's width comes from `.trigger-group-section`, a stretching flex
+   column, never from its contents. */
+.trigger-row {
+    container-type: inline-size;
+    container-name: trigger-row;
+}
+
+/* A trigger row carries three actions (Delete, Pause, Run once) against an info
+   column that is already several lines tall: title, chips, cron description and
+   expression, next runs, last run. Side by side those buttons claim the width of
+   all three labels at once, and once the row is narrow the column pays for it in
+   wraps, the title breaking after two words and the cron expression breaking
+   mid-expression. Stack them at that point and the cost is nothing: the stack is
+   no taller than the lines already beside it, a third of the width, and the
+   buttons come out one width (a column flex container stretches them to the
+   widest label), so the group reads as one block.
+
+   The gate measures the row's CONTENT box, so the 1rem gutters on each side are
+   already out of it. Three buttons abreast come to 12.8rem plus a 0.75rem gap,
+   which at 28rem leaves the info column ~14.5rem: enough for the chips line and
+   for a title of around 27 characters to stay whole (a 20-character one wraps at
+   10.5rem, measured at both 100% and 125% scale). Below that the column starts
+   breaking the title after two words. In rem, so the gate tracks the user's UI
+   scale (the root font-size IS that scale) rather than pinning to a width
+   measured at 100%. Every row in a list has the same width, so they all turn
+   together and the list stays uniform.
+
+   Desktop only: below the mobile breakpoint `.list-row` is itself a column
+   (mobile.css), so the actions already have a full-width line of their own under
+   the info and a stack there would just spend three rows of a phone screen on
+   what fits in one. */
+@media (--desktop-layout) {
+    @container trigger-row (max-width: 28rem) {
+        .trigger-row .list-row-actions {
+            flex-direction: column;
+        }
+    }
+}
+
+/* Change rows carry up to four actions (Thread, Diff, Discard, Apply) — too
+ * wide to sit beside the description without squeezing it into a narrow,
+ * heavily-wrapped column. Stack like apps/triggers do on mobile: the
+ * description (and details/label) span the full row width, with the actions
+ * on their own bottom-right row below. */
+.change-row {
+    flex-direction: column;
+    align-items: flex-start;
+}
+
+.change-row .list-row-info {
+    width: 100%;
+}
+
+.change-row .list-row-actions {
+    align-self: flex-end;
+}
+
+/* The control after Diff keeps one width on every row, so Diff sits in one
+   column down the list. 8rem holds "Apply on settle", the longest common face. */
+.change-row-primary {
+    min-width: 8rem;
+}
+
+.change-row-primary .split-button-primary {
+    flex: 1;
+}
+
+.trigger-disabled > .list-row-info {
+    opacity: 0.55;
+}
+
+.trigger-cron-list {
+    list-style: none;
+    margin: 0.125rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.0625rem;
+}
+
+.trigger-cron-item {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    font-size: var(--font-size-xs);
+}
+
+.trigger-cron-desc {
+    color: var(--text-secondary);
+}
+
+.trigger-cron {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+.trigger-enabled {
+    color: var(--accent);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: var(--font-size-xs);
+}
+
+.trigger-paused {
+    color: var(--text-muted);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: var(--font-size-xs);
+}
+
+.trigger-no-more-runs {
+    color: var(--text-muted);
+    font-weight: 500;
+    font-size: var(--font-size-xs);
+    font-style: italic;
+}
+
+/* A cron that can never fire (Feb 31 and friends). Replaces the status chip
+   rather than sitting beside it: the trigger is neither Active nor spent, and
+   "No more runs" would read as a one-shot that already did its job. */
+.trigger-schedule-error {
+    color: var(--accent-red);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: var(--font-size-xs);
+}
+
+/* The next few fire times, under the cron list. A "monthly" trigger listing
+   three dates a year apart gives itself away here, before it costs anything. */
+.trigger-next-runs {
+    margin-top: 0.125rem;
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+/* Last-run outcome chip on the trigger row (OK / failed). Sits inline after the
+   "Last run <time>" line so a threadless (script) trigger's health is visible at
+   a glance; absent until the trigger has run under an engine that records status. */
+.trigger-last-run {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+}
+
+.trigger-event-list {
+    list-style: none;
+    padding: 0;
+    margin: 0.125rem 0 0;
+}
+
+/* ===== Trigger groups (panel sections) ===== */
+
+.trigger-group-section,
+.trigger-group-members {
+    display: flex;
+    flex-direction: column;
+}
+
+/* Holds the name and the rename field in one box so the field can sit exactly
+   over the name while idle. It only grows while renaming: at rest the name
+   sizes the slot, which is what keeps the member count right beside it instead
+   of pushed to the far end of the heading. */
+.trigger-group-name-slot {
+    position: relative;
+    display: flex;
+    align-items: center;
+    min-width: 0;
+}
+
+.trigger-group-renaming .section-label,
+.trigger-group-renaming .trigger-group-name-slot {
+    flex: 1;
+    min-width: 0;
+}
+
+.trigger-group-header .section-label {
+    min-width: 0;
+}
+
+.trigger-group-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.trigger-group-renaming .trigger-group-name {
+    display: none;
+}
+
+/* Box and focus: global/text-input.css. */
+.trigger-group-name-input {
+    padding: 0.125rem 0.25rem;
+    /* Same text size and weight as the section label it replaces (the
+       input's own border and padding still make the header a few px taller while
+       renaming). Spelled out rather than `font: inherit`, which the rule used to
+       carry: the shorthand was declared after font-weight and reset it back to
+       inherited, and it also picked up the raw root size in the create row,
+       which sets no size of its own. */
+    font-family: inherit;
+    font-size: var(--font-size-md);
+    font-weight: 700;
+    min-width: 0;
+    flex: 1;
+}
+
+/* The idle rename field: laid over the name at the name's own size, invisible
+   and taking no pointer, so the heading looks and behaves exactly as it did and
+   the tap still reaches the collapse toggle underneath. It is here rather than
+   unmounted so the rename button can focus it inside the tap, which is the only
+   way iOS raises the keyboard (see TriggerGroupHeader). Deliberately NOT sized
+   to nothing: iOS scrolls the focused element into view, and it should be the
+   box the field is about to occupy. */
+.trigger-group-header:not(.trigger-group-renaming) .trigger-group-name-input {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* The idle create field, same bargain a row down: clipped to nothing so the
+   panel looks unchanged, while the input inside keeps a real box to focus.
+   Both classes, so it outranks the open row's padding declared further down. */
+.trigger-group-create-row.trigger-group-create-idle {
+    height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    overflow: hidden;
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* With a pointer, rename and delete wait until the heading is hovered or holds
+   focus, so a list of groups reads as titles rather than a column of icons.
+   Touch has no hover to reveal them, so there they always show. */
+@media (hover: hover) {
+    .trigger-group-header .list-section-actions {
+        opacity: 0;
+        transition: opacity var(--duration-fast);
+    }
+
+    .trigger-group-header:hover .list-section-actions,
+    .trigger-group-header:focus-within .list-section-actions {
+        opacity: 1;
+    }
+}
+
+/* Rename and delete are .icon-btn, not filled .action-btn pills: every section
+   heading carries both, so five groups put ten coloured blocks down the panel,
+   louder than the group names they belong to. They keep .icon-btn's own muted
+   foreground, already quieter than the name beside them, so only the delete
+   needs rules of its own. Its .trigger-group-rename twin carries no style and
+   is the pair's stable hook for e2e/trigger-groups.spec.ts. */
+
+/* Destructive on hover only, matching the queued-message trash: the glyph
+   already says delete, and a permanently red icon on every heading would put
+   the alarm back that the pills were removed for. */
+@media (hover: hover) {
+    .trigger-group-delete:hover {
+        color: var(--accent-red);
+        background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+    }
+}
+
+/* A group with members refuses deletion, and .icon-btn:disabled fades to 0.25,
+   which is a fine amount to take off a filled block and too much to take off a
+   2px stroke: the glyph all but vanished, so a group that CAN be deleted once
+   emptied read as one with no delete action at all. The pill it replaced said
+   that at 0.4, and the picker's disabled icons sit in the same band. The
+   tooltip naming what to do instead is out of reach either way, since a
+   disabled button dispatches no mouse events. */
+.trigger-group-delete:disabled {
+    opacity: 0.5;
+}
+
+.trigger-add-row {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+
+.trigger-add-row > .list-row-add-card {
+    flex: 1;
+}
+
+.trigger-group-create-row {
+    display: flex;
+    /* The section header's box. This is a heading with a name field in it,
+       so an edge that differs reads as a box that moved. */
+    padding: var(--section-header-pad) var(--section-inset-right) var(--section-header-pad) var(--section-inset-left);
+}
+
+.trigger-group-create-row > .trigger-group-name-input {
+    width: 100%;
+}
+
+.trigger-event-info {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    font-size: var(--font-size-xs);
+    margin-top: 0.125rem;
+}
+
+.trigger-event-type {
+    color: var(--accent);
+    font-weight: 500;
+}
+
+.trigger-condition {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+.trigger-subscription-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    padding: 0.5rem;
+    margin-bottom: 0.5rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.5);
+}
+
+.inline-form-body {
+    /* --space-lg (1rem) content-pane gutter (see .claude/rules/frontend.md). */
+    padding: var(--space-lg);
+}
+
+/* Box and focus: global/text-input.css. */
+.form-group textarea {
+    width: 100%;
+    padding: 0.625rem 0.75rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    resize: vertical;
+    min-height: 5rem;
+}
+
+.form-group .auto-textarea {
+    resize: none;
+    overflow: hidden;
+    min-height: 0;
+}
+
+.form-group .code-textarea {
+    min-height: 7.5rem;
+    max-height: 60vh;
+    overflow-y: auto;
+    resize: vertical;
+    white-space: pre;
+    tab-size: 2;
+    line-height: 1.4;
+}
+
+/* Single definition (a duplicate in pages.css was folded in here) — the
+   font-weight:normal matters for hints nested inside bold form labels. */
+.form-hint {
+    font-size: var(--font-size-2xs);
+    font-weight: normal;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+}
+
+/* Removable string list in trigger form (cron expressions) */
+.removable-list {
+    list-style: none;
+    margin: 0 0 0.375rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.removable-list-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.25rem 0.5rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.5);
+}
+
+.removable-list-item-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.0625rem;
+}
+
+.cron-description {
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}
+
+.cron-expression {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+.removable-input-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+}
+
+.removable-input-row .dropdown {
+    flex: 1;
+    min-width: 0;
+}
+
+/* Add row where the button sits INSIDE the field's frame. The wrapper owns the
+   border, background and focus ring, like .dropdown-input-wrap, and the input
+   is bare. So the button keeps its natural height, never stretched to the
+   field's by a sibling flex row. The ring is the text-input one
+   (global/text-input.css). */
+.input-with-action {
+    display: flex;
+    align-items: center;
+    padding-right: 0.375rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.5);
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
+}
+
+/* Prefixed to outrank `.form-group input` (pages.css) on specificity rather
+   than on the main.tsx import order. */
+.form-group .input-with-action input,
+.form-group .input-with-action input:focus {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+/* Invalid field, flagged by the form: the frame around a field (the cron add
+   row) or the field itself (the subscription condition textarea). The red has
+   to survive while the user is fixing the value, so the focus variants are
+   listed explicitly: they carry three classes and so outrank
+   `.form-group textarea:focus` and `.input-with-action:focus-within`, which
+   the two-class base selector alone would lose to (textarea) or tie with
+   (frame). A tie resolved by source order is not something a later edit to
+   this file should be able to flip. */
+.form-group .input-error,
+.form-group .input-error:focus,
+.form-group .input-error:focus-within {
+    border-color: var(--accent-red);
+}
+
+.form-error {
+    font-size: var(--font-size-2xs);
+    color: var(--accent-red);
+    margin-top: 0.25rem;
+}
+
+/* An error that carries its own recovery control. The message wraps and the
+   button keeps its natural size, so a long error never squashes the button. */
+.form-error-row {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-sm);
+}
+
+.form-error-row > span {
+    flex: 1;
+}
+
+/* ===== Apps ===== */
+
+/* Clickable list rows (e.g. single-UI apps) */
+.list-row.clickable {
+    cursor: pointer;
+}
