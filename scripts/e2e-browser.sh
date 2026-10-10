@@ -1,0 +1,995 @@
+#!/bin/bash
+# Run Playwright browser e2e tests against the e2e-test workspace.
+#
+# Usage:
+#   ./scripts/e2e-browser.sh [options] [-- playwright args]   # on GitHub's runners when it can, ADR 0386
+#   ./scripts/e2e-browser.sh --local [options]                # on this host
+#
+# Options:
+#   --local          Run on this host, not on GitHub. Local-only flags imply it.
+#   -h, --headed     Run with visible browser
+#   -f <file>        Run specific test file (e.g., chat.spec.ts)
+#   --no-reset       Skip DB reset AND leave the workspace running for the next
+#                    invocation. Use for fast iteration on a single spec.
+#   --webkit         Run mobile tests on WebKit (iOS Safari engine)
+#   --no-webkit      Run every browser project EXCEPT mobile-webkit
+#   --ios            Launch iOS Simulator with Safari (requires Xcode)
+#   --               Everything after this is passed to Playwright
+#
+# Examples:
+#   ./scripts/e2e-browser.sh                           # All tests
+#   ./scripts/e2e-browser.sh -h -f chat.spec.ts        # Headed, single file
+#   ./scripts/e2e-browser.sh -- --grep "sends message" # Filter by test name
+#   ./scripts/e2e-browser.sh --webkit                  # WebKit mobile tests
+#   ./scripts/e2e-browser.sh --no-webkit               # The cheap projects only
+#   ./scripts/e2e-browser.sh --ios                     # iOS Simulator
+#
+# Environment:
+#   LUCIDOS_E2E_WEBKIT_CHUNK    specs per fresh-browser chunk (default 3)
+#   LUCIDOS_E2E_WEBKIT_CHUNKS   run only nav chunks <first>-<last> (or <first>-)
+#   LUCIDOS_E2E_WEBKIT_PHASE    run one phase only: nav, cc, or both (default both)
+#
+# mobile-webkit grows the macOS VM compressor by roughly 15 GB. That is squeezed
+# idle memory host-wide rather than anything the run holds, so it is a cost to
+# the host's morning rather than a danger; see scripts/lib/host_memory_guard.sh.
+# The other five projects cost about 0.6 GB between them, so the two sets are
+# still run separately: `--no-webkit` here (or on scripts/e2e.sh) for the cheap
+# set, then `--webkit` for the expensive one. See docs/e2e-test-decisions.md.
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/e2e_github.sh
+source "$SCRIPT_DIR/lib/e2e_github.sh"
+e2e_github_handoff browser "$@"
+set -- ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+source "$SCRIPT_DIR/lib/e2e.sh"
+
+HEADED=""
+TEST_FILE=""
+NO_RESET=""
+USE_WEBKIT=""
+SKIP_WEBKIT=""
+USE_IOS=""
+IOS_ARGS=()
+PW_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--headed) HEADED=1; shift ;;
+        -f) TEST_FILE="$2"; shift 2 ;;
+        --no-reset) NO_RESET=1; shift ;;
+        --webkit) USE_WEBKIT=1; shift ;;
+        --no-webkit) SKIP_WEBKIT=1; shift ;;
+        --ios) USE_IOS=1; shift ;;
+        --device) IOS_ARGS+=(--device "$2"); shift 2 ;;
+        --screenshot) IOS_ARGS+=(--screenshot); shift ;;
+        --pwa) IOS_ARGS+=(--pwa); shift ;;
+        --) shift; PW_ARGS+=("$@"); break ;;
+        *) PW_ARGS+=("$1"); shift ;;
+    esac
+done
+
+if [ -n "$USE_WEBKIT" ] && [ -n "$SKIP_WEBKIT" ]; then
+    echo "e2e-browser.sh: --webkit and --no-webkit contradict each other" >&2
+    exit 1
+fi
+
+# iOS Simulator mode — delegate to e2e-ios.sh
+if [ -n "$USE_IOS" ]; then
+    exec "$SCRIPT_DIR/e2e-ios.sh" "${IOS_ARGS[@]}"
+fi
+
+# Named in this hold's E2ELockAcquired, so a memory snapshot can tell a WebKit
+# hold from a Chromium one. Ignored under the umbrella, which holds the lock.
+# shellcheck disable=SC2034 # read by _e2e_announce_lock_acquired in scripts/lib/e2e_lock.sh
+E2E_LOCK_PROJECTS="$(e2e_browser_lock_projects "$USE_WEBKIT" "$SKIP_WEBKIT" "$TEST_FILE" \
+    ${PW_ARGS[@]+"${PW_ARGS[@]}"})"
+setup_e2e_session e2e-browser --cleanup-worktrees-on-teardown
+
+# Host-load backpressure guard — the e2e lock is now held (by setup_e2e_session in
+# standalone mode, or by the umbrella scripts/e2e.sh under $LUCIDOS_E2E_UMBRELLA),
+# so this is the chokepoint right before the Playwright browser swarm spawns, for
+# BOTH entry paths. If the host is already saturated it waits/backs off; if it
+# stays saturated past the wait cap it returns HOST_LOAD_SATURATED_EXIT (75) and we
+# exit cleanly rather than piling the swarm onto a pegged host and wedging the
+# machine (2026-07-01 incident — see docs/e2e-test-decisions.md + host_load_guard.sh).
+# The lock is released on the way out by the EXIT-trap chain (standalone: this
+# script's teardown_e2e; umbrella: e2e.sh's set -e + teardown_e2e), so exit 75 never
+# leaves a stale lock. Deliberately invoked ONCE here, not also in e2e.sh, so the
+# umbrella run doesn't double the wait. e2e-api.sh is intentionally not guarded.
+wait_for_host_load || exit $?
+
+echo "Running browser e2e tests (port $VITE_PORT)"
+
+cd "$PROJECT_DIR/crates/lucidos-app"
+
+# Strict, deterministic install from the committed root lockfile (npm workspaces
+# hoists to the root, so run ci there; subshell keeps cwd at the app dir for
+# Playwright below).
+( cd "$PROJECT_DIR" && npm ci )
+
+# Every Playwright on the host shares one browsers cache, and any `playwright
+# install` deletes the builds no live install still registers. Ours registers a
+# worktree path that is later removed, so a foreign install (a workspace Python
+# venv, say) can take our browsers with it. Installing here is a no-op when the
+# build is present, and restores it when it is not.
+PW_BROWSERS=(chromium)
+[ -n "$SKIP_WEBKIT" ] || PW_BROWSERS+=(webkit)
+npx playwright install "${PW_BROWSERS[@]}"
+
+export E2E_WORKSPACE
+[ -n "$HEADED" ] && export HEADED=1
+
+# Start the WebKit RSS reaper — a host-memory safety net for the mobile-webkit
+# browser-process wedge (see docs/e2e-test-decisions.md). A wedged WebContent
+# child sits on its RSS; under nightly load several pile up and exhaust host
+# memory. The reaper SIGKILLs any single Playwright WebKit child over the cap;
+# Playwright's retries:1 recovers the affected test. Additive to gotoWithRetry +
+# retries:1, not a replacement.
+#
+# Teardown: in standalone mode setup_e2e_session's teardown_e2e (which calls
+# stop_e2e_background_guards) already owns the EXIT trap. Under the umbrella
+# ($LUCIDOS_E2E_UMBRELLA) setup_e2e_session installs no trap, so register one here
+# that stops both run-scoped loops — the reaper and the host-load sampler below —
+# when this browser phase exits, before the umbrella's wasm/embedder phases.
+start_webkit_reaper
+
+# Mid-run host-load sampler. wait_for_host_load above only knows about the
+# instant it fired; during the 2026-07-26 nightly an external daemon burst pinned
+# the host at load 83-227 for ~40 minutes AFTER that gate passed, starving the
+# browsers into timeouts that read exactly like product failures. The sampler
+# records load throughout the run so `finish` can classify such a run instead of
+# letting it pass for a product verdict. It never retries and never alters the
+# exit code (see report_host_load_saturation).
+start_host_load_sampler
+
+# Mid-run host-MEMORY sampler, which is what makes the boundary check peak-aware.
+# A boundary reading bounds the host at the boundary and says nothing about the
+# chunk that just ran, whose observed compressor deltas reach 1.16 GB. This loop
+# ticks throughout, and check_host_memory_at_boundary folds the worst sample
+# since the previous boundary over its own instantaneous reading. Purely
+# additive: with no sampler the boundary behaves exactly as it did before.
+# Reaped by the same stop_e2e_background_guards as the two above.
+start_host_memory_sampler
+
+if [ -n "${LUCIDOS_E2E_UMBRELLA:-}" ]; then
+    trap stop_e2e_background_guards EXIT
+fi
+
+# Every invocation of a project appends its output here, so the project can be
+# added up into one verdict (report_playwright_totals). Truncated per project,
+# removed on the way out.
+PW_TALLY_LOG="$(mktemp "${TMPDIR:-/tmp}/lucidos-pw-tally.XXXXXX")"
+
+# Every exit path funnels through here so the sampler is drained and the run is
+# classified exactly once, whichever branch below ran.
+finish() {
+    local rc="$1"
+    stop_host_load_sampler
+    report_host_load_saturation "$rc"
+    report_memory_resumes
+    report_memory_stop
+    report_left_behind_summary
+    report_webkit_chunk_range
+    report_webkit_phase_selection
+    report_webkit_excluded "$SKIP_WEBKIT"
+    report_e2e_mem_top_deltas
+    rm -f "$PW_TALLY_LOG"
+    exit "$rc"
+}
+
+# Run one Playwright invocation: straight to the terminal as before, and into
+# the project's tally. It runs in the background so its pid can be recorded for
+# the memory sampler's in-chunk stop (host_memory_guard.sh). A FIFO feeds `tee`,
+# so `wait` returns Playwright's own exit code and never tee's. Tee's code is the
+# false-green the repo's own "never pipe a test command" rule warns about.
+#
+# CHUNK_CEILING_SECS, when the caller sets it, arms the chunk ceiling for this
+# invocation. An invocation the sampler stopped on host memory never reaches
+# the tally: the harness re-runs that chunk after recovery, and counting both
+# would break the tally's sum.
+run_playwright() {
+    local rc=0 fifo tee_pid pw_pid inv_log
+    # The sampler already tripped with no runner to interrupt. Nothing new
+    # starts on a host that showed the freeze signature.
+    if host_memory_stopped_mid_chunk; then
+        echo "[e2e-mem] the sampler recorded the freeze signature, so this invocation does not start"
+        return "$HOST_MEMORY_STOP_EXIT"
+    fi
+    fifo="$(mktemp -u "${TMPDIR:-/tmp}/lucidos-pw-fifo.XXXXXX")"
+    if ! mkfifo "$fifo" 2>/dev/null; then
+        # No FIFO means no recorded runner: the sampler can still record a trip,
+        # it just cannot interrupt this invocation.
+        set +e
+        "$@" 2>&1 | tee -a "$PW_TALLY_LOG"
+        rc=${PIPESTATUS[0]}
+        set -e
+        return "$rc"
+    fi
+    inv_log="$(mktemp "${TMPDIR:-/tmp}/lucidos-pw-invocation.XXXXXX")"
+    tee "$inv_log" < "$fifo" &
+    tee_pid=$!
+    set +e
+    "$@" > "$fifo" 2>&1 &
+    pw_pid=$!
+    record_host_memory_runner "$pw_pid"
+    interrupt_host_memory_runner_if_tripped
+    if [ -n "${CHUNK_CEILING_SECS:-}" ]; then
+        start_chunk_ceiling_watchdog "$pw_pid" "$CHUNK_CEILING_SECS"
+    fi
+    wait "$pw_pid"
+    rc=$?
+    stop_chunk_ceiling_watchdog
+    clear_host_memory_runner
+    wait "$tee_pid"
+    set -e
+    host_memory_stopped_mid_chunk || cat "$inv_log" >> "$PW_TALLY_LOG"
+    rm -f "$fifo" "$inv_log"
+    return "$rc"
+}
+
+CMD=(npx playwright test)
+# Anchor -f, for the reason the chunk loop anchors its own filenames: Playwright
+# reads a positional as an unanchored regex over the test file path rather than
+# as a filename. A bare basename drags in every sibling whose path contains it,
+# so `-f chat.spec.ts` also ran app-coding-agent-spawn-from-chat.spec.ts. See
+# playwright_file_filter in scripts/lib/e2e.sh.
+[ -n "$TEST_FILE" ] && CMD+=("$(playwright_file_filter "$TEST_FILE")")
+[ ${#PW_ARGS[@]} -gt 0 ] && CMD+=("${PW_ARGS[@]}")
+
+# Detect whether the caller already pinned a project (via --webkit or `-- --project=`).
+# If so, run once. Otherwise, loop through every project with a clean DB between
+# each — the workspace DB is not isolated across projects. The same pass notes a
+# caller-pinned --output so set_output_dir never silently overrides it.
+USER_PINNED_PROJECT=""
+USER_PINNED_OUTPUT=""
+[ -n "$USE_WEBKIT" ] && USER_PINNED_PROJECT=1
+for arg in "${PW_ARGS[@]:-}"; do
+    case "$arg" in
+        --project=*|--project) USER_PINNED_PROJECT=1 ;;
+        --output=*|--output) USER_PINNED_OUTPUT=1 ;;
+    esac
+done
+
+# Failure-trace retention across a whole run. Playwright DELETES its output dir at
+# the START of every `playwright test` invocation (createRemoveOutputDirsTask), and
+# the default is the entire `test-results/` tree — but one suite run makes MANY
+# invocations: one per project, plus one per mobile-webkit chunk. On the default
+# each pass therefore erased the previous pass's retained traces + screenshots and
+# only the LAST project's survived, so an unattended nightly failure left nothing to
+# triage with. Fix: clear what this run owns here, then give every invocation its
+# own subdir under it (set_output_dir) — nothing is wiped mid-run. (These are Playwright's
+# "output artifacts", NOT Lucidos *artifacts* — they're ephemeral, gitignored test
+# output, so the naming here stays on `output` to keep the glossary term clean.)
+if [ -n "$TEST_FILE" ] || [ "${#PW_ARGS[@]}" -gt 0 ]; then
+    # Targeted repro: clear only its own corner, so a preceding full run's evidence
+    # — usually the very thing you're reproducing against — stays intact.
+    PW_OUTPUT_ROOT="test-results/targeted"
+    rm -rf "$PW_OUTPUT_ROOT"
+else
+    # Full run: clear only the projects this run owns, plus the per-run memory
+    # log. The documented recipe runs `--no-webkit` then `--webkit` as two
+    # invocations, so the second must keep the first's failure traces.
+    PW_OUTPUT_ROOT="test-results/full"
+    if [ -n "$USE_WEBKIT" ]; then
+        rm -rf "$PW_OUTPUT_ROOT/mobile-webkit" "$PW_OUTPUT_ROOT"/mobile-webkit-* "$PW_OUTPUT_ROOT/mem-samples.log"
+    elif [ -n "$SKIP_WEBKIT" ]; then
+        rm -rf "$PW_OUTPUT_ROOT/chromium" "$PW_OUTPUT_ROOT/mobile" "$PW_OUTPUT_ROOT/mem-samples.log"
+    else
+        rm -rf test-results
+    fi
+fi
+# The per-test compressor samples live at the root, which no invocation wipes.
+export_e2e_mem_sample_env "$PWD/$PW_OUTPUT_ROOT"
+
+# Per-invocation --output, kept as an array so "pinned by the caller" passes no
+# argument at all rather than an empty one.
+OUTPUT_ARG=()
+set_output_dir() {
+    OUTPUT_ARG=()
+    [ -n "$USER_PINNED_OUTPUT" ] || OUTPUT_ARG=(--output="$PW_OUTPUT_ROOT/$1")
+}
+
+# ── Host memory between mobile-webkit chunks ──────────────────────────
+# The stop condition, the thresholds and the readers all live in
+# scripts/lib/host_memory_guard.sh, sourced by lib/e2e.sh: HOST_MEMORY_STOP_EXIT,
+# MEMORY_STOPPED, check_host_memory_at_boundary, report_host_memory_start and
+# report_memory_stop. That file carries the rationale, including why the old fixed
+# compressor ceiling was the wrong instrument.
+#
+# What stays here is exit-code aggregation, which is this script's own job.
+
+# Fold one phase or chunk exit code into an aggregate, and echo the winner. A
+# memory stop is the WEAKEST non-zero code: it says the run was cut short, never
+# that the product is broken. So a real test failure always outranks it, from
+# whichever phase or chunk it came. Stated once here because the run aggregates
+# exit codes at three levels. A stop that overwrote a failure at any of them
+# would hide a red run behind a host-memory verdict.
+# Resolve LUCIDOS_E2E_WEBKIT_CHUNKS into "<first> <last>", clamped to 1..NCHUNKS.
+# Accepts "A-B" and the open-ended "A-". Anything else, an empty value included,
+# yields the full range, because a knob nobody can parse must never be read as a
+# request to run less. A garbage value SAYS SO on stderr rather than quietly
+# widening back: silently running everything is the safe direction, and silently
+# doing it without a word is how a typo goes unnoticed for a month.
+#
+# Pure: no host reads, no globals. $1 is the raw value, $2 is the chunk count.
+webkit_chunk_range() {
+    local raw="$1" nchunks="$2" first last
+    if [ -z "$raw" ]; then
+        echo "1 $nchunks"
+        return 0
+    fi
+    case "$raw" in
+        *-*) first="${raw%%-*}"; last="${raw#*-}" ;;
+        *) first=""; last="" ;;
+    esac
+    [ -n "$last" ] || last="$nchunks"
+    case "$first" in '' | *[!0-9]*) first="" ;; esac
+    case "$last" in *[!0-9]*) last="" ;; esac
+    # A first past the END is unusable, not clamped. Clamping "9-" on a 4-chunk
+    # run to "4 4" would silently run one chunk for a range that names none, and
+    # a silent reduction is the failure this knob must not have. Widening back
+    # can only cost time.
+    if [ -z "$first" ] || [ -z "$last" ] ||
+        [ "$first" -lt 1 ] || [ "$first" -gt "$last" ] || [ "$first" -gt "$nchunks" ]; then
+        echo "e2e-browser.sh: LUCIDOS_E2E_WEBKIT_CHUNKS='$raw' is not a chunk range of $nchunks, running every chunk" >&2
+        echo "1 $nchunks"
+        return 0
+    fi
+    # A last past the end IS clamped: the first is real, so the range names work
+    # that exists and simply asks for more tail than there is.
+    [ "$last" -le "$nchunks" ] || last="$nchunks"
+    # Normalise before echoing, because the caller decides "did a range narrow
+    # anything?" by comparing these as STRINGS. Unnormalised, `01-4` on a 4-chunk
+    # phase runs every chunk and still reports itself as a partial range, which
+    # inverts the one thing this knob must never get wrong. `10#` forces decimal:
+    # bash arithmetic reads a bare `08` as octal and errors.
+    echo "$((10#$first)) $((10#$last))"
+}
+
+# Set by run_specs_chunked when a range actually narrowed the nav phase, and read
+# once by finish(). A ranged run must never read as a complete project.
+WEBKIT_CHUNK_RANGE_APPLIED=""
+
+report_webkit_chunk_range() {
+    [ -n "$WEBKIT_CHUNK_RANGE_APPLIED" ] || return 0
+    echo ""
+    echo "[e2e] mobile-webkit nav ran a CHUNK RANGE ONLY: $WEBKIT_CHUNK_RANGE_APPLIED."
+    echo "[e2e] Coverage is incomplete. The chunks outside that range have no verdict."
+}
+
+# Resolve LUCIDOS_E2E_WEBKIT_PHASE into `both`, `cc` or `nav`. Anything else, an
+# empty value included, yields `both`, because a knob nobody can parse must never
+# be read as a request to run less. A garbage value SAYS SO on stderr rather than
+# quietly widening back, the same rule webkit_chunk_range carries: running
+# everything is the safe direction for a typo, and doing it silently is how a
+# typo goes unnoticed for a month.
+#
+# Values are kebab-case lowercase, like every other public knob here, and the
+# match is exact. Guessing at `NAV` would make the one unusable value that reads
+# like a request behave differently from every other one.
+#
+# Pure: no host reads, no globals. $1 is the raw value.
+webkit_phase_selection() {
+    case "$1" in
+        '' | both) echo both ;;
+        cc | nav) echo "$1" ;;
+        *)
+            echo "e2e-browser.sh: LUCIDOS_E2E_WEBKIT_PHASE='$1' is not nav, cc or both, running both phases" >&2
+            echo both
+            ;;
+    esac
+}
+
+# Set by _run_browser_project_body when a phase selection actually narrowed the
+# project, and read once by finish(). A phase-narrowed run must never read as a
+# complete project, exactly as a ranged one must not.
+WEBKIT_PHASE_APPLIED=""
+
+report_webkit_phase_selection() {
+    [ -n "$WEBKIT_PHASE_APPLIED" ] || return 0
+    local skipped="the CC-subprocess phase"
+    if [ "$WEBKIT_PHASE_APPLIED" = "cc" ]; then
+        skipped="the navigation phase"
+    fi
+    echo ""
+    echo "[e2e] mobile-webkit ran ONE PHASE ONLY: LUCIDOS_E2E_WEBKIT_PHASE=$WEBKIT_PHASE_APPLIED."
+    echo "[e2e] Coverage is incomplete. $skipped has no verdict."
+}
+
+merge_rc() {
+    local current="$1" incoming="$2"
+    if [ "$incoming" -eq 0 ]; then
+        echo "$current"
+    elif [ "$current" -eq 0 ] || [ "$current" -eq "$HOST_MEMORY_STOP_EXIT" ]; then
+        echo "$incoming"
+    elif [ "$incoming" -eq "$HOST_MEMORY_STOP_EXIT" ]; then
+        echo "$current"
+    else
+        echo "$incoming"
+    fi
+}
+
+# ── recovery after a memory stop (ADR 0351) ───────────────────────────
+# The harness owns the recovery from its own memory stops: tear down, wait for
+# the host to recover, restart on a fresh database, and carry on where the
+# stop landed. The whole run still reports one verdict.
+
+# How many resumes one run may spend. LUCIDOS_E2E_MEMORY_RESUMES, default 3,
+# and 0 stops the run at the first memory stop. Garbage keeps the default and
+# says so.
+memory_resume_budget() {
+    local v="${LUCIDOS_E2E_MEMORY_RESUMES:-}"
+    case "$v" in
+        '') echo 3 ;;
+        *[!0-9]*)
+            echo "e2e-browser.sh: LUCIDOS_E2E_MEMORY_RESUMES='$v' is not a count, using 3" >&2
+            echo 3
+            ;;
+        *) echo "$((10#$v))" ;;
+    esac
+}
+
+MEMORY_RESUMES=0
+MEMORY_STOP_HISTORY=""
+
+# Recover from the memory stop at $1, then return 0 so the caller resumes.
+# Returns 1 when the budget is spent or the host never recovers, and the caller
+# stops as before. $2 `no-restart` skips the engine restart, for a caller that
+# restarts the engine itself.
+recover_after_memory_stop() {
+    local where="$1" restart="${2:-restart}" budget
+    budget="$(memory_resume_budget)"
+    MEMORY_STOP_HISTORY="${MEMORY_STOP_HISTORY}${where}: ${MEMORY_STOP_DETAIL}
+"
+    if [ "$MEMORY_RESUMES" -ge "$budget" ]; then
+        echo "[e2e-resume] memory stop at $where, and $MEMORY_RESUMES of $budget resumes are spent, so the run stops here."
+        return 1
+    fi
+    echo ""
+    echo "[e2e-resume] memory stop at $where. Tearing down, waiting for the host to recover, then resuming."
+    stop_e2e_workspace
+    sweep_e2e_orphans
+    cleanup_e2e_worktrees
+    if ! host_memory_wait_for_recovery; then
+        echo "[e2e-resume] the run stops here."
+        return 1
+    fi
+    # The stop's record stays until the engine is back, so a failed restart
+    # still reports the stop that caused it.
+    if [ "$restart" != no-restart ] && ! reset_e2e_database; then
+        echo "[e2e-resume] the e2e engine did not come back up, so the run stops here."
+        return 1
+    fi
+    clear_host_memory_stop
+    MEMORY_RESUMES=$((MEMORY_RESUMES + 1))
+    echo "[e2e-resume] resumed ($MEMORY_RESUMES of $budget) on a fresh database."
+    return 0
+}
+
+# What this run never gave a verdict, one line per stretch, in run order. A
+# stop records it from the chunk list it holds, never from an estimate.
+RUN_UNVERIFIED=""
+
+note_unverified() {
+    RUN_UNVERIFIED="${RUN_UNVERIFIED}$1
+"
+}
+
+# Read once by finish(): every stop, every resume, and what has no verdict.
+report_memory_resumes() {
+    if [ -n "$MEMORY_STOP_HISTORY" ]; then
+        echo ""
+        echo "[e2e-resume] This run met $(printf '%s' "$MEMORY_STOP_HISTORY" | grep -c .) memory stop(s) and resumed $MEMORY_RESUMES time(s):"
+        printf '%s' "$MEMORY_STOP_HISTORY" | sed '/^$/d; s/^/[e2e-resume]   - /'
+    fi
+    if [ -n "$RUN_UNVERIFIED" ]; then
+        echo ""
+        echo "[e2e-resume] Coverage is INCOMPLETE. No verdict for:"
+        printf '%s' "$RUN_UNVERIFIED" | sed '/^$/d; s/^/[e2e-resume]   - /'
+        echo "[e2e-resume] That is the carry-over. Do not start a second run tonight."
+    elif [ -n "$MEMORY_STOP_HISTORY" ]; then
+        echo "[e2e-resume] Every chunk ran after the last resume, so coverage is COMPLETE and the exit code is the tests' own verdict."
+    fi
+}
+
+# The engine restart a chunk ceiling trip asks for, since a stuck chunk can
+# leave a wedged engine behind. Its own function so the tests can see it run.
+restart_e2e_after_chunk_ceiling() {
+    echo "── restarting the e2e engine on a fresh database before the next chunk ──"
+    stop_e2e_workspace
+    sweep_e2e_orphans
+    cleanup_e2e_worktrees
+    reset_e2e_database
+}
+
+# Chunk ceiling trips this run, and the project a second trip ended.
+CHUNK_CEILING_TRIPS=0
+CHUNK_CEILING_STOPPED=""
+
+# LUCIDOS_E2E_WEBKIT_CHUNK as a positive integer, default 3. A size that is not
+# one HANGS the chunk loop rather than failing: bash arithmetic reads `2-3` as
+# -1, the chunk count goes negative, and the loop counts down forever. One
+# character separates this knob from LUCIDOS_E2E_WEBKIT_CHUNKS.
+webkit_chunk_size() {
+    local size="${LUCIDOS_E2E_WEBKIT_CHUNK:-3}"
+    case "$size" in
+        '' | *[!0-9]* | 0)
+            echo "e2e-browser.sh: LUCIDOS_E2E_WEBKIT_CHUNK='$size' is not a positive integer, using 3" >&2
+            size=3
+            ;;
+    esac
+    echo "$((10#$size))"
+}
+
+# Run a browser project. For mobile-webkit, split the run into two ordered
+# phases: the specs that SPAWN a coding-agent thread FIRST, then everything else.
+# Other projects run in one pass.
+#
+# "Everything else" is the nav phase, and it is NOT free of Claude Code
+# subprocesses. coding-agent-question.spec.ts lands there and makes the engine
+# dispatch a real Continue (`--resume`), which the spec stops before it ends.
+# The partition detects a SPAWN through the compose destination picker, which
+# is the expensive thing, not every subprocess the engine starts.
+#
+# WHY THE CHEAP HALF GOES FIRST. The two halves cost wildly different amounts.
+# Nav grew the compressor 12.64 GB in one nightly; the whole CC phase costs about
+# 1 GB. With the expensive half first, the memory guard kept ending the run at the
+# phase boundary, so those 10 cheap specs repeatedly got no WebKit verdict at all,
+# and it got worse with every spec added to nav. Cheap half first means the ten
+# always report, and a shortfall lands in nav instead. That is the half where a
+# partial chunk range is cheap to carry over and already has discharge tooling.
+#
+# A shortfall, if one comes, lands in nav by design rather than by accident. It
+# is no longer EXPECTED on a warm host. The free-headroom floor in
+# host_memory_guard.sh used to stop a warm host on the available reading alone,
+# and a warm host reads low because of the idle compressed-page pool rather than
+# because it is short of memory. That floor is corroborated now, so a warm start
+# runs to the end unless the kernel or swap says otherwise.
+#
+# WHAT THE SPLIT BUYS mostly survives the reversal, and the part that does not is
+# priced. Keeping the two sets in separate invocations is what shrinks the
+# contention window behind the mobile-webkit nav-wedge's RESIDUAL variant (a
+# WebContent cold-start stall under heavy host load, see
+# docs/e2e-test-decisions.md), and that holds whichever phase runs first. The
+# wedge's PRIMARY variant (WebKit macOS system-proxy/PAC discovery on the first
+# navigation of each fresh context) is fixed at the source by the explicit
+# `proxy` on the mobile-webkit project in playwright.config.ts.
+#
+# What DID change direction is that nav now runs downstream of the CC-spawn
+# window rather than ahead of it. That cost is accepted: the split was only ever
+# recovery-frequency reduction rather than a cure, and nav keeps its real
+# defences, which are the context preflight in e2e/fixtures.ts, gotoWithRetry and
+# retries:1. The documented drafts.spec.ts:65 window is NOT evidence against the
+# reversal, because both its leak source and its victim are nav specs.
+#
+# CC specs are auto-detected by helper usage (pickComposeDestination, the compose
+# destination picker being the entry point for spawning a coding-agent thread), so
+# newly added specs classify themselves. If the set cannot be split we fall back
+# to a single run.
+# Run a list of spec files through CMD in fresh-process chunks of CHUNK_SIZE files
+# each. Each `npx playwright test` invocation launches a fresh browser, so
+# WebKit's per-context WebContent memory accumulation RESETS between chunks —
+# keeping host pressure below the threshold that makes the first navigation of a
+# fresh page cold-start-stall (the mobile-webkit nav-wedge, reproduced at
+# retries:0; root cause + rationale in
+# docs/plans/2026-06-27-mobile-webkit-shard-contention.md). Coverage is identical
+# to one big pass — only the process boundaries change. Exit codes aggregate, so
+# any failed chunk fails the whole. Chunk size is overridable via
+# LUCIDOS_E2E_WEBKIT_CHUNK for tuning without a code change.
+#
+# The default is 3 specs per chunk. At 8 the compressor still climbed 5 GB inside
+# this project. The nightly died here twice, before the wasm and embedder
+# projects ever started. More boundaries is the only lever this loop has on that
+# curve. Each boundary BETWEEN chunks also checks the compressor (see
+# check_host_memory_at_boundary) and stops the loop when the host is over the
+# ceiling. The boundary after the last chunk is the caller's: only it knows
+# whether another phase or another project follows, and a stop with nothing
+# left to stop would report a finished run as a cut-short one.
+#
+# LUCIDOS_E2E_WEBKIT_CHUNKS narrows the loop to a chunk range, and applies to the
+# NAV phase only. Two uses, and both are why it exists. It is how a partial run
+# is validated without an unfiltered pass on a working machine, and it is how a
+# night that lost the tail of nav discharges exactly that tail the next day. The
+# CC phase is four chunks and always runs whole, so a range never costs the ten
+# specs the phase order exists to protect.
+#
+# IT DOES COST THE CC PHASE'S OWN TIME AND MEMORY, and three separate
+# measurements put that at 93 to 97 percent of the excursion. So the cheapest
+# possible discharge, two nav specs, used to pay for all ten CC specs.
+# LUCIDOS_E2E_WEBKIT_PHASE=nav drops that half, and the two knobs compose: the
+# phase selector picks which halves run, the range narrows nav inside it.
+#
+# A ranged run must never read as a complete project: every skipped chunk says so
+# on its own line, and report_webkit_chunk_range restates the range at the end.
+run_specs_chunked() {
+    local project="$1"; shift
+    local label="$1"; shift
+    local specs=("$@")
+    local total="${#specs[@]}"
+    local size
+    size="$(webkit_chunk_size)"
+    local rc=0 start=0 chunk_no=0 nchunks ceiling
+    nchunks=$(( (total + size - 1) / size ))
+    ceiling="$(host_memory_chunk_ceiling_secs)"
+
+    # The range, resolved once. Only the nav phase honours it; the CC phase
+    # always gets 1..nchunks.
+    local first=1 last="$nchunks" range=""
+    if [ "$label" = "nav" ]; then
+        range="$(webkit_chunk_range "${LUCIDOS_E2E_WEBKIT_CHUNKS:-}" "$nchunks")"
+        first="${range%% *}"
+        last="${range##* }"
+        if [ "$first" != "1" ] || [ "$last" != "$nchunks" ]; then
+            WEBKIT_CHUNK_RANGE_APPLIED="$first-$last of $nchunks"
+            echo "── mobile-webkit $label: LIMITED to chunks $first-$last of $nchunks ──"
+        fi
+    fi
+
+    while [ "$start" -lt "$total" ]; do
+        chunk_no=$(( chunk_no + 1 ))
+        local chunk=("${specs[@]:start:size}")
+        # Outside the range: announced, never silent. A skipped chunk that said
+        # nothing would leave a green-looking log for a project that did not run.
+        if [ "$chunk_no" -lt "$first" ] || [ "$chunk_no" -gt "$last" ]; then
+            echo "── mobile-webkit $label chunk $chunk_no/$nchunks: SKIPPED, outside chunk range $first-$last ──"
+            start=$(( start + size ))
+            continue
+        fi
+        echo "── mobile-webkit $label chunk $chunk_no/$nchunks: ${#chunk[@]} specs (fresh browser) ──"
+        # Anchor each filename, because Playwright reads a positional argument as
+        # an unanchored regex over the file path. A bare basename therefore drags
+        # in every sibling containing it, across the CC/nav phase boundary
+        # included. See playwright_file_filter in scripts/lib/e2e.sh.
+        local filters=() spec
+        for spec in "${chunk[@]}"; do
+            filters+=("$(playwright_file_filter "$spec")")
+        done
+        # Own output dir per chunk (see set_output_dir) — otherwise each chunk
+        # would erase the previous chunk's failure traces/screenshots.
+        set_output_dir "$project-$label-$chunk_no"
+        local chunk_rc=0
+        CHUNK_CEILING_SECS="$ceiling" run_playwright "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" "${filters[@]}" || chunk_rc=$?
+        # The sampler interrupted this chunk on the freeze signature. An
+        # interrupted runner's exit code is not a test verdict, so it is dropped.
+        # After a recovery the SAME chunk runs again; otherwise the stop stands
+        # and this chunk onwards has no verdict.
+        if host_memory_stopped_mid_chunk; then
+            echo "── mobile-webkit $label chunk $chunk_no/$nchunks: STOPPED inside the chunk on host memory ──"
+            if recover_after_memory_stop "mobile-webkit $label chunk $chunk_no/$nchunks (inside the chunk)"; then
+                echo "── mobile-webkit $label chunk $chunk_no/$nchunks: RUNNING AGAIN after the recovery ──"
+                chunk_no=$(( chunk_no - 1 ))
+                continue
+            fi
+            MEMORY_STOPPED="$project"
+            note_unverified "mobile-webkit $label chunks $chunk_no-$last of $nchunks"
+            rc="$(merge_rc "$rc" "$HOST_MEMORY_STOP_EXIT")"
+            break
+        fi
+        start=$(( start + size ))
+        # The chunk hung past its ceiling. No verdict is a failure, never a
+        # pass. One trip restarts the engine, since a stuck chunk can leave it
+        # wedged; a second ends the project rather than spend the night on it.
+        if host_memory_chunk_ceiling_tripped; then
+            clear_chunk_ceiling_trip
+            CHUNK_CEILING_TRIPS=$(( CHUNK_CEILING_TRIPS + 1 ))
+            echo "── mobile-webkit $label chunk $chunk_no/$nchunks: CHUNK CEILING, interrupted after ${ceiling}s, so its tests have no verdict ──"
+            chunk_rc=1
+            if [ "$CHUNK_CEILING_TRIPS" -ge 2 ]; then
+                echo "── mobile-webkit: a second chunk hit the ceiling, so the project stops here ──"
+                CHUNK_CEILING_STOPPED="$project"
+                rc="$(merge_rc "$rc" "$chunk_rc")"
+                if [ "$chunk_no" -lt "$last" ]; then
+                    note_unverified "mobile-webkit $label chunks $(( chunk_no + 1 ))-$last of $nchunks (a second chunk hit the wall-clock ceiling)"
+                fi
+                break
+            fi
+            # Restart even after this loop's last chunk: the next phase or
+            # project would otherwise start on the engine that may be wedged.
+            restart_e2e_after_chunk_ceiling
+        fi
+        rc="$(merge_rc "$rc" "$chunk_rc")"
+        # BETWEEN chunks only. The boundary after the LAST one belongs to the
+        # caller, which is the only code that knows whether another phase or
+        # another project follows it. A stop needs something left to stop: with
+        # mobile-webkit running last, an unconditional check here would report a
+        # run that finished everything as a run that was cut short.
+        #
+        # `$last` as well as `$total`, so a ranged run gets no boundary after ITS
+        # last chunk either. The chunks past the range are not work this run was
+        # going to do, so stopping "before" them would report a run that did
+        # everything asked of it as one cut short.
+        #
+        # This SKIPS the check rather than leaving the loop, so the chunks after
+        # the range still reach the announcement above. Breaking here left them
+        # silent, which is the one thing a range must never be.
+        if [ "$start" -lt "$total" ] && [ "$chunk_no" -lt "$last" ] &&
+            ! check_host_memory_at_boundary "$project $label chunk $chunk_no/$nchunks"; then
+            if recover_after_memory_stop "mobile-webkit $label chunk $chunk_no/$nchunks (boundary)"; then
+                continue
+            fi
+            MEMORY_STOPPED="$project"
+            note_unverified "mobile-webkit $label chunks $(( chunk_no + 1 ))-$last of $nchunks"
+            # MEMORY_STOPPED carries the stop on its own, so merge_rc can keep a
+            # failing chunk's code and neither signal hides the other.
+            rc="$(merge_rc "$rc" "$HOST_MEMORY_STOP_EXIT")"
+            break
+        fi
+    done
+    return "$rc"
+}
+
+# One verdict per project, however many invocations it took to get there.
+# `_run_browser_project_body` does the running; this wraps it so the tally is
+# reported on EVERY exit path out of it, the memory-stop early return included.
+run_browser_project() {
+    local project="$1"
+    local rc=0 tally_rc=0
+    : > "$PW_TALLY_LOG"
+    _run_browser_project_body "$project" || rc=$?
+    # merge_rc, so a tally that does not add up can only ADD a failure. It is a
+    # harness verdict: it says the project was not measured, which must not read
+    # green, and must not overwrite a real test failure either.
+    report_playwright_totals "$project" "$PW_TALLY_LOG" || tally_rc=$?
+    # An invocation the sampler interrupted stays out of the tally. When it was
+    # the project's only one, the tally is empty. The memory stop already says
+    # so; it is no harness bug.
+    if [ "$tally_rc" -ne 0 ] && [ "$MEMORY_STOPPED" = "$project" ] && host_memory_stopped_mid_chunk; then
+        echo "   (expected: the invocation stopped on host memory did not report)"
+        tally_rc=0
+    fi
+    rc="$(merge_rc "$rc" "$tally_rc")"
+    return "$rc"
+}
+
+_run_browser_project_body() {
+    local project="$1"
+    local rc=0
+    local f base
+    local cc_specs=()
+    local nav_specs=()
+    # Only shard the FULL mobile-webkit run. When the caller pinned a spec/file
+    # filter (-f <file>, a positional, or -- args), honor it verbatim: appending
+    # the whole spec list would OR the filter away (Playwright unions positional
+    # filters), running the entire suite instead of the requested subset. Targeted
+    # runs fall through to the single-pass call below.
+    if [ "$project" = "mobile-webkit" ] && [ -z "$TEST_FILE" ] && [ "${#PW_ARGS[@]}" -eq 0 ]; then
+        # WHICH PHASES THIS RUN IS FOR. `both` is the whole project, and the two
+        # narrowings exist for one job each: `nav` discharges a nav tail without
+        # paying for the CC phase, which three separate measurements put at 93 to
+        # 97 percent of the memory excursion, and `cc` covers the reverse.
+        # Resolved before the partition, because the announcement below needs the
+        # counts of the phase it is NOT running.
+        local phase_sel
+        phase_sel="$(webkit_phase_selection "${LUCIDOS_E2E_WEBKIT_PHASE:-}")"
+        for f in e2e/*.spec.ts; do
+            [ -e "$f" ] || continue
+            base="$(basename "$f")"
+            # Skip *-desktop.spec.ts: the mobile-webkit project testIgnores them
+            # (playwright.config.ts), so they run zero tests here. Including them
+            # was harmless in the single-pass run, but a SHARD landing entirely on
+            # ignored files would make `playwright test` exit "no tests found" (rc 1)
+            # and fail the chunk spuriously. Excluding them keeps every chunk real.
+            case "$base" in *-desktop.spec.ts) continue ;; esac
+            if e2e_spec_spawns_claude_code "$f"; then
+                cc_specs+=("$base")
+            else
+                nav_specs+=("$base")
+            fi
+        done
+        if [ "${#cc_specs[@]}" -gt 0 ] && [ "${#nav_specs[@]}" -gt 0 ]; then
+            # CC-subprocess specs first (the cheap half), then nav specs. Each
+            # phase is sharded into fresh-process chunks so WebKit memory cannot
+            # accumulate across the whole suite into the cold-start-stall zone.
+            #
+            # A SKIPPED PHASE ANNOUNCES ITSELF, with the count it did not run.
+            # A phase that said nothing would leave a green-looking log for half
+            # a project, which is the one thing a narrowing must never do.
+            local cc_rc=0 nav_rc=0
+            if [ "$phase_sel" = "nav" ]; then
+                WEBKIT_PHASE_APPLIED=nav
+                echo "── mobile-webkit phase 1/2 SKIPPED: ${#cc_specs[@]} CC-subprocess specs, LUCIDOS_E2E_WEBKIT_PHASE=nav ──"
+            else
+                echo "── mobile-webkit phase 1/2: ${#cc_specs[@]} CC-subprocess specs (sharded) ──"
+                run_specs_chunked "$project" "CC" "${cc_specs[@]}" || cc_rc=$?
+            fi
+            if [ "$phase_sel" = "cc" ]; then
+                WEBKIT_PHASE_APPLIED=cc
+                echo "── mobile-webkit phase 2/2 SKIPPED: ${#nav_specs[@]} navigation specs, LUCIDOS_E2E_WEBKIT_PHASE=cc ──"
+            else
+                # The CC/nav boundary, which the chunk loop deliberately leaves
+                # to its caller. It is checked only when BOTH phases are in this
+                # run: a stop needs work left to stop, and with the CC phase
+                # skipped there is no CC-to-nav boundary to stand at.
+                if [ "$phase_sel" = "both" ] && [ -z "$MEMORY_STOPPED" ] && [ -z "$CHUNK_CEILING_STOPPED" ] \
+                    && ! check_host_memory_at_boundary "$project phase 1/2 (CC)" \
+                    && ! recover_after_memory_stop "mobile-webkit phase 1/2 (CC)"; then
+                    MEMORY_STOPPED="$project"
+                    cc_rc="$(merge_rc "$cc_rc" "$HOST_MEMORY_STOP_EXIT")"
+                fi
+                if [ -n "$MEMORY_STOPPED" ] || [ -n "$CHUNK_CEILING_STOPPED" ]; then
+                    # Phase 2 is the heavier half, and it is last ON PURPOSE:
+                    # this is where we chose a shortfall to land. Nav carries
+                    # over as a partial chunk range, so what is lost here is the
+                    # recoverable half rather than ten specs that have gone
+                    # unverified for weeks.
+                    local size nav_chunks
+                    size="$(webkit_chunk_size)"
+                    nav_chunks=$(( (${#nav_specs[@]} + size - 1) / size ))
+                    echo "── mobile-webkit phase 2/2 SKIPPED: the CC phase stopped the project ──"
+                    note_unverified "mobile-webkit nav chunks 1-$nav_chunks of $nav_chunks (the whole navigation phase)"
+                    return "$cc_rc"
+                fi
+                echo "── mobile-webkit phase 2/2: ${#nav_specs[@]} navigation specs (sharded) ──"
+                run_specs_chunked "$project" "nav" "${nav_specs[@]}" || nav_rc=$?
+            fi
+            # A nav-phase stop must not overwrite a failing CC phase (see
+            # merge_rc), which plain last-wins aggregation would do.
+            rc="$(merge_rc "$rc" "$cc_rc")"
+            rc="$(merge_rc "$rc" "$nav_rc")"
+            return "$rc"
+        fi
+        # The set did not split, so there are no phases to choose between and
+        # the single pass below runs everything. Say so: a selection that
+        # silently ran the whole project is the same lie as a silent skip.
+        if [ "$phase_sel" != "both" ]; then
+            echo "e2e-browser.sh: the mobile-webkit set did not split (${#cc_specs[@]} CC, ${#nav_specs[@]} nav), so LUCIDOS_E2E_WEBKIT_PHASE=$phase_sel ran everything" >&2
+        fi
+    fi
+    # Own output dir per project (see set_output_dir) — otherwise the NEXT
+    # project's invocation would wipe this one's, chunk dirs included.
+    # A stop inside a single pass runs the whole pass again after a recovery,
+    # since a pass has no chunk to resume from.
+    while :; do
+        rc=0
+        set_output_dir "$project"
+        run_playwright "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" || rc=$?
+        host_memory_stopped_mid_chunk || break
+        echo "── $project: STOPPED inside the run on host memory ──"
+        if recover_after_memory_stop "$project (inside its single pass)"; then
+            echo "── $project: RUNNING AGAIN after the recovery ──"
+            continue
+        fi
+        MEMORY_STOPPED="$project"
+        note_unverified "project $project (stopped inside its single pass)"
+        rc="$HOST_MEMORY_STOP_EXIT"
+        break
+    done
+    return "$rc"
+}
+
+if [ -n "$USE_WEBKIT" ] && [ -z "$TEST_FILE" ] && [ "${#PW_ARGS[@]}" -eq 0 ]; then
+    # `--webkit` with no filter: route through run_browser_project so a manual
+    # webkit run gets the SAME sharding/phase-split as the nightly full run (and so
+    # the sharding is validatable in isolation). A filtered `--webkit -f X` (or any
+    # `--`/positional arg) still falls through to the single-pass branch below —
+    # run_browser_project's own guard would single-pass it anyway, but keeping it
+    # here avoids appending --project twice.
+    # This is the documented "run it alone, on a cold host" recipe, so it is the
+    # run whose STARTING compressor matters most: it decides how far the project
+    # gets, and no other line records it.
+    echo ""
+    report_host_memory_start
+    webkit_rc=0
+    run_browser_project mobile-webkit || webkit_rc=$?
+    finish "$webkit_rc"
+elif [ -n "$USER_PINNED_PROJECT" ]; then
+    [ -n "$USE_WEBKIT" ] && CMD+=(--project=mobile-webkit)
+    set_output_dir pinned
+    # Capture rather than letting `set -e` exit here, so a failing pinned run
+    # still gets drained + classified by finish. Through run_playwright, so the
+    # sampler can interrupt a pinned run too.
+    pinned_rc=0
+    run_playwright "${CMD[@]}" "${OUTPUT_ARG[@]}" || pinned_rc=$?
+    if host_memory_stopped_mid_chunk; then
+        MEMORY_STOPPED="the pinned run"
+        pinned_rc="$HOST_MEMORY_STOP_EXIT"
+    fi
+    finish "$pinned_rc"
+else
+    # Run every project even if an earlier one failed, so the user sees all
+    # results in one run. Aggregate exit status so the script still exits
+    # non-zero when any project failed. macOS ships bash 3.x — no associative
+    # arrays, so use parallel indexed arrays.
+    #
+    # mobile-webkit runs LAST, and this reversed a deliberate earlier ordering.
+    # It used to run first, to keep its contention-sensitive WebContent spawns
+    # ahead of two more passes of CC-subprocess churn. The wedge that argued for
+    # is fixed at the source (the explicit `proxy` on the mobile-webkit project
+    # in playwright.config.ts) and the projects run sequentially, so the churn
+    # was never concurrent with it anyway. What is not fixed is the memory: this
+    # one project costs about 15 GB of compressor and the other two cost about
+    # 0.6 GB between them. Whatever is queued behind it is what a memory stop
+    # loses, so nothing is.
+    #
+    # A DB reset runs before each *subsequent* project (the workspace DB isn't
+    # isolated across projects); the first gets the freshly-booted state. Each
+    # reset recreates the database and restarts the engine on it, on the same
+    # binary, since build_e2e_engine_once never recompiles mid-suite. So every
+    # project sees a brand-new workspace database, seeds included.
+    # --no-webkit leaves the expensive project for its own run. Dropped from the
+    # list rather than skipped inside it, so the per-project table below reports
+    # what actually ran; report_webkit_excluded says what did not.
+    PROJECTS=()
+    while IFS= read -r project; do
+        PROJECTS+=("$project")
+    done <<EOF
+$(e2e_browser_projects ${SKIP_WEBKIT:+--no-webkit})
+EOF
+    # A targeted spec runs only on the projects that do not testIgnore it.
+    if [ -n "$TEST_FILE" ]; then
+        RUNS_SPEC=()
+        for project in "${PROJECTS[@]}"; do
+            if project_runs_spec "$project" "$TEST_FILE"; then
+                RUNS_SPEC+=("$project")
+            else
+                echo "[e2e] $project ignores $TEST_FILE (playwright.config.ts testIgnore), so it does not run."
+            fi
+        done
+        PROJECTS=("${RUNS_SPEC[@]}")
+    fi
+    PROJECT_RCS=()
+    overall_rc=0
+    echo ""
+    report_host_memory_start
+    for i in "${!PROJECTS[@]}"; do
+        project="${PROJECTS[$i]}"
+        if [ -n "$MEMORY_STOPPED" ]; then
+            # A memory stop the harness could not recover from, so the projects
+            # after it do not run. Record the stop code rather than leaving a
+            # hole. A project with no rc reads as a harness bug in the table
+            # below. An rc of 0 would read as green work that never ran.
+            echo ""
+            echo "── Skipping project (stopped on host memory): $project ──"
+            note_unverified "project $project"
+            PROJECT_RCS+=("$HOST_MEMORY_STOP_EXIT")
+            continue
+        fi
+        if [ "$i" -gt 0 ] && [ -z "$NO_RESET" ]; then
+            echo ""
+            echo "── Resetting DB before project: $project ──"
+            reset_e2e_database
+        fi
+        echo ""
+        echo "── Running project: $project ──"
+        rc=0
+        run_browser_project "$project" || rc=$?
+        # APPEND — never PROJECT_RCS[i]=. The body above calls into the e2e lib,
+        # and any lib function that leaks a loop variable named `i` (that was the
+        # 2026-07-26 bug: ensure_workspace_running's readiness counter) would make
+        # an indexed write land in the wrong slot, leaving a hole at the last
+        # project. Appending in lockstep with PROJECTS can't produce a hole.
+        PROJECT_RCS+=("$rc")
+        # merge_rc, not last-wins: a later project's memory stop must not
+        # overwrite an earlier project's real failure.
+        overall_rc="$(merge_rc "$overall_rc" "$rc")"
+        # The chunk loop guards mobile-webkit only. A project boundary is the
+        # same hazard: what comes next is another browser swarm, on whatever the
+        # last one left behind. Skipped after the LAST project, where nothing
+        # follows: a stop needs something left to stop. This project's own rc
+        # stays untouched either way, because it finished.
+        # The next project resets the database and restarts the engine itself,
+        # so a recovery here skips its own restart. Under --no-reset nothing
+        # else would bring the engine back, so the recovery does.
+        restart_after=no-restart
+        [ -z "$NO_RESET" ] || restart_after=restart
+        if [ -z "$MEMORY_STOPPED" ] && [ "$i" -lt "$(( ${#PROJECTS[@]} - 1 ))" ] \
+            && ! check_host_memory_at_boundary "the boundary after project $project" \
+            && ! recover_after_memory_stop "the boundary after project $project" "$restart_after"; then
+            MEMORY_STOPPED="$project"
+            overall_rc="$(merge_rc "$overall_rc" "$HOST_MEMORY_STOP_EXIT")"
+        fi
+    done
+
+    # Pair each project with its recorded rc; a short array (or a stray empty
+    # entry) surfaces as UNKNOWN and forces a non-zero exit inside the reporter.
+    PROJECT_ENTRIES=()
+    for i in "${!PROJECTS[@]}"; do
+        PROJECT_ENTRIES+=("${PROJECTS[$i]}:${PROJECT_RCS[$i]:-}")
+    done
+    final_rc=0
+    report_project_exit_codes "$overall_rc" "${PROJECT_ENTRIES[@]}" || final_rc=$?
+    finish "$final_rc"
+fi

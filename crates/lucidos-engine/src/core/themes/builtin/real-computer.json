@@ -1,0 +1,91 @@
+{
+  "name": "Real computer",
+  "description": "A real old computer: black glass, glowing green phosphor in VT323, scanlines across the screen, a block caret, double-line frames, hard DOS-style window shadows, and amber for anything notable.",
+  "author": "Lucidos",
+  "credit": "Colours after the P1 phosphor of 1970s and 80s monochrome terminals.",
+  "family": "neutral",
+  "fonts": {
+    "ui": "vt323",
+    "mono": "vt323"
+  },
+  "tokens": {
+    "--radius-control": "0",
+    "--radius-surface": "0",
+    "--radius-round": "0"
+  },
+  "dark": {
+    "--bg-primary": "#000000",
+    "--text-primary": "#33ff33",
+    "--accent": "#7dff7d",
+    "--text-on-accent": "#000000",
+    "--surface-bg": "#030d03",
+    "--border-color": "#0f4d0f",
+    "--accent-green": "#33ff33",
+    "--accent-yellow": "#ffd54a",
+    "--accent-orange": "#ffa033",
+    "--accent-red": "#ff4d4d",
+    "--header-bar-top": "#000000",
+    "--header-bar-bottom": "#000000",
+    "--header-gradient": "repeating-linear-gradient(to bottom, #000000 0 2px, #052205 2px 3px)",
+    "--titlebar-strip-bg": "#000000",
+    "--header-fg": "#33ff33",
+    "--header-divider": "#0f4d0f",
+    "--header-badge-bg": "#33ff33",
+    "--header-badge-fg": "#000000",
+    "--focus-header-tint": "transparent",
+    "--focus-header-underline": "#33ff33",
+    "--focus-header-underline-width": "2px",
+    "--focus-pill-bg": "#33ff33",
+    "--focus-pill-glow": "rgba(51, 255, 51, 0.4)",
+    "--focus-ring": "0 0 0 2px rgba(51, 255, 51, 0.7)",
+    "--shadow-sm": "0.25rem 0.25rem 0 #0a330a",
+    "--shadow-md": "0.375rem 0.375rem 0 #0f4d0f",
+    "--shadow-lg": "0.625rem 0.625rem 0 #0f4d0f",
+    "--shadow-up": "0 -0.25rem 0 #0a330a",
+    "--syntax-key": "#7dff7d",
+    "--syntax-string": "#b8ffb8",
+    "--syntax-number": "#ccff66",
+    "--syntax-keyword": "#66ffcc",
+    "--syntax-comment": "#1f8f1f",
+    "--syntax-control": "#66ffcc",
+    "--syntax-type": "#a6ff4d",
+    "--syntax-function": "#e0ffe0",
+    "--initiator-coding-agent": "#7dff7d",
+    "--lucidos-mark-bg-top": "#000000",
+    "--lucidos-mark-bg-bottom": "#000000",
+    "--lucidos-mark-fg": "#33ff33",
+    "--claude-mark": "#7dff7d",
+    "--codex-mark": "#7dff7d",
+    "--text-glow": "0 0 0.06em rgba(51, 255, 51, 0.5)",
+    "--bg-secondary": "#020a02",
+    "--picked-surface": "#082608",
+    "--bg-selected": "#0d3d0d",
+    "--accent-notable": "#ffb000",
+    "--scrim": "rgba(0, 10, 0, 0.85)",
+    "--nav-focus-glow": "rgba(51, 255, 51, 0.14)",
+    "parts": {
+      "screen": {
+        "background-image": "repeating-linear-gradient(#33ff330f 0px, #33ff330f 1px, #00000000 1px, #00000000 3px)"
+      },
+      "composer-text": {
+        "caret-shape": "block",
+        "caret-color": "#33ff33"
+      },
+      "surface": {
+        "border-style": "double",
+        "border-width": "3px",
+        "border-color": "#33ff33"
+      },
+      "card": {
+        "border-style": "double",
+        "border-width": "3px",
+        "border-color": "#1f8f1f"
+      },
+      "header-title": {
+        "letter-spacing": "0.06em"
+      }
+    },
+    "--bg-tertiary": "#0a300a",
+    "--bg-hover": "#0a300a"
+  }
+}

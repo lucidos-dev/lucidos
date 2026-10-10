@@ -1,0 +1,130 @@
+//! Claude/Anthropic request dispatch for `VertexProvider`.
+//!
+//! The wire format (request building, cache-control, SSE parsing) is shared
+//! with the direct Anthropic provider and lives in [`crate::llm::anthropic_wire`].
+//! This file is the Vertex-specific transport: gcloud bearer auth, the
+//! `streamRawPredict` URL, and the retry/auth-refresh loop.
+
+use super::VertexProvider;
+use crate::llm::anthropic_wire::{
+    build_claude_request, parse_claude_stream, parse_context_suffix, WireTarget,
+};
+use crate::llm::provider::{LlmResponse, Message, TokenCallback, ToolDefinition};
+use crate::llm::{ModelNotServed, ModelSelection};
+
+impl VertexProvider {
+    pub(super) async fn chat_claude(
+        &self,
+        messages: Vec<Message>,
+        tools: Vec<ToolDefinition>,
+        selection: ModelSelection<'_>,
+        system_prompt: Option<&str>,
+        on_token: Option<TokenCallback>,
+    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let model = selection.model.unwrap_or(&self.model);
+        let reasoning_effort = selection.reasoning_effort;
+        // Vertex carries the model in the URL, so strip the [1m] suffix for the
+        // endpoint; the request builder folds the 1M beta into the body.
+        let (base_model, _) = parse_context_suffix(model);
+        let url = self.endpoint_for_model(base_model);
+
+        let (mut request, header_betas) = build_claude_request(
+            messages,
+            tools,
+            model,
+            system_prompt,
+            reasoning_effort,
+            WireTarget::Vertex { url: &url },
+            "Vertex",
+        );
+        if let Some(tool) = selection.forced_tool {
+            request.force_tool(tool, model)?;
+        }
+        let beta_header = (!header_betas.is_empty()).then(|| header_betas.join(","));
+        let display = request.thinking_display();
+
+        let mut access_token = self.get_access_token().await?;
+
+        // Retry loop for connection errors, retryable HTTP status codes, and
+        // mid-stream overload errors. Content is accumulated internally by
+        // parse_claude_stream, so retrying the full request is safe.
+        let mut attempt = 0u32;
+        let mut retried_auth = false;
+        loop {
+            attempt += 1;
+
+            let mut builder = self
+                .streaming_client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Content-Type", "application/json");
+            if let Some(beta) = &beta_header {
+                builder = builder.header("anthropic-beta", beta);
+            }
+            let builder = builder.json(&request);
+            let resp = match crate::llm::send_streaming_request(
+                builder,
+                model,
+                attempt,
+                selection.attempt_timeout,
+            )
+            .await
+            {
+                crate::llm::StreamSend::Got(r) => r,
+                crate::llm::StreamSend::Retry => continue,
+                crate::llm::StreamSend::Failed(e) => return Err(e),
+            };
+
+            let status = resp.status();
+            if !status.is_success() {
+                let error_body = resp.text().await.unwrap_or_default();
+
+                if status.as_u16() == 401 && !retried_auth {
+                    if let Some(new_token) =
+                        self.handle_auth_refresh(model, &mut retried_auth).await
+                    {
+                        access_token = new_token;
+                        continue;
+                    }
+                    return Err(format!("Claude API error ({}): {}", status, error_body).into());
+                }
+
+                if crate::llm::should_retry_http(status.as_u16(), &error_body, attempt) {
+                    let delay = crate::llm::retry_delay(attempt, 1);
+                    crate::llm::log_retry(model, &format!("HTTP {}", status), attempt, delay);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                // A publisher-model 404 is the shape a fresh Vertex setup hits,
+                // and Google's own sentence names no fix. The helper supplies
+                // one. Every other failure keeps its own wording.
+                //
+                // `model` carries the `[1m]` suffix the URL drops, and naming
+                // it is deliberate: that is the value the user picks in
+                // Settings, so that is what they would change.
+                if let Some(advice) =
+                    super::explain_publisher_model_404(status.as_u16(), &error_body, model, &url)
+                {
+                    return Err(Box::new(ModelNotServed::new(
+                        crate::llm::with_retry_context(advice, attempt),
+                    )));
+                }
+                let message = format!("Claude API error ({}): {}", status, error_body);
+                return Err(crate::llm::with_retry_context(message, attempt).into());
+            }
+
+            // Parse SSE stream — retry on overload errors
+            match parse_claude_stream(resp, &on_token, display, "Vertex").await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if crate::llm::retry_after_stream_error(model, &err_str, attempt).await {
+                        continue;
+                    }
+                    return Err(crate::llm::with_retry_context(e, attempt).into());
+                }
+            }
+        }
+    }
+}

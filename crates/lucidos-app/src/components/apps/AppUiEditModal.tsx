@@ -1,0 +1,194 @@
+import { useEffect, useRef } from 'preact/hooks';
+import { activeInlineForm, appsList, appSourceEpoch, showToast } from '../../store/store';
+import { closeAppForm, saveAppMetadata, refreshAppUI } from '../../store/actions/apps';
+import type { App, Loadable } from '../../store/types';
+import { readAppSourceApi, writeAppSourceApi } from '../../api/client';
+import type { UiSourceFile } from '../../api/client';
+import { AutoTextarea } from '../shared/AutoTextarea';
+import { autoResizeTextarea } from '../../utils/dom';
+import { useLoadableFetch } from '../../hooks/useLoadableFetch';
+import { errorDetail } from '../../utils/errorDetail';
+import { LoadableError } from '../shared/LoadableError';
+import { FormSkeleton } from '../shared/FormSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useServerBackedField } from '../../hooks/useServerBackedField';
+
+export function AppUiEditModal() {
+  const form = activeInlineForm.value;
+  // Delay the spinner (300ms) so a fast load never flashes it.
+  const showLoading = useDelayedLoading(appsList.value);
+  if (form?.type !== 'app-edit') return null;
+
+  const { appId } = form;
+
+  if (appsList.value.status === 'failed') {
+    return (
+      <div class="inline-form">
+        <LoadableError error={appsList.value.error} noun="apps" />
+      </div>
+    );
+  }
+  const apps = appsList.value.status === 'loaded' ? appsList.value.data : null;
+  const app = apps?.find((s) => s.id === appId);
+  // key={appId} remounts the closer when the form flips from missing-A to
+  // missing-B. Without it, Preact reuses the instance, and the empty-deps
+  // useEffect never re-fires for B.
+  if (apps && !app) return <MissingAppCloser key={appId} />;
+
+  return (
+    <LoadingFade showSkeleton={showLoading} skeleton={<FormSkeleton fields={APP_EDIT_FORM_FIELDS} />}>
+      {app && <AppUiEditModalInner key={appId} app={app} />}
+    </LoadingFade>
+  );
+}
+
+/** The edit form's fields: its two own, then one source file whose name the
+ *  file read decides. */
+const APP_EDIT_FORM_FIELDS = [{ label: 'Name' }, { label: 'Description' }, { tall: true }];
+
+/** Closes the app-edit form when the target app no longer exists. Lives in a
+ *  child component so the signal write happens in useEffect (post-commit),
+ *  not inside the parent's render body. */
+function MissingAppCloser() {
+  useEffect(() => { closeAppForm(); }, []);
+  return null;
+}
+
+function AppUiEditModalInner({ app }: { app: App }) {
+  // Server-backed: an `AppUpdated` frame repaints an untouched field, and a
+  // touched one keeps the user's draft (ADR 0118).
+  const [name, setName] = useServerBackedField(app.name);
+  const [description, setDescription] = useServerBackedField(app.description);
+
+  // The file bodies obey the same rule at editor granularity. `appSourceEpoch`
+  // moves when the engine says this app's files changed on disk, and that
+  // re-reads them. The first keystroke stops both halves of that: the epoch
+  // freezes, so no NEW read starts, and `stillWanted` drops the reply of one
+  // already in flight. Without the second half a read begun a moment before
+  // the keystroke still lands and discards it.
+  //
+  // A ref, not state: the reply arrives between renders, so a state read would
+  // be a render behind. `updateFileContent` re-renders anyway through
+  // `setFilesLoadable`, which is what the epoch freeze needs.
+  const edited = useRef(false);
+  const epoch = useRef(appSourceEpoch.value);
+  if (!edited.current) epoch.current = appSourceEpoch.value;
+  const { loadable: filesLoadable, setLoadable: setFilesLoadable, showLoading } = useLoadableFetch<UiSourceFile[]>(
+    () => readAppSourceApi(app.id).then((res) => res.files),
+    [app.id, epoch.current],
+    {
+      // The epoch dep is a re-read of the SAME files, so the editors stay on
+      // screen and their contents swap when the fresh bytes land.
+      keepLoadedWhileRefetching: true,
+      stillWanted: () => !edited.current,
+    },
+  );
+
+  function updateFileContent(index: number, content: string) {
+    edited.current = true;
+    setFilesLoadable((prev) => {
+      if (prev.status !== 'loaded') return prev;
+      return { status: 'loaded', data: prev.data.map((f, i) => i === index ? { ...f, content } : f) };
+    });
+  }
+
+  async function handleSave(e: Event) {
+    e.preventDefault();
+    if (!name.trim()) return;
+
+    if (filesLoadable.status === 'failed') {
+      showToast('Cannot save: files failed to load (' + filesLoadable.error + ')', 'error');
+      return;
+    }
+    if (filesLoadable.status !== 'loaded') {
+      showToast('Cannot save: files are still loading', 'error');
+      return;
+    }
+
+    const metaOk = await saveAppMetadata(app.id, name.trim(), description.trim());
+    if (!metaOk) return;
+
+    const files = filesLoadable.data;
+    if (files.length > 0) {
+      try {
+        await writeAppSourceApi(app.id, files);
+        void refreshAppUI(app.id);
+      } catch (err) {
+        showToast('Failed to save files: ' + errorDetail(err), 'error');
+        return;
+      }
+    }
+
+    closeAppForm();
+  }
+
+  return (
+    <div class="inline-form">
+      <form onSubmit={handleSave}>
+        <div class="inline-form-body">
+          <div class="form-group">
+            <label>Name</label>
+            <input
+              type="text"
+              value={name}
+              onInput={(e) => setName((e.target as HTMLInputElement).value)}
+              required
+            />
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <AutoTextarea value={description} onInput={setDescription} />
+          </div>
+          <FilesEditor loadable={filesLoadable} showLoading={showLoading} updateFileContent={updateFileContent} />
+          <div class="form-actions">
+            <button type="button" class="btn-cancel" onClick={closeAppForm}>
+              Cancel
+            </button>
+            <button type="submit" class="btn-save" disabled={filesLoadable.status !== 'loaded'}>Save</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function FilesEditor({
+  loadable,
+  showLoading,
+  updateFileContent,
+}: {
+  loadable: Loadable<UiSourceFile[]>;
+  showLoading: boolean;
+  updateFileContent: (index: number, content: string) => void;
+}) {
+  if (loadable.status === 'failed') return <LoadableError noun="files" error={loadable.error} />;
+  return (
+    <LoadingFade showSkeleton={showLoading} skeleton={<FormSkeleton inline={false} fields={[{ tall: true }]} />}>
+      {loadable.status === 'loaded' && loadable.data.map((file, i) => (
+        <div class="form-group" key={file.name}>
+          <label>{file.name}</label>
+          <CodeTextarea value={file.content} onInput={(v) => updateFileContent(i, v)} />
+        </div>
+      ))}
+    </LoadingFade>
+  );
+}
+
+/** Auto-resizing textarea for code — Enter inserts newline (not submit). */
+function CodeTextarea({ value, onInput }: { value: string; onInput: (v: string) => void }) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => autoResizeTextarea(ref.current), [value]);
+
+  return (
+    <textarea
+      ref={ref}
+      class="auto-textarea code-textarea"
+      value={value}
+      onInput={(e) => onInput((e.target as HTMLTextAreaElement).value)}
+      rows={3}
+      spellcheck={false}
+    />
+  );
+}

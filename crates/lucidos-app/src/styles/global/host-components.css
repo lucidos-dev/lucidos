@@ -1,0 +1,2018 @@
+/*
+ * Lucidos host-chrome component CSS — HOST BUNDLE ONLY (never served to apps).
+ *
+ * These component classes are used only by the Lucidos host shell, not by app
+ * iframes: the header/filter icon-button variants, the send→cancel morph button,
+ * the custom <Dropdown> + nav-history popover, and the list-row FLIP helper.
+ *
+ * Imported by `global.css` AFTER `shared-components.css` so rules that extend a
+ * shared base class by source order (e.g. .send-cancel-morph overriding
+ * .action-btn's transition) keep winning. Deliberately NOT part of the
+ * `/api/v1/sdk-iframe.css` the engine serves to apps — apps get only the
+ * reusable layer in `shared-components.css` and use `lucidos.ui.Select`
+ * (.lucidos-select, in the engine's sdk_iframe.css) instead of .dropdown*.
+ *
+ * Keep genuinely-reusable component classes in `shared-components.css`, not here.
+ */
+
+/* ── Navigation focus marker (the "focus stick") ─────────────────────────────
+   Shared by every host navigation that lands on a specific inner element in a
+   scroll container: a chat event or change, a settings item, a plugin row
+   (driven by components/shared/focusMarker.ts). A Slack-style BACKGROUND
+   HIGHLIGHT (.nav-focus-stuck) that glows like a spotlight: the marked element's
+   own box is washed in the marker's own colour, and the wash blooms softly past
+   its edge. It is a light being switched on: it ramps up, holds at full for at least
+   NAV_FOCUS_HOLD_MS however fast the user engages, and only then dissolves via
+   .nav-focus-fading on the user's action (scroll / keypress / click / new nav /
+   explicit scroll) before being removed. It replaced an accent `outline` FRAME
+   around the box, which read as a heavy dialog border on a landed chat turn rather
+   than as a highlight.
+
+   All three layers ride ONE `box-shadow`, which is what makes the whole thing
+   work:
+     1. the inset layer is the fill. A 100vmax spread paints the entire padding
+        box flat (the standard fill-via-inset-shadow trick), and because an inset
+        shadow paints ABOVE the element's own background and BELOW its content, it
+        LAYERS OVER a host's background instead of competing with it. That is the
+        whole reason it is not a `background-color`, and the collision runs the
+        opposite way to the obvious guess: `.list-row:hover` is (0,2,0) and
+        `.nav-focus-stuck` is (0,1,0), so hovering a marked plugin row would win
+        the cascade and the MARKER would vanish under the pointer. As a shadow
+        there is no cascade to lose: both paint, hover tint beneath, wash above;
+     2. the hairline border, a 1px spread with no blur. Its strength is
+        --nav-focus-border-alpha: light draws it, dark sets 0% and stays frameless;
+     3. + 4. the two outer layers are the glow: a tight halo hugging the edge and
+        a wide soft bloom past it. That bloom IS the spotlight; a center-bright
+        radial gradient was rejected because the marked elements are wide, short
+        rows and panels, where a radial reads as an uneven horizontal wash.
+   box-shadow also keeps every geometry property the outline had: it is outside
+   the box model (no layout shift, and the deep-link landing relies on
+   scroll-margin staying exact) and it follows `border-radius`. And unlike a
+   gradient in `background-image` (which does not interpolate reliably across
+   engines) it interpolates layer-by-layer, so the turn-on and the dissolve below
+   are both plain keyframe animations rather than an opacity-faded pseudo-element
+   that would collide with the host elements' own ::before/::after.
+
+   Every colour is a color-mix over --nav-focus-glow, so this rule is hue-agnostic
+   and both themes work off one token. That token is NOT the accent: the marker used
+   to be an --accent wash and it read as a picked surface instead of as a marker,
+   because --picked-surface is the same accent hue at nearly the same alpha and
+   because every other piece of chrome here is blue already. Do NOT fold it back
+   onto --accent to "reuse the theme token": owning no other surface's colour is the
+   entire point, and reverting it reintroduces the collision.
+
+   The two themes deliberately resolve that token to DIFFERENT values, which is why
+   nothing here names a colour: retuning either value must never mean editing this
+   rule, so naming them would only create a second place to keep in step. base.css
+   carries both values and the reasoning, including why they differ rather than
+   matching. Note also that this rule PAINTS NOTHING
+   if the token is missing rather than degrading: an unresolved var makes each
+   color-mix invalid at computed-value time, which drops the whole box-shadow. Both
+   theme blocks defining it is pinned by nav-focus-marker-paint.test.ts.
+
+   This per-turn marker is why the `.thread-content` scroll region itself shows no
+   focus outline (input-messages.css): the marker signals focus, not a ring around
+   the whole conversation. Always-on; not applied to apps or whole-pane opens
+   (trigger detail, file preview).
+
+   The arrival marker (components/shared/ArrivalList.tsx) shares these rules: a
+   row that has just arrived wears the same light. It runs its own lifecycle with
+   the same timings, so it never takes the one navigation landing. */
+.nav-focus-stuck,
+.arrival-marker {
+    border-radius: calc(var(--radius-control) * 0.75);
+    box-shadow:
+        inset 0 0 0 100vmax color-mix(in srgb, var(--nav-focus-glow) 16%, transparent),
+        0 0 0 1px color-mix(in srgb, var(--nav-focus-glow) var(--nav-focus-border-alpha), transparent),
+        0 0 0.375rem color-mix(in srgb, var(--nav-focus-glow) 28%, transparent),
+        0 0 1.5rem color-mix(in srgb, var(--nav-focus-glow) 15%, transparent);
+    animation: nav-focus-spotlight-on calc(0.45s * var(--duration-scale)) ease-out;
+    /* Forced-colors fallback, the same one every focus ring in this codebase
+       carries (see .icon-btn / .action-btn in shared-components.css): high-contrast
+       mode STRIPS box-shadow, so a marker made only of shadows would leave a
+       forced-colors user with no indication at all of where the navigation landed.
+       A transparent outline paints nothing normally and is forced to a system
+       colour there, restoring a visible marker. This is NOT the accent frame the
+       highlight replaced: it never renders outside forced-colors mode. */
+    outline: 0.125rem solid transparent;
+}
+
+/* The spotlight switching ON: the marker ramps up from nothing rather than appearing
+   at full strength, and it ONLY rises. `ease-out` gives the fast-then-easing rise of
+   a lamp reaching steady state, and the implicit `to` keyframe is the element's own
+   computed value, i.e. the base rule, so the ramp lands exactly on the resting wash
+   and cannot drift from it.
+
+   Monotonic is a REQUIREMENT, not a shape preference, and it is why there is no
+   intermediate stop here. An earlier cut overshot to a surge at 55% and settled back
+   into the resting values, on the theory that a surge sells "switching on". It sells
+   the opposite: the drop from the surge to resting is a third of the brightness lost
+   a quarter-second after landing, and it reads as the light immediately turning back
+   down (reported exactly that way). A real lamp rises monotonically to steady state;
+   only a camera flash overshoots. Any stop added between 0% and the implicit end must
+   therefore stay BELOW the resting values, and the guard asserts the simplest form of
+   that, which is no intermediate stop at all.
+
+   This deliberately gives up the decay-only property the first version had, where
+   the marker was at full strength from its first painted frame so a glance-away or
+   a slow iOS load could not miss it. The user asked for a real turn-on, and the
+   trade is small **because the marker persists**: once the ramp lands it is there
+   until the user acts, and for at least NAV_FOCUS_HOLD_MS even then, so the only
+   thing a look-away can miss is the ramp itself, never the marker. That reasoning
+   does NOT extend to a ramp that ends in nothing, which is what fd61d7af9 removed
+   and must not come back.
+
+   No fill-mode, so once it ends the computed value falls back to the base rule.
+   Layer count and inset-ness match the base rule at every keyframe, or the layers
+   could not interpolate.
+
+   Whether re-marking the SAME element replays the ramp depends on whether a style
+   recalc separated the two, and both outcomes are fine. Re-marking within ONE task
+   with no forced flush (the Enter turn-toggle, which only writes signals) leaves the
+   class present throughout as far as style is concerned, so nothing restarts and the
+   marker simply holds at its resting strength. Re-marking across tasks or after a
+   flush (a second deep-link to the same event: the `pointerdown` that armed the
+   dismiss and the handler that re-applies are separate tasks with frames between)
+   does restart it, and it ramps up from transparent again. Measured both. The only
+   thing worth guarding against is the middle case that does not exist here, a
+   restart that ends somewhere other than the resting wash. */
+@keyframes nav-focus-spotlight-on {
+    0% {
+        box-shadow:
+            inset 0 0 0 100vmax transparent,
+            0 0 0 1px transparent,
+            0 0 0.375rem transparent,
+            0 0 1.5rem transparent;
+    }
+}
+
+/* The spotlight switching OFF: a dissolve rather than a cut, and still slower than
+   the turn-on. The marker is not being dismissed because it is in the way, it is
+   being retired because the user has moved on, so it should drain instead of blinking
+   off. Only just, though: the dismiss is triggered BY the action that moves them on,
+   so past a certain length the drain stops reading as a graceful exit and starts
+   reading as the marker being slow to let go, which is what this rule's original 2.5s
+   did. Time at FULL brightness is NAV_FOCUS_HOLD_MS's job, not this one.
+   focusMarker.ts removes both classes once it completes, and NAV_FOCUS_FADE_MS must
+   match this duration.
+
+   An ANIMATION, not a transition, and that is a correctness requirement rather than
+   a style preference. The turn-on is an animation, and while an animation is running
+   it owns `box-shadow` outright: a transition declared underneath it never gets to
+   start. Cancelling the turn-on with `animation: none` to free the property does not
+   help either, because the value then lands on the after-change style in the same
+   frame, with no transition to interpolate it. Measured on the real rule: with that
+   shape, a dismiss anywhere inside the ramp dropped the marker to fully
+   transparent within two frames in Chromium (WebKit diverged, snapping below ~100ms
+   and interpolating above ~300ms), so the marker BLINKED OFF exactly when the user
+   acted quickly, which is the one thing this rule exists to prevent. Replacing the
+   running animation by name is deterministic in both engines and always plays.
+
+   The implicit `from` keyframe is the element's underlying value, i.e. the base
+   rule's resting wash, so the resting state stays written exactly once and this
+   cannot drift from it. `forwards` holds the end state for the sliver between the
+   animation finishing and focusMarker.ts stripping the classes.
+
+   Interrupting the ramp costs a step: the dissolve begins from the resting value
+   rather than from wherever the ramp had got to. Since the ramp is monotonic and
+   never exceeds resting, that step is always UPWARD and at most the full resting
+   alpha, so the worst case is the light snapping to full before draining, never
+   dimming or vanishing. In practice NAV_FOCUS_HOLD_MS makes it unreachable: the
+   dissolve cannot start until well after the ramp has finished, so the two only
+   overlap if a supersede lands mid-ramp, which replaces the marker anyway. From
+   whatever value it starts at, the dissolve itself was measured strictly monotonic
+   in both engines, to within a frame of each other.
+
+   `linear`, not an ease: an `ease-out` dumps most of the alpha in the first couple of
+   hundred ms and then drags a nearly-invisible tail, which reads as a cut followed by
+   a lag rather than as a drain. An even ramp is what actually looks like draining.
+
+   If scroll jank on the transcript is ever traced to this rule, this is why: an
+   animated box-shadow is NOT GPU-composited, so every frame repaints the marked
+   element (which can be a full-width chat turn) and what shows through it, and the
+   dismiss is usually triggered BY a scroll gesture, so the repaint window overlaps
+   the moment jank shows most. The duration is short and the blurs are small, so it is
+   left alone until someone actually measures a drop; shortening it further is the
+   first knob, not a rewrite. */
+.nav-focus-stuck.nav-focus-fading,
+.arrival-marker.arrival-marker-fading {
+    animation: nav-focus-spotlight-off calc(0.8s * var(--duration-scale)) linear forwards;
+}
+
+@keyframes nav-focus-spotlight-off {
+    to {
+        box-shadow:
+            inset 0 0 0 100vmax transparent,
+            0 0 0 1px transparent,
+            0 0 0.375rem transparent,
+            0 0 1.5rem transparent;
+    }
+}
+
+/* focusMarker.ts also skips the dissolve under reduced motion (it strips both
+   classes at once, so .nav-focus-fading never lands); this is the CSS backstop
+   so neither the turn-on ramp nor the dissolve runs. The marker still appears
+   (instantly, at its resting strength, since the base rule is the resting state)
+   and still clears, just without motion. The fading arm needs its own rule
+   rather than inheriting the one above: it is a two-class selector, so it
+   outranks a bare `.nav-focus-stuck { animation: none }` and would keep
+   animating. */
+:root[data-motion="reduce"] .nav-focus-stuck,
+:root[data-motion="reduce"] .arrival-marker {
+    animation: none;
+}
+
+:root[data-motion="reduce"] .nav-focus-stuck.nav-focus-fading,
+:root[data-motion="reduce"] .arrival-marker.arrival-marker-fading {
+    animation: none;
+}
+
+/* Icon-only buttons: one 2.25rem tap target, three bands by what the control
+   sits in. `header-icon` in a header band, `row-icon` in a list row's action
+   cluster, `inline-icon` inline in a run of text. Three names because each band
+   answers to something different. The mobile thread title bar narrows the
+   header one, squeezing it onto the title's own line. The inline one has to
+   keep its target off the line it interrupts. Left to
+   `.icon-btn`'s bare padding any of them would be its glyph plus 0.25rem, a
+   ~24px target a thumb misses that reads squat beside the row's text. That is
+   what the queued message's trash (1.25rem) and the trigger group heading's
+   pair (1.375rem) each were before they came here.
+
+   `--icon-glyph` is the NOMINAL size of whatever glyph the box holds, and it is
+   the only part that varies: `--icon-tap-target` is the tap target, grown
+   deliberately after the trash was reported unhittable on mobile (and after the
+   `.edge-swipe-right` overlay fix), so a band that wants a smaller icon turns
+   the glyph down and leaves the target alone. It is declared per class below, on
+   selectors this rule's own list carries, so a nominal can never be set on
+   something that is not one of these tap targets. */
+.icon-btn.header-icon,
+.icon-btn.row-icon,
+.icon-btn.inline-icon {
+    --icon-tap-target: 2.25rem;
+    position: relative;
+    justify-content: center;
+}
+
+/* Both chrome bands take the target as their BOX. Each sits in a strip that
+   exists to hold controls, so a box larger than its glyph costs nothing there:
+   the strip is already that tall and the icons are its content. */
+.icon-btn.header-icon,
+.icon-btn.row-icon {
+    width: var(--icon-tap-target);
+    height: var(--icon-tap-target);
+    padding: 0;
+}
+
+/* An inline icon cannot take the target as its box: it interrupts a line of
+   text rather than sitting in a strip of its own. As a box the target WAS the
+   layout. It set the turn header's height to the target, against the
+   --turn-header-line every other header keeps. It also held the words either
+   side of the trash half an em further apart than their own gaps ask for. All
+   of that is padding nobody can see, and it was reported as too much space
+   around the glyph.
+
+   So the box is the glyph, and an overlay carries the target instead. The
+   negative margin hands `.icon-btn`'s own chip padding back on BOTH axes, the
+   way `.initiator-actor` does (chat/input-messages.css). The chip is a hover
+   affordance, not spacing: the row an inline icon lands in declares its own
+   gaps, and a chip that also spaced would stack on top of them. */
+.icon-btn.inline-icon {
+    --inline-icon-chip: 0.25rem;
+    padding: var(--inline-icon-chip);
+    margin: calc(-1 * var(--inline-icon-chip));
+    /* Raise the glyph onto the text's CAP BAND. A flex row centres it on the
+       line box, which sits low against the caps: a font's ascent and descent
+       are not symmetric about them. `.explainer-btn` below takes the same
+       correction from an x-height, and states its own derivation.
+
+       No one number is exact in both engines, which place the baseline
+       differently inside the line box. Against --font-size-md Fira Code,
+       Chromium wants 0.10em and WebKit 0.045em, at every UI scale. This splits
+       them, leaving under half a pixel either way. `em`, so the correction
+       tracks the text. `position` comes from the band rule above. */
+    top: -0.07em;
+}
+
+/* The overlay, and it grows on ONE axis. Transparent and positioned, so it
+   takes the pointer without painting anything.
+
+   It takes its HEIGHT from the shared 2.25rem and its WIDTH from the button,
+   because only the vertical has room. A square target at this size reaches
+   past both the words an inline icon sits between. The queued trash cleared
+   its "Queued" label by a single pixel, so the row held the two words 0.89em
+   and 1.05em out to make space for a box nobody can see. That was reported as
+   too much padding, and it was all of it. Above and below sits only the turn's
+   own body, which no pointer wants, so the reach goes there and the words come
+   back in to 0.59em and 0.74em.
+
+   Sized off the button rather than a second token, since the two are one
+   claim: a target that stopped tracking the box it covers would drift off the
+   glyph on the next retune. Each neighbour keeps that side's gap less the
+   chip, so the queued trash holds 0.125rem off the label and 0.25rem off the
+   timestamp. e2e/queued-message-group.spec.ts measures both.
+
+   `left`/`top` are load-bearing: the transform centres nothing on its own, and
+   without them the target slides half its width off the glyph. */
+.icon-btn.inline-icon::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 100%;
+    height: var(--icon-tap-target);
+    transform: translate(-50%, -50%);
+}
+
+/* A header icon IS the content of its band, so it takes the large step. */
+.icon-btn.header-icon {
+    --icon-glyph: var(--icon-size-lg);
+}
+
+/* A row icon is a secondary control beside text that outranks it, and the eye
+   reads it against the header icons a few rows up rather than against its own
+   neighbour, so it sits one step down. At the large step the trigger group
+   heading's pencil painted 20.12 of its 24 viewBox units where the header's
+   compose icon paints 12.5 of 18, a fifth more ink in a nominally equal box,
+   and was reported oversized: the same 21% mismatch the trash correction below
+   exists to remove, in the other direction. At the medium step it lands within
+   a few percent of that icon's ink. So the step is the band's default rather
+   than a per-caller retune. */
+.icon-btn.row-icon {
+    --icon-glyph: var(--icon-size-md);
+}
+
+/* An inline icon sits INSIDE a line of text, not beside one, so it reads
+   against the type it interrupts. The row band aims at the header icons
+   instead, which is the wrong target here, so this steps down once more.
+
+   The queued message's trash is the caller: at the row step its ink stood
+   0.84rem against 0.81rem text, and it was reported as too big. Width is what
+   does that, and the row band's numbers say nothing about it. The trash is 18
+   viewBox units wide against 16 tall, so the correction below matches HEIGHTS
+   and leaves it an eighth wider than the pencil. In the heading's action
+   cluster that reads as a pair; interrupting a status line it reads as an
+   oversized glyph. */
+.icon-btn.inline-icon {
+    --icon-glyph: var(--icon-size-sm);
+}
+
+.icon-btn.header-icon svg,
+.icon-btn.row-icon svg,
+.icon-btn.inline-icon svg {
+    width: var(--icon-glyph);
+    height: var(--icon-glyph);
+}
+
+/* The trash is sized by its INK, not by the box, which is the same correction
+   the composer's agent marks take and for the same reason: a shared box is not
+   a shared size (styles/__tests__/prompt-mark-optical-size.test.ts). Measured
+   in both engines at this box, the trash paints 16 of its 24 viewBox units
+   vertically where the pencil paints 20.12, so at one box it rendered a fifth
+   shorter and was reported as small twice over. Growing it by that ratio lands
+   the two on one height.
+
+   The pencil is the REFERENCE for how much of its box a glyph in this set
+   paints, not the reason, so this deliberately reaches the trash in every band
+   and not only the one that happens to sit beside a pencil: the queued
+   message's is an `inline-icon`, and a glyph whose ink correction depended on
+   its neighbours would come out at two sizes from one nominal. A band that
+   names a different nominal on purpose is not that case: it gets this same
+   correction, applied to the size it asked for.
+
+   The stroke has the ratio taken back out because `stroke-width` is in user
+   units and would otherwise thicken with the glyph, which would answer "too
+   small" with "too heavy". Both numbers are measurements of the artwork in
+   icons.tsx, so they are only right while it is unchanged: pinned against the
+   real rendering by e2e/trigger-group-icon-optics.spec.ts, which fails if
+   either glyph is redrawn without re-measuring here.
+
+   The correction is expressed against `--icon-glyph`, the nominal each band
+   declares above, rather than against `--icon-size-lg` directly. That is what
+   lets a band pick a smaller nominal (the inline one does) and still get this
+   ratio applied to it: the ink correction and the stroke division are
+   unchanged, they simply apply at whatever nominal is in scope. The stroke
+   needs no extra work for that, being in user units and therefore already
+   proportional to the glyph, so a smaller icon correctly comes out with a
+   thinner line. */
+.icon-btn.header-icon .trash-icon,
+.icon-btn.row-icon .trash-icon,
+.icon-btn.inline-icon .trash-icon {
+    /* The two measurements, in viewBox units of 24, and nothing derived from
+       them by hand: the size and the stroke both divide by the same pair, so
+       they cannot drift into a glyph that grew without its stroke thinning,
+       which is the mismatch this rule exists to avoid. */
+    --pencil-ink: 20.12;
+    --trash-ink: 16;
+    width: calc(var(--icon-glyph) * var(--pencil-ink) / var(--trash-ink));
+    height: calc(var(--icon-glyph) * var(--pencil-ink) / var(--trash-ink));
+    /* 2 is the stroke-width the artwork is drawn at (icons.tsx). */
+    stroke-width: calc(2 * var(--trash-ink) / var(--pencil-ink));
+}
+
+.icon-btn.filter-active,
+.icon-btn.view-selector-active {
+    color: var(--accent);
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-control) * 0.75);
+}
+
+@media (hover: hover) {
+    .icon-btn.filter-active:hover,
+    .icon-btn.view-selector-active:hover {
+        background: var(--bg-quaternary);
+        color: var(--accent);
+    }
+}
+
+.icon-btn.pinned {
+    color: var(--accent);
+}
+
+/* A crossfade between layers stacked in one grid cell
+   (components/shared/CrossfadeStack.tsx). Every layer stays mounted, so a swap
+   is a transition that can reverse mid-way. `min-width: 0` lets a layer
+   shrink inside a capped box. */
+.crossfade-stack {
+    display: grid;
+}
+
+.crossfade-layer {
+    grid-area: 1 / 1;
+    min-width: 0;
+    opacity: 0;
+    transition: opacity var(--duration-fast) ease;
+}
+
+.crossfade-layer[data-current] {
+    opacity: 1;
+}
+
+/* The scaled duration alone is not instant: a transition that short still
+   waits for its start, and Chromium can hold the old value a frame or two
+   under load. So reduced motion cancels it outright. */
+:root[data-motion="reduce"] .crossfade-layer {
+    transition: none;
+}
+
+/* The navigation cover (components/shared/NavigationCover.tsx): an opaque
+   theme surface that hides a pane's view swap, so a switch never shows its swap
+   frame. It plays its own animation and never waits on the view. Its host sets
+   the z-index: the content pane (panels/shell.css) and the thread drawer
+   (drawer.css).
+
+   Named a cover, never a "reveal": `revealContentPane()` is a different thing
+   (swipe to the pane on mobile, focus its pane group on desktop). Every surface
+   that hides a not-yet-ready view is a cover (`.app-ui-cover`, the quiet boot
+   cover). */
+.nav-cover {
+    position: absolute;
+    inset: 0;
+    background: var(--bg-primary);
+    pointer-events: none;
+    animation: nav-cover-clear var(--duration-normal) ease-out forwards;
+}
+
+@keyframes nav-cover-clear {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+/* The `dip`: the cover rises over the leaving view, holds opaque across the
+   midpoint where its host swaps the views, and clears off the arriving one. It
+   rests transparent, so a first frame the animation misses still shows the
+   leaving view rather than a flash of background. The hold absorbs a frame or
+   two of late start, so the swap still lands under an opaque cover. */
+.nav-cover.nav-cover-dip {
+    opacity: 0;
+    animation: nav-cover-dip var(--duration-slow) ease-in-out forwards;
+}
+
+@keyframes nav-cover-dip {
+    0% { opacity: 0; }
+    45%, 55% { opacity: 1; }
+    100% { opacity: 0; }
+}
+
+/* No animation. The cover is transparent from its first frame, since it stays
+   mounted until its fuse. */
+:root[data-motion="reduce"] .nav-cover {
+    animation: none;
+    opacity: 0;
+}
+
+/* Send → Cancel morph button. Always rendered at the same JSX position
+ * across send/cancel/canceling/placeholder so Preact never unmounts the
+ * DOM node — class-driven mode changes let the .action-btn background-color
+ * transition above animate the blue→red morph. min-width fits "Cancel..."
+ * so the row doesn't jitter sideways when the label changes.
+ * morph-placeholder keeps the row height stable when nothing else fills
+ * the slot. The "hidden" mode is handled by not rendering the button at
+ * all — snap-unmount, like the sibling section buttons — so the leave
+ * path doesn't pop to the prompt frame edge. */
+.send-cancel-morph {
+    transition:
+        background-color var(--duration-emphasis),
+        color var(--duration-normal),
+        opacity var(--duration-normal);
+}
+.send-cancel-morph.morph-placeholder {
+    visibility: hidden;
+    pointer-events: none;
+}
+/* The Stop a send just morphed into is disabled for a moment, so a laggy second
+ * tap on Send cannot cancel the turn (`armCancelSettle`). That guard is not a
+ * state the reader needs to see. Dimmed, the button blinks a beat after the
+ * send instead of turning into Stop with the rest of the composer. */
+.send-cancel-morph.morph-settling:disabled {
+    opacity: 1;
+}
+
+/* Round icon variant of the send/cancel morph. Replaces the old text label
+ * ("Send" / "Cancel") with a single compact circle that swaps only its glyph
+ * between the send (up-arrow) and stop (square) states — saving horizontal
+ * space on mobile while staying the .action-btn blue across both states. The
+ * padding/min-width from .action-btn are reset so the circle isn't stretched
+ * by the label-era sizing. The diameter is sized to sit at the height of the
+ * neighbouring text action buttons (Save / Diff / Apply) so the row reads as
+ * one cluster, not an oversized primary button. */
+.send-cancel-round {
+    min-width: 0;
+    width: var(--send-round-size);
+    height: var(--send-round-size);
+    padding: 0;
+    border-radius: var(--radius-round);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+.send-cancel-round svg {
+    width: 0.9375rem;
+    height: 0.9375rem;
+}
+
+/* Split button: a one-tap primary face joined to a caret that opens an upward
+ * menu of secondary actions. Reused by the change-action banner (Apply +
+ * Diff/Discard/Archive) and the prompt's multi-select answer control (Submit +
+ * Cancel). The face + caret read as a single pill: the face loses its right
+ * radius, the caret loses its left radius, and a translucent hairline divides
+ * them. See components/shared/SplitButton.tsx. */
+.split-button {
+    position: relative;
+    display: flex;
+    align-items: stretch;
+}
+
+/* A face that still takes presses reads disabled through aria-disabled. It
+   looks as `.action-btn:disabled` does and keeps its fill on hover. */
+.split-button-primary[aria-disabled="true"] {
+    opacity: 0.4;
+    cursor: default;
+}
+@media (hover: hover) {
+    .split-button-primary.action-btn-confirm[aria-disabled="true"]:hover {
+        background-color: var(--confirm-bg);
+    }
+}
+
+/* Archive held back by a sub-thread (ADR 0378). It looks disabled but still
+   takes a press, because the press explains why. */
+.action-btn-blocked[aria-disabled="true"] {
+    opacity: 0.4;
+    cursor: default;
+}
+@media (hover: hover) {
+    .action-btn-blocked[aria-disabled="true"]:hover {
+        background-color: var(--accent-action);
+    }
+}
+
+/* A split button with no menu draws no caret, and its face keeps both corners. */
+.split-button-primary:has(+ .split-button-caret) {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+}
+
+.split-button-caret {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+    /* No vertical padding: the caret stretches to the face's height, so its
+       icon never makes a split button taller than a plain button beside it. */
+    padding: 0 0.4375rem;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    border-left: 1px solid color-mix(in srgb, var(--text-on-accent) 30%, transparent);
+}
+
+.split-button-caret svg {
+    transition: transform var(--duration-normal);
+}
+
+/* Open → flip the chevron to point down (menu is above, pointing back at it). */
+.split-button-caret.open svg {
+    transform: rotate(180deg);
+}
+
+/* When expanded, the caret menu and the primary row read as ONE unit: a single
+ * slightly-translucent frosted frame with the solid .action-btn pills (Diff /
+ * Discard / Apply) stacked inside it. STEADY BASE is the load-bearing rule: the
+ * primary button is the anchor and must NOT move when the menu opens. So the
+ * frame is NOT built by growing the in-flow `.split-button` box (padding/border
+ * on open shoved the right/bottom-anchored button up-and-left — the jump). It's
+ * two OUT-OF-FLOW pieces that wrap the steady button: the menu is the
+ * rounded-top half (absolute, above), `.split-button.open::before` (below) is
+ * the rounded-bottom half (absolute, behind the pills). Both extend the same
+ * `0.375rem` beyond the button on the sides, sharing the same translucent fill
+ * and hairline border, so they fuse into one panel around an unmoved button. */
+
+/* Upper half of the frame. Extended `0.375rem` beyond the button on each side
+ * (matching the ::before below) and dropped flush onto the button's top edge (no
+ * margin) so menu + button fuse. Even padding all round → the seam gap
+ * (menu padding-bottom + the button's top edge) matches the inter-pill gap, so
+ * Diff→Discard→Apply read as one even rhythm without the button needing any
+ * top padding (which would move it). */
+.split-button-menu {
+    position: absolute;
+    bottom: 100%;
+    left: -0.375rem;
+    right: -0.375rem;
+    margin-bottom: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    padding: 0.375rem;
+    background: color-mix(in srgb, var(--bg-secondary) 86%, transparent);
+    -webkit-backdrop-filter: blur(0.625rem) saturate(1.2);
+    backdrop-filter: blur(0.625rem) saturate(1.2);
+    border: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
+    border-bottom: none;
+    border-radius: var(--radius-surface) var(--radius-surface) 0 0;
+    /* Up-only shadow so the unit lifts off the chat content above without
+     * casting onto (and darkening the seam over) the primary row below. */
+    box-shadow: var(--shadow-up);
+    z-index: var(--z-dropdown);
+    animation: split-button-menu-in var(--duration-normal) ease;
+}
+
+html[data-theme-mode="dark"] .split-button-menu {
+    box-shadow: 0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.4);
+}
+
+@keyframes split-button-menu-in {
+    from { opacity: 0; transform: translateY(0.375rem); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+.split-button-menu button {
+    width: 100%;
+    text-align: center;
+}
+
+/* Lower half of the frame, drawn OUT OF FLOW so the button never moves. The
+ * `::before` is absolutely positioned and extends `0.375rem` beyond the steady
+ * button on the sides + bottom and up to the button's top edge (the seam with
+ * the menu) — giving the same translucent fill + hairline border + rounded
+ * bottom + grounding shadow as the menu, wrapped around the unmoved pills. It
+ * sits BEHIND the pills (which get `z-index: 1` below); since it adds no padding
+ * or border to the in-flow box, opening the menu changes only paint, never
+ * layout. No `backdrop-filter` here on purpose: it would make this a backdrop
+ * root and break the menu's frost (the menu floats outside this box, over the
+ * chat content), so only the menu is frosted. */
+.split-button.open::before {
+    content: "";
+    position: absolute;
+    left: -0.375rem;
+    right: -0.375rem;
+    top: 0;
+    bottom: -0.375rem;
+    background: color-mix(in srgb, var(--bg-secondary) 86%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
+    border-top: none;
+    border-radius: 0 0 var(--radius-control) var(--radius-control);
+    /* Down-only shadow (mirrors the menu's up-only) so the unit grounds at the
+     * bottom without bleeding a shadow up through the translucent menu seam. */
+    box-shadow: 0 0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1);
+}
+
+html[data-theme-mode="dark"] .split-button.open::before {
+    box-shadow: 0 0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.4);
+}
+
+/* Lift the pills above the ::before frame backing. position+z-index don't change
+ * layout, so the steady base holds. flex:1 makes [Apply*] fill the row
+ * so it + the caret span the same width as the Diff / Discard pills above. */
+.split-button.open .split-button-primary,
+.split-button.open .split-button-caret {
+    position: relative;
+    z-index: 1;
+}
+
+.split-button.open .split-button-primary {
+    flex: 1;
+}
+
+/* Shared dropdown — custom select replacement */
+.dropdown {
+    position: relative;
+    flex-shrink: 0;
+}
+
+/* A dropdown wrapped in a <LoadingFade> so it can show a skeleton while its value loads.
+   The fade wrapper becomes the flex item in the parent row, so it has to carry
+   the trigger's own refusal to shrink: without it the row compresses the
+   wrapper (and `.loading-fade > * { min-width: 0 }` lets the compression reach
+   the control) instead of wrapping, and the label inside clips. */
+.dropdown-slot {
+    flex-shrink: 0;
+}
+
+/* `.dropdown-trigger` and `.dropdown-placeholder` live in
+   `shared-components.css` now — apps render them too via `lucidos.ui.Select`.
+   See docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md. */
+
+/* The loading skeleton (`<DropdownSkeleton>`) borrows the trigger's box so the real
+   control lands in exactly its place. It is a span rather than a button, so all
+   that is left to undo is the pointer affordance: a shimmer that highlights
+   under the cursor reads as something you can press. */
+.dropdown-trigger.dropdown-skeleton {
+    pointer-events: none;
+    cursor: default;
+}
+
+.dropdown-sizer {
+    display: grid;
+    text-align: left;
+}
+
+.dropdown-sizer > * {
+    grid-area: 1 / 1;
+    visibility: hidden;
+    white-space: nowrap;
+}
+
+.dropdown-sizer > :first-child {
+    visibility: visible;
+}
+
+/* Every option label is stacked in that one grid cell, so the trigger is as
+   wide as the widest of them and never resizes on a pick. The hidden rows
+   measure WIDTH only, so they carry no height, and they clip rather than feed
+   their overflow to a scrolling ancestor. The tallest row in the cell would
+   otherwise set the height of the whole control. A label the UI font cannot
+   draw falls back to a font with taller metrics: the compose destination
+   picker's fullwidth plus, or an emoji in an app name. That is what left that
+   picker standing taller than the coding-agent chip beside it. Width survives,
+   since a grid column sizes on its items' inline contributions. */
+.dropdown-sizer > *:not(:first-child) {
+    height: 0;
+    overflow: hidden;
+}
+
+/* A model selection reads as a whole pair, `Opus 5 (1M) · X-High`, so its
+   trigger is far wider than an ordinary dropdown's and a long registry id would
+   push its row past the pane. `.dropdown`'s blanket `flex-shrink: 0` is right
+   for a short control and wrong for this one, so this variant shrinks and
+   ellipsizes. It carries no `.dropdown-sizer`: the field renders one label
+   rather than every option stacked, so there is nothing to size against. */
+.dropdown.model-selection-field {
+    flex-shrink: 1;
+    min-width: 0;
+}
+
+/* `min-width: 0` is what lets it ellipsize: the trigger is a flex row, and a
+   flex item defends its min-content width until told otherwise. */
+.model-selection-value {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* `.dropdown-chevron` lives in `shared-components.css` now (see
+   docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md) — `lucidos.ui.Select`
+   wears it too, flipping the same glyph instead of swapping it. */
+
+/* Default styling for `.dropdown-menu` is `position: absolute`, anchored
+ * to its `.dropdown` wrapper. The shared `Dropdown` component overrides
+ * to `position: fixed` inline (paired with viewport-coordinate `top`/`left`
+ * from `useAnchoredPosition`) AND portals the panel to <body>, so the menu
+ * escapes any `overflow: hidden` ancestor, notably `.mobile-swipe-pane` on
+ * mobile, where an `absolute`-positioned menu was clipped at the pane edge
+ * regardless of placement direction. Custom callers that use `.dropdown-menu`
+ * directly (e.g. `ChangeSelector`) inherit the legacy absolute positioning.
+ *
+ * The z-index is the popover layer (--z-popover), above the floating header
+ * chrome, which otherwise paints its icons over a menu that reaches up into
+ * the header band.
+ * That is an ordinary case for the composer's destination picker: it opens
+ * upward and clamps to the top margin once the option list outgrows the space
+ * above it. Being a <body> child is what makes the number reachable at all,
+ * since inside a pane it is capped by that pane's stacking context. It sits
+ * above `.thread-toggle-slot`, on the same footing as `.thread-overflow-menu`.
+ *
+ * Deliberately below --z-modal, so a modal (and the UI-blocking overlay, which
+ * shares that level) still covers an open menu. So a menu opened INSIDE a
+ * backdrop `<Overlay>` portals into that modal's panel, not <body>
+ * (`PortalTarget` in `Overlay.tsx`). There it paints above the modal, and its
+ * taps read as inside it. Never raise this number past --z-modal instead:
+ * that would float every menu over the blocker.
+ *
+ * `max-width` caps a long option label so it clips (via the
+ * `.dropdown-option-label` ellipsis) instead of growing a viewport-positioned
+ * menu off a narrow screen. It bites only when the CONTENT wants more room
+ * than the trigger: `min-width` is the trigger's own width (set inline by
+ * `Dropdown`) and a min-width above the max-width wins, so a wide form field
+ * keeps its full-width menu. */
+.dropdown-menu {
+    position: absolute;
+    top: calc(100% + 0.25rem);
+    left: 0;
+    min-width: 100%;
+    max-width: min(24rem, calc(100vw - 1rem));
+    /* `--anchor-room` is the room between the trigger and the screen edge on
+       the side the menu opens, above the keyboard and below the status bar.
+       `useAnchoredPosition` measures it. Capped to it, a tall menu scrolls
+       instead of covering its trigger or the Dynamic Island. The fallback
+       covers a menu that publishes no room, such as the nav history. */
+    max-height: min(18.75rem, var(--anchor-room, calc(var(--app-height, 100dvh) - 1rem)));
+    overflow-y: auto;
+    z-index: calc(var(--z-popover) + 1);
+}
+
+/* A dropdown used as a form field sizes its option rows to the taller control
+ * the trigger is (`.form-group .dropdown-trigger`), so the menu does not read
+ * as a different, smaller control hanging off it. `Dropdown` puts this class on
+ * the panel itself (`dropdownMenuClass`) because the menu is portaled out of
+ * the `.form-group` that used to scope the rule through the DOM. */
+.dropdown-menu-field .dropdown-option {
+    padding: var(--space-sm) var(--space-md);
+    font-size: var(--font-size-md);
+}
+
+/* Overflow (⋯) menu — a sleek icon-list popover (the shared OverflowMenu shell
+ * behind ThreadOverflowMenu + DraftOverflowMenu).
+ * Portaled to <body> with `position: fixed` offsets from `useAnchoredPosition`
+ * (set inline via panelStyle), so this rule owns only the box + rows, not
+ * placement. Being a <body> child it takes the popover layer (--z-popover) to
+ * paint above the header chrome, same as `.nav-history-menu`. */
+.thread-overflow-menu {
+    /* Shrink-to-fit on the longest row, NOT the container width. The menu is
+     * portaled to <body> and measured (offsetWidth) by useAnchoredPosition while
+     * still in normal block flow (position is only applied once `pos` is
+     * computed) — a bare `display: block` child of <body> fills the viewport
+     * width, so the measured width came back ~viewport-wide. With `align: 'end'`
+     * (right edge pinned under the ⋯ trigger) that poisons
+     * `desiredLeft = rect.right - panelWidth` to a negative value, which the
+     * clamp then strands at the left margin. On desktop the drawer is a narrow
+     * left pane so the stranded menu still landed near the trigger; on mobile the
+     * full-width row puts the ⋯ at the far right, exposing the misalignment.
+     * `max-content` makes offsetWidth equal the rendered content width. */
+    width: max-content;
+    min-width: 12rem;
+    /* And a ceiling on that, because `max-content` trusts the longest row. A
+     * row's words are usually a verb, but the composer folds two STATUS
+     * readouts in here and each says its state in words. A waiting indicator
+     * reports the model's own sentence, which made the menu wider than the
+     * phone: `computeAnchorPosition` can only clamp a panel that FITS, so it
+     * pinned to the left margin and ran off the right edge. Capped, the row
+     * wraps instead (see `.thread-overflow-item`). */
+    max-width: min(22rem, calc(100vw - 1rem));
+    padding: 0.25rem;
+    z-index: calc(var(--z-popover) + 1);
+}
+
+.thread-overflow-item {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    width: 100%;
+    padding: 0.5rem 0.625rem;
+    background: none;
+    border: none;
+    border-radius: calc(var(--radius-control) * 0.75);
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    font-family: var(--font-ui);
+    text-align: left;
+    cursor: pointer;
+    /* A row wraps rather than running out of the menu. Dropping the old
+     * `nowrap` costs nothing while the menu sizes to `max-content`: a row can
+     * only wrap once the cap above binds, and there wrapping is the point.
+     * `anywhere` covers a label that is one long token, such as an event type
+     * or a path. */
+    overflow-wrap: anywhere;
+}
+
+/* A folded action's words, capped at two lines with an ellipsis. The row is
+ * flex, so the cap needs a box of its own: an anonymous flex item has nothing
+ * for `text-overflow` to act on. `min-width: 0` lets it shrink below its
+ * longest word, which is what makes the cap above bind instead of the row
+ * pushing the menu wider. */
+.thread-overflow-label {
+    min-width: 0;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+}
+
+.thread-overflow-item svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+    flex-shrink: 0;
+    color: var(--text-muted);
+}
+
+@media (hover: hover) {
+    .thread-overflow-item:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.thread-overflow-item:focus-visible {
+    background: var(--bg-hover);
+    outline: none;
+}
+
+/* Disabled-but-focusable menu row (aria-disabled, e.g. the diff-pinned Refresh
+ * collapsed into the content-header ⋯). Dimmed and hover-inert, but it stays in
+ * the roving-focus order — a `disabled` button would strand OverflowMenu's
+ * keyboard-open focus when the row is first. */
+.thread-overflow-item[aria-disabled="true"] {
+    opacity: 0.5;
+    cursor: default;
+}
+
+@media (hover: hover) {
+    .thread-overflow-item[aria-disabled="true"]:hover {
+        background: none;
+    }
+}
+
+/* A blocked thread exit (ADR 0378) takes the dimmed aria-disabled row above.
+ * Its reason is a muted note under the exits, which introduces the blocking
+ * sub-threads when there are any. */
+.thread-overflow-note {
+    padding: 0.375rem 0.625rem 0.125rem;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+.thread-overflow-sub-thread {
+    display: flex;
+    flex: 1;
+    gap: 0.75rem;
+    justify-content: space-between;
+    align-items: baseline;
+    min-width: 0;
+}
+
+.thread-overflow-sub-thread-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.thread-overflow-sub-thread-state {
+    flex-shrink: 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+/* Destructive overflow item (e.g. Delete draft) — red label + glyph, overriding
+ * the item's default text/muted-icon colors. */
+.thread-overflow-item-danger,
+.thread-overflow-item-danger svg {
+    color: var(--accent-red);
+}
+
+.thread-overflow-divider {
+    height: 1px;
+    margin: 0.25rem 0.375rem;
+    background: var(--border-color);
+}
+
+/* The glyph slot on a row that records a CHOICE rather than firing an action
+ * (the microphone picker behind the call control). Always present, checked or
+ * not, so every label in the group starts on one column. */
+.thread-overflow-check {
+    width: 0.75rem;
+    flex-shrink: 0;
+    color: var(--accent);
+    text-align: center;
+}
+
+/* The same check on a lone toggle row among actions (Apply on settle). It sits
+ * at the row's end, so the label keeps the column the icons give its siblings. */
+.thread-overflow-check-end {
+    margin-left: auto;
+}
+
+/* A muted line under a group of overflow rows, saying something about them
+ * rather than offering another action. It wraps at its own width rather than
+ * at the menu's cap, because it is a sentence and the rows are labels. */
+.thread-overflow-note {
+    max-width: 16rem;
+    padding: 0.25rem 0.625rem 0.375rem;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    white-space: normal;
+}
+
+/* A note reporting a FAILURE. It must not read as the muted aside above it:
+   "failed must look different from empty" (.claude/rules/frontend.md). */
+.thread-overflow-note-error {
+    color: var(--accent-red);
+}
+
+/* Saved pin (PinThreadButton): the icon is already filled (PinIcon filled) —
+ * the accent-colored filled silhouette alone signals the pinned state. No
+ * frame/background tint (the hover background still applies transiently, like
+ * every icon-btn). Shared across the drawer row + thread title headers. */
+.pin-thread-btn.active {
+    color: var(--accent);
+}
+
+/* Back/forward history popover — long-press or right-click on a nav chevron
+   (NavChevron). Reuses the .dropdown-menu surface + .dropdown-option rows;
+   constrains width so long thread / content titles ellipsize instead of shoving
+   the popover off a narrow viewport. The chevrons live in the floating
+   `.app-header` regions, whose `transform` traps a `position: fixed` child as
+   its containing block — so NavChevron portals this panel to <body> (escaping
+   the transform). Its own z-index is gone: `.dropdown-menu` above now carries
+   the one that clears the header chrome, for every menu on that surface. */
+.nav-history-menu {
+    min-width: 11rem;
+    max-width: min(20rem, 90vw);
+}
+
+/* A disabled chevron still names itself: its tooltip shows on hover, in every
+   pane. `.icon-btn:disabled` takes pointer events away, which also kills the
+   tooltip, so this gives them back. The hover wash stays off, because every
+   `.icon-btn:hover` wash skips a disabled button.
+
+   Gated on both inert regimes, like `.header-nav-cluster > *` in
+   styles/header-mark.css. A value set on the element beats the `none` those
+   regimes inherit down, so an ungated rule would keep the chevron live behind
+   an open menu or a raised keyboard. */
+:root:not([data-keyboard-active]):not([data-overlay-open]) .nav-chevron:disabled {
+    pointer-events: auto;
+}
+
+/* History rows pair a leading type glyph (thread type for ThreadNav, content
+ * category for PanelNav) with the destination label. Scoped to the history
+ * menu so other `.dropdown-option` callers keep their plain block layout: the
+ * icon holds a fixed column and the label flexes + ellipsizes beside it.
+ *
+ * Set at --font-size-md rather than the picker-sized --font-size-xs the base
+ * `.dropdown-option` carries: these rows are destinations to read (thread and
+ * content titles), not a list of short setting values, so they match the
+ * .thread-row-title of the drawer list they navigate. The padding comes up with
+ * the type for the same reason: the base 0.25rem/0.5rem was set around 11px
+ * text, and left alone it puts a 13px title 4px from its neighbour above. The
+ * menu scrolls past `.dropdown-menu`'s max-height, so the taller rows cost
+ * reach, not entries. */
+.nav-history-menu .dropdown-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: var(--space-sm) var(--space-md);
+    font-size: var(--font-size-md);
+}
+
+.nav-history-menu .dropdown-option .dropdown-option-label {
+    flex: 1;
+    min-width: 0;
+}
+
+/* Muted to match Search Everywhere's result icons. The Lucidos and Codex marks
+ * paint their own colours and ignore it. The Claude mark fills with
+ * `currentColor`, so it takes `--claude-mark` below, as on the chat's actor
+ * chips, rather than reading as a muted gray glyph. */
+.nav-history-icon {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1rem;
+    height: 1rem;
+    color: var(--text-muted);
+}
+
+.nav-history-icon .claude-icon {
+    color: var(--claude-mark);
+}
+
+.nav-history-icon svg {
+    width: 1rem;
+    height: 1rem;
+}
+
+.dropdown-filter-bar {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: 0.25rem;
+    background: var(--surface-bg);
+}
+
+/* Every search box in the host (`SearchField.tsx`). A host on its own
+   backdrop, like the brand header, recolours it through the three properties.
+   The transparent border keeps an outline in forced-colours mode. A neighbour
+   that lines up with the glyph reads the side padding from `:root`. */
+:root {
+    --search-field-pad-x: 0.75rem;
+}
+
+.search-field {
+    --search-field-bg: var(--bg-tertiary);
+    --search-field-fg: var(--text-primary);
+    --search-field-muted: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    min-width: 0;
+    padding: 0 var(--search-field-pad-x);
+    border: 1px solid transparent;
+    border-radius: var(--radius-round);
+    background: var(--search-field-bg);
+    color: var(--search-field-fg);
+}
+
+.search-field:has(> button) {
+    padding-right: 0.125rem;
+}
+
+.search-field-icon {
+    display: flex;
+    flex-shrink: 0;
+    color: var(--search-field-muted);
+}
+
+.search-field-icon svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+.search-field-input {
+    flex: 1;
+    min-width: 0;
+    padding: 0.3125rem 0;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: inherit;
+    font-size: var(--font-size-sm);
+}
+
+.search-field-input::placeholder {
+    color: var(--search-field-muted);
+}
+
+.search-field-clear {
+    flex-shrink: 0;
+    color: var(--search-field-muted);
+}
+
+.dropdown-no-results {
+    color: var(--text-muted);
+    cursor: default;
+}
+
+/* `.dropdown-option`'s base/hover/focused/active rules live in
+   `shared-components.css` now (see
+   docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md) — `lucidos.ui.Select`
+   wears them too. The variants below (header, danger, nav-history, form-field
+   sizing) stay here: the SDK control never applies these classes. */
+
+.dropdown-option.dropdown-option-header {
+    color: var(--text-secondary);
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    cursor: default;
+    padding-top: 0.375rem;
+    padding-bottom: 0.125rem;
+}
+
+@media (hover: hover) {
+    .dropdown-option.dropdown-option-header:hover {
+        background: transparent;
+        color: var(--text-secondary);
+    }
+}
+
+.dropdown-option.dropdown-option-header.focused {
+    background: transparent;
+    color: var(--text-secondary);
+}
+
+/* Every option's label is wrapped (one DOM shape — see Dropdown.tsx); clip
+ * with ellipsis when a caller constrains the menu width. */
+.dropdown-option-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Optional second line under an option's label (DropdownOption.description).
+ * var(--text-secondary) matches the established option-description treatment
+ * (.control-option-desc, .question-option-desc, .change-option-desc). */
+.dropdown-option-description {
+    font-size: var(--font-size-2xs);
+    color: var(--text-secondary);
+    white-space: normal;
+    max-width: 16rem;
+}
+
+/* Error row (DropdownOption.danger) — a failed load must look different from
+ * an empty group. Danger rows skip the header class entirely (Dropdown.tsx),
+ * so no uppercase resets are needed here. */
+.dropdown-option.dropdown-option-danger {
+    color: var(--accent-red);
+    cursor: default;
+}
+
+@media (hover: hover) {
+    .dropdown-option.dropdown-option-danger:hover {
+        background: transparent;
+        color: var(--accent-red);
+    }
+}
+
+.dropdown-option.dropdown-option-danger.focused {
+    background: transparent;
+    color: var(--accent-red);
+}
+
+.dropdown-input-wrap {
+    display: flex;
+    align-items: center;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.75);
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
+}
+
+/* Its focus ring is the text-input one, in text-input.css. */
+
+.dropdown-input-wrap .dropdown-chevron {
+    padding: 0 0.5rem 0 0;
+    cursor: pointer;
+}
+
+/* Typed value uses primary text in both themes — the old secondary grey made it
+   look dim/disabled (matches the .dropdown-trigger treatment above). */
+.dropdown-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    padding: 0.25rem 0.5rem;
+    outline: none;
+    min-width: 0;
+}
+
+.dropdown-input::placeholder {
+    color: var(--text-muted);
+    opacity: 0.6;
+}
+
+.dropdown-input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* FLIP animation helper — disables the row's background transition while a
+   reorder animation runs. Host-only. */
+.list-row.flip-animating {
+    transition: none;
+}
+
+/* `<Disclosure>` (components/shared/Disclosure.tsx). The body is its own
+   formatting context, so a child's margin stays inside the height the roll
+   measures. `:where` leaves a site's `bodyClass` free to lay it out instead.
+
+   The clip exists only mid-roll: at rest it would cut focus rings and
+   tooltips. It also drops a flex item's automatic minimum height, so the box
+   must not shrink, or a capped flex scroller squashes it to nothing. */
+.disclosure {
+    flex-shrink: 0;
+}
+
+:where(.disclosure-body) {
+    display: flow-root;
+}
+
+.disclosure.is-rolling {
+    overflow: hidden;
+}
+
+/* Rows rolling under the reveal line dissolve into it instead of meeting a
+   hard edge, as the transcript does under the thread title. Both clipping
+   boxes animate the reach (FADE_REACH, utils/disclosureMotion.ts): how far
+   their rows have slid under the line. Rows at rest are never dimmed.
+
+   Registered so the reach interpolates. `@property` is dropped inside a
+   conditional rule, so it stays at top level. */
+@property --disclosure-fade-reach {
+    syntax: '<length>';
+    inherits: false;
+    initial-value: 0px;
+}
+
+.disclosure.is-rolling,
+.flip-disclosure-mask {
+    -webkit-mask-image: linear-gradient(
+        to bottom, transparent 0, #000 min(var(--disclosure-fade-reach), var(--disclosure-fade)));
+    mask-image: linear-gradient(
+        to bottom, transparent 0, #000 min(var(--disclosure-fade-reach), var(--disclosure-fade)));
+}
+
+/* ── Explainer: the info icon and the popover it opens ───────────────────────
+   The one affordance replacing paragraphs of muted prose that used to sit
+   permanently under the controls they describe (components/shared/Explainer.tsx,
+   docs/glossary.md § explainer). HOST-ONLY: it is built on <Overlay>, whose
+   machinery no app iframe has, so these classes are deliberately NOT in
+   shared-components.css and never reach /api/v1/sdk-iframe.css.
+
+   The popover is a .surface, so only its placement caps and its body
+   typography live here: an explainer's copy is JSX with code spans and lists. */
+/* THE ICON NEVER WRAPS AWAY FROM ITS LABEL. A button is an atomic inline and
+   line breaking allows a break in front of one, so a label squeezed by the
+   control beside it drops the glyph onto a line of its own, under the text. The
+   slot's leading U+2060 WORD JOINER forbids that break. It also raises the
+   label's min-content width to include the icon, so a flex row cannot shrink it
+   off the line either.
+
+   `display: inline` is load-bearing. An inline-flex or inline-block slot is an
+   atomic inline itself, which hides the joiner from the line breaker and puts
+   the orphan straight back. `line-height: 0` keeps the joiner's own strut out
+   of the layout, so the wrapper measures exactly what the bare button did in
+   every row that holds an explainer, flex rows included.
+
+   The slot owns the space before the icon, so a row separating its items with
+   its own `gap` zeroes the margin HERE rather than on the button. */
+.explainer-slot {
+    display: inline;
+    line-height: 0;
+    margin-left: 0.375rem;
+}
+
+/* The joiner itself. Generated content rather than a text node in the markup,
+   which is what keeps it out of `textContent`, out of the accessible name of a
+   label wrapping an explainer, and out of a copied selection: it is a layout
+   instruction, and only the line breaker should ever see it. */
+.explainer-slot::before {
+    content: '\2060';
+}
+
+.explainer-btn {
+    /* Rides .icon-btn for colour, hover, focus ring and svg sizing. Overrides
+       are only about sitting INSIDE a line of label text: no padding to push
+       the label away. The gap before it belongs to the slot above.
+       `position: relative` is the anchor for the hit expander below, and for
+       the optical nudge. */
+    display: inline-flex;
+    position: relative;
+    padding: 0;
+    vertical-align: middle;
+    /* `vertical-align: middle` is defined against the X-HEIGHT: it puts the
+       glyph's centre at the baseline plus half an x, which sits visibly below
+       the middle of a label that starts with a capital. The gap shows because
+       the glyph is TALLER than the text it sits in (--icon-size-sm 0.875rem
+       against --font-size-md 0.8125rem), so the circle hangs into the descender
+       space while its top only just reaches the cap. Raise it by
+       (cap height - x height) / 2 to centre it on the cap instead: for the
+       monospace UI faces that is about (0.70em - 0.53em) / 2.
+
+       In `em`, not `rem`, because the correction is proportional to the text it
+       aligns to and the explainer rides labels at several sizes (a settings
+       row, an uppercase section title, a drawer filter row). Applied
+       unconditionally rather than scoped to the inline case: the flex rows that
+       hold an explainer (.form-label-row, .form-checkbox-row,
+       .thread-filter-option) already centre it on the label's line box, which
+       is a fraction of a pixel below the cap centre, so the same nudge lands
+       them within a pixel too. */
+    top: -0.085em;
+    color: var(--text-muted);
+}
+
+/* The glyph is --icon-size-sm (14px) and carries no padding, because padding
+   here would grow the line box of the label text it sits in and push settings
+   rows apart. That leaves a 14px target for a finger, and this is the primary
+   affordance on a phone. So the hit area is expanded by a transparent
+   pseudo-element instead, which is outside the box model and changes no layout:
+   14px + 2x8px = 30px. Deliberately not larger: the expander paints over
+   whatever is beside the icon, and on a checkbox row that is the label text the
+   reader taps to toggle, so every extra pixel is taken from that. */
+.explainer-btn::after {
+    content: '';
+    position: absolute;
+    inset: -0.5rem;
+}
+
+@media (hover: hover) {
+    .explainer-btn:hover {
+        /* .icon-btn's hover paints a background pad, which around a bare inline
+           glyph reads as a stray chip mid-sentence. Brighten the glyph instead. */
+        background: none;
+        color: var(--text-primary);
+    }
+}
+
+/* The popover the icon opens, on the anchored popover shell
+   (global/anchored-popover.css). Only its own caps live here. It opens down
+   from a label as often as up, so it takes more of the viewport's height than
+   the shell's bottom-bar default. */
+.explainer-popover {
+    width: min(24rem, var(--anchored-popover-fit));
+    /* The safe area comes off too: the position keeps the head below the
+       status bar, and the foot must still clear the keyboard. */
+    max-height: min(24rem, calc(var(--app-height, 100dvh) - 4rem - var(--safe-area-top)));
+}
+
+/* Explainer copy is the whole point of the popover, so it reads at full
+   strength. The shell's body class makes it the scroller. */
+.surface-body.explainer-body {
+    color: var(--text-primary);
+    overscroll-behavior: contain;
+}
+
+.explainer-body p {
+    margin: 0 0 var(--space-md);
+}
+
+.explainer-body p:last-child,
+.explainer-body ul:last-child {
+    margin-bottom: 0;
+}
+
+.explainer-body ul {
+    margin: 0 0 var(--space-md);
+    padding-left: 1.25rem;
+}
+
+.explainer-body li {
+    margin-bottom: var(--space-xs);
+}
+
+.explainer-body code {
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
+    background: var(--bg-tertiary);
+    padding: 0.0625rem 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+}
+
+/* Control-menu lists. Host chrome, shared across panes: the prompt bar's two
+   control menus render these, and so does the model-selection field in
+   Settings and the trigger form, through `ModelSelectionPicker`. The panel BOX
+   each opens in is its own host's business (`.control-dropdown` in the prompt
+   bar, `.dropdown-menu` for the field); what lives here is the list inside. */
+.control-list {
+    display: flex;
+    flex-direction: column;
+    padding: 0.25rem;
+}
+
+/* The list holds focus only so the arrow keys reach it. Its focus indicator is
+   the active row, so the container draws no outline. The browser's default one
+   showed as a stray blue edge where the panel's scroller clipped it.
+   Forced-colors strips the row's background, so the row keeps a transparent
+   outline there, inset so the scroller cannot clip it. */
+.control-list:focus {
+    outline: none;
+}
+
+.control-list:focus .control-item-active {
+    outline: 0.125rem solid transparent;
+    outline-offset: -0.125rem;
+}
+
+/* The list opens scrolled to the model in force, which on a long registry is
+   far down. A filter that scrolled away with it would be out of reach exactly
+   when it earns its place. Sticky keeps it on the panel's top edge. */
+.control-filter-bar {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: 0.25rem;
+    background: var(--surface-bg);
+}
+
+.control-empty {
+    padding: 0.5rem 0.625rem;
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
+}
+
+.control-section-label {
+    padding: 0.25rem 0.625rem;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.control-item {
+    display: block;
+    width: 100%;
+    padding: 0.375rem 0.625rem;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: calc(var(--radius-control) * 0.5);
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    cursor: pointer;
+}
+
+/* The active item is the keyboard cursor, seeded on open. A phone has no
+   keyboard to move it, and a tap sets it through `mouseenter`, so there it
+   would only paint a stray band. */
+@media (hover: hover) {
+    .control-item:hover,
+    .control-item-active {
+        background: var(--bg-hover);
+    }
+}
+
+/* The way back to the list this one was opened from. Muted, because it is an
+   exit rather than one of the choices on offer. */
+.control-back {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+}
+
+.control-back-glyph {
+    font-size: var(--font-size-md);
+    line-height: 1;
+}
+
+.control-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.control-option-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.control-option-label {
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* Picking this row opens another list rather than committing, so it sits at
+   the trailing edge where a disclosure belongs, centred on the whole row. */
+.control-option-more {
+    flex-shrink: 0;
+    color: var(--text-muted);
+}
+
+.control-checkmark {
+    color: var(--accent);
+    font-size: var(--font-size-sm);
+    font-weight: 700;
+}
+
+.control-current-value {
+    color: var(--text-muted);
+    font-weight: 400;
+}
+
+.control-option-current {
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.control-option-desc {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}
+
+.control-option-badge {
+    margin-left: var(--space-sm);
+    vertical-align: middle;
+}
+
+/* ── The System attention badge ───────────────────────────────────────────
+ * The mark on every step of the path into Settings > System, while there is an
+ * update to take or a release notice to answer. Host chrome: an app iframe has
+ * no menu drawer and no settings, so none of this ships to one. The rule and
+ * the words are in store/systemAttentionBadge.ts.
+ */
+
+/* A dot, not a count: an available update and an owed notice do not add up to
+   one number. The accent is the same blue every other attention mark in the
+   app wears, and the size is the version pill's unread dot, which marks the
+   same panel one step further in. */
+.system-attention-badge {
+    display: inline-block;
+    width: 0.375rem;
+    height: 0.375rem;
+    background: var(--accent);
+}
+
+/* On an icon-only button, hugging the corner every counted badge hugs. It
+   WEARS `.badge`, so `.app-header .badge` repaints it for the bar and gives it
+   the ring that stops a mark fusing with the glyph it rides. What is left here
+   is the dot's own shape: `.badge` pads and line-boxes for a glyph, and both
+   would stretch an empty box out of round.
+
+   COMPOUND with `.badge`, and that is load-bearing rather than decorative.
+   `.badge` lives in `header.css`, which `main.tsx` imports AFTER this sheet, so
+   a single-class modifier ties on specificity and loses on source order. The
+   dot then renders at the full counted-badge size, as an empty pill.
+
+   Bigger than the inline dot, at the pending brand badge's size. Both sizes
+   follow the app's own precedent: 0.375rem where a dot sits beside text at the
+   body step, 0.5rem where it sits on a glyph and has to read across a whole
+   header row. */
+.badge.system-attention-badge-corner {
+    top: 0.25rem;
+    right: 0.25rem;
+    min-width: 0.5rem;
+    min-height: 0.5rem;
+    padding: 0;
+    line-height: 0;
+}
+
+/* Glues the dot to the label it marks, which is the word-joiner pattern
+   `.explainer-slot` above is the worked example of: `display: inline` so the
+   wrapper is not itself an atomic inline, and generated content so the joiner
+   stays out of `textContent`. Its own rule rather than a shared selector list,
+   because the two are separate components that may drift apart, and because
+   `explainer.test.ts` pins the explainer's copy by selector. */
+.system-attention-badge-slot {
+    display: inline;
+    line-height: 0;
+    margin-left: 0.375rem;
+}
+
+.system-attention-badge-slot::before {
+    content: '\2060';
+}
+
+/* An inline markdown image opens the image popup, which is where it can be
+   zoomed past the 24rem cap `shared-components.css` puts on it in a transcript.
+   The click is delegated from the one global handler, over the same selector
+   (`store/imagePopup.ts`), so cursor and behaviour cover the same set.
+
+   HOST ONLY, even though the wrapper it sizes is a shared, app-facing class.
+   An app iframe has no popup to open, so a zoom cursor there would advertise
+   something that cannot happen. */
+.markdown-content .image-scroll-wrapper > img, .question-body .image-scroll-wrapper > img {
+    cursor: zoom-in;
+}
+
+/* A picture with a size hint holds its loaded box before its bytes arrive, so
+   nothing below it moves when it lands. HOST ONLY: the host renderer stamps the
+   hint (`renderMarkdown.ts` `applySizeHintsIn`), never an app iframe. The width
+   is what the shared cap gives the loaded picture: its natural width, or less
+   when that would put it over the cap. Once loaded, the picture's own ratio
+   wins (`auto`) and `contain` letterboxes it, so a wrong hint never stretches
+   it. */
+.image-scroll-wrapper > img[data-size-hint] {
+    width: min(
+        calc(var(--hint-w) * 1px),
+        calc(var(--image-max-height) * var(--hint-w) / var(--hint-h))
+    );
+    aspect-ratio: auto var(--hint-w) / var(--hint-h);
+    object-fit: contain;
+}
+
+/* A markdown image that failed to load gives way to a notice naming it
+   (`utils/markdownImageFallback.ts`). HOST ONLY: the script that swaps them runs
+   in the host, never in an app iframe. The surface prefix outranks the
+   `display: block` each surface gives its images, `chat.css` loading later. */
+.markdown-content .image-scroll-wrapper > img[data-load-failed],
+.question-body .image-scroll-wrapper > img[data-load-failed] {
+    display: none;
+}
+
+.markdown-image-unavailable {
+    display: inline-block;
+    max-width: 100%;
+    padding: var(--space-sm) var(--space-md);
+    border: 1px dashed var(--border-color);
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+.markdown-image-unavailable > code {
+    display: block;
+    margin-top: var(--space-xs);
+    overflow-wrap: anywhere;
+}
+
+/* ── Theme parts (ADR 0307) ─────────────────────────────────────────────────
+   Each rule reads one part token under the selector theme-parts.json names,
+   with a fallback equal to what the element paints without a theme. A theme
+   sets the token through its `parts`; it never writes a selector. The inherited
+   paint properties go on leaf text only, so no card inside a container picks
+   them up, and protected surfaces reset every part token anyway.
+   styles/__tests__/theme-part-consumers.test.ts pins every rule to the catalog. */
+.response-body .response-chunk,
+.response-body > .response-content > div:not([class]),
+.initiator-panel-bubble .user-bubble > .markdown-content {
+    color: var(--part-chat-text-color, currentcolor);
+    text-shadow: var(--part-chat-text-text-shadow, none);
+    letter-spacing: var(--part-chat-text-letter-spacing, normal);
+}
+
+/* Bold text and list markers set their own colour in shared-components.css,
+   so they follow a chat text colour here. */
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) strong,
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) li::marker {
+    color: var(--part-chat-text-color, var(--text-primary));
+}
+
+html[data-font-bold="none"] :is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) :is(strong, b) {
+    color: var(--text-strong);
+}
+
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) :is(h1, h2, h3, h4, h5, h6) {
+    color: var(--part-chat-heading-color, var(--part-chat-text-color, var(--text-primary)));
+    text-shadow: var(--part-chat-heading-text-shadow, var(--part-chat-text-text-shadow, none));
+    letter-spacing: var(--part-chat-heading-letter-spacing, var(--part-chat-text-letter-spacing, normal));
+}
+
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) a {
+    color: var(--part-chat-link-color, var(--accent));
+    text-shadow: var(--part-chat-link-text-shadow, var(--part-chat-text-text-shadow, none));
+}
+
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) code:not(pre > code) {
+    color: var(--part-inline-code-color, var(--accent));
+    background-color: var(--part-inline-code-background-color, var(--bg-tertiary));
+}
+
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) pre {
+    background-color: var(--part-code-block-background-color, var(--bg-tertiary));
+    box-shadow: var(--part-code-block-box-shadow, none);
+    text-shadow: var(--part-code-block-text-shadow, var(--part-chat-text-text-shadow, none));
+}
+
+.initiator-label,
+.response-executor-label {
+    text-shadow: var(--part-actor-label-text-shadow, none);
+    letter-spacing: var(--part-actor-label-letter-spacing, normal);
+}
+
+.initiator-icon svg,
+.response-executor-icon svg {
+    filter: var(--part-actor-icon-filter, none);
+}
+
+.app-header .icon-btn svg {
+    filter: var(--part-header-icon-filter, none);
+}
+
+.threads-header-title,
+.mobile-header-title,
+.mobile-content-title,
+.workspace-name-label,
+.pane-header-title-text,
+.panel-url-title,
+.thread-title {
+    text-shadow: var(--part-header-title-text-shadow, none);
+    letter-spacing: var(--part-header-title-letter-spacing, normal);
+}
+
+/* The chat composer only: the trigger form's Intent field shares .prompt-box.
+   panels/previews.css loads later, so its :focus-within border and focus ring
+   win. The ring replaces the theme's shadow rather than joining it: a theme
+   may write `none`, which no shadow list can hold. The composer can overlap
+   scrolled messages, so a theme shadow is inset only. The fill is also
+   a plain property, so mobile.css's frosted composer can tint it without
+   reading the part token outside the part. */
+.prompt-area .prompt-box {
+    --composer-background-color: var(--part-composer-background-color, var(--bg-secondary));
+    background-color: var(--part-composer-background-color, var(--bg-secondary));
+    border-color: var(--part-composer-border-color, color-mix(in srgb, var(--border-color) 50%, transparent));
+    box-shadow: var(--part-composer-box-shadow, none);
+}
+
+.prompt-area .prompt-row .prompt-textarea {
+    color: var(--part-composer-text-color, var(--text-primary));
+    caret-color: var(--part-composer-text-caret-color, auto);
+    caret-shape: var(--part-composer-text-caret-shape, auto);
+    text-shadow: var(--part-composer-text-text-shadow, none);
+    letter-spacing: var(--part-composer-text-letter-spacing, normal);
+}
+
+/* A blinking caret is motion, so reduced motion holds it steady. */
+:root[data-motion="reduce"] .prompt-area .prompt-row .prompt-textarea {
+    caret-animation: manual;
+}
+
+/* The drawn caret: the composer's caret-shape where the browser has none
+   (utils/drawnCaret.ts, ADR 0317). The native caret hides only while it
+   shows. The overlay copies the textarea's box and text; only the caret
+   span paints. No `display` here, so the `hidden` attribute still hides it. */
+.prompt-area .prompt-row .prompt-textarea[data-drawn-caret] {
+    caret-color: transparent;
+}
+
+.prompt-row .drawn-caret {
+    position: absolute;
+    margin: 0;
+    overflow: hidden;
+    pointer-events: none;
+    border-style: solid;
+    border-color: transparent;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    -webkit-text-fill-color: transparent;
+    text-shadow: none;
+}
+
+.drawn-caret-cursor {
+    animation: drawn-caret-blink 1s steps(1) infinite;
+}
+
+/* The block shows the character under it in the composer's own fill. */
+.drawn-caret-cursor[data-shape="block"] {
+    background-color: var(--drawn-caret-color);
+    -webkit-text-fill-color: var(--drawn-caret-ink);
+}
+
+.drawn-caret-cursor[data-shape="underscore"] {
+    box-shadow: inset 0 -0.12em var(--drawn-caret-color);
+}
+
+/* At a line end there is no character to cover, so the caret takes a cell. */
+.drawn-caret-cursor:empty {
+    padding-inline-end: 1ch;
+}
+
+:root[data-motion="reduce"] .drawn-caret-cursor {
+    animation: none;
+}
+
+@keyframes drawn-caret-blink {
+    50% {
+        opacity: 0;
+    }
+}
+
+/* A placeholder while the backing value loads: a dimmed pill with no knob. The
+   switch then mounts in its real position instead of sliding across from a
+   default (the host's `LoadableToggle`). */
+.toggle-switch-loading {
+    background-color: var(--bg-tertiary);
+    border-radius: calc(var(--radius-control) * 2.5);
+    opacity: 0.4;
+    cursor: default;
+}
+
+/* ── A change's commit list (`CommitList`) ───────────────────────────────────
+   Unfolded under a change's headline on the change card and in the Changes
+   panel. The headline names the change, so the list reads quieter than it. */
+.change-commit-list {
+    margin: 0;
+    padding-left: 1.25rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+.change-commit-list li {
+    margin: 0.125rem 0;
+    overflow-wrap: anywhere;
+}
+
+/* ── An unspaced em dash in rendered markdown (`renderMarkdown`) ────────────
+ * A monospace font draws the dash one cell wide, so pressed against its
+ * neighbours it reads as a hyphen. Margin rather than inserted spaces, so the
+ * text the user copies stays exactly as written. */
+.em-dash-gap {
+    margin-inline: var(--space-xs);
+}
+
+/* Pager: a paged list's foot, the row count and Prev/Next (components/shared/Pager.tsx). */
+.pager {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 0.5rem;
+    padding: 0.25rem 0;
+}
+
+.pager-info {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-family: var(--font-ui);
+}
+
+.pager-buttons {
+    display: flex;
+    /* .pager's space-between already places these at its right end. */
+    justify-content: flex-end;
+    gap: 0.25rem;
+}
+
+/* The find bar (components/shared/FindBar.tsx), rolled in above what it
+   searches. Every surface it docks on is full-bleed, so it carries the
+   content-pane gutter itself. */
+.find-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+    padding: var(--space-sm) var(--space-lg);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.find-field {
+    flex: 1;
+}
+
+.find-status {
+    flex-shrink: 0;
+    font-size: var(--font-size-xs);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    color: var(--search-field-muted);
+}
+
+.find-status.is-failed {
+    color: var(--accent-red);
+}
+
+/* The host's own find highlights, on a text preview and in the transcript.
+   Same names and look as an app frame's (api/sdk_iframe.css). */
+::highlight(lucidos-find) {
+    background-color: color-mix(in srgb, var(--accent-yellow) 45%, transparent);
+}
+
+::highlight(lucidos-find-current) {
+    background-color: var(--accent);
+    color: var(--text-on-accent);
+}
+
+/* ── A search match inside a snippet (`mark.search-match`) ──────────────────
+ * An accent tint, like `.line-selected` on the line a Text search row opens
+ * on. Host-wide, so any surface marking a matched phrase wears the same mark. */
+mark.search-match {
+    background: color-mix(in srgb, var(--accent) 28%, transparent);
+    color: inherit;
+    border-radius: calc(var(--radius-control) * 0.5);
+    padding: 0 0.0625rem;
+}
+
+/* ── App icon (ADR 0414) ─────────────────────────────────────────────────────
+   The one tile every app and widget picture sits on (`AppIcon`). A surface
+   sizes it through --app-icon-size, and a large one rounds it more through
+   --app-icon-radius. An image sits on a small neutral tile. The monogram
+   tile tints the theme hue `AppIcon` picks from the app id. */
+.app-icon {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    width: var(--app-icon-size, 1rem);
+    height: var(--app-icon-size, 1rem);
+    border-radius: var(--app-icon-radius, calc(var(--radius-control) * 0.5));
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.app-icon-image {
+    padding: calc(var(--app-icon-size, 1rem) * 0.1);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+}
+
+.app-icon-image img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.app-icon-monogram {
+    background: color-mix(in srgb, var(--app-icon-hue) 22%, var(--bg-secondary));
+    color: var(--app-icon-hue);
+    font-family: var(--font-ui);
+    font-size: calc(var(--app-icon-size, 1rem) * 0.5);
+    font-weight: 700;
+    line-height: 1;
+}

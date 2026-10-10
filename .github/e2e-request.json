@@ -1,0 +1,18 @@
+{
+  "run_id": "20261010-234445-f25f",
+  "suites": [
+    "browser"
+  ],
+  "api_args": [],
+  "browser": {
+    "projects": [
+      "chromium",
+      "mobile",
+      "mobile-webkit"
+    ],
+    "specs": [
+      "composer-send-keyboard-mobile.spec.ts"
+    ],
+    "pw_args": []
+  }
+}

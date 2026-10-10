@@ -1,0 +1,226 @@
+# E2E GitHub mode (ADRs 0382, 0386): run the e2e suites a driver asked for.
+#
+# Unless a run stays local, `./scripts/e2e*.sh` pushes a stripped, scanned,
+# parentless commit to an e2e/<run-id> branch, with its selection in
+# .github/e2e-request.json. This workflow runs from that push. The driver
+# downloads every shard's output, reports it like a local run, and deletes the
+# branch.
+#
+# Limits `scripts/check-e2e-workflow.sh` enforces:
+#   - No secrets, and the token is contents: read.
+#   - Triggers: push to e2e/** runs a selection; push to main only seeds the
+#     dependency caches every e2e/* branch can read. GitHub scopes caches by
+#     branch, so a cache saved on an e2e/* branch would only evict others.
+#   - mobile-webkit runs on macOS, the WebKit port iOS ships (ADR 0175).
+#   - Artifacts live one day. Traces upload only for a failed shard.
+
+name: e2e
+
+on:
+  push:
+    branches: ['e2e/**', 'main']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  # .cargo/config.toml wraps rustc in sccache, which runners lack. Empty
+  # turns the wrapper off, as scripts/lib/stage_runtime.sh does for releases.
+  RUSTC_WRAPPER: ''
+
+jobs:
+  plan:
+    if: github.repository == 'lucidos-dev/lucidos' && startsWith(github.ref, 'refs/heads/e2e/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      linux: ${{ steps.plan.outputs.linux }}
+      macos: ${{ steps.plan.outputs.macos }}
+      has_linux: ${{ steps.plan.outputs.has_linux }}
+      has_macos: ${{ steps.plan.outputs.has_macos }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - id: plan
+        run: ./scripts/e2e-github-shard.sh plan
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-plan
+          path: e2e-out/plan/entries
+          retention-days: 1
+
+  build-linux:
+    needs: plan
+    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_linux == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '20'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          prefix-key: v0-rust-e2e
+          shared-key: linux
+          save-if: false
+      - run: ./scripts/e2e-github-shard.sh build build-out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-build-linux
+          path: build-out/e2e-build.tar.gz
+          retention-days: 1
+
+  build-macos:
+    needs: plan
+    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_macos == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '20'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          prefix-key: v0-rust-e2e
+          shared-key: macos
+          save-if: false
+      - run: ./scripts/e2e-github-shard.sh build build-out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-build-macos
+          path: build-out/e2e-build.tar.gz
+          retention-days: 1
+
+  linux:
+    needs: [plan, build-linux]
+    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_linux == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.linux) }}
+    name: ${{ matrix.id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '20'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        if: matrix.suite != 'browser'
+        with:
+          prefix-key: v0-rust-e2e
+          shared-key: linux
+          save-if: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: e2e-build-linux
+          path: build-in
+      - run: ./scripts/e2e-github-shard.sh unpack build-in/e2e-build.tar.gz
+      - name: Prepare the runner
+        run: |
+          git config --global user.name "Lucidos e2e"
+          git config --global user.email "lucidos-e2e@users.noreply.github.com"
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq ripgrep postgresql-client >/dev/null
+      - name: Install Chromium's system libraries
+        if: matrix.suite == 'browser'
+        # e2e-browser.sh runs npm ci itself, so this fetches only the lockfile's
+        # Playwright to install the system libraries.
+        run: npx --yes "playwright@$(node -p "require('./package-lock.json').packages['node_modules/playwright'].version")" install-deps chromium
+      - name: Run ${{ matrix.id }}
+        run: ./scripts/e2e-github-shard.sh run "${{ matrix.id }}" "${{ matrix.suite }}" "${{ matrix.project }}" "${{ matrix.shard }}" "${{ matrix.total }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: e2e-out-${{ matrix.id }}
+          path: e2e-out/${{ matrix.id }}
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: failure()
+        with:
+          name: e2e-traces-${{ matrix.id }}
+          path: |
+            crates/lucidos-app/test-results
+            ~/workspaces/e2e-test/.lucidos/engine.log
+            ~/workspaces/e2e-test/.lucidos/e2e-gateway/gateway.log
+          retention-days: 1
+          if-no-files-found: ignore
+
+  macos:
+    needs: [plan, build-macos]
+    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_macos == 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.macos) }}
+    name: ${{ matrix.id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '20'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: e2e-build-macos
+          path: build-in
+      - run: ./scripts/e2e-github-shard.sh unpack build-in/e2e-build.tar.gz
+      - name: Prepare the runner
+        run: |
+          git config --global user.name "Lucidos e2e"
+          git config --global user.email "lucidos-e2e@users.noreply.github.com"
+      - name: Start Postgres with pgvector (macOS runners have no Docker)
+        run: ./scripts/e2e-github-shard.sh native-postgres "$RUNNER_TEMP/pg"
+      - name: Run ${{ matrix.id }}
+        run: ./scripts/e2e-github-shard.sh run "${{ matrix.id }}" "${{ matrix.suite }}" "${{ matrix.project }}" "${{ matrix.shard }}" "${{ matrix.total }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: e2e-out-${{ matrix.id }}
+          path: e2e-out/${{ matrix.id }}
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: failure()
+        with:
+          name: e2e-traces-${{ matrix.id }}
+          path: |
+            crates/lucidos-app/test-results
+            ~/workspaces/e2e-test/.lucidos/engine.log
+            ~/workspaces/e2e-test/.lucidos/e2e-gateway/gateway.log
+          retention-days: 1
+          if-no-files-found: ignore
+
+  # The only jobs that save a cache. Mirror main moves at each release, and
+  # every e2e/* branch can read what main saved.
+  seed-cache:
+    if: github.repository == 'lucidos-dev/lucidos' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            key: linux
+          - os: macos-15
+            key: macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '20'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          prefix-key: v0-rust-e2e
+          shared-key: ${{ matrix.key }}
+          save-if: true
+      - run: ./scripts/e2e-github-shard.sh build build-out
+      - name: Compile the API and WASM suites' test binaries
+        if: matrix.key == 'linux'
+        run: cargo test --locked -p lucidos-e2e --no-run

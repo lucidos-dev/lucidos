@@ -1,0 +1,715 @@
+import { useRef, useLayoutEffect } from 'preact/hooks';
+import { durationScale } from '../store/store';
+import { isReducedMotion } from '../utils/motion';
+import { isMobile } from '../utils/viewport';
+import { EASING_DISCLOSURE, FADE_REACH, disclosureDurationMs } from '../utils/disclosureMotion';
+
+interface Rect { top: number; left: number; width: number; height: number }
+
+const EASING_DESKTOP = 'cubic-bezier(0.22, 0, 0, 1)';
+const EASING_MOBILE = 'cubic-bezier(0.25, 0.1, 0.25, 1)'; // simpler ease for mobile perf
+const PX_PER_SEC = 600;
+const MIN_MS = 250;
+const MAX_MS = 450;
+// A departing copy holds full opacity through its first half. Its curve starts
+// fast, so fading from the start leaves it half gone by the first frames.
+const LINGER: Keyframe = { opacity: '1', offset: 0.5 };
+
+/** A section's rows in render order, its header first. */
+export interface FlipSection { name: string; ids: string[] }
+
+/** A run of adjacent rows that appear or disappear together, under `anchor`,
+ *  the row just before them (their parent, for a sub-thread family). */
+export interface DisclosureRun { anchor: string | null; ids: string[] }
+
+/** Split `order` into the contiguous runs of `members`. */
+export function contiguousRuns(order: string[], members: ReadonlySet<string>): DisclosureRun[] {
+    const runs: DisclosureRun[] = [];
+    let current: DisclosureRun | null = null;
+    order.forEach((id, i) => {
+        if (!members.has(id)) {
+            current = null;
+            return;
+        }
+        if (!current) {
+            current = { anchor: i > 0 ? order[i - 1] : null, ids: [] };
+            runs.push(current);
+        }
+        current.ids.push(id);
+    });
+    return runs;
+}
+
+/** A row copy and the viewport box it stands in for. */
+export interface DisclosureRow { ghost: HTMLElement; rect: Rect }
+
+/** A row a disclosure moves. Only a row the user can see gets a copy. */
+interface DisclosureEntry { id: string; rect: Rect; ghost?: HTMLElement; real?: HTMLElement }
+
+/** A block's reveal line (the anchor's bottom edge, else the first row's top)
+ *  and its full height, down to its lowest row's bottom edge. */
+export function blockExtent(rects: Rect[], anchorRect: Rect | undefined): { line: number; travel: number } {
+    const line = anchorRect ? anchorRect.top + anchorRect.height : rects[0].top;
+    const bottom = Math.max(...rects.map(r => r.top + r.height));
+    return { line, travel: bottom - line };
+}
+
+/** How far a block's copies move. A block that fits on screen rolls its whole
+ *  height. A long one rolls down to the last row that starts on screen, so it
+ *  moves at most about one screen. A block whose line has scrolled above the
+ *  screen does not roll: no parent or header is on screen to roll under. */
+export function rollDistance(rects: Rect[], line: number, travel: number, viewportHeight: number): number {
+    if (line < 0) return 0;
+    const onScreen = rects.filter(r => r.top < viewportHeight).map(r => r.top + r.height - line);
+    return onScreen.length > 0 ? Math.min(travel, Math.max(...onScreen)) : 0;
+}
+
+/** Whether a copy sliding from `rect` to `distance` px above it, clipped at
+ *  the reveal line, crosses the viewport at any point. A long section can hold
+ *  hundreds of rows, and copying unseen ones would stall the first frame. */
+export function crossesViewport(rect: Rect, line: number, distance: number, viewportHeight: number): boolean {
+    return rect.top - distance < viewportHeight && rect.top + rect.height > Math.max(0, line);
+}
+
+function bottomOf(rect: Rect | undefined): number {
+    return rect ? rect.top + rect.height : -Infinity;
+}
+
+/** A disclosure block's reveal line. `roll` is how far its copies move and
+ *  `rollEnd` where the rolling part ends. `cut` is the height left out of the
+ *  roll, which the rows below skip too. */
+interface BlockGeometry { line: number; roll: number; rollEnd: number; cut: number }
+
+function blockGeometry(rects: Rect[], anchorRect: Rect | undefined): BlockGeometry {
+    const { line, travel } = blockExtent(rects, anchorRect);
+    const roll = rollDistance(rects, line, travel, window.innerHeight);
+    return { line, roll, rollEnd: line + roll, cut: travel - roll };
+}
+
+/** Whether a row rolls with the block and is seen doing it, so it needs a
+ *  copy. Rows below a capped roll's cut stay out of the motion. */
+function rollsInView(rect: Rect, { line, roll, rollEnd }: BlockGeometry): boolean {
+    return rect.top < rollEnd && crossesViewport(rect, line, roll, window.innerHeight);
+}
+
+/** Index of the row that closes the rolling part of a block. */
+function closingIndex(rects: (Rect | undefined)[], { rollEnd }: BlockGeometry): number {
+    let best = -1;
+    rects.forEach((r, i) => {
+        if (r && r.top < rollEnd && (best < 0 || bottomOf(r) > bottomOf(rects[best]))) best = i;
+    });
+    return best;
+}
+
+/** The vertical offset a running animation currently gives `el`, or 0. */
+function currentLift(el: HTMLElement): number {
+    const transform = getComputedStyle(el).transform;
+    if (!transform || transform === 'none' || typeof DOMMatrixReadOnly === 'undefined') return 0;
+    return new DOMMatrixReadOnly(transform).m42;
+}
+
+/** Viewport x where a row's own bottom hairline starts, or null for a row
+ *  that draws none. A sub-thread's line starts further in, at its indent. */
+function rowHairlineLeft(row: HTMLElement): number | null {
+    const threadRow = row.matches('.thread-row') ? row : row.querySelector<HTMLElement>('.thread-row');
+    if (!threadRow) return null;
+    const left = parseFloat(getComputedStyle(threadRow, '::after').left);
+    return Number.isFinite(left) ? threadRow.getBoundingClientRect().left + left : null;
+}
+
+/** The horizontal scale that shrinks a carried line from its own box to a row
+ *  hairline starting at `rowLeft`. The two share a right edge, which is where
+ *  the line's transform is anchored. */
+export function rowEndScale(line: { left: number; width: number }, rowLeft: number | null): number {
+    if (rowLeft === null || line.width <= 0) return 1;
+    return Math.min(1, Math.max(0, (line.left + line.width - rowLeft) / line.width));
+}
+
+/** Mount `rows` in a mask whose top edge is the reveal line, the anchor's
+ *  bottom edge. The mask's overflow clip hides any copy that slides above the
+ *  line, so the copies pass under their parent. An animated clip-path did not
+ *  render in every WebKit, and an overflow clip renders everywhere. */
+export function mountDisclosureMask(host: HTMLElement, line: number, rows: DisclosureRow[]): HTMLElement {
+    const mask = document.createElement('div');
+    mask.className = 'flip-disclosure-mask';
+    mask.setAttribute('aria-hidden', 'true');
+    mask.inert = true;
+    host.appendChild(mask);
+    const origin = mask.getBoundingClientRect();
+    const bottom = Math.max(...rows.map(({ rect }) => rect.top + rect.height));
+    mask.style.top = `${line - origin.top}px`;
+    mask.style.height = `${bottom - line}px`;
+    placeCopies(mask, rows, line, origin.left);
+    return mask;
+}
+
+/** Mount copies of rows that left their section, each at its old box. The layer
+ *  scrolls and clips with the list, and does not clip the copies itself. */
+export function mountDepartureLayer(host: HTMLElement, rows: DisclosureRow[]): HTMLElement {
+    const layer = document.createElement('div');
+    layer.className = 'flip-departure-layer';
+    layer.setAttribute('aria-hidden', 'true');
+    layer.inert = true;
+    host.appendChild(layer);
+    const origin = layer.getBoundingClientRect();
+    placeCopies(layer, rows, origin.top, origin.left);
+    return layer;
+}
+
+/** Append each copy to `box` at its viewport rect, offset by `top` and `left`. */
+function placeCopies(box: HTMLElement, rows: DisclosureRow[], top: number, left: number) {
+    for (const { ghost, rect } of rows) {
+        Object.assign(ghost.style, {
+            position: 'absolute', margin: '0', boxSizing: 'border-box',
+            top: `${rect.top - top}px`, left: `${rect.left - left}px`,
+            width: `${rect.width}px`, height: `${rect.height}px`,
+        });
+        box.appendChild(ghost);
+    }
+}
+
+/** Hold `anims` on their first frame, then start them all on the frame that
+ *  paints them. An archive also opens the next thread, and on WebKit that
+ *  render delays the first paint by most of an exit. A shared start also keeps
+ *  copies in step with the rows sliding below them. `live` says whether this
+ *  batch still owns the drawer. */
+export function startTogetherOnNextFrame(anims: Animation[], live: () => boolean) {
+    if (anims.length === 0) return;
+    for (const a of anims) a.pause();
+    requestAnimationFrame(() => {
+        if (!live()) return;
+        const now = document.timeline?.currentTime ?? null;
+        for (const a of anims) {
+            if (now === null) a.play();
+            else a.startTime = now;
+        }
+    });
+}
+
+/** Run a departure layer's exits from the next frame, then remove the layer.
+ *  No batch takes these over: the places they stand for are gone either way,
+ *  and a newer batch would only drop a copy mid-exit. */
+function playOutDeparture(layer: HTMLElement, exits: Animation[]) {
+    startTogetherOnNextFrame(exits, () => layer.isConnected);
+    Promise.allSettled(exits.map(a => a.finished)).then(() => layer.remove());
+}
+
+/** Base duration for a row that moves `distance` px, before scaling. */
+function flightDurationMs(distance: number): number {
+    return Math.max(MIN_MS, Math.min(MAX_MS, distance / PX_PER_SEC * 1000));
+}
+
+/** An inert copy of a row that is about to unmount, for it to roll away as.
+ *  It sheds every attribute a lookup finds the real row by, so a query for the
+ *  thread never lands on the copy. */
+export function ghostOf(row: HTMLElement): HTMLElement {
+    const ghost = row.cloneNode(true) as HTMLElement;
+    for (const node of [ghost, ...ghost.querySelectorAll<HTMLElement>('*')]) {
+        node.removeAttribute('id');
+        node.removeAttribute('data-flip-id');
+        node.removeAttribute('data-thread-nav');
+    }
+    ghost.setAttribute('aria-hidden', 'true');
+    ghost.inert = true;
+    return ghost;
+}
+
+/**
+ * FLIP animation for thread list transitions.
+ *
+ * A render where any of `disclosureKeys` changed is a disclosure: a family
+ * showing or hiding its sub-threads, or a section its threads. Those rows
+ * unroll from under the row above them, and hidden ones roll back up as
+ * ghosts, in lockstep with the rows sliding below.
+ *
+ * On any other render, a row that left its section folds away where it stood,
+ * as a copy. Nothing flies between sections: a thread that lands in another
+ * one fades in there. The copy finishes its exit even when a newer render
+ * starts another batch.
+ *
+ * Speed setting: slider 0 = normal (1x), +10 = 10x faster, -10 = 10x slower.
+ */
+export function useFlipTransitions(
+    containerRef: { current: HTMLElement | null },
+    sections: FlipSection[],
+    resetKey?: unknown,
+    disclosureKeys: readonly unknown[] = [],
+) {
+    const prevResetKey = useRef<unknown>(resetKey);
+    const resetted = prevResetKey.current !== resetKey;
+    prevResetKey.current = resetKey;
+    const prevDisclosureKeys = useRef(disclosureKeys);
+    const disclosing = !resetted && disclosureKeys.some((key, i) => key !== prevDisclosureKeys.current[i]);
+    prevDisclosureKeys.current = disclosureKeys;
+    const prevSections = useRef<Map<string, string>>(new Map());
+    const prevOrder = useRef<string[]>([]);
+    const runningAnims = useRef<Animation[]>([]);
+    const animatedEls = useRef<HTMLElement[]>([]);
+    const hiddenEls = useRef<HTMLElement[]>([]);
+    const overlays = useRef<HTMLElement[]>([]);
+    // What a running disclosure shows in place of each thread (its row copy),
+    // and of each section's divider (its carried line).
+    const standIns = useRef(new Map<string, HTMLElement>());
+    // Each thread whose copy is still leaving, that copy's exit, and the
+    // section it left.
+    const departing = useRef(new Map<string, { ghost: HTMLElement; exit: Animation; from: string }>());
+
+    // ── Build flat ordered list and section map ──
+    const currentOrder: string[] = [];
+    const currentSections = new Map<string, string>();
+    for (const section of sections) {
+        for (const id of section.ids) {
+            currentOrder.push(id);
+            currentSections.set(id, section.name);
+        }
+    }
+
+    // ── Detect transitions, new items and removed items ──
+    // A row that left counts too: a thread archived into a collapsed Archive
+    // leaves the rendered rows, and the rows below it must still slide up.
+    const transitioned = new Set<string>();
+    const newItems = new Set<string>();
+    const removed = new Set<string>();
+    const prev = prevSections.current;
+    if (prev.size > 0 && !resetted) {
+        for (const [id, section] of currentSections) {
+            const prevSection = prev.get(id);
+            if (!prevSection) {
+                newItems.add(id);
+            } else if (prevSection !== section) {
+                transitioned.add(id);
+            }
+        }
+        for (const id of prev.keys()) {
+            if (!currentSections.has(id)) removed.add(id);
+        }
+    }
+
+    // ── Disclosure runs: rows a family or section toggle showed or hid ──
+    const isThreadRow = (id: string) => !id.startsWith('__section_');
+    const revealRuns = disclosing
+        ? contiguousRuns(currentOrder, new Set([...newItems].filter(isThreadRow)))
+        : [];
+    const hideRuns = disclosing
+        ? contiguousRuns(prevOrder.current, new Set([...removed].filter(isThreadRow)))
+        : [];
+    const revealed = new Set(revealRuns.flatMap(run => run.ids));
+    const hiding = new Set(hideRuns.flatMap(run => run.ids));
+
+    // ── Build affected siblings: any existing item that isn't moved/new ──
+    // When sections appear/disappear, index-range heuristics miss items outside
+    // the source-dest range (e.g. a section header below the moved thread).
+    // Instead, mark ALL surviving items as potential siblings: the pixel-delta
+    // check below skips items that didn't actually move.
+    const affectedSiblings = new Set<string>();
+    const hasChanges = transitioned.size > 0 || newItems.size > 0 || removed.size > 0;
+    if (hasChanges && prevOrder.current.length > 0) {
+        for (const id of currentOrder) {
+            if (!transitioned.has(id) && !newItems.has(id)) {
+                affectedSiblings.add(id);
+            }
+        }
+    }
+
+    // ── Capture OLD positions from the still-current DOM ──
+    // Rows about to hide are copied now too: after the commit they are gone.
+    // A thread this toggle shows or hides, while a running copy stands in for
+    // it, is read through that copy: it is what the user sees. A carried line
+    // is read the same way. Every other row reads itself, since it moves
+    // unmasked and must not start under a parent.
+    const oldRects = new Map<string, Rect>();
+    const ghosts = new Map<string, HTMLElement>();
+    // Copies of on-screen rows that left their section without a toggle.
+    const departures = new Map<string, HTMLElement>();
+    const seen = new Map<string, { rect: Rect; opacity: number }>();
+    // Per section header: where the closing row's own hairline starts.
+    const hidingLineLefts = new Map<string, number | null>();
+    // How far a running batch has each row moved off its layout box.
+    const lifts = new Map<string, number>();
+    const container = containerRef.current;
+    if (container && hasChanges) {
+        const box = (el: HTMLElement): Rect => {
+            const r = el.getBoundingClientRect();
+            return { top: r.top, left: r.left, width: r.width, height: r.height };
+        };
+        for (const [id, copy] of disclosing ? standIns.current : []) {
+            seen.set(id, { rect: box(copy), opacity: Number(getComputedStyle(copy).opacity) });
+        }
+        const rows = container.querySelectorAll<HTMLElement>('[data-flip-id]');
+        const hidingRows = new Map<string, HTMLElement>();
+        const moving = runningAnims.current.length > 0;
+        for (const row of rows) {
+            const id = row.dataset.flipId!;
+            if (moving) lifts.set(id, currentLift(row));
+            const rect = (hiding.has(id) ? seen.get(id)?.rect : undefined) ?? box(row);
+            oldRects.set(id, rect);
+            if (hiding.has(id)) hidingRows.set(id, row);
+            const onScreen = rect.top + rect.height > 0 && rect.top < window.innerHeight;
+            const left = removed.has(id) || transitioned.has(id);
+            if (!disclosing && left && onScreen) departures.set(id, ghostOf(row));
+        }
+        for (const run of hideRuns) {
+            const rects = run.ids.map(id => oldRects.get(id)).filter((r): r is Rect => !!r);
+            if (rects.length === 0) continue;
+            const geometry = blockGeometry(rects, run.anchor ? oldRects.get(run.anchor) : undefined);
+            for (const id of run.ids) {
+                const rect = oldRects.get(id);
+                const row = hidingRows.get(id);
+                if (!rect || !row || !rollsInView(rect, geometry)) continue;
+                ghosts.set(id, ghostOf(seen.has(id) ? standIns.current.get(id)! : row));
+            }
+            if (run.anchor && !isThreadRow(run.anchor)) {
+                const closing = run.ids[closingIndex(run.ids.map(id => oldRects.get(id)), geometry)];
+                const row = closing ? hidingRows.get(closing) : undefined;
+                hidingLineLefts.set(run.anchor, row ? rowHairlineLeft(row) : null);
+            }
+        }
+    }
+
+    // ── Update refs for next render ──
+    prevSections.current = currentSections;
+    prevOrder.current = currentOrder;
+
+    useLayoutEffect(() => {
+        const el = containerRef.current;
+        if (!el || !hasChanges || oldRects.size === 0) return;
+
+        if (isReducedMotion()) return;
+
+        // A thread back in the section it left takes over from its copy.
+        for (const [id, copy] of departing.current) {
+            if (currentSections.get(id) !== copy.from) continue;
+            copy.exit.cancel();
+            copy.ghost.remove();
+        }
+
+        // Cancel previous animations and restore hidden elements
+        for (const a of runningAnims.current) {
+            try { a.cancel(); } catch { /* already finished */ }
+        }
+        for (const r of animatedEls.current) {
+            r.classList.remove('flip-animating');
+        }
+        for (const h of hiddenEls.current) {
+            h.style.opacity = '';
+        }
+        for (const c of overlays.current) {
+            c.remove();
+        }
+        runningAnims.current = [];
+        animatedEls.current = [];
+        hiddenEls.current = [];
+        overlays.current = [];
+        standIns.current.clear();
+
+        const mobile = isMobile();
+        // The shared slider scale (store/store.ts), the same one every CSS
+        // --duration-* token folds in. Phones get the full length: a row that
+        // leaves in 150ms is gone before a reader sees it go.
+        const scale = durationScale.value;
+        const easing = mobile ? EASING_MOBILE : EASING_DESKTOP;
+
+        const rows = el.querySelectorAll<HTMLElement>('[data-flip-id]');
+        const rowById = new Map<string, HTMLElement>();
+        for (const row of rows) rowById.set(row.dataset.flipId!, row);
+        const newAnims: Animation[] = [];
+        const touched: HTMLElement[] = [];
+        const hidden: HTMLElement[] = [];
+        const created: HTMLElement[] = [];
+
+        // The anchor's own slide, if the commit moved it (a scroll clamp, say).
+        const anchorDrift = (anchor: string | null) => {
+            const oldRect = anchor ? oldRects.get(anchor) : undefined;
+            const anchorEl = anchor ? rowById.get(anchor) : undefined;
+            return oldRect && anchorEl ? oldRect.top - anchorEl.getBoundingClientRect().top : 0;
+        };
+
+        // A section's rows fade as they roll, so their hairlines cannot carry
+        // its closing line. This line does, at full strength, on the rolling
+        // part's bottom edge: it lands on the collapsed divider, or leaves
+        // from it. At the row end it narrows to the closing row's own indent.
+        const carryHairline = (
+            host: HTMLElement, anchor: string, rollEnd: number, rowLeft: number | null,
+            fromY: number, toY: number, reveal: boolean, timing: KeyframeAnimationOptions,
+        ) => {
+            const key = `__hairline_${anchor}`;
+            const hairline = document.createElement('div');
+            hairline.className = 'flip-disclosure-hairline';
+            hairline.setAttribute('aria-hidden', 'true');
+            host.appendChild(hairline);
+            const top = rollEnd - 1;
+            hairline.style.top = `${top - host.getBoundingClientRect().top}px`;
+            created.push(hairline);
+            const box = hairline.getBoundingClientRect();
+            const atRow = rowEndScale(box, rowLeft);
+            const was = seen.get(key);
+            standIns.current.set(key, hairline);
+            const fromScale = was && box.width > 0 ? was.rect.width / box.width : reveal ? 1 : atRow;
+            const at = (y: number, s: number) => ({ transform: `translateY(${y}px) scaleX(${s})` });
+            return hairline.animate(
+                [at(was ? was.rect.top - top : fromY, fromScale), at(toY, reveal ? atRow : 1)], timing);
+        };
+
+        // ── Disclosure: copies slide in a mask under the anchor. ──
+        // Showing rows wait invisible in their new boxes. Hiding rows leave
+        // from their old boxes, as copies taken before the commit. A block
+        // rolls at most about one screen (`rollDistance`), and the rows below
+        // it move that same distance, in lockstep.
+        const disclosureBlock = (
+            run: DisclosureRun, entries: DisclosureEntry[], geometry: BlockGeometry, reveal: boolean,
+            rowLeft: number | null,
+        ) => {
+            const rows = entries.filter((e): e is DisclosureEntry & DisclosureRow => !!e.ghost);
+            if (rows.length === 0) return null;
+            // Shown rows past the cut wait hidden too: a scroll mid-motion
+            // must not bring them up under the rows below, held one cut up.
+            const waiting = entries.filter(e => e.real && e.rect.top >= geometry.rollEnd).map(e => e.real!);
+            return { run, rows, waiting, ...geometry, drift: anchorDrift(run.anchor), reveal, rowLeft };
+        };
+        const blocks = [
+            ...revealRuns.map(run => {
+                const reals = run.ids.map(id => rowById.get(id)).filter((r): r is HTMLElement => !!r);
+                if (reals.length === 0) return null;
+                const rects = reals.map(real => real.getBoundingClientRect());
+                const anchorRect = run.anchor ? rowById.get(run.anchor)?.getBoundingClientRect() : undefined;
+                const geometry = blockGeometry(rects, anchorRect);
+                const closing = reals[closingIndex(rects, geometry)];
+                return disclosureBlock(
+                    run,
+                    reals.map((real, i) => ({
+                        id: real.dataset.flipId!, real, rect: rects[i],
+                        ghost: rollsInView(rects[i], geometry) ? ghostOf(real) : undefined,
+                    })),
+                    geometry, true,
+                    run.anchor && !isThreadRow(run.anchor) && closing ? rowHairlineLeft(closing) : null,
+                );
+            }),
+            ...hideRuns.map(run => {
+                const ids = run.ids.filter(id => oldRects.has(id));
+                const rects = ids.map(id => oldRects.get(id)!);
+                return disclosureBlock(
+                    run,
+                    ids.map((id, i) => ({ id, ghost: ghosts.get(id), rect: rects[i] })),
+                    blockGeometry(rects, run.anchor ? oldRects.get(run.anchor) : undefined), false,
+                    run.anchor ? hidingLineLefts.get(run.anchor) ?? null : null,
+                );
+            }),
+        ].filter(b => b !== null);
+        // No phone shortening here. A tall section already races past, and
+        // cut further its rows' hairlines strobe by.
+        const disclosureDuration = blocks.length > 0
+            ? disclosureDurationMs(Math.max(...blocks.map(b => b.roll))) * durationScale.value
+            : 0;
+
+        for (const { run, rows: blockRows, waiting, line, roll, rollEnd, drift, reveal, rowLeft } of blocks) {
+            // The mask joins the rows' own section, so the drawer's selectors
+            // still style the copies and they scroll with the list.
+            const host = (run.anchor ? rowById.get(run.anchor)?.parentElement : null) ?? el;
+            const mask = mountDisclosureMask(host, line, blockRows);
+            created.push(mask);
+            for (const real of [...blockRows.map(r => r.real), ...waiting]) {
+                if (!real) continue;
+                real.style.opacity = '0';
+                hidden.push(real);
+            }
+            const timing = { duration: disclosureDuration, easing: EASING_DISCLOSURE, fill: 'forwards' as const };
+            // A toggle that interrupts another starts where its copy was.
+            const startY = (id: string, rect: Rect) => {
+                const was = seen.get(id);
+                if (!was) return reveal ? -roll : 0;
+                return reveal ? was.rect.top - rect.top - drift : 0;
+            };
+            const endY = reveal ? 0 : -roll;
+            // The mask rides the anchor, and the copies slide the roll inside
+            // it, in lockstep with the rows below. Its fade reaches as far as
+            // the top copy has slid under the line.
+            const top = blockRows[0];
+            const maskAt = (driftY: number, copyY: number): Keyframe => ({
+                transform: `translateY(${driftY}px)`,
+                [FADE_REACH]: `${Math.max(0, line - (top.rect.top + copyY))}px`,
+            });
+            const drifted = reveal ? drift : -drift;
+            newAnims.push(mask.animate(reveal
+                ? [maskAt(drifted, startY(top.id, top.rect)), maskAt(0, endY)]
+                : [maskAt(0, startY(top.id, top.rect)), maskAt(drifted, endY)], timing));
+            for (const { id, ghost, rect } of blockRows) {
+                const was = seen.get(id);
+                const fromOpacity = was ? String(was.opacity) : reveal ? '0' : '1';
+                newAnims.push(ghost.animate([
+                    { transform: `translateY(${startY(id, rect)}px)`, opacity: fromOpacity },
+                    { transform: `translateY(${endY}px)`, opacity: reveal ? '1' : '0' },
+                ], timing));
+                standIns.current.set(id, ghost);
+            }
+            if (run.anchor && !isThreadRow(run.anchor)) {
+                newAnims.push(carryHairline(host, run.anchor, rollEnd, rowLeft,
+                    reveal ? drift - roll : 0, reveal ? 0 : -(roll + drift), reveal, timing));
+            }
+        }
+
+        // A capped roll leaves the rest of a long block out of the motion, so
+        // every row below it moves only the roll too. Collapsing, such a row
+        // starts the cut above its layout box, unless a running batch already
+        // holds it higher. Expanding, it moves the roll and settles off screen.
+        const orderIndex = new Map(currentOrder.map((id, i) => [id, i]));
+        const cutBelow = (id: string) => {
+            let hidingCut = 0;
+            let end = 0;
+            const at = orderIndex.get(id) ?? -1;
+            for (const block of blocks) {
+                const after = block.run.anchor ? orderIndex.get(block.run.anchor) ?? -1 : -1;
+                if (at <= after) continue;
+                if (block.reveal) end -= block.cut;
+                else hidingCut += block.cut;
+            }
+            const start = hidingCut > 0 ? -Math.max(0, (lifts.get(id) ?? 0) + hidingCut) : 0;
+            return { start, end };
+        };
+        // A block whose line has scrolled above the screen does not roll, so
+        // the rows below it do not slide either: that change lands at once. A
+        // rolling block nearer above a row still moves it.
+        const anchorIndex = (run: DisclosureRun) => run.anchor ? orderIndex.get(run.anchor) ?? -1 : -1;
+        const stillAfter = [
+            ...revealRuns.map(run => [run, run.anchor ? rowById.get(run.anchor)?.getBoundingClientRect() : undefined] as const),
+            ...hideRuns.map(run => [run, run.anchor ? oldRects.get(run.anchor) : undefined] as const),
+        ]
+            .filter(([, rect]) => rect !== undefined && rect.top + rect.height < 0)
+            .map(([run]) => anchorIndex(run));
+        const rollingAfter = blocks.map(block => anchorIndex(block.run));
+        const belowStill = (id: string) => {
+            const at = orderIndex.get(id) ?? -1;
+            const nearest = (anchors: number[]) => Math.max(-Infinity, ...anchors.filter(after => at > after));
+            return nearest(stillAfter) > nearest(rollingAfter);
+        };
+
+        // Threads whose new section draws them where they stood: none moved.
+        const settled = new Set([...transitioned].filter(id => {
+            const now = rowById.get(id)?.getBoundingClientRect();
+            const was = oldRects.get(id);
+            return !!now && !!was && Math.abs(now.left - was.left) < 1 && Math.abs(now.top - was.top) < 1;
+        }));
+
+        // ── Departures: copies of rows that left their section. ──
+        // Each folds up from its bottom edge on the same curve as the row
+        // below, which closes the gap. It never travels to where the thread
+        // went, even when that section is on screen.
+        const leaving = [...departures]
+            .filter(([id]) => !settled.has(id))
+            .map(([id, ghost]) => ({ id, ghost, rect: oldRects.get(id)! }));
+        if (leaving.length > 0) {
+            const layer = mountDepartureLayer(el, leaving);
+            const exits: Animation[] = [];
+            for (const { id, ghost } of leaving) {
+                const exit = ghost.animate([
+                    { transform: 'scaleY(1)', transformOrigin: 'top', opacity: '1' },
+                    LINGER,
+                    { transform: 'scaleY(0)', transformOrigin: 'top', opacity: '0' },
+                ], { duration: MIN_MS * scale, easing, fill: 'forwards' });
+                exits.push(exit);
+                departing.current.set(id, { ghost, exit, from: prev.get(id)! });
+                const forget = () => {
+                    if (departing.current.get(id)?.exit === exit) departing.current.delete(id);
+                };
+                exit.finished.then(forget, forget);
+            }
+            playOutDeparture(layer, exits);
+        }
+
+        for (const row of rows) {
+            const id = row.dataset.flipId!;
+            if (revealed.has(id)) continue;
+            const isNew = newItems.has(id);
+            const isMoved = transitioned.has(id);
+            const isAffected = affectedSiblings.has(id);
+
+            if (isNew) {
+                row.classList.add('flip-animating');
+                touched.push(row);
+                const isSection = id.startsWith('__section_');
+                // On mobile: simpler fade-in without scale bounce
+                const newItemKeyframes = (isSection || mobile)
+                    ? [{ opacity: '0' }, { opacity: '1' }]
+                    : [
+                        { opacity: '0', transform: 'scale(0.95)', transformOrigin: 'center' },
+                        { opacity: '1', transform: 'scale(1.03)', transformOrigin: 'center', offset: 0.6 },
+                        { opacity: '1', transform: 'scale(1)', transformOrigin: 'center' },
+                    ];
+                const anim = row.animate(
+                    newItemKeyframes,
+                    { duration: (isSection ? 350 : 450) * scale, easing, fill: 'none' },
+                );
+                newAnims.push(anim);
+                continue;
+            }
+
+            if (isMoved) {
+                if (settled.has(id)) continue;
+                // A thread that changed sections fades in at its new place,
+                // while its copy folds away where it stood.
+                row.classList.add('flip-animating');
+                touched.push(row);
+                newAnims.push(row.animate(
+                    [{ opacity: '0' }, { opacity: '1' }],
+                    { duration: MIN_MS * scale, easing, fill: 'none' },
+                ));
+                continue;
+            }
+
+            if (!isAffected || belowStill(id)) continue;
+
+            const newRect = row.getBoundingClientRect();
+            const oldRect = oldRects.get(id);
+            if (!oldRect) continue;
+
+            const deltaX = oldRect.left - newRect.left;
+            const deltaY = oldRect.top - newRect.top;
+            if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) continue;
+
+            // A row a disclosure pushed moves in lockstep with the block.
+            const pushed = disclosureDuration > 0;
+            const duration = pushed
+                ? disclosureDuration
+                : flightDurationMs(Math.sqrt(deltaX * deltaX + deltaY * deltaY)) * scale;
+
+            // A displaced sibling slides to its new position.
+            row.classList.add('flip-animating');
+            touched.push(row);
+            const { start, end } = cutBelow(id);
+            newAnims.push(row.animate([
+                { transform: `translate(${deltaX}px, ${deltaY + start}px)` },
+                { transform: `translate(0, ${end}px)` },
+            ], { duration, easing: pushed ? EASING_DISCLOSURE : easing, fill: 'none' }));
+        }
+
+        runningAnims.current = newAnims;
+        startTogetherOnNextFrame(newAnims, () => runningAnims.current === newAnims);
+        animatedEls.current = touched;
+        hiddenEls.current = hidden;
+        overlays.current = created;
+
+        // Cleanup after all animations finish
+        if (newAnims.length > 0) {
+            Promise.allSettled(newAnims.map(a => a.finished)).then(() => {
+                // A newer batch cancelled these, which is what settled us, and
+                // its takeover above already did this batch's cleanup. Running
+                // it again would un-hide a row whose new copy is still sliding,
+                // and would wipe the refs the NEXT batch cancels through.
+                if (runningAnims.current !== newAnims) return;
+                for (const r of touched) {
+                    r.classList.remove('flip-animating');
+                }
+                for (const h of hidden) {
+                    h.style.opacity = '';
+                }
+                for (const c of created) {
+                    c.remove();
+                }
+                runningAnims.current = [];
+                animatedEls.current = [];
+                hiddenEls.current = [];
+                overlays.current = [];
+                standIns.current.clear();
+            });
+        }
+    });
+}

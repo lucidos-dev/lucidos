@@ -1,0 +1,1920 @@
+//! The *Thread Queue* — system-wide admission control for ALL thread work.
+//!
+//! One shared capacity pool gates every path that creates running work:
+//! event-trigger fires, cron fires, agent-driven sub-thread spawns
+//! (`run_thread`), coding-agent spawns (`run_coding_agent`), agent-mode chat POSTs
+//! (cross-workspace tasks / `lucidos spawn-thread`), AND user-initiated chat /
+//! user-typed coding-agent threads.
+//!
+//! User-initiated work is **prioritized, not exempt** (ADR 0008, superseding
+//! ADR 0007's "user preempts and doesn't count"): it counts against
+//! `max_concurrent_total`, it drains ahead of background, it ignores the
+//! per-kind / per-trigger caps, and it queues when the pool is genuinely
+//! full — a person can briefly wait at true pool-max. `reserved_background`
+//! is a floor background can reclaim ahead of user work so priority can't
+//! starve triggers/cron.
+//!
+//! Two flavours of occupant share the pool:
+//! - **Background spawns** go through [`ThreadQueue::submit`]: the queue owns
+//!   their execution (via the executor) and persists them in the
+//!   `thread_queue` projection (event-sourced from `ThreadQueued` /
+//!   `ThreadQueueAdmitted` / `ThreadQueueDropped` / `ThreadQueueCompleted`),
+//!   so a restart re-queues work that never ran and drains it as capacity
+//!   frees.
+//! - **User-initiated work** goes through [`ThreadQueue::acquire_user_slot`]:
+//!   the caller (chat handler) runs it itself; the queue only gates the START
+//!   (back-pressure at pool-max) and counts the slot. From there the slot's
+//!   lifetime is owned by [`ThreadQueue::reconcile_user_slot`], driven by the
+//!   settle subscriber off `thread_summaries.status` — the SINGLE place the
+//!   user-half of the pool moves in and out, so it can never drift from real
+//!   thread status (a thread that parks on a question, resumes, is continued,
+//!   or auto-resumes after restart all converge correctly). These slots live
+//!   in-memory only — ephemeral runtime (a dead response is gone on restart,
+//!   never re-fired), so they are NOT persisted; the panel API merges them in
+//!   and a transient `ThreadQueueChanged` refreshes the panel when only user
+//!   state moves.
+//!
+//! Over capacity, work is enqueued (user waiters first, then FIFO per trigger,
+//! best-effort across triggers) instead of running unbounded.
+//!
+//! Per the broadcast/subscribe rule, all state changes flow through
+//! [`EventBus`]; the projection in `event_bus_projection_system.rs` keeps
+//! the table in lockstep, and SSE consumers (the Thread Queue panel) react
+//! to the same events.
+
+mod policy;
+mod request;
+
+pub mod executor;
+
+pub use executor::{ExecutableEntry, ThreadQueueExecutor};
+pub use policy::{
+    AdmissionCounts, AdmissionDecision, CapacityPolicy, OverflowPolicy, ThreadQueueKind,
+    DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD, DEFAULT_MAX_EVENT_TRIGGER_DEPTH,
+};
+pub(crate) use request::truncate_summary;
+pub use request::ThreadQueueRequest;
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::{MessageOrigin, ThreadEvent};
+use crate::engine::thread_lifecycle::ThreadStatus;
+use crate::engine::LucidosEngine;
+use crate::triggers::TriggerConfig;
+
+/// How long a trigger's oldest queued fire waits before the "significantly
+/// delayed" notification fires. Wait time, never queue depth: a burst of quick
+/// fires drains in seconds. One agentic fire often runs a few minutes, so a
+/// shorter wait would alert whenever two fires of one trigger overlap.
+const DELAY_ALERT_WAIT: Duration = Duration::from_secs(5 * 60);
+/// Minimum spacing between notifications for the same trigger (and for the
+/// global at-capacity notice) so a hot queue doesn't spam the inbox.
+const NOTIFY_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+/// Safety-net drain interval — normal drains are event-driven (completion,
+/// drop, policy change, trigger resume); the timer catches anything missed
+/// and drives the delay notification check.
+const DRAIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One queued spawn, in memory. Mirrors a `thread_queue` row with
+/// status `'queued'` plus the non-persistable runtime handles.
+struct QueueEntry {
+    id: Uuid,
+    kind: ThreadQueueKind,
+    trigger_id: Option<String>,
+    trigger_name: Option<String>,
+    thread_id: Option<Uuid>,
+    summary: String,
+    request: ThreadQueueRequest,
+    queued_at: DateTime<Utc>,
+    /// Cooperative cancel from the submitter (cron task loop). Lost on
+    /// restart — a re-queued entry runs uncancellable, same as a
+    /// missed-grace cron catch-up. Allowed-ephemeral.
+    cancel: Option<CancellationToken>,
+    /// Resolved on admit-completion or drop so a waiting submitter (the cron
+    /// task loop) unblocks. Allowed-ephemeral — after restart nobody waits.
+    completion_tx: Option<oneshot::Sender<()>>,
+}
+
+/// One admitted (actively executing) background spawn's accounting record.
+struct ActiveSlot {
+    kind: ThreadQueueKind,
+    trigger_id: Option<String>,
+    completion_tx: Option<oneshot::Sender<()>>,
+    /// The thread this entry's chain depth is registered under, so `complete`
+    /// can drop the registration. `None` until the work has a thread: a trigger
+    /// fire creates its own, and binds it later through `record_entry_thread`.
+    chain_thread_id: Option<Uuid>,
+    /// The entry's chain depth, kept so a late thread binding can register at
+    /// it without re-reading the request.
+    chain_depth: u32,
+}
+
+/// One admitted user-initiated response occupying the pool. In-memory only —
+/// never persisted (a dead response is gone on restart, never re-fired).
+struct UserSlot {
+    /// The thread running the response, for the panel's Running list.
+    thread_id: Option<Uuid>,
+    summary: String,
+    admitted_at: DateTime<Utc>,
+}
+
+/// A user-initiated response waiting for a free slot (pool at max). Drains
+/// with priority — ahead of background, behind the reserved-background floor.
+struct UserWaiter {
+    /// Stable id for this waiter / its eventual [`UserSlot`].
+    entry_id: Uuid,
+    thread_id: Option<Uuid>,
+    summary: String,
+    queued_at: DateTime<Utc>,
+    /// Resolved by the drainer once admitted, unblocking the chat task.
+    wake: oneshot::Sender<()>,
+}
+
+struct QueueState {
+    policy: CapacityPolicy,
+    queued: VecDeque<QueueEntry>,
+    active: HashMap<Uuid, ActiveSlot>,
+    /// Admitted user-initiated responses (in-memory only — see [`UserSlot`]).
+    user_active: HashMap<Uuid, UserSlot>,
+    /// User-initiated responses waiting for a slot (priority line, FIFO).
+    user_queued: VecDeque<UserWaiter>,
+    /// `thread_id` to the `user_active` key its slot was filed under before
+    /// [`ThreadQueue::reconcile_user_slot`] removed it on a park/idle.
+    ///
+    /// This is what lets the resume RE-file the slot under its ORIGINAL key.
+    /// [`UserSlotGuard`]'s backstop matches the gate's `entry_id`, so a resume
+    /// that minted a fresh `Uuid` put the slot permanently out of the guard's
+    /// reach: pair that with a settle missed on broadcast lag and the slot was
+    /// leaked for the life of the process, and enough leaks block every chat
+    /// POST on the pool. Keyed by thread because that is what reconcile has in
+    /// hand, and bounded by it: one parked key per thread, cleared when the
+    /// slot is re-filed or the guard drops.
+    parked_user_slots: HashMap<Uuid, Uuid>,
+    /// Per-trigger notification cooldowns (allowed-ephemeral — a restart
+    /// resetting the cooldown at worst re-notifies once).
+    delay_notified: HashMap<String, Instant>,
+    global_notified: Option<Instant>,
+}
+
+impl QueueState {
+    /// Everything occupying the shared pool — background admits + user admits.
+    fn total_active(&self) -> usize {
+        self.active.len() + self.user_active.len()
+    }
+
+    /// The "Lucidos is at capacity" notification, when the pool is full and
+    /// its cooldown has elapsed. Call under the state lock, send after.
+    fn capacity_notification_due(&mut self) -> Option<(String, String)> {
+        if self.total_active() < self.policy.max_concurrent_total
+            || self
+                .global_notified
+                .is_some_and(|t| t.elapsed() < NOTIFY_COOLDOWN)
+        {
+            return None;
+        }
+        self.global_notified = Some(Instant::now());
+        let total_queued = self.queued.len() + self.user_queued.len();
+        Some((
+            "Lucidos is at capacity".to_string(),
+            format!(
+                "All {} slots are busy; {total_queued} thread(s) are waiting \
+                 in the Thread Queue.",
+                self.policy.max_concurrent_total
+            ),
+        ))
+    }
+
+    /// Whether the trigger's delay cooldown has elapsed. Starts a new
+    /// cooldown when it has, so the caller must then notify.
+    fn delay_cooldown_elapsed(&mut self, trigger_id: &str) -> bool {
+        let elapsed = self
+            .delay_notified
+            .get(trigger_id)
+            .is_none_or(|t| t.elapsed() >= NOTIFY_COOLDOWN);
+        if elapsed {
+            self.delay_notified
+                .insert(trigger_id.to_string(), Instant::now());
+        }
+        elapsed
+    }
+
+    fn counts_for(&self, kind: ThreadQueueKind, trigger_id: Option<&str>) -> AdmissionCounts {
+        let kind_active = self.active.values().filter(|s| s.kind == kind).count();
+        let (trigger_active, trigger_queued) = match trigger_id {
+            Some(tid) => (
+                self.active
+                    .values()
+                    .filter(|s| s.trigger_id.as_deref() == Some(tid))
+                    .count(),
+                self.queued
+                    .iter()
+                    .filter(|e| e.trigger_id.as_deref() == Some(tid))
+                    .count(),
+            ),
+            None => (0, 0),
+        };
+        AdmissionCounts {
+            background_active: self.active.len(),
+            user_active: self.user_active.len(),
+            kind_active,
+            trigger_active,
+            trigger_queued,
+            user_queued: self.user_queued.len(),
+        }
+    }
+}
+
+/// Outcome of [`ThreadQueue::submit`].
+pub struct SubmitOutcome {
+    pub entry_id: Uuid,
+    /// `true` = running now; `false` = waiting in the queue.
+    pub admitted: bool,
+    /// 1-based queue position when `admitted == false`; 0 when admitted.
+    pub position: usize,
+    /// `true` when admission COALESCED the entry away: a fire of this cron
+    /// trigger was already active or queued, so nothing new was started and
+    /// `completion` is already resolved.
+    ///
+    /// The scheduler's two submit sites ignore this (a dropped redundant fire
+    /// is exactly what they want). It exists for the off-schedule-run path,
+    /// where `admitted: false, position: 0` is otherwise indistinguishable from
+    /// a queued entry and a caller would report "started" for a run that never
+    /// happened. See `engine_impl::trigger_runs`.
+    pub coalesced: bool,
+    /// Resolves when the entry's work finishes OR the entry is dropped.
+    pub completion: oneshot::Receiver<()>,
+}
+
+/// RAII handle for a user-initiated pool slot from
+/// [`ThreadQueue::acquire_user_slot`]. Releasing on drop (even on panic)
+/// frees the slot and drains, so a crashed chat task can't leak capacity.
+pub struct UserSlotGuard {
+    queue: Arc<ThreadQueue>,
+    entry_id: Uuid,
+    /// The thread the gate reserved for. Carried ONLY so the drop can clear
+    /// this thread's `parked_user_slots` key when the task ends while its
+    /// thread is parked. Releasing the slot itself stays keyed by `entry_id`;
+    /// see [`ThreadQueue::release_user_slot`] for why a by-thread release would
+    /// be wrong.
+    thread_id: Option<Uuid>,
+}
+
+impl Drop for UserSlotGuard {
+    fn drop(&mut self) {
+        // release_user_slot is async; the drop runs in a sync context, so hand
+        // the cleanup to a detached task. The pool count is in-memory, so a
+        // missed release at shutdown is harmless (it dies with the process).
+        let queue = self.queue.clone();
+        let entry_id = self.entry_id;
+        let thread_id = self.thread_id;
+        tokio::spawn(async move {
+            queue.release_user_slot(entry_id, thread_id).await;
+        });
+    }
+}
+
+/// One in-memory user-initiated pool occupant, for the panel API to merge
+/// with the persisted background rows. Mirrors the displayed fields of a
+/// `thread_queue` row (`kind` is always `user-chat` for these).
+pub struct UserQueueEntry {
+    pub id: Uuid,
+    pub thread_id: Option<Uuid>,
+    pub summary: String,
+    /// `"admitted"` (Running) or `"queued"` (waiting for a slot).
+    pub status: &'static str,
+    pub queued_at: DateTime<Utc>,
+    pub admitted_at: Option<DateTime<Utc>>,
+}
+
+/// One occupant of the shared pool, wire-shaped for the Thread Queue panel
+/// (`GET /api/v1/thread-queue`) AND the `list_thread_queue` LLM tool.
+/// Background entries (`event-trigger` / `cron` / `sub-thread` /
+/// `coding-agent`) are read from the `thread_queue` projection; user-initiated
+/// entries (`user-chat`) are merged in from the manager's in-memory state.
+/// Both read paths go through [`ThreadQueue::snapshot`], so the panel and the
+/// tool materialize the SAME view and can never diverge.
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct ThreadQueueEntryView {
+    pub id: Uuid,
+    /// `event-trigger` | `cron` | `sub-thread` | `coding-agent` | `user-chat`.
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<Uuid>,
+    pub summary: String,
+    /// `queued` | `admitted` (admitted = actively running).
+    pub status: String,
+    pub queued_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admitted_at: Option<DateTime<Utc>>,
+}
+
+/// The full Thread Queue view: every pool occupant plus the active capacity
+/// policy. The single response shape shared by the panel API and the LLM tool.
+#[derive(serde::Serialize)]
+pub struct ThreadQueueSnapshot {
+    pub entries: Vec<ThreadQueueEntryView>,
+    pub policy: CapacityPolicy,
+}
+
+/// Thread events on which the settle subscriber reconciles the user pool against
+/// the (now-committed) `thread_summaries.status`, so the pool stays a faithful
+/// mirror of real thread status — the SINGLE place the user-half of the pool
+/// moves in and out. Reconcile reads the actual post-commit status, so it's
+/// *direction-agnostic*; this predicate only needs to fire on the status
+/// transitions that matter.
+///
+/// Two deliberate groups, and one deliberate exclusion:
+///
+/// - **→ running WITHOUT a back-pressure gate** — resume after a park,
+///   continuation respawn, post-restart auto-resume, and engine-injected
+///   prompts (hardening / conflict recovery). reconcile is the *sole adder*
+///   for these, so they MUST be here — this is what fixes the reported bug and
+///   its whole family.
+/// - **→ not-running** — parked on the user, terminal, or back to idle.
+///   reconcile removes; removal is idempotent so these can never double-count.
+/// - **Excluded: gate-covered starts** (`MessageReceived`, `SessionStarted`,
+///   `CodingAgentUserMessageSent`, `PromptInjected`). These are always
+///   preceded by [`Self::acquire_user_slot`] inserting the slot (or are
+///   mid-flight into an already-counted thread), so reconcile must NOT also add
+///   on them — `acquire_user_slot` adds unconditionally, so a reconcile add
+///   racing it would double-count. The gate owns the start; reconcile owns
+///   everything after.
+///
+/// Per-token streaming and pure metadata/audit events never move status and are
+/// excluded. A missed status variant degrades to "the pool lags status until
+/// the next status event for that thread (or the gate guard's drop)", never a
+/// hard break — mirror new status arms here.
+fn affects_user_running(event: &ThreadEvent) -> bool {
+    matches!(
+        event,
+        // → running with no gate — reconcile is the sole adder.
+        ThreadEvent::ContinuationStarted { .. }
+            | ThreadEvent::ContinuationRequested { .. }
+            | ThreadEvent::UserQuestionAnswered { .. }
+            | ThreadEvent::CodingAgentPermissionResolved { .. }
+            | ThreadEvent::CommandPermissionResolved { .. }
+            | ThreadEvent::McpPermissionResolved { .. }
+            | ThreadEvent::CodingAgentPromptSent { .. }
+            | ThreadEvent::CodingAgentInputRead {
+                started_turn: true,
+                ..
+            }
+            // → waiting_for_user_answer (parked on the user).
+            | ThreadEvent::UserQuestionAsked { .. }
+            | ThreadEvent::CodingAgentPermissionRequest { .. }
+            | ThreadEvent::CommandPermissionRequested { .. }
+            | ThreadEvent::McpPermissionRequested { .. }
+            // → idle / waiting / failed (terminal or back-to-idle).
+            | ThreadEvent::ResponseGenerated { .. }
+            | ThreadEvent::ResponseCanceled { .. }
+            | ThreadEvent::ResponseAborted { .. }
+            | ThreadEvent::ResponseFailed { .. }
+            | ThreadEvent::CodingAgentIdled { .. }
+            | ThreadEvent::TriggerCompleted { .. }
+            | ThreadEvent::SessionEnded { .. }
+            | ThreadEvent::ChangeApplied { .. }
+            | ThreadEvent::ChangeDiscarded { .. }
+            | ThreadEvent::ThreadArchived
+    )
+}
+
+/// Central admission-control manager. Lives on [`LucidosEngine`] as
+/// `engine.thread_queue`; all four background spawn paths submit here.
+pub struct ThreadQueue {
+    pool: PgPool,
+    bus: EventBus,
+    trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
+    /// Needed because the overflow guard performs a real trigger write
+    /// (`TriggerDisabled`) through the trigger write chokepoint, which owns
+    /// both halves of the registry projection: the in-memory map and the
+    /// on-disk `trigger.toml`.
+    workspace_path: std::path::PathBuf,
+    /// The engine's `trigger_write_lock`, shared so the overflow guard's write
+    /// serializes against every other trigger write rather than racing them.
+    trigger_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Installed via [`Self::attach_engine`] after `Arc::new(engine)` —
+    /// executes admitted entries. Test fixtures install mocks.
+    executor: OnceLock<Arc<dyn ThreadQueueExecutor>>,
+    /// Weak engine handle, used only for push fan-out on queue notifications.
+    engine: OnceLock<Weak<LucidosEngine>>,
+    state: tokio::sync::Mutex<QueueState>,
+}
+
+impl ThreadQueue {
+    pub fn new(
+        pool: PgPool,
+        bus: EventBus,
+        trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
+        workspace_path: std::path::PathBuf,
+        trigger_write_lock: Arc<tokio::sync::Mutex<()>>,
+        policy: CapacityPolicy,
+    ) -> Self {
+        Self {
+            pool,
+            bus,
+            trigger_configs,
+            workspace_path,
+            trigger_write_lock,
+            executor: OnceLock::new(),
+            engine: OnceLock::new(),
+            state: tokio::sync::Mutex::new(QueueState {
+                policy,
+                queued: VecDeque::new(),
+                active: HashMap::new(),
+                user_active: HashMap::new(),
+                user_queued: VecDeque::new(),
+                parked_user_slots: HashMap::new(),
+                delay_notified: HashMap::new(),
+                global_notified: None,
+            }),
+        }
+    }
+
+    /// Load the capacity policy from the latest persisted
+    /// `CapacityPolicyChanged` event; absence (or a parse failure on a
+    /// legacy payload) falls back to defaults.
+    pub async fn load_policy(pool: &PgPool) -> CapacityPolicy {
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT payload FROM events WHERE event_type = 'CapacityPolicyChanged' \
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or_else(|e| {
+            log!(
+                "[ThreadQueue] load_policy query failed: {}, using defaults",
+                e
+            );
+            None
+        });
+        match row {
+            Some((payload,)) => {
+                // `SystemEvent::to_payload` persists the serde-tagged enum
+                // form: `{"type": "CapacityPolicyChanged", "data": {"policy": …}}`.
+                let policy_json = payload
+                    .pointer("/data/policy")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                match serde_json::from_value(policy_json) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log!(
+                            "[ThreadQueue] CapacityPolicyChanged payload unparseable: {} — using defaults",
+                            e
+                        );
+                        CapacityPolicy::default()
+                    }
+                }
+            }
+            None => CapacityPolicy::default(),
+        }
+    }
+
+    /// Wire the engine in after `Arc::new(engine)`: installs the real
+    /// executor and the weak handle for push fan-out. Called from
+    /// `LucidosEngine::set_self_arc`.
+    pub fn attach_engine(&self, engine: &Arc<LucidosEngine>) {
+        self.engine.set(Arc::downgrade(engine)).ok();
+        self.executor
+            .set(Arc::new(executor::EngineThreadQueueExecutor::new(
+                Arc::downgrade(engine),
+            )))
+            .ok();
+    }
+
+    /// Test seam: install a mock executor instead of the engine-backed one.
+    pub fn set_executor(&self, executor: Arc<dyn ThreadQueueExecutor>) {
+        self.executor.set(executor).ok();
+    }
+
+    pub async fn policy(&self) -> CapacityPolicy {
+        self.state.lock().await.policy.clone()
+    }
+
+    /// Replace the capacity policy. Emits `CapacityPolicyChanged` (the
+    /// persisted source of truth), then drains in case caps were raised.
+    pub async fn set_policy(
+        self: &Arc<Self>,
+        policy: CapacityPolicy,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.bus
+            .emit(BusEvent::System(SystemEvent::CapacityPolicyChanged {
+                policy: policy.clone(),
+                actor,
+            }))
+            .await?;
+        self.state.lock().await.policy = policy;
+        self.drain().await;
+        Ok(())
+    }
+
+    fn trigger_name(&self, trigger_id: &str) -> Option<String> {
+        self.trigger_configs
+            .read()
+            .ok()
+            .and_then(|configs| configs.get(trigger_id).map(|c| c.name.clone()))
+    }
+
+    /// Whether the registry says the trigger is paused. An unreadable
+    /// registry answers `false`, so a stuck queue still alerts.
+    fn trigger_paused(&self, trigger_id: &str) -> bool {
+        self.trigger_configs
+            .read()
+            .is_ok_and(|configs| configs.get(trigger_id).is_some_and(|c| c.paused))
+    }
+
+    /// Submit a background spawn. Admits immediately when capacity allows
+    /// (the executor's `prepare` hook runs inline, before this returns);
+    /// otherwise the entry waits in the queue. Never blocks on execution.
+    pub async fn submit(
+        self: &Arc<Self>,
+        mut request: ThreadQueueRequest,
+        actor: Option<MessageOrigin>,
+        cancel: Option<CancellationToken>,
+    ) -> SubmitOutcome {
+        // Before anything else, so the chain depth travels ON the request
+        // rather than in a task-local the spawn below would drop. Read here
+        // because a spawn submit is always awaited inline from the spawning
+        // task, which is the task that owns the chain.
+        request.stamp_caller_depth(crate::scheduler::user_tasks::current_event_trigger_depth());
+        // Every spawn passes here, so this is where an unattributed one is
+        // caught. Its first message would render Origin "Unknown". Tests fail
+        // loudly; a release build still spawns it, since the work is real.
+        let attributed = request.is_attributed();
+        debug_assert!(
+            attributed,
+            "spawn submitted with no origin and no parent linkage: {request:?}"
+        );
+        if !attributed {
+            log!(
+                "[ThreadQueue] unattributed {:?} spawn submitted; its first message has no origin",
+                request.kind()
+            );
+        }
+        let kind = request.kind();
+        let trigger_id = request.trigger_id().map(str::to_string);
+        let trigger_name = trigger_id.as_deref().and_then(|t| self.trigger_name(t));
+        let entry_id = Uuid::new_v4();
+        let (completion_tx, completion_rx) = oneshot::channel();
+
+        let mut entry = QueueEntry {
+            id: entry_id,
+            kind,
+            trigger_id: trigger_id.clone(),
+            trigger_name: trigger_name.clone(),
+            thread_id: request.thread_id(),
+            summary: request.summary(trigger_name.as_deref()),
+            request,
+            queued_at: Utc::now(),
+            cancel,
+            completion_tx: Some(completion_tx),
+        };
+
+        let decision = {
+            let mut state = self.state.lock().await;
+            let counts = state.counts_for(kind, trigger_id.as_deref());
+            let decision = state
+                .policy
+                .decide_submit(counts, kind, trigger_id.is_some());
+            match decision {
+                AdmissionDecision::Admit => {
+                    state.active.insert(
+                        entry_id,
+                        ActiveSlot {
+                            kind,
+                            trigger_id: trigger_id.clone(),
+                            completion_tx: entry.completion_tx.take(),
+                            chain_thread_id: entry.thread_id,
+                            chain_depth: entry.request.depth(),
+                        },
+                    );
+                }
+                AdmissionDecision::Queue
+                | AdmissionDecision::Overflow
+                | AdmissionDecision::Coalesce => {}
+            }
+            decision
+        };
+
+        match decision {
+            AdmissionDecision::Admit => {
+                self.prepare_entry(&mut entry.request).await;
+                self.emit_queued(&entry, false, actor).await;
+                self.emit_admitted(
+                    entry_id,
+                    entry.thread_id,
+                    entry.trigger_id.clone(),
+                    entry.request.depth(),
+                    None,
+                )
+                .await;
+                self.spawn_execution(entry);
+                SubmitOutcome {
+                    entry_id,
+                    admitted: true,
+                    position: 0,
+                    coalesced: false,
+                    completion: completion_rx,
+                }
+            }
+            AdmissionDecision::Queue => {
+                self.emit_queued(&entry, false, actor).await;
+                let (position, notify) = {
+                    let mut state = self.state.lock().await;
+                    state.queued.push_back(entry);
+                    (state.queued.len(), state.capacity_notification_due())
+                };
+                if let Some((title, message)) = notify {
+                    self.notify(title, message).await;
+                }
+                SubmitOutcome {
+                    entry_id,
+                    admitted: false,
+                    position,
+                    coalesced: false,
+                    completion: completion_rx,
+                }
+            }
+            AdmissionDecision::Overflow => {
+                self.handle_overflow(entry, actor).await;
+                SubmitOutcome {
+                    entry_id,
+                    admitted: false,
+                    position: 0,
+                    coalesced: false,
+                    completion: completion_rx,
+                }
+            }
+            AdmissionDecision::Coalesce => {
+                // A fire of this cron trigger is already active or queued — this
+                // one is redundant (cron fires carry no distinct payload). Drop
+                // it without a persisted event (it never entered the queue), and
+                // resolve completion so the awaiting submitter (cron loop /
+                // missed-grace catch-up) proceeds to the next occurrence rather
+                // than hanging on a fire that will never run.
+                log!(
+                    "[ThreadQueue] Coalesced redundant cron fire for trigger '{}'",
+                    trigger_name
+                        .as_deref()
+                        .or(trigger_id.as_deref())
+                        .unwrap_or("?")
+                );
+                if let Some(tx) = entry.completion_tx.take() {
+                    let _ = tx.send(());
+                }
+                SubmitOutcome {
+                    entry_id,
+                    admitted: false,
+                    position: 0,
+                    coalesced: true,
+                    completion: completion_rx,
+                }
+            }
+        }
+    }
+
+    /// Apply the overflow policy: the trigger's queue is at its ceiling.
+    async fn handle_overflow(self: &Arc<Self>, entry: QueueEntry, actor: Option<MessageOrigin>) {
+        let trigger_id = entry
+            .trigger_id
+            .clone()
+            .expect("overflow only fires for trigger-bound entries");
+        let trigger_label = entry
+            .trigger_name
+            .clone()
+            .unwrap_or_else(|| trigger_id.clone());
+        let overflow = {
+            let state = self.state.lock().await;
+            state.policy.overflow
+        };
+        self.emit_queued(&entry, false, actor).await;
+        match overflow {
+            OverflowPolicy::DropOldest => {
+                let (dropped, cap) = {
+                    let mut state = self.state.lock().await;
+                    let idx = state
+                        .queued
+                        .iter()
+                        .position(|e| e.trigger_id.as_deref() == Some(trigger_id.as_str()));
+                    let dropped = idx.and_then(|i| state.queued.remove(i));
+                    state.queued.push_back(entry);
+                    (dropped, state.policy.max_queued_per_trigger)
+                };
+                if let Some(mut old) = dropped {
+                    if let Some(tx) = old.completion_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    let reason =
+                        format!("per-trigger queue cap ({cap}) reached, oldest entry dropped");
+                    self.emit_dropped(old.id, &reason, None).await;
+                    self.notify(
+                        format!("{trigger_label} queue overflowed"),
+                        format!(
+                            "The queue for trigger \"{trigger_label}\" hit its cap of {cap}; \
+                             the oldest waiting fire was dropped: {}",
+                            old.summary
+                        ),
+                    )
+                    .await;
+                }
+            }
+            OverflowPolicy::PauseTrigger => {
+                let cap = {
+                    let mut state = self.state.lock().await;
+                    state.queued.push_back(entry);
+                    state.policy.max_queued_per_trigger
+                };
+                // Pause through the trigger write chokepoint, exactly as a user
+                // pause would: the event is the record, and the registry is
+                // flipped before this returns so the very next admission
+                // decision already sees the trigger paused.
+                crate::engine::trigger_writes::TriggerRegistryWriter {
+                    event_bus: &self.bus,
+                    trigger_configs: &self.trigger_configs,
+                    workspace_path: &self.workspace_path,
+                    write_lock: &self.trigger_write_lock,
+                }
+                .write_or_log(
+                    crate::engine::trigger_writes::TriggerWrite::Disabled,
+                    &trigger_id,
+                    serde_json::json!({ "reason": "thread-queue overflow" }),
+                    None,
+                    "[ThreadQueue] (overflow)",
+                )
+                .await;
+                self.notify(
+                    format!("{trigger_label} paused — queue overflow"),
+                    format!(
+                        "Trigger \"{trigger_label}\" hit its queue cap of {cap} and was \
+                         paused. Its queued fires wait in the Thread Queue; resume the \
+                         trigger to continue."
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Admit whatever fits, by priority. Three passes run under one lock:
+    ///
+    /// 1. **Background reclaim-floor** — admit background up to
+    ///    `reserved_background` so user priority can't starve triggers/cron.
+    /// 2. **User priority** — admit waiting user-initiated responses (FIFO)
+    ///    while the pool has room. A person waits only at true pool-max.
+    /// 3. **Background fill** — admit the rest of the background backlog while
+    ///    capacity allows.
+    ///
+    /// Within background, per-trigger FIFO is strict (once a trigger is skipped
+    /// — paused or at its cap — every later entry of it is skipped too);
+    /// cross-trigger order is best-effort.
+    pub async fn drain(self: &Arc<Self>) {
+        let (to_admit, to_drop, woke) = {
+            let mut state = self.state.lock().await;
+            let mut to_admit: Vec<QueueEntry> = Vec::new();
+            let mut to_drop: Vec<(QueueEntry, String)> = Vec::new();
+
+            // Phase 1 — background reclaims up to its reserved floor first.
+            let floor = state.policy.effective_reserved_background();
+            self.drain_background_into(&mut state, floor, &mut to_admit, &mut to_drop);
+            // Phase 2 — user-initiated waiters take priority for free slots.
+            let woke = Self::drain_users(&mut state);
+            // Phase 3 — background fills whatever capacity remains.
+            self.drain_background_into(&mut state, usize::MAX, &mut to_admit, &mut to_drop);
+
+            (to_admit, to_drop, woke)
+        };
+
+        for (mut entry, reason) in to_drop {
+            if let Some(tx) = entry.completion_tx.take() {
+                let _ = tx.send(());
+            }
+            self.emit_dropped(entry.id, &reason, None).await;
+        }
+        // Unblock admitted user waiters; their queued→running move is in-memory
+        // (no persisted event), so refresh the panel explicitly.
+        let woke_any = !woke.is_empty();
+        for tx in woke {
+            let _ = tx.send(());
+        }
+        if woke_any {
+            self.emit_changed().await;
+        }
+        for mut entry in to_admit {
+            self.prepare_entry(&mut entry.request).await;
+            self.emit_admitted(
+                entry.id,
+                entry.thread_id,
+                entry.trigger_id.clone(),
+                entry.request.depth(),
+                None,
+            )
+            .await;
+            self.spawn_execution(entry);
+        }
+    }
+
+    /// Run the executor's admission hook at the request's chain depth.
+    ///
+    /// `prepare` emits: a sub-thread's eager `MessageReceived` goes out here.
+    /// It runs on three different tasks, the submitter's, the drainer's and
+    /// `run_now`'s, and only the first of those is inside the fire. Scoping the
+    /// hook makes the emitted event carry the same depth whichever admitted it.
+    async fn prepare_entry(&self, request: &mut ThreadQueueRequest) {
+        let Some(executor) = self.executor.get() else {
+            return;
+        };
+        let depth = request.depth();
+        crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
+            .scope(depth, executor.prepare(request))
+            .await;
+    }
+
+    /// Background admission scan (drain phases 1 & 3). Admits queued background
+    /// entries oldest-first — respecting per-trigger pause/deletion + FIFO and
+    /// the capacity caps — until background occupies `bg_target` slots or the
+    /// backlog is exhausted. Admitted entries land in `to_admit`; entries whose
+    /// trigger has vanished land in `to_drop`.
+    fn drain_background_into(
+        &self,
+        state: &mut QueueState,
+        bg_target: usize,
+        to_admit: &mut Vec<QueueEntry>,
+        to_drop: &mut Vec<(QueueEntry, String)>,
+    ) {
+        let mut skipped: HashSet<String> = HashSet::new();
+        let mut i = 0;
+        while i < state.queued.len() {
+            if state.active.len() >= bg_target {
+                break; // floor reached for this pass
+            }
+            let (kind, trigger_id) = {
+                let e = &state.queued[i];
+                (e.kind, e.trigger_id.clone())
+            };
+            if let Some(ref tid) = trigger_id {
+                if skipped.contains(tid) {
+                    i += 1;
+                    continue;
+                }
+                // A registry we could not READ is unknown, never "the trigger
+                // is gone": that arm drops the fire. `.ok()` collapsed the two,
+                // so one poisoning panic discarded every queued fire in the
+                // workspace on the next drain.
+                let paused = match self.trigger_configs.read() {
+                    Ok(configs) => configs.get(tid).map(|c| c.paused),
+                    Err(e) => {
+                        log!(
+                            "[ThreadQueue] Trigger registry unreadable ({}); leaving {}'s queued fires in place",
+                            e,
+                            tid
+                        );
+                        skipped.insert(tid.clone());
+                        i += 1;
+                        continue;
+                    }
+                };
+                match paused {
+                    None => {
+                        // Trigger no longer exists — its queued fires are
+                        // undeliverable.
+                        if let Some(e) = state.queued.remove(i) {
+                            to_drop.push((e, "trigger no longer exists".to_string()));
+                        }
+                        continue;
+                    }
+                    Some(true) => {
+                        // Paused — entries wait for resume.
+                        skipped.insert(tid.clone());
+                        i += 1;
+                        continue;
+                    }
+                    Some(false) => {}
+                }
+            }
+            let counts = state.counts_for(kind, trigger_id.as_deref());
+            match state
+                .policy
+                .decide_drain(counts, kind, trigger_id.is_some())
+            {
+                AdmissionDecision::Admit => {
+                    if let Some(mut e) = state.queued.remove(i) {
+                        state.active.insert(
+                            e.id,
+                            ActiveSlot {
+                                kind: e.kind,
+                                trigger_id: e.trigger_id.clone(),
+                                completion_tx: e.completion_tx.take(),
+                                chain_thread_id: e.thread_id,
+                                chain_depth: e.request.depth(),
+                            },
+                        );
+                        to_admit.push(e);
+                    }
+                }
+                _ => {
+                    if let Some(tid) = trigger_id {
+                        skipped.insert(tid);
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// User admission scan (drain phase 2). Admits user-initiated waiters
+    /// FIFO while the pool has a free slot. Returns the wake senders to fire
+    /// after the lock is released (each unblocks its waiting chat task).
+    fn drain_users(state: &mut QueueState) -> Vec<oneshot::Sender<()>> {
+        let mut woke = Vec::new();
+        while state.policy.user_can_admit(state.total_active()) {
+            let Some(waiter) = state.user_queued.pop_front() else {
+                break;
+            };
+            state.user_active.insert(
+                waiter.entry_id,
+                UserSlot {
+                    thread_id: waiter.thread_id,
+                    summary: waiter.summary,
+                    admitted_at: Utc::now(),
+                },
+            );
+            woke.push(waiter.wake);
+        }
+        woke
+    }
+
+    /// Force-admit a queued entry, ignoring every cap. User intent ("Run
+    /// now" in the Thread Queue panel) — `actor` stamps the admission.
+    pub async fn run_now(
+        self: &Arc<Self>,
+        entry_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), String> {
+        let mut entry = {
+            let mut state = self.state.lock().await;
+            let idx = state
+                .queued
+                .iter()
+                .position(|e| e.id == entry_id)
+                .ok_or_else(|| "entry is not queued (already running or gone)".to_string())?;
+            let mut entry = state
+                .queued
+                .remove(idx)
+                .expect("index verified by position()");
+            state.active.insert(
+                entry.id,
+                ActiveSlot {
+                    kind: entry.kind,
+                    trigger_id: entry.trigger_id.clone(),
+                    completion_tx: entry.completion_tx.take(),
+                    chain_thread_id: entry.thread_id,
+                    chain_depth: entry.request.depth(),
+                },
+            );
+            entry
+        };
+        self.prepare_entry(&mut entry.request).await;
+        self.emit_admitted(
+            entry.id,
+            entry.thread_id,
+            entry.trigger_id.clone(),
+            entry.request.depth(),
+            actor,
+        )
+        .await;
+        self.spawn_execution(entry);
+        Ok(())
+    }
+
+    /// Drop a queued entry without running it. User intent from the panel,
+    /// or internal cleanup (unparseable request at boot).
+    pub async fn drop_entry(
+        self: &Arc<Self>,
+        entry_id: Uuid,
+        reason: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), String> {
+        let mut entry = {
+            let mut state = self.state.lock().await;
+            let idx = state
+                .queued
+                .iter()
+                .position(|e| e.id == entry_id)
+                .ok_or_else(|| "entry is not queued (already running or gone)".to_string())?;
+            state
+                .queued
+                .remove(idx)
+                .expect("index verified by position()")
+        };
+        if let Some(tx) = entry.completion_tx.take() {
+            let _ = tx.send(());
+        }
+        self.emit_dropped(entry_id, reason, actor).await;
+        Ok(())
+    }
+
+    /// Release an admitted entry's capacity slot — its work finished (any
+    /// outcome). Resolves the submitter's completion handle and drains.
+    pub async fn complete(self: &Arc<Self>, entry_id: Uuid) {
+        let slot = {
+            let mut state = self.state.lock().await;
+            state.active.remove(&entry_id)
+        };
+        let Some(mut slot) = slot else {
+            return; // double-complete or unknown id — nothing to release
+        };
+        // The chain depth lasts as long as the work, not as long as the thread:
+        // a user who Continues this thread later starts a fresh chain at 0.
+        // Only THIS entry's binding goes, so a sibling entry on the same thread
+        // keeps its own.
+        if let Some(tid) = slot.chain_thread_id {
+            crate::scheduler::user_tasks::forget_chain_depth(tid, entry_id);
+        }
+        if let Some(tx) = slot.completion_tx.take() {
+            let _ = tx.send(());
+        }
+        // At the entry's depth, for the same reason it states its trigger: this
+        // frame closes that fire, and it goes out on the sibling task that
+        // joined the work rather than on the fire's own.
+        self.at_chain_depth(
+            slot.chain_depth,
+            self.bus.emit_or_log_as_trigger(
+                BusEvent::System(SystemEvent::ThreadQueueCompleted { entry_id }),
+                "[ThreadQueue] ThreadQueueCompleted",
+                slot.trigger_id.clone(),
+            ),
+        )
+        .await;
+        self.drain().await;
+    }
+
+    /// Bind the thread a trigger fire just created to its admitted entry.
+    ///
+    /// A cron / event-trigger entry has no thread at submit time: the fire
+    /// creates one only while it executes, so its `ThreadQueueAdmitted` went
+    /// out with a `None` thread id and the row stayed unbound. An unbound row
+    /// is what left [`Self::recover_persisted_entries`] unable to tell a fire
+    /// that already started from one that never did. It re-ran the whole
+    /// trigger after a restart. See
+    /// `docs/plans/2026-08-25-thread-queue-boot-handoff-for-trigger-fires.md`.
+    ///
+    /// Re-emitting `ThreadQueueAdmitted` is the carrier: the projection already
+    /// COALESCEs the id onto the row, holds the status at `admitted`, and keeps
+    /// the original `admitted_at`. Best-effort like every other queue emit, so
+    /// an entry already completed or dropped simply matches no row.
+    pub async fn record_entry_thread(&self, entry_id: Uuid, thread_id: Uuid) {
+        // A trigger fire's thread appears only now, so this is also where its
+        // chain depth gets bound. Everything the fire's thread emits from a
+        // task the executor's scope cannot reach resolves through that binding.
+        let (trigger_id, chain_depth) = {
+            let mut state = self.state.lock().await;
+            match state.active.get_mut(&entry_id) {
+                Some(slot) => {
+                    slot.chain_thread_id = Some(thread_id);
+                    crate::scheduler::user_tasks::register_chain_depth(
+                        thread_id,
+                        entry_id,
+                        slot.chain_depth,
+                    );
+                    (slot.trigger_id.clone(), slot.chain_depth)
+                }
+                None => (None, 0),
+            }
+        };
+        self.emit_admitted(entry_id, Some(thread_id), trigger_id, chain_depth, None)
+            .await;
+    }
+
+    /// Bind a thread's events to this work's chain depth, for the emits the
+    /// executor's task-local scope cannot reach (see
+    /// `scheduler::user_tasks::register_chain_depth`).
+    fn register_chain_thread(&self, entry_id: Uuid, thread_id: Option<Uuid>, depth: u32) {
+        if let Some(tid) = thread_id {
+            crate::scheduler::user_tasks::register_chain_depth(tid, entry_id, depth);
+        }
+    }
+
+    /// Run an emit at `depth`, for a queue frame that goes out on a task the
+    /// fire does not own.
+    ///
+    /// The same reasoning that makes those frames state their trigger owner
+    /// (`docs/adr/0137-a-trigger-never-wakes-itself.md`) applies to the depth.
+    /// `ThreadQueueCompleted` comes from the sibling task that joins the work,
+    /// so the ambient scope reads 0 there. Two triggers subscribed to it would
+    /// then wake each other at depth 1 forever, with nothing to end it.
+    async fn at_chain_depth<F: std::future::Future>(&self, depth: u32, fut: F) -> F::Output {
+        crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
+            .scope(depth, fut)
+            .await
+    }
+
+    // ---- User-initiated work (preempting, prioritized, counted) ----
+
+    /// Reserve a pool slot for a NEW user-initiated response (chat / user-typed
+    /// coding-agent thread). This is the **back-pressure gate**: user work is
+    /// **prioritized but not exempt** — it admits immediately when the pool has
+    /// a free slot, otherwise it joins the priority line and this call *awaits*
+    /// until a slot frees, so a person briefly waits only at true pool-max
+    /// (ADR 0008). In-memory only — never persisted.
+    ///
+    /// The gate seeds the slot; from there [`Self::reconcile_user_slot`] (driven
+    /// by the settle subscriber off `thread_summaries.status`) owns the slot's
+    /// lifetime — it removes it when the thread parks/idles/terminates and
+    /// re-adds it on resume — so the panel always mirrors real thread status.
+    /// The returned guard's drop is the BACKSTOP: it releases the gate's
+    /// reservation if the task dies before reconcile cleared it (normally a
+    /// no-op, since the terminal status event already reconciled the slot away).
+    ///
+    /// **The guard is built before the first `.await`, not at the end.** The
+    /// reservation lands in `user_queued` / `user_active` under the lock, and
+    /// everything after that is cancellable. An aborted caller drops this future
+    /// at `emit_changed` or at the wake. A reservation with no guard behind it
+    /// has nobody left to release it: the drainer admits the dead waiter, its
+    /// wake send fails into `let _ =`, and the slot is held for the life of the
+    /// process. Enough of those and every chat POST blocks on the pool. Owning
+    /// the reservation from the moment it exists is what releases it on cancel.
+    pub async fn acquire_user_slot(
+        self: &Arc<Self>,
+        thread_id: Option<Uuid>,
+        summary: String,
+    ) -> UserSlotGuard {
+        let entry_id = Uuid::new_v4();
+        let wait = {
+            let mut state = self.state.lock().await;
+            if state.policy.user_can_admit(state.total_active()) {
+                state.user_active.insert(
+                    entry_id,
+                    UserSlot {
+                        thread_id,
+                        summary,
+                        admitted_at: Utc::now(),
+                    },
+                );
+                None
+            } else {
+                let (tx, rx) = oneshot::channel();
+                state.user_queued.push_back(UserWaiter {
+                    entry_id,
+                    thread_id,
+                    summary,
+                    queued_at: Utc::now(),
+                    wake: tx,
+                });
+                Some(rx)
+            }
+        };
+        // Own the reservation before the first await, so cancelling anything
+        // below releases it instead of stranding it. See the doc comment.
+        let guard = UserSlotGuard {
+            queue: self.clone(),
+            entry_id,
+            thread_id,
+        };
+        // Panel: a new running (admitted) or waiting (queued) user entry.
+        self.emit_changed().await;
+        if let Some(rx) = wait {
+            // Block until the drainer admits us. A dropped sender (engine
+            // teardown) resolves Err — proceed; the slot dies with the process.
+            let _ = rx.await;
+        }
+        guard
+    }
+
+    /// Backstop release of the gate's reserved slot, keyed by the guard's
+    /// `entry_id` — fires from [`UserSlotGuard`]'s drop when the chat task ends.
+    /// Normally a no-op: [`Self::reconcile_user_slot`] already removed the slot
+    /// (by thread id) on the terminal status event. It still matters when the
+    /// task dies without a terminal status event (a reserved-but-never-started
+    /// thread, or broadcast lag), or to clear a still-**queued** waiter whose
+    /// task gave up before admission. Refreshes the panel and drains so the
+    /// freed slot admits waiting work.
+    ///
+    /// **It stays keyed by `entry_id` alone, and `parked_user_slots` is what
+    /// makes that sufficient.** `reconcile_user_slot` removes a parked thread's
+    /// slot and re-files it on resume; when it minted a fresh `Uuid` there, the
+    /// guard's `entry_id` matched nothing afterwards and this backstop could
+    /// never fire. Pair that with a settle missed on broadcast lag (the
+    /// subscriber skips reconcile for dropped events) and the slot leaked for
+    /// the life of the process, and enough leaks block every chat POST on the
+    /// pool. The resume now re-files under the parked key, so identity survives
+    /// the round trip and no by-thread fallback is needed. A fallback would be
+    /// worse than the leak it fixed: it releases whatever slot currently holds
+    /// the thread, which after a second gate for the same thread is the NEWER
+    /// request's slot, admitting queued work above the configured pool limit
+    /// with no status transition guaranteed to put it back.
+    ///
+    /// `thread_id` is taken only to drop this thread's parked key, so a guard
+    /// dropped while its thread is parked leaves nothing behind in the map.
+    async fn release_user_slot(self: &Arc<Self>, entry_id: Uuid, thread_id: Option<Uuid>) {
+        let removed = {
+            let mut state = self.state.lock().await;
+            if let Some(tid) = thread_id {
+                if state.parked_user_slots.get(&tid) == Some(&entry_id) {
+                    state.parked_user_slots.remove(&tid);
+                }
+            }
+            if state.user_active.remove(&entry_id).is_some() {
+                true
+            } else {
+                let before = state.user_queued.len();
+                state.user_queued.retain(|w| w.entry_id != entry_id);
+                state.user_queued.len() != before
+            }
+        };
+        if removed {
+            self.emit_changed().await;
+            self.drain().await;
+        }
+    }
+
+    /// Snapshot of in-memory user-initiated occupants for the panel API to
+    /// merge with the persisted background rows (admitted = Running, queued =
+    /// Queued).
+    pub async fn user_entries(&self) -> Vec<UserQueueEntry> {
+        let state = self.state.lock().await;
+        let mut out = Vec::with_capacity(state.user_active.len() + state.user_queued.len());
+        for (id, slot) in &state.user_active {
+            out.push(UserQueueEntry {
+                id: *id,
+                thread_id: slot.thread_id,
+                summary: slot.summary.clone(),
+                status: "admitted",
+                queued_at: slot.admitted_at,
+                admitted_at: Some(slot.admitted_at),
+            });
+        }
+        for w in &state.user_queued {
+            out.push(UserQueueEntry {
+                id: w.entry_id,
+                thread_id: w.thread_id,
+                summary: w.summary.clone(),
+                status: "queued",
+                queued_at: w.queued_at,
+                admitted_at: None,
+            });
+        }
+        out
+    }
+
+    /// The merged Thread Queue view — persisted background rows (FIFO by
+    /// `sequence`) followed by the in-memory user-initiated occupants
+    /// (`kind: "user-chat"`) — plus the active capacity policy. The SINGLE
+    /// source of truth shared by `GET /api/v1/thread-queue` and the
+    /// `list_thread_queue` LLM tool, so the panel and the tool can never
+    /// disagree about who occupies the pool (the divergence that let the tool
+    /// report an empty pool while the panel showed phantom user-chat rows).
+    pub async fn snapshot(&self) -> Result<ThreadQueueSnapshot, sqlx::Error> {
+        let mut entries: Vec<ThreadQueueEntryView> = sqlx::query_as(
+            "SELECT id, kind, trigger_id, trigger_name, thread_id, summary, status, queued_at, admitted_at \
+             FROM thread_queue ORDER BY sequence",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        // Merge the in-memory user-initiated occupants (never persisted rows).
+        for u in self.user_entries().await {
+            entries.push(ThreadQueueEntryView {
+                id: u.id,
+                kind: "user-chat".to_string(),
+                trigger_id: None,
+                trigger_name: None,
+                thread_id: u.thread_id,
+                summary: u.summary,
+                status: u.status.to_string(),
+                queued_at: u.queued_at,
+                admitted_at: u.admitted_at,
+            });
+        }
+        let policy = self.policy().await;
+        Ok(ThreadQueueSnapshot { entries, policy })
+    }
+
+    /// Converge the in-memory user-initiated pool for `thread_id` onto its
+    /// authoritative `thread_summaries.status` — the SINGLE place the user-half
+    /// of the pool moves in and out, so it can never drift from reality:
+    ///
+    /// - A user-initiated thread that is `running` occupies **exactly one**
+    ///   user slot (added here if missing).
+    /// - Anything else — idle, parked on the user (`waiting_for_user_answer`),
+    ///   failed, terminal, or any non-user / background thread — occupies
+    ///   **none** (removed here if present).
+    ///
+    /// Because it reads the real, just-committed status (the subscriber observes
+    /// events post-`tx.commit()`, post-projection) it is *direction-agnostic*:
+    /// it doesn't matter whether the triggering event was a park, a resume, or a
+    /// termination — reconcile reads where the thread actually landed and makes
+    /// the pool match. That is what fixes the whole family in one stroke: a
+    /// thread that parks on a question then resumes, a continuation respawn, and
+    /// a post-restart auto-resume all flip `status` back to `running`, so the
+    /// slot reappears with no per-path re-acquire wiring.
+    ///
+    /// Adding here is unconditional (no capacity wait): a thread that's already
+    /// `running` cannot be made to wait — back-pressure applies only to NEW work
+    /// via [`Self::acquire_user_slot`], which still gates the start. For NEW
+    /// work the gate has already inserted the slot, so the first reconcile is a
+    /// no-op. Idempotent; a cheap PK lookup that no-ops for every background
+    /// thread (`initiator != 'user'`) and every already-consistent thread.
+    pub async fn reconcile_user_slot(self: &Arc<Self>, thread_id: Uuid) {
+        let row: Option<(ThreadStatus, String, String)> = match sqlx::query_as(
+            "SELECT status, initiator, \
+                    COALESCE(NULLIF(title, ''), NULLIF(first_message, ''), '') \
+             FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(row) => row,
+            // Leave the pool UNCHANGED on a transient query error — don't read a
+            // failed status read as "not running" and yank a live thread's slot
+            // (that would drop it from the panel until the next status event).
+            // The next status event for the thread reconciles it correctly.
+            Err(e) => {
+                log!(
+                    "[ThreadQueue] reconcile_user_slot query failed for {}: {} — leaving pool unchanged",
+                    thread_id,
+                    e
+                );
+                return;
+            }
+        };
+        // Only user-initiated threads occupy a user slot; background spawns
+        // (initiator 'system'/'unknown') are tracked via the `thread_queue`
+        // projection, not here.
+        let should_occupy = matches!(
+            row.as_ref(),
+            Some((status, initiator, _)) if *status == ThreadStatus::Running && initiator == "user"
+        );
+
+        let (added, removed) = {
+            let mut state = self.state.lock().await;
+            let has_slot = state
+                .user_active
+                .values()
+                .any(|s| s.thread_id == Some(thread_id));
+            match (should_occupy, has_slot) {
+                (true, false) => {
+                    let summary = row
+                        .as_ref()
+                        .map(|(_, _, s)| truncate_summary(s.trim()))
+                        .unwrap_or_default();
+                    // Re-file under the key this thread's slot was parked at, so
+                    // the gate's `UserSlotGuard` can still release it. A fresh
+                    // `Uuid` here put the slot permanently out of the guard's
+                    // reach; see `parked_user_slots`. No parked key means this
+                    // resume has no live guard behind it, so a fresh one is
+                    // right and the reconcile removal below owns the slot.
+                    let entry_id = state
+                        .parked_user_slots
+                        .remove(&thread_id)
+                        .unwrap_or_else(Uuid::new_v4);
+                    state.user_active.insert(
+                        entry_id,
+                        UserSlot {
+                            thread_id: Some(thread_id),
+                            summary,
+                            admitted_at: Utc::now(),
+                        },
+                    );
+                    (true, false)
+                }
+                (false, true) => {
+                    if let Some(key) = state
+                        .user_active
+                        .iter()
+                        .find(|(_, s)| s.thread_id == Some(thread_id))
+                        .map(|(k, _)| *k)
+                    {
+                        state.parked_user_slots.insert(thread_id, key);
+                    }
+                    state
+                        .user_active
+                        .retain(|_, s| s.thread_id != Some(thread_id));
+                    (false, true)
+                }
+                // Already consistent (running with a slot, or not-running with
+                // none) — nothing to do.
+                _ => (false, false),
+            }
+        };
+        if added || removed {
+            self.emit_changed().await;
+        }
+        // Removal frees a slot — drain so waiting work takes it. An add only
+        // adds load (the thread is already running), so it needs no drain.
+        if removed {
+            self.drain().await;
+        }
+    }
+
+    /// Subscribe to the bus and keep the user-half of the pool in lockstep with
+    /// each thread's `thread_summaries.status` (see [`Self::reconcile_user_slot`]).
+    /// Spawned once at boot. Survives broadcast lag — a dropped event at worst
+    /// leaves a slot stale until the next status event for that thread (or the
+    /// gate guard's drop), so the consumer must never exit on `Lagged`.
+    pub fn spawn_settle_subscriber(self: &Arc<Self>) {
+        let mgr = self.clone();
+        let mut rx = self.bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(emitted) => {
+                        // Only persisted thread events have a committed status to
+                        // read; transient (seq == None) events never change it.
+                        if emitted.seq.is_none() {
+                            continue;
+                        }
+                        if let BusEvent::Thread {
+                            thread_id, event, ..
+                        } = &emitted.typed
+                        {
+                            if affects_user_running(event) {
+                                mgr.reconcile_user_slot(*thread_id).await;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log!(
+                            "[ThreadQueue] settle subscriber lagged by {} events — \
+                             user-slot reconcile skipped for those; continuing",
+                            n
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        log!("[ThreadQueue] settle subscriber channel closed — exiting");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Transient panel refresh after an in-memory-only change (a user slot
+    /// admitted / queued / released). Background changes already emit persisted
+    /// `ThreadQueue*` events; user slots don't, so this nudges the panel to
+    /// refetch and merge the in-memory user entries.
+    async fn emit_changed(&self) {
+        self.bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::ThreadQueueChanged {}),
+                "[ThreadQueue] ThreadQueueChanged",
+            )
+            .await;
+    }
+
+    /// Spawn an admitted entry's work and complete the slot when it resolves
+    /// — even on panic (the JoinHandle surfaces it), so a crashed executor
+    /// can never leak a capacity slot.
+    ///
+    /// **The spawn is where the chain used to end.** `EVENT_TRIGGER_DEPTH`
+    /// follows an await chain and not a `tokio::spawn`, so execution read 0
+    /// while the `prepare` beside it read the fire's depth. Re-establishing the
+    /// scope here, from the value the request carries, is what lets
+    /// the depth cap end a loop that passes through spawned work.
+    /// Work that spawns AGAIN inside itself is covered by the per-thread
+    /// registration below, not by this scope.
+    fn spawn_execution(self: &Arc<Self>, entry: QueueEntry) {
+        let entry_id = entry.id;
+        let Some(executor) = self.executor.get().cloned() else {
+            // No executor wired (engine still booting) — leave the slot
+            // admitted; the boot requeue sweep recovers it on next start.
+            log!(
+                "[ThreadQueue] No executor installed — entry {} stays admitted unexecuted",
+                entry_id
+            );
+            return;
+        };
+        let depth = entry.request.depth();
+        self.register_chain_thread(entry.id, entry.thread_id, depth);
+        let executable = ExecutableEntry {
+            id: entry.id,
+            request: entry.request,
+            cancel: entry.cancel,
+        };
+        let mgr = self.clone();
+        let work = tokio::spawn(
+            crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
+                .scope(depth, async move { executor.execute(executable).await }),
+        );
+        // Lives in the joiner, which outlasts the work whether it returns,
+        // fails or panics. A script trigger has no chat turn of its own.
+        let awake = crate::core::keep_awake::hold(
+            crate::core::keep_awake::Work::QueueEntry,
+            entry_id.to_string(),
+        );
+        tokio::spawn(async move {
+            let _awake = awake;
+            if let Err(join_err) = work.await {
+                if join_err.is_panic() {
+                    log!(
+                        "[ThreadQueue] Entry {} execution panicked: {:?}",
+                        entry_id,
+                        join_err
+                    );
+                }
+            }
+            mgr.complete(entry_id).await;
+        });
+    }
+
+    // ---- Startup recovery ----
+
+    /// Rebuild in-memory state from the `thread_queue` projection. Called at
+    /// boot BEFORE any submission path is live (scheduler not started), so
+    /// per-trigger FIFO holds across the restart:
+    ///
+    /// - `queued` rows load back into the in-memory queue (no re-emit).
+    /// - `admitted` rows are work the previous process had already started.
+    ///   One rule covers all four kinds: an entry whose `thread_id` names a
+    ///   live `thread_summaries` row completes here, and thread-level recovery
+    ///   (CC auto-resume / chat settle) owns it from there. An entry with no
+    ///   thread re-queues, because nothing ran.
+    ///
+    /// Draining starts separately via [`Self::start_draining`] once trigger
+    /// configs are loaded.
+    pub async fn recover_persisted_entries(self: &Arc<Self>) {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            kind: String,
+            trigger_id: Option<String>,
+            trigger_name: Option<String>,
+            thread_id: Option<Uuid>,
+            summary: String,
+            request: serde_json::Value,
+            status: String,
+            queued_at: DateTime<Utc>,
+        }
+        let rows: Vec<Row> = match sqlx::query_as(
+            "SELECT id, kind, trigger_id, trigger_name, thread_id, summary, request, status, queued_at \
+             FROM thread_queue ORDER BY sequence",
+        )
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log!("[ThreadQueue] recover_persisted_entries query failed: {}", e);
+                return;
+            }
+        };
+        if rows.is_empty() {
+            return;
+        }
+        log!(
+            "[ThreadQueue] Recovering {} persisted entr(ies) from thread_queue",
+            rows.len()
+        );
+
+        // Cron coalescing on recovery: rows arrive oldest-first (ORDER BY
+        // sequence). The first cron row of a trigger to go BACK IN THE QUEUE is
+        // kept. Any later one is a duplicate scheduled fire, so drop it and
+        // reboots stay cron-idempotent.
+        //
+        // A trigger enters this set only where an entry is actually pushed
+        // below, never on the handoff path. A handed-off fire already ran, so
+        // letting it consume the trigger's slot would drop a sibling row that
+        // never ran and still owes a run.
+        let mut seen_cron: HashSet<String> = HashSet::new();
+
+        for row in rows {
+            let request: ThreadQueueRequest = match serde_json::from_value(row.request) {
+                Ok(r) => r,
+                Err(e) => {
+                    log!(
+                        "[ThreadQueue] Entry {} has unparseable request ({}) — dropping",
+                        row.id,
+                        e
+                    );
+                    self.emit_dropped(row.id, "unparseable request after restart", None)
+                        .await;
+                    continue;
+                }
+            };
+            let kind = request.kind();
+            debug_assert_eq!(kind.as_str(), row.kind);
+
+            // Deliberately NOT re-registering the chain depth here. A row that
+            // hands off below completes without an in-memory slot, so nothing
+            // would ever clear the binding. It would outlive the work, and a
+            // later user Continue on that thread would inherit a chain it has
+            // nothing to do with. A row that RE-QUEUES needs no help: it
+            // registers when it is admitted. What survives the restart is the
+            // depth on the request, which is the half that has to.
+            //
+            // So work handed to thread recovery resumes at depth 0. That is
+            // safe because the resume is gated on cause (CLAUDE.md § Engine
+            // Statelessness): a crash leaves the manual Continue button, so a
+            // loop cannot restart itself into a fresh budget.
+            if kind == ThreadQueueKind::Cron {
+                if let Some(tid) = row.trigger_id.as_deref() {
+                    if seen_cron.contains(tid) {
+                        // A fire for this cron trigger is already back in the
+                        // queue, so this row is redundant. Emit
+                        // ThreadQueueDropped to clear its projection row; don't
+                        // reload it into memory.
+                        self.emit_dropped(
+                            row.id,
+                            "coalesced on recovery — duplicate scheduled fire",
+                            None,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            }
+
+            let requeue = if row.status == "queued" {
+                false // already queued — load silently, keep original queued_at
+            } else {
+                // An `admitted` row is work the dead process had already
+                // started. Whether re-running it would DUPLICATE that work
+                // turns on one question, the same for every kind: did a thread
+                // materialize? A spawn kind binds its thread at submit time,
+                // and a trigger fire binds one as soon as it mints one (see
+                // `record_entry_thread`). So the column answers for all four.
+                let thread_exists = match row.thread_id {
+                    Some(tid) => {
+                        match sqlx::query_scalar::<_, bool>(
+                            "SELECT EXISTS(SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
+                        )
+                        .bind(tid)
+                        .fetch_one(&self.pool)
+                        .await
+                        {
+                            Ok(exists) => exists,
+                            // A probe that could not run is UNKNOWN, so name the
+                            // side we fall to. Re-queuing risks a duplicate run
+                            // the user can see and stop. Handing off on a
+                            // transient read error abandons the fire in silence,
+                            // with nothing in the inbox to act on.
+                            Err(e) => {
+                                log!(
+                                    "[ThreadQueue] thread_summaries probe failed for entry {} (thread {}): {}, re-queuing",
+                                    row.id,
+                                    tid,
+                                    e
+                                );
+                                false
+                            }
+                        }
+                    }
+                    None => false,
+                };
+                if thread_exists {
+                    // The work happened, so thread-level recovery owns it. This
+                    // is the ONLY thing standing between a trigger fire that
+                    // parked on a question and a second identical run of it:
+                    // parking emits no terminal event, so nothing ever
+                    // completed the entry and the row is still `admitted`.
+                    log!(
+                        "[ThreadQueue] Entry {} ({}) already materialized thread {:?}, handing off to thread recovery",
+                        row.id,
+                        kind.as_str(),
+                        row.thread_id
+                    );
+                    self.bus
+                        .emit_or_log_as_trigger(
+                            BusEvent::System(SystemEvent::ThreadQueueCompleted {
+                                entry_id: row.id,
+                            }),
+                            "[ThreadQueue] ThreadQueueCompleted (boot handoff)",
+                            row.trigger_id.clone(),
+                        )
+                        .await;
+                    continue;
+                }
+                // No thread: the process died between admission and thread
+                // creation, so nothing ran and there is nothing to hand off
+                // to. Re-queue. This case is what keeps the guard above from
+                // being over-eager. It is also where a **script** trigger
+                // permanently lives, since a script fire creates no thread at
+                // all. Re-firing it is the existing crash contract.
+                true
+            };
+
+            let entry = QueueEntry {
+                id: row.id,
+                kind,
+                trigger_id: row.trigger_id,
+                trigger_name: row.trigger_name,
+                thread_id: row.thread_id,
+                summary: row.summary,
+                request,
+                queued_at: if requeue { Utc::now() } else { row.queued_at },
+                cancel: None,
+                completion_tx: None,
+            };
+            if requeue {
+                self.emit_queued(&entry, true, None).await;
+            }
+            if kind == ThreadQueueKind::Cron {
+                if let Some(tid) = entry.trigger_id.clone() {
+                    seen_cron.insert(tid);
+                }
+            }
+            self.state.lock().await.queued.push_back(entry);
+        }
+    }
+
+    /// Kick off the drain loop: an immediate drain (queued backlog from the
+    /// previous process), then the periodic safety-net drain + delay
+    /// notification check. Call AFTER the scheduler has replayed trigger
+    /// configs — drain consults them for pause/deletion.
+    pub fn start_draining(self: &Arc<Self>) {
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            loop {
+                mgr.drain().await;
+                let due = {
+                    let mut state = mgr.state.lock().await;
+                    mgr.delay_notifications_due(&mut state, Utc::now())
+                };
+                for (title, message) in due {
+                    mgr.notify(title, message).await;
+                }
+                tokio::time::sleep(DRAIN_INTERVAL).await;
+            }
+        });
+    }
+
+    /// One "significantly delayed" notification per trigger whose oldest
+    /// queued fire has waited [`DELAY_ALERT_WAIT`] or longer, subject to the
+    /// per-trigger cooldown. A paused trigger's fires wait for resume on
+    /// purpose, so it never alerts. Driven by the periodic drain loop.
+    fn delay_notifications_due(
+        &self,
+        state: &mut QueueState,
+        now: DateTime<Utc>,
+    ) -> Vec<(String, String)> {
+        let mut oldest: HashMap<String, (DateTime<Utc>, usize)> = HashMap::new();
+        for e in &state.queued {
+            if let Some(ref tid) = e.trigger_id {
+                let slot = oldest.entry(tid.clone()).or_insert((e.queued_at, 0));
+                slot.0 = slot.0.min(e.queued_at);
+                slot.1 += 1;
+            }
+        }
+        let mut due = Vec::new();
+        for (tid, (oldest_at, count)) in oldest {
+            let waited = (now - oldest_at).to_std().unwrap_or_default();
+            if waited < DELAY_ALERT_WAIT
+                || self.trigger_paused(&tid)
+                || !state.delay_cooldown_elapsed(&tid)
+            {
+                continue;
+            }
+            let label = self.trigger_name(&tid).unwrap_or_else(|| tid.clone());
+            due.push((
+                format!("{label} is significantly delayed"),
+                format!(
+                    "Trigger \"{label}\"'s oldest fire has waited {} min in the Thread \
+                     Queue ({count} waiting).",
+                    waited.as_secs() / 60
+                ),
+            ));
+        }
+        due
+    }
+
+    // ---- Event emission helpers ----
+
+    // An entry's three lifecycle frames state whose fire they belong to, taken
+    // from the entry itself. None of them can read it off the ambient scope.
+    // `ThreadQueued` runs before the fire, and `ThreadQueueCompleted` on the
+    // sibling task that joins it. A sub-thread the fire submits is submitted
+    // inline, so it would inherit a marker it must not have. See
+    // `EventBus::emit_as_trigger`.
+    //
+    // `ThreadQueueDropped` passes `None` on purpose. A dropped entry never
+    // fired, so it emitted nothing and there is no self-wake to suppress. The
+    // trigger should still hear that a fire of its was coalesced away.
+
+    async fn emit_queued(&self, entry: &QueueEntry, requeued: bool, actor: Option<MessageOrigin>) {
+        let request_json = match serde_json::to_value(&entry.request) {
+            Ok(v) => v,
+            Err(e) => {
+                log!("[ThreadQueue] request serialization failed: {}", e);
+                return;
+            }
+        };
+        let depth = entry.request.depth();
+        self.at_chain_depth(
+            depth,
+            self.bus.emit_or_log_as_trigger(
+                BusEvent::System(SystemEvent::ThreadQueued {
+                    entry_id: entry.id,
+                    kind: entry.kind,
+                    trigger_id: entry.trigger_id.clone(),
+                    trigger_name: entry.trigger_name.clone(),
+                    thread_id: entry.thread_id,
+                    summary: entry.summary.clone(),
+                    request: request_json,
+                    requeued,
+                    actor,
+                }),
+                "[ThreadQueue] ThreadQueued",
+                entry.trigger_id.clone(),
+            ),
+        )
+        .await;
+    }
+
+    async fn emit_admitted(
+        &self,
+        entry_id: Uuid,
+        thread_id: Option<Uuid>,
+        trigger_id: Option<String>,
+        depth: u32,
+        actor: Option<MessageOrigin>,
+    ) {
+        self.at_chain_depth(
+            depth,
+            self.bus.emit_or_log_as_trigger(
+                BusEvent::System(SystemEvent::ThreadQueueAdmitted {
+                    entry_id,
+                    thread_id,
+                    actor,
+                }),
+                "[ThreadQueue] ThreadQueueAdmitted",
+                trigger_id,
+            ),
+        )
+        .await;
+    }
+
+    async fn emit_dropped(&self, entry_id: Uuid, reason: &str, actor: Option<MessageOrigin>) {
+        self.bus
+            .emit_or_log_as_trigger(
+                BusEvent::System(SystemEvent::ThreadQueueDropped {
+                    entry_id,
+                    reason: reason.to_string(),
+                    actor,
+                }),
+                "[ThreadQueue] ThreadQueueDropped",
+                None,
+            )
+            .await;
+    }
+
+    /// Inbox notification + push fan-out for queue-health events. Push is
+    /// best-effort: in test fixtures no engine is attached, and the inbox
+    /// row (emitted through the bus) is the durable record either way.
+    async fn notify(&self, title: String, message: String) {
+        let id = Uuid::new_v4();
+        // Every Thread Queue notification is about queue state. The inbox row
+        // and the push both open the Thread Queue panel, where the backlog is.
+        let tap = crate::scheduler::notifications::Tap::Navigate {
+            to: Box::new(crate::scheduler::notifications::NavigateUi {
+                target: crate::scheduler::notifications::NavigateTarget::ThreadQueue,
+                ..Default::default()
+            }),
+        };
+        self.bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::NotificationCreated {
+                    id: id.to_string(),
+                    title: title.clone(),
+                    message: message.clone(),
+                    task_id: None,
+                    app_id: None,
+                    thread_id: None,
+                    event_id: None,
+                    tap: tap.clone(),
+                    actor: None,
+                }),
+                "[ThreadQueue] NotificationCreated",
+            )
+            .await;
+        if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
+            crate::scheduler::push::send_push_to_all_with_app(
+                &engine,
+                &title,
+                &message,
+                Some(id),
+                None,
+                None,
+                None,
+                tap,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "manager_tests.rs"]
+mod manager_tests;

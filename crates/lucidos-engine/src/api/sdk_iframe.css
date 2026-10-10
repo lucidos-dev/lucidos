@@ -1,0 +1,398 @@
+:root {
+    --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+    --font-ui: var(--font-mono);
+    /* TEMPORARY MEASURE — model-tolerance (removable — see
+       docs/temporary-measures.md § Model-tolerance measures, governed by
+       .claude/rules/temporary-measures.md). `--font-ui` is the canonical token
+       for the user's UI font (set live by sdk-prefs.js / applyPreferences), but
+       app-building agents overwhelmingly reach for `--font-family` (it mirrors
+       the CSS property) or the `--font` shorthand. An undefined `var()` silently
+       falls back to the app's hardcoded stack, so the wrong guess shipped the
+       system font instead of the user's choice — with no error. Aliasing the two
+       most-guessed names to the one source of truth makes the intuitive guess
+       just work; drop it once agents reliably emit `--font-ui`. IFRAME-ONLY:
+       host code uses --font-ui directly, so these don't belong in base.css. */
+    --font-family: var(--font-ui);
+    --font: var(--font-ui);
+    --space-xs: 0.25rem;
+    --space-sm: 0.5rem;
+    --space-md: 0.75rem;
+    --space-lg: 1rem;
+    --space-xl: 1.5rem;
+    --radius-sm: 0.25rem;
+    --radius-md: 0.375rem;
+    --radius-lg: 0.5rem;
+    /* The theme's corner steps, which shared-components.css reads. Keep in sync
+       with base.css. */
+    --radius-control: 0.5rem;
+    --radius-surface: 0.75rem;
+    --radius-round: 999px;
+    --transition: 0.15s ease;
+
+    /* Z-index for the shared #tooltip rules appended from shared-components.css.
+       Mirrors base.css, whose wider scale the iframe has no use for. Keep in
+       sync with base.css. It must also clear .lucidos-select-menu (1000). */
+    --z-tooltip: 10000;
+
+    /* Transition durations — mirror base.css so the shared component classes
+       below animate identically to the host. Keep in sync with base.css.
+
+       Same calc() form as the host so the two files stay literally in sync, but
+       --duration-scale is pinned to 1 here, bar reduced motion below: it carries the
+       host's diagnostic Animation speed slider, which an iframe cannot see. The
+       host publishes it as an inline style on ITS OWN :root, and a custom
+       property does not cross a document boundary, so an app always animates at
+       1x. That is deliberate: the slider is a host debugging aid for inspecting
+       host transitions, not a preference apps are expected to honour. */
+    --duration-scale: 1;
+    --duration-fast: calc(0.15s * var(--duration-scale));
+    --duration-normal: calc(0.2s * var(--duration-scale));
+    --duration-slow: calc(0.3s * var(--duration-scale));
+    --duration-emphasis: calc(0.5s * var(--duration-scale));
+
+    /* Icon sizes (used by .icon-btn variants). Keep in sync with base.css. */
+    --icon-size-sm: 0.875rem;
+    --icon-size-md: 1rem;
+    --icon-size-lg: 1.25rem;
+
+    /* The ring weight of the shared .mini-spinner. Keep in sync with base.css. */
+    --spinner-weight: 0.125rem;
+
+    /* Type scale — the sanctioned font sizes. The appended shared-components.css
+       references var(--font-size-*), and app iframes never load base.css, so
+       these MUST be defined here. Keep in sync with base.css. */
+    --font-size-3xs: 0.5625rem;   /* 9px — micro-label / tiny badge */
+    --font-size-2xs: 0.625rem;    /* 10px */
+    --font-size-xs: 0.6875rem;    /* 11px */
+    --font-size-sm: 0.75rem;      /* 12px */
+    --font-size-md: 0.8125rem;    /* 13px */
+    --font-size-lg: 0.875rem;     /* 14px */
+    --font-size-xl: 1rem;         /* 16px */
+    --font-size-2xl: 1.125rem;    /* 18px */
+    --font-size-3xl: 1.25rem;     /* 20px */
+    --font-size-display: 2.25rem; /* 36px */
+
+    /* Brand blue — the icon-mark identity color. Theme-independent; feeds
+       --accent-action (the filled-button blue) per theme below. Keep in sync
+       with base.css. */
+    --brand-blue: #1a6fd0;
+    --brand-blue-deep: #0a4ea8;
+
+    /* Focus ring shared by the component classes below (.action-btn, .icon-btn).
+       `--accent` is resolved per theme at use time. Keep in sync with base.css,
+       ring width included: a clipping box reserves --focus-ring-width. */
+    --focus-ring-width: 0.1875rem;
+    --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* Reduced motion collapses every tokenized transition, as it does in the host,
+   so the shared components stand still in an app too. The value is the SDK's
+   REDUCED_MOTION_DURATION_SCALE: small enough to end inside one frame, and
+   never 0, so a `transitionend` still fires. */
+:root[data-motion="reduce"] {
+    --duration-scale: 0.001;
+}
+
+/* Dark theme (default) */
+html, html[data-theme-mode="dark"] {
+    color-scheme: dark;
+    /* Very dark blue (logo hue) — mirror of base.css dark ladder so app
+       iframes share the parent's surfaces. Keep in sync with base.css. */
+    --bg-primary: #07172e;
+    --bg-secondary: #0d2244;
+    --bg-tertiary: #163052;
+    --bg-quaternary: #21406c;
+    --border-color: #2c456a;
+    --bg-hover: #122a4a;
+    --bg-selected: #163356;
+    /* Surfaces: every toast, popover, menu and dialog (styles/global/surface.css).
+       Keep in sync with base.css. */
+    --surface-bg: var(--bg-secondary);
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-muted: #6e7681;
+    --text-on-accent: #fff;
+    /* Bold text where the UI font has no bold face. Keep in sync with base.css. */
+    --text-strong: color-mix(in oklab, var(--text-primary) 60%, white);
+    --accent: #58a6ff;
+    --accent-light: #7ab8ff;
+    /* Action-button blue — the filled-CTA color, lifted off the brand blue
+       toward --accent. Keep in sync with base.css. */
+    --accent-action: color-mix(in srgb, var(--brand-blue) 82%, var(--accent));
+    --accent-green: #3fb950;
+    /* Caution. Muted sand, not a saturated gold — the previous #d29922 read as
+       brown on the navy theme. Keep in sync with base.css. (The host also has
+       --accent-notable for neutral "notable state" markers; it is deliberately
+       NOT served to apps, so don't reference it from shared-components.css.) */
+    --accent-yellow: #d9c48f;
+    --accent-red: #f85149;
+    --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+/* Light theme */
+html[data-theme-mode="light"] {
+    color-scheme: light;
+    --bg-primary: #ffffff;
+    --bg-secondary: #f6f8fa;
+    --bg-tertiary: #e1e4e8;
+    --bg-quaternary: #d0d7de;
+    --border-color: #d0d7de;
+    --bg-hover: #eaeef2;
+    --bg-selected: #eff2f5;
+    /* Elevation runs toward white here, so a floating surface sits on the
+       brightest fill. Keep in sync with base.css. */
+    --surface-bg: var(--bg-primary);
+    --text-primary: #1f2328;
+    --text-secondary: #656d76;
+    --text-muted: #8b949e;
+    --text-on-accent: #fff;
+    --text-strong: color-mix(in oklab, var(--text-primary) 60%, black);
+    --accent: #0969da;
+    --accent-light: #218bff;
+    /* Light mode anchors the filled CTA on the brand blue. Keep in sync with
+       base.css. */
+    --accent-action: var(--brand-blue);
+    --accent-green: #1a7f37;
+    /* Caution — light-mode sand, darkened to clear AA on white. Keep in sync
+       with base.css. */
+    --accent-yellow: #8a6d2f;
+    --accent-red: #cf222e;
+    --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.08);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.1);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.1);
+}
+
+html {
+    font-size: var(--user-ui-scale, 100%);
+}
+
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    /* The chat prose step, so text an app doesn't size explicitly reads at the
+       size of the chat beside it (ADR 0319). Controls keep `md`, as in the host.
+       It is a `rem`, so it still tracks the user's UI-scale preference through
+       the root font-size above. Without it, unstyled app text falls to the raw
+       root (`1rem`), a size nothing in the host renders body text at. */
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+}
+
+/* A minimal widget window draws the widget alone (ADR 0419). The page is
+   see-through, so the widget's own drawing is its shape, and the body takes
+   its content's width, which the SDK reports so the window fits it. */
+html[data-widget-mode="minimal"],
+html[data-widget-mode="minimal"] body {
+    background: transparent;
+}
+
+html[data-widget-mode="minimal"] body {
+    width: max-content;
+    max-width: 100%;
+}
+
+/* A shared row title names no size and inherits the body's. The host body is
+   `md`, so the row keeps the host's UI step here rather than the prose step.
+   On the container, so a `.title list-row-name` still wins with its own. */
+.list-row-info {
+    font-size: var(--font-size-md);
+}
+
+/* Programming ligatures belong to CODE, never to prose. sdk-prefs.js
+   (api/sdk_prefs.rs) and applyPreferences (packages/lucidos-sdk/src/ui.ts)
+   publish two values on <html>: --font-features-text and --font-features-code.
+   For a font with programming ligatures (`ligatures` in the font catalog) they
+   are '"liga" 0, "calt" 0' and '"liga" 1, "calt" 1'; for every other font both
+   are `normal`. These two rules are their ONLY consumers
+   in an app iframe, mirroring the host's rules in styles/global/base.css.
+
+   Fira Code's `calt` re-spaces dot runs, so a typed `...` reads as two dots
+   (tonsky/FiraCode#1561, open upstream, no way to disable a single sequence).
+   Two traps, both established by pixel comparison rather than by reading the
+   computed value, which shows neither: `normal` is NOT off (liga and calt are
+   default-ON, so `normal` renders identically to `1`), and form controls do not
+   inherit this property (the UA `font` shorthand resets it), so they are named
+   explicitly. See preferences.ts in the host for the full write-up. */
+html,
+input,
+textarea,
+select,
+button {
+    font-feature-settings: var(--font-features-text, normal);
+}
+
+code,
+pre,
+kbd,
+samp {
+    font-feature-settings: var(--font-features-code, normal);
+}
+
+a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+@media (hover: hover) {
+    a:hover {
+        text-decoration: underline;
+    }
+}
+
+input, textarea, select {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    padding: var(--space-sm) var(--space-md);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    outline: none;
+    transition: border-color var(--transition);
+}
+
+input:focus, textarea:focus, select:focus {
+    border-color: var(--accent);
+}
+
+button {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    padding: var(--space-sm) var(--space-lg);
+    /* Named for the same reason `input, textarea, select` above name it: the UA
+       `font` shorthand on a control resets the family, so a button inherits
+       nothing from `body`. Without this an app's buttons painted in the system
+       UI face while its inputs painted in --font-ui, inside the same app. */
+    font-family: var(--font-ui);
+    font-size: var(--font-size-md);
+    cursor: pointer;
+    transition: background var(--transition), border-color var(--transition);
+}
+
+/* Gated: on touch an ungated hover latches onto the last button tapped and
+   paints it grey, so an unpicked control reads as disabled. */
+@media (hover: hover) {
+    button:hover {
+        background: var(--border-color);
+        border-color: var(--text-muted);
+    }
+}
+
+/* Themed dropdown — lucidos.ui.Select (replaces native <select> popup).
+   select.ts renders the host's own `.dropdown-trigger` / `.dropdown-option`
+   classes (shared-components.css) and `.surface-box` (surface.css) for the
+   menu's box, so the look has one source with the host's own dropdown and
+   nothing to keep in sync. See
+   docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md. What stays here is
+   only what those classes do not cover: the control's own non-portaled
+   positioning and its open/closed toggle. */
+.lucidos-select {
+    position: relative;
+    display: inline-block;
+    font-family: var(--font-ui);
+    text-align: left;
+}
+
+/* The host's trigger sizes to its content via `.dropdown-sizer`; Select has
+   no such trick, so it fills its container instead. */
+.lucidos-select-trigger {
+    width: 100%;
+}
+
+.lucidos-select-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Not portaled, so it stays in normal flow under the trigger: the host's
+   `.dropdown-menu` default (before `Dropdown.tsx`'s own portal/fixed
+   override) is this same absolute/top/left/min-width shape, but that rule
+   lives in host-components.css and never reaches an app frame, so the
+   position is restated here rather than shared with nothing to share it. */
+.lucidos-select-menu {
+    display: none;
+    position: absolute;
+    top: calc(100% + 0.25rem);
+    left: 0;
+    min-width: 100%;
+    max-height: 18.75rem;
+    overflow-y: auto;
+    z-index: 1000;
+}
+
+.lucidos-select[data-state="open"] > .lucidos-select-menu {
+    display: block;
+}
+
+/* No host equivalent: the host's nearest concept, `.dropdown-option-header`,
+   is a non-selectable section heading, not a disabled-but-present option. */
+.lucidos-select-option.disabled {
+    color: var(--text-muted);
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+.lucidos-select-option.disabled.focused {
+    background: transparent;
+}
+
+@media (hover: hover) {
+    .lucidos-select-option.disabled:hover {
+        background: transparent;
+    }
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+    width: 0.375rem;
+    height: 0.375rem;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border-color);
+    border-radius: 0.1875rem;
+}
+
+@media (hover: hover) {
+    ::-webkit-scrollbar-thumb:hover {
+        background: var(--text-muted);
+    }
+}
+
+/* Find in app: every match, and the current one, as the host's find bar
+   steps through them (packages/lucidos-sdk/src/find.ts). The SDK reads
+   `--find-highlights` to know these rules are here. An app without this
+   stylesheet gets the current match as its selection instead. */
+:root {
+    --find-highlights: styled;
+}
+
+::highlight(lucidos-find) {
+    background-color: color-mix(in srgb, var(--accent-yellow) 45%, transparent);
+}
+
+::highlight(lucidos-find-current) {
+    background-color: var(--accent);
+    color: var(--text-on-accent);
+}

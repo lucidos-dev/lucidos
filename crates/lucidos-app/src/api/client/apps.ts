@@ -1,0 +1,345 @@
+import { API, API_BASE, json, mutatingFetch, retryTransientRead, throwIfNotOk, throwIfRefused } from './_core';
+import { readDeviceId } from '../../utils/deviceIdHeader';
+import { lucidos, WIDGET_PARAMS_QUERY } from '@lucidos/sdk';
+import { canonicalWidgetParams, hasWidgetParams, type WidgetParams } from '../../utils/widgetParams';
+import type { App, PinnedAppEntry } from '../../store/types';
+import type { ApiResult, ArtifactsResponse, UploadResponse } from '../types';
+
+// --- Workspaces ---
+export interface WorkspaceInfo {
+  name: string;
+  path: string;
+  port: number | null;
+  engine_running: boolean;
+  engine_version: string;
+}
+
+export async function fetchWorkspaces(): Promise<{ workspaces: WorkspaceInfo[] }> {
+  return json(`${API}/workspaces`);
+}
+
+// --- Artifacts (SDK delegation) ---
+export function listArtifacts(): Promise<ArtifactsResponse> {
+  return lucidos.data.list().then(files => ({
+    artifacts: files,
+  })) as Promise<ArtifactsResponse>;
+}
+
+export function uploadFile(file: File): Promise<UploadResponse> {
+  return lucidos.data.upload(file) as Promise<UploadResponse>;
+}
+
+// --- Plugins ---
+export interface PluginArchiveUploadResponse {
+  path: string;
+  filename: string;
+  byte_size: number;
+}
+
+/** Upload a `.lucidos-plugin` archive to a per-request temp directory inside
+ *  the workspace. Returns the absolute filesystem path the LLM tool
+ *  `install_plugin` can consume. The chat layer then sends a message asking
+ *  the LLM to install from that path. */
+export async function uploadPluginArchive(file: File): Promise<PluginArchiveUploadResponse> {
+  const fd = new FormData();
+  fd.append('file', file, file.name);
+  const res = await mutatingFetch(`${API}/plugins/upload-archive`, {
+    method: 'POST',
+    body: fd,
+  });
+  await throwIfNotOk(res);
+  return res.json();
+}
+
+export interface PluginLocalChangesResult {
+  /** Paths whose local edit was merged into the new version. */
+  merged: string[];
+  /** Paths where the edit and upstream's touched the same lines. */
+  conflicted: string[];
+  /** Paths replaced outright: a trigger definition, a binary, or the keep
+   *  control switched off. Each has a copy in `saved_paths`. */
+  replaced: string[];
+  /** Paths the user had deleted that upstream still ships, so they came back.
+   *  These have no saved copy: a deletion has no content to keep. */
+  restored: string[];
+  /** `data/`-relative copies of every edit the update discarded. */
+  saved_paths: string[];
+}
+
+export interface PluginConfirmInstallResponse {
+  summary: string;
+  installed_files: string[];
+  /** Set when the plugin shipped `setup` instructions: the Lucidos Agent thread
+   *  spawned to walk the user through them. The frontend navigates here. */
+  setup_thread_id?: string;
+  /** What the install did to files the user had locally edited. Absent when it
+   *  met none, which is every fresh install. */
+  local_changes?: PluginLocalChangesResult;
+}
+
+/** User accepted the staged install in the install panel. The engine writes
+ *  files into `data/`, emits `PluginInstalled`, and (if any `auth-modules/`
+ *  files were touched) auto-reloads the WASM signer map.
+ *
+ *  `keepLocalChanges` is the panel's keep control. True merges the user's local
+ *  edits into the new version; false takes a clean upstream copy and saves
+ *  those edits aside. Omitting the flag means keep, so a caller that never
+ *  showed the control cannot silently discard a patch. */
+export async function confirmPluginInstall(
+  installId: string,
+  keepLocalChanges = true,
+): Promise<PluginConfirmInstallResponse> {
+  const res = await mutatingFetch(
+    `${API}/plugins/install/${encodeURIComponent(installId)}/confirm`
+      + `?keep_local_changes=${keepLocalChanges}`,
+    { method: 'POST' },
+  );
+  await throwIfNotOk(res);
+  return res.json();
+}
+
+export interface PluginProposeUpstreamResponse {
+  /** `data/`-relative path of the generated patch. */
+  patch_path: string;
+  /** The thread that will take the patch to the plugin's author. */
+  thread_id: string;
+}
+
+/** Offer the user's local patch to the plugin's author. The engine derives the
+ *  diff, writes it under `data/artifacts/`, and spawns a thread to take it from
+ *  there. It performs no GitHub operation itself. */
+export async function proposePluginUpstream(
+  id: string,
+): Promise<PluginProposeUpstreamResponse> {
+  const res = await mutatingFetch(`${API}/plugins/propose-upstream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id }),
+  });
+  await throwIfNotOk(res);
+  return res.json();
+}
+
+/** User dismissed the staged install. The engine drops the staged temp dir
+ *  and emits `PluginInstallCanceled` for audit. */
+export async function cancelPluginInstall(installId: string): Promise<void> {
+  const res = await mutatingFetch(
+    `${API}/plugins/install/${encodeURIComponent(installId)}/cancel`,
+    { method: 'POST' },
+  );
+  await throwIfNotOk(res);
+}
+
+export interface PluginConfirmUninstallResponse {
+  summary: string;
+  files_deleted: string[];
+  files_missing: string[];
+}
+
+/** User accepted the staged uninstall in the panel. The engine deletes the
+ *  recorded files from `data/`, prunes empty parent dirs, emits
+ *  `PluginUninstalled` with the deleted/missing partition, and (if any
+ *  `auth-modules/` files were removed) reloads the WASM signer map. */
+export async function confirmPluginUninstall(uninstallId: string): Promise<PluginConfirmUninstallResponse> {
+  const res = await mutatingFetch(
+    `${API}/plugins/uninstall/${encodeURIComponent(uninstallId)}/confirm`,
+    { method: 'POST' },
+  );
+  await throwIfNotOk(res);
+  return res.json();
+}
+
+/** User dismissed the staged uninstall. No files touched; emits
+ *  `PluginUninstallCanceled` for audit. */
+export async function cancelPluginUninstall(uninstallId: string): Promise<void> {
+  const res = await mutatingFetch(
+    `${API}/plugins/uninstall/${encodeURIComponent(uninstallId)}/cancel`,
+    { method: 'POST' },
+  );
+  await throwIfNotOk(res);
+}
+
+// --- Apps (SDK delegation) ---
+export function listAppsApi(): Promise<App[]> {
+  return lucidos.apps.list() as Promise<App[]>;
+}
+
+export function deleteAppApi(
+  id: string
+): Promise<{ commit: string }> {
+  return json(`${API}/app?id=${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+/** Record that the user opened an app's UI: the evidence the workspace prompt
+ *  footprint judges an app's use by (ADR 0413). */
+export async function recordAppOpenedApi(id: string): Promise<void> {
+  const res = await mutatingFetch(`${API}/app/opened?id=${encodeURIComponent(id)}`, {
+    method: 'POST',
+  });
+  await throwIfNotOk(res);
+}
+
+export function updateAppApi(
+  id: string,
+  data: { name: string; description: string; instructions?: string }
+): Promise<{ commit: string }> {
+  return json(`${API}/app?id=${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+}
+
+export interface UiSourceFile {
+  name: string;
+  content: string;
+}
+
+export function readAppSourceApi(
+  appId: string,
+): Promise<{ files: UiSourceFile[] }> {
+  return json(
+    `${API}/app/${encodeURIComponent(appId)}/source`
+  );
+}
+
+export function writeAppSourceApi(
+  appId: string,
+  files: UiSourceFile[]
+): Promise<{ commit: string }> {
+  return json(
+    `${API}/app/${encodeURIComponent(appId)}/source`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files }),
+    }
+  );
+}
+
+/** The iframe src for an app, optionally previewing a thread's worktree and
+ *  optionally targeting a place inside the app.
+ *
+ *  The target is a FRAGMENT rather than a query parameter, and that is not a
+ *  style choice: the engine's WIP-preview branch rebuilds the query and keeps
+ *  only `thread_id`, so a query parameter would be dropped on the way in. The
+ *  fragment goes last, after the query, as a URL requires. */
+export function appUrl(
+  appId: string,
+  threadId?: string,
+  fragment?: string,
+  widgetParams?: WidgetParams,
+): string {
+  const base = `${API_BASE}/app/${encodeURIComponent(appId)}/`;
+  const params = new URLSearchParams();
+  // `thread_id` triggers the engine's WIP-preview branch (see
+  // `api/apps.rs::serve_app_ui`) — content comes from the open
+  // coding-agent thread's worktree instead of the live workspace data.
+  if (threadId) params.set('thread_id', threadId);
+  // `device` is whose appearance the app's first paint should carry. The engine
+  // stamps it onto the app's own `sdk-prefs.js` reference, and that script then
+  // resolves this device's theme, font and scale. An isolated app frame cannot
+  // read them out of the shell's storage the way a same-origin one could.
+  const deviceId = readDeviceId();
+  if (deviceId) params.set('device', deviceId);
+  // A widget's params ride one key the SDK owns, so they never meet a host
+  // name (ADR 0415). Canonical, so one instance always has one URL.
+  if (hasWidgetParams(widgetParams)) params.set(WIDGET_PARAMS_QUERY, canonicalWidgetParams(widgetParams));
+  const query = params.toString();
+  const withQuery = query ? `${base}?${query}` : base;
+  return fragment ? `${withQuery}#${fragment}` : withQuery;
+}
+
+/** The URL of a file inside an app folder, such as its app icon. `path` is
+ *  relative to the folder, and each segment is encoded on its own. */
+export function appFileUrl(appId: string, path: string): string {
+  const segments = path.split('/').map(encodeURIComponent).join('/');
+  return `${API_BASE}/app/${encodeURIComponent(appId)}/${segments}`;
+}
+
+// --- App Capture ---
+/** Answer a capture request. The body names this page's device the way a chat
+ *  send does, so the engine checks the answer against the device the turn
+ *  recorded. */
+export async function postAppCapture(
+  requestId: string,
+  screenshot: string,
+  dom: string,
+): Promise<void> {
+  const resp = await mutatingFetch(`${API}/app-capture`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ request_id: requestId, device_id: readDeviceId(), screenshot, dom }),
+  });
+  await throwIfNotOk(resp);
+}
+
+// --- Pinned Apps ---
+export function getPinnedAppUis(deviceId: string): Promise<{ entries: PinnedAppEntry[] }> {
+  return json(`${API}/pinned-apps?device_id=${encodeURIComponent(deviceId)}`);
+}
+
+/** Pin an app for a device. A refusal THROWS: the engine answers a failed pin
+ *  with `200 {success: false}`, and `pinApp` reverts its optimistic pin only on
+ *  a rejection. */
+export async function pinAppApi(appId: string, deviceId: string): Promise<ApiResult> {
+  const result = await json<ApiResult>(`${API}/pinned-apps`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: appId, device_id: deviceId }),
+  });
+  return throwIfRefused(result, `the engine refused to pin "${appId}"`);
+}
+
+/** Unpin an app for a device. A refusal THROWS, as `pinAppApi` explains. */
+export async function unpinAppApi(appId: string, deviceId: string): Promise<ApiResult> {
+  const result = await json<ApiResult>(`${API}/pinned-apps`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: appId, device_id: deviceId }),
+  });
+  return throwIfRefused(result, `the engine refused to unpin "${appId}"`);
+}
+
+// --- Events ---
+
+/** The trigger event-type picker's only source of names.
+ *
+ *  Retried once on a transport failure. The picker caches the verdict, so one
+ *  dropped fetch would otherwise render "Failed to load event types". A 4xx or
+ *  5xx is a real verdict and is not retried. */
+export function fetchEventTypes(): Promise<string[]> {
+  return retryTransientRead(() => json(`${API}/events/types`));
+}
+
+// --- Knowhow ---
+export interface KnowhowEntry {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/** Process-wide cache for the knowhow list. Its one consumer, the file-preview
+ *  404 hint, refetches on every mount, so the cache is what keeps reopening a
+ *  preview off the endpoint. It holds the in-flight promise, so concurrent
+ *  first-callers share the request, and a rejection clears it so the next
+ *  caller retries. Nothing invalidates it: a knowhow file added this session is
+ *  missing from the hint until the page reloads. */
+let knowhowEntriesCache: Promise<KnowhowEntry[]> | null = null;
+
+export function fetchKnowhowEntries(): Promise<KnowhowEntry[]> {
+  if (!knowhowEntriesCache) {
+    knowhowEntriesCache = json<{ knowhow: KnowhowEntry[] }>(`${API}/knowhow`)
+      .then(r => r.knowhow)
+      .catch(e => { knowhowEntriesCache = null; throw e; });
+  }
+  return knowhowEntriesCache;
+}
+
+/** `system-knowhow/` ids are already rooted (engine-shipped); bare ids root
+ *  under `data/knowhow/`. */
+export function knowhowPreviewPath(id: string): string {
+  return id.startsWith('system-knowhow/') ? `${id}.md` : `knowhow/${id}.md`;
+}

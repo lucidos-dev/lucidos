@@ -1,0 +1,7 @@
+{
+  "name": "Text glow only",
+  "description": "Browser test fixture: a theme written before parts, with --text-glow alone.",
+  "tokens": {
+    "--text-glow": "0 0 0.25rem rgba(51, 255, 51, 0.55)"
+  }
+}

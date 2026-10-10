@@ -1,0 +1,488 @@
+/* --- Widgets (ADRs 0402, 0407) ---
+   A widget is a card at the turn that showed it (.widget-card-inline), and a
+   chip on the thread's widget shelf once pinned. A chip tap drops the widget
+   open under the title (.widget-shelf-drop). The inline frame never scrolls,
+   so no scroller sits inside the transcript's own. */
+
+/* A chip never squeezes the title. On desktop the shelf sits beside the title
+   when the row has room and wraps under it when not. On the phone it always
+   takes its own line. Each row sets its own row gap. */
+.thread-view-header,
+.mobile-thread-title-row {
+    flex-wrap: wrap;
+}
+
+.mobile-thread-title-row .widget-shelf {
+    flex-basis: 100%;
+}
+
+.widget-shelf {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    min-width: 0;
+    flex: 0 1 auto;
+    overflow-x: auto;
+    scrollbar-width: none;
+    /* Ring room: the scroll box clips, so it pads the chips' focus ring in
+       and hands the space back. The chips stay centred on the title's first
+       line. */
+    padding: var(--focus-ring-width);
+    margin: calc(0.125rem - var(--focus-ring-width)) calc(-1 * var(--focus-ring-width));
+}
+
+.widget-shelf::-webkit-scrollbar {
+    display: none;
+}
+
+.widget-chip {
+    --app-icon-size: 1.125rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    flex-shrink: 0;
+    padding: 0.1875rem 0.625rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-round);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    white-space: nowrap;
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
+    transition: border-color var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+
+.widget-chip-name {
+    min-width: 0;
+    max-width: 14rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* The chip is the neutral surface already, so the image needs no ring. */
+.widget-chip .app-icon-image {
+    border: none;
+}
+
+/* A shelf too narrow for every label shows icons only, each chip keeping its
+   pill. The name stays the tooltip and the accessible name (invariant I16). */
+.widget-shelf.is-tight .widget-chip {
+    padding: 0.1875rem;
+}
+
+.widget-shelf.is-tight .widget-chip-name {
+    display: none;
+}
+
+.widget-chip.is-open {
+    border-color: var(--accent);
+    color: var(--text-primary);
+}
+
+.widget-chip:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+@media (hover: hover) {
+    .widget-chip:hover {
+        color: var(--text-primary);
+        border-color: var(--accent);
+    }
+}
+
+/* The dropped open widget: an anchored overlay under the title row, the
+   row's own width. Its card carries the surface. */
+.widget-shelf-drop {
+    z-index: var(--z-float);
+    padding: 0 var(--space-sm);
+}
+
+.widget-shelf-drop .widget-card {
+    margin: 0.25rem 0 0;
+    background: var(--bg-primary);
+    box-shadow: var(--shadow-md);
+}
+
+.widget-card {
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
+    background: var(--bg-secondary);
+    overflow: hidden;
+}
+
+.widget-card-inline {
+    margin: var(--space-sm) 0;
+}
+
+/* About one phone screen. A taller widget is cut here, never scrolled: the
+   clip has no scrollbar, so a swipe over the card moves the transcript. */
+.widget-card-clip {
+    position: relative;
+    max-height: min(70dvh, 36rem);
+    overflow: hidden;
+}
+
+/* Over the clipped edge: the widget dissolves into the card, and Expand opens
+   it in full. Only the button takes a tap; the rest reaches the widget. */
+.widget-card-fade {
+    position: absolute;
+    inset: auto 0 0;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    min-height: 4rem;
+    padding: var(--space-sm);
+    background: linear-gradient(to bottom, transparent, var(--bg-secondary));
+    pointer-events: none;
+}
+
+.widget-card-fade .action-btn {
+    pointer-events: auto;
+}
+
+.widget-card-gone {
+    padding: var(--space-sm) var(--space-md);
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+.widget-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    min-width: 0;
+    padding: 0.25rem 0.375rem 0.25rem 0.75rem;
+    border-bottom: 1px solid var(--border-color);
+    font-size: var(--font-size-sm);
+}
+
+.widget-bar-icon {
+    --app-icon-size: 1.125rem;
+    flex: none;
+    display: inline-flex;
+    width: var(--app-icon-size);
+    height: var(--app-icon-size);
+}
+
+.widget-bar-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.widget-bar-kind {
+    flex-shrink: 0;
+    color: var(--text-muted);
+}
+
+.widget-bar-kind::before {
+    content: '· ';
+}
+
+.widget-bar-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.125rem;
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+.widget-bar .icon-btn.header-icon {
+    width: 1.75rem;
+    height: 1.75rem;
+}
+
+.widget-bar .icon-btn.header-icon svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+}
+
+/* Sized to what the widget reports. Only the shelf's frame animates its
+   height, since the inline card reads the clip box's settled height. */
+.widget-frame {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+
+/* A flex item's automatic floor is its content height, and an iframe's is
+   150px. Without this, a frame sized shorter spills its iframe over whatever
+   sits below, such as the next question option. */
+.widget-frame > .app-ui-iframe {
+    min-height: 0;
+}
+
+/* The inline frame takes the full reported height, so it never scrolls. The
+   cap sits far past the card's clip and stops a widget whose body tracks the
+   viewport from feeding its own height back without end. */
+.widget-frame-inline,
+.widget-frame-option,
+.widget-frame-embed {
+    max-height: 300dvh;
+}
+
+/* The drop-down covers the transcript, so past the cap the frame is the only
+   scroller under a finger. */
+.widget-frame-shelf {
+    max-height: 70dvh;
+    transition: height var(--duration-fast) ease;
+}
+
+:root[data-motion="reduce"] .widget-frame-shelf {
+    transition: none;
+}
+
+/* A widget window (ADR 0419): an open widget floating over the app. Three
+   modes. Minimal is the widget alone, shaped as it draws itself. Window is the
+   card with its bar, at a size the user sets. Docked hangs under the thread's
+   title row. Minimal and docked carry their controls in a floating toolbar
+   that shows on hover, or on a tap on a touch screen. */
+.widget-window {
+    --widget-minimal-cap: min(24rem, calc(100vw - 2 * var(--space-sm)));
+    position: fixed;
+    width: min(22rem, calc(100vw - 2 * var(--space-sm)));
+    animation: widget-window-in var(--duration-normal) ease;
+}
+
+.widget-window .widget-card {
+    background: var(--bg-primary);
+    box-shadow: var(--shadow-lg);
+}
+
+/* The widget's own drawing is the shape: no card, and the frame is
+   see-through. The frame lays out at the cap and the window clips it to the
+   width the widget reports. */
+.widget-window.is-minimal {
+    width: min(var(--widget-content-width, var(--widget-minimal-cap)), var(--widget-minimal-cap));
+    /* A widget that reports nothing wide still leaves a window to reach. */
+    min-width: 3rem;
+}
+
+.widget-window.is-minimal .widget-card {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
+}
+
+.widget-window.is-minimal .widget-frame {
+    width: var(--widget-minimal-cap);
+    height: min(var(--widget-content-height, 10rem), 70dvh);
+}
+
+.widget-window.is-minimal .app-ui-iframe {
+    background: transparent;
+}
+
+/* Window mode grows with the widget until the first report sets its size,
+   then holds it: the widget scrolls inside the frame. */
+.widget-window.is-window .widget-frame {
+    height: min(var(--widget-content-height, 15rem), 60dvh);
+}
+
+.widget-window.is-window.is-sized {
+    display: flex;
+    flex-direction: column;
+}
+
+.widget-window.is-window.is-sized .widget-card {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.widget-window.is-window.is-sized .widget-frame {
+    flex: 1;
+    height: auto;
+    min-height: 0;
+}
+
+.widget-window.is-docked .widget-frame {
+    height: min(var(--widget-content-height, 15rem), 50dvh);
+}
+
+/* Off with its title row, such as on a phone swiped to another pane. */
+.widget-window.is-dock-hidden {
+    visibility: hidden;
+    pointer-events: none;
+}
+
+/* A drag on the bar or the grip moves the window and never scrolls the page. */
+.widget-window .widget-bar,
+.widget-window-grip {
+    touch-action: none;
+    cursor: grab;
+}
+
+.widget-window.is-dragging .widget-bar,
+.widget-window.is-dragging .widget-window-grip {
+    cursor: grabbing;
+}
+
+/* The frame would take the pointer from a drag or a resize passing over it. */
+.widget-window.is-dragging iframe,
+.widget-window.is-resizing iframe {
+    pointer-events: none;
+}
+
+/* Floats over the widget's top right corner, out of flow, so showing it never
+   moves or grows the window. */
+.widget-window-controls {
+    position: absolute;
+    top: var(--space-xs);
+    right: var(--space-xs);
+    display: flex;
+    align-items: center;
+    gap: 0.125rem;
+    padding: 0.125rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-control);
+    background: var(--bg-primary);
+    box-shadow: var(--shadow-md);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(-0.25rem) scale(0.96);
+    transition:
+        opacity var(--duration-normal) ease,
+        transform var(--duration-normal) ease,
+        visibility 0s linear var(--duration-normal);
+}
+
+.widget-window.is-revealed .widget-window-controls,
+.widget-window-controls:focus-within {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: none;
+    transition:
+        opacity var(--duration-normal) ease,
+        transform var(--duration-normal) ease,
+        visibility 0s;
+}
+
+@media (hover: hover) {
+    .widget-window:hover .widget-window-controls {
+        opacity: 1;
+        visibility: visible;
+        pointer-events: auto;
+        transform: none;
+        transition:
+            opacity var(--duration-normal) ease,
+            transform var(--duration-normal) ease,
+            visibility 0s;
+    }
+}
+
+.widget-window-controls .icon-btn.header-icon {
+    width: 1.75rem;
+    height: 1.75rem;
+}
+
+.widget-window-controls .icon-btn.header-icon svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+}
+
+.widget-window-grip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.25rem;
+    height: 1.75rem;
+    color: var(--text-muted);
+}
+
+.widget-window-grip svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+/* Window mode's resize corner. Big enough for a finger, drawn as a quiet
+   corner mark. */
+.widget-window-resize {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: 1.25rem;
+    height: 1.25rem;
+    cursor: nwse-resize;
+    touch-action: none;
+}
+
+.widget-window-resize::after {
+    content: '';
+    position: absolute;
+    right: 0.3125rem;
+    bottom: 0.3125rem;
+    width: 0.4375rem;
+    height: 0.4375rem;
+    border-right: 1px solid var(--text-muted);
+    border-bottom: 1px solid var(--text-muted);
+}
+
+.widget-window.is-closing {
+    animation: widget-window-out var(--duration-normal) ease forwards;
+    pointer-events: none;
+}
+
+@keyframes widget-window-in {
+    from { opacity: 0; transform: scale(0.96); }
+    to { opacity: 1; transform: none; }
+}
+
+@keyframes widget-window-out {
+    from { opacity: 1; transform: none; }
+    to { opacity: 0; transform: scale(0.96); }
+}
+
+.widget-menu-label {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 0;
+}
+
+.widget-menu-hint {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+/* --- Widget embeds in a reply (ADR 0415) ---
+   The renderer writes a slot holding the embed's label. Once the reply is
+   final, the slot holds the widget: a quiet bar naming it, with its menu,
+   over its frame. */
+.widget-embed-slot {
+    display: block;
+    margin: var(--space-sm) 0;
+    color: var(--text-secondary);
+}
+
+.widget-embed-embed {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+}
+
+.widget-embed-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    min-width: 0;
+}
+
+.widget-embed-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+}

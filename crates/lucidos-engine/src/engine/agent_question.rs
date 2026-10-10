@@ -1,0 +1,1848 @@
+//! Question-lifecycle primitives shared by every `AskUserQuestion` channel:
+//! CC's PreToolUse hook (`lucidos-cli ask-user-question-hook`, served by
+//! `api::internal::ask_user_question`), Codex's `ask_user_question` MCP tool
+//! (`lucidos mcp-permission-server`, same endpoint), and the chat agent's
+//! `ask_user_question` tool
+//! (`engine::agentic_loop_special_tool::handle_chat_ask_user_question`).
+//! All flow through `walk_question_batch` here; all resolve via
+//! `answer_pending_question` here. The HTTP / tool layers stay thin — they
+//! only translate the outcome into their respective wire shapes.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use uuid::Uuid;
+
+use crate::engine::agent_recovery::ANSWERED_AFTER_IDLE_REASON;
+use crate::engine::chat::rerun::ChatResumeAnchor;
+use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::thread_events::{
+    AnswerKind, EventChannel, EventMeta, MessageOrigin, QuestionOption, ThreadEvent,
+};
+use crate::engine::{AgentSession, LucidosEngine};
+
+/// Outcome of answering a pending question. Maps to HTTP status codes in the API layer.
+#[derive(Debug)]
+pub enum AnswerResult {
+    /// Answer persisted; any waiting hook has been notified. The Claude Code subprocess
+    /// is already alive and continuing in its existing session.
+    Resumed,
+    /// No matching `UserQuestionAsked` for this `tool_use_id`, or already answered.
+    Conflict(String),
+}
+
+/// Resolve any pending `UserQuestionAsked` for `thread_id` as `Canceled` so the
+/// QuestionCard renders a "Canceled" badge instead of leaving stale answer
+/// buttons. No-op when there's no pending question. Conflicts (rare race where
+/// the user answered between lookup and emit) are logged and swallowed —
+/// callers should not fail because of them.
+///
+/// Returns `true` when a pending question was actually cancel-stamped (a
+/// `UserQuestionAnswered(Canceled)` was emitted). The cancel/stop handlers fold
+/// this into their `{"canceled": bool}` response so a Stop that only had a
+/// question card to resolve still reports that it did something — the client
+/// then keeps its optimistic state (the card resolution is the incoming event)
+/// rather than treating the click as a stale no-op. A `Conflict` (already
+/// answered) reports `false`: nothing new was emitted.
+pub async fn resolve_pending_question_as_canceled(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    actor: Option<MessageOrigin>,
+) -> bool {
+    resolve_pending_question_as(engine, thread_id, AnswerKind::Canceled, actor, "canceled").await
+}
+
+/// Resolve any pending `UserQuestionAsked` for `thread_id` as `Superseded`,
+/// because a follow-up arrived that could not be its answer. Same
+/// swallow-the-conflict contract as [`resolve_pending_question_as_canceled`].
+///
+/// This is what keeps a coding-agent thread from deadlocking on its own
+/// question. The agent is parked inside the call that asked. It cannot read the
+/// follow-up until that call returns, and only an answer makes it return.
+/// Meanwhile the follow-up's own `CodingAgentPromptSent` lands in
+/// `QUESTION_OVERTAKEN_EVENT_TYPES`, which kills the card's buttons and the
+/// typed-answer route. Nobody can answer it and nothing else will, so the
+/// follow-up has to.
+///
+/// Uses the broad `lookup_pending_question_tool_use_id` on purpose. A question
+/// the agent already overtook parks the same call the same way. That is the
+/// parallel-tool-call race, and the narrow "active" lookup walks straight past
+/// it. See `docs/adr/0082-a-followup-supersedes-the-open-question.md`.
+pub async fn resolve_pending_question_as_superseded(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    actor: Option<MessageOrigin>,
+) -> bool {
+    resolve_pending_question_as(
+        engine,
+        thread_id,
+        AnswerKind::Superseded,
+        actor,
+        "superseded",
+    )
+    .await
+}
+
+/// Shared body of the two resolve-the-dangling-card helpers. `label` names the
+/// caller in the conflict log, which is the only thing that differs beyond the
+/// kind itself.
+async fn resolve_pending_question_as(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    kind: AnswerKind,
+    actor: Option<MessageOrigin>,
+    label: &str,
+) -> bool {
+    let Some(tool_use_id) = lookup_pending_question_tool_use_id(engine.pool(), thread_id).await
+    else {
+        return false;
+    };
+    match answer_pending_question(engine, thread_id, tool_use_id, kind, actor).await {
+        AnswerResult::Resumed => true,
+        AnswerResult::Conflict(msg) => {
+            log!(
+                "[CCQuestion] resolve_pending_question_as_{}({}): {}",
+                label,
+                thread_id,
+                msg
+            );
+            false
+        }
+    }
+}
+
+const PENDING_QUESTION_SQL: &str = "SELECT q.payload->>'tool_use_id' \
+     FROM events q \
+     LEFT JOIN events a ON a.thread_id = q.thread_id \
+          AND a.event_type = 'UserQuestionAnswered' \
+          AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
+     WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
+     ORDER BY q.sequence DESC LIMIT 1";
+
+const ACTIVE_QUESTION_SQL: &str = "SELECT q.payload->>'tool_use_id' \
+     FROM events q \
+     LEFT JOIN events a ON a.thread_id = q.thread_id \
+          AND a.event_type = 'UserQuestionAnswered' \
+          AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
+     WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
+       AND NOT EXISTS ( \
+         SELECT 1 FROM events t \
+         WHERE t.thread_id = q.thread_id \
+           AND t.sequence > q.sequence \
+           AND t.event_type = ANY($2::text[]) \
+       ) \
+     ORDER BY q.sequence DESC LIMIT 1";
+
+fn unwrap_tool_use_id_row(
+    result: Result<Option<(String,)>, sqlx::Error>,
+    thread_id: Uuid,
+) -> Option<String> {
+    match result {
+        Ok(row) => row.map(|(t,)| t).filter(|t| !t.is_empty()),
+        Err(e) => {
+            // Don't silently treat a DB outage as "no pending question" —
+            // that would let the user's free-form text spawn a brand-new CC
+            // turn over the unanswered one.
+            log!(
+                "[CCQuestion] DB lookup failed for pending question on {}: {}",
+                thread_id,
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Find the `tool_use_id` of the latest unanswered `UserQuestionAsked` for
+/// `thread_id`, if any. One round-trip — the LEFT JOIN filters out questions
+/// that already have a matching answer.
+///
+/// "Unanswered" here means literally "no `UserQuestionAnswered` row exists".
+/// A question whose surrounding turn was terminated (engine restart, cancel,
+/// failure, idle) still counts — `archive_thread` and the CC stop endpoint
+/// rely on this to cancel-stamp the QuestionCard so its answer buttons render
+/// disabled rather than dangling clickable on an archived/stopped thread.
+/// Use `lookup_active_question_tool_use_id` instead when you only want
+/// questions whose turn is still in flight.
+pub async fn lookup_pending_question_tool_use_id(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Option<String> {
+    let result = sqlx::query_as::<_, (String,)>(PENDING_QUESTION_SQL)
+        .bind(thread_id)
+        .fetch_optional(pool)
+        .await;
+    unwrap_tool_use_id_row(result, thread_id)
+}
+
+/// Same as `lookup_pending_question_tool_use_id`, but also excludes questions
+/// the agent has already moved past (terminal events, progression events, or
+/// a replacement question — see `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES`)
+/// before any answer landed.
+///
+/// Used by the chat::process FreeText fast-path. Two failure modes this
+/// defends:
+///   1. Engine restart while a question was on-screen leaves it "unanswered"
+///      forever; routing the user's next typed follow-up to it as
+///      `FreeText` means `MessageReceived` is never emitted and the typed
+///      message vanishes from the timeline.
+///   2. CC parallel-calls `AskUserQuestion` alongside other tool_uses in one
+///      assistant message. The hook blocks the AskUserQuestion tool_use,
+///      but sibling tool_uses dispatch and emit
+///      `CodingAgent{TextStreamed,ToolCalled,ToolResult,…}` events.
+///      The user types a comment minutes later — without the progression
+///      filter, the comment is silently absorbed as a `FreeText` answer.
+pub async fn lookup_active_question_tool_use_id(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Option<String> {
+    let result = sqlx::query_as::<_, (String,)>(ACTIVE_QUESTION_SQL)
+        .bind(thread_id)
+        .bind(ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES)
+        .fetch_optional(pool)
+        .await;
+    unwrap_tool_use_id_row(result, thread_id)
+}
+
+/// Look up whether `(thread_id, tool_use_id)` has a `UserQuestionAsked` and
+/// (if so) whether it's already been answered. Single round-trip.
+/// Returns `None` when no question exists, `Some(true)` when answered,
+/// `Some(false)` when pending.
+async fn find_pending_question(
+    engine: &LucidosEngine,
+    thread_id: Uuid,
+    tool_use_id: &str,
+) -> Result<Option<bool>, sqlx::Error> {
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT EXISTS(\
+             SELECT 1 FROM events a \
+             WHERE a.thread_id = q.thread_id \
+               AND a.event_type = 'UserQuestionAnswered' \
+               AND a.payload->>'tool_use_id' = $2 \
+         ) \
+         FROM events q \
+         WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' \
+           AND q.payload->>'tool_use_id' = $2 \
+         ORDER BY q.sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .bind(tool_use_id)
+    .fetch_optional(engine.pool())
+    .await?;
+    Ok(row.map(|(already_answered,)| already_answered))
+}
+
+/// Outcome of `walk_question_batch`. `answer_kinds` is the per-question
+/// `AnswerKind` JSON (Selected / FreeText / MultiSelected / Canceled), in
+/// the same order as the input questions. Callers feed it to
+/// `build_hook_answers` to produce the joined `{question_text: label}` map.
+#[derive(Debug)]
+pub(crate) struct QuestionWalkOutcome {
+    pub answer_kinds: Vec<serde_json::Value>,
+}
+
+/// Why a `walk_question_batch` call failed. Boxed because no caller today
+/// branches on a variant — both consumers (`api::internal::ask_user_question`
+/// and `agentic_loop_special_tool::handle_chat_ask_user_question`) only
+/// format the error via `Display`. The only legitimate failure mode is
+/// infrastructure (DB / bus / shutdown), which a tool retry won't fix.
+/// Reintroduce a typed enum if a caller ever needs to branch.
+pub(crate) type QuestionWalkError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The chat card's `message`, or `None` when it is absent or blank. Prose
+/// before a tool call may reach the user only as a summary. A tool input
+/// never does, so an answer the card follows belongs here.
+pub(crate) fn card_message(tool_args: &serde_json::Value) -> Option<&str> {
+    tool_args
+        .get("message")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.trim().is_empty())
+}
+
+/// A card's message, with the turn's meta so it renders in the asking turn.
+pub(crate) struct CardMessage<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) meta: &'a EventMeta,
+}
+
+/// Shows a card's message as the agent's text. Emit it just before the card:
+/// a `TextStreamed` after a card overtakes it and disables its buttons.
+pub(crate) async fn emit_card_message(
+    bus: &EventBus,
+    thread_id: Uuid,
+    message: &CardMessage<'_>,
+) -> Result<(), QuestionWalkError> {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::TextStreamed {
+            text: message.text.to_string(),
+        },
+        meta: message.meta.clone(),
+    })
+    .await
+    .map(|_| ())
+}
+
+/// Who asks a question batch, and on what terms.
+pub(crate) struct QuestionAsker {
+    /// The Claude Code session to resume. Empty for chat and Codex.
+    pub(crate) cc_session_id: String,
+    pub(crate) channel: crate::engine::thread_events::EventChannel,
+    /// Set only when the batch is an *owner approval card* (ADR 0387).
+    pub(crate) owner_approval: Option<crate::engine::thread_events::OwnerApproval>,
+}
+
+/// Refuse a batch whose option carries a widget that cannot draw: a
+/// broken or doubled embed, a missing or non-widget id, another thread's
+/// widget that is not reusable, or params its manifest does not take.
+pub(crate) fn check_option_widgets(
+    app_manager: &crate::core::AppManager,
+    parsed: &[crate::engine::agent_session::ParsedQuestion],
+    thread_id: Uuid,
+) -> Result<(), QuestionWalkError> {
+    use crate::engine::widgets::{check_widget_embed, WidgetCheckFailed};
+    for (idx, q) in parsed.iter().enumerate() {
+        for option in &q.options {
+            let refuse = |reason: String| -> QuestionWalkError {
+                format!(
+                    "Option '{}' in question {idx} cannot be asked: {reason}. Fix the \
+                     embed, written ![label](app:<id>?params={{...}}), and re-ask.",
+                    option.label
+                )
+                .into()
+            };
+            if let Some(problem) = crate::engine::agent_session::option_embed_problem(option) {
+                return Err(refuse(problem));
+            }
+            let Some(widget) = &option.widget else {
+                continue;
+            };
+            match check_widget_embed(
+                app_manager,
+                &widget.app_id,
+                widget.params.as_ref(),
+                thread_id,
+            ) {
+                Ok(()) => {}
+                Err(WidgetCheckFailed::Refused(reason)) => return Err(refuse(reason)),
+                Err(e @ WidgetCheckFailed::ReadFailed(_)) => {
+                    return Err(format!("Checking option '{}': {e}", option.label).into())
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a batch whose card message draws a widget named like one of its
+/// options. That sample belongs in the option, where the user picks it. A
+/// list above the card makes them match samples to buttons by name.
+pub(crate) fn check_message_embeds(
+    message: Option<&str>,
+    parsed: &[crate::engine::agent_session::ParsedQuestion],
+) -> Result<(), QuestionWalkError> {
+    let Some(message) = message else {
+        return Ok(());
+    };
+    for found in crate::engine::widget_embed::scan(message) {
+        let Some(label) = found.embed.ok().and_then(|embed| embed.label) else {
+            continue;
+        };
+        let named = parsed
+            .iter()
+            .flat_map(|q| &q.options)
+            .find(|option| option.label.trim().eq_ignore_ascii_case(&label));
+        if let Some(option) = named {
+            return Err(format!(
+                "Option '{}' has its widget drawn in the card's message. Move that \
+                 ![label](app:<id>?params={{...}}) embed into that option's description, \
+                 drop it from the message, and re-ask.",
+                option.label
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+impl LucidosEngine {
+    /// Walk a batch of questions sequentially (one card on screen at a
+    /// time), emit `UserQuestionAsked` for each, and block until each is
+    /// answered. Crash-recovery fast-path: any prior `UserQuestionAnswered`
+    /// from a pre-restart session is returned without re-emitting the
+    /// `Asked`. Cancel short-circuits — the remaining questions get
+    /// `UserQuestionAnswered { Canceled }` rows persisted so the next
+    /// re-entry (e.g. CC's hook re-firing after restart) sees the cancel
+    /// for every trailing sub_id and doesn't re-ask.
+    ///
+    /// `asker.channel` is stamped onto every emitted `UserQuestionAsked` and on
+    /// the trailing Canceled padding answers so `answer_pending_question`
+    /// can branch on the originating channel — coding-agent threads (CC and
+    /// Codex both ride `EventChannel::ClaudeCode`, the coding-agent channel)
+    /// get the resume marker + `ContinuationRequested` spawn; chat threads
+    /// skip both because the chat tool returns the answer directly as a
+    /// tool result.
+    ///
+    /// The walk shows `message` once, just before it first asks the first card.
+    pub(crate) async fn walk_question_batch(
+        &self,
+        thread_id: Uuid,
+        outer_tool_use_id: &str,
+        questions: &serde_json::Value,
+        message: Option<CardMessage<'_>>,
+        asker: QuestionAsker,
+    ) -> Result<QuestionWalkOutcome, QuestionWalkError> {
+        let QuestionAsker {
+            cc_session_id,
+            channel,
+            owner_approval,
+        } = asker;
+        let parser_input = serde_json::json!({ "questions": questions });
+        let parsed = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
+        let total = parsed.len();
+        if total == 0 {
+            return Ok(QuestionWalkOutcome {
+                answer_kinds: vec![],
+            });
+        }
+
+        // Strict enforcement: every question MUST carry a non-empty
+        // `question` field. The schema marks it `required`, but tool-call
+        // schemas are advisory — the model can still omit it (that was the
+        // "(no question text)" bug). Reject the batch up front — before any
+        // `UserQuestionAsked` is persisted — so the caller surfaces a
+        // tool-result error and the model re-asks with the full text filled
+        // in, instead of the user seeing a blank card they can't act on. The
+        // `header` chip-label is never accepted as a substitute.
+        if let Some(idx) = parsed.iter().position(|q| q.question.is_empty()) {
+            return Err(format!(
+                "Question at index {idx} has no text — every question needs a non-empty \
+                 `question` field (the `header` chip-label is not a substitute). Re-call \
+                 ask_user_question with the full question text filled in."
+            )
+            .into());
+        }
+        // A broken option widget, or one drawn in the message instead of its
+        // option, refuses the whole batch before any card is asked (ADR 0415).
+        // A batch already asked is a re-fire after a restart: its cards and any
+        // answers stand, whatever happened to a widget since.
+        let first_asked = user_question_already_asked(
+            self.pool(),
+            thread_id,
+            &synth_question_id(outer_tool_use_id, 0),
+        )
+        .await
+        .map_err(|e| format!("DB lookup for question state failed: {e}"))?;
+        if !first_asked {
+            check_option_widgets(&self.app_manager, &parsed, thread_id)?;
+            check_message_embeds(message.as_ref().map(|m| m.text), &parsed)?;
+        }
+
+        let mut answer_kinds: Vec<serde_json::Value> = Vec::with_capacity(total);
+        // Where the walk stopped early, and with which kind, so the padding
+        // below repeats that kind rather than assuming a cancel.
+        let mut ended_at: Option<(usize, AnswerKind)> = None;
+        for (i, q) in parsed.into_iter().enumerate() {
+            let sub_id = synth_question_id(outer_tool_use_id, i);
+
+            // Register FIRST. If the lookup ran first and the user
+            // answered between lookup and register, the broadcast send
+            // would find no subscriber and we'd block forever on `recv`.
+            // Registering first guarantees the wake either lands in the
+            // channel buffer (caught by `recv`) or fires before we get
+            // here (caught by the lookup below).
+            let mut waiter = self.question_wait_registry.register(&sub_id).await;
+
+            match lookup_existing_answer(self.pool(), thread_id, &sub_id).await {
+                Ok(Some(prior)) => {
+                    self.question_wait_registry.forget(&sub_id).await;
+                    let ending = batch_ending_answer(&prior);
+                    answer_kinds.push(prior);
+                    if let Some(kind) = ending {
+                        ended_at = Some((i, kind));
+                        break;
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.question_wait_registry.forget(&sub_id).await;
+                    log!("[QuestionWalk] prior-answer lookup failed {thread_id}/{sub_id}: {e}");
+                    return Err(format!("DB lookup for question state failed: {e}").into());
+                }
+            }
+
+            let already_asked = match user_question_already_asked(self.pool(), thread_id, &sub_id)
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    self.question_wait_registry.forget(&sub_id).await;
+                    log!("[QuestionWalk] already-asked lookup failed {thread_id}/{sub_id}: {e}");
+                    return Err(format!("DB lookup for question state failed: {e}").into());
+                }
+            };
+            if !already_asked {
+                if let Some(message) = message.as_ref().filter(|_| i == 0) {
+                    if let Err(e) = emit_card_message(&self.event_bus, thread_id, message).await {
+                        self.question_wait_registry.forget(&sub_id).await;
+                        log!("[QuestionWalk] emit card message failed {thread_id}/{sub_id}: {e}");
+                        return Err(format!("Failed to persist the card's message: {e}").into());
+                    }
+                }
+                if let Err(e) = self
+                    .event_bus
+                    .emit(BusEvent::Thread {
+                        thread_id,
+                        event: ThreadEvent::UserQuestionAsked {
+                            tool_use_id: sub_id.clone(),
+                            cc_session_id: cc_session_id.clone(),
+                            question: self.with_image_size_hints(&q.question),
+                            options: q
+                                .options
+                                .into_iter()
+                                .map(|o| self.option_with_image_size_hints(o))
+                                .collect(),
+                            worktree_path: None,
+                            multi_select: q.multi_select,
+                            owner_approval: owner_approval.clone(),
+                        },
+                        meta: EventMeta {
+                            channel: Some(channel),
+                            ..EventMeta::NONE
+                        },
+                    })
+                    .await
+                {
+                    self.question_wait_registry.forget(&sub_id).await;
+                    log!("[QuestionWalk] emit UserQuestionAsked failed {thread_id}/{sub_id}: {e}");
+                    return Err(format!("Failed to persist UserQuestionAsked: {e}").into());
+                }
+            }
+
+            // Block until UserQuestionAnswered fires. No timeout — same as
+            // MCP permission (the user is the rate-limiter).
+            let payload = match waiter.recv().await {
+                Ok(p) => p,
+                Err(_) => {
+                    self.question_wait_registry.forget(&sub_id).await;
+                    return Err("wait registry channel closed".into());
+                }
+            };
+            self.question_wait_registry.forget(&sub_id).await;
+
+            let ending = batch_ending_answer(&payload.answers);
+            answer_kinds.push(payload.answers);
+            if let Some(kind) = ending {
+                ended_at = Some((i, kind));
+                break;
+            }
+        }
+
+        // Pad the sub_ids the loop short-circuited past with the same kind that
+        // ended it. Without this, an engine restart between that answer and the
+        // caller's next re-entry would re-fire the walk, the per-question
+        // crash-recovery lookup would see no answer for the trailing sub_ids,
+        // and we'd re-emit `UserQuestionAsked` for cards the user is already
+        // done with.
+        if let Some((ended_index, ending_kind)) = ended_at {
+            let padding = serde_json::to_value(&ending_kind).unwrap_or(serde_json::Value::Null);
+            for j in (ended_index + 1)..total {
+                let remaining_sub = synth_question_id(outer_tool_use_id, j);
+                // Carry the padding into the returned kinds too, so the agent
+                // reads the same outcome the events record. Without it,
+                // `build_hook_answers` fills the gap with its `(canceled)`
+                // default, and a superseded batch tells the model its trailing
+                // questions were canceled.
+                answer_kinds.push(padding.clone());
+                self.event_bus
+                    .emit_or_log(
+                        BusEvent::Thread {
+                            thread_id,
+                            event: ThreadEvent::UserQuestionAnswered {
+                                tool_use_id: remaining_sub,
+                                answer: ending_kind.clone(),
+                            },
+                            meta: EventMeta {
+                                channel: Some(channel),
+                                ..EventMeta::NONE
+                            },
+                        },
+                        "[QuestionWalk] padding for remaining sub_id",
+                    )
+                    .await;
+            }
+        }
+
+        Ok(QuestionWalkOutcome { answer_kinds })
+    }
+}
+
+/// Is this card an *owner approval card* (ADR 0387)? `Err` when the read
+/// failed, so a caller deciding who may answer it can fail closed.
+pub(crate) async fn is_owner_approval_card(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM events \
+           WHERE aggregate_id = $1 AND event_type = 'UserQuestionAsked' \
+             AND payload->>'tool_use_id' = $2 \
+             AND payload ? 'owner_approval')",
+    )
+    .bind(thread_id.to_string())
+    .bind(tool_use_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Read the `channel` field from the most recent `UserQuestionAsked` for
+/// `(thread_id, tool_use_id)`. `Ok(None)` covers no matching row, NULL
+/// channel, and unparseable channel string (legacy rows or a hand-edited
+/// payload); callers must default such rows to today's CC behaviour for
+/// back-compat. An unparseable non-NULL string also logs a warning so the
+/// silent dispatch to CC is at least visible to operators.
+pub(crate) async fn lookup_question_channel(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+) -> Result<Option<crate::engine::thread_events::EventChannel>, sqlx::Error> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT payload->>'channel' \
+         FROM events \
+         WHERE thread_id = $1 AND event_type = 'UserQuestionAsked' \
+           AND payload->>'tool_use_id' = $2 \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .bind(tool_use_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((Some(channel_str),)) = row else {
+        return Ok(None);
+    };
+    match serde_json::from_value::<crate::engine::thread_events::EventChannel>(
+        serde_json::Value::String(channel_str.clone()),
+    ) {
+        Ok(channel) => Ok(Some(channel)),
+        Err(_) => {
+            log!(
+                "[CCQuestion] UserQuestionAsked payload->>'channel' = {:?} did not parse as EventChannel for {}/{}; defaulting to CC resume behaviour",
+                channel_str,
+                thread_id,
+                tool_use_id
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Decide whether to fire the CC-specific resume side-effects after
+/// emitting `UserQuestionAnswered`. Today those side-effects are:
+///
+/// - emit an empty `CodingAgentPromptSent` so the timeline shows a Thinking
+///   placeholder while CC processes the `tool_result`;
+/// - call `ensure_resume_after_answer`, which may emit `ContinuationRequested` to
+///   respawn the Claude Code subprocess with `--resume`.
+///
+/// The chat agent is in-process: its `ask_user_question` tool blocks on
+/// `QuestionWaitRegistry`, gets woken by the notify path, and returns the
+/// answer as the tool result on the same turn. It needs neither the marker
+/// nor the resume spawn. Legacy rows without a channel default to today's
+/// CC behaviour for back-compat.
+pub(crate) fn should_emit_cc_resume_side_effects(
+    channel: Option<crate::engine::thread_events::EventChannel>,
+) -> bool {
+    use crate::engine::thread_events::EventChannel;
+    match channel {
+        Some(EventChannel::ClaudeCode) | None => true,
+        Some(EventChannel::Chat) | Some(EventChannel::Trigger) => false,
+    }
+}
+
+/// Per-question `tool_use_id` derived from the outer batch id and the
+/// question's 0-based index. CC sends one outer `tool_use_id` per
+/// `AskUserQuestion` call regardless of how many questions are inside; the
+/// engine renders them sequentially and needs a unique key per individual
+/// question for the wait registry, the answered-already crash-recovery
+/// lookup, and the `events_user_question_answered_unique` partial index.
+pub(crate) fn synth_question_id(outer: &str, index: usize) -> String {
+    format!("{outer}#q{index}")
+}
+
+/// The batch-ending `AnswerKind` a persisted answer carries, or `None` when
+/// `walk_question_batch` should keep asking. Two kinds stop the walk, because
+/// both mean the user is done with the whole batch rather than this one card:
+/// `Canceled` (they dismissed it) and `Superseded` (they replied with something
+/// else). The kind comes back out so the padding written for the untouched
+/// sub-ids says the same thing the real answer did.
+pub(crate) fn batch_ending_answer(answer_kind: &serde_json::Value) -> Option<AnswerKind> {
+    match answer_kind.get("kind").and_then(|k| k.as_str()) {
+        Some("Canceled") => Some(AnswerKind::Canceled),
+        Some("Superseded") => Some(AnswerKind::Superseded),
+        _ => None,
+    }
+}
+
+/// True for the answer kinds that resolve a question with NO engine-driven
+/// resume behind them. `Canceled` tears the thread down, so nothing follows.
+/// `Superseded` is followed by the very message that replaced the question, and
+/// that follow-up drives the next turn itself. Either way the engine must emit
+/// neither a resume marker nor a `ContinuationRequested`. The first would strand
+/// an empty Thinking step, the second would race the follow-up.
+///
+/// [`arm_question_resume_if_live`] deliberately does not use this. A superseded
+/// session is alive and still finishing its turn, so it does need the flag.
+fn answer_resolves_without_resume(answer: &AnswerKind) -> bool {
+    matches!(answer, AnswerKind::Canceled | AnswerKind::Superseded)
+}
+
+/// Most recent `UserQuestionAnswered.answer` for `tool_use_id`, if any. DB
+/// errors propagate so a transient failure isn't read as "no prior answer".
+pub(crate) async fn lookup_existing_answer(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    let row = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT payload->'answer' FROM events
+         WHERE thread_id = $1 AND event_type = 'UserQuestionAnswered'
+           AND payload->>'tool_use_id' = $2
+         LIMIT 1",
+    )
+    .bind(thread_id)
+    .bind(tool_use_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.filter(|v| !v.is_null()))
+}
+
+/// True iff a `UserQuestionAsked` already exists for this `tool_use_id` (used
+/// to suppress duplicate emits on hook re-fire after an engine restart). DB
+/// errors propagate so a transient failure isn't read as "no prior question".
+pub(crate) async fn user_question_already_asked(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+           SELECT 1 FROM events
+           WHERE thread_id = $1 AND event_type = 'UserQuestionAsked'
+             AND payload->>'tool_use_id' = $2
+         )",
+    )
+    .bind(thread_id)
+    .bind(tool_use_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Resolve a synthesized `opt-N` id to its label from the `question_index`-th
+/// question's options. Falls back to the bare id on miss so the model sees a
+/// recognizable error rather than a silent drop.
+fn lookup_option_label(
+    opt_id: &str,
+    cc_questions: &serde_json::Value,
+    question_index: usize,
+) -> String {
+    opt_id
+        .strip_prefix("opt-")
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(|idx| {
+            cc_questions
+                .as_array()
+                .and_then(|arr| arr.get(question_index))
+                .and_then(|q| q.get("options"))
+                .and_then(|opts| opts.as_array())
+                .and_then(|opts| opts.get(idx))
+                .and_then(|opt| opt.get("label"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| opt_id.to_string())
+}
+
+/// What a superseded question hands back to the agent that asked it. It has to
+/// do two jobs at once: stop the model re-asking, and stop it reading the
+/// replacement as an answer to what it asked. The message that superseded the
+/// question is already on its way in. So the tool result only has to point at
+/// it.
+const SUPERSEDED_HOOK_VALUE: &str = "(superseded) The user did not answer this \
+    question. They sent a new message instead, which arrives as your next \
+    input. Work from that, and do not ask this question again unless it is \
+    still open after reading it.";
+
+/// Follows a typed reply that picks no option. The engine records it as the
+/// card's answer, but users often type a new request instead of answering.
+/// Prose before a tool call can reach the user as a one-line note, so the
+/// response goes on the card where the tool allows it.
+pub(crate) const TYPED_REPLY_NOTE: &str = "The user typed this instead of picking an \
+    option. It may answer your question, or it may ask or say something else. If it \
+    leaves your question open, respond to what they said, then ask the question again. \
+    Put that response in the card's `message` field if your tool has one.";
+
+/// How an answer's images are written into the text its agent reads.
+#[derive(Clone, Copy)]
+pub(crate) enum AnswerImages<'a> {
+    /// A coding agent opens each image itself, from its blob path under this
+    /// workspace. Its sessions are granted `data/`, so no permission card.
+    BlobPaths(&'a std::path::Path),
+    /// The Lucidos Agent receives the images as blocks after the tool result
+    /// (see [`with_answer_images`]). The text is stored and replayed on later
+    /// turns, which carry no image, so it must stay true there too.
+    AttachedBlocks,
+    /// The Lucidos Agent resumed after a restart. Its turn is rebuilt from
+    /// stored events, and no event carries the image bytes to lift. So the
+    /// text says the images exist and asks for them again.
+    Unshown,
+}
+
+/// The lines naming an answer's images, or `None` for an imageless answer.
+fn answer_image_lines(hashes: &[String], images: AnswerImages<'_>) -> Option<String> {
+    if hashes.is_empty() {
+        return None;
+    }
+    Some(match images {
+        AnswerImages::BlobPaths(workspace) => hashes
+            .iter()
+            .map(
+                |hash| match crate::core::blobs::resolve_blob(workspace, hash) {
+                    Some(blob) => format!(
+                    "[The user attached an image to this answer: {}. Open that file to see it.]",
+                    blob.path.display()
+                ),
+                    None => format!(
+                        "[The user attached an image to this answer, but its file {hash} is gone.]"
+                    ),
+                },
+            )
+            .collect::<Vec<_>>()
+            .join("\n"),
+        AnswerImages::AttachedBlocks => match hashes.len() {
+            1 => "[The user attached an image to this answer. It was shown right after this \
+                  result, in this turn only.]"
+                .into(),
+            n => format!(
+                "[The user attached {n} images to this answer. They were shown right after this \
+                 result, in this turn only.]"
+            ),
+        },
+        AnswerImages::Unshown => format!(
+            "[The user attached {} image(s) to this answer. A restart means they cannot be \
+             shown to you. Ask the user to send them again if you need them.]",
+            hashes.len()
+        ),
+    })
+}
+
+/// Join an answer's text and its image lines, skipping whichever is empty.
+fn with_image_lines(text: String, image_lines: Option<String>) -> String {
+    match image_lines {
+        None => text,
+        Some(lines) if text.is_empty() => lines,
+        Some(lines) => format!("{text}\n\n{lines}"),
+    }
+}
+
+/// The text the user typed with an answer, or `""` when they typed none.
+fn typed_text(answer_kind: &serde_json::Value) -> &str {
+    answer_kind
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+}
+
+/// Append [`TYPED_REPLY_NOTE`] when the answer is typed text that picks no
+/// option.
+fn with_typed_reply_note(value: String, typed_only: bool) -> String {
+    match typed_only {
+        true => format!("{value}\n\n[{TYPED_REPLY_NOTE}]"),
+        false => value,
+    }
+}
+
+/// `Canceled` produces a `(canceled)` marker rather than an empty string —
+/// an empty answer causes CC's model to read the question as unanswered and
+/// re-invoke the tool in a loop. `Superseded` carries a longer sentence for the
+/// same reason, plus a pointer at the message that replaced the question.
+/// `MultiSelected` joins resolved labels with
+/// `", "` and appends any non-empty `text` (freetext typed in the prompt
+/// textarea while the card was on screen) on the same separator. A typed
+/// answer's images follow its text, written as `images` says. Typed text that
+/// picks no option ends with [`TYPED_REPLY_NOTE`].
+fn answer_kind_to_hook_value(
+    answer_kind: &serde_json::Value,
+    cc_questions: &serde_json::Value,
+    question_index: usize,
+    images: AnswerImages<'_>,
+) -> serde_json::Value {
+    let hashes: Vec<String> = answer_kind
+        .get("image_hashes")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let image_lines = answer_image_lines(&hashes, images);
+    let kind = answer_kind
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("");
+    match kind {
+        "Selected" => {
+            let opt_id = answer_kind
+                .get("option_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            serde_json::Value::String(lookup_option_label(opt_id, cc_questions, question_index))
+        }
+        "MultiSelected" => {
+            let mut parts: Vec<String> = answer_kind
+                .get("option_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|id| lookup_option_label(id, cc_questions, question_index))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let text = typed_text(answer_kind);
+            let typed_only = parts.is_empty() && !text.is_empty();
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
+            let value = with_image_lines(parts.join(", "), image_lines);
+            serde_json::Value::String(with_typed_reply_note(value, typed_only))
+        }
+        "FreeText" => {
+            let text = typed_text(answer_kind);
+            let value = with_image_lines(text.to_string(), image_lines);
+            serde_json::Value::String(with_typed_reply_note(value, !text.is_empty()))
+        }
+        "Canceled" => serde_json::Value::String("(canceled)".to_string()),
+        "Superseded" => serde_json::Value::String(SUPERSEDED_HOOK_VALUE.to_string()),
+        _ => serde_json::Value::String(format!("(unknown answer kind: {})", kind)),
+    }
+}
+
+/// SQL behind [`answered_question_recap`]: every `UserQuestionAsked` of one
+/// batch, joined to its answer, in ask order.
+///
+/// The batch is matched on the `{outer}#q` prefix (see [`synth_question_id`])
+/// with `left(…, length($2)) = $2` rather than `LIKE $2 || '%'`, because a
+/// `tool_use_id` is a `toolu_vrtx_…` string and `_` is a `LIKE` single-character
+/// wildcard: `LIKE` would also match a *different* batch whose id happens to
+/// agree everywhere the literal characters do.
+const ANSWERED_BATCH_SQL: &str = "SELECT q.payload->>'question' AS question, \
+            COALESCE(q.payload->'options', '[]'::jsonb) AS options, \
+            a.payload->'answer' AS answer \
+     FROM events q \
+     JOIN events a ON a.thread_id = q.thread_id \
+          AND a.event_type = 'UserQuestionAnswered' \
+          AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
+     WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' \
+       AND left(q.payload->>'tool_use_id', length($2)) = $2 \
+     ORDER BY q.sequence";
+
+/// One answered sub-question, read back out of the event store.
+#[derive(Debug, sqlx::FromRow)]
+struct AnsweredSubQuestion {
+    question: String,
+    /// The `UserQuestionAsked.options` array, needed to turn a persisted
+    /// `opt-N` id back into the label the user actually saw.
+    options: serde_json::Value,
+    /// The `UserQuestionAnswered.answer` object (an `AnswerKind`).
+    answer: serde_json::Value,
+}
+
+/// How the user produced this answer, said in words the resumed agent cannot
+/// misread. The `FreeText` line is the load-bearing one: a typed reply that
+/// happens not to be "Approve" is NOT approval, and an agent resumed next to a
+/// teardown-stamped rejection will otherwise reach for exactly that inference.
+fn answer_kind_note(answer_kind: &serde_json::Value) -> &'static str {
+    let has_text = !typed_text(answer_kind).is_empty();
+    let picked_any = answer_kind
+        .get("option_ids")
+        .and_then(|v| v.as_array())
+        .is_some_and(|ids| !ids.is_empty());
+    match answer_kind.get("kind").and_then(|k| k.as_str()) {
+        Some("Selected") => "The user picked that option.",
+        Some("MultiSelected") if has_text && picked_any => {
+            "The user picked those options and typed the rest themselves."
+        }
+        Some("MultiSelected") if picked_any => "The user picked those options.",
+        Some("FreeText" | "MultiSelected") if has_text => {
+            "The user typed that themselves. It is not one of the options you \
+             offered, so it picks none of them."
+        }
+        Some("Canceled") => "The question was canceled.",
+        Some("Superseded") => {
+            "The user never answered this. They sent a new message instead, \
+             which replaced the question."
+        }
+        _ => "That is the user's answer.",
+    }
+}
+
+/// The user's answer to the most recent question batch on `thread_id`, rendered
+/// as `Q:` / `A:` pairs for a resumed coding agent, or `None` when the thread
+/// has no answered question to recap.
+///
+/// This exists because the answer cannot always reach the agent the normal way.
+/// A coding agent blocked on a question is answered *in band*: the engine wakes
+/// the blocked hook (Claude Code) or MCP call (Codex) and the answer returns as
+/// that tool's result. But when the subprocess was torn down while the card was
+/// on screen, there is no blocked call left to wake, and the agent's own
+/// transcript has already closed the tool call, so the hook does not re-fire on
+/// `--resume` and its crash-recovery lookup never runs. The answer then reaches
+/// the model only if the engine puts it in the resume message, which is what
+/// `agent_recovery::continue_input_for_reason` does with this.
+///
+/// Read back out of the `events` table rather than carried in memory, so an
+/// engine restart between the answer and the respawn changes nothing
+/// (`CLAUDE.md` § Engine Statelessness).
+pub(crate) async fn answered_question_recap(
+    pool: &sqlx::PgPool,
+    workspace: &std::path::Path,
+    thread_id: Uuid,
+) -> Option<String> {
+    let newest = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT payload->>'tool_use_id' FROM events \
+         WHERE thread_id = $1 AND event_type = 'UserQuestionAnswered' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        // A DB error is not "this thread has no answer": say so, and fall
+        // through to the bare continue message rather than inventing silence.
+        log!("[CCQuestion] newest-answer lookup failed for {thread_id}: {e}");
+        None
+    })
+    .flatten()
+    .filter(|id| !id.is_empty())?;
+
+    // `{outer}#q{i}` back to `{outer}#q`, the prefix shared by the whole batch.
+    // An id with no `#q` at all yields a prefix nothing can match (`left()`
+    // clamps to the string's length, so `id` never equals `id#q`), and the
+    // caller falls back to the bare continue message. That is only reachable
+    // for rows predating `synth_question_id`, which cannot be the newest answer
+    // on a live continuation, and falling back is the safe direction anyway.
+    let (outer, _) = newest.rsplit_once("#q").unwrap_or((newest.as_str(), ""));
+    let prefix = format!("{outer}#q");
+
+    let rows: Vec<AnsweredSubQuestion> = sqlx::query_as(ANSWERED_BATCH_SQL)
+        .bind(thread_id)
+        .bind(&prefix)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| {
+            log!("[CCQuestion] answered-batch lookup failed for {thread_id}: {e}");
+            Vec::new()
+        });
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    for row in &rows {
+        // `answer_kind_to_hook_value` resolves `opt-N` against a questions
+        // ARRAY at a given index, so wrap this row's options as a one-entry
+        // array: one definition of option-label resolution, not two.
+        let one = serde_json::json!([{ "options": row.options }]);
+        let rendered =
+            answer_kind_to_hook_value(&row.answer, &one, 0, AnswerImages::BlobPaths(workspace));
+        let value = rendered.as_str().unwrap_or_default();
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "Q: {}\nA: {}\n   ({})\n",
+            row.question,
+            value,
+            answer_kind_note(&row.answer)
+        ));
+    }
+    Some(out)
+}
+
+/// Build the `{question_text: answer_label}` map both channels send back to
+/// their LLM (CC via the hook tool result; chat via the tool result string).
+/// A question with no collected answer (loop short-circuited on cancel)
+/// surfaces as `(canceled)` so the model never reads it as "unanswered" and
+/// re-invokes the tool. Duplicate question texts disambiguate with a
+/// `" (#i)"` suffix — without it, a naive `Map::insert` would silently
+/// overwrite the first answer.
+pub(crate) fn build_hook_answers(
+    answer_kinds: &[serde_json::Value],
+    cc_questions: &serde_json::Value,
+    images: AnswerImages<'_>,
+) -> serde_json::Value {
+    let Some(arr) = cc_questions.as_array() else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    let mut map = serde_json::Map::with_capacity(arr.len());
+    for (i, q) in arr.iter().enumerate() {
+        // Key on the same `question` field the card renders, so the answer-map
+        // key the LLM reads back matches the text the user saw. The
+        // "(unknown question)" fallback is defensive only — walk_question_batch
+        // already rejected any entry missing a `question`, so it's unreachable
+        // in the normal flow.
+        let raw_text = crate::engine::agent_session::question_text(q)
+            .unwrap_or_else(|| "(unknown question)".to_string());
+        let key = if map.contains_key(&raw_text) {
+            crate::log!(
+                "[AskUserQuestion] duplicate question text in tool input — disambiguating with suffix: {raw_text:?}"
+            );
+            format!("{raw_text} (#{})", i + 1)
+        } else {
+            raw_text
+        };
+        let value = match answer_kinds.get(i) {
+            Some(ans) => answer_kind_to_hook_value(ans, cc_questions, i, images),
+            None => serde_json::Value::String("(canceled)".to_string()),
+        };
+        map.insert(key, value);
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Validate a user-supplied answer against the question's option list and
+/// `multi_select` flag. Pure function; the surrounding I/O lives in
+/// `answer_pending_question`.
+///
+/// - `MultiSelected` requires at least one id, non-empty `text` or an image.
+///   Every id must exist in `options`, and the question must be marked
+///   `multi_select`. The `text` field carries freetext typed in the prompt
+///   textarea while the question was on screen. The prompt-row Submit button
+///   folds it in.
+/// - `Selected`/`FreeText`/`Canceled` are unrestricted here — the existing
+///   pre-validation (option lookup on the hook side) covers their well-formedness.
+pub(crate) fn validate_answer(
+    answer: &AnswerKind,
+    options: &[QuestionOption],
+    multi_select: bool,
+) -> Result<(), String> {
+    let AnswerKind::MultiSelected {
+        option_ids,
+        text,
+        image_hashes,
+    } = answer
+    else {
+        return Ok(());
+    };
+    let has_text = text.as_deref().is_some_and(|t| !t.is_empty());
+    if option_ids.is_empty() && !has_text && image_hashes.is_empty() {
+        return Err(
+            "MultiSelected requires at least one option_id, non-empty text or an image".into(),
+        );
+    }
+    if !multi_select {
+        return Err("MultiSelected answer for single-select question".into());
+    }
+    let known: std::collections::HashSet<&str> = options.iter().map(|o| o.id.as_str()).collect();
+    for id in option_ids {
+        if !known.contains(id.as_str()) {
+            return Err(format!("MultiSelected contains unknown option_id: {id}"));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an answer naming an image this workspace does not hold, so a card
+/// never records a picture its agent cannot open.
+pub(crate) fn check_answer_images(
+    workspace: &std::path::Path,
+    answer: &AnswerKind,
+) -> Result<(), String> {
+    match answer
+        .image_hashes()
+        .iter()
+        .find(|hash| crate::core::blobs::resolve_blob(workspace, hash).is_none())
+    {
+        Some(hash) => Err(format!(
+            "The answer names image {hash}, which was never uploaded to this workspace"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Marks a Lucidos Agent tool result whose answer carries images, as
+/// `[ANSWER_IMAGES:<hash>,<hash>]\n<result>`. The agentic loop strips it and
+/// attaches the images after the result (`split_tool_result`).
+const ANSWER_IMAGES_PREFIX: &str = "[ANSWER_IMAGES:";
+
+/// Prefix `result` with the images of every answer in the batch, or return it
+/// unchanged when none has any.
+pub(crate) fn with_answer_images(result: String, answer_kinds: &[serde_json::Value]) -> String {
+    let hashes: Vec<String> = answer_kinds
+        .iter()
+        .filter_map(|answer| answer.get("image_hashes")?.as_array().cloned())
+        .flatten()
+        .filter_map(|hash| hash.as_str().map(str::to_string))
+        .collect();
+    if hashes.is_empty() {
+        return result;
+    }
+    format!("{ANSWER_IMAGES_PREFIX}{}]\n{result}", hashes.join(","))
+}
+
+/// Split a [`with_answer_images`] result into its blob hashes and the result.
+pub(crate) fn parse_answer_images(result: &str) -> Option<(Vec<String>, &str)> {
+    let rest = result.strip_prefix(ANSWER_IMAGES_PREFIX)?;
+    let (list, text) = rest.split_once("]\n")?;
+    Some((list.split(',').map(str::to_string).collect(), text))
+}
+
+/// Look up `(options, multi_select)` for the most recent `UserQuestionAsked`
+/// matching `tool_use_id` on `thread_id`. Returns the parsed pair so the
+/// validator can run against the canonical persisted shape.
+async fn lookup_question_options(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+) -> Result<Option<(Vec<QuestionOption>, bool)>, sqlx::Error> {
+    let row: Option<(serde_json::Value, Option<bool>)> = sqlx::query_as(
+        "SELECT COALESCE(payload->'options', '[]'::jsonb), \
+                (payload->>'multi_select')::bool \
+         FROM events \
+         WHERE thread_id = $1 AND event_type = 'UserQuestionAsked' \
+           AND payload->>'tool_use_id' = $2 \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .bind(tool_use_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(opts_json, multi)| {
+        let options: Vec<QuestionOption> = serde_json::from_value(opts_json).unwrap_or_default();
+        (options, multi.unwrap_or(false))
+    }))
+}
+
+/// Persist the user's answer and wake the PreToolUse hook blocked on this
+/// `tool_use_id`. Idempotent: a partial unique index on
+/// `(thread_id, tool_use_id) WHERE event_type='UserQuestionAnswered'` ensures
+/// duplicate concurrent answers reject at the DB layer.
+///
+/// `actor` is the resolved `MessageOrigin` of whoever submitted the answer
+/// (per CLAUDE.md "Mutating endpoints stamp the actor"). Engine-internal
+/// callers — e.g. `archive_thread` synthesizing `AnswerKind::Canceled` —
+/// pass the request actor too; only the resume side-effect uses `None`
+/// because a resumed Claude Code subprocess is engine-driven.
+pub async fn answer_pending_question(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    tool_use_id: String,
+    answer: AnswerKind,
+    actor: Option<MessageOrigin>,
+) -> AnswerResult {
+    match find_pending_question(engine, thread_id, &tool_use_id).await {
+        Ok(Some(false)) => {}
+        Ok(Some(true)) => {
+            return AnswerResult::Conflict(format!(
+                "Question {} on thread {} has already been answered",
+                tool_use_id, thread_id
+            ));
+        }
+        Ok(None) => {
+            return AnswerResult::Conflict(format!(
+                "No pending question for tool_use_id {} on thread {}",
+                tool_use_id, thread_id
+            ));
+        }
+        Err(e) => {
+            log!(
+                "[CCQuestion] DB lookup failed for {}/{}: {}",
+                thread_id,
+                tool_use_id,
+                e
+            );
+            return AnswerResult::Conflict("Database lookup failed".into());
+        }
+    }
+
+    // Validate the answer shape against the persisted question. The pending
+    // lookup above guarantees the question exists, so a `None` here is a
+    // race we treat as a conflict for symmetry with the answered-already arm.
+    match lookup_question_options(engine.pool(), thread_id, &tool_use_id).await {
+        Ok(Some((options, multi_select))) => {
+            if let Err(msg) = validate_answer(&answer, &options, multi_select)
+                .and_then(|()| check_answer_images(engine.workspace_path(), &answer))
+            {
+                return AnswerResult::Conflict(msg);
+            }
+        }
+        Ok(None) => {
+            return AnswerResult::Conflict(format!(
+                "Question {} on thread {} disappeared before validation",
+                tool_use_id, thread_id
+            ));
+        }
+        Err(e) => {
+            log!(
+                "[CCQuestion] DB lookup for question options failed {}/{}: {}",
+                thread_id,
+                tool_use_id,
+                e
+            );
+            return AnswerResult::Conflict("Database lookup failed".into());
+        }
+    }
+
+    // Read the originating question's channel so we can propagate it onto
+    // the answer (so the persisted pair shares a wire-channel) and decide
+    // whether to fire the CC-specific resume side-effects below. Legacy
+    // rows without a channel field default to today's CC behaviour, both
+    // here and in `should_emit_cc_resume_side_effects`.
+    let original_channel =
+        match lookup_question_channel(engine.pool(), thread_id, &tool_use_id).await {
+            Ok(ch) => ch,
+            Err(e) => {
+                log!(
+                    "[CCQuestion] DB lookup for question channel failed {}/{}: {}",
+                    thread_id,
+                    tool_use_id,
+                    e
+                );
+                return AnswerResult::Conflict("Database lookup failed".into());
+            }
+        };
+    let answer_channel = original_channel.unwrap_or(EventChannel::ClaudeCode);
+
+    if let Err(e) = engine
+        .event_bus
+        .emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::UserQuestionAnswered {
+                tool_use_id: tool_use_id.clone(),
+                answer: answer.clone(),
+            },
+            meta: EventMeta {
+                channel: Some(answer_channel),
+                actor: actor.clone(),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+    {
+        let msg = e.to_string();
+        if msg.contains("events_user_question_answered_unique") {
+            return AnswerResult::Conflict(format!(
+                "Question {} on thread {} was answered concurrently",
+                tool_use_id, thread_id
+            ));
+        }
+        log!(
+            "[CCQuestion] Failed to emit UserQuestionAnswered for {}/{}: {}",
+            thread_id,
+            tool_use_id,
+            e
+        );
+        return AnswerResult::Conflict(format!("Failed to persist answer: {}", e));
+    }
+
+    // CC-specific resume side-effects: `CodingAgentPromptSent` (timeline
+    // Thinking placeholder while CC processes the tool_result) and the
+    // `ContinuationRequested` spawn (respawn Claude Code subprocess if no live one). The
+    // chat agent is in-process — its `ask_user_question` tool blocks on
+    // `QuestionWaitRegistry`, gets woken below, and returns the answer as
+    // a tool_result on the same turn. Skip both for chat-channel answers.
+    if !should_emit_cc_resume_side_effects(original_channel) {
+        let had_waiter = notify_and_release_waiter(engine, &tool_use_id, &answer).await;
+        // No live in-process loop means the engine restarted while the card was
+        // on screen (the chat `ask_user_question` blocks the loop on the wait
+        // registry; a restart drops it). Re-enter the loop so answering RESUMES
+        // the thread — the chat parity of CC's `--resume`. With a live loop the
+        // notify already woke the blocked tool, which returns the answer on the
+        // same turn. `Canceled` is a teardown sentinel (archive/stop), never a
+        // resume, and `Superseded` is followed by the message that replaced the
+        // question, which drives the next turn itself.
+        if !had_waiter && !answer_resolves_without_resume(&answer) {
+            // Resume on the ORIGINATING channel — this branch runs for both
+            // `Chat` and `Trigger` questions (both skip CC side effects), so a
+            // restart-preserved trigger question must resume as `Trigger`, not
+            // be misclassified as chat. `answer_channel` is the persisted
+            // question's channel (Chat or Trigger here; the CC/None case took
+            // the branch below).
+            resume_chat_after_answer(
+                engine,
+                thread_id,
+                &tool_use_id,
+                answer_channel,
+                actor.clone(),
+            )
+            .await;
+        }
+        return AnswerResult::Resumed;
+    }
+
+    let coding_agent = engine.thread_coding_agent(thread_id).await;
+    emit_resume_marker_for_cc_answer(
+        &engine.event_bus,
+        thread_id,
+        &answer,
+        actor.clone(),
+        coding_agent,
+    )
+    .await;
+
+    // Arm the run-loop resume signal on a live subprocess BEFORE waking its hook.
+    // The answer reaches CC through the PreToolUse hook (notify below), not via
+    // `msg_tx`, so it never hits the `msg_rx` arm's `reset_per_turn_flags` — the
+    // only place the run loop clears `emitted_terminal_event`. Without this the
+    // continued turn's output is dropped as "post-terminal stragglers" (see
+    // `AgentSession::question_resume_pending`). Set before notify so the flag is
+    // visible before CC's first post-answer event reaches the loop.
+    arm_question_resume_if_live(&engine.agent_sessions, thread_id, &answer).await;
+
+    // Wake the blocked hook (if any). No-op if nothing is registered:
+    // - The subprocess died with the hook (teardown, restart, kill). Nothing
+    //   re-runs that hook: the agent's transcript has already closed the tool
+    //   call, so the answer travels instead as the body of the
+    //   `answered_after_idle` resume message (`answered_question_recap`).
+    // - User answered before the hook re-registered after a transient error.
+    //   Here the subprocess IS alive and the tool call still open, so the hook
+    //   really does re-fire and the endpoint's crash-recovery path reads the
+    //   just-persisted UserQuestionAnswered from the DB. This is the one case
+    //   that lookup still serves.
+    notify_and_release_waiter(engine, &tool_use_id, &answer).await;
+
+    ensure_resume_after_answer(
+        &engine.event_bus,
+        &engine.agent_sessions,
+        thread_id,
+        &answer,
+        actor.clone(),
+    )
+    .await;
+
+    // The human replied, so agent messages held behind the question go now.
+    // A Cancel keeps them held (ADR 0256).
+    if crate::engine::chat::answer_releases_held_messages(&answer) {
+        engine.spawn_held_message_release(thread_id);
+    }
+
+    AnswerResult::Resumed
+}
+
+/// Wake every waiter blocked on `tool_use_id`, then drop the registry
+/// entry. The broadcast buffers the payload, so a waiter that registered
+/// before the send still receives it after the forget; a waiter that
+/// registers later hits the persisted `UserQuestionAnswered` via the
+/// crash-recovery DB lookup instead. The forget is the registry's only
+/// cleanup for waiters that died mid-question (agent killed while the card
+/// was on screen — the dropped handler never reaches its own `forget`;
+/// without this, every cancel-stamped question leaked one entry until
+/// engine restart).
+///
+/// Returns whether a LIVE in-process waiter received the wake. The chat
+/// answer path uses `false` (no live loop — the process restarted while the
+/// card was on screen) to decide it must re-enter the agentic loop rather
+/// than rely on the in-memory wake.
+async fn notify_and_release_waiter(
+    engine: &Arc<LucidosEngine>,
+    tool_use_id: &str,
+    answer: &AnswerKind,
+) -> bool {
+    let had_waiter = engine
+        .question_wait_registry
+        .notify(
+            tool_use_id,
+            crate::engine::cc_question_wait::AnswerPayload {
+                answers: serde_json::to_value(answer).unwrap_or(serde_json::Value::Null),
+            },
+        )
+        .await;
+    engine.question_wait_registry.forget(tool_use_id).await;
+    had_waiter
+}
+
+/// The `ask_user_question` tool call a restart interrupted — the most recent
+/// one on the thread, read back out of the event store by
+/// [`lookup_interrupted_ask`].
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct InterruptedAsk {
+    /// The `ToolCalled` event id. Pairs the synthetic `ToolResult` back to the
+    /// call so the timeline (and the resume reconstruction) sees a complete
+    /// tool_use/tool_result pair instead of a dangling call.
+    #[sqlx(rename = "id")]
+    pub(crate) call_event_id: Uuid,
+    /// The `questions` array the tool was called with — `build_hook_answers`
+    /// needs it to turn persisted `option_id`s back into labels.
+    pub(crate) questions: serde_json::Value,
+    /// The asking turn's `request_event_id` — the resume anchor. `None` only on
+    /// legacy rows persisted before the loop stamped it.
+    pub(crate) request_event_id: Option<Uuid>,
+}
+
+/// Most recent `ToolCalled{ask_user_question}` on `thread_id`, or `None` when
+/// the thread has none (a coding-agent question never emits one — CC/Codex use
+/// `CodingAgentToolCalled` — and neither does a hand-seeded legacy thread).
+pub(crate) async fn lookup_interrupted_ask(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Option<InterruptedAsk> {
+    sqlx::query_as::<_, InterruptedAsk>(
+        "SELECT id, \
+                COALESCE(payload->'args'->'questions', '[]'::jsonb) AS questions, \
+                NULLIF(payload->>'request_event_id','')::uuid AS request_event_id \
+         FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ToolCalled' \
+           AND payload->>'name' = $2 \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id.to_string())
+    .bind(crate::llm::tool_names::ASK_USER_QUESTION)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        log!("[CCQuestion] ask_user_question call lookup failed for {thread_id}: {e}");
+        None
+    })
+}
+
+/// Where the answer-driven resume anchors: on the turn that asked the question
+/// (so the restart stays invisible), falling back to a fresh Continue boundary
+/// only when there is no turn to continue — a legacy `ToolCalled` with no
+/// `request_event_id`, or no `ToolCalled` at all. Without an anchor the
+/// resumed events would carry no `request_event_id` and strand outside every
+/// exchange, which is worse than a redundant boundary panel.
+///
+/// The fallback carries `interrupted_turn: None` because that is the same
+/// missing field. With no lower bound the queued-message recovery would sweep
+/// the whole thread, so it is skipped instead
+/// ([`ChatResumeAnchor::interrupted_turn`]).
+pub(crate) fn resume_anchor_for_ask(
+    ask: Option<&InterruptedAsk>,
+    thread_id: Uuid,
+) -> ChatResumeAnchor {
+    match ask.and_then(|a| a.request_event_id) {
+        Some(request_event_id) => ChatResumeAnchor::ExistingTurn(request_event_id),
+        None => {
+            log!(
+                "[CCQuestion] no interrupted turn to continue for thread {} — resuming with a Continue boundary",
+                thread_id
+            );
+            ChatResumeAnchor::NewBoundary {
+                interrupted_turn: None,
+            }
+        }
+    }
+}
+
+/// Re-enter a chat thread's agentic loop after its `ask_user_question` was
+/// answered with NO live in-process loop — the loop died on an engine restart
+/// while the card was on screen. This is the chat parity of the coding-agent
+/// resume: each lane hands the answer back itself rather than waiting for the
+/// agent to ask again. The coding-agent lane puts it in the `--resume`
+/// message ([`answered_question_recap`]); chat has no subprocess, so we
+/// reconstruct the tool pair and re-run the agentic loop as a continuation.
+///
+/// Emits the `ToolResult{ask_user_question}` the dead loop never got to emit —
+/// pairing the dangling `ToolCalled` with the REAL answer (built from the
+/// persisted sub-answers via `build_hook_answers`), so the resumed turn's
+/// reconstruction shows the answer instead of the "[tool result unavailable:
+/// orphaned]" stub — then spawns the continuation with a short engine note as
+/// the current turn (reusing `spawn_chat_resume`, shared with `continue_chat`).
+///
+/// The resume is anchored on the interrupted turn's OWN `request_event_id`
+/// ([`ChatResumeAnchor::ExistingTurn`], read off the originating
+/// `ToolCalled{ask_user_question}`), so it emits **no** `ContinuationStarted` /
+/// `PromptInjected` boundary: this thread was never aborted (the restart
+/// preserve guard, `agent_recovery::thread_has_unanswered_question`, is what
+/// kept the card live) and the user already did the one thing that was needed —
+/// they answered. Opening the manual-Continue boundary here mislabelled the
+/// resume as "Continued the response" and surfaced a stale "Reminded the model
+/// that no actions had completed" note under an answered card. Anchoring on the
+/// original turn makes the resumed reply group under the question card exactly
+/// as it would have without the restart. A thread that genuinely still needs
+/// user action keeps its abort + Continue button, and Continue still emits the
+/// boundary + reminder ([`ChatResumeAnchor::NewBoundary`]).
+///
+/// The multi-question walk asks one card at a time, so on a mid-batch restart
+/// only the asked-so-far sub-answers exist; `build_hook_answers` fills any
+/// not-yet-asked question with `(canceled)`, and the LLM may re-ask — an
+/// accepted degradation for that rare case (single-question asks resume cleanly).
+async fn resume_chat_after_answer(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    sub_tool_use_id: &str,
+    // The originating question's channel (`Chat` or `Trigger`) — stamped on the
+    // reconstructed ToolResult and the continuation so a trigger thread's resume
+    // isn't misclassified as chat.
+    channel: EventChannel,
+    actor: Option<MessageOrigin>,
+) {
+    const RESUME_NOTE: &str = "[Engine note — resumed after restart] Your \
+        ask_user_question was answered while the engine was restarting; its \
+        result is in the tool result above. Continue the turn — do not ask the \
+        same question again.";
+
+    // A multi-question batch shares one outer id (`{outer}#q{i}`).
+    let outer = sub_tool_use_id
+        .rsplit_once("#q")
+        .map(|(o, _)| o)
+        .unwrap_or(sub_tool_use_id);
+    // Read before the ToolResult below, which would mark every held delivery
+    // as read (ADR 0321).
+    let held = crate::engine::chat::held_deliveries::held_deliveries(
+        engine.pool(),
+        thread_id,
+        &synth_question_id(outer, 0),
+    )
+    .await;
+
+    let ask = lookup_interrupted_ask(engine.pool(), thread_id).await;
+    let anchor = resume_anchor_for_ask(ask.as_ref(), thread_id);
+
+    if let Some(InterruptedAsk {
+        call_event_id,
+        questions,
+        request_event_id,
+    }) = ask
+    {
+        // Gather the persisted sub-answers in index order, so a multi-question
+        // batch rebuilds its full answer map.
+        let mut answer_kinds: Vec<serde_json::Value> = Vec::new();
+        let mut i = 0usize;
+        loop {
+            match lookup_existing_answer(engine.pool(), thread_id, &synth_question_id(outer, i))
+                .await
+            {
+                Ok(Some(a)) => {
+                    answer_kinds.push(a);
+                    i += 1;
+                }
+                Ok(None) => break,
+                // A DB error is NOT "no more sub-answers". `lookup_existing_answer`
+                // propagates precisely so a transient failure cannot be read as
+                // "no prior answer", and this used to be a `while let Ok(Some(..))`
+                // that collapsed the two: `build_hook_answers` then fills every
+                // index past the truncation with `(canceled)`, so the resumed model
+                // is told the user abandoned questions they had actually answered.
+                // Nothing above can retry (this path returns `()`), so stop and say
+                // so loudly rather than mislabel the answers silently.
+                Err(e) => {
+                    log!(
+                        "[Question] Sub-answer lookup failed for {} at index {}: {}. \
+                         Resuming with the {} answer(s) found so far; any later \
+                         question will read as (canceled) to the model",
+                        outer,
+                        i,
+                        e,
+                        answer_kinds.len()
+                    );
+                    break;
+                }
+            }
+        }
+        let answers_map = build_hook_answers(&answer_kinds, &questions, AnswerImages::Unshown);
+        let result_str =
+            serde_json::to_string(&answers_map).unwrap_or_else(|_| answers_map.to_string());
+
+        engine
+            .event_bus
+            .emit_or_log(
+                BusEvent::Thread {
+                    thread_id,
+                    event: ThreadEvent::ToolResult {
+                        name: crate::llm::tool_names::ASK_USER_QUESTION.to_string(),
+                        result: result_str,
+                        images: vec![],
+                        success: true,
+                        // Pair with the originating ToolCalled so the frontend
+                        // groups it into the question's exchange (and the resume
+                        // reconstruction pairs the tool_use with the real answer).
+                        tool_called_event_id: Some(call_event_id),
+                    },
+                    meta: EventMeta {
+                        channel: Some(channel),
+                        // Same turn as the call it answers — a live emit carries
+                        // this too, and it keeps the pair together if the
+                        // `tool_called_event_id` route ever misses.
+                        request_event_id,
+                        ..EventMeta::NONE
+                    },
+                },
+                "[CCQuestion] ToolResult (ask_user_question resume after restart)",
+            )
+            .await;
+    }
+
+    // `spawn_chat_resume` returns a boxed `dyn Future` (its concrete return type
+    // is the type-erasure boundary that breaks the mutual-async-recursion cycle —
+    // see its doc), so a plain `.await` here is Send-safe.
+    let note =
+        crate::engine::chat::held_deliveries::resume_note_with_held_deliveries(RESUME_NOTE, &held);
+    if let Err(e) = engine
+        .spawn_chat_resume(thread_id, note, channel, actor, anchor)
+        .await
+    {
+        log!(
+            "[CCQuestion] chat resume-after-answer failed for thread {}: {}",
+            thread_id,
+            e
+        );
+    }
+}
+
+/// Emit the empty `CodingAgentPromptSent` "resume marker" that projects to a
+/// `success: null` Thinking step in the timeline (frontend:
+/// thread-events.ts isThinking + resolveLastPendingResponseStep), resolved
+/// by the next CC tool call or text. Without it, the steps area sits empty
+/// during Anthropic's next turn. Empty text skips the redundant
+/// thread_summaries status update — `UserQuestionAnswered` already set it
+/// to Running.
+///
+/// Skipped for `AnswerKind::Canceled`: the cancel-stamp path (HTTP
+/// `claude_code_stop`, `archive_thread`) immediately follows with `stop_agent`,
+/// and `ensure_resume_after_answer` short-circuits the spawn — no next CC
+/// turn ever runs, so the marker would strand as an empty `Thinking ✓`
+/// placeholder under the QuestionCard's own ✓ Cancel state. Returns `true`
+/// when the marker was emitted, `false` when skipped.
+///
+/// Skipped for `AnswerKind::Superseded` for the mirror-image reason: the
+/// follow-up that superseded the question emits its own
+/// `CodingAgentPromptSent` moments later, and that is the placeholder. Emitting
+/// one here would leave two Thinking steps for one turn.
+pub(crate) async fn emit_resume_marker_for_cc_answer(
+    bus: &EventBus,
+    thread_id: Uuid,
+    answer: &AnswerKind,
+    actor: Option<MessageOrigin>,
+    // Which backend is processing the answer: CC via its PreToolUse hook or
+    // via the MCP tool its permission server also exposes, Codex via that same
+    // tool under its own mount name. The marker must stamp the real backend or
+    // a Codex thread's Thinking placeholder would attribute the next turn to
+    // Claude Code. The route does not decide the backend, which is why this is
+    // a parameter: all three names in `runtime::is_user_question_tool` reach
+    // the same endpoint.
+    coding_agent: crate::runtime::CodingAgent,
+) -> bool {
+    if answer_resolves_without_resume(answer) {
+        return false;
+    }
+    bus.emit_or_log(
+        BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::CodingAgentPromptSent {
+                text: String::new(),
+                coding_agent,
+                origin: actor.clone(),
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                actor,
+                ..EventMeta::NONE
+            },
+        },
+        "[CCQuestion] CodingAgentPromptSent (resume marker)",
+    )
+    .await;
+    true
+}
+
+/// If no live Claude Code subprocess exists for `thread_id`, emit a `ContinuationRequested`
+/// so the spawn dispatcher boots a fresh subprocess via `--resume`.
+///
+/// **The answer travels in that continuation's resume message**, built by
+/// `agent_recovery::continue_input_for_reason` from
+/// [`answered_question_recap`]. It does NOT travel by the resumed subprocess
+/// re-running its `AskUserQuestion` hook: on teardown Claude Code closes the
+/// pending tool call in its own transcript as rejected, so there is nothing
+/// dangling to re-run, the hook never fires, and `walk_question_batch`'s
+/// crash-recovery lookup never executes. This doc asserted that dead mechanism
+/// until 2026-08-10; do not "simplify" the recap away on the strength of it.
+///
+/// `AnswerKind::Canceled` is the engine-internal sentinel used by
+/// `archive_thread` to resolve a pending question card before tearing the
+/// thread down — resuming there would race the subsequent `stop_agent`
+/// call. `AnswerKind::Superseded` is excluded for the same class of reason: the
+/// follow-up that superseded the question is itself mid-flight through
+/// `process_message_with_steps_internal`, and it spawns its own `--resume` when
+/// the subprocess is dead. A continuation here would race that.
+///
+/// Returns `true` when `ContinuationRequested` was emitted, `false` when a live
+/// subprocess was found (`notify()` already woke the in-flight hook) or the
+/// answer carried no resume of its own.
+async fn ensure_resume_after_answer(
+    event_bus: &EventBus,
+    agent_sessions: &Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
+    thread_id: Uuid,
+    answer: &AnswerKind,
+    actor: Option<MessageOrigin>,
+) -> bool {
+    if answer_resolves_without_resume(answer) {
+        return false;
+    }
+    let has_live_subprocess = {
+        let sessions = agent_sessions.lock().await;
+        sessions
+            .get(&thread_id)
+            .map(|s| s.is_live())
+            .unwrap_or(false)
+    };
+    if has_live_subprocess {
+        return false;
+    }
+    crate::engine::thread_events::emit_continuation_requested_or_log(
+        event_bus,
+        thread_id,
+        ANSWERED_AFTER_IDLE_REASON,
+        actor,
+        "[CCQuestion] ContinuationRequested (resume after idle answer)",
+    )
+    .await;
+    true
+}
+
+/// Arm the run-loop resume signal on a *live* coding-agent subprocess so the turn
+/// it continues after a question answer re-arms event emission. The answer is
+/// delivered to CC via its PreToolUse hook (`notify_and_release_waiter`), not via
+/// `msg_tx`, so it never reaches the `msg_rx` arm's `reset_per_turn_flags` — the
+/// only place the run loop clears `emitted_terminal_event`. Setting
+/// `question_resume_pending` lets the loop self-heal: it reads-and-clears the flag
+/// on the per-event lock it already takes and, if the turn was terminal-armed,
+/// resets the per-turn flags before matching CC's first post-answer event instead
+/// of dropping it as a "post-terminal straggler".
+///
+/// Must run BEFORE `notify_and_release_waiter` so the flag is visible before CC
+/// resumes. No-op for `AnswerKind::Canceled` (the thread is being torn down) and
+/// for a dead/absent subprocess (that path spawns a fresh `--resume` turn via
+/// `ensure_resume_after_answer`, whose new run loop starts with clean flags).
+/// Returns whether a live subprocess was armed.
+///
+/// `AnswerKind::Superseded` DOES arm, which is why this guard is not
+/// [`answer_resolves_without_resume`] like its three neighbours. A superseded
+/// session is not being torn down. It wakes, finishes the turn it was in, and
+/// reads the follow-up only after that. Its post-answer events need the same
+/// re-arming a real answer's do.
+async fn arm_question_resume_if_live(
+    agent_sessions: &Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
+    thread_id: Uuid,
+    answer: &AnswerKind,
+) -> bool {
+    if matches!(answer, AnswerKind::Canceled) {
+        return false;
+    }
+    let mut sessions = agent_sessions.lock().await;
+    match sessions.get_mut(&thread_id) {
+        Some(s) if s.is_live() => {
+            s.question_resume_pending = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+// `pub(crate)`: the CC seeding helpers (`seed_cc_thread`, `emit_user_question`)
+// are shared with `engine_impl/shutdown_tests.rs` — the teardown-preserve tests
+// park a thread on the same question shape this suite uses.
+#[cfg(test)]
+#[path = "agent_question_tests/common.rs"]
+pub(crate) mod aq_test_helpers;
+
+#[cfg(test)]
+#[path = "agent_question_tests/tests.rs"]
+mod aq_tests;

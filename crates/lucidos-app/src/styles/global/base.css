@@ -1,0 +1,868 @@
+/* Every vendored font's faces, generated from the font catalog
+   (`crates/lucidos-engine/src/core/fonts.rs`). Each `url()` is relative, so Vite
+   hashes the file into `assets/`, which the service worker's SHELL_CACHE covers
+   once fetched. A face downloads only when text uses it. App iframes get the
+   same bytes from the engine (ADR 0077, ADR 0298). */
+@import '../generated/font-faces.css';
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html {
+    font-size: var(--user-ui-scale, 100%);
+    -webkit-text-size-adjust: 100%;
+    background: var(--bg-primary);
+    color-scheme: dark;
+    /* A tap paints no background, anywhere. It inherits, so no rule below
+       restates it. Guarded by touch-paints-no-press.test.ts. */
+    -webkit-tap-highlight-color: transparent;
+}
+
+:root {
+    /* Font stacks */
+    --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+    /* NOT the UI font. This is the pre-JS floor, and it is deliberately the
+       local system stack: the inline FOUC script in index.html overwrites
+       --font-ui on <html> before this sheet is even parsed, so this value only
+       paints if that script somehow did not run, and at that instant no web
+       font can be assumed decoded either. What paints is `resolveFontKey` in
+       the appearance contract. */
+    --font-ui: var(--font-mono);
+    /* Neutral system sans-serif — the gateway workspace picker opts out of the
+       app's monospace --font-ui for a calmer, brand-neutral surface. Native
+       stack so it needs no font load and is unaffected by a user font preference
+       (which only overrides --font-ui). */
+    --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+
+    /* Z-index scale */
+    --z-float: 20;
+    --z-dropdown: 100;
+    --z-sticky: 200;
+    --z-drawer: 300;
+    --z-control-panel: 2200;
+    /* The floor of the widget windows' band (ADR 0419). Each window adds its
+       stack rank. They float over the panes, the drawer and the header
+       chrome, and under popovers, menus, modals and toasts. */
+    --z-widget-window: 2210;
+    /* Popovers and menus, above the header chrome they open from and above
+       the widget windows, so a menu is never drawn behind a window. */
+    --z-popover: 2220;
+    /* A pseudo-fullscreen app panel (.app-ui-fullscreen, the CSS fallback used
+       where the Fullscreen API is unavailable) covers the header chrome (2200)
+       and is covered by the modal layer (2300). Both halves are load-bearing:
+       fullscreen means the app owns the screen, but the host's own modals and
+       toasts are the only way it can talk to the reader, so they must still
+       paint over it. It sat at --z-tooltip until 2026-08-05, which is why an
+       app's lucidos.ui.previewFile / confirm / prompt / toast rendered behind
+       the app and the reader's click looked like it did nothing. */
+    --z-app-fullscreen: 2250;
+    /* The FLOOR of the modal band, not a single level. Each open modal adds its
+       overlay-stack depth to this (see store/overlayStack.ts), so the one the
+       reader opened last is the one drawn on top: a confirm raised BY a modal
+       has to cover the modal that asked. The band tops out at
+       --z-modal + MAX_MODAL_STACK_DEPTH, and .ui-blocking-overlay sits above
+       all of it at --z-modal + 50.
+       The floor is above the floating header chrome (2200) so the dim backdrop
+       covers it. Otherwise header buttons punch through, show tooltips on
+       hover, and outside-click never lands on the overlay. */
+    --z-modal: 2300;
+    /* Toasts sit above the whole modal band and above .ui-blocking-overlay, so
+       they remain visible over any open modal and during a client refresh. */
+    --z-toast: 2400;
+    /* NOTE: the boot splash sits above all of the above (z-index 2500), but it is
+       inlined in index.html (it must paint before this bundle's CSS loads), so it
+       hardcodes 2500 there rather than referencing a token defined here. */
+    --z-tooltip: 10000;
+
+    /* Surfaces: every toast, popover, menu and dialog (styles/global/surface.css).
+       A control sits inside a surface, so its corner is the smaller step. */
+    --radius-control: 0.5rem;
+    --radius-surface: 0.75rem;
+    /* Circles and pills. On a square box 999px clamps to half the side, the
+       same circle as 50%. Every other corner in the shell is a multiple of
+       the two steps above, so a theme can square the whole UI. Spinners and
+       badges are the exceptions and stay round (styles/badges.css). */
+    --radius-round: 999px;
+    /* Light mode inverts the background ladder, so it overrides this fill. */
+    --surface-bg: var(--bg-secondary);
+    /* The one dimming wash behind a blocking surface. Only the image viewer and
+       the camera go darker, because they are lightboxes. */
+    --scrim: rgba(0, 0, 0, 0.5);
+    /* Casts upward, for a surface docked under the content it lifts off. */
+    --shadow-up: 0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1);
+
+    /* Transitions.
+     *
+     * Every duration below is its 1x literal MULTIPLIED by --duration-scale,
+     * the diagnostic Animation speed slider (Settings > System > Debugging),
+     * published onto :root by store/effects.ts as the reciprocal of the speed.
+     * That multiplication is the only thing that carries the slider into CSS:
+     * it used to reach the JS-driven animations alone (FLIP rows, toasts) while
+     * all 100-odd token-driven transitions ran at 1x whatever the slider said.
+     * A new duration token joins the same form, or it silently opts out.
+     *
+     * 1 here is both the untouched-slider value and the value that holds for
+     * the frame before the effect first runs, so nothing moves for a user who
+     * never opens the setting. Unitless, so the tokens can multiply it. */
+    --duration-scale: 1;
+    --duration-fast: calc(0.15s * var(--duration-scale));
+    --duration-normal: calc(0.2s * var(--duration-scale));
+    --duration-slow: calc(0.3s * var(--duration-scale));
+    /* For deliberate state-change cues that must register with the user
+     * (e.g. Send → Cancel morph). Reach for normal/slow first. */
+    --duration-emphasis: calc(0.5s * var(--duration-scale));
+
+    /* Layout */
+    --divider-width: 0.1875rem;
+    --content-max-width: 50rem;
+    /* The thread pane's horizontal gutter, shared by the transcript
+       (.thread-content) and the composer below it (.prompt-area). The two must
+       carry the SAME left inset and the SAME right inset, or the composer box
+       stops lining up with the turn content it sits under. A step off the
+       --space-* scale below (the thread pane's own gutter, one step tighter than
+       the content pane's --space-lg), named for the coupling it carries.
+       Plus the side inset below. */
+    --thread-pane-gutter: calc(var(--space-md) + var(--phone-side-inset));
+    /* What every pane keeps clear at each side. 0 here; the phone layout
+       (mobile.css) sets it to clear the Dynamic Island and rounded corners. */
+    --phone-side-inset: 0px;
+    /* Width the platform reserves for a classic (layout-consuming) scrollbar,
+       published in px at boot by utils/scrollbarGutter.ts and re-measured when
+       the UI scale changes (our ::-webkit-scrollbar width is rem-sized). It is
+       0px wherever scrollbars are overlay: iOS, and macOS unless the system is
+       set to always show them.
+
+       The transcript scrolls and the composer does not, so the transcript's
+       centered content is shifted left by half this width relative to any
+       non-scrolling sibling. `.thread-content` reserves it unconditionally via
+       `overflow-y: scroll` + `scrollbar-gutter: stable` (so a short thread
+       doesn't shift when it grows past one screen), and every sibling that must
+       line up with the transcript adds it to its own right inset. */
+    --scrollbar-gutter-width: 0px;
+    /* The safe-area insets. Read these, never env() directly: an iOS home-screen
+       app can lose its env() insets mid-session, and utils/safeAreaFloor.ts
+       restores them through the --safe-area-floor-* vars. That floor arm is a
+       temporary measure (docs/temporary-measures.md, "Safe-area floor"). */
+    --safe-area-top: max(env(safe-area-inset-top, 0px), var(--safe-area-floor-top, 0px));
+    --safe-area-right: max(env(safe-area-inset-right, 0px), var(--safe-area-floor-right, 0px));
+    --safe-area-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-floor-bottom, 0px));
+    --safe-area-left: max(env(safe-area-inset-left, 0px), var(--safe-area-floor-left, 0px));
+    /* Height of the desktop app header (.app-header, panels/shell.css): the
+       2.5rem .pane-header bar plus its 0.25rem top padding plus the safe-area
+       inset the header reserves. */
+    --app-header-height: calc(2.5rem + 0.25rem + var(--safe-area-top));
+    /* Viewport y of the app header's BOTTOM edge. Every position:fixed element
+       that must sit below the header anchors to this, because a fixed element's
+       top is measured from the viewport rather than from the header's flex slot.
+       It has to include --titlebar-inset: on the packaged macOS build
+       (titleBarStyle:"Overlay") the reclaimed title-bar band (.titlebar-strip)
+       sits ABOVE the header and pushes it down, so anything anchored to the bare
+       header height lands ~28px too high and overlaps the header controls. The
+       var is unset (0px) on web / PWA / non-macOS, so those are unchanged.
+       Mobile redefines this in mobile.css: its header is fixed at the viewport
+       top instead, so the anchor there is the measured header height alone. */
+    --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px) + var(--app-conn-banner-height, 0px) + var(--app-ingress-banner-height, 0px) + var(--app-refusal-banner-height, 0px) + var(--app-slowness-banner-height, 0px));
+    /* The breathing room a surface HUNG FROM the header leaves below that edge,
+       so it reads as coming out of the row it was opened from rather than as
+       welded to it. The other half of the anchor above, and it lives beside it
+       for the same reason: a surface that picks its own gap starts on a
+       different line from every other one. Its users are the Lucidos menu
+       (.brand-menu, styles/header-mark.css), the Search everywhere palette
+       (components/search/SearchEverywhere.css) and file search. */
+    --header-surface-gap: 0.5rem;
+    /* The width the surfaces hung from the header share: the Lucidos menu,
+       file search, and Search everywhere on a phone (desktop gives Search
+       everywhere more room). Its size is a budget: the
+       menu's Workspaces row must spell an ordinary workspace name whole. On a
+       phone the `min()` keeps a 1rem margin to each screen edge. */
+    --header-surface-width: min(22rem, calc(100vw - 2 * var(--space-lg)));
+    /* Height of the app-shell banner that sits between the desktop header and
+       the panes (Settings-less chrome such as the backup reminder), published
+       live by the banner's own ResizeObserver and absent when no banner is up.
+       It is a term of the anchor above so the toast stack and the drawer clear
+       the banner instead of starting behind it. Mobile does NOT need it: there
+       the banner renders inside the fixed header, whose measured height
+       (--mobile-header-height) already includes it. */
+    --app-banner-height: 0px;
+    /* The connection banner's own height, on the same terms. A SECOND property
+       rather than a share of the one above, because both bars can be up at once
+       and each publishes from its own ResizeObserver: one property would mean
+       whichever measured last wins, and retracting either would clear the
+       reservation for both. */
+    --app-conn-banner-height: 0px;
+    /* The webhook ingress bar's own height, a THIRD property on the same terms.
+       It is up whenever the public delivery path has failed for two probe
+       cycles, which is independent of both bars above: a workspace this client
+       reaches perfectly well can still be unreachable from the internet. */
+    --app-ingress-banner-height: 0px;
+    /* The webhook refusal bar's own height, a FOURTH property on the same
+       terms. It is up whenever a hook is throwing away the deliveries that DO
+       arrive, which is independent of the bar above: the ingress probe reads a
+       401 as healthy, so a hook refusing everything passes it perfectly. */
+    --app-refusal-banner-height: 0px;
+    /* The slowness bar's own height, a FIFTH property on the same terms. It
+       says a reachable workspace is slow, which is independent of every bar
+       above, so it stands alongside them. */
+    --app-slowness-banner-height: 0px;
+    /* How much of a state colour an app-shell banner washes over its surface.
+       Shared by every bar so they read as one family, and named so the live
+       style remote can retune the wash without reaching into four rules. */
+    --banner-tint-strength: 10%;
+    /* The connection banner's line-height, stated rather than inherited and
+       named rather than written into the rule, because the dot's offset is
+       derived from it: the offset lands the dot on the sentence's FIRST line,
+       so a second copy of the number would drift the dot off that line the
+       moment either is retuned. */
+    --banner-line-height: 1.4;
+    /* The dot leading the connection banner's sentence. Named because the
+       shared `.status-dot` scale carries colour only: every host sizes its own
+       (see `--brand-menu-notice-dot`, the same dot inside the Lucidos menu). */
+    --connection-banner-dot: 0.5rem;
+    /* Height of the desktop transcript's top fade (the mask that dissolves
+       messages as they scroll up under the thread title header — see
+       .thread-content in chat/input-messages.css). Shared so the deep-link /
+       navigation scroll clearance (.chat-exchange scroll-margin-top in
+       chat/response.css) lands an element BELOW this band, not inside it where
+       its top / focus-marker highlight would be faded out. */
+    --thread-top-fade: 1.5rem;
+    /* Height of the mobile transcript's top fade — the gradient below the sticky
+       thread-title bar (.mobile-thread-title-row::after in mobile.css) that
+       dissolves content scrolling up under the bar. Shared with the mobile
+       .chat-exchange scroll-margin-top (chat/response.css) so a navigated turn
+       lands clear of it. Mobile's desktop-mask analog; kept a touch shorter. */
+    --mobile-title-fade: 0.75rem;
+    /* How deep rows dissolve as a disclosure rolls them under the header or
+       parent row above (host-components.css). The transcript's own depth. */
+    --disclosure-fade: var(--thread-top-fade);
+    /* The band below the mobile header where content dissolves on its way
+       under the bar (.app-header::after in mobile.css). */
+    --mobile-header-fade: 0.5rem;
+    /* How far the navigation focus marker (.nav-focus-stuck, host-components.css)
+       reaches beyond a turn's box. The marker is a background wash whose visible
+       edge IS the box, plus a glow blooming past it; this is the reach the
+       transcript reserves for that bloom. At the bottom it is padding past
+       --prompt-fade. At the top the first turn's feed padding covers it, and
+       the fade is off at rest there. So a first or last turn's marker is never
+       dissolved by a fade. Deliberately kept at the old outline frame's exact reach (its
+       0.1875rem offset + 0.1875rem width) rather than grown to the glow's full
+       1.5rem blur: growing it would push every deep-link landing further down the
+       transcript, and a soft halo half-dissolved in a fade is invisible in a way a
+       clipped hard outline was not. Keep in sync with .nav-focus-stuck if the
+       HARD-EDGED part of the marker changes: this token and the marker's paint are
+       coupled, and nothing else in the tree records that. (The soft glow is
+       deliberately allowed to exceed it, per the paragraph above, so a change to the
+       blur radius alone is not a reason to move this.) */
+    --nav-focus-reach: 0.375rem;
+    /* Desktop floating scroll chevrons (.scroll-to-top / .scroll-to-bottom in
+       chat/input-messages.css). Since these were pulled IN from the right gutter
+       to sit OVER the centered transcript (fix 956b47519), a deep-link / turn-nav
+       landing near the top would tuck the element (and its focus-marker glow)
+       right under the up-chevron with no room. Shared here so the landing
+       clearance (.chat-exchange scroll-margin-top, chat/response.css) is computed
+       from the chevron's OWN size + top inset and can never drift from it. */
+    --scroll-chevron-size: 1.5rem; /* button diameter (width == height) */
+    --scroll-chevron-glyph: var(--icon-size-md);
+    --scroll-chevron-top: 0.75rem; /* desktop top inset (see @media hover) */
+    /* Height of the transcript's bottom dissolve: the bg-colored gradient band
+       .prompt-area::before (panels/content.css) draws over the scroll area. The
+       transcript's bottom padding reserves this plus --nav-focus-reach so the
+       last turn's focus marker clears it. The band sizes itself from this var,
+       so the two are coupled by construction rather than by hand. */
+    --prompt-fade: 1rem;
+    /* Left inset shared by a turn's body content — LLM response body and every
+       initiator body (change card, question, permission, child completion) line
+       up against the same edge. Also the UNIFORM gap the navigation focus marker
+       leaves to a turn's content on all four sides (chat/response.css). */
+    --turn-body-inset: 0.4rem;
+    /* Distance from a NESTED thread-pane surface's outer edge to its content.
+       Two of them stack on the --turn-body-inset edge above: a question or
+       permission card inside a turn (.question-body) and the composer box below
+       the transcript (.prompt-box). The composer docks directly under the
+       cards, so their CONTENT has to start at the same x. Matching the outer
+       box edges alone still leaves the typed text a few px right of the card
+       text it sits under, which is what reads as "the composer is misaligned
+       on the left". Each surface subtracts its OWN border, because the card's
+       is a 1px hairline and the composer's is the thicker
+       --prompt-box-border-width focus ring. Value = the card's historical
+       1px + 0.875rem. */
+    --turn-surface-inset: calc(0.875rem + 1px);
+    /* .prompt-box's border (panels/previews.css). A token because the composer's
+       inner padding is derived from --turn-surface-inset MINUS this, so the two
+       cannot be changed independently without moving the composer's content off
+       the card content edge. Deliberately px, not the 0.125rem it used to be
+       (the rem rule exempts border widths, and the card's hairline is a literal
+       1px for the same reason): a border width is snapped to a whole unit before
+       layout, so a rem value that lands on 2.25px or 2.5px at a scaled root is
+       rounded by an amount the calc above cannot see, and the composer's text
+       drifts back off the card edge by a fraction of a px. Chromium snaps to
+       whole CSS px, WebKit to device px, so the drift also differed per engine. */
+    --prompt-box-border-width: 2px;
+    /* Vertical feed-rhythm padding on every transcript turn (.initiator-panel /
+       .response-panel in chat/input-messages.css) — the space between adjacent
+       turns (there is no divider line). Named so the navigation focus marker can
+       hand this padding back as margin when it tightens a focused turn's box to a
+       uniform gap (chat/response.css .nav-focus-stuck rule). */
+    --turn-feed-pad-y: 0.85rem;
+    /* One line of a turn header (.initiator-header / .response-header): the box
+       every field on that row is sized to, so the actor chip, the turn controls
+       and the status all resolve to the SAME height and their content centres on
+       one line. It is what lets the headers align at flex-start rather than
+       centre: once the status + timestamp cluster stacks, centring measured the
+       chip against BOTH its lines and dropped the executor's name half a line
+       below the status beside it. Sized above every field's natural height (the
+       tallest is a turn control, a 0.875rem glyph in 0.25rem of padding), so
+       pinning them to it grows nothing and the one-row header is unchanged.
+       Was the headers' bare `min-height: 1.2rem`, which is still one of its
+       jobs; named because the fields now have to agree with it.
+       See styles/__tests__/turn-meta-stacking.test.ts. */
+    --turn-header-line: 1.2rem;
+
+    /* Icon sizes (used by .icon-btn variants) */
+    --icon-size-sm: 0.875rem;
+    --icon-size-md: 1rem;
+    --icon-size-lg: 1.25rem;
+
+    /* Type scale — the only sanctioned font sizes. Snap to the nearest step;
+       don't reintroduce eyeballed in-between values (0.8/0.85/0.72rem …). The
+       `rem` units keep every step scaling with the user's UI-scale preference
+       (html font-size = var(--user-ui-scale)). This block is MIRRORED into the
+       engine's api/sdk_iframe.css :root so app iframes (which never load this
+       file) get the same scale via the appended shared-components.css — keep the
+       two in sync. em/percentage/inherit font-sizes stay literal on purpose
+       (they're deliberately relative). */
+    --font-size-3xs: 0.5625rem;   /* 9px — micro-label / tiny uppercase badge */
+    --font-size-2xs: 0.625rem;    /* 10px — dots, micro-meta */
+    --font-size-xs: 0.6875rem;    /* 11px — dense metadata */
+    --font-size-sm: 0.75rem;      /* 12px — labels, secondary */
+    --font-size-md: 0.8125rem;    /* 13px — body default */
+    --font-size-lg: 0.875rem;     /* 14px — emphasis */
+    --font-size-xl: 1rem;         /* 16px — section headings */
+    --font-size-2xl: 1.125rem;    /* 18px — larger headings */
+    --font-size-3xl: 1.25rem;     /* 20px — large headings */
+    --font-size-display: 2.25rem; /* 36px — hero */
+
+    /* Spacing scale — the sanctioned structural padding/gap steps. MIRROR of the
+       app-iframe --space-* scale in the engine's api/sdk_iframe.css :root (apps
+       never load this file, so the two are defined separately) — the VALUES must
+       stay identical so a shared component (e.g. .list-row in shared-components.css,
+       which is served to app iframes) renders the same rhythm in both. Do NOT
+       redefine an existing step's value here without changing sdk_iframe.css too —
+       apps in the wild key off these. Content-pane views snap their structural
+       padding to these and share the --space-lg (1rem) horizontal gutter; see the
+       "content-pane padding" rule in .claude/rules/frontend.md. */
+    --space-xs: 0.25rem;   /* 4px */
+    --space-sm: 0.5rem;    /* 8px */
+    --space-md: 0.75rem;   /* 12px */
+    --space-lg: 1rem;      /* 16px — the content-pane horizontal gutter */
+    --space-xl: 1.5rem;    /* 24px */
+
+    --dot-gap: 0.35rem;
+
+    /* Default spinner stroke weight */
+    --spinner-weight: 0.125rem;
+
+    /* Brand blue — the icon-mark identity color (see WorkspacePicker mark).
+       Theme-independent; the badge text on the header pill uses --brand-blue-deep
+       in both themes. The header BAR background (--header-gradient) is defined
+       per-theme below — vivid brand blue on the white app, deep navy on the dark
+       app — and must NOT live here: :root (0,1,0) would out-specify the dark
+       theme block's bare `html` selector (0,0,1) and clobber the override. */
+    --brand-blue: #1a6fd0;
+    --brand-blue-deep: #0a4ea8;
+
+    /* Focus ring — the single soft accent band shared by every focusable button
+       (.action-btn, .icon-btn, dropdowns, question options, …). `--accent` is
+       resolved per theme at use time, so one definition covers both. The
+       transparent outline each rule keeps alongside this is the forced-colors
+       fallback. Redefine --focus-ring on a context (e.g. the blue app header)
+       to recolor the ring there without touching every button rule.
+
+       The band paints outside the box and adds nothing to scrollable overflow,
+       so a box that clips cuts it at a flush edge. Such a box reserves ring
+       room of --focus-ring-width there (frontend-css.md § Focus rings). The
+       ring stays a literal because a theme replaces it whole, and
+       focus-ring-width.test.ts holds every definition's band to the width. */
+    --focus-ring-width: 0.1875rem;
+    --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* A finger needs a bigger target than a pointer, so the floating chevrons grow
+   on touch. They stop at the mobile header's own button box, so they never read
+   larger than the header buttons above them. */
+@media (pointer: coarse) {
+    :root {
+        --scroll-chevron-size: var(--mobile-header-icon-box);
+        /* How far a chevron's tap target reaches past its circle, on every
+           side (chat/input-messages.css). It equals the 0.75rem gap each
+           chevron keeps to the title bar and the composer, so it never takes
+           their taps. */
+        --scroll-chevron-reach: 0.75rem;
+    }
+}
+
+/* Dark theme (default) */
+html, html[data-theme-mode="dark"] {
+    /* Very dark blue, anchored on the brand/logo blue (--brand-blue-deep
+       #0a4ea8) but much darker — the app's near-black surfaces retinted toward
+       navy so the whole dark theme reads as "logo blue, dark" rather than grey.
+       The ladder keeps roughly the same lightness steps as the old GitHub-dark
+       greys, just shifted onto the logo hue (~215°). The anti-flash literals in
+       index.html / preferences.ts / sdk_prefs.rs / sdk_iframe.css must match
+       --bg-primary exactly (they paint before this CSS loads). */
+    --bg-primary: #07172e;
+    --bg-secondary: #0d2244;
+    --bg-tertiary: #163052;
+    --bg-quaternary: #21406c;
+    --border-color: #2c456a;
+    --bg-hover: #122a4a;
+    --bg-selected: #163356;
+    /* Accent-tinted "picked" surface: user message bubble, selected/answered
+       question option, freetext resolution. One recipe so
+       the whole picked family stays in lockstep (overridden per theme below). */
+    --picked-surface: color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary));
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-muted: #6e7681;
+    --text-on-accent: #fff;
+    /* Bold text, where the UI font has no bold face ([data-font-bold]): a step
+       brighter than the text, like a terminal's bright attribute. */
+    --text-strong: color-mix(in oklab, var(--text-primary) 60%, white);
+    /* A theme's text glow, off by default. The engine compiles a theme's value
+       into the text-shadow part tokens, so no rule reads this token. */
+    --text-glow: none;
+    --accent: #58a6ff;
+    --accent-light: #7ab8ff;
+    /* Action-button blue — darker than the bright sky-blue --accent (which stays
+       the link/badge/active-state accent), but lifted a little off the brand
+       blue toward that accent so it isn't too heavy. Carries white text with
+       good contrast either way. */
+    --accent-action: color-mix(in srgb, var(--brand-blue) 82%, var(--accent));
+    --accent-green: #3fb950;
+    /* Green for a status WORD in a pill ("Installed", "applied"). The full
+       --accent-green shouts at pill size, so this pulls it toward the grey of
+       secondary text. One declaration serves both themes: it resolves against
+       whichever --accent-green and --text-secondary the theme sets. Host-only,
+       like --accent-notable below. */
+    --accent-green-soft: color-mix(in srgb, var(--accent-green) 60%, var(--text-secondary));
+    /* Caution ONLY — see the --accent-notable note below for the other half of
+       what this token used to carry. A muted sand rather than a saturated gold:
+       the previous #d29922 was GitHub's attention-yellow, tuned for GitHub's
+       neutral grey-black, and at HSL 40° / 48% lightness it read as brown on
+       this theme's navy. Sand keeps the warm caution reading without the mud.
+       App-facing (documented in system-knowhow/js-sdk.md) — the name is a
+       contract, so shipped apps keep resolving it; mirrored by value in the
+       engine's api/sdk_iframe.css. */
+    --accent-yellow: #d9c48f;
+    --accent-red: #f85149;
+    --accent-orange: #D97757;
+    /* Neutral "notable state" — a state worth marking that is NOT a caution:
+       waiting, canceled-adjacent, trimmed, changed, non-default. Split off
+       --accent-yellow, which used to paint both and so made every one of these
+       look like a warning. Cool grey-blue recedes the way an informational
+       marker should. Host-only by design: not defined in sdk_iframe.css, so
+       never reference it from shared-components.css (that file is served to
+       app iframes, where the variable would not resolve). */
+    --accent-notable: #9db4d0;
+    /* The navigation focus marker's spotlight (.nav-focus-stuck in
+       host-components.css): plain white here, and NEUTRAL by request. The marker
+       is a light shone on the thing the user landed on, not a colour that means
+       something, so it now carries no hue at all. That also settles the collision
+       question rather than navigating it: a wash with no hue cannot be mistaken
+       for another hue's surface, so there is no neighbouring token to keep clear
+       of, and no judgement to redo when a new coloured surface ships.
+
+       The one thing it must still NOT be is the accent, and that is a correction
+       rather than a preference. The marker used to wash the landed element in
+       --accent at 16%, which is the same hue at nearly the same alpha as
+       --picked-surface (--accent at 12%, worn by the user bubble, the selected
+       question option), so a spotlit turn read as a
+       PICKED surface rather than as a marker. Blue could not have carried the
+       signal anyway: the header, the links and the badges are all already blue,
+       so nothing about an accent wash says "look here".
+
+       The light theme carries a GREY rather than white, which looks like an
+       oversight and is not: the two themes have opposite problems, so one value
+       cannot serve both. Over a near-black navy a wash can only lift toward its
+       own colour, so dark needs the brightest neutral there is; over white nothing
+       can be added, so light needs a DARKER neutral to sink the surface instead.
+       Same absence of hue, driven from opposite ends of the scale.
+
+       Do not reuse a SEMANTIC token for either value. A marker must not assert a
+       STATE, so reaching for the caution or success token would say something is
+       wrong with, or has succeeded about, the thing the user just navigated to.
+       Neutral makes that easy to hold: there is nothing here for a reader to
+       interpret as a status in the first place.
+
+       Host-only by design, like --accent-notable above: the marker is host chrome
+       and never renders in an app iframe, so this is absent from the engine's
+       sdk_iframe.css and must never be referenced from shared-components.css. */
+    --nav-focus-glow: #ffffff;
+    /* The marker's hairline border, off here: the white wash already stands out
+       on navy. Keep it defined, since a missing value drops the whole marker. */
+    --nav-focus-border-alpha: 0%;
+    /* Sole survivor of the --initiator-* family: the coding-agent brand orange.
+       Its one reader is --claude-mark below. */
+    --initiator-coding-agent: #fb923c;
+    /* The actor icons' brand colours, one value for both modes. Each var() that
+       reads them repeats the default as its fallback, so a mark painted before
+       this sheet loads looks the same. --claude-mark resolves here on <html>,
+       so a theme that sets only --initiator-coding-agent still recolours it. */
+    --lucidos-mark-bg-top: #2d83e0;
+    --lucidos-mark-bg-bottom: #0a4ea8;
+    --lucidos-mark-fg: #ffffff;
+    --claude-mark: var(--initiator-coding-agent);
+    --codex-mark: var(--accent-light);
+    --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);
+    --syntax-key: #9cdcfe;
+    --syntax-string: #ce9178;
+    --syntax-number: #b5cea8;
+    --syntax-keyword: #569cd6;
+    --syntax-comment: #6a9955;
+    --syntax-control: #c586c0;
+    --syntax-type: #4ec9b0;
+    --syntax-function: #dcdcaa;
+    /* Header bar — a muted, deeper blue in dark mode: clearly reads as brand-blue
+       chrome but calmer than the vivid light-mode blue (which glows as a bright
+       slab against the near-black app), without sinking into murky navy. Light
+       foreground stays legible on it.
+       The two STOPS are named, in every theme that sets the gradient, because
+       things drawn ON the bar have to match it. `--titlebar-strip-bg` takes the
+       top one; `--header-badge-ring` (panels/shell.css) mixes both.
+       A literal copied into either would drift the first time a stop moves. */
+    --header-bar-top: #15549e;
+    --header-bar-bottom: #0b3868;
+    --header-gradient: linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%);
+    /* Active-pane cue — the mobile active pane dot (.mobile-dot.active) wears
+       this fill + layered neon bloom on the header bar. The body is a soft cool
+       BLUE — landing between the prior brand blue and near-white (a midpoint of
+       the two), so it reads bright and high-contrast on --header-gradient's deep
+       blue stop while keeping a clear blue tint rather than going fully white; the
+       soft blue bloom reinforces the brand identity. Per theme it's tuned only
+       slightly — the light override below is a touch lighter/more opaque to stay
+       crisp on the brighter light bar. */
+    --focus-pill-bg: rgba(169, 197, 232, 0.87);
+    --focus-pill-glow: 0 0 0.25rem rgba(178, 206, 240, 0.42),
+                       0 0 0.625rem rgba(158, 190, 232, 0.28);
+    /* Focused-pane header wash — a faint lighter-blue overlay filling the focused
+       pane's header segment (the .header-focus-wash box), so the whole segment
+       reads a touch lighter-blue than the deep bar — the visual cue for which pane
+       is focused. Same soft cool-blue hue as the active-pane dot at a much lower
+       alpha so it lightens without flattening the brand blue; it crossfades in/out
+       as focus moves between panes. */
+    --focus-header-tint: rgba(169, 197, 232, 0.12);
+    /* A second focus cue: a line along the bottom of the focused pane's header
+       segment. Off by default, so the wash above carries focus alone. A theme
+       that wants an underline instead sets a colour here and clears the tint.
+       A px width, like a border: a rem would round at a scaled root. */
+    --focus-header-underline: transparent;
+    --focus-header-underline-width: 2px;
+    /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
+       TOP stop above, so the strip is seamless with the header's top edge. */
+    --titlebar-strip-bg: var(--header-bar-top);
+    /* 1 carries --header-gradient up through that band as one fill with the
+       header (panels/shell.css). Off here, so the band stays solid. A theme
+       that sets its own header fill gets 1 (theme-tokens.json). */
+    --titlebar-strip-continues: 0;
+    /* The header bar's foreground scale, the same in both modes because the
+       bar is brand blue in both. Declared here, on <html>, rather than on
+       .pane-header, so a theme can retune it (panels/shell.css). */
+    --header-fg: #ffffff;
+    /* An alpha of its own, because the Filter glyph paints the muted tone as
+       an opaque shape under a group opacity (.crossfade-glyph in shell.css). */
+    --header-fg-muted-alpha: 0.72;
+    --header-fg-muted: color-mix(in srgb, var(--header-fg) calc(var(--header-fg-muted-alpha) * 100%), transparent);
+    /* The veil steps a header control wears, as alphas of --header-fg: one step
+       under the pointer, a stronger one while toggled on. Alphas rather than
+       colours, because a badge riding a control washes the same veil over the
+       ring colour, so the ring matches the square its button drew. */
+    --header-control-veil-hover: 12%;
+    --header-control-veil-active: 22%;
+    --header-control-veil-active-hover: 30%;
+    /* Off, so the bar reads as one seamless header across the pane splits. The
+       divider geometry is kept (panels/shell.css), so a theme can turn it on. */
+    --header-divider: transparent;
+    --header-badge-bg: #ffffff;
+    --header-badge-fg: var(--brand-blue-deep);
+
+    /* The protected palette of the default theme, which paints nothing inline.
+       Engine-derived and literal, so no override flows through (ADR 0309).
+       core/themes tests fail on drift and print the block to paste. */
+    --protected-bg: #07172e;
+    --protected-surface: #0d2244;
+    --protected-inset: #0d2244;
+    --protected-raised: #163052;
+    --protected-picked: #1e3e67;
+    --protected-text: #e6edf3;
+    --protected-text-muted: #a0aab4;
+    --protected-accent: #62abff;
+    --protected-caution: #d9c48f;
+    --protected-confirm-text: #45be55;
+    --protected-danger-text: #ff8579;
+    --protected-confirm: #008a28;
+    --protected-on-confirm: #ffffff;
+    --protected-danger: #dd3532;
+    --protected-on-danger: #ffffff;
+    --protected-action: #2176d5;
+    --protected-on-action: #ffffff;
+    --protected-scrim: rgba(0, 0, 0, 0.5);
+    --protected-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+}
+
+/* iOS PWA dark-mode brand-blue correction (iPhone OLED).
+   The dark-mode brand blues above are genuine blue (~212° hue), but iPhone OLED
+   panels emit *saturated deep* blue with a violet bias, so the blue header
+   chrome reads slightly purple in the iOS PWA while looking correct on every
+   other display. `main.tsx` adds `.ios-pwa` to <html> only for an iOS standalone
+   PWA (isIOSPwa()), so this nudges ONLY the deep header blues a couple of degrees
+   toward cyan for that context — desktop, Android, and iOS-in-Safari are
+   pixel-identical. The nudge is deliberately faint (~a quarter off the base
+   blue): the same shift reads far stronger on the large header slab.
+   `--accent` is intentionally NOT overridden — the lighter sky-blue accent does
+   not pick up the OLED violet, and nudging it shifted accent-derived chrome
+   (the --focus-ring band and the info-toast border) off the app's standard blue.
+   Higher specificity than the `html, html[data-theme-mode="dark"]` block above. */
+html.ios-pwa[data-theme-mode="dark"] {
+    --header-bar-top: #15579c;
+    --header-bar-bottom: #0b3a66;
+    --header-gradient: linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%);
+    --titlebar-strip-bg: var(--header-bar-top);
+}
+
+/* A theme or mode swap repaints every colour at once. Until it has painted, no
+   transition runs, so no control eases from the old colours while the page
+   around it snaps (markThemeSwap in store/actions/preferences.ts). */
+html[data-theme-swap] *,
+html[data-theme-swap] *::before,
+html[data-theme-swap] *::after {
+    transition: none !important;
+}
+
+/* Light theme */
+html[data-theme-mode="light"] {
+    color-scheme: light;
+    --bg-primary: #ffffff;
+    --bg-secondary: #f6f8fa;
+    --bg-tertiary: #e1e4e8;
+    --bg-quaternary: #d0d7de;
+    --border-color: #d0d7de;
+    --bg-hover: #eaeef2;
+    --bg-selected: #eff2f5;
+    /* Elevation runs toward white here, so a floating surface sits on the
+       brightest fill and floats on its shadow and hairline. */
+    --surface-bg: var(--bg-primary);
+    /* Lighter in light mode — a softer tint over the near-white secondary surface
+       instead of the heavier grey tertiary, so the bubble reads gentler. */
+    --picked-surface: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
+    --text-primary: #1f2328;
+    --text-secondary: #656d76;
+    --text-muted: #8b949e;
+    --text-on-accent: #fff;
+    --text-strong: color-mix(in oklab, var(--text-primary) 60%, black);
+    --accent: #0969da;
+    --accent-light: #218bff;
+    /* Action-button blue — light mode uses the brand blue instead of the much
+       brighter accent-light scale, keeping filled CTAs anchored on white while
+       preserving strong contrast for the white label. */
+    --accent-action: var(--brand-blue);
+    --accent-green: #1a7f37;
+    /* Caution — the light-mode sand. Darker and less saturated than the dark
+       theme's #d9c48f so it clears AA on white (4.87:1); the old #9a6700 was
+       olive-brown here. Keep in sync with api/sdk_iframe.css. */
+    --accent-yellow: #8a6d2f;
+    --accent-red: #cf222e;
+    --accent-orange: #c26a4a;
+    /* Neutral notable state — see the dark-theme note. Host-only. */
+    --accent-notable: #5a7492;
+    /* Marker spotlight, a light grey. See the dark-theme note for why it carries no
+       hue, why it is not the accent, and why the two themes sit at opposite ends
+       of the neutral scale rather than sharing one value: the marker's alphas are
+       low and nothing can be added to white, so on this theme the wash has to
+       darken the surface where the dark one brightens it. Host-only.
+       Keep the wash LIGHTER than --bg-tertiary. The question option cards wear
+       that grey, so a wash at the same shade makes a landed card's options
+       vanish into it. At 16% this lands near #f1f1f1, between white and the card. */
+    --nav-focus-glow: #a8a8a8;
+    /* The marker's hairline border. The light wash is faint over white, so the
+       border is what outlines the landed turn. 60% reads as a hairline, not a frame. */
+    --nav-focus-border-alpha: 60%;
+    /* Light-theme variants — darkened so each hue passes contrast on the white surface. */
+    --initiator-coding-agent: #ea7c2a;
+    --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.08);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.1);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.1);
+    --syntax-key: #0550ae;
+    --syntax-string: #0a3069;
+    --syntax-number: #0550ae;
+    --syntax-keyword: #cf222e;
+    --syntax-comment: #6e7781;
+    --syntax-control: #8250df;
+    --syntax-type: #953800;
+    --syntax-function: #8250df;
+    /* Header bar — vivid brand blue on the white app (deep-navy dark-mode
+       variant is in the dark theme block above). */
+    --header-bar-top: var(--brand-blue);
+    --header-bar-bottom: var(--brand-blue-deep);
+    --header-gradient: linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%);
+    /* Active-pane cue — a touch lighter/more opaque than the dark-theme value so
+       the soft-blue dot stays crisp on the brighter light bar (see the dark block
+       for the intent). */
+    --focus-pill-bg: rgba(191, 213, 243, 0.93);
+    --focus-pill-glow: 0 0 0.25rem rgba(198, 220, 248, 0.5),
+                       0 0 0.625rem rgba(186, 212, 244, 0.34);
+    /* Focused-pane header wash — a touch lighter/more opaque than the dark value
+       so it stays visible on the brighter light bar (see the dark block). */
+    --focus-header-tint: rgba(191, 213, 243, 0.16);
+    /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
+       TOP stop above, so the strip is seamless with the header. */
+    --titlebar-strip-bg: var(--header-bar-top);
+    --titlebar-strip-continues: 0;
+
+    /* The default theme's protected palette, light mode (see the dark block). */
+    --protected-bg: #ffffff;
+    --protected-surface: #ffffff;
+    --protected-inset: #f6f8fa;
+    --protected-raised: #e1e4e8;
+    --protected-picked: #c7d5e6;
+    --protected-text: #1f2328;
+    --protected-text-muted: #545c65;
+    --protected-accent: #0058bd;
+    --protected-caution: #745716;
+    --protected-confirm-text: #006927;
+    --protected-danger-text: #ba001f;
+    --protected-confirm: #1a7f37;
+    --protected-on-confirm: #ffffff;
+    --protected-danger: #cf222e;
+    --protected-on-danger: #ffffff;
+    --protected-action: #1a6fd0;
+    --protected-on-action: #ffffff;
+    --protected-scrim: rgba(0, 0, 0, 0.5);
+    --protected-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+}
+
+button,
+[role="button"],
+label {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+/* Programming ligatures belong to CODE, never to prose. The font preference
+   (store/actions/preferences.ts, mirrored by the index.html FOUC IIFE)
+   publishes two values on <html>: --font-features-text and
+   --font-features-code. For a font with programming ligatures (`ligatures` in
+   the font catalog) they are '"liga" 0, "calt" 0' and '"liga" 1, "calt" 1'. For
+   every other font both are `normal`, so its rendering is unchanged. These two rules are their ONLY consumers in the host,
+   because a custom property inherits as a value and renders nothing until
+   something applies it: the scope of the feature is decided right here.
+
+   Why the feature has to be turned off at all: Fira Code's `calt` deliberately
+   re-spaces dot runs (`..` and `...` are separate contextual rules so the font
+   can tighten range operators), and a typed `...` comes out kerned tight enough
+   to read as two dots in the composer and in the transcript. That is
+   tonsky/FiraCode#1561, open upstream, with no way to disable one sequence.
+
+   TWO TRAPS, both of which shipped as a silent no-op on 2026-08-07 and were
+   settled by pixel comparison in headless Chromium. The computed value shows
+   neither, so do not "verify" a change here with getComputedStyle:
+
+   1. `normal` is NOT off. `liga` and `calt` are default-ON features, so
+      `normal` means "the font's defaults" and renders byte-identically to
+      '"liga" 1, "calt" 1'. Only the explicit zeros disable them. Deleting the
+      declaration achieves nothing at all.
+   2. Form controls do NOT inherit font-feature-settings. The UA stylesheet
+      applies the `font` shorthand to them and that shorthand resets this
+      property, so `html` alone reaches prose but stops at the composer, which
+      is the surface the bug was reported against. Hence the explicit list,
+      the same reason the app sets `font-family` on inputs by hand. */
+html,
+input,
+textarea,
+select,
+button {
+    font-feature-settings: var(--font-features-text, normal);
+}
+
+/* The other half of trap 2 above, and the reason the app "sets font-family on
+   inputs by hand" in roughly twenty places. The UA shorthand resets the whole
+   font, not just its features, so a control inherits neither the family from
+   `body` nor a size from its container: it renders in the system UI face at a
+   FIXED pixel size that does not move with the user's ui-scale at all. Every
+   one of those hand-written declarations was somebody noticing one control look
+   wrong; this is the default they were each standing in for. (Caught live by
+   e2e/type-scale.spec.ts: `.welcome-dismiss` sized itself from a token and
+   still painted in Arial.)
+
+   LONGHANDS, never the `font` shorthand. The shorthand resets `font-weight` and
+   `font-feature-settings` to their initial values, so a global one would undo
+   the rule directly above at every control at once, and clobber deliberate
+   weights. Both traps are already recorded at the sites that hit them:
+   skills.css (a shorthand ate a `font-weight: 600`, and picked up the raw root
+   size in a row that set none) and steps.css (a shorthand handed Fira Code's
+   ligatures back, needing an explicit `font-feature-settings: inherit` after
+   it). `html` is deliberately NOT in this list: `font-size: inherit` on the
+   root would override the ui-scale declaration at the top of this file, since
+   both are element selectors and this one comes later.
+
+   `inherit` rather than a token, so a control inside a smaller container (a
+   button in a `--font-size-xs` row) matches its surroundings instead of jumping
+   back to body size. */
+input,
+textarea,
+select,
+button {
+    font-family: inherit;
+    font-size: inherit;
+}
+
+/* Element selectors on purpose, so a new code surface is covered with nothing
+   to maintain: fenced blocks and inline code in markdown, the shell commands in
+   step rows (<code class="step-note-detail">), LineNumberedCode (which backs the
+   file preview and both side-by-side diff columns), RenderedDiff's removals and
+   the slides tree are all <pre>/<code>. .diff-line-content is named because
+   DiffView builds its lines out of spans instead. These re-enable explicitly
+   rather than resetting to `normal`, because they now inherit an OFF value.
+   Mirrored for app iframes in the engine's api/sdk_iframe.css. */
+code,
+pre,
+kbd,
+samp,
+.diff-line-content {
+    font-feature-settings: var(--font-features-code, normal);
+}
+
+/* The #tooltip rules moved to styles/global/shared-components.css, so one copy
+   styles the host shell and every app iframe. Do not add a copy back here. */
+
+body {
+    font-family: var(--font-ui);
+    /* The body step, so text that names no size of its own lands on prose
+       rather than on a heading. This is a DEFAULT, not a value anything is
+       expected to rely on: nearly every surface still names its own token.
+
+       Without it an unsized element resolves to the root, and the root is
+       `var(--user-ui-scale)`, which is exactly `--font-size-xl` (1rem) and is
+       labelled "section headings". So an omission did not render "unstyled",
+       it rendered a step and a half ABOVE body text, and it did so most
+       visibly at a scaled root. That shipped in Settings > System > What's New,
+       where the release notes came out larger than the version heading they sat
+       under, because `.whats-new-notes` styled its padding and stopped.
+
+       Matches `body` in the engine's api/sdk_iframe.css, which has carried the
+       same declaration since 2026-08-05 for the same reason on the app side.
+       docs/code-review-priors.md carries the history of both, including the one
+       time this was deleted on the theory that a `rem` here ignores the UI
+       scale. It does not: the token is a `rem`, so it tracks the root. */
+    font-size: var(--font-size-md);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    background: var(--bg-primary);
+    min-height: 100vh;
+    color: var(--text-primary);
+}
