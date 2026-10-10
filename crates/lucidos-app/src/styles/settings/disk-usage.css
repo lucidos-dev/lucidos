@@ -1,0 +1,237 @@
+/* Settings › System › Disk Usage. One quiet overview (a headline figure, the
+   bar and a key), one card for the recommended cleanup, then the worktree
+   list. Hairlines, not boxes, separate things. */
+
+/* Every border here is a 0.5px hairline: one device pixel on a high-density
+   screen. A border width is snapped before layout, so it rounds up to a full
+   pixel on a 1x screen. */
+
+.disk-usage-figure {
+    font-variant-numeric: tabular-nums;
+}
+
+.disk-usage-headline {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0 var(--space-sm);
+}
+
+.disk-usage-headline-value {
+    font-size: var(--font-size-xl);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.disk-usage-headline-sub {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+.disk-usage-pressure {
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+}
+
+.disk-usage-pressure-soft {
+    color: var(--accent-yellow);
+}
+
+.disk-usage-pressure-hard {
+    color: var(--accent-red);
+}
+
+/* Each segment is a flex child sized via inline `flex-grow` = byte share. */
+.disk-usage-bar {
+    display: flex;
+    width: 100%;
+    height: 0.375rem;
+    border-radius: var(--radius-round);
+    overflow: hidden;
+    background: var(--bg-tertiary);
+    margin: var(--space-md) 0;
+}
+
+.disk-usage-segment {
+    height: 100%;
+    min-width: 0.125rem;
+    transition: filter var(--duration-fast) ease;
+}
+
+@media (hover: hover) {
+    .disk-usage-segment:hover {
+        filter: brightness(1.2);
+    }
+}
+
+.disk-usage-segment-other {
+    background: var(--bg-quaternary);
+}
+
+.disk-usage-segment-workspace-data {
+    background: color-mix(in srgb, var(--accent) 35%, var(--bg-quaternary));
+}
+
+.disk-usage-segment-free {
+    background: transparent;
+}
+
+/* A categorical chart palette with a legend, not a semantic scale: c2's only job
+   is to stay distinguishable from the other five slots. It keeps --accent-yellow
+   for that reason. The cool --accent-notable used for neutral markers elsewhere
+   would put three blues in a six-slot palette (c0, c4, and it). Don't
+   "consistency-fix" this one either. */
+.disk-usage-segment-c0 { background: var(--accent); }
+.disk-usage-segment-c1 { background: var(--accent-orange); }
+.disk-usage-segment-c2 { background: var(--accent-yellow); }
+.disk-usage-segment-c3 { background: var(--accent-green); }
+.disk-usage-segment-c4 { background: var(--accent-light); }
+.disk-usage-segment-c5 { background: var(--accent-red); }
+
+/* The key's swatch for all worktrees at once: the first three palette slots,
+   since every worktree takes its own colour in the bar. */
+.disk-usage-segment-worktrees {
+    background: linear-gradient(
+        90deg,
+        var(--accent) 0 34%,
+        var(--accent-orange) 34% 67%,
+        var(--accent-yellow) 67%
+    );
+}
+
+.disk-usage-legend-swatch {
+    display: inline-block;
+    flex-shrink: 0;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: var(--radius-round);
+}
+
+.disk-usage-key {
+    display: flex;
+    flex-direction: column;
+    border-top: 0.5px solid var(--border-color);
+}
+
+.disk-usage-key-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: var(--space-sm) 0;
+    font-size: var(--font-size-sm);
+    border-bottom: 0.5px solid var(--border-color);
+}
+
+.disk-usage-key-label {
+    flex: 1;
+    min-width: 0;
+    color: var(--text-primary);
+}
+
+.disk-usage-key-note {
+    margin-left: var(--space-sm);
+    color: var(--text-muted);
+}
+
+.disk-usage-key-value {
+    color: var(--text-secondary);
+}
+
+/* The recommended cleanup. A hairline box, the figure one step above body, and
+   the button beside the text until the pane is too narrow to hold both. */
+.disk-usage-reclaim {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-md) var(--space-lg);
+    padding: var(--space-md) var(--space-lg);
+    border: 0.5px solid var(--border-color);
+    border-radius: calc(var(--radius-surface) * 0.5);
+}
+
+.disk-usage-reclaim-text {
+    flex: 1 1 14rem;
+    min-width: 0;
+}
+
+.disk-usage-reclaim-title {
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    margin-bottom: var(--space-xs);
+}
+
+.disk-usage-reclaim-figure {
+    font-size: var(--font-size-lg);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.disk-usage-reclaim-note {
+    margin: var(--space-xs) 0 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}
+
+.disk-usage-reclaim-btn {
+    flex-shrink: 0;
+}
+
+/* The worktree list: rows on hairlines, titles at body size. */
+.disk-usage-rows > .disk-usage-row + .disk-usage-row {
+    border-top: 0.5px solid var(--border-color);
+}
+
+.disk-usage-row .list-row-name {
+    font-size: var(--font-size-md);
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    overflow-wrap: anywhere;
+}
+
+.disk-usage-row .list-row-name .accent-link {
+    text-decoration: none;
+}
+
+@media (hover: hover) {
+    .disk-usage-row .list-row-name .accent-link:hover {
+        text-decoration: underline;
+    }
+}
+
+/* A margin, not a space: a space inside the link would be underlined. */
+.disk-usage-row .list-row-name .disk-usage-legend-swatch {
+    margin-right: var(--space-sm);
+    vertical-align: 0.0625rem;
+}
+
+/* A worktree row grows tall (a wrapping title over a line of fields) and
+   `.list-row` top-aligns its children, so pin the actions to the bottom edge,
+   the way `.app-row` / `.trigger-row` (skills.css) and the Accounts rows
+   (settings/accounts.css) already do. */
+.disk-usage-row .list-row-actions {
+    align-self: flex-end;
+}
+
+/* On mobile the row stacks (mobile.css). The two small buttons sit under the
+   fields, left-aligned with them, rather than floating at the far edge. */
+@media (--phone-layout) {
+    .disk-usage-row .list-row-actions {
+        align-self: flex-start;
+        justify-content: flex-start;
+    }
+}
+
+/* A running pass: the Backup page's running line and bar, across the card. */
+.disk-usage-reclaim-progress {
+    flex: 1 0 100%;
+}
+
+.disk-usage-reclaim-progress-line {
+    display: block;
+    margin-bottom: var(--space-xs);
+    color: var(--text-primary);
+}

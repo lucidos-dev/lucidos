@@ -1,0 +1,629 @@
+import { showToast, removeToast, clientOfferedRelease, latestTauriAppNotes, appUpdateCheckError, appUpdateCheckInFlight, appUpdateProgress, lucidosRelease, relayedUpdate, releaseCheck, settingsScrollTarget } from '../store';
+import { isNewerVersion } from '../../utils/version';
+import type { ToastAction } from '../types';
+// The READ lives a layer up, where a surface can ask "is there an update?"
+// without importing this module's toasts, IPC and menu navigation.
+import { packagedUpdateVersion } from '../packagedUpdate';
+import { relayAvailable } from '../updateRelay';
+import { refreshUpdateRelay, resumeRelayedUpdate, watchRelayedUpdate, type RelayNews } from './update-relay';
+import { openWhatsNew, openSettingsSubview } from './menu';
+import { isTauri, thisDeviceIsMobile } from '../../utils/platform';
+import { errorDetail } from '../../utils/errorDetail';
+import { requestUpdateRelay, requestUpdateCheck } from '../../api/client/control';
+import {
+  checkAppUpdate,
+  installAppUpdateAndRestart,
+  listen,
+  APP_UPDATE_PROGRESS_EVENT,
+  type AppUpdateOffer,
+  type AppUpdateProgress,
+} from '../../utils/tauri';
+
+/** ONE key for every packaged-update TOAST: the "Lucidos <v> available" offer,
+ *  and a failure. Keyed, so a failure replaces the offer in place rather than
+ *  stacking a second toast on it.
+ *
+ *  The live progress is not here. A run takes the app away and comes back with
+ *  a different one, so it owns the progress dialog instead
+ *  (docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md). */
+const UPDATE_TOAST_KEY = 'app-update-available';
+
+/** Why a check could not run, when the INSTALL is the reason rather than the
+ *  session. A source checkout is the everyday case, and it never polls. */
+const NO_CHECK_HERE = 'this install has no update check';
+
+/** The answer a phone gets when no desktop app can take the update for it.
+ *
+ *  It says WHERE and stops, because the how varies by install shape and none of
+ *  them is a thing this device can do. A bundle installs in the desktop client,
+ *  a headless install re-runs `install.sh`, and a source checkout rebuilds. So a
+ *  sentence naming the app would misdirect the last two outright.
+ *
+ *  Keyed, because the button that raises it stays live: unkeyed, a second tap
+ *  stacked a second copy of one sentence. */
+const UPDATE_ON_DESKTOP = 'Update Lucidos on the machine that runs this workspace, not from this device.';
+const UPDATE_ON_DESKTOP_KEY = 'app-update-on-desktop';
+
+/** A relayed request vanished with nothing installed: the desktop app quit,
+ *  never claimed it, or the gateway restarted for another reason. */
+const RELAY_DID_NOT_RUN =
+  'The desktop app did not run the update. Make sure Lucidos is open on that Mac, then try again.';
+
+let installing = false;
+/** Unsubscribe for the progress event, or `null` when not subscribed. */
+let unlistenProgress: (() => void) | null = null;
+/** Guards the async gap in {@link startAppUpdateProgress} so remounting
+ *  (reload, workspace switch, restart-reconnect) can't register a second
+ *  listener while the first `listen` call is still in flight. */
+let subscribing = false;
+/** The version this window has already toasted about, so a repeat refresh does
+ *  not raise a second offer for the same release. The same dedupe the plugin
+ *  marketplace scan keeps in `plugin-update-notice.json`, one layer up. */
+let lastOfferedVersion: string | null = null;
+/** The user-initiated check in flight, or `null`. Holding the PROMISE is what
+ *  makes a second caller join the first rather than race it: a bare boolean
+ *  would let the loser resolve with nothing. See {@link checkForUpdatesNow}. */
+let inFlightCheck: Promise<UpdateCheckVerdict> | null = null;
+
+/** What a check concluded, as the thing the CALLER acts on.
+ *
+ *  The verdict travels as a return value rather than being re-read off the
+ *  signals afterwards. Those signals are also written by the background poll,
+ *  so a reader could otherwise report one request's state having awaited
+ *  another's. That is what showed "Lucidos is up to date" a moment before the
+ *  offer toast for the release it had just found. */
+export type UpdateCheckVerdict =
+  /** A newer release is available to this install. */
+  | { kind: 'available'; version: string }
+  /** The check ran and found nothing newer. */
+  | { kind: 'up-to-date' }
+  /** The check failed, or there was none this session could run. `reason` is
+   *  user-facing. */
+  | { kind: 'failed'; reason: string }
+  /** An install is already under way, so its own narration is the answer. */
+  | { kind: 'installing' }
+  /** A second install is serving this workspace, and it is older than the app
+   *  asking. Nothing about the CLIENT's version answers that, so neither
+   *  "up to date" nor a client-side offer would be true. */
+  | { kind: 'shadowed'; engine: string; client: string };
+
+/** Surface the "Lucidos <v> available" offer.
+ *
+ *  It always carries an action, which is the rule this whole module keeps: no
+ *  surface may announce a release without saying how to get it. Which action is
+ *  {@link updateRoute}'s answer, so the toast, What's New and Settings cannot
+ *  disagree about what taking this update takes.
+ *
+ *  The wording is sentence case, as every other toast action is. The buttons in
+ *  Settings are Title Case, as every other `.action-btn` is. One route, two
+ *  typographic conventions.
+ *
+ *  Extracted so the cancel path can put the offer straight back: abandoning a
+ *  download abandons the attempt, not the update. */
+function offerAppUpdate(version: string): void {
+  // Never on a phone, even when the relay could take it (ADR 0338). Raising it
+  // here interrupts a reader about an update to another machine. The release
+  // check still runs and What's New still marks the release `Available`, with
+  // the relay's button where one applies.
+  if (thisDeviceIsMobile()) return;
+  const route = updateRoute(true);
+  // `confirm` keeps "Update & restart" a button. A lone neutral action becomes
+  // a tap on the whole card (`toastTap`), and a stray tap must not restart.
+  const follow = () => { void followUpdateRoute(route); };
+  const action: ToastAction = route === 'install'
+    ? { label: 'Update & restart', variant: 'confirm', onClick: follow }
+    : route === 'relay'
+      ? { label: 'Update desktop app', variant: 'confirm', onClick: follow }
+      : { label: 'How to update', onClick: follow };
+  showToast(`Lucidos ${version} available`, 'info', {
+    key: UPDATE_TOAST_KEY,
+    action,
+    // "What is in it?" is the question an update offer raises, and answering it
+    // is not the same click as taking the update. Rendered only when notes are
+    // known, so the control never opens onto nothing. The gateway carries none,
+    // so this is the client-check path's affordance.
+    //
+    // It NAMES the version, which is what makes the panel open on it. Left
+    // unnamed, What's New falls back to expanding the release already running.
+    ...(latestTauriAppNotes.value
+      ? {
+          secondaryAction: {
+            label: "What's new",
+            onClick: () => { openWhatsNew(version); },
+          },
+        }
+      : {}),
+  });
+}
+
+/** Take one progress frame. A running frame is simply RECORDED: the progress
+ *  dialog is derived from {@link appUpdateProgress}, so recording the frame is
+ *  what draws it, and clearing the signal is what closes it.
+ *
+ *  A terminal frame ends the run and says why on a toast. A finished operation
+ *  is a message, rather than something the user must watch. */
+function handleAppUpdateProgress(frame: AppUpdateProgress): void {
+  if (frame.phase === 'cancelled') {
+    appUpdateProgress.value = null;
+    installing = false;
+    // Nothing was written to disk, so the update is still available — re-offer it
+    // rather than leaving the user with a silently vanished toast.
+    const version = frame.version ?? packagedUpdateVersion();
+    if (version) offerAppUpdate(version);
+    else removeToast(UPDATE_TOAST_KEY);
+    return;
+  }
+  if (frame.phase === 'failed') {
+    // Clear the run BEFORE toasting: `appUpdateCommitted` suppresses ordinary
+    // toasts while an update is past the point of no return, and this error is
+    // exactly the thing that must get through.
+    appUpdateProgress.value = null;
+    installing = false;
+    showToast(`Update failed: ${frame.message}`, 'error', { key: UPDATE_TOAST_KEY });
+    return;
+  }
+  if (frame.phase === 'bundle-swap-failed') {
+    // The install destroyed the app on disk without landing a replacement, so
+    // this is not "the update failed, try again": there is nothing left to try
+    // against. The Rust message is already a full account with the recovery path
+    // in it, so it is shown verbatim rather than prefixed, and the update is
+    // deliberately NOT re-offered the way a cancel re-offers it. Same
+    // clear-before-toast ordering as `failed`, for the same reason.
+    appUpdateProgress.value = null;
+    installing = false;
+    showToast(frame.message, 'error', { key: UPDATE_TOAST_KEY });
+    return;
+  }
+  // A running frame. The dialog reads this signal, applies the narration, and
+  // offers Cancel exactly while `cancellable` says one can still work. Nothing
+  // needs keeping alive against the toast suppression either, since a dialog is
+  // not a toast. That matters from `installing` on, where the launchd service
+  // restarts and the gateway serving this page dies with it.
+  appUpdateProgress.value = frame;
+  // Drop the offer the run started from. The keyed toast used to be REPLACED by
+  // the narration. Now that the narration is a dialog, the offer would sit
+  // behind it, still inviting a click on an update already running.
+  removeToast(UPDATE_TOAST_KEY);
+}
+
+/** Subscribe to the Rust updater's progress stream. Idempotent across remounts;
+ *  Tauri-only. Carries no timer: the CHECK lives in the gateway (ADR 0108) and
+ *  this is only the narration for an install the user started.
+ *
+ *  Best-effort (frontend.md carve-out): this runs at startup without user intent,
+ *  and a failed subscription costs the narration, not the update — the install
+ *  action's own error toast and System > Overview still report outcomes. It
+ *  leaves itself unsubscribed on failure, so the next mount retries. */
+export function startAppUpdateProgress(): void {
+  if (!isTauri()) return;
+  void subscribeToAppUpdateProgress();
+}
+
+async function subscribeToAppUpdateProgress(): Promise<void> {
+  if (unlistenProgress || subscribing) return;
+  subscribing = true;
+  try {
+    unlistenProgress = await listen<AppUpdateProgress>(
+      APP_UPDATE_PROGRESS_EVENT,
+      (e) => { handleAppUpdateProgress(e.payload); },
+    );
+  } catch (e) {
+    console.warn('[app-update] progress subscription failed; retried on next mount', e);
+  } finally {
+    subscribing = false;
+  }
+}
+
+/** Drop the progress subscription (startup cleanup). */
+export function stopAppUpdateProgress(): void {
+  if (unlistenProgress) {
+    unlistenProgress();
+    unlistenProgress = null;
+  }
+}
+
+/** Ask the GATEWAY whether a newer Lucidos is published, and record the answer.
+ *
+ *  The check itself lives in the gateway (ADR 0108), so this is a loopback read
+ *  rather than a poll of the release host. The gateway asks lucidos.dev only
+ *  when its own answer is stale, and concurrent callers coalesce there, so N
+ *  open windows still cost one outbound request.
+ *
+ *  Best-effort on the background path (frontend.md carve-out): it runs on mount
+ *  and on resume without user intent, so a transport failure is a
+ *  `console.warn`. A FORCED call is the Settings button, which the user clicked
+ *  and is owed an answer to, so that one records the failure.
+ *
+ *  `force` is that button asking for a poll now. */
+export async function refreshReleaseCheck(force = false): Promise<UpdateCheckVerdict> {
+  try {
+    releaseCheck.value = await requestUpdateCheck(force);
+  } catch (e) {
+    // No gateway (a direct engine port), an older one with no such route, or a
+    // transient blip. Leaves the last known answer standing and the next resume
+    // retries. System > Overview falls back to the client check while the
+    // gateway announces nothing at all.
+    console.warn('[app-update] gateway release check unavailable; retried on next resume', e);
+    const reason = errorDetail(e);
+    if (force) appUpdateCheckError.value = reason;
+    return { kind: 'failed', reason };
+  }
+  // Before the offer below, which reads the route, and the route reads this.
+  if (!isTauri()) await refreshUpdateRelay();
+  // A poll that FAILED must never read as "you are up to date", so the
+  // gateway's own verdict drives the persistent Settings notice. Cleared by
+  // the same field on the next success.
+  appUpdateCheckError.value = releaseCheck.value.last_error;
+  const latest = releaseCheck.value.latest;
+  // The notes travel with the version, so the "What's new" link and the panel's
+  // Available row cannot end up describing a different release. The origin may
+  // carry none, and then there is simply no link.
+  latestTauriAppNotes.value = latest?.notes ?? null;
+  // A gateway that MAY not poll returns an untouched snapshot, and reading that
+  // as "up to date" is a claim nothing supports: it never asked. `supported` is
+  // false for a source checkout, and for a target we publish nothing for.
+  // `may_poll` refuses both however hard the caller forces (ADR 0108).
+  if (!releaseCheck.value.supported) return { kind: 'failed', reason: NO_CHECK_HERE };
+  if (!latest) {
+    // A stale answer plus a failed poll is not "up to date": the gateway has
+    // nothing newer to report BECAUSE it could not ask.
+    const lastError = releaseCheck.value.last_error;
+    return lastError ? { kind: 'failed', reason: lastError } : { kind: 'up-to-date' };
+  }
+  // An update already running owns the shared toast key, and its narration is
+  // a far more specific answer than a fresh offer would be.
+  if (appUpdateProgress.value) return { kind: 'installing' };
+  // The dedupe keeps a repeat BACKGROUND poll from re-offering on every resume.
+  // A forced check is a click, and a click is owed a reply: without the bypass,
+  // asking again after dismissing the toast produced nothing at all.
+  if (lastOfferedVersion !== latest.version || force) {
+    lastOfferedVersion = latest.version;
+    offerAppUpdate(latest.version);
+  }
+  return { kind: 'available', version: latest.version };
+}
+
+/** The single user-initiated check, shared by every control that offers one.
+ *
+ *  It owns three things no caller should re-derive. The in-flight signal, so
+ *  the control can report itself and refuse a second start. The single flight,
+ *  so two overlapping clicks make one request and share one answer. And the
+ *  verdict, returned rather than read back off the signals.
+ *
+ *  The gateway owns the check (ADR 0108), so that is the first choice. The
+ *  client's own Tauri updater is the ADR 0105 fallback. It is taken only where
+ *  the gateway announces nothing at all, which means one too old to carry the
+ *  field. */
+export function checkForUpdatesNow(): Promise<UpdateCheckVerdict> {
+  if (inFlightCheck) return inFlightCheck;
+  appUpdateCheckInFlight.value = true;
+  inFlightCheck = runUserCheck().finally(() => {
+    inFlightCheck = null;
+    appUpdateCheckInFlight.value = false;
+  });
+  return inFlightCheck;
+}
+
+/** What a surface can offer about a release newer than the one running.
+ *
+ *  Five answers, and deliberately never "nothing" (ADR 0142). A surface may
+ *  not say a newer release exists and then leave the reader no way to get it.
+ *  That is what What's New did for every release the updater had not offered.
+ *
+ *  - `install`: take it here. A Tauri client fronting a bundle.
+ *  - `relay`: ask the desktop app to take it (ADR 0338). A session that cannot
+ *    install, while a desktop app is attached and can install unattended.
+ *  - `check`: no newer release known, and this session has a check it can run.
+ *  - `guide`: the answer is on Settings, System, Overview. It carries the
+ *    installer command for a headless install, and the rebuild for a source
+ *    checkout.
+ *  - `desktop`: the answer is one sentence, said here on a toast. A phone is
+ *    never the machine an install lands on, and that page's controls are all
+ *    things it cannot do. */
+export type UpdateRoute = 'install' | 'relay' | 'check' | 'guide' | 'desktop';
+
+/** Could this session install an offer, if one existed?
+ *
+ *  A Tauri client fronting a bundle can. A browser or PWA session has no IPC to
+ *  invoke, and a headless install is updated by re-running `install.sh`.
+ *
+ *  It SUBTRACTS `installer-rerun` rather than requiring `desktop-app`, and the
+ *  asymmetry is deliberate. `install` describes the GATEWAY's own layout, while
+ *  `isTauri()` is what answers "can this session install". A Tauri client is a
+ *  bundle by construction. Requiring `desktop-app` would only withhold a working
+ *  button: from a layout the gateway failed to recognise, and from a dev client
+ *  with no `latest`. See `docs/code-review-priors.md`. */
+export function sessionCanInstall(): boolean {
+  return isTauri() && releaseCheck.value?.latest?.install !== 'installer-rerun';
+}
+
+/** Can this session ask, right now, whether a newer release is published?
+ *
+ *  The gateway is authoritative once it has answered. `supported` is false for a
+ *  source checkout and for a target Lucidos publishes nothing for, and
+ *  `may_poll` refuses either way (ADR 0108). Offering a check there would be a
+ *  button that errors every time it is pressed.
+ *
+ *  With no gateway answer at all, the client's own updater is the ADR 0105
+ *  fallback. That covers a gateway too old to carry the field, and a direct
+ *  engine port with no gateway in front of it. */
+export function canCheckForUpdatesHere(): boolean {
+  const check = releaseCheck.value;
+  return check ? check.supported : isTauri();
+}
+
+/** Which route this session takes to a newer release.
+ *
+ *  `hasNewerRelease` says whether one is KNOWN, which is what decides between
+ *  acting and asking. It defaults to the updater's offer, and a caller holding
+ *  the fact from somewhere else passes `true`. Two do. The client-check path has
+ *  the offer in hand before the signals it would be re-derived from have
+ *  settled. And What's New reads the published changelog, which names releases
+ *  the hourly poll has not reached yet.
+ *
+ *  So `check` is for a surface that does NOT know: Settings, System, whose
+ *  button is a plain maintenance control. A surface that has just told the
+ *  reader a release is newer must not then offer to go and find out.
+ *
+ *  **`relay` is decided first**, because it is the one route that lets a phone
+ *  act. It needs a release the GATEWAY knows, not merely one `hasNewerRelease`
+ *  asserts: the gateway refuses a request for anything else.
+ *
+ *  **Otherwise a mobile client gets one answer, whatever the state.** None of
+ *  the branches below can reach a different one: Lucidos ships no mobile client,
+ *  so `isTauri()` is false and `install` is already out. What it takes away is
+ *  `check`, whose only outcomes on a phone are "up to date" and this same
+ *  sentence. And `guide`, which spends a page load to say it. */
+export function updateRoute(
+  hasNewerRelease: boolean = packagedUpdateVersion() !== null,
+): UpdateRoute {
+  if (hasNewerRelease && !sessionCanInstall() && relayAvailable()) return 'relay';
+  if (thisDeviceIsMobile()) return 'desktop';
+  if (hasNewerRelease) return sessionCanInstall() ? 'install' : 'guide';
+  return canCheckForUpdatesHere() ? 'check' : 'guide';
+}
+
+/** The label an update BUTTON wears, in every one of its states.
+ *
+ *  Every word here, so Settings and What's New cannot drift apart. Handing each
+ *  surface its own idle string is what let them ship as "Check for Updates" and
+ *  "Check for updates" at once.
+ *
+ *  `guide` and `desktop` share their words, because the reader's question is
+ *  the same one and so is the answer's subject. What differs is where the
+ *  answer is written: a page for one, a toast for the other.
+ *
+ *  Paired with `disabled`, the in-flight word is also the whole of the feedback
+ *  a fast check needs. A spinner would be a second gate on top of this one. */
+export function updateControlLabel(route: UpdateRoute, checking: boolean): string {
+  if (checking) return 'Checking…';
+  if (route === 'install') return 'Update & Restart';
+  if (route === 'relay') return 'Update Desktop App';
+  return route === 'check' ? 'Check for Updates' : 'How to Update';
+}
+
+/** Do what a route says. The click behind every label above.
+ *
+ *  `desktop` answers on a toast and navigates nowhere. Every control the page
+ *  below would offer a phone is one it cannot work: an installer command, a
+ *  rebuild, an in-app install. So the page costs a load and leaves the reader
+ *  to find the one line that applies. See {@link UPDATE_ON_DESKTOP} for why
+ *  that line names no mechanism.
+ *
+ *  `guide` lands on System > Overview and scrolls to Maintenance, which is
+ *  where the installer command, the update button and the rebuild control all
+ *  live. Nothing else in the app holds the whole account of how an install
+ *  updates. It opens the PAGE, never `system`: that key is the submenu now, and
+ *  a Maintenance anchor there would scroll to nothing. */
+export async function followUpdateRoute(route: UpdateRoute): Promise<void> {
+  if (route === 'install') {
+    await installAppUpdate();
+    return;
+  }
+  if (route === 'relay') {
+    await relayUpdateToDesktop();
+    return;
+  }
+  if (route === 'check') {
+    reportUpdateCheck(await checkForUpdatesNow());
+    return;
+  }
+  if (route === 'desktop') {
+    showToast(UPDATE_ON_DESKTOP, 'info', { key: UPDATE_ON_DESKTOP_KEY });
+    return;
+  }
+  settingsScrollTarget.value = 'system:maintenance';
+  openSettingsSubview('system-overview');
+}
+
+/** Say what a user-initiated check concluded.
+ *
+ *  One wording for every control that offers a check, so Settings and What's
+ *  New cannot answer the same click differently. `available` and `installing`
+ *  are deliberately silent: the offer toast and the progress dialog have
+ *  already said more than a second toast could. */
+export function reportUpdateCheck(verdict: UpdateCheckVerdict): void {
+  if (verdict.kind === 'up-to-date') showToast('Lucidos is up to date', 'success');
+  else if (verdict.kind === 'failed') {
+    showToast(`Couldn't check for updates: ${verdict.reason}`, 'error');
+  } else if (verdict.kind === 'shadowed') {
+    // Not a failure, and emphatically not "up to date". An older Lucidos is
+    // serving this workspace, so the check has no answer. Name the two
+    // versions that disagree, and point at the page holding the account.
+    //
+    // It states the FACT and stops. A second install is the usual cause but
+    // not the only one: the gateway re-adopts an engine that outlived it, so a
+    // survivor of a failed restart reads identically from here. Installs, on
+    // that page, is what can tell the two apart.
+    showToast(
+      `This workspace is served by Lucidos ${verdict.engine}, but this app is ` +
+        `${verdict.client}. See System > Overview.`,
+      'error',
+    );
+  }
+}
+
+/** Is an OLDER Lucidos serving this workspace than the app asking?
+ *
+ *  Two coexisting installs can both be current while the wrong one holds the
+ *  port. The engine's `/health` carries its `release`, and it has for a long
+ *  time, so this works against a gateway ten releases behind. That is the whole
+ *  point: such a gateway is precisely the one that cannot answer for itself.
+ *
+ *  Packaged clients only. A browser session has no release of its own to
+ *  compare, just a build id, so it can conclude nothing here. */
+export function shadowedEngine(): { engine: string; client: string } | null {
+  const client = typeof window !== 'undefined' ? window.__LUCIDOS_APP_RELEASE__ : undefined;
+  const engine = lucidosRelease.value;
+  if (!client || !engine) return null;
+  return isNewerVersion(client, engine) ? { engine, client } : null;
+}
+
+async function runUserCheck(): Promise<UpdateCheckVerdict> {
+  if (appUpdateProgress.value) return { kind: 'installing' };
+  if (releaseCheck.value) return refreshReleaseCheck(true);
+  // Before the client fallback, never after. That fallback asks the Tauri
+  // updater, which compares the CLIENT's version and nothing else. With an old
+  // install holding the port, it answered "Lucidos is up to date" over an
+  // ancient engine. That is the worst part of this whole story.
+  const shadow = shadowedEngine();
+  if (shadow) return { kind: 'shadowed', ...shadow };
+  if (isTauri()) return checkAppUpdateViaClient();
+  // No gateway answer and no client updater: a browser or PWA session on a
+  // direct engine port. It cannot learn about a release at all, so "up to date"
+  // would be a guess dressed up as an answer.
+  return { kind: 'failed', reason: 'this session has no update check to run' };
+}
+
+/** Ask the Tauri updater directly. The ADR 0105 degradation for a gateway too
+ *  old to announce a release: the client is newer than the machine's gateway
+ *  right after an update, and this keeps System > Overview working meanwhile.
+ *
+ *  User-initiated only, and on no timer. The outcome is recorded so the
+ *  persistent Settings surface can report a failed check rather than let it look
+ *  like "you are up to date". */
+export async function checkAppUpdateViaClient(): Promise<UpdateCheckVerdict> {
+  if (!isTauri()) return { kind: 'failed', reason: 'no client updater in this session' };
+  if (appUpdateProgress.value) return { kind: 'installing' };
+  let offer: AppUpdateOffer | null;
+  try {
+    offer = await checkAppUpdate();
+  } catch (e) {
+    // Through `errorDetail` because the rejection is no longer always Rust's own
+    // error string: an unreadable IPC payload arrives as an Error, and `String`
+    // would put its "Error: " prefix in front of the reason on the System page.
+    const reason = errorDetail(e);
+    appUpdateCheckError.value = reason;
+    return { kind: 'failed', reason };
+  }
+  appUpdateCheckError.value = null;
+  // The notes travel WITH the version, written and cleared on the same branches,
+  // so the two can never end up describing different releases.
+  clientOfferedRelease.value = offer?.version ?? null;
+  latestTauriAppNotes.value = offer?.notes ?? null;
+  if (!offer) return { kind: 'up-to-date' };
+  offerAppUpdate(offer.version);
+  return { kind: 'available', version: offer.version };
+}
+
+/** Can THIS session install the offered update itself?
+ *
+ *  An offer exists for every install shape, but only a Tauri client fronting a
+ *  bundle can act on one. Both halves: there must BE an offer, and the session
+ *  must be able to take it. {@link sessionCanInstall} owns the second half and
+ *  documents why it subtracts `installer-rerun`. */
+export function canInstallUpdateHere(): boolean {
+  return packagedUpdateVersion() !== null && sessionCanInstall();
+}
+
+/** Install the available packaged update and restart the whole stack. This runs on
+ *  USER intent (the toast action / the System page button), so a failure is
+ *  surfaced as an error toast. On success the client re-execs and this page is
+ *  torn down — no further code runs.
+ *
+ *  The invoke resolves only when the whole thing is OVER; everything the user sees
+ *  in between arrives on the progress event (see {@link handleAppUpdateProgress}).
+ *  Awaiting it silently is precisely what made the update look like a freeze. */
+export async function installAppUpdate(): Promise<void> {
+  if (installing) return;
+  installing = true;
+  // React on the CLICK, not on the first event: the IPC hop plus the updater's own
+  // network check take long enough that the button would otherwise look dead.
+  handleAppUpdateProgress({ version: packagedUpdateVersion(), phase: 'checking' });
+  try {
+    await installAppUpdateAndRestart();
+    // Reached only if the command resolved WITHOUT restarting — a cancel (whose
+    // event already reset the surface) or a no-op. Allow a retry either way.
+    installing = false;
+    // The command has returned, so by definition nothing is running any more: a
+    // still-set run here would be a spinner with nothing behind it. Normally the
+    // cancel frame has already cleared it, but the event and the command reply
+    // travel on different channels and can land in either order.
+    if (appUpdateProgress.value) {
+      appUpdateProgress.value = null;
+      removeToast(UPDATE_TOAST_KEY);
+    }
+  } catch (e) {
+    installing = false;
+    // Rust emits a `failed` frame for everything it can attribute, and that
+    // handler has already cleared the run and shown the reason. This covers what
+    // it cannot reach — a rejected invoke, an ACL denial, a dead bridge — so a
+    // failed update can never leave the toast spinning forever.
+    if (appUpdateProgress.value) {
+      appUpdateProgress.value = null;
+      showToast(`Update failed: ${errorDetail(e)}`, 'error', { key: UPDATE_TOAST_KEY });
+    }
+  }
+}
+
+// ── The update relay (ADR 0338) ────────────────────────────────────────────
+
+/** Ask the desktop app to install the newest release, then watch the run.
+ *
+ *  This runs on a click, so a refusal is an error toast naming the gateway's
+ *  reason. The progress dialog opens at once, as `installAppUpdate` does, since
+ *  the client claims the request on its next heartbeat, seconds away. */
+export async function relayUpdateToDesktop(): Promise<void> {
+  if (relayedUpdate.value) return;
+  const fromVersion = releaseCheck.value?.current_version;
+  if (!fromVersion) {
+    showToast("Couldn't update the desktop app: the running version is not known yet", 'error', {
+      key: UPDATE_TOAST_KEY,
+    });
+    return;
+  }
+  let ticket;
+  try {
+    ticket = await requestUpdateRelay();
+  } catch (e) {
+    showToast(`Couldn't update the desktop app: ${errorDetail(e)}`, 'error', { key: UPDATE_TOAST_KEY });
+    return;
+  }
+  handleAppUpdateProgress({ version: ticket.version, phase: 'checking' });
+  watchRelayedUpdate(
+    { id: ticket.id, version: ticket.version, fromVersion, since: Date.now() },
+    handleRelayNews,
+  );
+}
+
+/** Pick a relayed update back up after a reload (startup). */
+export function resumeUpdateRelay(): void {
+  resumeRelayedUpdate(handleRelayNews);
+}
+
+/** What a relayed run's news means on screen. Its frames go through the same
+ *  handler as a local run's, so the dialog and the endings read alike. */
+function handleRelayNews(news: RelayNews): void {
+  if (news.kind === 'progress' || news.kind === 'ended') {
+    handleAppUpdateProgress(news.frame);
+    return;
+  }
+  // Clear the run BEFORE toasting, for the reason `handleAppUpdateProgress`
+  // gives: a committed update suppresses ordinary toasts.
+  appUpdateProgress.value = null;
+  if (news.kind === 'succeeded') {
+    showToast(`The desktop app is now on Lucidos ${news.version}`, 'success', { key: UPDATE_TOAST_KEY });
+  } else {
+    showToast(RELAY_DID_NOT_RUN, 'error', { key: UPDATE_TOAST_KEY });
+  }
+}

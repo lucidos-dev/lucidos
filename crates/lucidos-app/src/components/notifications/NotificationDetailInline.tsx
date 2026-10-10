@@ -1,0 +1,205 @@
+import {
+  notifications,
+  notificationsHasMore,
+  viewingNotification,
+  appsList,
+} from '../../store/store';
+import { openApp } from '../../store/actions/apps';
+import { navigateToTrigger } from '../../store/actions/triggers';
+import { navigateAdjacentNotification } from '../../store/actions/notifications';
+import { discussNotification } from '../../store/actions/notification-discuss';
+import { focusThreadOrBootstrap } from '../../store/actions/threads';
+import { handleNavigationRequest } from '../../store/actions/navigation-request';
+import { composeHandlers } from '../chat/composeHandlers';
+import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
+import { formatNotificationDate } from '../../utils/formatTime';
+import { renderMarkdown } from '../../utils/renderMarkdown';
+import { linkifyPaths } from '../../utils/linkifyPaths';
+import { loadedOr } from '../../store/types';
+import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
+import { useSkeleton, SkText } from '../shared/Skeleton';
+import { resolveLinkedApp } from './resolveLinkedApp';
+import { appById } from '../../store/appsById';
+import { notificationPosition } from './notificationPosition';
+import { navigateTapLabel } from './notificationTapLabel';
+import { notificationActions, notificationTriggerId } from './notificationActions';
+
+/** The notification detail rendered directly in the content pane (replacing the
+ *  former modal). The content-pane header owns the title and the back/forward
+ *  nav; this body renders the date, the markdown body, the action buttons, and
+ *  the newer/older chevrons that walk the inbox list (styled like the
+ *  thread-view scroll chevrons).
+ *
+ *  Source-level contract: this component must not write store signals directly.
+ *  Every mutation routes through actions/notifications.ts (prev/next),
+ *  actions/notification-discuss.ts (Discuss), or the navigation actions (open
+ *  app / thread / nav-tap). */
+export function NotificationDetailInline() {
+  const sk = useSkeleton();
+  const detail = viewingNotification.value;
+  // Skeleton mode renders the same frame with shimmer leaves, so the detail's
+  // loading placeholder is this component and cannot drift from it (the
+  // self-skeletonizing rule in `.claude/rules/frontend.md`). Only reachable via
+  // `ContentPane`'s pending branch, which mounts it inside a SkeletonProvider
+  // while a notification the page does not already hold is being fetched.
+  if (sk) return <NotificationDetailSkeleton />;
+  if (!detail) return null;
+
+  const position = notificationPosition(
+    loadedOr(notifications.value, []),
+    detail.id,
+    notificationsHasMore.value,
+  );
+
+  const linked = resolveLinkedApp(detail.app_id, appsList.value, appById(detail.app_id ?? ''));
+  const apps = loadedOr(appsList.value, []);
+  const content = linkifyPaths(renderMarkdown(detail.message), [], apps);
+  const dateStr = formatNotificationDate(new Date(detail.created_at));
+
+  // Which buttons the actions row offers, including the dedup between a
+  // `navigate` tap and a dedicated button for the same destination. Pure and
+  // unit-tested in notificationActions.test.ts.
+  const actions = notificationActions(detail, linked.kind === 'linked');
+  const triggerId = notificationTriggerId(detail);
+
+  function handleOpenApp() {
+    if (linked.kind !== 'linked') return;
+    openApp(linked.app);
+  }
+
+  function handleOpenThread() {
+    if (!detail?.thread_id) return;
+    focusThreadOrBootstrap(detail.thread_id, {
+      targetEventId: detail.event_id ?? null,
+    });
+  }
+
+  // `composeHandlers` with NO focus nudge, the shape `HeaderMark`'s setup-
+  // interview item uses. The wrapper is here for its touch/click dedup. A tap
+  // with the iOS keyboard up can blur the field and shift the viewport, moving
+  // the button from under the finger. WebKit then drops the synthetic click.
+  // The focus half is dropped because Discuss sends, so a raised keyboard would
+  // only cover the reply.
+  const discussHandlers = composeHandlers(
+    () => { void discussNotification(detail!); },
+    () => {},
+  );
+
+  function handleNavigateTap() {
+    if (!actions.navTap) return;
+    handleNavigationRequest(actions.navTap);
+  }
+
+  function handleOpenTrigger() {
+    if (!triggerId) return;
+    // navigateToTrigger re-fetches the trigger list on a cache miss before
+    // concluding the trigger is gone, and names this notification as the origin
+    // in that toast.
+    void navigateToTrigger(triggerId, 'a notification');
+  }
+
+  // The same router the transcript uses, so every link kind an agent writes
+  // opens here too: artifacts, files on disk, panels, apps and triggers.
+  function handleBodyClick(e: MouseEvent) {
+    handleMarkdownLinkClick(e, apps, 'a notification');
+  }
+
+  return (
+    <div class="notification-detail">
+      {/* Up/down, never left/right: the header's left/right chevrons are
+       *  history, and the inbox list runs top to bottom, newest first. Both
+       *  buttons stay rendered, `disabled` at either end of the list. */}
+      <div class="notification-detail-header">
+        <span class="notification-detail-date">{dateStr}</span>
+        <button
+          class="notification-detail-nav newer"
+          onClick={() => void navigateAdjacentNotification(detail.id, -1)}
+          disabled={!position.hasNewer}
+          aria-label="Newer notification"
+          data-tooltip="Newer notification"
+        >
+          <ChevronUpIcon />
+        </button>
+        <button
+          class="notification-detail-nav older"
+          onClick={() => void navigateAdjacentNotification(detail.id, 1)}
+          disabled={!position.hasOlder}
+          aria-label="Older notification"
+          data-tooltip="Older notification"
+        >
+          <ChevronDownIcon />
+        </button>
+      </div>
+      <h2 class="notification-detail-title">{detail.title || 'Notification'}</h2>
+      <div
+        class="notification-detail-body markdown-content"
+        onClick={handleBodyClick}
+        dangerouslySetInnerHTML={{ __html: content }}
+      />
+      {/* Always rendered: a notification either has a thread to open or is
+       *  discussable, so the row always holds a button. Discuss takes the slot
+       *  "Open thread" occupies, which keeps the row's shape across the two. */}
+      <div class="notification-detail-actions">
+        {linked.kind === 'linked' && (
+          <button class="action-btn" onClick={handleOpenApp}>
+            Open {linked.app.name}
+          </button>
+        )}
+        {actions.openThread && (
+          <button class="action-btn" onClick={handleOpenThread}>
+            Open thread
+          </button>
+        )}
+        {actions.discuss && (
+          <button class="action-btn" {...discussHandlers}>
+            Discuss
+          </button>
+        )}
+        {actions.openTrigger && (
+          <button class="action-btn" onClick={handleOpenTrigger}>
+            Open trigger
+          </button>
+        )}
+        {actions.navTap && (
+          <button class="action-btn" onClick={handleNavigateTap}>
+            {navigateTapLabel(actions.navTap)}
+          </button>
+        )}
+      </div>
+      {linked.kind === 'unknown' && (
+        <div class="notification-detail-actions">
+          <span class="error-text">Unknown app: {linked.appId}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The detail drawn as a loading placeholder: the same frame (nav row, title,
+ *  body) with shimmer leaves instead of content. Mirrors the real layout above
+ *  by sharing its class names, so the swap to real content doesn't reflow.
+ *
+ *  Rendered while a notification is being FETCHED, which after the memory-first
+ *  open in `viewNotification` means only the cold push-tap deep link: the page
+ *  holds neither list yet, so it genuinely has to ask the engine. The chevrons
+ *  and action buttons are omitted rather than shimmered, because which of them
+ *  exist is a property of the row we haven't got. */
+function NotificationDetailSkeleton() {
+  return (
+    <div class="notification-detail">
+      <div class="notification-detail-header">
+        <span class="notification-detail-date">
+          <SkText w="7rem" />
+        </span>
+      </div>
+      <h2 class="notification-detail-title">
+        <SkText w="12rem" />
+      </h2>
+      <div class="notification-detail-body markdown-content">
+        <SkText as="div" w="100%" />
+        <SkText as="div" w="92%" />
+        <SkText as="div" w="64%" />
+      </div>
+    </div>
+  );
+}

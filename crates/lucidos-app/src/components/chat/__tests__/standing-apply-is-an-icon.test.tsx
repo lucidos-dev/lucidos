@@ -1,0 +1,255 @@
+// @vitest-environment jsdom
+/**
+ * The prompt row's *standing apply* is an ICON with an on and off state.
+ *
+ * It was a green `action-btn` pill reading "Apply on settle", and on a
+ * phone that took over half the row. No shorter label fixed it, so the label
+ * went. The Changes panel keeps the text, where there is room for it, and
+ * `components/changes/ChangesView.test.tsx` pins that half.
+ *
+ * This file pins the two things an icon-only toggle owes. It must still carry
+ * the word, for a reader who cannot see the glyph, and it must say which
+ * state it is in. The words match the Changes panel's. The check is not
+ * part of them: each surface draws its own, and here `aria-pressed` carries it.
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { render, type ComponentChild } from 'preact';
+
+vi.mock('../../../store/actions/threads', () => ({
+  focusThreadOrBootstrap: vi.fn(),
+  focusThread: vi.fn(),
+}));
+vi.mock('../../../store/actions/repositories', () => ({
+  viewChangeDiff: vi.fn(),
+  viewThreadCcDiff: vi.fn(),
+}));
+
+import { getStandaloneActions } from '../WaitingBanner';
+import {
+  changes,
+  standingApplyThreadIds,
+  armingStandingApplyThreadIds,
+  threadMap,
+  focusedThreadId,
+} from '../../../store/store';
+import type { Change } from '../../../api/client';
+import type { ThreadState } from '../../../store/thread-events';
+
+/** The standing apply as the prompt row draws it, or null when it has none. */
+function standingApply(): ComponentChild | null {
+  const member = getStandaloneActions().find((m) => m.key === 'standing-apply');
+  return member?.render ? member.render({}) : null;
+}
+
+const THREAD = 'thread-1';
+
+function makeChange(): Change {
+  return {
+    id: 'change-1',
+    request_id: '00000000-0000-0000-0000-000000000000',
+    thread_id: THREAD,
+    thread_title: 'Working thread',
+    branch_name: 'b',
+    repo_root: '/r',
+    description: 'desc',
+    file_count: 3,
+    files: ['a.rs'],
+    requires_restart: false,
+    hardened: true,
+    status: 'pending',
+    created_at: '2026-01-01T00:00:00Z',
+    resolved_at: null,
+    pre_merge_sha: null,
+    post_merge_sha: null,
+    commits: [],
+    summary: null,
+    incomplete: false,
+    thread_unsettled: true,
+    thread_settling: true,
+  } as Change;
+}
+
+function makeThread(): ThreadState {
+  return {
+    meta: {
+      id: THREAD,
+      title: 'Working thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      saved: false,
+      createdAt: '',
+      updatedAt: '',
+      status: 'running',
+      summaryVersion: 0,
+      messageCount: 0,
+      section: 'inbox',
+      activeChildrenCount: 0,
+      totalChildrenCount: 0,
+      blockingDescendantCount: 0,
+      attentionDescendantCount: 0,
+      codingAgentChangeState: { kind: 'proposed', requires_restart: false },
+      codingAgentIsExternalRepo: false,
+      lastRevivedAt: '',
+      state: 'active',
+      latestTodoList: null,
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
+    },
+    events: new Map(),
+    streamingBuffer: '',
+    eventsLoaded: true,
+    eventsLoadFailed: false,
+    lastDbSeq: 0,
+    pendingUserMessages: [],
+  } as ThreadState;
+}
+
+let host: HTMLDivElement;
+
+/** The control as the prompt row draws it right now.
+ *
+ *  Re-resolved rather than re-rendered from a held vnode, because the armed
+ *  signal reaches this button by two routes. The button reads it for its own
+ *  class and fill, and the selector reads it for the label. `PromptInput`
+ *  re-resolves on every render for that reason. A test that re-rendered the
+ *  old vnode would assert a wording the row never shows.
+ */
+function control(): HTMLButtonElement {
+  render(standingApply(), host);
+  const btn = host.querySelector<HTMLButtonElement>('button[data-role="standing-apply"]');
+  if (!btn) throw new Error('the prompt row draws no standing apply');
+  return btn;
+}
+
+beforeEach(() => {
+  changes.value = { status: 'loaded', data: [makeChange()] };
+  standingApplyThreadIds.value = new Set();
+  armingStandingApplyThreadIds.value = new Set();
+  threadMap.value = new Map([[THREAD, makeThread()]]);
+  focusedThreadId.value = THREAD;
+  host = document.createElement('div');
+  document.body.appendChild(host);
+});
+
+afterEach(() => {
+  render(null, host);
+  host.remove();
+});
+
+describe('the prompt row draws the standing apply as an icon', () => {
+  it('wears the row\'s icon-button classes and no action-btn pill', () => {
+    const btn = control();
+    expect(btn.className).toContain('icon-btn');
+    expect(btn.className).toContain('header-icon');
+    expect(btn.className).not.toContain('action-btn');
+  });
+
+  it('shows a glyph and no text', () => {
+    const btn = control();
+    expect(btn.querySelector('svg')).not.toBeNull();
+    expect(btn.textContent).toBe('');
+  });
+
+  // useFitsInOneRow sums every [data-row-item]; a control missing the
+  // attribute lets the row overflow instead of lifting its liftable slot.
+  /** The composer stamps the measurement marker, because it also names WHICH
+   *  member this is. A hardcoded one here would win over that name and hide the
+   *  member from the fold. */
+  it('takes the row marker from the composer rather than hardcoding it', () => {
+    expect(control().hasAttribute('data-row-item')).toBe(false);
+  });
+});
+
+describe('the icon says which state it is in', () => {
+  it('starts unarmed, and says so', () => {
+    expect(control().getAttribute('aria-pressed')).toBe('false');
+  });
+
+  it('flips to pressed when the armed signal turns on', () => {
+    standingApplyThreadIds.value = new Set([THREAD]);
+    expect(control().getAttribute('aria-pressed')).toBe('true');
+  });
+
+  // The fill is the visible half of the same flip: an outlined flag off, a
+  // solid one armed, over one shape. Colour alone would carry it for nobody
+  // who cannot separate the two accents.
+  it('fills the glyph once armed, and outlines it otherwise', () => {
+    expect(control().querySelector('svg')?.getAttribute('fill')).toBe('none');
+    standingApplyThreadIds.value = new Set([THREAD]);
+    expect(control().querySelector('svg')?.getAttribute('fill')).toBe('currentColor');
+  });
+
+  it('takes the row\'s active class once armed', () => {
+    expect(control().className).not.toContain('active');
+    standingApplyThreadIds.value = new Set([THREAD]);
+    expect(control().className).toContain('active');
+  });
+});
+
+// The surface the bug was reported on. Lucidos never merges into an external
+// repo, and such a thread proposes nothing, so the flag offered to apply a
+// change that could never exist.
+describe('the prompt row draws no flag where Lucidos never applies', () => {
+  function markExternal(meta: Partial<ThreadState['meta']>): void {
+    const thread = makeThread();
+    threadMap.value = new Map([[THREAD, { ...thread, meta: { ...thread.meta, ...meta } }]]);
+  }
+
+  it('draws nothing for a thread on an external repo', () => {
+    markExternal({ codingAgentKind: 'external' });
+    expect(standingApply()).toBeNull();
+  });
+
+  // An old row carries the bool and no kind.
+  it('draws nothing for a legacy external-repo row', () => {
+    markExternal({ codingAgentIsExternalRepo: true });
+    expect(standingApply()).toBeNull();
+  });
+
+  // The regression: this thread is running, which is exactly when the flag is
+  // drawn and exactly when `getCodingAgentWaitingInfo` answers null.
+  it('draws nothing before the thread has proposed anything', () => {
+    markExternal({ codingAgentKind: 'external', codingAgentChangeState: { kind: 'none' }});
+    expect(standingApply()).toBeNull();
+  });
+});
+
+describe('the icon keeps the word it stopped showing', () => {
+  it('names the action for a reader in both states', () => {
+    expect(control().getAttribute('aria-label')).toBe('Apply on settle');
+    standingApplyThreadIds.value = new Set([THREAD]);
+    expect(control().getAttribute('aria-label')).toBe('Applying on settle');
+  });
+
+  it('folds into the ⋯ menu as a toggle that says whether it is armed', () => {
+    const member = () => getStandaloneActions().find((m) => m.key === 'standing-apply');
+    expect(member()?.active).toBe(false);
+    standingApplyThreadIds.value = new Set([THREAD]);
+    expect(member()?.active).toBe(true);
+  });
+
+  it('carries a tooltip that changes with the state', () => {
+    const off = control().getAttribute('data-tooltip');
+    standingApplyThreadIds.value = new Set([THREAD]);
+    const on = control().getAttribute('data-tooltip');
+    expect(off).toBeTruthy();
+    expect(on).toBeTruthy();
+    expect(on).not.toBe(off);
+  });
+
+  // The phone is why the label went, so the tooltip has to reach a finger. The
+  // host shell reveals on a long press only for elements that opt in, so a
+  // `data-tooltip` alone leaves a mobile reader an unexplained flag.
+  it('opts the tooltip into a touch long press', () => {
+    expect(control().hasAttribute('data-tooltip-longpress')).toBe(true);
+  });
+
+  // ADR 0168: `.icon-btn:disabled` sets `pointer-events: none`, which takes the
+  // tooltip above out of reach. A tap mid-request is dropped by the handler.
+  it('never renders disabled, in either state', () => {
+    expect(control().disabled).toBe(false);
+    armingStandingApplyThreadIds.value = new Set([THREAD]);
+    standingApplyThreadIds.value = new Set([THREAD]);
+    expect(control().disabled).toBe(false);
+  });
+});

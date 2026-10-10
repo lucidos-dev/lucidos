@@ -1,0 +1,157 @@
+import { describe, it, expect } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+
+// iOS PWA paint loss on the CONTENT pane.
+//
+// `.content-pane-body` (styles/panels/shell.css) is a scroll
+// container, so WKWebView gives it its own compositing layer. While the PWA is
+// backgrounded (the phone locked) WebKit stops committing the layer tree and that
+// layer freezes on a stale-or-empty backing texture: the panel is fully built and
+// laid out in the DOM, and nothing is on screen. This is exactly the blank
+// root-caused for `.thread-content` by the `ios-pwa-blackout` investigation
+// (24/24 render probes classified `content-present`; see
+// docs/temporary-measures.md), but the repaint hardening that closed it was wired
+// into ThreadView / CreateThreadView only. The content pane never got it.
+//
+// The recovery is a repaint on RESUME, and only on resume. No signal changes on
+// wake (same panel, same data), so no render produces DOM changes and only an
+// explicit repaint can un-blank the layer. The shared `onPageResume` signal covers
+// all three iOS wake events (visibilitychange / pageshow / focus), which is also
+// why one wake gets three superseding attempts: iOS often restores a PWA through
+// `pageshow` with no `visible` visibilitychange.
+//
+// The element is LONG-LIVED, with every view swapping children inside it, which is
+// why the blank read as unrecoverable before the fix: tapping Notifications
+// rebuilt the DOM inside a layer the compositor had stopped committing, and only a
+// reload built a new one. That made a per-view repaint tempting, and it is
+// deliberately NOT done. See the `does NOT repaint on panel switch` case below for
+// what it cost.
+//
+// A compositor paint loss is INVISIBLE to JS (the DOM is present, laid out and
+// non-zero height; only the texture is stale), and the frontend test environment
+// is deliberately non-jsdom, so there is no observable state to assert on. Pin
+// the wiring in source instead, the same approach as the `ThreadView resume
+// repaint wiring` guard in utils/pageResume.test.ts and the wake-recovery guard
+// in mobile-swipe-app-height-recovery.test.ts.
+
+const here: string = dirname(fileURLToPath(import.meta.url));
+const contentPaneSrc = readFileSync(resolve(here, '../ContentPane.tsx'), 'utf-8');
+
+/** The same source with comments stripped. The negative assertions below ban a
+ *  CALL, not the word, and this component's comments deliberately explain the
+ *  reverted per-view repaint: naming `forceWebKitRepaintBurst` or `[viewKey]` while
+ *  explaining why they are gone must not turn the guard red. Scanning raw source
+ *  would make that prose fail the test it exists to document. */
+const contentPaneCode = contentPaneSrc
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+describe('ContentPane iOS resume repaint', () => {
+  it('subscribes to the shared onPageResume signal', () => {
+    // Not a bare `visibilitychange` listener: iOS frequently restores a PWA via
+    // `pageshow` (bfcache) or `focus` with no `visible` visibilitychange, and
+    // `onPageResume` is the single place all three are handled (and the wake-tap
+    // guard armed).
+    expect(contentPaneCode).toMatch(
+      /import\s*\{[^}]*\bonPageResume\b[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/pageResume['"]/,
+    );
+    expect(contentPaneCode).toMatch(/onPageResume\(/);
+  });
+
+  it('repaints the content pane body element, not some other node', () => {
+    // The blanked layer is the scroll container itself, and `bodyRef` is the only
+    // ref pointing at `.content-pane-body`.
+    expect(contentPaneCode).toMatch(/forceWebKitRepaint\(\s*bodyRef\.current\s*\)/);
+  });
+
+  it('does NOT repaint on panel switch (the reverted lag regression)', () => {
+    // A per-view repaint keyed on `viewKey` was tried and reverted.
+    // `forceWebKitRepaint`'s recovery nudge writes `scrollTop`, and `useHideOnScroll`
+    // listens for scroll on this exact element
+    // (`.mobile-swipe-pane .content-pane-body`), so every nudge moved the mobile
+    // header and rewrote `--mobile-header-offset` on `:root`. As a 5-attempt burst
+    // that came to ten header transforms plus five forced synchronous layouts per
+    // view change, while the incoming view was still mounting its lazy chunk and
+    // its data. The notification detail keys `viewKey` per notification, so each
+    // prev/next chevron tap paid it too. Reported as lag opening notifications.
+    //
+    // As of 2026-08-03 that cost is gone: `useHideOnScroll` skips scroll events
+    // inside the nudge window (`isRepaintNudging`), and the offset is written on
+    // its two consumer elements as a `transform` rather than on `:root` as a
+    // `top`, so a nudge no longer moves the header or forces a layout.
+    //
+    // This test still holds, on the reason that outlived the regression: the wake
+    // already fires visibilitychange + pageshow + focus, so the resume path gets
+    // three superseding attempts on its own and needs no navigation fallback.
+    //
+    // Stated as "exactly one repaint call site, and it is inside a mount-once
+    // effect". That covers the burst, a second plain toggle, and any future
+    // variant, without depending on the banned symbol's name.
+    const repaintCalls = contentPaneCode.match(/forceWebKitRepaint\w*\(/g) ?? [];
+    expect(repaintCalls).toHaveLength(1);
+    expect(contentPaneCode).toMatch(/onPageResume\([\s\S]*?\)\s*,\s*\[\s*\]\s*\)/);
+    // A `[viewKey]` dep array is not banned outright: the navigation reveal
+    // (content-pane-nav-reveal.test.ts) legitimately keys a cover on it, and
+    // that effect touches neither the scroll container nor a repaint. What is
+    // banned is a per-view effect that pokes the element the resume path owns,
+    // which is the shape the reverted regression had whatever it was called.
+    // Sliced at each effect call so one effect's body can never be read as
+    // another's: a plain lazy match would swallow the resume effect whole on
+    // its way to a `[viewKey]` further down and fail on ITS repaint call.
+    for (const block of contentPaneCode.split(/(?=use(?:Layout)?Effect\()/)) {
+      const perViewEffect = block.match(/^use(?:Layout)?Effect\([\s\S]*?,\s*\[\s*viewKey\s*\]\s*\)/)?.[0];
+      if (!perViewEffect) continue;
+      expect(perViewEffect).not.toMatch(/Repaint|bodyRef|scrollTop/);
+    }
+  });
+
+  it('skips only a pane something is FULLSCREEN over, nothing wider', () => {
+    // `forceWebKitRepaint` writes a transform for one frame, which makes
+    // `.content-pane-body` the containing block for a `position: fixed`
+    // descendant. The pseudo-fullscreen panel (`.app-ui-fullscreen`, rendered
+    // in-tree by AppUiInline) is one, so the repaint would snap it back to the
+    // pane's box for that frame. One guard for the one repaint path; a second
+    // path would need its own.
+    const guards = contentPaneCode.match(/if\s*\(fullscreenCoversThePane\(\)\)\s*return/g) ?? [];
+    expect(guards).toHaveLength(1);
+  });
+
+  it('does not skip an ordinary in-pane app', () => {
+    // It used to skip every app-ui overlay, which excluded the one view a deep
+    // link most often lands in: a banner tap to an app painted nothing. The
+    // hazard is fullscreen, so the predicate reads no overlay type at all.
+    const predicate = contentPaneCode.match(/function fullscreenCoversThePane\(\)[\s\S]*?\n}/)?.[0] ?? '';
+    expect(predicate).not.toMatch(/panelOverlay|'app-ui'/);
+  });
+
+  it('asks the DOM about native fullscreen, not the app-panel overlay mount', () => {
+    // `appFullscreenHost` is null whenever the fullscreen element is not an app
+    // panel of ours. An app that fullscreens its OWN content makes the iframe
+    // that element, and the pane is covered just the same.
+    expect(contentPaneCode).toMatch(/nativeFullscreenElement\(\)\s*!==\s*null/);
+    expect(contentPaneCode).not.toMatch(/appFullscreenHost\.peek/);
+  });
+
+  it('reads the fullscreen state live, not at render time', () => {
+    // The resume subscription is mounted once with `[]` deps, so a captured
+    // value would be frozen at whatever the pane showed at mount and the guard
+    // would consult the wrong state forever after.
+    expect(contentPaneCode).toMatch(/appPseudoFullscreen\.peek\(\)/);
+  });
+
+  it('uses the shared repaint utilities rather than a hand-rolled toggle', () => {
+    // `forceWebKitRepaint` is iOS-gated, detached-node-safe, supersede-safe, and
+    // yields to concurrent scroll writers (useScrollMemory's restore). A local
+    // `style.transform` poke would have none of that and would fight the
+    // saved-scroll restore this same component sets up.
+    expect(contentPaneCode).toMatch(
+      /import\s*\{[^}]*\bforceWebKitRepaint\b[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/webkitRepaint['"]/,
+    );
+    expect(contentPaneCode).not.toMatch(/style\.transform/);
+  });
+});

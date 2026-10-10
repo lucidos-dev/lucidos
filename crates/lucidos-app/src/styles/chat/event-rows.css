@@ -1,0 +1,369 @@
+/* ───────────────────────────────────────────────────────────────────────
+   The EVENT ROW: one transcript marker for an event wait, an event delivery, a
+   child-thread callback and a trigger fire (components/chat/EventRow.tsx,
+   docs/plans/2026-08-10-one-event-row-for-the-transcript.md).
+
+   These are RECORDS, not steps. The distinction is the reason the file
+   exists: the event wait used to render through `.inline-step`, which put a
+   green success check on a subscription that might still be sleeping and
+   ellipsized both the reason and the subscription, the two things the row is
+   for. Nothing here may take a step outcome colour.
+
+   It IS a card, as of 2026-08-10, and it was not before. Unboxed, the subject,
+   the facts and the fold read as three loose lines of debris between the step
+   list above and the prose below; the user rejected that on sight. The weight
+   still ranks below `.step-note-card`, which is what an inline affordance
+   earns (the checkpoint's Undo), so this lifts on `--bg-secondary` with a
+   hairline rather than taking the tertiary fill and full border. A left accent
+   stripe stays banned outright (.claude/rules/frontend-css.md).
+   ─────────────────────────────────────────────────────────────────────── */
+
+.event-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    margin: var(--space-sm) 0;
+    /* The left inset adds back the lead badge's pull (its pad and border, see
+       `.event-row-subject > .event-name:first-child`). So the badge sits as far
+       from the left edge as from the top, and the text below lines up past it. */
+    --event-row-inset: 0.625rem;
+    padding: var(--event-row-inset) var(--space-md) var(--event-row-inset)
+        calc(var(--event-row-inset) + 0.375rem + 1px);
+    background: var(--bg-secondary);
+    border: 1px solid color-mix(in srgb, var(--border-color) 30%, transparent);
+    border-radius: calc(var(--radius-surface) * 5 / 6);
+    font-size: var(--font-size-md);
+    /* Pinned rather than inherited, for the same reason `.inline-step` pins
+       its own: these render inside `.response-content`, whose 1.6 is prose
+       leading for wrapped paragraphs, and a marker wants a tighter pitch than
+       the paragraph around it. Looser than the step list's 1.4, because this
+       one's subject genuinely wraps. */
+    line-height: 1.45;
+    /* Selectable, unlike `.inline-step`, which turns selection off so an iOS
+       tap opens the step-detail modal instead of selecting. There is no modal
+       behind an event row, and its subject is the kind of thing a reader
+       copies out. */
+    user-select: text;
+    -webkit-user-select: text;
+}
+
+/* Subject and state on ONE line, at every width. The state sits on the
+   subject's first baseline, so a subject that wraps to three lines still
+   reports its verdict where the reading starts. The head must not wrap: a
+   state dropped to a line of its own floats mid-card, under nothing. */
+.event-row-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-sm);
+}
+
+/* At the far edge, capped so the subject always keeps over half the line. A
+   state longer than the cap wraps inside its own column, right-aligned. */
+.event-row-state {
+    flex: 0 0 auto;
+    max-width: 45%;
+    margin-left: auto;
+    text-align: right;
+}
+
+/* ABOVE the card, right-aligned, in the muted stamp a user bubble carries
+   (`.initiator-timestamp`). The card's own top margin is the gap under it,
+   the same 0.5rem a turn header leaves above its body. */
+.event-row-time {
+    display: block;
+    margin-top: var(--space-sm);
+    text-align: right;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+/* An open form request's Open, or a change's Diff and Revert. */
+.event-row-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-sm);
+    margin-top: var(--space-xs);
+}
+
+/* WRAPS, and this is load-bearing rather than a preference. The subject is a
+   sentence a human or a model wrote (an event wait's reason, a child thread's
+   title, a trigger's name), and an ellipsis there hides the only thing the row
+   is answering. `overflow-wrap` rather than `word-break`, so an ordinary
+   sentence still breaks at its spaces and only an unbroken token is split. */
+.event-row-subject {
+    /* Takes whatever the state leaves, and wraps inside it. The state's cap
+       keeps that share from shrinking to one letter per line. */
+    flex: 1 1 0;
+    min-width: 0;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+/* The sentence under a chip subject. It wraps for the same reason the subject
+   does: a model wrote it, and an ellipsis would hide what the row is for. */
+.event-row-detail {
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+/* The machine-readable facts, under the subject. Wraps as a whole, so a narrow
+   thread pane stacks the chips instead of clipping them. */
+.event-row-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.3125rem var(--space-sm);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* A row waiting behind an open question dims until the agent reads it. Its
+   note says when. */
+.event-row[data-held] {
+    opacity: 0.55;
+}
+
+.event-row-held-note {
+    font-size: var(--font-size-xs);
+    font-style: italic;
+    color: var(--text-secondary);
+}
+
+/* A separator and the fact it introduces, kept on one line together. */
+.event-row-fact {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.event-row-sep {
+    color: color-mix(in srgb, var(--text-muted) 45%, transparent);
+}
+
+.event-row-glue {
+    color: var(--text-muted);
+    font-size: var(--font-size-2xs);
+}
+
+/* The state as a WORD in plain tinted text, with no pill behind it. The tint
+   only groups it: every state stays legible as text, so a colourblind reader
+   and a screen reader get the same fact the colour carries. One vocabulary
+   across all kinds, which is what makes a matched wait, a delivered event and
+   a child's verdict comparable at a glance. */
+.event-row-state {
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+/* The tick or cross before a verdict word. A word joiner after it glues it to
+   that word (.claude/rules/frontend-css.md, icon glue), so the label itself
+   stays free to wrap. */
+.event-row-state-glyph {
+    display: inline;
+    line-height: 0;
+}
+
+.event-row-state-glyph::after {
+    content: '\2060';
+}
+
+/* Sized to the word's cap band. The rem pair is the fallback for an engine
+   without `cap`: an unsized inline svg draws at 300 by 150. */
+.event-row-state-glyph svg {
+    width: 0.5rem;
+    height: 0.5rem;
+    width: 1cap;
+    height: 1cap;
+    margin-right: var(--space-xs);
+    vertical-align: baseline;
+}
+
+/* Still watching: cool and quiet, since nothing has happened yet and the row
+   must not read as a result. */
+.event-row-state[data-tone="live"] {
+    color: var(--accent-notable);
+}
+
+/* Something arrived (a delivery, a matched wait, a trigger fire). */
+.event-row-state[data-tone="arrived"] {
+    color: var(--accent);
+}
+
+/* A verdict: a child thread's outcome, an applied change, a finished form.
+   It reports what the row points at, never the row's own success. */
+.event-row-state[data-tone="good"] {
+    color: var(--accent-green-soft);
+}
+
+.event-row-state[data-tone="bad"] {
+    color: var(--accent-red);
+}
+
+/* A deadline passed with no match. Not red: nothing failed, the watch simply
+   ended without its event. */
+.event-row-state[data-tone="lapsed"] {
+    color: var(--accent-yellow);
+}
+
+/* Somebody ended it early (a stand-down, an archive, a discard). Warm and
+   deliberately NOT the neutral, so it cannot be mistaken for the untinted
+   `none` word beside it in the same stream. */
+.event-row-state[data-tone="halted"] {
+    color: var(--accent-orange);
+}
+
+.event-row-state[data-tone="none"] {
+    color: var(--text-muted);
+}
+
+/* The event-type atom. THE one way an event type is spelled in the transcript,
+   used by an event wait's subscription list, a delivery's matched event and an
+   event-fired trigger alike. Neutral when inert, so the accent is left to mean
+   one thing: this chip does something when pressed. */
+.event-name {
+    display: inline-flex;
+    align-items: baseline;
+    /* A flex box drops the space text node between name and note, so the gap
+       stands in for it. */
+    gap: 0.4em;
+    --event-name-h-pad: 0.375rem;
+    padding: 0.0625rem var(--event-name-h-pad);
+    /* Transparent, so the link variant's outline costs no layout shift. */
+    border: 1px solid transparent;
+    border-radius: calc(var(--radius-control) * 0.625);
+    background: color-mix(in srgb, var(--text-primary) 7%, transparent);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+}
+
+/* A badge header: a row whose subject IS the event-type chip, with nothing
+   leading it ("Child thread returned", a trigger fire, a boundary event). The
+   chip's own padding and border inset its label text past where the facts
+   and fold rows below start flush. Pull the chip left by that same inset so
+   its label lines up with them on one left edge instead of sitting indented
+   above it. */
+.event-row-subject > .event-name:first-child {
+    margin-left: calc(-1px - var(--event-name-h-pad));
+}
+
+/* "filtered" / "6 filters": a qualifier, so it recedes behind the name in
+   whichever colour the chip wears. */
+.event-name-note {
+    color: color-mix(in srgb, currentColor 60%, transparent);
+}
+
+/* The chip AS the jump, or the door to a subscription's conditions. It is a
+   `<button>`, so it sheds the UA button box and takes the chip's own back.
+   The outline is the affordance, since colour alone fails a colourblind
+   reader. The accent tint and the hover back it up. */
+.event-name-link {
+    border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    margin: 0;
+    font-weight: inherit;
+    line-height: inherit;
+    cursor: pointer;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+    transition: background var(--duration-fast) ease, border-color var(--duration-fast) ease;
+}
+
+@media (hover: hover) {
+    .event-name-link:hover {
+        background: color-mix(in srgb, var(--accent) 22%, transparent);
+        border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+    }
+}
+
+/* In flight. The chip keeps its NAME rather than swapping in a "Opening…"
+   label, because the name is a fact the row states and not a button caption:
+   replacing it would delete the answer to "what arrived here" for as long
+   as the navigation takes. Dimmed and inert instead, which says "working" while
+   leaving the fact on screen. */
+.event-name-link:disabled {
+    cursor: default;
+    opacity: 0.55;
+}
+
+/* One disclosure, labelled by what it holds (Payload / Summary / Prompt), and
+   closed by default: the subject already answered the question the reader had,
+   and the body is for the rare follow-up. */
+.event-row-fold {
+    margin-top: 0.125rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
+.event-row-fold-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0;
+    border: none;
+    background: none;
+    color: inherit;
+    cursor: pointer;
+    user-select: none;
+    transition: color var(--duration-fast) ease;
+}
+
+/* The icon is 1em on a 24-unit box, and its ink starts 8 units in (the
+   polyline at 9, less its round cap). Pulling it left by that bearing puts
+   the drawn chevron on the card's text edge, with the badge label above it. */
+.event-row-fold-chevron {
+    display: inline-flex;
+    margin-left: calc(-8em / 24);
+    transition: transform var(--duration-fast) ease;
+}
+
+/* Turned down, the ink starts 5 units in, not 8, so it shifts back by 3. */
+.event-row-fold-toggle[aria-expanded="true"] > .event-row-fold-chevron {
+    transform: translateX(calc(3em / 24)) rotate(90deg);
+}
+
+@media (hover: hover) {
+    .event-row-fold-toggle:hover {
+        color: var(--text-primary);
+    }
+}
+
+/* `--bg-tertiary`, not `--bg-secondary`: the card itself is now secondary, so a
+   body on the same fill would open onto an invisible panel. Tertiary lifts in
+   both themes, which keeps the direction consistent rather than recessing on
+   one and lifting on the other. */
+.event-row-fold-pre,
+.event-row-fold-body {
+    margin: 0.375rem 0 0;
+    padding: var(--space-sm) 0.625rem;
+    border-radius: calc(var(--radius-surface) * 0.5);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+/* Machine data of unknown width (a path, a sha). Scrolls rather than wraps: a
+   wrapped sha reads as two shas. */
+.event-row-fold-pre {
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    line-height: 1.4;
+}
+
+.event-row-fold-body {
+    font-size: var(--font-size-sm);
+}
+
+/* A fold inside a fold (a re-entry's "What the agent was told") already sits on
+   the outer body's fill. A second fill on the same colour would vanish, so the
+   inner body drops its box and reads as text under its own toggle. */
+.event-row-fold-body .event-row-fold {
+    margin-top: var(--space-sm);
+}
+
+.event-row-fold-body .event-row-fold-pre,
+.event-row-fold-body .event-row-fold-body {
+    padding: 0;
+    background: none;
+}

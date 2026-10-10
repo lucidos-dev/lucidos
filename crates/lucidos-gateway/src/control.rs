@@ -1,0 +1,1470 @@
+//! The gateway control plane — `/~/api/v1/control/*`.
+//!
+//! Lives behind the reserved sigil namespace (ADR 0014 §2) so it can never
+//! collide with a workspace slug. Serves the workspace picker's CRUD: list (with
+//! per-workspace health), create (provision a stack), rename (registry-only
+//! edit), delete-to-trash, and a manual restart for an unhealthy stack.
+
+use crate::auth;
+use crate::error::ApiError;
+use crate::net_config;
+use crate::peers;
+use crate::server::{GatewayState, RestoreStatus};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post, put};
+use axum::{Extension, Json, Router};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+pub fn router() -> Router<GatewayState> {
+    Router::new()
+        .route("/workspaces", get(list).post(create))
+        // Register a directory that already exists, without provisioning or
+        // starting anything. `create`'s sibling for a tree somebody else owns.
+        .route("/workspaces/adopt", post(adopt))
+        // Fresh aggregate unread total across running workspaces, computed on
+        // demand. The desktop dock badge reads this on its nudge (and periodic
+        // tick) so a just-read notification reflects immediately, rather than
+        // waiting for the supervise loop's cached `last_unread` to catch up.
+        .route("/unread-total", get(unread_total))
+        // Restore a local backup archive into a new workspace (picker upload).
+        // The body is a multipart upload of a potentially multi-GB `.enc`, so the
+        // default 2 MB extractor limit is lifted for this route only.
+        .route(
+            "/workspaces/restore",
+            post(restore).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/restore-status", get(restore_status).delete(clear_restore))
+        // Gateway self-update: is a rebuilt binary waiting, and adopt it (re-exec).
+        .route("/gateway/status", get(gateway_status))
+        .route("/gateway/reload", post(gateway_reload))
+        // Ask the release check to poll now (ADR 0108). Kept off
+        // `/gateway/status`, which the picker hits every 2s and which must
+        // never wait on an outbound request.
+        .route("/gateway/check-updates", post(gateway_check_updates))
+        // The update relay (ADR 0338). The desktop client beats here, and a
+        // session that cannot install asks it to.
+        .route("/desktop-client/heartbeat", post(desktop_client_heartbeat))
+        .route("/update-relay", post(request_update_relay))
+        // Is Lucidos slow, and why (ADRs 0274, 0283)? The cached answer only,
+        // since every workspace window polls it.
+        .route("/slowness", get(slowness_status))
+        // Every Lucidos install on this machine. Kept off `/gateway/status`
+        // for the same reason as the line above: this one walks directories.
+        .route("/installs", get(list_installs))
+        // Where one named workspace lives when THIS gateway does not serve it.
+        // A lookup, never a listing: see `crate::peers`.
+        .route("/workspace-location", get(workspace_location))
+        // Write the machine-global release-check preference. The matching READ
+        // is the `release_check` field on `/gateway/status`, so there is one
+        // place the frontend gets the whole answer.
+        .route("/release-check", put(set_release_check_config))
+        // Machine-global network bind (the gateway's own bind + the engine
+        // inherit toggle) — the picker's Network access control writes
+        // ~/.lucidos/network.toml here.
+        .route(
+            "/network-config",
+            get(network_config).put(set_network_config),
+        )
+        .route("/workspaces/:id/rename", post(rename))
+        .route("/workspaces/:id/restart", post(restart))
+        .route("/workspaces/:id/stop", post(stop))
+        .route("/workspaces/:id/autostart", post(set_autostart))
+        // A booting engine reports its current phase here (best-effort) so the
+        // boot splash can narrate the wait. Called by the engine during its own
+        // startup, before its HTTP server is up — see the engine's
+        // `report_boot_phase`.
+        .route("/workspaces/:id/boot-phase", post(set_boot_phase))
+        // ...and reports here when that startup DIES in a way no retry can fix
+        // (chiefly a database migrated by a newer Lucidos). Unlike the phase
+        // report this one is awaited by the engine, because the process exits
+        // immediately after — see the engine's `boot_failure`.
+        .route("/workspaces/:id/boot-failure", post(set_boot_failure))
+        .route("/workspaces/:id", delete(delete_workspace))
+        // Request-level authorization for the whole destructive control plane.
+        .layer(middleware::from_fn(control_authz))
+}
+
+// ── Control-plane CSRF defense ─────────────────────────────────────────────
+//
+// This is a CSRF gate, NOT an authenticator. Browser metadata is a CSRF signal,
+// and the absence of it proves nothing about a caller: any curl can omit every
+// header. Read this module as answering one question only: *which document sent
+// this request*.
+//
+// WHO the caller is was already decided, upstream, by
+// [`crate::auth_api::enforce`] (ADR 0094). It wraps the entire gateway router,
+// so a control request arrives here only after it presented the machine-local
+// token or a paired device's credential. `auth_api::is_public_path` is the whole
+// exemption list, and no control route is on it. That is why the header-less
+// arm below allows: not because such a caller is trusted, but because it has
+// already proved a credential.
+//
+// The bind is not what protects this plane, and never should be read as doing
+// so. The default IS loopback, but `~/.lucidos/network.toml` and
+// `LUCIDOS_GATEWAY_BIND_ALL` both open it, and remote access is a shipped
+// feature. A gateway on a tailnet address refuses an uncredentialed control
+// request exactly as a loopback one does, which
+// `an_uncredentialed_control_request_is_refused` pins against the real router.
+//
+// What this gate adds on top. App UIs are served at `/<slug>/app/<id>/`, and a
+// document opened there runs with whatever credential the browser holds.
+// Without this, its JS could
+// `fetch('/~/api/v1/control/workspaces/<slug>/stop', {method:'POST'})` and stop
+// the workspace it runs in, carrying the user's own cookie. Three arms:
+//
+//   * Non-browser clients (the dev launcher / `stop.sh` curl, the engine→gateway
+//     boot-phase report, the packaged smoke test) send NO fetch metadata. They
+//     are not driving a document, so there is no CSRF to defend against, and
+//     `enforce` has already authenticated them.
+//   * Cross-site / cross-origin browser requests are rejected via the
+//     forge-proof `Sec-Fetch-Site` + `Origin`/`Host` checks (a page cannot set
+//     these via `fetch()`). This fully closes the classic CSRF vector.
+//   * A same-origin browser request must carry a `Referer` naming the picker
+//     (`/~/...`) or the workspace shell (`/<slug>/...`, no `app` segment). An
+//     app document (`/<slug>/app/...`) is refused, and so is NO `Referer`:
+//     page script can suppress the header, so its absence proves nothing.
+//     `Sec-Fetch-Site: none` alone passes without one, as a user action.
+//
+// An app FRAME inside the shell is now an opaque origin (ADR 0227). The second
+// arm catches it on the forge-proof headers alone, and the third never has to.
+// What the third still carries is the app opened in its own TAB, a top-level
+// document on this origin.
+//
+// RESIDUAL: such a tab can name a shell URL as its `referrer`, since the fetch
+// option accepts same-origin URLs. So for it the Referer rule is strong
+// defense-in-depth rather than an absolute boundary. ADR 0144 records why no
+// same-origin signal can close that, and ADR 0014 the distinct-origin fix.
+//
+// A second RESIDUAL: Safari before 16.4 sends no `Sec-Fetch-*`, and no `Origin`
+// on a same-origin GET. Such a GET with its Referer suppressed carries no
+// browser metadata, so it reads as a CLI call and passes. Mutations still
+// refuse, because they carry `Origin`.
+//
+// The auth plane's credentialed routes sit behind this same gate. They mint a
+// pairing code and list and revoke devices, which is worse in an app's hands
+// than stopping a workspace.
+
+/// Axum middleware: reject a control-plane or auth-plane request that an app
+/// document (or a cross-site page) originated. Allows non-browser clients and
+/// same-origin picker / workspace-shell requests. See the module note above.
+pub(crate) async fn control_authz(req: Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()));
+    if control_request_allowed(req.headers(), host.as_deref()) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            "the gateway API is not reachable from app documents or cross-origin requests",
+        )
+            .into_response()
+    }
+}
+
+/// Read a header as a trimmed, non-empty `&str`.
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Pure authorization decision for a control-plane request (extracted so the
+/// policy is exhaustively unit-tested). See the module note for the full model.
+fn control_request_allowed(headers: &HeaderMap, host: Option<&str>) -> bool {
+    let sec_fetch_site = header_str(headers, "sec-fetch-site");
+    let origin = header_str(headers, "origin");
+    let referer = header_str(headers, "referer");
+
+    // Non-browser client (CLI launcher, engine→gateway report, curl): no fetch
+    // metadata at all → allow. It is driving no document, so there is no CSRF
+    // here to defend against, and `auth_api::enforce` already authenticated it.
+    if sec_fetch_site.is_none() && origin.is_none() && referer.is_none() {
+        return true;
+    }
+
+    // Browser-originated. Require same-origin (forge-proof: `fetch()` cannot set
+    // `Sec-Fetch-*` or `Origin`). Reject cross-site / same-site.
+    if let Some(site) = sec_fetch_site {
+        if !matches!(site, "same-origin" | "none") {
+            return false;
+        }
+    }
+    // When Origin is present, its authority must match the request Host (covers
+    // browsers without Sec-Fetch metadata; another CSRF guard).
+    if let (Some(origin), Some(host)) = (origin, host) {
+        if !origin_matches_host(origin, host) {
+            return false;
+        }
+    }
+
+    // No cross-site signal here, and only the Referer tells the shell from an
+    // app tab. A browser request without one is unattributable and fails closed.
+    // `none` is the exception: the user typed or bookmarked it, and no page
+    // script can produce it.
+    match referer {
+        Some(referer) => !referer_is_app_iframe(referer),
+        None => sec_fetch_site == Some("none"),
+    }
+}
+
+/// Whether `origin` (e.g. `https://localhost:5251`) has the same authority as
+/// the request `host` (e.g. `localhost:5251`). Compares the host:port only.
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let origin_authority = origin
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(origin)
+        .trim_end_matches('/');
+    origin_authority.eq_ignore_ascii_case(host)
+}
+
+/// Whether a `Referer` URL points at an app-iframe document. App UIs are served
+/// at `/<slug>/app/<id>/…`, so the second path segment is `app`. The picker
+/// (`/~/…`) and the workspace shell (`/<slug>/…`, no `app` segment) are not.
+fn referer_is_app_iframe(referer: &str) -> bool {
+    // Strip scheme://authority to get the path; tolerate a bare path too.
+    let after_scheme = referer.split_once("://").map(|(_, r)| r).unwrap_or(referer);
+    let path = match after_scheme.find('/') {
+        // Referer had an authority — path starts at the first '/'.
+        Some(idx) if referer.contains("://") => &after_scheme[idx..],
+        // No authority (already a path) — use as-is.
+        _ if referer.starts_with('/') => referer,
+        _ => return false,
+    };
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    let _slug = segments.next();
+    matches!(segments.next(), Some("app"))
+}
+
+/// Reject a malformed workspace id (defense in depth — the path-segment lookup
+/// already only matches registered slugs, but a clean 400 beats a 404 for a
+/// non-slug input, and guards the trash-path construction in delete).
+fn reject_invalid_id(id: &str) -> Result<(), ApiError> {
+    if crate::registry::is_valid_id(id) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("invalid workspace id"))
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateBody {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct AdoptBody {
+    /// Absolute path to an existing directory. Its basename slugifies to the
+    /// workspace address.
+    dir: String,
+    /// Display name. Absent leaves an existing entry's name alone, and names a
+    /// new one after its directory.
+    #[serde(default)]
+    name: Option<String>,
+    /// Absent means false for a NEW entry and unchanged for an existing one.
+    /// The picker owns this toggle exactly as it owns the display name, so a
+    /// re-adopt must not silently undo it.
+    #[serde(default)]
+    autostart: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct RenameBody {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct AutostartBody {
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct BootPhaseBody {
+    /// Kebab-case phase name (see [`crate::boot_phase::BootPhase::from_wire`]).
+    /// An unrecognized value is accepted and ignored (forward-compatible).
+    phase: String,
+}
+
+#[derive(Deserialize)]
+struct BootFailureBody {
+    /// The engine's user-facing explanation of why this boot cannot succeed,
+    /// rendered verbatim (HTML-escaped) on the splash. The gateway deliberately
+    /// does not classify it — the engine is the only side that knows which
+    /// migrations it carries.
+    message: String,
+}
+
+#[derive(Deserialize, Default)]
+struct DeleteBody {
+    /// Type-the-name confirmation. When present it must match the workspace's
+    /// current display name (defense in depth behind the picker's confirm).
+    #[serde(default)]
+    confirm: Option<String>,
+}
+
+async fn list(State(state): State<GatewayState>) -> Json<Value> {
+    Json(json!({ "workspaces": state.list_status().await }))
+}
+
+/// Fresh aggregate unread total across running workspaces (see
+/// [`GatewayState::fresh_unread_total`]). Read by the Tauri desktop dock-badge
+/// loop on its nudge + periodic tick.
+async fn unread_total(State(state): State<GatewayState>) -> Json<Value> {
+    Json(json!({ "total": state.fresh_unread_total().await }))
+}
+
+async fn create(
+    State(state): State<GatewayState>,
+    Json(body): Json<CreateBody>,
+) -> Result<Json<Value>, ApiError> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("workspace name must not be empty"));
+    }
+    // Picker "+ New": auto-start off by default — the user opens it now; whether
+    // it auto-starts on a future gateway boot is their per-workspace toggle.
+    // The gateway returns a typed error: a duplicate display name is a 409 the
+    // user can act on, not a 500.
+    let status = state.create_workspace(name).await?;
+    Ok(Json(json!({ "workspace": status })))
+}
+
+/// Register an existing directory as a workspace, and start nothing.
+///
+/// The response carries the registry entry, the allocated `port` included, so
+/// the caller can boot its own engine there. The gateway adopts that engine on
+/// its next supervise tick, and from then on the workspace is a regular one:
+/// healthy in the picker, proxied, stoppable and restartable.
+///
+/// Deliberately NOT a `WorkspaceStatus` like [`create`]'s. That shape carries
+/// `health`, and at this instant nothing is running yet, whatever the caller is
+/// about to boot. Reporting health here would describe the gap rather than the
+/// registration that worked.
+async fn adopt(
+    State(state): State<GatewayState>,
+    Json(body): Json<AdoptBody>,
+) -> Result<Json<Value>, ApiError> {
+    let ws = state
+        .adopt_workspace(
+            std::path::Path::new(body.dir.trim()),
+            body.name.as_deref(),
+            body.autostart,
+        )
+        .await?;
+    Ok(Json(json!({ "workspace": ws })))
+}
+
+/// Restore a local encrypted backup archive into a NEW workspace. Multipart body:
+/// `file` (the `.enc`), `key` (base64 backup key), and optional `name` (sent only
+/// when the derived name collides with an existing workspace). Streams the upload
+/// to a temp file, then hands off to the gateway's restore flow (which validates,
+/// provisions, shells out to the engine, and registers the workspace). Returns
+/// 200 `{id, name}` once the background restore has started — the picker polls
+/// `GET /restore-status` for progress.
+async fn restore(
+    State(state): State<GatewayState>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, ApiError> {
+    // Reject a concurrent restore before consuming a (possibly multi-GB) upload.
+    if matches!(state.restore_status(), RestoreStatus::Running { .. }) {
+        return Err(ApiError::conflict("A restore is already in progress"));
+    }
+
+    // The streamed temp archive is removed on ANY early return from here on — a
+    // connection dropped mid-upload, a malformed trailing field, or a missing
+    // key — via this guard, so a (possibly multi-GB) `.enc` is never orphaned in
+    // the temp dir. It's disarmed only when ownership passes to
+    // `restore_workspace` (which then owns cleanup).
+    let mut guard: Option<TempFileGuard> = None;
+    let mut filename = String::new();
+    let mut key: Option<String> = None;
+    let mut name: Option<String> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("upload error: {e}")))?
+    {
+        // Capture the field name as owned so the borrow ends before we move the
+        // field into the streaming helper.
+        let field_name = field.name().map(|s| s.to_string());
+        match field_name.as_deref() {
+            Some("file") => {
+                filename = field.file_name().unwrap_or_default().to_string();
+                let path = std::env::temp_dir().join(format!(
+                    "lucidos-restore-{}.enc",
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                ));
+                let g = TempFileGuard::arm(path);
+                stream_field_to_file(field, g.path()).await?;
+                guard = Some(g);
+            }
+            Some("key") => {
+                key = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| ApiError::bad_request(format!("bad key field: {e}")))?,
+                )
+            }
+            Some("name") => {
+                name = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| ApiError::bad_request(format!("bad name field: {e}")))?,
+                )
+            }
+            _ => {}
+        }
+    }
+
+    let guard = guard.ok_or_else(|| ApiError::bad_request("missing 'file' field"))?;
+    let key = key
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| ApiError::bad_request("missing backup key"))?;
+    let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+
+    // Hand the temp file to the restore flow; it removes it when the background
+    // restore finishes, or on its own error paths.
+    let tmp = guard.disarm();
+    let (id, ws_name) = state.restore_workspace(tmp, filename, key, name).await?;
+    Ok(Json(json!({ "id": id, "name": ws_name })))
+}
+
+/// Removes its path on drop unless [`disarm`](TempFileGuard::disarm)ed. Guards
+/// the uploaded restore archive so a multipart error after the file part was
+/// streamed never orphans the (possibly multi-GB) temp file.
+struct TempFileGuard(Option<std::path::PathBuf>);
+
+impl TempFileGuard {
+    fn arm(path: std::path::PathBuf) -> Self {
+        Self(Some(path))
+    }
+    fn path(&self) -> &std::path::Path {
+        self.0.as_deref().expect("guard armed")
+    }
+    fn disarm(mut self) -> std::path::PathBuf {
+        self.0.take().expect("guard armed")
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Current restore-flow state for the picker's poll (idle / running+phase /
+/// completed / failed).
+async fn restore_status(State(state): State<GatewayState>) -> Json<RestoreStatus> {
+    Json(state.restore_status())
+}
+
+/// Gateway self-update status for the picker's reload control: this process's
+/// build id, whether a newer gateway binary is on disk waiting to be adopted, and
+/// whether this is a packaged build (the picker hides the dev-only self-reload
+/// control when `packaged`).
+///
+/// It also carries `release_check`, the machine's answer to "is a newer Lucidos
+/// PUBLISHED" (ADR 0108). That is the last known answer only: this route is
+/// polled every 2s and must never wait on the origin. An older gateway omits
+/// the field, and the frontend reads that as no offer.
+async fn gateway_status(State(state): State<GatewayState>) -> Json<Value> {
+    Json(json!({
+        "build_id": state.build_id(),
+        "update_available": state.gateway_update_available().await,
+        "packaged": state.packaged(),
+        "release_check": state.release_check().snapshot(),
+        "update_relay": state.update_relay().snapshot(std::time::Instant::now()),
+    }))
+}
+
+/// POST /~/api/v1/control/desktop-client/heartbeat: the desktop client says it
+/// is running, and learns of a pending update request.
+///
+/// The machine-local token only. A paired device holds full control-plane
+/// authority, but posing as the client would let it fake an attached client.
+async fn desktop_client_heartbeat(
+    State(state): State<GatewayState>,
+    local: Option<Extension<auth::AuthenticatedLocalProcess>>,
+    Json(beat): Json<crate::update_relay::Heartbeat>,
+) -> Result<Json<Value>, ApiError> {
+    if local.is_none() {
+        return Err(ApiError::forbidden(
+            "only the desktop app on this machine can send a heartbeat",
+        ));
+    }
+    let request = state
+        .update_relay()
+        .heartbeat(beat, std::time::Instant::now());
+    Ok(Json(json!({ "request": request })))
+}
+
+/// POST /~/api/v1/control/update-relay: ask the desktop client to install the
+/// newest published release. 200 with the ticket, or 409 saying why not.
+///
+/// Not 202, though the run is asynchronous: the frontend's control client
+/// reads every 202 as bodyless, and the requester needs the ticket.
+///
+/// Any caller the control plane already admits may ask, a paired phone
+/// included: it can already restart and delete workspaces (ADR 0338).
+async fn request_update_relay(
+    State(state): State<GatewayState>,
+    device: Option<Extension<auth::AuthenticatedDevice>>,
+) -> Result<Json<crate::update_relay::Ticket>, ApiError> {
+    let latest = state.release_check().latest_version();
+    let ticket = state
+        .update_relay()
+        .request(latest.as_deref(), std::time::Instant::now())
+        .map_err(|refusal| ApiError::conflict(refusal.message()))?;
+    let by = device
+        .as_deref()
+        .map_or("a local process", |d| d.label.as_str());
+    crate::log!(
+        "[Gateway] desktop update {} to {} requested by {by}",
+        ticket.id,
+        ticket.version
+    );
+    Ok(Json(ticket))
+}
+
+/// GET /~/api/v1/control/slowness: the sampler's last answer. It never
+/// samples here, so it answers at once however starved the machine is.
+async fn slowness_status(
+    State(state): State<GatewayState>,
+) -> Json<crate::slowness::SlownessStatus> {
+    Json(state.slowness().snapshot())
+}
+
+/// GET /~/api/v1/control/installs: every Lucidos install on this machine, and
+/// which of them are configured for one port.
+///
+/// The answer is what Settings, System, Overview renders. It is also the only
+/// way a headless install learns that a second one is shadowing it, having no
+/// client to raise a dialog.
+async fn list_installs(State(state): State<GatewayState>) -> Json<lucidos_installs::Inventory> {
+    Json(state.install_inventory())
+}
+
+/// Query for [`workspace_location`]: the workspace name a thread link carried.
+#[derive(Deserialize)]
+struct WorkspaceLocationQuery {
+    name: String,
+}
+
+/// Where a workspace this gateway does not serve lives, and how to reach it.
+///
+/// The shape the client acts on. `scheme` appears only on the reachable arm: it
+/// is what the peer answered, and a gateway that answered nothing said nothing
+/// about its scheme.
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+enum WorkspaceLocation {
+    /// A peer gateway answered. This is the whole address the client needs.
+    Reachable {
+        install: String,
+        gateway_port: u16,
+        scheme: &'static str,
+        slug: String,
+    },
+    /// An install carries the workspace, and its gateway answered nothing.
+    /// Reported rather than started: that launch agent is not ours to run.
+    InstallNotRunning {
+        install: String,
+        gateway_port: u16,
+        slug: String,
+    },
+    /// Several installs carry the name. Picking one would be a guess.
+    Ambiguous { installs: Vec<String> },
+}
+
+/// GET /~/api/v1/control/workspace-location?name=…: locate a workspace that
+/// belongs to another install on this machine.
+///
+/// This is what turns a cross-gateway thread link from a lie ("not available")
+/// into a destination. The client navigates to the peer gateway's own origin;
+/// nothing is proxied and no workspace data crosses. See `crate::peers`.
+///
+/// A name no other install carries is a 404, so the caller learns nothing about
+/// a peer's other workspaces. The answer names exactly the one they asked for.
+async fn workspace_location(
+    State(state): State<GatewayState>,
+    Query(query): Query<WorkspaceLocationQuery>,
+) -> Result<Json<WorkspaceLocation>, ApiError> {
+    let name = query.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("workspace name must not be empty"));
+    }
+    match peers::locate(&state.install_inventory(), state.gateway_port(), name) {
+        peers::Located::Nowhere => Err(ApiError::not_found(format!(
+            "no other Lucidos install on this machine serves a workspace called '{name}'"
+        ))),
+        peers::Located::Ambiguous(found) => Ok(Json(WorkspaceLocation::Ambiguous {
+            installs: found.into_iter().map(|peer| peer.install).collect(),
+        })),
+        peers::Located::One(peer) => {
+            let scheme = peers::probe_scheme(&peers::probe_client(), peer.gateway_port).await;
+            Ok(Json(match scheme {
+                Some(scheme) => WorkspaceLocation::Reachable {
+                    install: peer.install,
+                    gateway_port: peer.gateway_port,
+                    scheme,
+                    slug: peer.slug,
+                },
+                None => WorkspaceLocation::InstallNotRunning {
+                    install: peer.install,
+                    gateway_port: peer.gateway_port,
+                    slug: peer.slug,
+                },
+            }))
+        }
+    }
+}
+
+/// Body for a release-check poll request. Absent means an ordinary refresh,
+/// which the staleness gate may answer from the last known result.
+#[derive(Deserialize, Default)]
+struct CheckUpdatesBody {
+    /// The Settings button, which asks for a poll now. Still floored at one a
+    /// minute, so the button cannot be mashed into a burst.
+    #[serde(default)]
+    force: bool,
+}
+
+/// POST /~/api/v1/control/gateway/check-updates: poll if the answer is stale,
+/// then return the fresh `release_check` object.
+///
+/// Concurrent callers coalesce inside the check, so N open windows asking at
+/// once still produce one outbound request.
+async fn gateway_check_updates(
+    State(state): State<GatewayState>,
+    body: Option<Json<CheckUpdatesBody>>,
+) -> Json<Value> {
+    let force = body.map(|Json(b)| b.force).unwrap_or_default();
+    Json(state.release_check().refresh(force).await)
+}
+
+/// Body for the release-check preference write. The field is optional, so a
+/// body that names nothing settles on the stored value rather than erroring.
+#[derive(Deserialize)]
+struct ReleaseCheckBody {
+    enabled: Option<bool>,
+}
+
+/// PUT /~/api/v1/control/release-check: write `~/.lucidos/updates.toml` and
+/// return the resulting state. The check re-reads the file on every tick, so a
+/// change takes effect with no gateway restart.
+async fn set_release_check_config(
+    State(state): State<GatewayState>,
+    Json(body): Json<ReleaseCheckBody>,
+) -> Result<Json<Value>, ApiError> {
+    let check = state.release_check();
+    // The merge belongs to the writer, not here. It re-reads the file, so an
+    // absent field settles on what is stored rather than on what this handler
+    // last happened to see.
+    check
+        .update_config(body.enabled)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(check.snapshot()))
+}
+
+/// Adopt the on-disk gateway binary by re-exec'ing this process onto it (same
+/// PID, supervisor untouched, running engines re-adopted on boot). Returns 202
+/// before the re-exec so the picker's request resolves; the gateway then briefly
+/// drops while the new image binds, and the picker's poll reconnects.
+async fn gateway_reload(State(state): State<GatewayState>) -> Result<StatusCode, ApiError> {
+    state
+        .reload_gateway()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Body for the machine-global network bind write.
+#[derive(Deserialize)]
+struct NetworkConfigBody {
+    /// `loopback` | `all` | a literal IP. Validated server-side.
+    gateway_bind: String,
+    /// Whether every workspace engine inherits this gateway bind (vs reads its
+    /// own per-workspace `network_bind` preference).
+    inherit: bool,
+}
+
+/// GET /~/api/v1/control/network-config — the machine-global gateway bind +
+/// engine-inherit toggle (from `~/.lucidos/network.toml`) plus a best-effort
+/// Tailscale `100.x` hint, for the picker's Network access control.
+async fn network_config() -> Json<Value> {
+    let net = net_config::read_network_toml();
+    Json(json!({
+        "gateway_bind": net.gateway_bind.unwrap_or_else(|| "loopback".to_string()),
+        "inherit": net.engine_inherit,
+        "detected_tailscale_ip": net_config::detect_tailscale_ipv4(),
+    }))
+}
+
+/// PUT /~/api/v1/control/network-config — write the machine-global config.
+/// Validated server-side (loopback / all / a parseable IP); takes effect only
+/// after a gateway / engine restart (a live socket cannot be re-bound).
+async fn set_network_config(Json(body): Json<NetworkConfigBody>) -> Result<StatusCode, ApiError> {
+    net_config::validate_bind_input(&body.gateway_bind).map_err(ApiError::bad_request)?;
+    // Normalize keyword case so the stored value is canonical.
+    let gateway_bind = match body.gateway_bind.trim().to_ascii_lowercase().as_str() {
+        "loopback" => "loopback".to_string(),
+        "all" => "all".to_string(),
+        _ => body.gateway_bind.trim().to_string(),
+    };
+    net_config::write_network_toml(&gateway_bind, body.inherit)
+        .map_err(|e| ApiError::internal(format!("failed to write network.toml: {e}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Dismiss a terminal restore result (back to Idle). 409 while one is running.
+async fn clear_restore(State(state): State<GatewayState>) -> Result<StatusCode, ApiError> {
+    state.clear_restore_status()?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stream one multipart field to `path` without buffering the whole upload in
+/// memory (a backup archive can be many GB).
+async fn stream_field_to_file(
+    mut field: axum::extract::multipart::Field<'_>,
+    path: &std::path::Path,
+) -> Result<(), ApiError> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| ApiError::internal(format!("temp file: {e}")))?;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("upload read: {e}")))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| ApiError::internal(format!("temp write: {e}")))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| ApiError::internal(format!("temp flush: {e}")))?;
+    Ok(())
+}
+
+async fn rename(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> Result<StatusCode, ApiError> {
+    reject_invalid_id(&id)?;
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("workspace name must not be empty"));
+    }
+    state.rename_workspace(&id, name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The device the caller is on, as `enforce` AUTHENTICATED it. Absent for every
+/// non-browser client (the dev launcher, `stop.sh`, the packaged smoke test),
+/// which is what keeps those teardowns unattributed.
+///
+/// Read from the request extension, never from the inbound header, for the same
+/// reason [`crate::proxy`] re-injects rather than forwards. This value reaches
+/// the engine's restart-intent endpoint, where it is the device-actor half of
+/// `switch_was_user_initiated`. A client-chosen one would let any paired caller
+/// attribute a restart, and the auto-resume it authorizes, to any device it
+/// cared to name.
+fn requesting_device(device: Option<&auth::AuthenticatedDevice>) -> Option<&str> {
+    device.map(|d| d.id.as_str())
+}
+
+async fn restart(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    device: Option<Extension<auth::AuthenticatedDevice>>,
+) -> Result<StatusCode, ApiError> {
+    reject_invalid_id(&id)?;
+    state
+        .restart_workspace(&id, requesting_device(device.as_deref()))
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Stop a workspace's engine but keep its registry entry (it stays listed in the
+/// picker as stopped). The dev `stop.sh` calls this so the shared gateway forgets
+/// the stack and its supervisor stops respawning the engine.
+///
+/// 202 for a workspace this gateway knows, running or not. 404 for one it does
+/// not, which is how `stop.sh` tells the owning gateway from a peer on another
+/// port. See [`GatewayState::stop_workspace`].
+async fn stop(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    device: Option<Extension<auth::AuthenticatedDevice>>,
+) -> Result<StatusCode, ApiError> {
+    reject_invalid_id(&id)?;
+    state
+        .stop_workspace(&id, requesting_device(device.as_deref()))
+        .await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Record the booting engine's current phase for the boot splash. Best-effort
+/// telemetry: an unknown phase string is accepted and ignored (a newer engine
+/// may report a phase this gateway doesn't render), and an unknown/healthy
+/// workspace is a harmless no-op (the splash only renders for a stopped slug;
+/// the next healthy probe clears the phase). 204 on success (400 only for a
+/// malformed id, which the engine never sends); either way the engine's
+/// fire-and-forget caller ignores the response, so a report can't fail the boot.
+async fn set_boot_phase(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(body): Json<BootPhaseBody>,
+) -> Result<StatusCode, ApiError> {
+    reject_invalid_id(&id)?;
+    if let Some(phase) = crate::boot_phase::BootPhase::from_wire(&body.phase) {
+        state.set_boot_phase(&id, phase);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Record a TERMINAL boot failure for `id`: the engine has determined this boot
+/// cannot succeed and is exiting. Unlike [`set_boot_phase`] this is not telemetry
+/// — it changes behavior. The gateway renders the message on the splash instead of
+/// "Workspace starting…" and stops auto-respawning the engine, because the
+/// canonical cause (a database migrated by a newer Lucidos) is not something a
+/// restart can resolve.
+///
+/// An empty message is ignored rather than rendered as a blank splash. 204 on
+/// success; 400 only for a malformed id, which the engine never sends.
+async fn set_boot_failure(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(body): Json<BootFailureBody>,
+) -> Result<StatusCode, ApiError> {
+    reject_invalid_id(&id)?;
+    let message = body.message.trim();
+    if !message.is_empty() {
+        // Always TERMINAL: the engine only reports what it has classified as
+        // unfixable (its `boot_failure.rs` stays silent when in doubt, so the
+        // supervisor keeps retrying). The gateway's own provisioning failures are
+        // the ones that can be merely retrying.
+        state.set_boot_failure(&id, crate::boot_failure::BootFailure::terminal(message));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Flip a workspace's auto-start flag (registry only; does not start/stop the
+/// engine). Drives the picker's per-workspace auto-start toggle.
+async fn set_autostart(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    Json(body): Json<AutostartBody>,
+) -> Result<StatusCode, ApiError> {
+    reject_invalid_id(&id)?;
+    state
+        .set_autostart(&id, body.enabled)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_workspace(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    body: Option<Json<DeleteBody>>,
+) -> Result<StatusCode, ApiError> {
+    reject_invalid_id(&id)?;
+    let confirm = body.and_then(|Json(b)| b.confirm);
+    state
+        .delete_workspace(&id, confirm.as_deref())
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod authz_tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    const HOST: &str = "localhost:5251";
+
+    #[test]
+    fn no_fetch_metadata_is_allowed() {
+        // The dev launcher / stop.sh curl, the engine→gateway boot-phase report,
+        // the packaged smoke test: no Origin/Sec-Fetch/Referer → allowed. This
+        // function is the CSRF half only. Such a caller reached it because
+        // `auth_api::enforce` authenticated it, which
+        // `an_uncredentialed_control_request_is_refused` pins.
+        assert!(control_request_allowed(&headers(&[]), Some(HOST)));
+        assert!(control_request_allowed(
+            &headers(&[("user-agent", "curl/8.0")]),
+            Some(HOST)
+        ));
+    }
+
+    #[test]
+    fn picker_same_origin_request_is_allowed() {
+        let h = headers(&[
+            ("sec-fetch-site", "same-origin"),
+            ("origin", "https://localhost:5251"),
+            ("referer", "https://localhost:5251/~/"),
+        ]);
+        assert!(control_request_allowed(&h, Some(HOST)));
+    }
+
+    #[test]
+    fn workspace_shell_request_is_allowed() {
+        // The shell at /<slug>/ (e.g. the workspace switcher hitting gateway
+        // status/reload) — no `app` segment → allowed.
+        let h = headers(&[
+            ("sec-fetch-site", "same-origin"),
+            ("origin", "https://localhost:5251"),
+            ("referer", "https://localhost:5251/dev/"),
+        ]);
+        assert!(control_request_allowed(&h, Some(HOST)));
+    }
+
+    #[test]
+    fn app_iframe_request_is_rejected() {
+        // The core finding: an app at /<slug>/app/<id>/ must not drive control.
+        for referer in [
+            "https://localhost:5251/dev/app/habit-tracker/",
+            "https://localhost:5251/dev/app/habit-tracker/index.html",
+            "https://localhost:5251/myws/app/demo-director/sub/page?x=1",
+        ] {
+            let h = headers(&[
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://localhost:5251"),
+                ("referer", referer),
+            ]);
+            assert!(
+                !control_request_allowed(&h, Some(HOST)),
+                "app-iframe referer must be rejected: {referer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_browser_request_that_hides_its_referer_is_refused() {
+        // An app tab's own `fetch` with `referrerPolicy: 'no-referrer'`. The
+        // forge-proof headers read as the shell's, so the missing Referer is
+        // the only tell, and it must refuse rather than pass.
+        for pairs in [
+            &[
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://localhost:5251"),
+            ][..],
+            &[("sec-fetch-site", "same-origin")][..],
+            &[("origin", "https://localhost:5251")][..],
+        ] {
+            assert!(
+                !control_request_allowed(&headers(pairs), Some(HOST)),
+                "a browser request with no Referer must be refused: {pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_navigation_the_user_typed_is_allowed() {
+        // `Sec-Fetch-Site: none` is a user action (the address bar, a
+        // bookmark). No document sent it, and no page script can produce it.
+        let h = headers(&[("sec-fetch-site", "none")]);
+        assert!(control_request_allowed(&h, Some(HOST)));
+    }
+
+    #[test]
+    fn cross_site_browser_request_is_rejected() {
+        for site in ["cross-site", "same-site"] {
+            let h = headers(&[
+                ("sec-fetch-site", site),
+                ("origin", "https://evil.example"),
+                ("referer", "https://evil.example/"),
+            ]);
+            assert!(
+                !control_request_allowed(&h, Some(HOST)),
+                "Sec-Fetch-Site {site} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_host_mismatch_is_rejected() {
+        // A browser without Sec-Fetch metadata but a foreign Origin → CSRF.
+        let h = headers(&[("origin", "https://attacker.example")]);
+        assert!(!control_request_allowed(&h, Some(HOST)));
+    }
+
+    #[test]
+    fn origin_matches_host_compares_authority() {
+        assert!(origin_matches_host(
+            "https://localhost:5251",
+            "localhost:5251"
+        ));
+        assert!(origin_matches_host(
+            "http://Localhost:5251/",
+            "localhost:5251"
+        ));
+        assert!(!origin_matches_host(
+            "https://localhost:5252",
+            "localhost:5251"
+        ));
+        assert!(!origin_matches_host(
+            "https://evil.example",
+            "localhost:5251"
+        ));
+    }
+
+    #[test]
+    fn referer_is_app_iframe_detects_app_segment_only() {
+        assert!(referer_is_app_iframe("https://h/dev/app/x/"));
+        assert!(referer_is_app_iframe(
+            "https://h:5251/myws/app/demo/index.html?a=1"
+        ));
+        assert!(referer_is_app_iframe("/dev/app/x")); // bare path tolerated
+                                                      // Not app-iframe documents:
+        assert!(!referer_is_app_iframe("https://h/~/")); // picker
+        assert!(!referer_is_app_iframe("https://h/dev/")); // workspace shell
+        assert!(!referer_is_app_iframe("https://h/dev/api/v1/threads")); // shell API
+        assert!(!referer_is_app_iframe("https://h/")); // root
+        assert!(!referer_is_app_iframe("https://h/appworkspace/")); // slug literally "appworkspace"
+    }
+
+    #[test]
+    fn requesting_device_names_only_an_authenticated_caller() {
+        // The value reaches the engine's restart-intent route, where it is the
+        // device-actor half of `switch_was_user_initiated`. It comes from the
+        // extension `enforce` stamps, so a client cannot choose it.
+        let device = auth::AuthenticatedDevice {
+            id: "device-1".into(),
+            label: "My iPhone".into(),
+        };
+        assert_eq!(requesting_device(Some(&device)), Some("device-1"));
+    }
+
+    #[test]
+    fn requesting_device_is_absent_for_a_caller_that_proved_no_device() {
+        // The dev launcher, `stop.sh` and the packaged smoke test all land here.
+        // Their teardowns stay unattributed rather than borrowing a name.
+        assert_eq!(requesting_device(None), None);
+    }
+
+    // ── The plane behind the real router ────────────────────────────────────
+    //
+    // Everything above tests the CSRF half in isolation, which is what let a
+    // false claim about the loopback bind survive three security reviews. These
+    // drive `server::gateway_router`, so they answer the question a reviewer
+    // actually asks: can a caller with no credential reach this plane?
+
+    /// Every destructive route the plane exposes, as (method, path).
+    ///
+    /// Listed rather than derived, so adding a route to `router()` without
+    /// adding it here is the only way to miss one. The refusal happens before
+    /// routing, so a path that no longer exists still asserts the same 401.
+    const DESTRUCTIVE_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/~/api/v1/control/workspaces"),
+        ("POST", "/~/api/v1/control/workspaces"),
+        ("POST", "/~/api/v1/control/workspaces/adopt"),
+        ("POST", "/~/api/v1/control/workspaces/restore"),
+        ("POST", "/~/api/v1/control/workspaces/dev/stop"),
+        ("POST", "/~/api/v1/control/workspaces/dev/restart"),
+        ("POST", "/~/api/v1/control/workspaces/dev/rename"),
+        ("DELETE", "/~/api/v1/control/workspaces/dev"),
+        ("POST", "/~/api/v1/control/gateway/reload"),
+        ("GET", "/~/api/v1/control/network-config"),
+        ("PUT", "/~/api/v1/control/network-config"),
+        // A read, and still behind the credential: it enumerates this user's
+        // install paths, launch agents and data directories.
+        ("GET", "/~/api/v1/control/installs"),
+        // A read too, and it names another install's port and slug.
+        ("GET", "/~/api/v1/control/workspace-location?name=dev"),
+        // A read that names the apps this user runs.
+        ("GET", "/~/api/v1/control/slowness"),
+        // The update relay (ADR 0338). A fake heartbeat would fake a client.
+        ("POST", "/~/api/v1/control/desktop-client/heartbeat"),
+        ("POST", "/~/api/v1/control/update-relay"),
+    ];
+
+    async fn control_call(
+        state: &crate::server::GatewayState,
+        method: &str,
+        path: &str,
+        hdrs: &[(&str, &str)],
+    ) -> StatusCode {
+        use tower::ServiceExt as _;
+        let mut builder = axum::extract::Request::builder().method(method).uri(path);
+        for (k, v) in hdrs {
+            builder = builder.header(*k, *v);
+        }
+        crate::server::gateway_router(state.clone())
+            .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn an_uncredentialed_control_request_is_refused() {
+        // The reported attack: no Origin, no Referer, no Sec-Fetch-Site, which
+        // `control_request_allowed` reads as a trusted non-browser client. It
+        // never gets that far, because `auth_api::enforce` wraps the router.
+        let state = crate::server::GatewayState::for_tests();
+        for (method, path) in DESTRUCTIVE_ROUTES {
+            assert_eq!(
+                control_call(&state, method, path, &[]).await,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} must refuse a caller that proved nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_bind_is_not_what_protects_the_control_plane() {
+        // A gateway on a tailnet address answers exactly as a loopback one
+        // does. Auth here is bind-independent on purpose (ADR 0094): a
+        // `tailscale serve` hop arrives with a loopback peer address, so
+        // trusting the bind would trust the whole tailnet.
+        let state = crate::server::GatewayState::for_tests();
+        for host in ["127.0.0.1:5251", "100.64.0.1:5251", "[::1]:5251"] {
+            assert_eq!(
+                control_call(
+                    &state,
+                    "POST",
+                    "/~/api/v1/control/workspaces/dev/stop",
+                    &[("host", host)]
+                )
+                .await,
+                StatusCode::UNAUTHORIZED,
+                "a caller reaching us on {host} must still prove a credential"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_machine_local_token_reaches_the_control_plane() {
+        // The other half of the contract. `stop.sh`, the dev launcher, the
+        // engine's boot report and `lucidos` all authenticate this way. A gate
+        // that refused them would break every local caller.
+        //
+        // A read, deliberately: an authenticated POST here would create or stop
+        // something for real.
+        let state = crate::server::GatewayState::for_tests();
+        let status = control_call(
+            &state,
+            "GET",
+            "/~/api/v1/control/workspaces",
+            &[(auth::HEADER_LOCAL_TOKEN, "test-local-token")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_local_token_is_refused() {
+        let state = crate::server::GatewayState::for_tests();
+        for token in ["", "   ", "not-the-token"] {
+            assert_eq!(
+                control_call(
+                    &state,
+                    "GET",
+                    "/~/api/v1/control/workspaces",
+                    &[(auth::HEADER_LOCAL_TOKEN, token)]
+                )
+                .await,
+                StatusCode::UNAUTHORIZED,
+                "token {token:?} must not authenticate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn slowness_answers_normal_before_the_first_sample() {
+        use tower::ServiceExt as _;
+        let state = crate::server::GatewayState::for_tests();
+        let response = crate::server::gateway_router(state)
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/~/api/v1/control/slowness")
+                    .header(auth::HEADER_LOCAL_TOKEN, "test-local-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, json!({ "state": "normal" }));
+    }
+
+    #[tokio::test]
+    async fn the_install_inventory_is_not_on_the_two_second_poll() {
+        // The picker refetches `gateway/status` every two seconds. This scan
+        // walks directories and reads a plist, so it lives on its own route and
+        // is fetched when somebody opens Settings.
+        let state = crate::server::GatewayState::for_tests();
+
+        let Json(status) = gateway_status(State(state.clone())).await;
+        assert!(
+            status.get("installs").is_none(),
+            "an install scan must never ride the picker's poll"
+        );
+
+        // Shape only. What this machine actually carries is not the subject:
+        // `lucidos-installs` owns the enumeration, against fixture trees.
+        let Json(inventory) = list_installs(State(state)).await;
+        let body = serde_json::to_value(&inventory).unwrap();
+        assert!(body["installs"].is_array());
+        assert!(body["conflicts"].is_array());
+    }
+
+    #[tokio::test]
+    async fn locating_a_workspace_nothing_carries_is_a_404() {
+        // The name is deliberately one no registry on any machine holds, so
+        // this asserts the route's own answer rather than the developer's
+        // install set. What a real hit looks like is `peers`' subject, against
+        // fixture trees.
+        let state = crate::server::GatewayState::for_tests();
+        let status = control_call(
+            &state,
+            "GET",
+            "/~/api/v1/control/workspace-location?name=no-install-carries-this-name",
+            &[(auth::HEADER_LOCAL_TOKEN, "test-local-token")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn locating_a_blank_workspace_name_is_refused() {
+        let state = crate::server::GatewayState::for_tests();
+        for query in ["name=", "name=%20%20"] {
+            assert_eq!(
+                control_call(
+                    &state,
+                    "GET",
+                    &format!("/~/api/v1/control/workspace-location?{query}"),
+                    &[(auth::HEADER_LOCAL_TOKEN, "test-local-token")],
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "{query} names no workspace"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_app_iframe_holding_a_real_credential_is_still_refused() {
+        // Both halves at once, which is the case neither half covers alone. The
+        // caller authenticates, so `enforce` passes it, and `control_authz`
+        // then refuses it for the document it came from.
+        let state = crate::server::GatewayState::for_tests();
+        let status = control_call(
+            &state,
+            "POST",
+            "/~/api/v1/control/workspaces/dev/stop",
+            &[
+                (auth::HEADER_LOCAL_TOKEN, "test-local-token"),
+                ("sec-fetch-site", "same-origin"),
+                ("referer", "https://localhost:5251/dev/app/habit-tracker/"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_shell_holding_a_real_credential_reaches_the_control_plane() {
+        // The shell's real request shape: same-origin, a matching Origin, and
+        // the default Referer policy's full shell URL.
+        let state = crate::server::GatewayState::for_tests();
+        let status = control_call(
+            &state,
+            "GET",
+            "/~/api/v1/control/restore-status",
+            &[
+                (auth::HEADER_LOCAL_TOKEN, "test-local-token"),
+                ("host", "localhost:5251"),
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://localhost:5251"),
+                ("referer", "https://localhost:5251/dev/"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_app_tab_that_suppresses_its_referer_is_refused_with_a_real_credential() {
+        // The same caller as above, minus its Referer. `enforce` passes it on
+        // the credential, and the gate must still refuse it.
+        let state = crate::server::GatewayState::for_tests();
+        let status = control_call(
+            &state,
+            "POST",
+            "/~/api/v1/control/workspaces/dev/stop",
+            &[
+                (auth::HEADER_LOCAL_TOKEN, "test-local-token"),
+                ("host", "localhost:5251"),
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://localhost:5251"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // ── The update relay (ADR 0338) ─────────────────────────────────────────
+
+    /// A state holding one paired phone, and the cookie that proves it.
+    fn state_with_phone(dir: &std::path::Path) -> (crate::server::GatewayState, String) {
+        let state = crate::server::GatewayState::for_tests_with_static_dir(Some(dir.to_path_buf()));
+        state
+            .write_paired_devices_for_test(|paired| {
+                paired.devices.push(auth::PairedDevice {
+                    id: "device-1".into(),
+                    label: "My iPhone".into(),
+                    credential_digest: auth::digest("cred-phone"),
+                    paired_at: "2020-01-01T00:00:00Z".into(),
+                    last_seen_at: None,
+                });
+            })
+            .unwrap();
+        let cookie = format!("{}=cred-phone", state.device_cookie_name());
+        (state, cookie)
+    }
+
+    async fn relay_call(
+        state: &crate::server::GatewayState,
+        path: &str,
+        hdrs: &[(&str, &str)],
+        body: Value,
+    ) -> (StatusCode, Value) {
+        use tower::ServiceExt as _;
+        let mut builder = axum::extract::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json");
+        for (k, v) in hdrs {
+            builder = builder.header(*k, *v);
+        }
+        let response = crate::server::gateway_router(state.clone())
+            .oneshot(
+                builder
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    const HEARTBEAT: &str = "/~/api/v1/control/desktop-client/heartbeat";
+    const REQUEST: &str = "/~/api/v1/control/update-relay";
+
+    #[tokio::test]
+    async fn only_the_local_token_can_send_a_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, cookie) = state_with_phone(dir.path());
+        let beat = json!({ "version": "1.0.0" });
+
+        let (status, _) = relay_call(&state, HEARTBEAT, &[("cookie", &cookie)], beat.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a phone must not pose as the client"
+        );
+        assert_eq!(
+            state.update_relay().snapshot(std::time::Instant::now())["client"],
+            Value::Null
+        );
+
+        let local = [(auth::HEADER_LOCAL_TOKEN, "test-local-token")];
+        let (status, body) = relay_call(&state, HEARTBEAT, &local, beat).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "request": null }));
+        assert_eq!(
+            state.update_relay().snapshot(std::time::Instant::now())["client"]["version"],
+            "1.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paired_phone_needs_nothing_more_to_ask() {
+        // The phone already holds full control-plane authority, so the request
+        // reaches the relay. With no client attached, the relay says so.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, cookie) = state_with_phone(dir.path());
+        let (status, body) = relay_call(
+            &state,
+            REQUEST,
+            &[
+                ("cookie", &cookie),
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://localhost:5251"),
+                ("referer", "https://localhost:5251/dev/"),
+                ("host", "localhost:5251"),
+            ],
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"],
+            "the desktop app is not running on this machine"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cross_origin_page_cannot_ask_for_an_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, cookie) = state_with_phone(dir.path());
+        let (status, _) = relay_call(
+            &state,
+            REQUEST,
+            &[
+                ("cookie", &cookie),
+                ("sec-fetch-site", "cross-site"),
+                ("origin", "https://evil.example"),
+                ("host", "localhost:5251"),
+            ],
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+}

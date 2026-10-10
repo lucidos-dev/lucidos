@@ -1,0 +1,256 @@
+// Test-only helper that synthesizes a ThreadAggregate snapshot for each
+// event passed to handleEvent. handleEvent applies aggregates rather than
+// deriving meta from event types, so unit tests that exercise integration
+// flows (exchanges, groupings, optimistic UI) need a stand-in for the
+// backend's projection. The Rust lifecycle tests
+// (engine/thread_lifecycle_tests/tests.rs) remain the source of truth for
+// the rules; this helper is a TS-side mirror, not a duplicate spec.
+import type { CodingAgentChangeState } from '../../api/threads';
+import {
+  handleEvent,
+  isSwitchTeardownAbort,
+  NO_CHANGE,
+  type AbortCause,
+  type MessageOrigin,
+  type ThreadAggregate,
+  type ThreadEvent,
+  type ThreadMeta,
+  type ThreadState,
+  type TransientEvent,
+  type ThreadStatus,
+} from '../thread-events';
+
+/** Build a ThreadAggregate snapshot from the current meta. Used as the
+ *  starting point before applying per-event rules. */
+function aggregateFromMeta(meta: ThreadMeta): ThreadAggregate {
+  if (meta.channel === 'error_unknown_channel') {
+    throw new Error(`aggregateFromMeta: thread ${meta.id} has channel='error_unknown_channel' — fix the test setup, don't coerce a sentinel into 'chat'`);
+  }
+  return {
+    threadId: meta.id,
+    title: meta.title,
+    channel: meta.channel,
+    initiator: meta.initiator,
+    createdAt: meta.createdAt,
+    lastActivity: meta.updatedAt,
+    messageCount: meta.messageCount,
+    section: meta.section,
+    status: meta.status,
+    // Each event the engine folds changes the row, so its aggregate is one
+    // version past the meta it builds from.
+    summaryVersion: Math.max(meta.summaryVersion, 0) + 1,
+    activeChildrenCount: meta.activeChildrenCount,
+    totalChildrenCount: meta.totalChildrenCount,
+    blockingDescendantCount: meta.blockingDescendantCount,
+    attentionDescendantCount: meta.attentionDescendantCount,
+    liveEventWaitCount: meta.liveEventWaitCount,
+    codingAgentChangeState: meta.codingAgentChangeState,
+    codingAgentIsExternalRepo: meta.codingAgentIsExternalRepo,
+    isSaved: meta.saved,
+    hasResponse: false,
+    lastRevivedAt: meta.lastRevivedAt || null,
+    parentThreadId: meta.parentThreadId ?? null,
+    parentThreadTitle: meta.parentThreadTitle ?? null,
+    triggerId: meta.triggerId,
+    triggerName: meta.triggerName,
+    ccRepoId: meta.repoId,
+    ccRepoName: meta.repoName,
+    state: meta.state,
+  };
+}
+
+/** A fact about the branch: whether it differs from main. A pending change
+ *  keeps the state `proposed`, and work that stays unproposed keeps its
+ *  reason. Mirrors `branch_work_sql` (engine `event_bus/mod.rs`). */
+function branchWork(state: CodingAgentChangeState, hasWork: boolean): CodingAgentChangeState {
+  if (state.kind === 'proposed') return state;
+  if (!hasWork) return NO_CHANGE;
+  return state.kind === 'unproposed' ? state : { kind: 'unproposed', reason: null };
+}
+
+/** A thread's last pending change left `pending`. Applied and Discarded leave
+ *  nothing to speak of; Set aside and Withdraw keep the work unproposed. Mirrors
+ *  `sync_thread_proposal` with `landing_after`, for a thread holding one
+ *  change. */
+function changeLeft(state: CodingAgentChangeState, landing: 'none' | 'unproposed'): CodingAgentChangeState {
+  if (state.kind !== 'proposed') return state;
+  return landing === 'none' ? NO_CHANGE : { kind: 'unproposed', reason: null };
+}
+
+/** The change-state rule for `event`. Mirrors the engine's projection arms. */
+function nextChangeState(state: CodingAgentChangeState, event: ThreadEvent | TransientEvent): CodingAgentChangeState {
+  switch (event.type) {
+    case 'CodingAgentIdled':
+      return event.has_changes === undefined ? state : branchWork(state, event.has_changes);
+    case 'CodingAgentDiffChanged':
+      return branchWork(state, event.has_diff);
+    case 'ChangeProposed':
+      if (event.set_aside) return changeLeft(state, 'unproposed');
+      return { kind: 'proposed', requires_restart: event.requires_restart === true };
+    case 'ChangeBroughtBack':
+      return { kind: 'proposed', requires_restart: false };
+    case 'ChangeSetAside':
+    case 'ChangeWithdrawn':
+      return changeLeft(state, 'unproposed');
+    case 'ChangeApplied':
+    case 'ChangeDiscarded':
+      return branchWork(changeLeft(state, 'none'), false);
+    case 'ThreadArchived':
+      return branchWork(state, false);
+    case 'ProposalWithheld':
+      return state.kind === 'proposed' ? state : { kind: 'unproposed', reason: event.reason };
+    // A new turn starts, so the last turn end's reason no longer stands.
+    case 'CodingAgentUserMessageSent':
+    case 'PromptInjected':
+    case 'ContinuationRequested':
+      return state.kind === 'unproposed' && state.reason !== null ? { kind: 'unproposed', reason: null } : state;
+    default:
+      return state;
+  }
+}
+
+/** Status values that are a VERDICT about how the turn ended, not a resting
+ *  state. Mirrors `PRESERVED_STATUS_VERDICTS` (engine `event_bus/mod.rs`). */
+const VERDICT_STATUSES: ReadonlySet<string> = new Set(['failed', 'paused']);
+
+/** Events that mean NEW WORK was requested, so they clear a verdict. Their
+ *  projection arms write `status = 'running'` plainly. */
+const START_EVENTS: ReadonlySet<string> = new Set([
+  'MessageReceived', 'TriggerStarted', 'CodingAgentUserMessageSent',
+  'PromptInjected', 'CodingAgentPromptSent', 'ContinuationRequested',
+  'UserQuestionAnswered', 'CodingAgentPermissionResolved',
+  'CommandPermissionResolved', 'McpPermissionResolved',
+]);
+
+/** Events that merely stream a turn's output. Their projection arm writes
+ *  `preserving_verdict("'running'")`, so they revive a thread that drifted to
+ *  idle/waiting but never one carrying a verdict. */
+const ACTIVITY_EVENTS: ReadonlySet<string> = new Set([
+  'TextStreamed', 'ThoughtStreamed', 'ToolCalled', 'ToolResult', 'MemoryRecalled',
+  'CodingAgentTextStreamed', 'CodingAgentThoughtStreamed',
+  'CodingAgentToolCalled', 'CodingAgentToolResult',
+]);
+
+/** Events that merely CLOSE OUT an ended turn, so they must not overwrite a
+ *  verdict either. Their arms write `preserving_verdict(STATUS_FROM_PROPOSED_CHANGE)`.
+ *  `ResponseGenerated` is deliberately absent: its arm writes the bare
+ *  `STATUS_FROM_PROPOSED_CHANGE`, because a turn that generated a response
+ *  really did finish. */
+const VERDICT_PRESERVING_TERMINALS: ReadonlySet<string> = new Set([
+  'ResponseCanceled', 'SessionEnded', 'CodingAgentIdled',
+]);
+
+/** Apply the status/cc-flag rule for `event` to `agg`, returning a new
+ *  aggregate. Mirrors thread_lifecycle.rs::status_transitions(), plus the
+ *  projection's `preserving_verdict` guard, which the contract table cannot
+ *  express (see the note on `CodingAgentIdled` there).
+ *
+ *  The guard is load-bearing for anything replaying a coding-agent teardown: a
+ *  dying subprocess keeps draining `CodingAgentTextStreamed` /
+ *  `CodingAgentToolResult` for milliseconds after the abort, and then emits
+ *  `CodingAgentIdled` / `SessionEnded`. Without the mirror, this helper walked
+ *  a just-interrupted thread from 'paused' back to 'running' and then to
+ *  'idle', so a test could not reproduce what the client actually receives. */
+function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEvent): ThreadAggregate {
+  const out: ThreadAggregate = { ...agg };
+  const t = event.type;
+
+  // SessionEnded special cases: payload-dependent, mirroring the deleted
+  // updateStatusFromEvent's handling. Both return before the
+  // `preserving_verdict` guard below, deliberately. `stale_resume` writes no
+  // status at all, and `discarded` is a user action, which is the one kind of
+  // thing that may overwrite a verdict.
+  if (t === 'SessionEnded') {
+    const reason = (event as { reason?: string }).reason;
+    // Stale resume is a mid-flight retry, so the backend skips the status update.
+    if (reason === 'stale_resume') return out;
+    // Discarded clears all CC flags and forces idle. It covers the stale-session
+    // discard where no pending change exists, so no `ChangeDiscarded` is emitted
+    // to carry the clear (see the `thread-flows-cc-status` case for that shape).
+    if (reason === 'discarded') {
+      out.codingAgentChangeState = NO_CHANGE;
+      out.codingAgentIsExternalRepo = false;
+      out.status = 'idle';
+      return out;
+    }
+  }
+
+  // Status rules
+  const setRunning: ReadonlySet<string> = new Set([
+    ...START_EVENTS,
+    ...ACTIVITY_EVENTS,
+  ]);
+  const setIdle: ReadonlySet<string> = new Set([
+    'TriggerCompleted', 'ChangeApplied', 'ChangeDiscarded', 'ThreadArchived',
+    'ResponseGenerated', 'ResponseCanceled', 'SessionEnded', 'CodingAgentIdled',
+  ]);
+
+  out.codingAgentChangeState = nextChangeState(agg.codingAgentChangeState, event);
+  if (t === 'ChangeApplied' || t === 'ChangeDiscarded' || t === 'ThreadArchived') {
+    out.codingAgentIsExternalRepo = false;
+  }
+
+  // `preserving_verdict`: an event that only streams or closes out the ended
+  // turn leaves a 'failed' / 'paused' verdict exactly where it is.
+  if (
+    VERDICT_STATUSES.has(out.status)
+    && (ACTIVITY_EVENTS.has(t) || VERDICT_PRESERVING_TERMINALS.has(t))
+  ) {
+    return out;
+  }
+
+  if (setRunning.has(t)) out.status = 'running';
+  else if (setIdle.has(t)) out.status = 'idle';
+  else if (t === 'ResponseFailed') out.status = 'failed';
+  // Mirrors `AbortCause::status_sql()`, which reads the ACTOR as well as the
+  // cause: only the user's own switch teardown (`isSwitchTeardownAbort`) settles
+  // at 'paused', because that is the one interruption the engine promised to
+  // resume. Every other abort is 'failed', except 'stale_settle' at the
+  // cancel-style idle. A pending change does NOT enter into it: the verdict is
+  // recorded either way, and `resolveVisualStatus` ranks the two.
+  else if (t === 'ResponseAborted') {
+    const { cause, actor } = event as { cause?: AbortCause; actor?: MessageOrigin };
+    out.status = cause === 'stale_settle' ? 'idle'
+      : isSwitchTeardownAbort(actor, cause) ? 'paused' as ThreadStatus
+      : 'failed';
+  }
+  else if (t === 'UserQuestionAsked' || t === 'CodingAgentPermissionRequest' || t === 'CommandPermissionRequested' || t === 'McpPermissionRequested') out.status = 'waiting_for_user_answer' as ThreadStatus;
+
+  return out;
+}
+
+/** Synthesize the post-event aggregate that the backend would compute. */
+function synthesizeAggregate(
+  meta: ThreadMeta,
+  event: ThreadEvent | TransientEvent,
+  overrides: Partial<ThreadAggregate> = {},
+): ThreadAggregate {
+  const base = aggregateFromMeta(meta);
+  const withRules = applyEventRules(base, event);
+  return { ...withRules, ...overrides };
+}
+
+/** Drop-in replacement for handleEvent that synthesizes the aggregate the
+ *  backend would have shipped, so integration tests see status/CC-flag
+ *  updates as a side effect of replaying events. */
+export function handleEventWithAgg(
+  threadMap: Map<string, ThreadState>,
+  threadId: string,
+  seq: number | null,
+  event: ThreadEvent | TransientEvent,
+  created?: string,
+  eventId?: string,
+  aggregateOverrides: Partial<ThreadAggregate> = {},
+): boolean {
+  const thread = threadMap.get(threadId);
+  if (!thread || seq === null) {
+    // Transient events don't carry aggregates; defer to plain handleEvent.
+    return handleEvent(threadMap, threadId, seq, event, created, eventId).applied;
+  }
+  // Stamp lastActivity from the event timestamp so the aggregate doesn't
+  // overwrite the server-time updatedAt that handleEvent has already set.
+  const overrides: Partial<ThreadAggregate> =
+    created ? { lastActivity: created, ...aggregateOverrides } : aggregateOverrides;
+  const agg = synthesizeAggregate(thread.meta, event, overrides);
+  return handleEvent(threadMap, threadId, seq, event, created, eventId, agg).applied;
+}

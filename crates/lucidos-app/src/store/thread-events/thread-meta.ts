@@ -1,0 +1,715 @@
+import { changeWork, EVENT_CLASSIFICATION, LAST_ACTIVITY_EVENTS } from '../../generated/thread-lifecycle';
+import type { ChangeWork, EventChannel, ThreadStatus } from '../../generated/thread-lifecycle';
+import type { EventWaitSummary, StoredEvent, ThreadInitiator, ThreadSection, TodoItem } from './thread-event-types';
+import type { CodingAgentChangeState } from '../../api/threads';
+
+/** Post-event projection snapshot carried on persisted SSE thread events
+ *  (`data.aggregate`) and on `fetchThreadEvents` HTTP responses
+ *  (`currentAggregate`). Mirrors the backend `ThreadAggregate` struct.
+ *  Compose fields are intentionally excluded — they have their own
+ *  broadcast cadence and including them would clobber local typing.
+ *  Frontend overlays this onto `thread.meta` so it never has to derive
+ *  thread state from event-type lookups (SECTION_TRANSITIONS / STATUS_TRANSITIONS). */
+export type ThreadAggregate = {
+  threadId: string;
+  title: string;
+  channel: string;
+  initiator: ThreadInitiator;
+  createdAt: string;
+  lastActivity: string;
+  /** When the user last drove this thread forward — the drawer sort key. The
+   *  backend always sends it; optional only so test fixtures needn't set a
+   *  recency they don't assert on (consumers fall back to `lastActivity`). */
+  lastUserAction?: string;
+  /** When the agent (or trigger) last did something — the tooltip's Agent line.
+   *  Optional for the same reason as `lastUserAction`. */
+  lastAgentAction?: string;
+  messageCount: number;
+  section: ThreadSection;
+  status: ThreadStatus;
+  /** See `ThreadMeta.summaryVersion`. */
+  summaryVersion: number;
+  activeChildrenCount: number;
+  /** See `ThreadMeta.waitingChildrenCount`. */
+  waitingChildrenCount?: number;
+  totalChildrenCount: number;
+  /** Count of descendants (transitive) currently blocking this thread's
+   *  archive. Maintained by EventBus on
+   *  `thread_summaries.blocking_descendant_count`. Consumed by
+   *  `resolveThreadActions` via `count > 0`. */
+  blockingDescendantCount: number;
+  /** Count of descendants (transitive) currently in a state that needs user
+   *  attention (WaitingForUserAnswer, or an in-workspace CC thread with
+   *  pending changes). Strict subset of `blockingDescendantCount` — drops
+   *  the Running case. Consumed by `displaySection` via `count > 0` to
+   *  bubble the parent to REVIEW even when sibling descendants are still
+   *  running. */
+  attentionDescendantCount: number;
+  /** Whether this thread is a *stopped child*: a user Stop ended its turn and
+   *  its parent is still owed a result (ADR 0252). The backend always sends
+   *  it; optional only so test fixtures needn't set it. */
+  isStoppedChild?: boolean;
+  /** Whether the thread's agent asked the user to read its latest reply,
+   *  still unseen (ADR 0409). Optional only so test fixtures needn't set it. */
+  readRequested?: boolean;
+  /** How many event waits this thread holds unresolved. Consumed by
+   *  `resolveVisualStatus` via `count > 0`. See `ThreadMeta.liveEventWaitCount`
+   *  for why the count is carried separately from `meta.liveEventWaits`. */
+  liveEventWaitCount: number;
+  /** The waits themselves. Overlaid onto `meta.liveEventWaits`, which is what
+   *  makes the subscription panel self-healing on EVERY event: this overlay
+   *  runs ahead of `handleEvent`'s seq-dedup guard, so even a re-delivered
+   *  sequence repairs a stranded list.
+   *
+   *  Optional only so a partial test aggregate needn't supply it; the backend
+   *  always sends it. Absence leaves the list alone, `[]` clears it. */
+  liveEventWaits?: EventWaitSummary[];
+  /** What the coding-agent branch holds. See `ThreadMeta.codingAgentChangeState`. */
+  codingAgentChangeState: CodingAgentChangeState;
+  /** Whether the Claude Code session is bound to an external repo. External repos
+   *  can't be Applied via the engine merge flow — the WaitingBanner shows
+   *  Done / Archive instead. */
+  codingAgentIsExternalRepo: boolean;
+  isSaved: boolean;
+  /** Whether this is the home thread. The engine omits the key on every other
+   *  thread. An SSE event can be the first the client hears of Home, so this
+   *  is what keeps it out of the drawer's sections. */
+  home?: true;
+  hasResponse: boolean;
+  lastRevivedAt: string | null;
+  parentThreadId: string | null;
+  parentThreadTitle: string | null;
+  triggerId?: string;
+  triggerName?: string;
+  ccRepoId?: string;
+  ccRepoName?: string;
+  /** Coding-agent thread flavor — drives app-specific affordances (WIP preview
+   *  button, app-icon branch chip). Absent for non-CC threads and legacy CC
+   *  rows; consumers default absence → 'lucidos'. */
+  codingAgentKind?: 'lucidos' | 'app' | 'external';
+  /** Canonical folder the coding agent operates on (`<ws>/data/apps/<id>/`
+   *  for app threads). Absent for non-CC threads and legacy rows. */
+  codingAgentFolder?: string;
+  /** Which backend drives this thread — 'claude-code' | 'codex'. Absent for
+   *  non-CC threads and legacy rows (consumers default to 'claude-code'). */
+  codingAgent?: 'claude-code' | 'codex';
+  state: ThreadComposeState;
+};
+
+/** Do two *event wait* lists name the same waits, in the same order?
+ *
+ *  `wait_id` alone is the identity, because a wait is immutable once armed. Its
+ *  `reason`, `on` and `expires_at` are copies of one `EventWaitStarted` payload,
+ *  and nothing in the family mutates a wait (ADR 0059). So two lists agreeing
+ *  on ids agree on content, and a deep compare would buy nothing.
+ *
+ *  Used only to decide whether the overlay CHANGED anything, which gates a
+ *  `threadMap` flush. */
+function sameWaits(a: EventWaitSummary[], b: EventWaitSummary[]): boolean {
+  return a.length === b.length && a.every((w, i) => w.wait_id === b[i].wait_id);
+}
+
+/** The version of a row the client drew before any server summary existed.
+ *  Every server version is at least 0, so the first summary always wins. */
+export const UNVERSIONED = -1;
+
+/** Whether a server summary at `version` is at least as new as what `meta`
+ *  holds. Equal versions saw the same row, so either may be applied. Written
+ *  as "not older" on purpose: a summary with no version compares false both
+ *  ways, and is taken as current rather than refused forever. */
+export function isSummaryCurrent(meta: ThreadMeta, version: number): boolean {
+  return !(version < meta.summaryVersion);
+}
+
+/** Take a server summary's status if it is current (`isSummaryCurrent`).
+ *  The one writer of `meta.status` and `meta.summaryVersion`. Returns whether
+ *  the summary is current, so the caller applies its other fields with it. */
+export function applySummaryVersion(meta: ThreadMeta, version: number, status: ThreadStatus): boolean {
+  if (!isSummaryCurrent(meta, version)) return false;
+  const writable = meta as { status: ThreadStatus; summaryVersion: number };
+  writable.summaryVersion = version;
+  writable.status = status;
+  return true;
+}
+
+/** Apply an aggregate snapshot to a thread's meta. Used by live SSE (per-event
+ *  aggregate) and historical replay (fetchThreadEvents.currentAggregate).
+ *  Nullable fields propagate cleared values; trigger/repo fields are omitted
+ *  by the backend when not applicable, so absence preserves prior values.
+ *
+ *  An aggregate older than the meta's `summaryVersion` changes nothing, so a
+ *  reordered broadcast or a stale read cannot put an old status back.
+ *
+ *  Returns `true` when any shape-relevant field actually changed value. The
+ *  `updatedAt` / `messageCount` ticks are intentionally excluded from the
+ *  changed signal — they move on every streaming event and would defeat the
+ *  fan-out gate in `thread-sync.ts`. ThreadDrawer's "X ago" stays approximate
+ *  during a stream and refreshes on the next shape change (status flip etc.). */
+export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): boolean {
+  const prevStatus = meta.status;
+  if (!applySummaryVersion(meta, agg.summaryVersion, agg.status)) return false;
+  let changed = meta.status !== prevStatus;
+  if (meta.section !== agg.section) { meta.section = agg.section; changed = true; }
+  if (meta.activeChildrenCount !== agg.activeChildrenCount) { meta.activeChildrenCount = agg.activeChildrenCount; changed = true; }
+  if ((meta.waitingChildrenCount ?? 0) !== (agg.waitingChildrenCount ?? 0)) { meta.waitingChildrenCount = agg.waitingChildrenCount ?? 0; changed = true; }
+  if (meta.totalChildrenCount !== agg.totalChildrenCount) { meta.totalChildrenCount = agg.totalChildrenCount; changed = true; }
+  if (meta.blockingDescendantCount !== agg.blockingDescendantCount) { meta.blockingDescendantCount = agg.blockingDescendantCount; changed = true; }
+  if (meta.attentionDescendantCount !== agg.attentionDescendantCount) { meta.attentionDescendantCount = agg.attentionDescendantCount; changed = true; }
+  if (!!meta.isStoppedChild !== !!agg.isStoppedChild) { meta.isStoppedChild = !!agg.isStoppedChild; changed = true; }
+  if (!!meta.readRequested !== !!agg.readRequested) { meta.readRequested = !!agg.readRequested; changed = true; }
+  if (meta.liveEventWaitCount !== agg.liveEventWaitCount) { meta.liveEventWaitCount = agg.liveEventWaitCount; changed = true; }
+  if (agg.liveEventWaits !== undefined && !sameWaits(meta.liveEventWaits, agg.liveEventWaits)) { meta.liveEventWaits = agg.liveEventWaits; changed = true; }
+  if (!sameChangeState(meta.codingAgentChangeState, agg.codingAgentChangeState)) { meta.codingAgentChangeState = agg.codingAgentChangeState; changed = true; }
+  if (meta.codingAgentIsExternalRepo !== agg.codingAgentIsExternalRepo) { meta.codingAgentIsExternalRepo = agg.codingAgentIsExternalRepo; changed = true; }
+  if (meta.saved !== agg.isSaved) { meta.saved = agg.isSaved; changed = true; }
+  if (agg.home && !meta.home) { meta.home = true; changed = true; }
+  // updatedAt / messageCount: overlay unconditionally, do NOT mark changed
+  meta.messageCount = agg.messageCount;
+  meta.updatedAt = agg.lastActivity;
+  // lastUserAction is the drawer SORT key — mark changed so a user action
+  // re-sorts the list immediately. lastAgentAction is tooltip-only, so overlay
+  // it like updatedAt (no `changed`) — it moves on every agent event and would
+  // otherwise defeat the fan-out gate in thread-sync.ts. Only overlay when the
+  // aggregate carries them (it always does in prod) so a field-less test
+  // aggregate can't blank a previously-set value.
+  if (agg.lastUserAction !== undefined && meta.lastUserAction !== agg.lastUserAction) { meta.lastUserAction = agg.lastUserAction; changed = true; }
+  if (agg.lastAgentAction !== undefined) meta.lastAgentAction = agg.lastAgentAction;
+  const nextLastRevived = agg.lastRevivedAt ?? '';
+  if (meta.lastRevivedAt !== nextLastRevived) { meta.lastRevivedAt = nextLastRevived; changed = true; }
+  if (meta.state !== agg.state) { meta.state = agg.state; changed = true; }
+  const nextParentId = agg.parentThreadId ?? undefined;
+  if (meta.parentThreadId !== nextParentId) { meta.parentThreadId = nextParentId; changed = true; }
+  const nextParentTitle = agg.parentThreadTitle ?? undefined;
+  if (meta.parentThreadTitle !== nextParentTitle) { meta.parentThreadTitle = nextParentTitle; changed = true; }
+  if (agg.triggerId && meta.triggerId !== agg.triggerId) { meta.triggerId = agg.triggerId; changed = true; }
+  if (agg.triggerName && meta.triggerName !== agg.triggerName) { meta.triggerName = agg.triggerName; changed = true; }
+  if (agg.ccRepoId && meta.repoId !== agg.ccRepoId) { meta.repoId = agg.ccRepoId; changed = true; }
+  if (agg.ccRepoName && meta.repoName !== agg.ccRepoName) { meta.repoName = agg.ccRepoName; changed = true; }
+  if (agg.codingAgentKind && meta.codingAgentKind !== agg.codingAgentKind) {
+    meta.codingAgentKind = agg.codingAgentKind;
+    changed = true;
+  }
+  if (agg.codingAgentFolder && meta.codingAgentFolder !== agg.codingAgentFolder) {
+    meta.codingAgentFolder = agg.codingAgentFolder;
+    changed = true;
+  }
+  if (agg.codingAgent && meta.codingAgent !== agg.codingAgent) {
+    meta.codingAgent = agg.codingAgent;
+    changed = true;
+  }
+  return changed;
+}
+
+/** Placeholder shown in the drawer while a thread waits for its first
+ *  LLM-generated title. Treated as "no title" by anything that displays it. */
+export const PENDING_TITLE_PLACEHOLDER = '...';
+
+export type ThreadMeta = {
+  id: string;
+  title: string;
+  channel: EventChannel | 'error_unknown_channel';
+  initiator: ThreadInitiator;
+  saved: boolean;
+  /** The workspace's home thread (ADR 0362). Set only on that one thread; it
+   *  never changes once the engine has created it. */
+  home?: true;
+  createdAt: string;
+  updatedAt: string;
+  /** When the user last drove this thread forward (message sent, question
+   *  answered, permission resolved, change applied/discarded). The drawer SORTS
+   *  by this — agent streaming/idle does NOT bump it — so background agent churn
+   *  no longer reshuffles the list. Optional only for test ergonomics; every
+   *  production path (API load, optimistic insert, aggregate overlay) sets it,
+   *  and `recencyKey` falls back to `updatedAt` if it's somehow absent. */
+  lastUserAction?: string;
+  /** When the agent (or trigger) last did something — streaming, a terminal
+   *  response, an idle, a trigger fire/complete, or asking the user. Drives the
+   *  thread-row tooltip's "Agent ·" line, distinct from `lastUserAction` so the
+   *  tooltip stays accurate even right after the user acts. */
+  lastAgentAction?: string;
+  /** Thread status computed by the backend. Read-only: only a server summary
+   *  writes it, through `applyAggregateToMeta` or `applySummaryVersion`. */
+  readonly status: ThreadStatus;
+  /** The `summary_version` of the newest server summary applied here. A
+   *  summary older than this is refused, so a stale read cannot win. A row
+   *  the client drew before the server had one starts at `UNVERSIONED`. */
+  readonly summaryVersion: number;
+  /** Server-computed exchange count (MESSAGE_COUNT_EVENTS in thread_lifecycle.rs). */
+  messageCount: number;
+  /** Section from backend DB projection — used as initial section before events load. */
+  section: ThreadSection;
+  /** Number of active child threads (non-zero means parent is "in progress"). */
+  activeChildrenCount: number;
+  /** Direct children idle on their own live event wait, from
+   *  `thread_summaries.waiting_children_count`. Such a child has not finished
+   *  (ADR 0254), so the parent waits on it as on an active one. Disjoint from
+   *  `activeChildrenCount`, so the two add up. Absent reads as zero, which is
+   *  what a meta built before the field existed means. */
+  waitingChildrenCount?: number;
+  /** Total number of child threads (active + finished). */
+  totalChildrenCount: number;
+  /** Count of descendants (transitive) currently blocking this thread's
+   *  archive. Consumed by `resolveThreadActions` via `count > 0`. */
+  blockingDescendantCount: number;
+  /** Count of descendants (transitive) currently in a state that needs user
+   *  attention (WaitingForUserAnswer, or an in-workspace CC thread with
+   *  pending changes). Strict subset of `blockingDescendantCount` — drops the
+   *  Running case. Consumed by `getThreadDisplaySection` via `count > 0`. */
+  attentionDescendantCount: number;
+  /** Whether this thread is a *stopped child*: a user Stop ended its turn and
+   *  its parent is still owed a result (ADR 0252). It counts toward the
+   *  attention badge and draws the notice that ends the transcript. Absent
+   *  reads as false, which is what a meta built before the field existed
+   *  means. */
+  isStoppedChild?: boolean;
+  /** The *read request*: the thread's agent asked the user to read its latest
+   *  reply, and they have not seen it yet (ADR 0409). Lists a settled thread
+   *  under Review. Absent reads as false. */
+  readRequested?: boolean;
+  /** How many *event waits* this thread holds unresolved, from the backend
+   *  projection (`thread_summaries.live_event_wait_count`). Consumed by
+   *  `resolveVisualStatus` via `count > 0` to paint the same Waiting dot
+   *  active children paint: both mean the thread finished its turn and is not
+   *  done, because something else will wake it.
+   *
+   *  Kept as its own field rather than read off `liveEventWaits.length`, even
+   *  though the backend derives one from the other and they always agree. Both
+   *  arrive on the same snapshot, so a local derivation buys nothing. It would
+   *  also re-open the drift this pair exists to close, by leaving a reader of
+   *  one unable to notice that the other was wrong. */
+  liveEventWaitCount: number;
+  /** What the coding-agent branch holds (ADR 0400): no work, unproposed work,
+   *  or a pending change. The server's summary and SSE aggregate set it, and
+   *  an optimistic archive writes `NO_CHANGE` until they answer. A pending
+   *  change is what Apply acts on and what blocks Archive; read that through
+   *  `changeReadyToReview`. */
+  codingAgentChangeState: CodingAgentChangeState;
+  /** Whether the Claude Code session is bound to an external repo — drives the
+   *  WaitingBanner Done / Archive vs Apply choice. */
+  codingAgentIsExternalRepo: boolean;
+  /** When the thread last entered 'running' state (for IN PROGRESS sort order). */
+  lastRevivedAt: string;
+  /** Set when mode != 'human' on the initial MessageReceived. */
+  parentThreadId?: string;
+  parentThreadTitle?: string;
+  /** Trigger that fired this thread (only for `channel === 'trigger'`). */
+  triggerId?: string;
+  /** Trigger name at fire-time (snapshot — falls back when the trigger is renamed/deleted). */
+  triggerName?: string;
+  /** Repository the Claude Code session bound to (only for `channel === 'claude_code'`). */
+  repoId?: string;
+  /** Current repo name from the registry — undefined when the repo was deleted. */
+  repoName?: string;
+  /** Coding-agent thread flavor — 'lucidos' | 'app' | 'external'. Drives
+   *  app-specific affordances (WIP preview button, app-icon branch chip).
+   *  Absent for non-CC threads and legacy rows (consumers default to
+   *  'lucidos'). */
+  codingAgentKind?: 'lucidos' | 'app' | 'external';
+  /** Canonical folder the coding agent operates on. For app threads,
+   *  `<ws>/data/apps/<id>/` — the last path segment is the app id. */
+  codingAgentFolder?: string;
+  /** Which backend drives this thread — 'claude-code' | 'codex'. Bound at
+   *  compose promotion (sendCompose) for new threads; loaded from the
+   *  thread summary afterwards. Absent = legacy / 'claude-code'. */
+  codingAgent?: 'claude-code' | 'codex';
+  /** Compose state machine. Server is the source of truth; events flow via
+   *  ThreadStarted, MessageReceived, ThreadDiscarded, ThreadArchived.
+   *
+   *  Draft text / images / mode pick live in the sibling `composeDrafts`
+   *  signal (see `store/composeDrafts.ts`). They are NOT on ThreadMeta:
+   *  per-keystroke draft writes would otherwise re-render every component
+   *  subscribed to threadMap (most expensively ChatExchange, which calls
+   *  marked.parse per render). */
+  state: ThreadComposeState;
+  /** Current *Todo list* snapshot — overwritten each time a `TodoListWritten`
+   *  event arrives in `handleEvent`. `null` until the agent first writes one;
+   *  `[]` is a valid "cleared" state. Projected here (rather than re-derived
+   *  per render) so the prompt-bar indicator doesn't walk the events Map on
+   *  every threadMap flush — see `TodoListIndicator`. */
+  latestTodoList: TodoItem[] | null;
+  /** The *todo notes* written with that list, or `null` when it carried none.
+   *  Replaced with the items on every `TodoListWritten`, so it can never
+   *  outlive the list it was written against. Almost always absent: notes are
+   *  ADR 0085's *context mode*, which is off by default.
+   *
+   *  Optional where `latestTodoList` is required, because absent and `null`
+   *  say the same thing here and every reader takes `?? null`. Requiring it
+   *  would have every hand-built `ThreadMeta` fixture declare "no notes" for
+   *  a field almost none of them will ever have. */
+  latestTodoNotes?: string | null;
+  /** Live *event waits* on this thread, oldest first, with each one's reason,
+   *  subscription and deadline. This is what the always-visible subscription
+   *  indicator renders, and the only surface answering "what is this thread
+   *  subscribed to right now" without scrolling the transcript.
+   *
+   *  **Server-reconciled, on three paths, and that is load-bearing.** Every
+   *  thread-summary snapshot (`upsertThread`) and every per-event aggregate
+   *  (`applyAggregateToMeta`) overwrite it from
+   *  `thread_summaries.live_event_waits`, and `handleEvent` folds each
+   *  `EventWait*` in as it arrives, for immediacy. Folding used to be the ONLY
+   *  source, so one missed `EventWaitDelivered` stranded a resolved wait here
+   *  forever, still counting down. The fold is idempotent by `wait_id`, so it
+   *  and the snapshots converge rather than fight. */
+  liveEventWaits: EventWaitSummary[];
+};
+
+/** Compose state machine — mirrors the Rust `ThreadState` enum. The archive
+ *  flag is intentionally NOT here; it lives on the separate `ThreadSection`
+ *  ('inbox' | 'archived') maintained by the contract layer. An archived
+ *  thread carries `state='active'` plus `archive_state='archived'`. */
+export type ThreadComposeState = 'composing' | 'active' | 'discarded';
+export type ComposeChannelMode = 'lucidos' | 'claude_code' | null;
+
+export type PendingUserMessage = {
+  text: string;
+  eventId: string;
+  created: string;
+  image_hashes?: string[];
+  unconfirmed?: boolean;
+  /** The open question card this send answers, by tool-use id. The engine
+   *  routes it there as a `FreeText` answer, so it draws on that card rather
+   *  than as a row. `splitTypedAnswers` names the cases that keep the row. */
+  answersQuestion?: string;
+};
+
+export type ThreadState = {
+  meta: ThreadMeta;
+  events: Map<number, StoredEvent>;
+  /** Each *unsent message* in `events`, by its client event id: the seq of its
+   *  client-only message row. Its failure card sits on the next seq. Written by
+   *  `showUnsentExchange` (actions/chat.ts), cleared by `retireUnsentExchange`. */
+  unsentMessageSeqs?: Map<string, number>;
+  streamingBuffer: string;
+  eventsLoaded: boolean;
+  /** True when loadThreadEvents exhausted retries. The UI shows an error
+   *  state instead of a spinner. On next resume, runResumeSync retries
+   *  failed threads via loadThreadEvents (which resets this flag). */
+  eventsLoadFailed: boolean;
+  /** SSE events may arrive out of order during reconnect, so we track
+   *  the max DB-loaded sequence separately to avoid skipping gap events. */
+  lastDbSeq: number;
+  /** How far BACK this thread is loaded, and whether older events remain.
+   *
+   *  The mirror of `lastDbSeq`, which is how far forward. A long thread opens
+   *  on its newest page and backfills as the reader scrolls up. The two answer
+   *  different questions, and neither substitutes for the other.
+   *
+   *  `historyFloor` is the oldest row held, as the `(created, sequence)` pair
+   *  the server pages by. Null before the first load, and on a thread served
+   *  whole, which is every thread shorter than a page.
+   *
+   *  Both are OPTIONAL. A thread built without them reads as served
+   *  whole, which is the truth for a fixture and for any pre-paging state. */
+  historyFloor?: { created: string; sequence: number } | null;
+  /** True while the server says older events remain behind `historyFloor`.
+   *  False on a thread served whole, so nothing ever asks for a page that
+   *  cannot exist. */
+  hasOlderEvents?: boolean;
+  /** Optimistic user messages shown before real SSE events arrive.
+   *  Each entry is removed when its corresponding MessageReceived event arrives
+   *  from SSE, matched by the client-generated event_id UUID.
+   *
+   *  `unconfirmed` marks a row the safety refetch gave up on: the send was
+   *  never confirmed and the row is kept so the text stays visible, but it no
+   *  longer counts as a turn in flight (see `effectiveThreadStatus`). */
+  pendingUserMessages: PendingUserMessage[];
+  /** Every utterance of this call the engine has not written down yet, oldest
+   *  first.
+   *
+   *  A LIST rather than a slot, because the engine holds one utterance at a
+   *  time while the talker decides what to do with it. A caller who carries on
+   *  speaking therefore has a second row up before the first one's row exists.
+   *  A slot would drop the first one's words to draw the second (ADR 0174).
+   *
+   *  Deliberately NOT `pendingUserMessages` entries: nothing was sent, nothing
+   *  is in flight, and there is nothing to retract. Every rule that array
+   *  carries would need a carve-out, `effectiveThreadStatus`'s running flip
+   *  most of all, and its safety timer drops a row on a clock.
+   *
+   *  `store/liveUtterance.ts` writes them from the call, and `handleEvent`
+   *  retires them as the words themselves land.
+   *
+   *  Optional for the reason `latestTodoNotes` is: absent and empty say the
+   *  same thing, and requiring it would have every hand-built fixture declare
+   *  "nobody is speaking". */
+  liveUtterances?: LiveUtterance[];
+  /** The WORDS of rows the engine has written that no live row has claimed
+   *  yet, oldest first and trimmed.
+   *
+   *  Words rather than a count, and that is the whole of the rule. A count
+   *  pairs a landing row with whichever live row is next in line, and the two
+   *  sides disagree about what next is. The browser's gate and the provider's
+   *  turn detection cut the same audio differently. `call.rs` also writes no
+   *  row at all for words spent answering a question card. One mispairing then
+   *  stands for the rest of the call.
+   *
+   *  `claimUtteranceRows` is the rule, and
+   *  `docs/plans/2026-09-14-the-transcript-shows-a-call-as-it-happens.md`
+   *  traces the orderings it closes.
+   *
+   *  Reset when a call draws its first row. Optional for the same reason as
+   *  the field above. */
+  unclaimedUtterances?: string[];
+  /** The reply being spoken, drawn from the first word to the engine's own row
+   *  for it.
+   *
+   *  A SLOT where the caller's is a list, and the asymmetry is the engine's:
+   *  `call.rs` holds the floor to one reply at a time, so a second live reply
+   *  is a state that cannot exist. A list would model it anyway.
+   *
+   *  Retired by the persisted `SpokenReplyGenerated`, with `VoiceSessionEnded`
+   *  as the backstop. Optional for the same reason as the fields above. */
+  liveReply?: LiveReply;
+};
+
+/** A caller's utterance the transcript is drawing before the engine's own row
+ *  for it exists.
+ *
+ *  The count is the call's own, so a second utterance is told from the first
+ *  even though both are just "the caller speaking". */
+export type LiveUtterance = {
+  eventId: string;
+  count: number;
+  /** When the row was drawn, for the timestamp its bubble header shows. */
+  created: string;
+  /** What the caller said, once the provider has ENDED the turn.
+   *
+   *  The final words, and the only thing a landing row may claim. Absent until
+   *  the speaking stops, which is the whole point: the swap from bars to words
+   *  costs no frame and no round trip. */
+  text?: string;
+  /** What the provider has heard SO FAR, while they are still speaking.
+   *
+   *  Drawn in the bubble when `text` is absent, so the row reads as words
+   *  rather than as bars from the first one. Revised in place as the provider
+   *  corrects itself, and dropped the moment `text` arrives.
+   *
+   *  Claims nothing, ever. A partial is the sentence being said now, and a row
+   *  the engine writes is for one already finished. Letting it count is how a
+   *  bubble disappears mid-sentence. */
+  partial?: string;
+};
+
+/** The reply the transcript is drawing while the talker says it.
+ *
+ *  No count: one reply at a time, so there is nothing to tell apart. */
+export type LiveReply = {
+  eventId: string;
+  /** When the row was drawn, for the timestamp its header shows, and for the
+   *  order it reads in against the caller's own rows. */
+  created: string;
+  /** What has been said so far, built from the deltas as they arrive. */
+  text: string;
+};
+
+/** Build a fresh `ThreadState` for optimistic / SSE-bootstrapped threads.
+ *  All CC/changes flags default to false and counts to 0; callers override
+ *  what they actually know. Centralised so adding a `ThreadMeta` field is a
+ *  one-line change instead of a four-place audit.
+ *
+ *  Compose draft (text/images/mode) lives in the sibling `composeDrafts`
+ *  signal — callers that bootstrap a `composing` thread (compose.ts,
+ *  thread-sync.ts ThreadStarted skeleton) seed the draft entry separately
+ *  via `setDraft`. Keeps this builder free of signal side effects. */
+export function makeOptimisticThreadState(opts: {
+  id: string;
+  title: string;
+  channel: ThreadMeta['channel'];
+  initiator: ThreadInitiator;
+  eventsLoaded: boolean;
+  timestamp?: string;
+  pendingUserMessages?: ThreadState['pendingUserMessages'];
+  triggerId?: string;
+  triggerName?: string;
+  repoId?: string;
+  repoName?: string;
+  codingAgentKind?: 'lucidos' | 'app' | 'external';
+  codingAgentFolder?: string;
+  codingAgent?: 'claude-code' | 'codex';
+  /** Override compose state — defaults to 'active'. Set 'composing' for
+   *  optimistic draft creation (compose.ts, ThreadStarted SSE). */
+  state?: ThreadComposeState;
+  /** Override status — defaults to 'running'. Composing rows want 'idle'. */
+  status?: ThreadStatus;
+}): ThreadState {
+  const ts = opts.timestamp ?? new Date().toISOString();
+  return {
+    meta: {
+      id: opts.id,
+      title: opts.title,
+      channel: opts.channel,
+      initiator: opts.initiator,
+      saved: false,
+      createdAt: ts,
+      updatedAt: ts,
+      lastUserAction: ts,
+      lastAgentAction: ts,
+      status: opts.status ?? 'running',
+      summaryVersion: UNVERSIONED,
+      messageCount: 0,
+      // The engine creates every row in the inbox. Archived here would drop
+      // the row from Current whenever it stops running before a summary lands.
+      section: 'inbox',
+      activeChildrenCount: 0,
+      totalChildrenCount: 0,
+      blockingDescendantCount: 0,
+      attentionDescendantCount: 0,
+      liveEventWaitCount: 0,
+      codingAgentChangeState: NO_CHANGE,
+      codingAgentIsExternalRepo: false,
+      lastRevivedAt: ts,
+      triggerId: opts.triggerId,
+      triggerName: opts.triggerName,
+      repoId: opts.repoId,
+      repoName: opts.repoName,
+      codingAgentKind: opts.codingAgentKind,
+      codingAgentFolder: opts.codingAgentFolder,
+      codingAgent: opts.codingAgent,
+      state: opts.state ?? 'active',
+      latestTodoList: null,
+      latestTodoNotes: null,
+      liveEventWaits: [],
+    },
+    events: new Map(),
+    streamingBuffer: '',
+    eventsLoaded: opts.eventsLoaded,
+    eventsLoadFailed: false,
+    lastDbSeq: 0,
+    historyFloor: null,
+    hasOlderEvents: false,
+    pendingUserMessages: opts.pendingUserMessages ?? [],
+    liveUtterances: [],
+  };
+}
+
+/** Recency key for drawer ordering: when the USER last acted on the thread, so
+ *  background agent churn (streaming, idle) doesn't reshuffle the list. Falls
+ *  back to `updatedAt` (last activity) only if `lastUserAction` is absent — the
+ *  backend always sends it, so the fallback just keeps older test fixtures and
+ *  any pre-field skeleton sane. */
+export const recencyKey = (t: ThreadState): string =>
+  t.meta.lastUserAction || t.meta.updatedAt;
+
+/** Sort threads by last user action descending (most recent first). */
+export const byRecent = (a: ThreadState, b: ThreadState): number =>
+  recencyKey(b).localeCompare(recencyKey(a));
+
+/** Creation-time key for drawer ordering: the immutable creation timestamp, so
+ *  the row never moves once created (no reshuffle from agent churn). Falls back
+ *  to `updatedAt` only for skeleton rows that haven't received a `createdAt` yet
+ *  (the backend always sends one for real threads). The Current AND Archive
+ *  sections order by this — and `loadOlderThreads` pages the Archive by the same
+ *  key, so the pagination cursor and the display sort stay coherent. */
+export const createdKey = (t: ThreadState): string =>
+  t.meta.createdAt || t.meta.updatedAt;
+
+/** Sort threads by creation time descending (newest created first). The drawer's
+ *  Current and Archive sections order by this so the list stays stable: a thread
+ *  holds its position regardless of agent churn or attention state — the
+ *  attention/drafts filter icons surface those subsets instead of reshuffling
+ *  the list, and the displayed date (createdAt) matches the sort. */
+export const byCreated = (a: ThreadState, b: ThreadState): number =>
+  createdKey(b).localeCompare(createdKey(a));
+
+/** Threads whose compose state hides them from every drawer section: composing
+ *  drafts live in the compose pane / Drafts surface, and discarded threads
+ *  are tombstones. Any code that derives "what shows in a drawer section"
+ *  (drawer rendering, the post-archive sibling picker, attention badges)
+ *  must skip these so the count matches what the user can actually see. */
+export const isExcludedFromSections = (t: ThreadState): boolean =>
+  t.meta.state === 'composing' || t.meta.state === 'discarded';
+
+/** Review-section sort tier for a thread under a given status — lower sorts
+ *  higher. Three tiers:
+ *    0 — WaitingForUserAnswer: a user question or permission request is
+ *        blocking the agent. Most critical (nothing progresses until the user
+ *        answers), so these float to the very top.
+ *    1 — other CTA: `changeReadyToReview` (a finished change) or Failed
+ *        (the last response errored), or Paused (an engine restart interrupted
+ *        the turn). The user should act, but no agent is stalled waiting on
+ *        them.
+ *    2 — no CTA: running, idle, etc.
+ *  Tier 0 is the most-critical subset. Every caller (the drawer's family-aware
+ *  sort via `computeFamilyKeys`, the attention view, and the post-archive focus
+ *  picker) passes `effectiveThreadStatus`, which honors optimistic archiving and
+ *  pending sends.
+ *
+ *  Tier 1 is deliberately WIDER than `threadIsBlocked`, which covers tier 0
+ *  plus Failed but neither Paused nor a ready change (that one has its own
+ *  Review view). This is a sort key, not a badge: floating a paused thread to
+ *  the top of Current costs the user nothing, whereas counting one in the
+ *  Blocked badge would light it on every version switch, for work the
+ *  engine is about to resume by itself. */
+export function reviewTier(t: ThreadState, status: ThreadStatus): 0 | 1 | 2 {
+  if (status === 'waiting_for_user_answer') return 0;
+  if (changeReadyToReview(t.meta) || status === 'failed' || status === 'paused') return 1;
+  return 2;
+}
+
+/** The thread holds a change ready to review: a pending change. An unfinished
+ *  turn never proposes (ADR 0400), so every pending change is ready. */
+export function changeReadyToReview(meta: Pick<ThreadMeta, 'codingAgentChangeState'>): boolean {
+  return meta.codingAgentChangeState.kind === 'proposed';
+}
+
+/** The change state of a thread whose branch holds no work. */
+export const NO_CHANGE: CodingAgentChangeState = Object.freeze({ kind: 'none' });
+
+/** Whether two change states say the same thing, field by field. */
+export function sameChangeState(a: CodingAgentChangeState, b: CodingAgentChangeState): boolean {
+  if (a === b) return true;
+  switch (a.kind) {
+    case 'none': return b.kind === 'none';
+    case 'unproposed': return b.kind === 'unproposed' && a.reason === b.reason;
+    case 'proposed': return b.kind === 'proposed' && a.requires_restart === b.requires_restart;
+  }
+}
+
+/** Whether this event type updates the thread's last_activity in the backend
+ *  projection (event_bus.rs). Generated from thread_lifecycle.rs. */
+export function updatesLastActivity(type: string): boolean {
+  return LAST_ACTIVITY_EVENTS.has(type);
+}
+
+/** CC activity event types — tool calls, text streaming, and tool results.
+ *  Used to detect active CC work after mid-session completion events.
+ *  Derived from the generated thread lifecycle contract. */
+export const CC_ACTIVITY_EVENTS = new Set(
+  Object.entries(EVENT_CLASSIFICATION)
+    .filter(([evt, cls]) => cls === 'activity' && evt.startsWith('CodingAgent'))
+    .map(([evt]) => evt)
+);
+
+/** CC waiting info — sourced from backend thread_summaries projection. Used
+ *  by the WaitingBanner to decide whether Apply / Discard appear and how
+ *  they're rendered. `proposed` mirrors the existence of a `changes` row in
+ *  the engine DB (both written in the `ChangeProposed` projection tx); use
+ *  it as a union with the frontend `pendingChange` lookup so the banner
+ *  doesn't flash between the two SSE broadcasts. */
+export type CodingAgentWaitingInfo = {
+  proposed: boolean;
+  isExternalRepo: boolean;
+  requiresRestart: boolean;
+};
+
+/** What the thread holds toward a change: proposed, or held by an idle that
+ *  ended while an event wait was live (ADR 0395). */
+export function threadChangeWork(meta: ThreadMeta): ChangeWork {
+  return changeWork(meta.codingAgentChangeState.kind, meta.liveEventWaitCount > 0);
+}
+
+/** Get CC waiting info from thread meta. Returns null for non-CC threads,
+ *  threads without a pending proposal, and threads whose loop is mid-stream
+ *  (status==='running' means a follow-up turn is in flight, so the user is
+ *  not yet being asked to review). */
+export function getCodingAgentWaitingInfo(meta: ThreadMeta): CodingAgentWaitingInfo | null {
+  const change = meta.codingAgentChangeState;
+  if (meta.channel !== 'claude_code') return null;
+  if (change.kind !== 'proposed') return null;
+  if (meta.status === 'running') return null;
+  return {
+    proposed: true,
+    isExternalRepo: meta.codingAgentIsExternalRepo,
+    requiresRestart: change.requires_restart,
+  };
+}

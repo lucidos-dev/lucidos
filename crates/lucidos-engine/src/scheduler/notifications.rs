@@ -1,0 +1,1388 @@
+//! Notification storage
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
+
+/// Where a tap on this notification (OS push, in-app toast) should land.
+///
+/// Discriminated union — `kind` selects the variant. `Modal` (default) opens
+/// the inbox modal so the user reads the message and chooses what to do next.
+/// `Navigate` delegates to the same target/sub-field router the `navigate_ui`
+/// LLM tool uses, so any UI surface reachable by `navigate_ui` is reachable by
+/// a notification tap with no per-target wrapper variant. Every notification is
+/// openable — there is no passive/button-less kind.
+///
+/// The old passive `None` kind (`{"kind":"none"}`) is RETIRED: nothing produces
+/// it anymore, and the custom `Deserialize` below coerces any historical
+/// `{"kind":"none"}` event/row to `Modal` (see that impl for why it can't just
+/// be deleted). Removed by `docs/plans/2026-07-02-remove-notification-tap-none.md`.
+///
+/// Wire shape (JSON):
+/// - `{"kind":"modal"}`
+/// - `{"kind":"navigate","to":{"target":"app","app_id":"habit-tracker"}}`
+///
+/// Required sub-fields on `NavigateUi.to` (e.g. `app_id` for `target=app`) are
+/// validated by the page-side router, not by this type: the LLM tool definition
+/// documents them. The ONE exception is a thread target's `id`, which every
+/// producer settles through [`resolve_thread_tap_id`] before the write.
+///
+/// # Strict — no tolerance for the legacy four-string form
+///
+/// Inbound `Tap` deserialization is strict: only the canonical object form
+/// is accepted. The pre-`20260522152123_notification_tap_jsonb.sql` bare
+/// strings (`"modal"` / `"open_app"` / `"open_thread"` / `"none"`) are
+/// rejected by serde with a clear "missing field 'kind'" error — surfacing
+/// as `400 Bad Request` on the HTTP `notifications` POST and as a
+/// `send_notification` LLM tool error on bad LLM output. (The retired
+/// `{"kind":"none"}` OBJECT is the one exception — coerced to `Modal`, not
+/// rejected; the bare string `"none"` is still rejected.)
+///
+/// Workspaces that still have triggers or apps emitting the old strings
+/// must migrate them. `system-knowhow/workspace-audit.md` finds them, and
+/// its remediation section owns the rewrite. Historical `NotificationCreated`
+/// event payloads with the old form remain in the events table forever
+/// (event-sourcing immutability), but the projection is built once by the
+/// JSONB migration and incremental updates only consume new events with the
+/// canonical shape — normal operation never re-deserializes the old strings.
+/// A force projection rebuild on a pre-migration workspace will fail loudly,
+/// at which point the workspace owner runs that audit's fix path and
+/// rebuilds.
+///
+/// `to` is boxed because `NavigateUi` is one field per navigate target and
+/// keeps growing, while `Modal` carries nothing. Unboxed, every `Tap` in the
+/// program paid the largest target's size, `Notification` and the
+/// `NotificationCreated` event included. The box is invisible on the wire.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Tap {
+    #[default]
+    Modal,
+    Navigate {
+        to: Box<NavigateUi>,
+    },
+}
+
+// Custom Deserialize (not derived) so the RETIRED `{"kind":"none"}` kind coerces
+// to `Modal` rather than erroring. `Tap::None` (the old passive kind) was removed
+// so every notification is openable — but immutable `NotificationCreated` event
+// payloads, and any `notifications` rows a projection rebuild replays, still carry
+// `{"kind":"none"}` forever. So the read boundary MUST tolerate it. This is
+// PERMANENT old-data tolerance (a parser for a legacy wire shape), NOT a temporary
+// measure — so it carries no `docs/temporary-measures.md` row.
+//
+// It delegates to a private derived helper that keeps serde's full strictness:
+// legacy bare strings ("modal"/"none"/"open_thread") and unknown object kinds are
+// still rejected loudly (the strict-tap guard). ONLY the well-formed
+// `{"kind":"none"}` object is coerced — to `Modal`, which then re-serializes as
+// `{"kind":"modal"}`, so a rebuilt row never re-emits `none`.
+impl<'de> Deserialize<'de> for Tap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum TapWire {
+            Modal,
+            None,
+            Navigate { to: Box<NavigateUi> },
+        }
+        Ok(match TapWire::deserialize(deserializer)? {
+            TapWire::Modal | TapWire::None => Tap::Modal,
+            TapWire::Navigate { to } => Tap::Navigate { to },
+        })
+    }
+}
+
+/// Navigation payload — mirrors the `navigate_ui` LLM tool arg shape. Used
+/// as the `to` of `Tap::Navigate`. Required sub-fields are not enforced at
+/// the Rust layer; the page-side router rejects malformed nav targets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct NavigateUi {
+    pub target: NavigateTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_view: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    /// The place INSIDE the app to open, delivered as the app iframe's
+    /// `location.hash`. Only meaningful with `target: App`. The page-side
+    /// router hands it over and never inspects it, since only the app knows
+    /// what its own targets are. An app that ignores the hash still opens,
+    /// exactly as a file opens at the top when its cited line has gone stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// First line to select in the file preview, 1-based. Only meaningful with
+    /// `target: File`. The page-side router validates and silently ignores a
+    /// line it can't use (0, negative, past the end of the file) rather than
+    /// refusing to open the file: a citation's line number is the part that
+    /// goes stale, and the file is still what the reader asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// Last line of the selected range, 1-based and INCLUSIVE. Omit for a
+    /// single line. Only meaningful alongside `line`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_end: Option<u32>,
+    /// The thread or trigger to open. A thread's is settled to a uuid at the
+    /// producer by [`resolve_thread_tap_id`]. The page dereferences it later,
+    /// with no way to ask what was meant. Decoding stays permissive, so a row
+    /// written before that guard is still readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+/// Navigation target enum — every UI surface a notification tap can deep-link
+/// to. Wire format: kebab-case (e.g. `"new-app"`). Mirrors the `navigate_ui`
+/// LLM tool's `target` enum.
+///
+/// Has a `Default` impl (`Thread`) so callers can use the
+/// `NavigateUi { target: …, ..Default::default() }` shorthand. The default
+/// target value is rarely the right pick — `handleNavigationRequest` surfaces
+/// a `Navigation target missing …` toast at runtime when a navigate-kind tap
+/// lacks the required sub-field for whatever target was chosen, which is the
+/// failure mode this would have masked.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NavigateTarget {
+    Files,
+    Apps,
+    AppStore,
+    Plugins,
+    Triggers,
+    ThreadQueue,
+    Changes,
+    Notifications,
+    Settings,
+    App,
+    File,
+    Trigger,
+    #[default]
+    Thread,
+    NewApp,
+    NewTrigger,
+    NewChat,
+    Url,
+}
+
+/// The tap a producer gets when it supplied none.
+///
+/// `Navigate` to the source event when the notification names one, `Modal`
+/// otherwise. An `event_id` is the producer saying there is a specific thing to
+/// look at: a question, a permission request, a failure card. Landing on it is
+/// what the reader wanted, and the card in between was a second tap for nothing.
+///
+/// A `thread_id` alone is NOT enough, and deliberately so. The engine stamps it
+/// on every `send_notification` from the origin thread, so it is provenance
+/// rather than intent. Navigating on it would drop a daily-summary notification
+/// into the middle of that trigger's agent transcript. That is worse than the
+/// card the summary was written for.
+pub fn default_tap(link_thread: Option<Uuid>, link_event: Option<Uuid>) -> Tap {
+    match (link_thread, link_event) {
+        (Some(thread), Some(event)) => Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::Thread,
+                id: Some(thread.to_string()),
+                event_id: Some(event.to_string()),
+                ..Default::default()
+            }),
+        },
+        _ => Tap::Modal,
+    }
+}
+
+/// Settle a thread-targeted tap's `id` before the notification is written.
+///
+/// A notification is persisted AND pushed, so a tap naming no real thread is
+/// already wrong by the time anyone can see it: the OS banner carries it to a
+/// device that cannot repair anything, and the reader meets it as
+/// `Thread "<id>" no longer exists`. So this runs at every producer, and the
+/// notification is refused rather than written with a dead target.
+///
+/// `caller` is the thread the producer is working in. It resolves the
+/// `current` / `this` alias an agent reaches for, because the sibling `events`
+/// tool takes it. `None` refuses the alias; [`crate::api::resolve_thread_id_arg`]
+/// says why a surface with no ambient thread must not guess one.
+///
+/// Scoped to [`NavigateTarget::Thread`], the one target whose id the alias can
+/// mean. An ABSENT id is refused too, unlike the transient navigate event's:
+/// this one is stored and pushed, so leaving it to the page-side router means
+/// the reader meets `Navigation target missing thread id` on a banner instead.
+/// Reading stays untouched, since rows written before this guard have to stay
+/// readable to be repaired
+/// (`docs/plans/2026-09-18-notification-tap-thread-id-is-a-uuid.md`).
+pub fn resolve_thread_tap_id(tap: &mut Tap, caller: Option<Uuid>) -> Result<(), String> {
+    let Tap::Navigate { to } = tap else {
+        return Ok(());
+    };
+    if to.target != NavigateTarget::Thread {
+        return Ok(());
+    }
+    let Some(raw) = to.id.as_deref() else {
+        return Err(
+            "a tap on a thread needs that thread's id in `to.id`, and this one has none."
+                .to_string(),
+        );
+    };
+    to.id = Some(crate::api::resolve_thread_id_arg(raw, caller)?.to_string());
+    Ok(())
+}
+
+/// Refuse a notification that points at an event its thread does not hold.
+///
+/// The page resolves an anchor only inside the thread it opens, so any other
+/// event can never render there. A trigger fired by a domain event hit this: it
+/// passed that event's id, and a domain event lives in no thread. Refused here,
+/// the producer hears why and can retry. Written, the reader meets a dead tap.
+///
+/// Two pairs are checked, each on its own. The row's `link_thread` and
+/// `link_event` drive the inbox card's "Open thread". A thread tap's `to.id` and
+/// `to.event_id` drive the tap. A missing half means no anchor, as before.
+///
+/// The outer `Err` is a lookup that could not run. The inner one is a verdict.
+pub async fn verify_event_anchors(
+    pool: &PgPool,
+    link_thread: Option<Uuid>,
+    link_event: Option<Uuid>,
+    tap: &Tap,
+) -> Result<Result<(), String>, sqlx::Error> {
+    let mut anchors: Vec<(Uuid, Uuid)> = Vec::new();
+    if let (Some(thread), Some(event)) = (link_thread, link_event) {
+        anchors.push((thread, event));
+    }
+    if let Tap::Navigate { to } = tap {
+        if let (NavigateTarget::Thread, Some(id), Some(event)) =
+            (to.target, to.id.as_deref(), to.event_id.as_deref())
+        {
+            let Ok(thread) = Uuid::parse_str(id) else {
+                return Ok(Err(format!("the tap's thread id `{id}` is not a uuid.")));
+            };
+            let Ok(event) = Uuid::parse_str(event.trim()) else {
+                return Ok(Err(format!("the tap's event_id `{event}` is not a uuid.")));
+            };
+            if !anchors.contains(&(thread, event)) {
+                anchors.push((thread, event));
+            }
+        }
+    }
+
+    for (thread, event) in anchors {
+        let location: Option<(Option<Uuid>, String)> =
+            sqlx::query_as("SELECT thread_id, event_type FROM events WHERE id = $1")
+                .bind(event)
+                .fetch_optional(pool)
+                .await?;
+        let refusal = match location {
+            None => format!("event_id {event} names no event."),
+            Some((None, event_type)) => format!(
+                "event_id {event} is a {event_type} event, which belongs to no thread, so no \
+                 tap can land on it. Omit event_id: the tap then opens the notification card."
+            ),
+            Some((Some(home), _)) if home != thread => format!(
+                "event_id {event} is in thread {home}, not in thread {thread} that this \
+                 notification opens. Omit event_id, or tap to thread {home} instead."
+            ),
+            Some(_) => continue,
+        };
+        return Ok(Err(refusal));
+    }
+    Ok(Ok(()))
+}
+
+/// One Settings page an engine notification can send the reader to: the route
+/// written the way the UI's breadcrumbs read, and the view id that opens it.
+///
+/// Holding both in one value is what keeps a notification's body and its tap on
+/// the same page. A System subpanel reads "Settings → System → X", not
+/// "Settings → X".
+///
+/// `view` must be one of `NAVIGABLE_SETTINGS_VIEWS` (`llm/tools/misc.rs`), the
+/// set the frontend router renders. Anything else toasts "Unknown settings
+/// section" instead of navigating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsPage {
+    pub path: &'static str,
+    pub view: &'static str,
+}
+
+impl SettingsPage {
+    pub const ACCOUNTS: Self = Self {
+        path: "Settings → Accounts",
+        view: "accounts",
+    };
+    pub const BACKUP: Self = Self {
+        path: "Settings → System → Backup",
+        view: "backup",
+    };
+    pub const DISK_USAGE: Self = Self {
+        path: "Settings → System → Disk Usage",
+        view: "disk-usage",
+    };
+
+    /// Every page above, for the test that holds each to a renderable view.
+    #[cfg(test)]
+    pub const ALL: [Self; 3] = [Self::ACCOUNTS, Self::BACKUP, Self::DISK_USAGE];
+
+    /// A tap that deep-links here, the same way the LLM's `navigate_ui` does.
+    pub fn tap(self) -> Tap {
+        Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::Settings,
+                settings_view: Some(self.view.to_string()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// The route as a markdown link to this page, for a notification body.
+    ///
+    /// The label is the route itself, so every plain-text surface (OS banner,
+    /// toast, inbox row) still reads the route after markdown is stripped.
+    pub fn link(self) -> String {
+        format!("[{}](settings:{})", self.path, self.view)
+    }
+}
+
+/// A notification sent to the user
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Notification {
+    pub id: Uuid,
+    pub task_id: Option<Uuid>,
+    pub app_id: Option<String>,
+    /// Originating thread, when the notification has one. Drives the inbox
+    /// modal's "Open thread" button. Engine sets this from `link_thread` —
+    /// the same value that powers push deep-linking and presence-based push
+    /// suppression.
+    pub thread_id: Option<Uuid>,
+    /// Specific event UUID inside `thread_id` to deep-link to. When set, both
+    /// the inbox modal's "Open thread" button and a tap with
+    /// `Tap::Navigate { to: { target: Thread, .. } }` push scroll and briefly
+    /// pulse this event on land. Typically points at the `UserQuestionAsked`
+    /// or `CodingAgentPermissionRequest` row the user should answer.
+    pub event_id: Option<Uuid>,
+    pub title: String,
+    pub message: String,
+    pub read: bool,
+    pub created_at: DateTime<Utc>,
+    /// Where a tap lands. Stored as JSONB; see [`Tap`] for the wire shape.
+    /// The `Json<Tap>` newtype handles the JSONB encode/decode; the field
+    /// reads back as a plain `Tap` to call sites via the `Deref` extraction
+    /// below in the `FromRow` decode.
+    #[sqlx(json)]
+    pub tap: Tap,
+}
+
+/// Storage for notifications
+pub struct NotificationStore;
+
+impl NotificationStore {
+    /// Insert a notification with a custom timestamp (for backdating).
+    ///
+    /// The single insert path. A callerless `Utc::now()` wrapper used to sit
+    /// beside it, stamping `created_at` off the host clock. The dedup windows
+    /// in `scheduler/backup.rs` and `scheduler/user_tasks.rs` compare that
+    /// column against the Postgres clock (ADR 0053).
+    // One arg per persisted column; matches the `notifications` row schema 1:1.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_with_timestamp(
+        pool: &PgPool,
+        title: &str,
+        message: &str,
+        task_id: Option<Uuid>,
+        app_id: Option<&str>,
+        thread_id: Option<Uuid>,
+        event_id: Option<Uuid>,
+        tap: Tap,
+        created_at: DateTime<Utc>,
+    ) -> Result<Notification, sqlx::Error> {
+        let id = Uuid::new_v4();
+
+        sqlx::query(
+            r#"
+            INSERT INTO notifications (id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8, $9)
+            "#,
+        )
+        .bind(id)
+        .bind(task_id)
+        .bind(app_id)
+        .bind(thread_id)
+        .bind(event_id)
+        .bind(title)
+        .bind(message)
+        .bind(created_at)
+        .bind(sqlx::types::Json(&tap))
+        .execute(pool)
+        .await?;
+
+        Ok(Notification {
+            id,
+            task_id,
+            app_id: app_id.map(|s| s.to_string()),
+            thread_id,
+            event_id,
+            title: title.to_string(),
+            message: message.to_string(),
+            read: false,
+            created_at,
+            tap,
+        })
+    }
+
+    /// Count unread notifications (no cap — returns the real total)
+    pub async fn count_unread(pool: &PgPool) -> Result<i64, sqlx::Error> {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM notifications WHERE read = false")
+                .fetch_one(pool)
+                .await?;
+        Ok(count)
+    }
+
+    /// Get notifications with optional filter and cursor pagination.
+    ///
+    /// `filter` — `"unread"` returns only unread; anything else returns all.
+    /// `before_ts` — cursor: only rows with `created_at < $ts` (for infinite scroll).
+    /// `limit` — max rows to return.
+    pub async fn get_filtered(
+        pool: &PgPool,
+        filter: &str,
+        limit: i64,
+        before_ts: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Notification>, sqlx::Error> {
+        let unread_only = filter == "unread";
+
+        match (unread_only, before_ts) {
+            (true, Some(ts)) => {
+                sqlx::query_as::<_, Notification>(
+                    r#"
+                    SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
+                    FROM notifications
+                    WHERE read = false AND created_at < $1
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                    "#,
+                )
+                .bind(ts)
+                .bind(limit)
+                .fetch_all(pool)
+                .await
+            }
+            (true, None) => {
+                sqlx::query_as::<_, Notification>(
+                    r#"
+                    SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
+                    FROM notifications
+                    WHERE read = false
+                    ORDER BY created_at DESC
+                    LIMIT $1
+                    "#,
+                )
+                .bind(limit)
+                .fetch_all(pool)
+                .await
+            }
+            (false, Some(ts)) => {
+                sqlx::query_as::<_, Notification>(
+                    r#"
+                    SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
+                    FROM notifications
+                    WHERE created_at < $1
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                    "#,
+                )
+                .bind(ts)
+                .bind(limit)
+                .fetch_all(pool)
+                .await
+            }
+            (false, None) => {
+                sqlx::query_as::<_, Notification>(
+                    r#"
+                    SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
+                    FROM notifications
+                    ORDER BY created_at DESC
+                    LIMIT $1
+                    "#,
+                )
+                .bind(limit)
+                .fetch_all(pool)
+                .await
+            }
+        }
+    }
+
+    /// Get notifications created before a specific timestamp (for time travel)
+    pub async fn get_all_before(
+        pool: &PgPool,
+        before: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<Notification>, sqlx::Error> {
+        sqlx::query_as::<_, Notification>(
+            r#"
+            SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
+            FROM notifications
+            WHERE created_at <= $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(before)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    }
+
+    /// Flip one notification to read. Returns `true` only when the row moved
+    /// from unread to read.
+    ///
+    /// **Private on purpose**: [`Self::mark_read`] is the reachable mutator,
+    /// and it emits.
+    async fn mark_read_row(pool: &PgPool, notification_id: Uuid) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE notifications
+            SET read = true
+            WHERE id = $1 AND read = false
+            "#,
+        )
+        .bind(notification_id)
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Flip every unread notification to read, returning how many moved.
+    ///
+    /// **Private on purpose**: [`Self::mark_all_read`] is the reachable
+    /// mutator, and it emits.
+    async fn mark_all_read_rows(pool: &PgPool) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE notifications
+            SET read = true
+            WHERE read = false
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Mark a notification read and announce it. The only way to flip one.
+    ///
+    /// `NotificationRead` fires only when the row really moved from unread to
+    /// read, so a redundant write (the service worker POSTs read on tap AND the
+    /// in-app dispatch also marks read) cannot fan out a duplicate SSE frame.
+    pub async fn mark_read(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        notification_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let marked = Self::mark_read_row(pool, notification_id).await?;
+        if marked {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::NotificationRead {
+                        id: notification_id.to_string(),
+                        actor,
+                    }),
+                    "[Notifications] NotificationRead",
+                )
+                .await;
+        }
+        Ok(marked)
+    }
+
+    /// Mark every unread notification read and announce it once. Returns how
+    /// many moved; announces nothing when the inbox was already clear.
+    pub async fn mark_all_read(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        actor: Option<MessageOrigin>,
+    ) -> Result<u64, sqlx::Error> {
+        let count = Self::mark_all_read_rows(pool).await?;
+        if count > 0 {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::NotificationsAllRead { actor }),
+                    "[Notifications] NotificationsAllRead",
+                )
+                .await;
+        }
+        Ok(count)
+    }
+
+    /// Get notification by ID
+    pub async fn get_by_id(
+        pool: &PgPool,
+        notification_id: Uuid,
+    ) -> Result<Option<Notification>, sqlx::Error> {
+        sqlx::query_as::<_, Notification>(
+            r#"
+            SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
+            FROM notifications
+            WHERE id = $1
+            "#,
+        )
+        .bind(notification_id)
+        .fetch_optional(pool)
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{setup_test_db, teardown_test_db};
+
+    #[test]
+    fn tap_modal_serializes_with_kind_only() {
+        let v = serde_json::to_value(Tap::Modal).unwrap();
+        assert_eq!(v, serde_json::json!({"kind": "modal"}));
+    }
+
+    #[test]
+    fn tap_navigate_thread_with_id_and_event_id() {
+        let t = Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::Thread,
+                id: Some("11111111-2222-3333-4444-555555555555".into()),
+                event_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
+                ..Default::default()
+            }),
+        };
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["kind"], "navigate");
+        assert_eq!(v["to"]["target"], "thread");
+        assert_eq!(v["to"]["id"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(v["to"]["event_id"], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert!(v["to"].get("settings_view").is_none());
+        assert!(v["to"].get("file_path").is_none());
+    }
+
+    #[test]
+    fn tap_navigate_app_uses_app_id() {
+        let t = Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::App,
+                app_id: Some("habit-tracker".into()),
+                ..Default::default()
+            }),
+        };
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["kind"], "navigate");
+        assert_eq!(v["to"]["target"], "app");
+        assert_eq!(v["to"]["app_id"], "habit-tracker");
+        // An app tap that names no place inside the app writes no key, so the
+        // shape stored before `fragment` existed is still the shape produced.
+        assert!(v["to"].get("fragment").is_none());
+    }
+
+    #[test]
+    fn tap_navigate_app_round_trips_a_fragment() {
+        let t = Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::App,
+                app_id: Some("habit-tracker".into()),
+                fragment: Some("day-2026-08-28".into()),
+                ..Default::default()
+            }),
+        };
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["to"]["fragment"], "day-2026-08-28");
+        assert_eq!(serde_json::from_value::<Tap>(v).unwrap(), t);
+    }
+
+    #[test]
+    fn tap_navigate_app_deserializes_without_a_fragment() {
+        // Every notification row written before the field existed. It must read
+        // back as `None` rather than failing the whole tap.
+        let t: Tap = serde_json::from_value(serde_json::json!({
+            "kind": "navigate",
+            "to": {"target": "app", "app_id": "habit-tracker"}
+        }))
+        .unwrap();
+        let Tap::Navigate { to } = t else {
+            panic!("expected a navigate tap");
+        };
+        assert_eq!(to.fragment, None);
+    }
+
+    #[test]
+    fn tap_navigate_kebab_case_targets() {
+        // new-app / new-trigger / new-chat / thread-queue all serialize
+        // kebab-case on the wire.
+        for (target, wire) in [
+            (NavigateTarget::NewApp, "new-app"),
+            (NavigateTarget::NewTrigger, "new-trigger"),
+            (NavigateTarget::NewChat, "new-chat"),
+            (NavigateTarget::ThreadQueue, "thread-queue"),
+        ] {
+            let v = serde_json::to_value(target).unwrap();
+            assert_eq!(v, serde_json::Value::String(wire.into()));
+        }
+    }
+
+    #[test]
+    fn tap_deserialize_modal() {
+        let t: Tap = serde_json::from_value(serde_json::json!({"kind": "modal"})).unwrap();
+        assert_eq!(t, Tap::Modal);
+    }
+
+    #[test]
+    fn tap_deserialize_none_coerces_to_modal() {
+        // The retired `{"kind":"none"}` kind is no longer produced, but historical
+        // NotificationCreated events + notifications rows still carry it. It must
+        // deserialize (as Modal) and re-serialize as `{"kind":"modal"}`, so a
+        // projection rebuild never re-emits `none`.
+        let t: Tap = serde_json::from_value(serde_json::json!({"kind": "none"})).unwrap();
+        assert_eq!(t, Tap::Modal);
+        assert_eq!(
+            serde_json::to_value(&t).unwrap(),
+            serde_json::json!({"kind": "modal"})
+        );
+    }
+
+    #[test]
+    fn tap_deserialize_navigate() {
+        let v = serde_json::json!({
+            "kind": "navigate",
+            "to": {"target": "thread", "id": "abc"}
+        });
+        let t: Tap = serde_json::from_value(v).unwrap();
+        match t {
+            Tap::Navigate { to } => {
+                assert_eq!(to.target, NavigateTarget::Thread);
+                assert_eq!(to.id.as_deref(), Some("abc"));
+            }
+            _ => panic!("expected Navigate"),
+        }
+    }
+
+    // Strict deserialization — only the canonical {kind, to?} object form is
+    // accepted. Legacy bare strings ('modal' / 'none' / 'open_app' /
+    // 'open_thread') are rejected; workspaces with stale taps must migrate
+    // via system-knowhow/workspace-audit.md.
+
+    #[test]
+    fn tap_deserializes_canonical_modal_object() {
+        let v: Tap = serde_json::from_str(r#"{"kind":"modal"}"#).unwrap();
+        assert_eq!(v, Tap::Modal);
+    }
+
+    #[test]
+    fn tap_deserializes_canonical_navigate_object() {
+        let v: Tap = serde_json::from_str(
+            r#"{"kind":"navigate","to":{"target":"thread","id":"t-9","event_id":"e-7"}}"#,
+        )
+        .unwrap();
+        match v {
+            Tap::Navigate { to } => {
+                assert_eq!(to.target, NavigateTarget::Thread);
+                assert_eq!(to.id.as_deref(), Some("t-9"));
+                assert_eq!(to.event_id.as_deref(), Some("e-7"));
+            }
+            _ => panic!("expected Navigate"),
+        }
+    }
+
+    #[test]
+    fn tap_rejects_legacy_bare_string_modal() {
+        let r: Result<Tap, _> = serde_json::from_str("\"modal\"");
+        assert!(
+            r.is_err(),
+            "expected legacy bare-string `\"modal\"` to be rejected"
+        );
+    }
+
+    #[test]
+    fn tap_rejects_legacy_bare_string_open_thread() {
+        let r: Result<Tap, _> = serde_json::from_str("\"open_thread\"");
+        assert!(
+            r.is_err(),
+            "expected legacy bare-string `\"open_thread\"` to be rejected"
+        );
+    }
+
+    #[test]
+    fn tap_rejects_legacy_bare_string_none_but_coerces_the_object() {
+        // The retired `none` OBJECT (`{"kind":"none"}`) is coerced to Modal (see
+        // tap_deserialize_none_coerces_to_modal), but the legacy BARE STRING
+        // `"none"` must still be rejected loudly (the strict-tap guard). The
+        // two must never be conflated.
+        let bare: Result<Tap, _> = serde_json::from_str("\"none\"");
+        assert!(
+            bare.is_err(),
+            "expected legacy bare-string `\"none\"` to be rejected"
+        );
+        let obj: Tap = serde_json::from_str(r#"{"kind":"none"}"#).unwrap();
+        assert_eq!(
+            obj,
+            Tap::Modal,
+            "the `{{kind:none}}` object must coerce to Modal"
+        );
+    }
+
+    #[test]
+    fn tap_rejects_unknown_kind() {
+        let r: Result<Tap, _> = serde_json::from_str(r#"{"kind":"open_anywhere"}"#);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn tap_serializes_to_canonical_form_only() {
+        // Outbound is always the structured form.
+        assert_eq!(
+            serde_json::to_string(&Tap::Modal).unwrap(),
+            r#"{"kind":"modal"}"#
+        );
+    }
+
+    #[test]
+    fn tap_default_is_modal() {
+        assert_eq!(Tap::default(), Tap::Modal);
+    }
+
+    #[test]
+    fn default_tap_navigates_to_the_named_source_event() {
+        let thread = Uuid::new_v4();
+        let event = Uuid::new_v4();
+        match default_tap(Some(thread), Some(event)) {
+            Tap::Navigate { to } => {
+                assert_eq!(to.target, NavigateTarget::Thread);
+                assert_eq!(to.id.as_deref(), Some(thread.to_string().as_str()));
+                assert_eq!(to.event_id.as_deref(), Some(event.to_string().as_str()));
+            }
+            other => panic!("expected a navigate tap, got {:?}", other),
+        }
+    }
+
+    /// A thread alone is provenance, not intent: the engine stamps it on every
+    /// `send_notification`. Navigating on it would send a summary notification
+    /// into the middle of its own trigger's transcript.
+    #[test]
+    fn default_tap_needs_both_a_thread_and_an_event() {
+        let id = Uuid::new_v4();
+        assert_eq!(default_tap(Some(id), None), Tap::Modal);
+        assert_eq!(default_tap(None, Some(id)), Tap::Modal);
+        assert_eq!(default_tap(None, None), Tap::Modal);
+    }
+
+    fn thread_tap(id: &str) -> Tap {
+        Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::Thread,
+                id: Some(id.into()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn tap_id(tap: &Tap) -> Option<&str> {
+        match tap {
+            Tap::Navigate { to } => to.id.as_deref(),
+            Tap::Modal => None,
+        }
+    }
+
+    /// The alias is what an agent already writes for the `events` tool. So it
+    /// resolves here too, rather than being stored as a dead deep link.
+    #[test]
+    fn the_alias_resolves_to_the_calling_thread() {
+        let caller = Uuid::new_v4();
+        for alias in ["current", "this", "  Current  ", "THIS"] {
+            let mut tap = thread_tap(alias);
+            resolve_thread_tap_id(&mut tap, Some(caller))
+                .unwrap_or_else(|e| panic!("{alias} must resolve, got: {e}"));
+            assert_eq!(tap_id(&tap), Some(caller.to_string().as_str()));
+        }
+    }
+
+    /// A script POSTing to `/api/v1/notifications` has no thread of its own, so
+    /// an alias there would name whichever one the engine happened to serve.
+    #[test]
+    fn the_alias_is_refused_without_a_calling_thread() {
+        let mut tap = thread_tap("current");
+        let err = resolve_thread_tap_id(&mut tap, None).expect_err("must refuse");
+        assert!(err.contains("current"), "must name the value, got: {err}");
+        assert_eq!(tap_id(&tap), Some("current"), "refused means unchanged");
+    }
+
+    #[test]
+    fn a_non_uuid_thread_id_is_refused_at_the_producer() {
+        for (caller, bad) in [
+            (Some(Uuid::new_v4()), "t-9"),
+            (Some(Uuid::new_v4()), "currently"),
+            (Some(Uuid::new_v4()), ""),
+            (None, "the one we discussed"),
+        ] {
+            let mut tap = thread_tap(bad);
+            let err = resolve_thread_tap_id(&mut tap, caller)
+                .expect_err("a non-uuid must be refused, not stored");
+            assert!(
+                err.contains("is not a uuid"),
+                "{bad} must say why, got: {err}"
+            );
+        }
+    }
+
+    /// The advice fits the surface. Only a caller with a thread of its own can
+    /// spend the alias, so offering it to one that cannot is a second dead end.
+    #[test]
+    fn only_a_thread_bound_caller_is_offered_the_alias() {
+        let with_caller =
+            resolve_thread_tap_id(&mut thread_tap("nope"), Some(Uuid::new_v4())).unwrap_err();
+        assert!(with_caller.contains("'current'"), "got: {with_caller}");
+        let without = resolve_thread_tap_id(&mut thread_tap("nope"), None).unwrap_err();
+        assert!(!without.contains("'current'"), "got: {without}");
+    }
+
+    #[test]
+    fn a_real_uuid_survives_untouched() {
+        let id = Uuid::new_v4().to_string();
+        let mut tap = thread_tap(&id);
+        resolve_thread_tap_id(&mut tap, Some(Uuid::new_v4())).unwrap();
+        assert_eq!(tap_id(&tap), Some(id.as_str()));
+    }
+
+    /// Only a thread target names a thread. A modal carries no id, and an app
+    /// id is a directory name.
+    #[test]
+    fn every_other_target_is_left_alone() {
+        let mut modal = Tap::Modal;
+        resolve_thread_tap_id(&mut modal, None).unwrap();
+        assert_eq!(modal, Tap::Modal);
+
+        let mut app = Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::App,
+                app_id: Some("habit-tracker".into()),
+                id: Some("not-a-uuid".into()),
+                ..Default::default()
+            }),
+        };
+        resolve_thread_tap_id(&mut app, None).unwrap();
+        assert_eq!(tap_id(&app), Some("not-a-uuid"));
+    }
+
+    /// A thread tap with no id at all is as dead as one with a bad id, and this
+    /// row is stored and pushed. Leaving it to the page-side router puts
+    /// `Navigation target missing thread id` on a banner nobody can repair.
+    #[test]
+    fn a_thread_tap_with_no_id_is_refused_too() {
+        let mut idless = Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::Thread,
+                ..Default::default()
+            }),
+        };
+        let err = resolve_thread_tap_id(&mut idless, Some(Uuid::new_v4())).expect_err("refused");
+        assert!(err.contains("has none"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // SettingsPage
+    // -----------------------------------------------------------------------
+
+    /// A view outside the router's set toasts "Unknown settings section", so
+    /// both the tap and the body link would be dead ends.
+    #[test]
+    fn every_settings_page_is_a_renderable_view() {
+        for page in SettingsPage::ALL {
+            assert!(
+                crate::llm::tools::NAVIGABLE_SETTINGS_VIEWS.contains(&page.view),
+                "{page:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_page_link_and_tap_name_the_same_view() {
+        let page = SettingsPage::BACKUP;
+        assert_eq!(page.link(), "[Settings → System → Backup](settings:backup)");
+        let Tap::Navigate { to } = page.tap() else {
+            panic!("a settings tap navigates");
+        };
+        assert_eq!(to.target, NavigateTarget::Settings);
+        assert_eq!(to.settings_view.as_deref(), Some("backup"));
+    }
+
+    /// The OS banner, the toast and the inbox row strip markdown. They must
+    /// still read the route, and never show the link syntax.
+    #[test]
+    fn a_settings_link_reads_as_its_route_in_plain_text() {
+        let body = format!("Open {} to retry.", SettingsPage::BACKUP.link());
+        let plain = crate::scheduler::notification_plain_text::plain_text_body(&body);
+        assert_eq!(plain, "Open Settings → System → Backup to retry.");
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_event_anchors
+    // -----------------------------------------------------------------------
+
+    async fn seed_event(pool: &PgPool, event_type: &str, thread_id: Option<Uuid>) -> Uuid {
+        let id = Uuid::new_v4();
+        let aggregate = if thread_id.is_some() {
+            "thread"
+        } else {
+            "domain"
+        };
+        sqlx::query(
+            "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+             VALUES ($1, $2, '{}'::jsonb, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(event_type)
+        .bind(thread_id)
+        .bind(aggregate)
+        .bind(thread_id.map(|t| t.to_string()))
+        .execute(pool)
+        .await
+        .expect("seed event");
+        id
+    }
+
+    fn anchored_tap(thread: Uuid, event: Option<Uuid>) -> Tap {
+        Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::Thread,
+                id: Some(thread.to_string()),
+                event_id: event.map(|e| e.to_string()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// The reported bug. A trigger fired by a domain event passed that event's
+    /// id, as its `## Triggering Event` block offered. The tap then opened the
+    /// trigger's own thread, which cannot show a workspace event. So the reader
+    /// met "That event is not shown in this thread".
+    #[tokio::test]
+    async fn a_domain_event_anchor_is_refused_and_named() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        let domain = seed_event(&pool, "E2ETestsPassed", None).await;
+
+        let err = verify_event_anchors(
+            &pool,
+            Some(thread),
+            Some(domain),
+            &default_tap(Some(thread), Some(domain)),
+        )
+        .await
+        .expect("the check ran")
+        .expect_err("refused");
+        assert!(err.contains("E2ETestsPassed"), "names the event: {err}");
+        assert!(err.contains("no thread"), "says why: {err}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_anchor_in_another_thread_is_refused_and_names_that_thread() {
+        let (pool, db) = setup_test_db().await;
+        let linked = Uuid::new_v4();
+        let elsewhere = Uuid::new_v4();
+        let question = seed_event(&pool, "UserQuestionAsked", Some(elsewhere)).await;
+
+        let err = verify_event_anchors(
+            &pool,
+            Some(linked),
+            Some(question),
+            &default_tap(Some(linked), Some(question)),
+        )
+        .await
+        .expect("the check ran")
+        .expect_err("refused");
+        assert!(err.contains(&elsewhere.to_string()), "names it: {err}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_anchor_naming_no_event_is_refused() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        let ghost = Uuid::new_v4();
+
+        let err = verify_event_anchors(&pool, Some(thread), Some(ghost), &Tap::Modal)
+            .await
+            .expect("the check ran")
+            .expect_err("refused");
+        assert!(err.contains("names no event"), "got: {err}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn an_anchor_in_its_own_thread_passes() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        let question = seed_event(&pool, "UserQuestionAsked", Some(thread)).await;
+
+        verify_event_anchors(
+            &pool,
+            Some(thread),
+            Some(question),
+            &default_tap(Some(thread), Some(question)),
+        )
+        .await
+        .expect("the check ran")
+        .expect("an event in its own thread is a valid anchor");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// An explicit tap carries its own pair, which is checked on its own. The
+    /// row's `thread_id` is provenance and may name a different thread.
+    #[tokio::test]
+    async fn an_explicit_tap_is_checked_against_its_own_thread() {
+        let (pool, db) = setup_test_db().await;
+        let provenance = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let question = seed_event(&pool, "UserQuestionAsked", Some(target)).await;
+
+        verify_event_anchors(
+            &pool,
+            Some(provenance),
+            None,
+            &anchored_tap(target, Some(question)),
+        )
+        .await
+        .expect("the check ran")
+        .expect("the tap's event is in the tap's thread");
+
+        let err = verify_event_anchors(
+            &pool,
+            Some(provenance),
+            None,
+            &anchored_tap(provenance, Some(question)),
+        )
+        .await
+        .expect("the check ran")
+        .expect_err("the tap's event is in another thread");
+        assert!(err.contains(&target.to_string()), "got: {err}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_tap_event_id_that_is_not_a_uuid_is_refused() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        let mut tap = anchored_tap(thread, None);
+        if let Tap::Navigate { to } = &mut tap {
+            to.event_id = Some("evt-latest".into());
+        }
+
+        let err = verify_event_anchors(&pool, Some(thread), None, &tap)
+            .await
+            .expect("the check ran")
+            .expect_err("refused");
+        assert!(err.contains("evt-latest"), "got: {err}");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_notification_with_no_anchor_passes() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+
+        verify_event_anchors(&pool, Some(thread), None, &default_tap(Some(thread), None))
+            .await
+            .expect("the check ran")
+            .expect("nothing to check");
+        // An event with no thread to live in is ignored, as it always was.
+        verify_event_anchors(&pool, None, Some(Uuid::new_v4()), &Tap::Modal)
+            .await
+            .expect("the check ran")
+            .expect("no linked thread, so no anchor");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 20260918051213_repair_alias_notification_tap_thread_ids.sql
+    // -----------------------------------------------------------------------
+
+    /// The shipped file, so there is no second copy that can drift.
+    const REPAIR_ALIAS_TAPS: &str = include_str!(
+        "../../migrations/20260918051213_repair_alias_notification_tap_thread_ids.sql"
+    );
+
+    async fn seed_notification(
+        pool: &PgPool,
+        thread_id: Option<Uuid>,
+        tap: serde_json::Value,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO notifications (id, thread_id, title, message, read, created_at, tap) \
+             VALUES ($1, $2, 'seeded', 'seeded', false, NOW(), $3)",
+        )
+        .bind(id)
+        .bind(thread_id)
+        .bind(sqlx::types::Json(tap))
+        .execute(pool)
+        .await
+        .expect("seed notification");
+        id
+    }
+
+    async fn tap_of(pool: &PgPool, id: Uuid) -> serde_json::Value {
+        sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
+            "SELECT tap FROM notifications WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .0
+    }
+
+    /// The rows the old producers wrote are already in every inbox, and the
+    /// engine-side guard cannot reach back for them. Each one's own `thread_id`
+    /// is the value its tap should have carried, so the repair is not a guess.
+    ///
+    /// The last two rows are why the predicate matches the ALIAS rather than
+    /// "fails a uuid regex". Each holds a real uuid in a form `Uuid::parse_str`
+    /// takes and a hyphen-only regex does not. A broader predicate would
+    /// re-point a working deep link at a different thread.
+    #[tokio::test]
+    async fn the_migration_repairs_the_alias_and_destroys_nothing_else() {
+        let (pool, db) = setup_test_db().await;
+
+        let owner = Uuid::new_v4();
+        let aliased = seed_notification(
+            &pool,
+            Some(owner),
+            serde_json::json!({"kind": "navigate", "to": {"target": "thread", "id": "current"}}),
+        )
+        .await;
+        let shouty = seed_notification(
+            &pool,
+            Some(owner),
+            serde_json::json!({"kind": "navigate", "to": {"target": "thread", "id": " THIS "}}),
+        )
+        .await;
+        let orphan = seed_notification(
+            &pool,
+            None,
+            serde_json::json!({"kind": "navigate", "to": {"target": "thread", "id": "current"}}),
+        )
+        .await;
+        let healthy_id = Uuid::new_v4();
+        let healthy = seed_notification(
+            &pool,
+            Some(owner),
+            serde_json::json!({
+                "kind": "navigate",
+                "to": {"target": "thread", "id": healthy_id.to_string(), "event_id": "keep-me"}
+            }),
+        )
+        .await;
+        let app = seed_notification(
+            &pool,
+            None,
+            serde_json::json!({
+                "kind": "navigate",
+                "to": {"target": "app", "app_id": "habit-tracker", "id": "not-a-uuid"}
+            }),
+        )
+        .await;
+        let simple_id = Uuid::new_v4();
+        let unhyphenated = seed_notification(
+            &pool,
+            Some(owner),
+            serde_json::json!({
+                "kind": "navigate",
+                "to": {"target": "thread", "id": simple_id.simple().to_string()}
+            }),
+        )
+        .await;
+        let padded_id = Uuid::new_v4();
+        let padded = seed_notification(
+            &pool,
+            Some(owner),
+            serde_json::json!({
+                "kind": "navigate",
+                "to": {"target": "thread", "id": format!(" {padded_id} ")}
+            }),
+        )
+        .await;
+
+        sqlx::raw_sql(REPAIR_ALIAS_TAPS)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for (id, what) in [(aliased, "current"), (shouty, " THIS ")] {
+            assert_eq!(
+                tap_of(&pool, id).await["to"]["id"],
+                serde_json::json!(owner.to_string()),
+                "{what} must take the row's own thread"
+            );
+        }
+        assert_eq!(
+            tap_of(&pool, orphan).await,
+            serde_json::json!({"kind": "modal"}),
+            "with no thread to fall back on, the card is the honest landing"
+        );
+        let kept = tap_of(&pool, healthy).await;
+        assert_eq!(kept["to"]["id"], serde_json::json!(healthy_id.to_string()));
+        assert_eq!(
+            kept["to"]["event_id"],
+            serde_json::json!("keep-me"),
+            "a healthy tap keeps every sibling field"
+        );
+        assert_eq!(
+            tap_of(&pool, app).await["to"]["id"],
+            serde_json::json!("not-a-uuid"),
+            "only a thread target names a thread"
+        );
+        assert_eq!(
+            tap_of(&pool, unhyphenated).await["to"]["id"],
+            serde_json::json!(simple_id.simple().to_string()),
+            "a uuid the parser accepts is not ours to rewrite"
+        );
+        assert_eq!(
+            tap_of(&pool, padded).await["to"]["id"],
+            serde_json::json!(format!(" {padded_id} ")),
+            "neither is a padded one"
+        );
+
+        // Every repaired row must still decode, or the inbox 500s on exactly
+        // the rows the migration touched. It must also need no caller, which is
+        // what says the alias is gone rather than merely rewritten.
+        let repaired: Tap = serde_json::from_value(tap_of(&pool, aliased).await).expect("decodes");
+        let mut settled = repaired.clone();
+        resolve_thread_tap_id(&mut settled, None).expect("a repaired tap needs no caller");
+        assert_eq!(settled, repaired);
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+}

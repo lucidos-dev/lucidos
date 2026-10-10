@@ -1,0 +1,719 @@
+pub mod anthropic;
+pub mod anthropic_wire;
+mod aux_provider;
+/// Temporary diagnostic, off unless `LUCIDOS_CACHE_PROBE` is set. Tracked in
+/// `docs/temporary-measures.md`.
+pub(crate) mod cache_probe;
+pub mod image;
+pub mod judgment;
+pub mod metered;
+pub mod mock;
+pub use mock::MOCK_MODEL;
+pub mod model_registry;
+pub mod not_served;
+pub mod openai;
+pub mod provider;
+pub mod provider_build;
+pub mod provider_selection;
+pub mod reasoning;
+pub mod routing;
+pub mod tool_names;
+pub mod tools;
+pub mod unconfigured;
+pub mod usage_wire;
+pub mod validate;
+pub mod vertex;
+pub mod web_search;
+
+pub use anthropic::{
+    resolve_anthropic_auth, AnthropicAuth, AnthropicAuthSource, AnthropicProvider,
+};
+pub(crate) use aux_provider::{AuxProvider, NotServedReport};
+pub use image::{ImageProvider, ImageSize};
+pub use judgment::{
+    Answers, ChoiceAnswer, Judgment, JudgmentProvider, NoulCriteria, Question, SystemOneProvider,
+    JEV_DEFAULT_MODEL,
+};
+pub use model_registry::{ModelRegistry, ProviderKind};
+pub use not_served::ModelNotServed;
+pub use openai::{
+    resolve_bearer_key, resolve_openai_api_key, OpenAiKeySource, OpenAiProvider,
+    OPENAI_DEFAULT_BASE_URL,
+};
+pub use provider::{
+    ContentBlock, LlmProvider, Message, MessageContent, ModelSelection, TokenCallback, ToolCall,
+};
+pub use provider_build::{
+    boot_without_provider_enabled, build_active_provider, ProviderBuildContext,
+    ProviderBuildOutcome, PROVIDER_CREDENTIAL_SERVICES, PROVIDER_PREFERENCE_KEYS,
+};
+pub use provider_selection::{select_provider, ProviderSelection, ProviderSelectionInputs};
+// `clamp_effort` is deliberately NOT re-exported: it is the wire-side rule and
+// its only caller is `RoutingProvider`, inside this module. Anything outside
+// `llm` wanting to know a model's tiers wants `supported_efforts`.
+pub use reasoning::{supported_efforts, EFFORT_LADDER};
+pub use routing::RoutingProvider;
+pub use tools::{
+    chat_tail_tools, get_default_tools, get_image_generation_tool, get_notification_tool,
+    get_save_thread_image_tool, get_view_image_tool, ToolCapabilities,
+};
+pub use unconfigured::{UnconfiguredProvider, NO_PROVIDER_MESSAGE};
+pub use vertex::VertexProvider;
+pub use web_search::{WebSearchChain, WebSearchProvider, NO_SEARCH_BACKEND};
+
+use std::time::Duration;
+
+/// OpenRouter's OpenAI-compatible API root. Single home shared by the LLM
+/// provider (`provider_build`) and the builtin `openrouter` proxy
+/// (`api::proxy_builtin`).
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// xAI's OpenAI-compatible API root, serving the Grok family. Single home
+/// shared by the LLM provider (`provider_build`) and the builtin `xai` proxy
+/// (`api::proxy_builtin`).
+pub const XAI_BASE_URL: &str = "https://api.x.ai/v1";
+
+/// OpenCode's Zen relay, whose free tier answers anonymously. The one base URL
+/// reached with no credential: the relay rejects an unrecognized bearer, so the
+/// provider is built with an empty key and sends no `Authorization` header.
+pub const OPENCODE_FREE_BASE_URL: &str = "https://opencode.ai/zen/v1";
+
+/// Direct Anthropic API root (`{base}/messages`). Single home shared by the
+/// LLM provider (`anthropic::chat`) and the builtin `anthropic` proxy
+/// (`api::proxy_builtin`).
+pub const ANTHROPIC_API_BASE_URL: &str = "https://api.anthropic.com/v1";
+
+/// Max retry attempts for LLM API calls (shared across providers).
+pub const MAX_RETRIES: u32 = 3;
+
+/// Map a unified `reasoning_effort` string to the Claude thinking `budget_tokens`
+/// value (Vertex + direct Anthropic). Unknown values fall back to the "high"
+/// budget — the default each call site picked independently before this was
+/// DRYed up. (Gemini 3.x no longer uses a budget — it maps effort to
+/// `thinkingConfig.thinkingLevel` in `vertex::gemini::gemini_thinking_level`.)
+pub(crate) fn thinking_budget_for_effort(effort: &str) -> u32 {
+    match effort {
+        "low" => 4096,
+        "medium" => 8192,
+        "high" => 16384,
+        "xhigh" => 24576,
+        "max" => 32768,
+        _ => 16384,
+    }
+}
+
+/// Whether an HTTP status code is retryable (429 rate limit, 529 overload, 5xx server error).
+pub fn is_retryable_status(status_code: u16) -> bool {
+    status_code == 429 || status_code == 529 || status_code >= 500
+}
+
+/// True if `code` appears in `haystack` as a standalone alphanumeric token —
+/// "HTTP 529" matches, "request id 529abc..." and "1529" do not. Used by
+/// `is_transient_error` to keep the HTTP-status heuristic from false-positiving
+/// on opaque identifiers.
+fn contains_status_token(haystack: &str, code: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok == code)
+}
+
+/// Whether an error is a transient network/infrastructure issue (not a logic or auth error).
+/// Used to suppress noisy duplicate notifications for triggers.
+pub fn is_transient_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("error sending request")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        // The provider hung up mid-stream, before it said why it stopped.
+        // Raised by `parse_claude_stream` when the stream carried no output.
+        || lower.contains("stream truncated")
+        || lower.contains("broken pipe")
+        || lower.contains("timed out")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("network error")
+        || lower.contains("rate limit")
+        || lower.contains("overloaded")
+        || contains_status_token(&lower, "529")
+        || contains_status_token(&lower, "503")
+        || contains_status_token(&lower, "502")
+}
+
+/// Whether a failed call says the provider has no capacity for us right now:
+/// a rate limit, an overload, or a timeout. A caller that adapts how many
+/// calls it runs at once backs off on one.
+pub fn is_capacity_error(err: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "overloaded",
+        "resource_exhausted",
+        "resource exhausted",
+        "quota",
+        "timed out",
+    ];
+    let lower = err.to_lowercase();
+    PHRASES.iter().any(|p| lower.contains(p))
+        || ["429", "529", "503"]
+            .iter()
+            .any(|code| contains_status_token(&lower, code))
+}
+
+/// Whether a stream/parse error message indicates a retryable condition.
+/// Superset of `is_transient_error` — also includes stream parsing errors and
+/// known intermittent validation blips from regional API replicas (rare 400s
+/// that succeed on the next attempt).
+pub fn is_retryable_error(err: &str) -> bool {
+    if is_transient_error(err) {
+        return true;
+    }
+    let lower = err.to_lowercase();
+    lower.contains("server_error")
+        || lower.contains("error decoding response body")
+        || lower.contains("stream read error")
+        // Vertex regional replica drift on Opus 4.7's `adaptive` thinking type.
+        // Same call succeeds on retry; ~1 in 550 on global endpoint.
+        || err.contains("Input tag 'adaptive' found")
+}
+
+/// Whether an HTTP response should trigger a retry — combines status-code and
+/// body checks (covers transient 5xx/429/529 plus known 400 validation blips
+/// that succeed on retry) and bounds attempts at `MAX_RETRIES`. A 2xx is never
+/// retried: its body is the model's billed answer, not an error message.
+pub fn should_retry_http(status: u16, body: &str, attempt: u32) -> bool {
+    !(200..300).contains(&status)
+        && (is_retryable_status(status) || is_retryable_error(body))
+        && attempt <= MAX_RETRIES
+}
+
+/// Calculate exponential backoff delay for a given attempt (1-indexed).
+/// `base_secs` is the starting delay (1 for connect errors, 2 for stream errors).
+pub fn retry_delay(attempt: u32, base_secs: u64) -> Duration {
+    Duration::from_secs(base_secs << (attempt - 1))
+}
+
+/// Log a retry attempt with model context.
+pub fn log_retry(model: &str, reason: &str, attempt: u32, delay: Duration) {
+    log!(
+        "[{}] {} (attempt {}/{}), retrying in {:?}...",
+        model,
+        reason,
+        attempt,
+        MAX_RETRIES + 1,
+        delay
+    );
+}
+
+/// Back off after a failed SSE parse, when the error is retryable and attempts
+/// remain. `true` means the caller re-sends the whole request; `false` means it
+/// returns the error.
+///
+/// The four streaming providers (OpenAI Chat, OpenAI Responses, direct
+/// Anthropic, Vertex Claude) all reached this arm with the same fourteen lines.
+/// One home keeps the base delay and the log wording the same across them. A
+/// change to the backoff can no longer land on three paths out of four.
+pub(crate) async fn retry_after_stream_error(model: &str, err: &str, attempt: u32) -> bool {
+    if !is_retryable_error(err) || attempt > MAX_RETRIES {
+        return false;
+    }
+    // Base 2 rather than 1: a stream that died partway costs more to re-run
+    // than a connect that never started.
+    let delay = retry_delay(attempt, 2);
+    log_retry(model, &format!("Stream error: {}", err), attempt, delay);
+    tokio::time::sleep(delay).await;
+    true
+}
+
+/// A stream failure, made final once `on_token` has shown the user something.
+///
+/// The caller's retry re-sends the whole request, so text already on screen
+/// would render a second time (ADR 0089). This covers a dropped connection, a
+/// chunk timeout and a mid-stream `error` frame. The cause is logged, because
+/// the returned message must carry no retryable wording.
+pub(crate) fn stream_failure(
+    err: String,
+    rendered_any: bool,
+    provider_tag: &str,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    if !rendered_any || !is_retryable_error(&err) {
+        return err.into();
+    }
+    crate::log!(
+        "[{}] Stream failed after text had streamed, so not retrying: {}",
+        provider_tag,
+        err
+    );
+    STREAM_FAILED_AFTER_TEXT.into()
+}
+
+const STREAM_FAILED_AFTER_TEXT: &str = "The reply was cut off after it had started \
+     streaming. Retrying would render that text twice, so the turn stops here.";
+
+/// Whether `err` is a [`stream_failure`] that stopped a turn after text had
+/// rendered. The cause was transient, but the wording must not read as
+/// retryable, so a caller deduplicating transient failures asks this too.
+pub fn is_stream_cut_after_text(err: &str) -> bool {
+    err.contains(STREAM_FAILED_AFTER_TEXT)
+}
+
+/// Wrap a final error with retry context so logs/notifications show what was attempted.
+pub fn with_retry_context(err: impl std::fmt::Display, attempts: u32) -> String {
+    if attempts > 1 {
+        format!("{} (after {} attempts)", err, attempts)
+    } else {
+        err.to_string()
+    }
+}
+
+/// Wall-clock budget for the connect + request + response-headers phase of a
+/// streaming LLM call. The streaming *body* is bounded separately by each
+/// provider's per-chunk timeout inside `parse_*_stream`; the `streaming_client`
+/// is deliberately built WITHOUT an overall `.timeout()` so long valid streams
+/// aren't capped — which left THIS pre-stream phase unbounded. A black-holed
+/// connection there (TCP established, but the server never returns response
+/// headers) hung a chat turn forever: `send().await` never resolved, the
+/// agentic loop's `tokio::select!` only races the user's Stop button, so the
+/// response task never returned and the thread sat `running` with no terminal
+/// event. Bounding it converts that hang into a normal retryable network error.
+pub(crate) const STREAM_HEADER_TIMEOUT_SECS: u64 = 120;
+
+/// Outcome of one streaming-request send attempt. Each provider's retry loop
+/// matches on it: `Got` → proceed to read the SSE stream; `Retry` → the helper
+/// already logged + backed off, the caller does `continue`; `Failed` → the
+/// final error after retries are exhausted, the caller returns it.
+pub(crate) enum StreamSend {
+    Got(reqwest::Response),
+    Retry,
+    Failed(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Send a streaming request with the connect+headers phase bounded by
+/// `STREAM_HEADER_TIMEOUT_SECS`, folding the four streaming providers' identical
+/// network-error retry arm into one place. A transport error OR a header-phase
+/// timeout both retry up to `MAX_RETRIES` (both are network stalls), then fail.
+/// The caller builds the full `RequestBuilder` (URL + headers + body) and reads
+/// the SSE stream itself on `Got` — only the send/retry handling is shared.
+///
+/// `attempt_timeout` is [`ModelSelection::attempt_timeout`], applied by
+/// [`cap_attempt`]. A required argument, so no streaming site can drop it.
+pub(crate) async fn send_streaming_request(
+    builder: reqwest::RequestBuilder,
+    model: &str,
+    attempt: u32,
+    attempt_timeout: Option<Duration>,
+) -> StreamSend {
+    send_streaming_request_with_timeout(
+        cap_attempt(builder, attempt_timeout),
+        model,
+        attempt,
+        Duration::from_secs(STREAM_HEADER_TIMEOUT_SECS),
+    )
+    .await
+}
+
+/// Cap one HTTP attempt, the body included, at `attempt_timeout`.
+///
+/// Per request rather than per client, because the router's backends are
+/// shared by turns and auxiliary calls. The request's timeout overrides the
+/// client's, so a 900s client still gives up within an auxiliary budget.
+pub(crate) fn cap_attempt(
+    builder: reqwest::RequestBuilder,
+    attempt_timeout: Option<Duration>,
+) -> reqwest::RequestBuilder {
+    match attempt_timeout {
+        Some(timeout) => builder.timeout(timeout),
+        None => builder,
+    }
+}
+
+/// Inner implementation with the header-phase timeout injected, so tests can
+/// drive the timeout path deterministically with a tiny budget instead of
+/// waiting `STREAM_HEADER_TIMEOUT_SECS`.
+async fn send_streaming_request_with_timeout(
+    builder: reqwest::RequestBuilder,
+    model: &str,
+    attempt: u32,
+    header_timeout: Duration,
+) -> StreamSend {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        match tokio::time::timeout(header_timeout, builder.send()).await {
+            Ok(Ok(resp)) => return StreamSend::Got(resp),
+            Ok(Err(e)) => Box::new(e),
+            // Keep "error sending request" + "timed out" in the message so
+            // `is_transient_error` classifies it retryable (suppresses noisy
+            // trigger failure notifications) exactly like a real transport stall.
+            Err(_elapsed) => format!(
+                "error sending request: stream timed out after {:?} waiting for response headers",
+                header_timeout
+            )
+            .into(),
+        };
+    if attempt <= MAX_RETRIES {
+        let delay = retry_delay(attempt, 1);
+        log_retry(model, &format!("Network error: {}", err), attempt, delay);
+        tokio::time::sleep(delay).await;
+        StreamSend::Retry
+    } else {
+        StreamSend::Failed(with_retry_context(err, attempt).into())
+    }
+}
+
+/// Clamp an upstream u64 token count (from provider SSE usage blocks) into the
+/// u32 our meta/usage structs store. Above-bound values indicate corrupt
+/// upstream data; log and clamp rather than panicking or silently truncating
+/// so a single bad block can't tank the stream and we don't lose visibility
+/// on the corruption. `source` is a short tag (e.g. "OpenAI", "Vertex",
+/// "ClaudeCode") used in the log prefix.
+pub(crate) fn clamp_provider_token_count(n: u64, source: &str) -> u32 {
+    match u32::try_from(n) {
+        Ok(v) => v,
+        Err(_) => {
+            log!(
+                "[{}] Token count {} exceeds u32::MAX; clamping (likely corrupt upstream usage block)",
+                source,
+                n
+            );
+            u32::MAX
+        }
+    }
+}
+
+/// Append an SSE byte chunk to `out`, holding back a character the transport
+/// split in two.
+///
+/// `bytes_stream` yields whatever the socket read, so a multi-byte character
+/// can straddle two chunks. Decoding each chunk alone replaces both halves with
+/// U+FFFD, which silently corrupts the model's text. Complete characters go to
+/// `out` and the incomplete tail waits in `carry` for the next chunk. A byte
+/// that can never start a character is replaced, as `from_utf8_lossy` would.
+pub(crate) fn push_utf8_chunk(carry: &mut Vec<u8>, chunk: &[u8], out: &mut String) {
+    carry.extend_from_slice(chunk);
+    loop {
+        let (valid, bad_len) = match std::str::from_utf8(carry.as_slice()) {
+            // The whole buffer decoded, which is the common case. Push the
+            // `&str` already in hand rather than re-scanning the same bytes.
+            Ok(decoded) => {
+                out.push_str(decoded);
+                carry.clear();
+                return;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                // `from_utf8` validated this prefix, so the conversion below
+                // borrows it and replaces nothing.
+                out.push_str(&String::from_utf8_lossy(&carry[..valid]));
+                (valid, e.error_len())
+            }
+        };
+        match bad_len {
+            // Bytes no character can start with: replace them and carry on.
+            Some(bad) => {
+                out.push(char::REPLACEMENT_CHARACTER);
+                carry.drain(..valid + bad);
+            }
+            // A character the next chunk finishes.
+            None => {
+                carry.drain(..valid);
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_retryable_error_network_errors() {
+        assert!(is_retryable_error(
+            "error sending request for url https://example.com/streamRawPredict"
+        ));
+        assert!(is_retryable_error("connection reset by peer"));
+        assert!(is_retryable_error(
+            "Connection closed before message completed"
+        ));
+        assert!(is_retryable_error("broken pipe"));
+        assert!(is_retryable_error("request timed out"));
+        assert!(is_retryable_error("Resource temporarily unavailable"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_api_errors() {
+        assert!(is_retryable_error("rate limit exceeded"));
+        assert!(is_retryable_error("Rate limit exceeded"));
+        assert!(is_retryable_error("overloaded"));
+        assert!(is_retryable_error(
+            "Claude streaming error [overloaded]: overloaded"
+        ));
+        assert!(is_retryable_error("server_error"));
+        assert!(is_retryable_error("error decoding response body"));
+        assert!(is_retryable_error("Stream read error: connection lost"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_non_retryable() {
+        assert!(!is_retryable_error("invalid JSON in request"));
+        assert!(!is_retryable_error("authentication failed"));
+        assert!(!is_retryable_error("unknown tool: foo"));
+    }
+
+    /// Vertex regional replicas occasionally return HTTP 400 with this body
+    /// when they haven't picked up the latest schema for Opus 4.7's `adaptive`
+    /// thinking type. The same call usually succeeds on retry. Observed rate
+    /// after switching to vertex_region=global: ~1 in 550 calls.
+    #[test]
+    fn test_is_retryable_error_vertex_adaptive_validation_blip() {
+        let body = r#"Claude API error (400 Bad Request): {"type":"error","error":{"type":"invalid_request_error","message":"thinking: Input tag 'adaptive' found using 'type' does not match any of the expected tags: 'disabled', 'enabled'"},"request_id":"req_vrtx_011CaRQ1MT6t454hXfteqBXp"}"#;
+        assert!(
+            is_retryable_error(body),
+            "intermittent adaptive-thinking validation 400 must be retryable"
+        );
+    }
+
+    #[test]
+    fn a_stream_cut_after_text_is_recognised_but_never_retried() {
+        let err = stream_failure("Stream read error: reset".to_string(), true, "Test").to_string();
+        assert!(is_stream_cut_after_text(&with_retry_context(&err, 2)));
+        assert!(!is_retryable_error(&err));
+        assert!(!is_stream_cut_after_text("Stream read error: reset"));
+    }
+
+    #[test]
+    fn test_is_transient_error() {
+        assert!(is_transient_error("error sending request for url"));
+        assert!(is_transient_error("connection reset by peer"));
+        assert!(is_transient_error("request timed out"));
+        assert!(is_transient_error("rate limit exceeded"));
+        assert!(is_transient_error("HTTP 529 overloaded"));
+        assert!(is_transient_error("HTTP 503 service unavailable"));
+        // A stream the provider cut before its stop reason. Transient, so a
+        // trigger that hits it twice notifies once.
+        assert!(is_transient_error(
+            "Claude stream truncated: Vertex closed the stream before message_delta"
+        ));
+        assert!(!is_transient_error("invalid JSON"));
+        assert!(!is_transient_error("authentication failed"));
+    }
+
+    /// HTTP status token matching must be word-bounded: "529" inside an opaque
+    /// identifier like "request id 529abc..." or a longer number "1529" is not
+    /// a status code and must NOT classify the error as transient. Pre-fix
+    /// substring matching false-positived on both.
+    #[test]
+    fn test_is_transient_error_status_token_not_substring() {
+        assert!(!is_transient_error("invalid request id 529abc1234"));
+        assert!(!is_transient_error("trace 502xy"));
+        assert!(!is_transient_error("rpc code 5031 not found"));
+        assert!(!is_transient_error("port 1529 closed"));
+        // Standalone status tokens still match, regardless of surrounding punctuation.
+        assert!(is_transient_error("(529): server overloaded"));
+        assert!(is_transient_error("status=502"));
+        assert!(is_transient_error("got 503,"));
+    }
+
+    /// Only a sign that the provider is out of capacity counts. An auth or
+    /// request error says nothing about how many calls it takes at once.
+    #[test]
+    fn a_capacity_error_is_a_rate_limit_an_overload_or_a_timeout() {
+        for err in [
+            "API error 429: Too Many Requests",
+            "rate_limit_exceeded",
+            "HTTP 529 overloaded_error",
+            "RESOURCE_EXHAUSTED: quota exceeded for model",
+            "status 503",
+            "timed out after 120s",
+        ] {
+            assert!(is_capacity_error(err), "{err}");
+        }
+        for err in [
+            "API error 401: invalid x-api-key",
+            "API error 400: prompt is too long",
+            "request id 4291abc",
+            "the model returned an empty line",
+        ] {
+            assert!(!is_capacity_error(err), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_with_retry_context() {
+        assert_eq!(
+            with_retry_context("connection failed", 1),
+            "connection failed"
+        );
+        assert_eq!(
+            with_retry_context("connection failed", 3),
+            "connection failed (after 3 attempts)"
+        );
+    }
+
+    /// The two ways the shared stream-error arm declines to retry. Both return
+    /// without sleeping, so the four provider loops fall through to the error
+    /// they were going to return anyway.
+    #[tokio::test]
+    async fn a_stream_error_stops_retrying_when_spent_or_not_transient() {
+        assert!(
+            !retry_after_stream_error("test-model", "connection reset by peer", MAX_RETRIES + 1)
+                .await,
+            "attempts are spent"
+        );
+        assert!(
+            !retry_after_stream_error("test-model", "authentication failed", 1).await,
+            "an auth failure is not transient"
+        );
+    }
+
+    #[test]
+    fn test_retry_delay_exponential_backoff() {
+        assert_eq!(retry_delay(1, 1), Duration::from_secs(1));
+        assert_eq!(retry_delay(2, 1), Duration::from_secs(2));
+        assert_eq!(retry_delay(3, 1), Duration::from_secs(4));
+        assert_eq!(retry_delay(1, 2), Duration::from_secs(2));
+        assert_eq!(retry_delay(2, 2), Duration::from_secs(4));
+    }
+
+    /// Reproduction for the stuck-thread bug: a streaming send to a black-holed
+    /// endpoint — connection accepted but response headers NEVER sent — must be
+    /// bounded by the header-phase timeout and surface as a retryable network
+    /// error, not hang forever. Without `send_streaming_request_with_timeout`'s
+    /// `tokio::time::timeout` wrap this `await` never returns (the
+    /// `streaming_client` has no `.timeout()`, and the per-chunk stream timeout
+    /// only engages AFTER headers arrive), which is exactly what left a chat
+    /// thread `running` with no terminal event.
+    #[tokio::test]
+    async fn stream_send_header_timeout_does_not_hang() {
+        // Black-hole: accept connections and hold them open, never replying.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream); // keep each socket open + silent
+            }
+        });
+
+        let url = format!("http://{}/", addr);
+        // attempt > MAX_RETRIES so the helper returns Failed immediately (no backoff sleep).
+        let builder = reqwest::Client::new().post(&url).body("{}");
+        let outcome = send_streaming_request_with_timeout(
+            builder,
+            "test-model",
+            MAX_RETRIES + 1,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        match outcome {
+            StreamSend::Failed(e) => {
+                let msg = e.to_string();
+                let lower = msg.to_lowercase();
+                assert!(
+                    lower.contains("timed out") && lower.contains("header"),
+                    "expected a header-phase timeout error, got: {msg}"
+                );
+                assert!(
+                    is_transient_error(&msg),
+                    "a header-phase timeout must classify as transient/retryable so it routes through retry then a clean ResponseFailed, got: {msg}"
+                );
+            }
+            StreamSend::Got(_) => panic!("black-hole endpoint must not return a response"),
+            StreamSend::Retry => panic!("attempt > MAX_RETRIES must Fail, not Retry"),
+        }
+    }
+
+    /// An auxiliary attempt gives up at its own cap, not at the 120s header
+    /// bound. Without the cap the router's long-lived clients would let one
+    /// attempt eat the purpose's whole deadline (ADR 0107).
+    #[tokio::test]
+    async fn an_auxiliary_attempt_gives_up_within_its_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let builder = reqwest::Client::new()
+            .post(format!("http://{}/", addr))
+            .body("{}");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            send_streaming_request(
+                builder,
+                "test-model",
+                MAX_RETRIES + 1,
+                Some(Duration::from_millis(200)),
+            ),
+        )
+        .await
+        .expect("the attempt cap must end the attempt long before the header bound");
+        assert!(matches!(outcome, StreamSend::Failed(_)));
+    }
+
+    /// A turn passes no cap, so its request keeps the client's behaviour and a
+    /// long valid stream is never cut off.
+    #[test]
+    fn only_a_capped_call_carries_a_request_timeout() {
+        let request = |cap| {
+            cap_attempt(reqwest::Client::new().post("http://localhost/"), cap)
+                .build()
+                .expect("build the request")
+        };
+        assert_eq!(request(None).timeout(), None);
+        let cap = Duration::from_secs(20);
+        assert_eq!(request(Some(cap)).timeout(), Some(&cap));
+    }
+
+    /// A character split across two reads must arrive whole. Decoding each
+    /// chunk on its own yields two U+FFFD instead, which corrupts model text
+    /// and any file written from a tool argument.
+    #[test]
+    fn a_character_split_across_two_chunks_survives() {
+        let text = "hei på deg 😀 日本語";
+        let bytes = text.as_bytes();
+        for split in 1..bytes.len() {
+            let mut carry = Vec::new();
+            let mut out = String::new();
+            push_utf8_chunk(&mut carry, &bytes[..split], &mut out);
+            push_utf8_chunk(&mut carry, &bytes[split..], &mut out);
+            assert_eq!(out, text, "split at byte {split}");
+            assert!(carry.is_empty(), "nothing held back, split at byte {split}");
+        }
+    }
+
+    /// A byte no character can start with still becomes the replacement, so a
+    /// genuinely broken stream reads as it did before.
+    #[test]
+    fn an_invalid_byte_still_becomes_the_replacement_character() {
+        let mut carry = Vec::new();
+        let mut out = String::new();
+        push_utf8_chunk(&mut carry, b"a\xffb", &mut out);
+        assert_eq!(out, "a\u{fffd}b");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn test_is_retryable_status() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(529));
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(503));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(404));
+    }
+
+    #[test]
+    fn a_successful_response_is_never_retried_whatever_its_body_says() {
+        // A billed answer can mention a rate limit or carry a 503 token count.
+        let body = r#"{"text":"the rate limit timed out","promptTokenCount": 503}"#;
+        assert!(is_retryable_error(body));
+        for status in [200, 201, 204, 299] {
+            assert!(!should_retry_http(status, body, 1), "status {status}");
+        }
+        assert!(should_retry_http(400, body, 1));
+    }
+}

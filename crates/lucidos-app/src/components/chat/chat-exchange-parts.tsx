@@ -1,0 +1,1672 @@
+import { blobPreviewUrl, postCommandCheckpointUndo } from '../../api/client';
+import { CONTINUE_GUARD_MS, continueStoppedThread } from './continueStoppedThread';
+import type { Change } from '../../api/client';
+import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
+import { changeCommitList, knownChangeHeadline } from '../../store/changeHeadline';
+import { HELD_MESSAGE_NOTE } from '../../store/exchange-status';
+import { ensureEventTargetResolved, eventHasTarget, jumpableEventId, showEventWhereItLives } from '../../store/actions/event-navigation';
+import { viewChangeDiff } from '../../store/actions/repositories';
+import { checkpointDiffModal, contextViewer, eventConditionDoor, eventConditionPopoverOpenFor, findChangeById, lazyChanges, openImagePopupFromGroup, openSubAgentGroups, showToast, stepDetailModal, toggleEventConditionPopover, toggleSubAgentGroup } from '../../store/store';
+import { prefetchStepDetail } from '../../store/stepDetailCache';
+import { LUCIDOS_AGENT_LABEL, awaitedSubject, continuationCause, plainEventName, responseAbortedState, starterEngineReason, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote } from '../../store/thread-events';
+import { LucidosGlyph } from '../shared/LucidosMark';
+import { BlobImage } from '../shared/BlobImage';
+import { CommitList } from '../shared/CommitList';
+import { Disclosure } from '../shared/Disclosure';
+import { DisclosureChevron } from '../shared/DisclosureChevron';
+import type { AbortCause, CancelCause, ChangeLifecycleType, EngineReason, EventSubscription, EventWaitReason, EventWaitCancelCause, Exchange, MessageOrigin, StoredEvent, SubscriptionGroup } from '../../store/thread-events';
+import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
+import type { CodingAgent } from '../../api/types';
+import { HEARING_YOU } from '../../voice/callState';
+import { describeAbortCause, describeCancelCause, describeContinuationReason, describeEngineReason, describeWatchedEvents } from '../../utils/engineEventExplainers';
+import { errorDetail } from '../../utils/errorDetail';
+import { formatFileCount } from '../../utils/formatFileCount';
+import { formatMessageTimestamp, formatShortDate, formatShortTime, isSameDayInUserTz } from '../../utils/formatTime';
+import { renderMarkdown } from '../../utils/renderMarkdown';
+import { EventRowFoldView, eventNameChip, eventRowBody } from './EventRow';
+import type { EventRowChip, EventRowFact, EventRowTone } from './EventRow';
+import { contextPercent, formatTokens } from '../../utils/formatTokens';
+import { CallIcon, ClaudeIcon, CodexIcon, CollapseTurnIcon, FullResponseIcon, StepLogIcon, StepOutcomeIcon } from '../shared/icons';
+import { highlightEllipsis } from './highlightEllipsis';
+import { getSessionBlobUrlForHash } from './pastedImages';
+import { useSignal } from '@preact/signals';
+import type { ComponentChildren } from 'preact';
+import { useEffect } from 'preact/hooks';
+import type { InitiatorDescriptor } from './ChatExchange';
+import { ROW_ATTR } from './scrollAnchor';
+import { withScrollAnchor } from './CreateThreadView';
+
+// Presentational sub-components for ChatExchange (panels, bodies, response
+// rendering). Extracted from ChatExchange.tsx; imported back there. The only
+// dependency on the parent is the InitiatorDescriptor type (erased at runtime).
+
+/** How each change resolution reads on its card. The accent is the initiator
+ *  panel's class, which the change deep link keys on (`scrollToChangeAndPulse`). */
+const CHANGE_STATE: Record<ChangeLifecycleType, { label: string; tone: EventRowTone; accent: string }> = {
+  ChangeApplied: { label: 'Applied', tone: 'good', accent: 'change-applied' },
+  ChangeDiscarded: { label: 'Discarded', tone: 'halted', accent: 'change-discarded' },
+  ChangeReverted: { label: 'Reverted', tone: 'none', accent: 'change-reverted' },
+  ChangeApplyFailed: { label: 'Failed', tone: 'bad', accent: 'change-failed' },
+};
+
+export function changeAccent(type: ChangeLifecycleType): string {
+  return CHANGE_STATE[type].accent;
+}
+
+export function MarkdownBlock({ html, onClick }: { html: string; onClick?: (e: MouseEvent) => void }) {
+  return <div class="markdown-content" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+export function FileList({ files }: { files: string[] }) {
+  return (
+    <ul class="initiator-files">
+      {files.map(f => <li key={f}><code>{f}</code></li>)}
+    </ul>
+  );
+}
+
+/** The thumbnails of images the user attached: to a message, a side question
+ *  or a typed answer. Nothing when there are none. */
+function UserImages({ imageHashes }: { imageHashes: readonly string[] }) {
+  if (imageHashes.length === 0) return null;
+  return (
+    <div class="user-images">
+      {imageHashes.map((hash, i) => {
+        const src = getSessionBlobUrlForHash(hash) ?? blobPreviewUrl(hash);
+        return (
+          <BlobImage
+            key={hash + ':' + i}
+            src={src}
+            class="user-image-thumb"
+            alt=""
+            onClick={(e) => openImagePopupFromGroup(e.currentTarget.src, e.currentTarget)}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+export function UserMessageBody({ html, imageHashes }: { html: string; imageHashes: readonly string[] }) {
+  return (
+    <>
+      {html && <div class="markdown-content" dangerouslySetInnerHTML={{ __html: html }} />}
+      <UserImages imageHashes={imageHashes} />
+    </>
+  );
+}
+
+/** A change resolution (applied, discarded, reverted, failed), as an **event
+ *  row**: the same card a child thread's return wears. A "Change" chip leads,
+ *  as on every event row. The headline is the detail sentence under it. Diff
+ *  and Revert sit in the card's action slot.
+ *
+ *  `seedDescription` / `seedFileCount` / `seedSummary` come from the in-thread
+ *  `ChangeProposed` and `ChangeSummarized` events, already loaded with the
+ *  thread. They render the card at its FINAL height on first open, before the
+ *  per-id `Change` lazy-fetch lands. So a thread ending with "Change applied"
+ *  does not jump when the fetched row pops its headline and file count in. The
+ *  authoritative live row wins once loaded, and is normally identical. */
+export function ChangeEventRow({ type, changeId, error, seedDescription, seedFileCount, seedSummary }: {
+  type: ChangeLifecycleType;
+  changeId?: string;
+  error?: string;
+  seedDescription?: string;
+  seedFileCount?: number;
+  seedSummary?: string;
+}) {
+  const change: Change | undefined = changeId ? findChangeById(changeId) : undefined;
+  const lazy: Loadable<Change> = (changeId ? lazyChanges.value.get(changeId) : undefined) ?? { status: 'not-loaded' };
+
+  useEffect(() => {
+    if (changeId) void ensureChangeLoaded(changeId);
+  }, [changeId]);
+
+  const naming = change ?? { description: seedDescription, summary: seedSummary };
+  const fileCount = change?.file_count ?? seedFileCount;
+  const seeded = !!naming.description?.trim() || fileCount != null;
+
+  // A lifecycle error wins over the lazy-fetch state. A seeded card is already
+  // complete, so a fetch failure only costs it Diff and Revert. And a 404 for a
+  // row that SSE delivers moments later must not strand a stale error.
+  const shownError = error
+    ?? (!seeded && lazy.status === 'failed' ? `Failed to load change details: ${lazy.error}` : undefined);
+  const { label, tone } = CHANGE_STATE[type];
+  return changeEventRowBody({
+    type,
+    headline: knownChangeHeadline(naming),
+    headlinePending: !change && !seeded && !!changeId && (lazy.status === 'not-loaded' || lazy.status === 'loading'),
+    stateLabel: label,
+    tone,
+    fileCount,
+    commits: changeCommitList(naming),
+    error: shownError,
+    actions: changeActions(changeId, type === 'ChangeApplyFailed', type === 'ChangeApplied'),
+  });
+}
+
+/** The card's markup, hookless for the same reason `eventWaitRowBody` is: the
+ *  tests drive this, since there is no jsdom to render the wrapper.
+ *
+ *  `commits` is oldest first. The fold lists them only when there are several:
+ *  a single commit IS the headline, and a fold repeating it adds nothing. */
+export function changeEventRowBody({ type, headline, headlinePending, stateLabel, tone, fileCount, commits = [], error, actions }: {
+  type: ChangeLifecycleType;
+  headline?: string;
+  /** The headline is still loading. Its line keeps its box, so the card does
+   *  not grow when it lands. */
+  headlinePending?: boolean;
+  stateLabel: string;
+  tone: EventRowTone;
+  fileCount?: number;
+  commits?: readonly string[];
+  error?: string;
+  actions?: ComponentChildren;
+}) {
+  return eventRowBody({
+    kind: 'change',
+    state: type,
+    role: 'change-event-row',
+    // The state word says how it resolved, so the chip names only the family.
+    subject: eventNameChip({ kind: 'chip', name: type, label: 'change', sentenceStart: true }),
+    stateLabel,
+    tone,
+    detail: headline ?? (headlinePending ? <span aria-hidden="true">{'\u00a0'}</span> : undefined),
+    // The file count is a single value inside a real card, so an unseeded
+    // card leaves its slot empty until the lazy read fills it.
+    facts: [
+      fileCount != null ? { kind: 'text' as const, text: formatFileCount(fileCount) } : null,
+    ],
+    // An error is open, because the reason an apply failed is the one thing
+    // the reader came for. It takes the slot over the commit list.
+    fold: error
+      ? { label: 'Error', open: true, body: error }
+      : commits.length > 1
+        ? { label: `${commits.length} commits`, body: <CommitList commits={commits} /> }
+        : undefined,
+    actions,
+  });
+}
+
+/** "Continue" button rendered on the abort exchange the user may resume from
+ *  (`continuableAbortIndex`). Disables itself between click and response, and
+ *  `continueStoppedThread` refuses a second press, so a double-click can't
+ *  double-emit. Surfaces network failures via toast and re-enables. */
+export function ContinueButton({ threadId }: { threadId: string }) {
+  const inFlight = useSignal(false);
+  const onClick = async (e: MouseEvent) => {
+    e.stopPropagation();
+    if (inFlight.value) return;
+    inFlight.value = true;
+    if (!(await continueStoppedThread(threadId))) {
+      inFlight.value = false;
+      return;
+    }
+    // ContinuationStarted will arrive via SSE and remove the button by hiding
+    // this exchange's `isContinuableAbort`. Re-enable as a safety net in case
+    // the SSE event is delayed.
+    setTimeout(() => { inFlight.value = false; }, CONTINUE_GUARD_MS);
+  };
+  return (
+    <button class="action-btn" onClick={onClick} disabled={inFlight.value}>
+      {inFlight.value ? 'Continuing...' : 'Continue'}
+    </button>
+  );
+}
+
+/** What a cancel's state word says, by what the user did. */
+const CANCEL_STATE: Partial<Record<CancelCause, string>> = {
+  user_stop: 'You stopped it',
+  user_action: 'Stopped by apply, discard or archive',
+  superseded_by_followup: 'Replaced',
+};
+
+interface BoundaryStarter {
+  type: string;
+  origin?: MessageOrigin;
+  actor?: MessageOrigin;
+  cause?: string;
+  tool?: string;
+}
+
+/** Where the turn a boundary card opened stands. A card that asked for work
+ *  (hardening, a merge, a prompt) reports it, as a held message reports its
+ *  delivery. */
+export type BoundaryTurn = 'waiting' | 'working' | 'done' | 'stopped';
+
+/** What the engine asked for, in words, when its reason says more than the
+ *  event's own name. */
+const REASON_PILL: Partial<Record<EngineReason['kind'], string>> = {
+  missing_hardening: 'hardening needed',
+  missing_plan: 'plan needed',
+  harden_retrigger: 'hardening needed',
+  merge_conflict: 'merge conflict',
+  stale_session: 'stopped agent tidied up',
+  orphan_recovery: 'picked up after a restart',
+  archived_branch_work: 'work set aside',
+  plugin_setup: 'plugin setup',
+  plugin_upstream_proposal: 'plugin change offered',
+  scheduler: 'scheduled message',
+};
+
+/** A wait re-entry's pill and chip tooltip, by how the wait ended. */
+const WAIT_REENTRY: Record<EventWaitReason['outcome'], { pill: string; meaning: string }> = {
+  delivered: {
+    pill: 'event arrived',
+    meaning: 'Lucidos told the agent the event it was waiting for happened.',
+  },
+  expired: {
+    pill: 'wait timed out',
+    meaning: 'Lucidos told the agent its wait ran out of time.',
+  },
+};
+
+
+/** The live word a work card shows while its turn runs. */
+const WORKING_STATE: Partial<Record<string, string>> = {
+  MissingHardeningDetected: 'Running hardening',
+  MergeConflictDetected: 'Resolving',
+  PromptInjected: 'Agent working',
+  CodingAgentPromptSent: 'Agent working',
+};
+
+/** A work card's state, from where its turn stands. */
+function workState(type: string, turn: BoundaryTurn) {
+  switch (turn) {
+    case 'working': return { state: WORKING_STATE[type], tone: 'live' as const };
+    case 'done': return { state: 'Done', tone: 'good' as const };
+    case 'stopped': return { state: 'Stopped', tone: 'halted' as const };
+    case 'waiting': return { state: 'Queued', tone: 'arrived' as const };
+  }
+}
+
+/** A boundary card's state, tone, explanation and the one fact it adds. */
+function boundaryCardParts(
+  ev: BoundaryStarter,
+  reason: EngineReason | undefined,
+  summary: string,
+  pill: string,
+  turn: BoundaryTurn,
+) {
+  const why = reason ? describeEngineReason(reason) : null;
+  // A summary that says more than the pill does stays, as a fact.
+  const fact = summary.toLowerCase() !== pill ? summary : undefined;
+  switch (ev.type) {
+    case 'ResponseAborted':
+      return { state: responseAbortedState(ev.actor, ev.cause as AbortCause), tone: 'halted' as const, why: describeAbortCause(ev.cause as AbortCause) };
+    case 'ResponseCanceled':
+      // A follow-up that replaced the reply lapsed it, as a replaced form does.
+      return { state: CANCEL_STATE[ev.cause as CancelCause], tone: ev.cause === 'superseded_by_followup' ? 'lapsed' as const : 'halted' as const, why: describeCancelCause(ev.cause as CancelCause) };
+    case 'EventWaitCanceled':
+      return { state: 'You stopped it', tone: 'halted' as const, fact };
+    case 'McpConsentRequested':
+      return { state: 'Requested', tone: 'live' as const, fact: ev.tool };
+    case 'MissingHardeningDetected':
+    case 'MergeConflictDetected':
+    case 'PromptInjected':
+    case 'CodingAgentPromptSent':
+      return { ...workState(ev.type, turn), why };
+    default:
+      return { tone: 'arrived' as const, why, fact };
+  }
+}
+
+/** A turn the agent did not write (the engine, the system or your own control
+ *  press), as the card every other event row is: the event as a pill, its
+ *  state, the one fact it adds, and Details. Details explains why it happened,
+ *  then holds what the starter carried (a file list, a prompt). `actions` is a
+ *  button the card owns, such as an interrupted response's Continue. */
+export function boundaryCard(event: StoredEvent, summary: string, opts: {
+  carried?: ComponentChildren;
+  actions?: ComponentChildren;
+  turn: BoundaryTurn;
+}) {
+  const ev = event as BoundaryStarter;
+  const reason = starterEngineReason(event);
+  if (reason?.kind === 'event_wait') return waitReentryCard(reason, opts);
+  // Clearing a stuck reply interrupted nothing, so it does not wear that name.
+  const pill = ev.type === 'ResponseAborted' && ev.cause === 'stale_settle'
+    ? 'stuck reply cleared'
+    : (reason && REASON_PILL[reason.kind]) ?? plainEventName(ev.type);
+  const { state, tone, why, fact } = {
+    why: null,
+    fact: undefined,
+    ...boundaryCardParts(ev, reason, summary, pill, opts.turn),
+  };
+  return eventRowBody({
+    kind: 'boundary',
+    role: 'boundary-card',
+    subject: eventNameChip({ kind: 'chip', name: ev.type, label: pill, sentenceStart: true }),
+    stateLabel: state,
+    tone,
+    facts: [fact ? { kind: 'text', text: fact } : null],
+    fold: why || opts.carried ? {
+      label: 'Details',
+      body: <>{why && <p>{why}</p>}{opts.carried}</>,
+    } : undefined,
+    actions: opts.actions,
+  });
+}
+
+/** An *event wait* re-entry, told as a story: what happened as the pill, what
+ *  the agent waited for as the fact, and why Lucidos spoke up in Details. The
+ *  words the model read sit one fold deeper, since they are written for it. */
+function waitReentryCard(reason: EventWaitReason, opts: { carried?: ComponentChildren; turn: BoundaryTurn }) {
+  const { pill, meaning } = WAIT_REENTRY[reason.outcome];
+  const waitedFor = describeWatchedEvents(reason.watched);
+  const { state, tone } = workState('PromptInjected', opts.turn);
+  return eventRowBody({
+    kind: 'boundary',
+    role: 'boundary-card',
+    subject: eventNameChip({ kind: 'chip', name: 'PromptInjected', label: pill, meaning, sentenceStart: true }),
+    stateLabel: state,
+    tone,
+    facts: [waitedFor ? { kind: 'text', text: waitedFor } : null],
+    fold: {
+      label: 'Details',
+      body: (
+        <>
+          <p>{describeEngineReason(reason)}</p>
+          {opts.carried && <EventRowFoldView label="What the agent was told" body={opts.carried} />}
+        </>
+      ),
+    },
+  });
+}
+
+/** The card that opens a resumed turn, inside the reply it resumed. It reads
+ *  like every other event row: the event, its cause as the state word, and a
+ *  Details fold. The fold explains the cause, then folds the engine's note to
+ *  the model one level deeper when there is one (a coding-agent resume carries
+ *  none). */
+export function ResumeCard({ exchange }: { exchange: Exchange }) {
+  const ev = exchange.userEvent as { reason?: string; actor?: MessageOrigin };
+  const note = resumeEngineNote(exchange);
+  return eventRowBody({
+    kind: 'resume',
+    role: 'resume',
+    subject: eventNameChip({ kind: 'chip', name: 'ContinuationStarted', sentenceStart: true }),
+    stateLabel: continuationCause(ev.reason, ev.actor),
+    tone: 'arrived',
+    fold: {
+      label: 'Details',
+      body: (
+        <>
+          <p>{describeContinuationReason(ev.reason) ?? describeEngineReason({ kind: 'continuation_started' })}</p>
+          {note && (
+            <>
+              <p>{note.toolCount > 0
+                ? `Lucidos reminded the agent of the ${note.toolCount} step${note.toolCount === 1 ? '' : 's'} it had already taken.`
+                : 'Lucidos told the agent that none of its steps had finished.'}</p>
+              <EventRowFoldView label="What the agent was told" pre body={note.text} />
+            </>
+          )}
+        </>
+      ),
+    },
+  });
+}
+
+/** The body of an event-delivery exchange: the event a *thread subscription*
+ *  delivered, named, with its payload folded away (ADR 0047).
+ *
+ *  The anchor's `PromptInjected.text` spells the payload out as
+ *  pretty-printed JSON, because that text IS the prompt the model reads.
+ *  Rendering it through `MarkdownBlock` puts a screen of raw JSON in the
+ *  transcript. The engine links the anchor to its `EventWaitDelivered` so the
+ *  client can show the same facts as structure. Closed by default: the NAME
+ *  answers "why did this thread start talking again". It names no arming reason
+ *  either. That reason lives on the `EventWaitStarted`, routinely outside the
+ *  loaded window by then, and a row states no fact its own event carries.
+ *
+ *  **"arrived", never "Woke on".** The anchor records no idle flag.
+ *  `resume_from_event_wake` injects the delivery into a live turn when there is
+ *  one, so the card must be true of both lanes. See
+ *  `docs/plans/2026-08-13-a-delivery-does-not-know-the-thread-was-asleep.md`.
+ *
+ *  The jump to the matched event lives here and the NAME is it, since this card
+ *  IS the arrival. The markup is `eventDeliveryBody`. */
+export function EventDeliveryBody({
+  eventType,
+  eventId,
+  payloadJson,
+  heldNote,
+}: {
+  eventType: string;
+  eventId?: string;
+  payloadJson?: string;
+  heldNote?: string;
+}) {
+  const jump = useEventJump(jumpableEventId(eventId, eventType));
+  return eventDeliveryBody({
+    eventType,
+    payloadJson,
+    opening: jump.opening,
+    onOpenMatched: jump.onOpen,
+    heldNote,
+  });
+}
+
+/** Settle whether a jump to `eventId` has anywhere to go, and report it.
+ *
+ *  False until the answer is known, so a row starts plain and GAINS its link.
+ *  The other direction, a link that appears and then disappears, reads as a bug
+ *  and can be tapped in the window before it goes.
+ *
+ *  Resolution happens in the effect rather than the render body precisely so the
+ *  row subscribes to the one small verdict signal and not to `threadMap`. */
+function useEventTarget(eventId: string | undefined): boolean {
+  useEffect(() => { ensureEventTargetResolved(eventId); }, [eventId]);
+  return eventHasTarget(eventId);
+}
+
+/** The jump to a matched event, as the two things a chip needs: whether it is in
+ *  flight, and the handler when there is somewhere to go.
+ *
+ *  Resolving the matched event's thread is a round-trip except for a match in
+ *  this same thread. So the chip dims and goes inert while the jump runs, rather
+ *  than accepting a second tap. See `showEventWhereItLives`.
+ *
+ *  `onOpen` is absent when the event has nowhere to open, which is what keeps a
+ *  dead tap unreachable rather than merely unlikely. Both rows that offer a jump
+ *  take it from here, so neither can grow a different in-flight rule. */
+function useEventJump(eventId: string | undefined): { opening: boolean; onOpen?: () => void } {
+  const opening = useSignal(false);
+  const linkable = useEventTarget(eventId);
+  if (!linkable || !eventId) return { opening: opening.value };
+  return {
+    opening: opening.value,
+    onOpen: async () => {
+      if (opening.value) return;
+      opening.value = true;
+      try {
+        await showEventWhereItLives(eventId);
+      } finally {
+        opening.value = false;
+      }
+    },
+  };
+}
+
+/** The row's markup, hookless for the same reason `eventWaitRowBody` is. There
+ *  is no jsdom in the test infra, so a component carrying a hook cannot be
+ *  invoked as a plain function. The tests drive this instead.
+ *
+ *  `onOpenMatched` absent means there is nowhere to go, and the event name is
+ *  then inert text: no link, no affordance, no dead tap. Both of the ways that
+ *  happens are ordinary, which is why the plain form is the default rather than
+ *  a fallback. The engine may have recorded no `event_id` for the delivery, and
+ *  a recorded one may point at an event no transcript draws. A workspace domain
+ *  event belongs to no conversation, and a `BackgroundBashCompleted` merely
+ *  landed inside whichever turn was open. */
+export function eventDeliveryBody({
+  eventType,
+  payloadJson,
+  opening,
+  onOpenMatched,
+  heldNote,
+}: {
+  eventType: string;
+  payloadJson?: string;
+  opening: boolean;
+  onOpenMatched?: () => void;
+  heldNote?: string;
+}) {
+  return eventRowBody({
+    kind: 'delivery',
+    heldNote,
+    role: 'event-delivery',
+    // The matched event usually lives somewhere ELSE: a `CodingAgentIdled` or a
+    // `ChangeProposed` from the coding-agent thread this one watched. So the
+    // jump resolves the owning thread first and navigates there, rather than
+    // searching the open thread's DOM for an event not in it.
+    // The chip IS the sentence: "Background job finished". Event types are
+    // past tense, so the plain name already says what happened.
+    subject: eventNameChip({
+      kind: 'chip',
+      name: eventType,
+      sentenceStart: true,
+      onClick: onOpenMatched,
+      pending: opening,
+      role: 'event-delivery-jump',
+    }),
+    stateLabel: 'Arrived',
+    tone: 'arrived',
+    fold: payloadJson ? { label: 'Details', pre: true, body: payloadJson } : undefined,
+  });
+}
+
+type TriggerStartedEvent = Extract<Exchange['userEvent'], { type: 'TriggerStarted' }>;
+
+/** A trigger firing, as an **event row**: the same marker an event wait, an
+ *  event delivery and a child callback use. Something outside the thread happened
+ *  and started a turn, which is the one thing all four report.
+ *
+ *  The prompt goes in the fold, rather than being the whole body: rendered as
+ *  markdown it put a trigger's full instructions above every response.
+ *
+ *  **It names no schedule.** `TriggerStarted` carries `invocation: { kind:
+ *  'Schedule' }` and no cron expression, so a scheduled run says `scheduled`
+ *  rather than inventing one. An event-driven run carries its `event_type` and
+ *  gets the chip.
+ *
+ *  **That chip is the jump, when there is one.** A trigger usually fires on a
+ *  workspace domain event, which belongs to no conversation and has no
+ *  transcript to open. The engine also fires triggers on thread-scoped events
+ *  (`TriggerInvocation::Event` carries an `origin_thread_id`), and those do
+ *  open. So the rule is the delivery card's rather than a blanket "never link
+ *  here": the chip links only when the event turns out to live somewhere.
+ *
+ *  The thin hook-holding wrapper; the markup is `triggerFiredBody`. */
+export function TriggerFiredBody({ event }: { event: TriggerStartedEvent }) {
+  const invocation = event.invocation;
+  const matched = invocation?.kind === 'Event'
+    ? jumpableEventId(invocation.event_id, invocation.event_type)
+    : undefined;
+  const jump = useEventJump(matched);
+  return triggerFiredBody({
+    event,
+    opening: jump.opening,
+    onOpenMatched: jump.onOpen,
+  });
+}
+
+/** The row's markup, hookless for the same reason `eventWaitRowBody` is. There
+ *  is no jsdom in the test infra, so a component carrying a hook cannot be
+ *  invoked as a plain function. The tests drive this instead.
+ *
+ *  `onOpenMatched` absent means the matched event has nowhere to open, and the
+ *  chip is then inert text. See the wrapper above for why that is the common
+ *  case on this row rather than the exceptional one. */
+export function triggerFiredBody({
+  event,
+  opening,
+  onOpenMatched,
+}: {
+  event: TriggerStartedEvent;
+  opening: boolean;
+  onOpenMatched?: () => void;
+}) {
+  const invocation = event.invocation;
+  const name = event.trigger_name?.trim();
+  return eventRowBody({
+    kind: 'trigger',
+    role: 'trigger-fired',
+    // A trigger with no recorded name says only that one fired. It never falls
+    // back to `trigger_id`: that is a uuid, and no screen in Lucidos is
+    // labelled with one.
+    subject: eventNameChip({ kind: 'chip', name: 'TriggerStarted', sentenceStart: true }),
+    stateLabel: invocation?.kind === 'Schedule' ? 'Scheduled' : invocation?.kind === 'Event' ? 'On event' : 'Fired',
+    tone: 'arrived',
+    facts: [
+      name ? { kind: 'text' as const, text: name } : null,
+      invocation?.kind === 'Event'
+        ? {
+            kind: 'chip' as const,
+            name: invocation.event_type,
+            onClick: onOpenMatched,
+            pending: opening,
+            role: 'trigger-event-jump',
+          }
+        : null,
+    ],
+    fold: event.prompt
+      ? { label: 'Details', body: <MarkdownBlock html={renderMarkdown(event.prompt)} /> }
+      : undefined,
+  });
+}
+
+/** Diff/Revert action buttons rendered in a change card's action slot for
+ *  ChangeApplied/Discarded/Reverted exchanges. Returns null when the
+ *  change has no relevant actions (e.g. ChangeApplyFailed leaves the change
+ *  pending — user reads the error, doesn't diff/revert).
+ *
+ *  `reserveWhileLoading` renders a hidden button placeholder while the per-id
+ *  `Change` row is being fetched. The real Diff and Revert buttons then slot
+ *  into an already-reserved action row, with no vertical shift on first open.
+ *  It is set for ChangeApplied cards, which always get at least a Revert
+ *  button. Mirrors the body's `seed*` props in <ChangeEventRow>. */
+export function changeActions(changeId?: string, suppress?: boolean, reserveWhileLoading?: boolean): ComponentChildren {
+  if (suppress || !changeId) return null;
+  const change = findChangeById(changeId);
+  if (!change) {
+    return reserveWhileLoading
+      ? <button class="action-btn change-actions-placeholder" aria-hidden="true" tabIndex={-1}>Revert</button>
+      : null;
+  }
+  const showDiff = change.status === 'pending' || !!change.pre_merge_sha;
+  const showRevert = change.status === 'applied';
+  if (!showDiff && !showRevert) return null;
+  return (
+    <>
+      {showDiff && <button class="action-btn" onClick={() => void viewChangeDiff(change)}>Diff</button>}
+      {showRevert && <button class="action-btn action-btn-danger" onClick={() => void revertChange(change.id)}>Revert</button>}
+    </>
+  );
+}
+
+/** The turn's fold, as an icon button. Both headers render this one control, so
+ *  a reader folds a user message the way they fold the reply under it.
+ *
+ *  It is the third of the response header's three `turnControls`, and the
+ *  initiator header's only one. Everything a reader keys off is therefore
+ *  shared: the minus/plus glyph, the label naming the turn, and the
+ *  `.turn-control-collapse` class the pressed-chip rule excludes by name
+ *  (styles/chat/input-messages.css). A fold draws nothing below the header, so
+ *  this control is the only mark of it: folded, its plus is lit.
+ *
+ *  `collapsible` is false on a panel with no body to fold. Disabling it matters
+ *  on the response header, whose panel is often only a status line while the
+ *  turn is in flight: an enabled control there takes the fold, holds it, and
+ *  folds the turn as its first content arrives.
+ *
+ *  One object rather than two positional booleans and a callback: adjacent
+ *  same-typed arguments mis-order with no type error. */
+function collapseControl(
+  { collapsed, collapsible, onToggle }: { collapsed: boolean; collapsible: boolean; onToggle: (e: MouseEvent) => void },
+): ComponentChildren {
+  const label = collapsed ? 'Expand this turn' : 'Collapse this turn';
+  return (
+    <button
+      type="button"
+      class="icon-btn turn-control-collapse"
+      data-role="toggle-collapsed"
+      disabled={!collapsible}
+      aria-pressed={collapsed}
+      aria-label={label}
+      data-tooltip={label}
+      onClick={onToggle}
+    >
+      <CollapseTurnIcon collapsed={collapsed} />
+    </button>
+  );
+}
+
+interface InitiatorPanelProps {
+  initiator: InitiatorDescriptor;
+  timestamp: string;
+  onActorClick?: (e: MouseEvent) => void;
+  collapsible: boolean;
+  collapsed: boolean;
+  onToggle?: (e: MouseEvent) => void;
+  /** Delegated click for the BODY, which is the transcript's link router.
+   *  This panel draws markdown too: the reader's own message, an injected
+   *  prompt, a trigger prompt, a child thread's summary. Without the router an
+   *  anchor in any of them is the browser's, and a relative one reloads the
+   *  whole workspace (ADR 0038). */
+  onBodyClick?: (e: MouseEvent) => void;
+  /** User message → render the body as a right-aligned gray bubble. */
+  bubble?: boolean;
+  /** Drop the actor chip (icon + name) entirely — used for user messages and
+   *  change-lifecycle turns. Attribution is reached via the clickable timestamp,
+   *  which opens the route popover. */
+  chromeless?: boolean;
+  /** The body waits behind an open question: it dims, and `note` (if any)
+   *  says when it is read. Absent while the body's own card carries the note. */
+  held?: { note?: string };
+}
+
+function ActorChipBody({ initiator }: { initiator: InitiatorDescriptor }) {
+  return (
+    <>
+      {/* Iconless chips (e.g. the "Response canceled" boundary header) skip the
+          icon span entirely so the label sits flush, with no leading gap. */}
+      {initiator.icon != null && initiator.icon !== '' && (
+        <span class="initiator-icon">{initiator.icon}</span>
+      )}
+      <span class="initiator-label">{initiator.label}</span>
+    </>
+  );
+}
+
+export function InitiatorPanel({ initiator, timestamp, onActorClick, collapsible, collapsed, onToggle, onBodyClick, bubble = false, chromeless = false, held }: InitiatorPanelProps) {
+  const accentClass = initiator.accent ? ` initiator-panel-${initiator.accent}` : '';
+  const hasBody = !!initiator.summary || !!initiator.details;
+
+  // The turn's fold. Rendered only where there is a body to fold, which is the
+  // one way it departs from the response header's run of three: this panel's
+  // body comes from its event rather than streaming in, so a control that is
+  // dead now stays dead. The run keeps a disabled one instead, since two of its
+  // three are transcript-wide and a hole in it shows.
+  //
+  // ONE slot: immediately right of the actor chip, where the response header
+  // keeps its run. Both chipless turns are exempt from the fold, so the slot
+  // is never a bare row lead. `canCollapseInitiator` in `ChatExchange` is what
+  // drops it, for a user message and for a change turn.
+  const collapse = collapsible && onToggle
+    ? <span class="turn-controls">{collapseControl({ collapsed, collapsible, onToggle })}</span>
+    : null;
+
+  return (
+    <div class={`initiator-panel initiator-panel-${initiator.variant}${accentClass}${bubble ? ' initiator-panel-bubble' : ''}`} data-held={held ? '' : undefined}>
+      {/* The row is inert, like the response header's: the control owns folding.
+          A row that swallowed a click announced it with nothing but a cursor,
+          and it fired for any click that missed the chip. */}
+      <div class="initiator-header">
+        {!chromeless && (onActorClick ? (
+          <button
+            type="button"
+            class="initiator-actor"
+            onClick={onActorClick}
+            aria-label={`Show info for ${initiator.label}`}
+          >
+            <ActorChipBody initiator={initiator} />
+          </button>
+        ) : (
+          <span class="initiator-actor">
+            <ActorChipBody initiator={initiator} />
+          </span>
+        ))}
+        {collapse}
+        {/* Status (question/permission resolution) + timestamp, grouped right.
+            That order is the response header's, read across: controls, then
+            meta. Chromeless turns have no actor chip, so the timestamp is the
+            popover trigger. */}
+        <span class="initiator-meta">
+          {initiator.status}
+          {chromeless && onActorClick ? (
+            <button
+              type="button"
+              class="initiator-timestamp initiator-timestamp-button"
+              onClick={onActorClick}
+              aria-label={`Show info for ${initiator.label}`}
+            >
+              {timestamp}
+            </button>
+          ) : (
+            <span class="initiator-timestamp">{timestamp}</span>
+          )}
+        </span>
+      </div>
+      {hasBody && (
+        <Disclosure open={!collapsed}>
+          <div class="initiator-body" onClick={onBodyClick}>
+            {initiator.summary && <div class="initiator-summary">{initiator.summary}</div>}
+            {bubble ? <div class="user-bubble">{initiator.details}</div> : initiator.details}
+            {held?.note && <div class="initiator-held-note">{held.note}</div>}
+          </div>
+        </Disclosure>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Response panel — bordered card wrapping the executor's reply. Header carries
+// executor + status + (optional) stop button + timestamp + collapse toggle.
+// Body is the response content; collapses when the user clicks the header.
+// ---------------------------------------------------------------------------
+
+/** Triggers invoke the Lucidos agent rather than running their own executor, so
+ *  the label always reflects the LLM that produced the response. The model is
+ *  shown in the executor info popover, not in the header. "Lucidos Agent"
+ *  matches the initiator label used when one Lucidos thread spawns another.
+ *
+ *  Claude Code reads "Claude" HERE and nowhere else. This row is the app's
+ *  tightest on a phone, and the coding agent's own name was the longest thing
+ *  in it. Every other "Claude Code" names the BACKEND the user is choosing
+ *  between, where the full product name is the point, so those stay. The icon
+ *  beside it carries the rest of the identity, and the popover the label opens
+ *  names the model exactly. */
+export function describeExecutor(
+  isCC: boolean,
+  codingAgent: CodingAgent = 'claude-code',
+): { icon: ComponentChildren; label: string } {
+  if (isCC && codingAgent === 'codex') return { icon: <CodexIcon />, label: 'Codex' };
+  if (isCC) return { icon: <ClaudeIcon />, label: 'Claude' };
+  return { icon: <LucidosGlyph />, label: LUCIDOS_AGENT_LABEL };
+}
+
+interface TurnControlsProps {
+  /** Current state of each toggle, which is what the icon and `aria-pressed` say. */
+  detailsOn: boolean;
+  stepsOn: boolean;
+  /** This turn folded down to its header. Unlike the two above, per-turn state. */
+  collapsed: boolean;
+  /** Whether this turn HAS a body to fold (`canCollapse`). False on a panel
+   *  that is only a status line so far, where the collapse control is disabled.
+   *  The store would otherwise take the fold and hold it. The click then looks
+   *  dead and lands later, folding the turn as its first content arrives. */
+  collapsible: boolean;
+  /** Every one takes the click EVENT, not a bare notification. The correction
+   *  that holds the transcript still anchors on `currentTarget`, the control
+   *  the reader pressed (`heldOnThePress` in `ChatExchange.tsx`). */
+  onToggleDetails: (e: MouseEvent) => void;
+  onToggleSteps: (e: MouseEvent) => void;
+  onToggleCollapsed: (e: MouseEvent) => void;
+}
+
+/** The response header's `controls` slot: three icon buttons right of the
+ *  executor label, evenly spaced as one run.
+ *
+ *  The first two are the detail toggles, the full response and the step log,
+ *  both ON until the reader turns one off. Both always render, whatever this
+ *  turn holds. What they flip is a per-user setting spanning the whole
+ *  transcript. A turn with no steps is still a place to set how turns read.
+ *  Rendering them conditionally leaves holes in a column of identical headers.
+ *
+ *  The third is `collapseControl`, the same control the initiator header
+ *  carries, and the only one whose effect stops at the turn it sits on. Its
+ *  LABEL is what says so. The run stays evenly spaced
+ *  (`.turn-controls`, styles/chat/input-messages.css): a 2+1 break reads as
+ *  "two things and a stray" rather than as a scope split. The pair sit on a
+ *  pressed chip when on; the collapse control swaps minus for plus instead.
+ *  `CollapseTurnIcon` and `FullResponseIcon` carry the long form. */
+export function turnControls({
+  detailsOn, stepsOn, collapsed, collapsible, onToggleDetails, onToggleSteps, onToggleCollapsed,
+}: TurnControlsProps): ComponentChildren {
+  // "the LATEST answer" and not "the answer". Turning the full response off
+  // keeps only what follows the last text block (`getCollapsedVisibleEvents`).
+  // A turn that said something, worked, then said something else loses the
+  // first of the two.
+  const detailsLabel = detailsOn ? 'Show the latest answer only' : 'Show the full response';
+  const stepsLabel = stepsOn ? 'Hide steps' : 'Show steps';
+  return (
+    <span class="turn-controls">
+      <button
+        type="button"
+        class="icon-btn"
+        data-role="toggle-details"
+        aria-pressed={detailsOn}
+        aria-label={detailsLabel}
+        data-tooltip={detailsLabel}
+        onClick={onToggleDetails}
+      >
+        <FullResponseIcon />
+      </button>
+      <button
+        type="button"
+        class="icon-btn"
+        data-role="toggle-steps"
+        aria-pressed={stepsOn}
+        aria-label={stepsLabel}
+        data-tooltip={stepsLabel}
+        onClick={onToggleSteps}
+      >
+        <StepLogIcon />
+      </button>
+      {collapseControl({ collapsed, collapsible, onToggle: onToggleCollapsed })}
+    </span>
+  );
+}
+
+interface ResponsePanelProps {
+  executor: { icon: ComponentChildren; label: string };
+  onExecutorClick?: (e: MouseEvent) => void;
+  /** The turn's controls (`turnControls`), rendered immediately right of the
+   *  executor label. They render in every state, collapsed included: the
+   *  collapse control is one of them, so hiding the group would fold a turn
+   *  and take away the thing that unfolds it. */
+  controls?: ComponentChildren;
+  status: ComponentChildren;
+  timestamp: string;
+  collapsed: boolean;
+  hasBody: boolean;
+  /** Drop the header row entirely, for a *speech-only turn*. Its body is the
+   *  reply the caller heard, and the initiator above it is what they said. A
+   *  header between those two names an actor the reader already knows.
+   *
+   *  It takes the fold with it: the collapse control is in the row that goes,
+   *  so a folded turn here would have no way back out. */
+  headerless?: boolean;
+  children: ComponentChildren;
+}
+
+/** The response half of a turn.
+ *
+ *  Its header is NOT a click target: folding this turn is the third turn
+ *  control's job. A whole row that silently swallowed a click announced
+ *  nothing, and it sat under three buttons that each mean something else. Both
+ *  turn headers read that way now. */
+export function ResponsePanel({
+  executor, onExecutorClick, controls, status, timestamp, collapsed, hasBody, headerless = false, children,
+}: ResponsePanelProps) {
+  const folded = collapsed && !headerless;
+  return (
+    <div class="response-panel">
+      {!headerless && (
+        <div class="response-header">
+          <button
+            type="button"
+            class="response-executor"
+            onClick={onExecutorClick}
+            aria-label="Show who answered"
+          >
+            <span class="response-executor-icon">{executor.icon}</span>
+            <span class="response-executor-label">{executor.label}</span>
+          </button>
+          {controls}
+          <span class="response-meta">
+            {status}
+            <span class="response-timestamp">{timestamp}</span>
+          </span>
+        </div>
+      )}
+      {/* Mounted even with no body, so a body that stops drawing rolls away.
+          Hiding steps on a step-only turn takes the whole body with it. */}
+      <Disclosure open={hasBody && !folded}>
+        <div class="response-body">
+          {children}
+        </div>
+      </Disclosure>
+    </div>
+  );
+}
+
+/** Cap a preview string at `max` characters, marking the cut with an ellipsis.
+ *  The one place the response's preview-truncation convention lives, so the
+ *  step ticker and the image tooltip clip the same way. */
+function clip(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/** Longest prompt surfaced as an image tooltip. A generation prompt routinely
+ *  runs to several paragraphs, and a tooltip filling the pane is worse than a
+ *  short one. The untruncated prompt stays one click away in the generating
+ *  step's detail modal. */
+const IMAGE_PROMPT_SUMMARY_MAX = 240;
+
+/** A generated image's description: the prompt it came from, flattened to one
+ *  line and capped. Undefined when no prompt was recorded, which is what makes
+ *  the image carry NO tooltip rather than a meaningless one. */
+export function imagePromptSummary(prompt: string | undefined, max = IMAGE_PROMPT_SUMMARY_MAX): string | undefined {
+  const text = prompt?.replace(/\s+/g, ' ').trim();
+  if (!text) return undefined;
+  return clip(text, max);
+}
+
+/** Generated image rendered inline in the response.
+ *
+ *  The tooltip lives on the `<img>`, not on the block wrapper: the wrapper is
+ *  as wide as the response column, so anchoring there centered the tooltip
+ *  over empty space beside the picture. */
+export function GeneratedImage({ event }: { event: Extract<ResponseEvent, { type: 'image' }> }) {
+  const src = `data:${event.mime_type};base64,${event.base64}`;
+  const summary = imagePromptSummary(event.prompt);
+  return (
+    <div class="generated-image">
+      <img
+        src={src}
+        class="image-thumbnail"
+        alt={summary ?? 'Generated image'}
+        data-tooltip={summary}
+        loading="lazy"
+      />
+    </div>
+  );
+}
+
+/** Latest non-empty line of streamed reasoning, truncated — the inline "ticker"
+ *  preview for a live Thinking step. The full text lives in the detail modal. */
+function lastLinePreview(text: string, max = 120): string {
+  const line = text.split('\n').map(s => s.trim()).filter(Boolean).pop() ?? '';
+  return clip(line, max);
+}
+
+/** The context-usage suffix on a step row.
+ *
+ *  `compact` keeps only the percentage. The full "178k / 1M (18%)" is wider
+ *  than a narrow row's remaining space. The row is `nowrap`, so the excess
+ *  pushes the description out rather than wrapping. The percentage is the part
+ *  read at a glance anyway.
+ *
+ *  Which form the user sees is decided in CSS, not here: `InlineStep` renders
+ *  both and a container query on the row picks one (see `.step-context-compact`
+ *  in steps.css). */
+export function contextLabel(
+  used: number,
+  window: number | null | undefined,
+  messages: number | null | undefined,
+  compact: boolean,
+): string {
+  if (window) {
+    const pct = `${contextPercent(used, window)}%`;
+    return compact ? pct : `${formatTokens(used)} / ${formatTokens(window)} (${pct})`;
+  }
+  // No window to divide by, so there is no percentage: the token count alone is
+  // the compact form.
+  if (compact) return formatTokens(used);
+  return `${formatTokens(used)} tokens${messages != null ? `, ${messages} msgs` : ''}`;
+}
+
+/** Outcomes whose row carries its `stepStatus` label as a tooltip. See the
+ *  `data-tooltip` comment in `InlineStep` for what earns membership. */
+const NAMED_STEP_OUTCOMES: ReadonlySet<StepOutcome> = new Set<StepOutcome>([
+  'error',
+  'unfinished',
+  'blocked',
+  'denied',
+]);
+
+/** One action, as one row: the model's thinking and the call it produced share
+ *  a row rather than taking two (see `nameThinkingRow` in the projection).
+ *
+ *  The row therefore has several click targets, which is why it is a `<div>`
+ *  around buttons rather than one button: a `<button>` may not contain another
+ *  interactive element. The main target opens what the step DID, and the
+ *  context counter opens what the model was SENT. An `Agent` row adds its fold
+ *  toggle on both sides of the main target. */
+export function InlineStep(
+  { event, rowRef, fold, anchored = true }: {
+    event: Extract<ResponseEvent, { type: 'step' }>;
+    /** Handed this row's own element, so a caller can watch where it sits.
+     *  `ChatExchange` gives it to the live row alone, which is how the
+     *  "Working" label learns whether the live shimmer is on screen. */
+    rowRef?: (el: HTMLDivElement | null) => void;
+    /** An `Agent` row's fold over its sub-agent steps (`SubAgentStepGroup`). */
+    fold?: StepFold;
+    /** Whether a reading position may name this row. A row that can vanish
+     *  under a fold must not, or the position cannot be restored. */
+    anchored?: boolean;
+  },
+) {
+  const { label, className } = stepStatus(event.outcome);
+  const snap = event.contextCapture;
+  const used = snap?.usage?.input_tokens ?? snap?.estimated_total_tokens ?? event.context_tokens;
+  const window = snap?.context_window;
+  const trimmed = snap?.trimmed ?? event.trimmed;
+  const hasContext = used != null;
+  // Reasoning streams into `thinkingText` while the row is still an unnamed
+  // "Thinking" marker. Show its tail (latest non-empty line, truncated) as a
+  // live ticker so a long reasoning pass visibly progresses. It stops at the
+  // rename: once the row names the call it produced, a truncated mid-sentence
+  // fragment trailing "Running: cd …" is noise, and the full reasoning is one
+  // click away in the step detail.
+  const thinkingTail = isThinking(event) && event.thinkingText
+    ? lastLinePreview(event.thinkingText)
+    : '';
+  const detailText = event.detail || thinkingTail;
+
+  const isPending = event.outcome === 'pending';
+  // Both forms go into the DOM and CSS shows exactly one, because what decides
+  // is the ROW's own width, which nothing here can read. The row is as wide as
+  // the thread pane the divider was dragged to. So a narrow desktop pane crowds
+  // the counter the way a phone does. The gate is a container query on
+  // `.inline-step` (steps.css). Measuring in JS would mean re-rendering every
+  // step row on every frame of that drag.
+  const counter = hasContext && (
+    <>
+      <span class="step-context-full">
+        {contextLabel(used!, window, event.context_messages, false)}
+      </span>
+      <span class="step-context-compact">
+        {contextLabel(used!, window, event.context_messages, true)}
+      </span>
+      {trimmed && ' · trimmed'}
+    </>
+  );
+
+  return (
+    <div
+      ref={rowRef}
+      class={`inline-step ${className}${fold ? ' has-fold' : ''}`}
+      data-role="inline-step"
+      /* The reading position names this row (`ROW_ATTR` in scrollAnchor.ts). */
+      {...(anchored ? { [ROW_ATTR]: event.call_event_id ?? event.result_event_id } : {})}
+      /* The agent holding control, not a row it drew (`DRAWN_ROW_SELECTOR`). */
+      data-thinking-row={isThinking(event) ? '' : undefined}
+      /* A row the user can't read at a glance needs naming, and the tooltip
+         says what the mark means without a trip through the detail modal. The
+         four that earn one are the four that are neither a green check nor a
+         live shimmer: failed, killed mid-call, held on a permission card,
+         refused. */
+      data-tooltip={NAMED_STEP_OUTCOMES.has(event.outcome) ? label : undefined}
+    >
+      {/* The chevron takes the mark's slot, so the description keeps its
+          column. A button may not sit inside `.step-main`, so it leads it. */}
+      {fold && (
+        <button
+          type="button"
+          class="step-fold"
+          data-role="step-fold"
+          aria-expanded={fold.open}
+          aria-label={`${fold.open ? 'Hide' : 'Show'} the agent's ${stepCount(fold.count)}`}
+          onClick={fold.onToggle}
+        >
+          <DisclosureChevron open={fold.open} />
+        </button>
+      )}
+      <button
+        type="button"
+        class="step-main"
+        data-role="step-main"
+        /* Starts the fetch the modal will need, so it opens at its size. */
+        onPointerDown={() => prefetchStepDetail(event)}
+        onClick={() => { stepDetailModal.value = event; }}
+      >
+        {/* A running step draws no mark, but the span still renders: the slot
+            is a fixed-width column in CSS, so the running row's text sits on
+            the same column as the finished rows above it. */}
+        {!fold && <span class="step-icon"><StepOutcomeIcon outcome={event.outcome} /></span>}
+        <span class={`step-description${isPending ? ' running-shimmer' : ''}`}>{highlightEllipsis(event.description)}</span>
+        {detailText && <span class="step-detail">{highlightEllipsis(detailText)}</span>}
+      </button>
+      {/* The count toggles too, as a wider target than the chevron. The
+          chevron is the one keyboard stop, so this one stays out of the tab
+          order and the accessibility tree. */}
+      {fold && (
+        <button
+          type="button"
+          class="step-fold-count"
+          tabIndex={-1}
+          aria-hidden="true"
+          onClick={fold.onToggle}
+        >
+          {stepCount(fold.count)}
+        </button>
+      )}
+      {/* The counter is a button only when there is a snapshot behind it. A
+          legacy row carries `context_tokens` with nothing to open, and a button
+          that opens nothing is worse than plain text. */}
+      {counter && (snap ? (
+        <button
+          type="button"
+          class={`step-context${trimmed ? ' trimmed' : ''}`}
+          data-role="step-context"
+          aria-label="Show the context sent for this call"
+          onClick={() => { contextViewer.value = { snapshot: snap, description: event.description }; }}
+        >
+          {counter}
+        </button>
+      ) : (
+        <span class={`step-context${trimmed ? ' trimmed' : ''}`}>{counter}</span>
+      ))}
+    </div>
+  );
+}
+
+interface StepFold {
+  open: boolean;
+  count: number;
+  /** Takes the click, so the pressed control can be held still. */
+  onToggle: (e: MouseEvent) => void;
+}
+
+const stepCount = (n: number) => `${n} ${n === 1 ? 'step' : 'steps'}`;
+
+/** An `Agent` call and the steps its sub-agent took, folded under its row.
+ *
+ *  Folded, one line beneath the row says where the agent is. A running agent
+ *  shows its latest step, so the reader sees it working without the whole list.
+ *  An ended one says how it ended, since the chevron holds the slot where its
+ *  outcome mark would go. The line goes while the fold is open. */
+export function SubAgentStepGroup(
+  { event, rowRef }: {
+    event: Extract<ResponseEvent, { type: 'step' }>;
+    rowRef?: (el: HTMLDivElement | null) => void;
+  },
+) {
+  const children = event.children ?? [];
+  const id = event.tool_use_id ?? '';
+  const open = openSubAgentGroups.value.has(id);
+  const running = event.outcome === 'pending';
+  // Held on the press like a turn control, so the growth cannot scroll a reader
+  // who follows the live edge.
+  const onToggle = (e: MouseEvent) =>
+    withScrollAnchor(e.currentTarget as HTMLElement | null, () => toggleSubAgentGroup(id));
+  return (
+    <div class="sub-agent-group" data-role="sub-agent-group">
+      <InlineStep
+        event={event}
+        rowRef={rowRef}
+        fold={{ open, count: children.length, onToggle }}
+      />
+      <Disclosure open={!open}>
+        <div class={`sub-agent-tail${running ? '' : ' ended'}`} data-role="sub-agent-tail">
+          {running
+            ? <InlineStep event={children[children.length - 1]} anchored={false} />
+            : <SubAgentEnding event={event} />}
+        </div>
+      </Disclosure>
+      <Disclosure open={open}>
+        <div class="sub-agent-steps" data-role="sub-agent-steps">
+          {children.map((child, i) => <InlineStep key={child.tool_use_id ?? i} event={child} anchored={false} />)}
+        </div>
+      </Disclosure>
+    </div>
+  );
+}
+
+/** How an agent ended, as the tail line: its outcome mark and one word. It
+ *  opens the agent's step detail, which holds the report it returned. */
+function SubAgentEnding({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
+  const { label, className } = stepStatus(event.outcome);
+  return (
+    <div class={`inline-step ${className}`}>
+      <button
+        type="button"
+        class="step-main"
+        onPointerDown={() => prefetchStepDetail(event)}
+        onClick={() => { stepDetailModal.value = event; }}
+      >
+        <span class="step-icon"><StepOutcomeIcon outcome={event.outcome} /></span>
+        <span class="step-description">{event.outcome === 'success' ? 'Done' : label}</span>
+      </button>
+    </div>
+  );
+}
+
+type EventWaitState = Extract<ResponseEvent, { type: 'event_wait' }>['state'];
+
+/** How each state reads on the row: the state WORD's tone.
+ *
+ *  None of these is a step outcome, and that is the point. `stepStatus` takes a
+ *  `StepOutcome`, which has no `waiting`. Routing this row through it would
+ *  have to call a sleeping subscription `success` and paint a green check on
+ *  it. A marker reports a fact. Only the child-thread row shows a verdict, and
+ *  that verdict is the CHILD's.
+ *
+ *  `waiting` reads as live rather than in-progress: a shimmer would run for
+ *  however long the thread sleeps and claim a turn was running when none is.
+ *  `timed_out` and `canceled` are told apart by their words, not by red:
+ *  nothing failed either time, the watch simply ended without its event.
+ *
+ *  **A check and when it was done, never "woke"**, and that is a fact about the
+ *  wait rather than about the thread. A delivery does not require an idle thread:
+ *  `resume_from_event_wake` injects into a live turn when there is one, and
+ *  frames it to the model as arriving "while you were working". The row cannot
+ *  tell the two lanes apart (its anchor records no such flag), so it says the
+ *  thing that is true of both. Same reason `eventDeliveryBody` says "arrived". */
+const EVENT_WAIT_ROW_TONE: Record<EventWaitState, EventRowTone> = {
+  waiting: 'live',
+  matched: 'arrived',
+  timed_out: 'lapsed',
+  canceled: 'halted',
+};
+
+/** The state word, which says the outcome once. The headline already says
+ *  "Waiting", so a live state gives the deadline instead. A delivered one
+ *  says when it arrived. */
+function eventWaitStateLabel(state: EventWaitState, expiresAt: string, matchedAt?: string): string {
+  const deadline = waitMoment(expiresAt);
+  switch (state) {
+    case 'waiting':
+      return deadline ? `Until ${deadline}` : 'Waiting';
+    case 'matched': {
+      const done = waitMoment(matchedAt);
+      return done ? `Arrived ${done}` : 'Arrived';
+    }
+    case 'timed_out':
+      return deadline ? `Gave up at ${deadline}` : 'Gave up';
+    case 'canceled':
+      return 'Stopped';
+  }
+}
+
+/** Who stopped a wait, in plain words.
+ *
+ *  The word is **stopped**, never "discarded". *Discarded* already means
+ *  throwing a thing away in Lucidos, and one of these causes IS a discarded
+ *  thread, so reusing it would collide. "Stop waiting" is what the button says.
+ *  The `canceled` identifiers underneath keep their names: they are on disk in
+ *  persisted rows.
+ *
+ *  An unknown cause gets no note, since the state already says it stopped. */
+const EVENT_WAIT_STOP_NOTE: Record<EventWaitCancelCause, string | null> = {
+  user_stop: 'you stopped it',
+  agent_stand_down: 'the agent stopped it',
+  thread_archived: 'stopped when the thread was archived',
+  thread_discarded: 'stopped when the thread was discarded',
+  // Retired: a thread-level Stop no longer stops a subscription. Only old rows
+  // carry it, and they still have to render.
+  thread_canceled: 'stopped by Stop',
+  unknown: null,
+};
+
+/** The mark on a user message that was spoken rather than typed.
+ *
+ *  It sits in the bubble header's status slot, where a queued message shows
+ *  "Queued". A user bubble is chromeless and carries no actor chip. So this is
+ *  the one place in the header a fact about the message can go.
+ *
+ *  It names the ACT, never a second speaker. The user meets one Lucidos, and
+ *  the split behind a call is internal (ADR 0149).
+ *
+ *  **The icon is the whole mark.** It says what the word said, and it says it
+ *  in a header that already reads as the reader's own. The word is kept for a
+ *  screen reader, which has no icon to read. */
+export function SpokenChip() {
+  return (
+    <span class="spoken-chip" data-role="spoken-chip">
+      <CallIcon />
+      <span class="visually-hidden">{'Spoken'}</span>
+    </span>
+  );
+}
+
+/** What Lucidos said out loud, one row per talker turn.
+ *
+ *  It sits inside the exchange that was open, which is where it happened, but
+ *  it is NOT the written answer. That answer is what the reader reads; this is
+ *  the short spoken version the caller heard. So it keeps a raised surface and
+ *  a mark of its own rather than blending into the response body (ADR 0150).
+ *
+ *  The mark is the call icon alone, and on a *speech-only turn* it is the whole
+ *  of the row's chrome: no header is drawn there to name a speaker. A screen
+ *  reader has no icon to read and keeps the words.
+ *
+ *  Plain text, never markdown. This is a transcript of speech, and there was
+ *  no formatting to lose.
+ *
+ *  **It carries no liveness mark, and nothing here could honestly carry one**
+ *  (ADR 0197). The live row is retired by the engine's own row, written at the
+ *  next move of the conversation (ADR 0188, ADR 0191). A finished sentence
+ *  therefore stands here until the caller speaks again, and a mark on it says
+ *  "more is coming" about a reply that ended.
+ *
+ *  Gating it on the call phase is the obvious repair and is worse: a pause is
+ *  not the end of a reply, so the mark would blink several times through one
+ *  bubble. The caller's own bubble keeps the mark because there the client IS
+ *  told the words are final, the provider ending the turn.
+ *
+ *  Not a `.step`: a reply the caller heard is a *transcript marker*. No audio
+ *  is kept, so the steps control would hide the only record of it. */
+export function SpokenReply(
+  { event }: { event: Extract<ResponseEvent, { type: 'spoken_reply' }> },
+) {
+  return (
+    <div class="spoken-reply" data-role="spoken-reply">
+      {/* The mark is drawn once per RUN, and the slot is kept either way so
+          the bubbles below it stay on the same left edge. */}
+      <span class="spoken-reply-who" aria-hidden={event.follows ? 'true' : undefined}>
+        {!event.follows && <CallIcon />}
+        {!event.follows && <span class="visually-hidden">{'Said aloud'}</span>}
+      </span>
+      <span class="spoken-reply-text">
+        {event.text}
+        {/* The caller talked over it, so the text stops where they cut in. */}
+        {event.interrupted && <span class="spoken-reply-cut">{'cut off'}</span>}
+      </span>
+    </div>
+  );
+}
+
+/** ONE mark for "the caller's words are still arriving".
+ *
+ *  Three bars that rise and fall, which is what speech looks like. Their bubble
+ *  opens on them before a word exists. The words then push them along as they
+ *  arrive, and they go when the provider ends the turn.
+ *
+ *  **The caller's side only.** The talker's reply draws no mark at all, and
+ *  `SpokenReply` carries the reasoning (ADR 0197).
+ *
+ *  A blinking caret was the earlier shape, and it is gone: a text cursor is a
+ *  typing metaphor, and nobody types on a call.
+ *
+ *  Hidden from a screen reader, which has no animation to read. Whoever draws
+ *  it says the same thing in words. */
+export function LiveSpeechMark() {
+  return (
+    <span class="live-speech-mark" data-role="live-speech-mark" aria-hidden="true">
+      <span class="live-speech-bar" />
+      <span class="live-speech-bar" />
+      <span class="live-speech-bar" />
+    </span>
+  );
+}
+
+/** What a caller's bubble holds once the provider has heard some of it.
+ *
+ *  Plain text and the mark, on one line. NOT the markdown path a finished
+ *  message takes: a partial is a sentence cut mid-word, so half an emphasis
+ *  marker or a stray backtick would render as markup the caller never meant.
+ *
+ *  Inline, so the mark hugs the last word rather than dropping below the block
+ *  a rendered paragraph would make.
+ *
+ *  It carries the empty bubble's hidden phrase, so the bubble reads the same to
+ *  a screen reader whichever of the two it holds. */
+export function LivePartialBody({ text }: { text: string }) {
+  return (
+    <span class="live-partial" data-role="live-partial">
+      {text}
+      <LiveSpeechMark />
+      <span class="visually-hidden">{HEARING_YOU}</span>
+    </span>
+  );
+}
+
+/** What a caller's bubble holds before any words at all.
+ *
+ *  The mark alone, in the slot the words will fill, so the swap to text moves
+ *  nothing around it. Drawn until the first partial arrives, and for the whole
+ *  utterance when the transcriber streams none.
+ *
+ *  The hidden phrase is the same one the call toggle's status region speaks, so
+ *  a screen reader hears one thing said one way. Without it the bubble reads as
+ *  empty, an icon being nothing to read out.
+ *
+ *  It says "hearing", never "recording": Lucidos keeps no audio, and this is
+ *  the one surface where a caller would believe the other word. */
+export function LiveUtteranceBody() {
+  return (
+    <span class="live-utterance" data-role="live-utterance">
+      <LiveSpeechMark />
+      <span class="visually-hidden">{HEARING_YOU}</span>
+    </span>
+  );
+}
+
+/** An event wait, as an **event row** (ADR 0047). It shares one marker with the
+ *  event delivery, the child callback and the trigger fire.
+ *
+ *  Deliberately NOT an exchange divider: an attached delivery resumes the SAME
+ *  exchange, so the delivery's steps continue below this row rather than under
+ *  a fresh boundary.
+ *
+ *  It holds no hook and no affordance. The jump to the matched event lives on
+ *  the delivery card below, where the event arrived. This card is about the
+ *  ARMING, and a link out of it to something hours later does not read as
+ *  belonging to it. */
+export function EventWaitRow({ event }: { event: Extract<ResponseEvent, { type: 'event_wait' }> }) {
+  return eventWaitRowBody({ event });
+}
+
+/** The row's markup, hookless so it stays a pure function of its state (same
+ *  split as `waitingIndicatorBody` next door). There is no jsdom in the test
+ *  infra, so a component carrying a hook cannot be invoked as a plain function.
+ *  The tests drive this instead. */
+export function eventWaitRowBody({
+  event,
+}: {
+  event: Extract<ResponseEvent, { type: 'event_wait' }>;
+}) {
+  const stopNote = event.state === 'canceled' && event.cause ? EVENT_WAIT_STOP_NOTE[event.cause] : null;
+  // One layout in every state, the delivery card's: a pill and the outcome
+  // word on top, then what it waits for. The pill names the wait and never
+  // changes; the state word says how it stands. Only the delivery card says
+  // what arrived. The UI never says "event wait": that is the internal name
+  // (`system-knowhow/glossary.md` § Event wait).
+  return eventRowBody({
+    kind: 'wait',
+    state: event.state,
+    role: 'event-wait-row',
+    subject: eventNameChip({ kind: 'chip', name: 'EventWaitStarted', label: WAIT_PILL }),
+    stateLabel: eventWaitStateLabel(event.state, event.expires_at, event.matched_at),
+    tone: EVENT_WAIT_ROW_TONE[event.state],
+    detail: waitDetail(event.reason),
+    time: eventWaitTime(event.created),
+    // Only a live wait lists what it watches: on a finished one the list would
+    // read as a watch still running. A stop says how it ended instead.
+    //
+    // **No jump from here.** A link out to the matched event belongs on the
+    // card about that event, the delivery (`EventDeliveryBody`). A filtered
+    // subscription chip is pressable and does not break that: it opens the
+    // condition armed at this moment. See `subscriptionFacts`.
+    facts: event.state === 'waiting'
+      ? subscriptionFacts(event.wait_id, event.subscriptions)
+      : [stopNote ? { kind: 'text' as const, text: stopNote } : null],
+  });
+}
+
+export const WAIT_PILL = 'Waiting for';
+
+/** The agent's reason as the sentence under the pill. The pill already says
+ *  "Waiting for", so a leading "waiting for" goes (`awaitedSubject`). A legacy
+ *  stop row carries no reason and says the one thing it knows. */
+function waitDetail(reason: string): string {
+  const subject = awaitedSubject(reason).trim();
+  return subject ? subject.charAt(0).toUpperCase() + subject.slice(1) : 'An event';
+}
+
+/** An agent-sent message the coding agent holds until a human replies
+ *  (ADR 0256). Once its delivered copy is on record, that copy is the one
+ *  card and this row stops drawing (`Exchange.deliveredHeldIds`). A released
+ *  row without one stays, so a lost delivery is visible; its text is folded.
+ *  While held, the note says what it waits for, so it carries no state word. */
+export function HeldMessageRow({ event }: { event: Extract<ResponseEvent, { type: 'held_message' }> }) {
+  return eventRowBody({
+    kind: 'held',
+    state: event.released ? 'released' : 'held',
+    role: 'held-message-row',
+    subject: eventNameChip({ kind: 'chip', name: 'MessageHeld', sentenceStart: true }),
+    stateLabel: event.released ? HELD_MESSAGE_DELIVERED : undefined,
+    tone: event.released ? 'arrived' : 'none',
+    heldNote: event.released ? undefined : HELD_MESSAGE_NOTE,
+    facts: [{ kind: 'text', text: `from ${event.sender}` }],
+    fold: { label: 'Details', body: event.text },
+  });
+}
+
+export const HELD_MESSAGE_DELIVERED = 'Delivered';
+
+/** The watched event types as chips, one per type, after "watching for" and joined
+ *  by the word the subscription language itself uses. Both words are `glue`
+ *  rather than facts, so the row's middot separator steps over them: one fact.
+ *
+ *  A filtered chip is the door to its conditions. Its note says a filter exists
+ *  and nothing about what it says, since the raw operator JSON is far too wide
+ *  for a facts line. So the summary stays on the row and the conditions open in
+ *  a popover at the chip. */
+function subscriptionFacts(waitId: string, subscriptions: EventSubscription[]): EventRowFact[] {
+  const chip = (g: SubscriptionGroup): EventRowChip => {
+    const name = g.event_type;
+    const note = subscriptionFilterNote(g);
+    // `eventConditionDoor` reads the same conditions the note does, so the chip
+    // is pressable exactly when it carries one. The waiting panel asks the same
+    // question through it, which keeps the two surfaces from drifting apart.
+    const door = eventConditionDoor(g);
+    if (!door) return { kind: 'chip', name, note };
+    return {
+      kind: 'chip',
+      name,
+      note,
+      action: door.label,
+      popupOpen: eventConditionPopoverOpenFor(waitId, name),
+      onClick: (anchor) => toggleEventConditionPopover({ ...door.condition, anchor, waitId }),
+    };
+  };
+  return groupSubscriptions(subscriptions).flatMap((g, i) => [
+    // "watching for", never "wakes on": a match can land in a running turn,
+    // so no wait surface claims the thread was asleep.
+    { kind: 'glue' as const, text: i === 0 ? 'watching for' : 'or' },
+    chip(g),
+  ]);
+}
+
+/** When the row's event happened, in the format a message header uses: the
+ *  start of a wait, or the moment a stop row records. The row sits inside a
+ *  response body, whose header shows when the TURN ended, so nothing else says
+ *  when the watch began. Absent when missing or unparseable. */
+function eventWaitTime(created: string | undefined): { label: string; iso: string } | undefined {
+  if (!created || Number.isNaN(new Date(created).getTime())) return undefined;
+  return { label: formatMessageTimestamp(created), iso: created };
+}
+
+/** A moment in the state word: when an unresolved wait gives up, or when a delivered
+ *  one was done. A fact rather than a countdown.
+ *
+ *  Deliberately not ticking. ADR 0047 puts the live countdown on the
+ *  waiting indicator and keeps the transcript record LIGHTER. A per-second
+ *  span here would re-render inside `ChatExchange`, the component the whole
+ *  store is shaped around not re-rendering. The panel's own countdown keeps its
+ *  interval, being one open popover rather than one row per wait.
+ *
+ *  **The day is named whenever the moment is not today.** An `await_event`
+ *  timeout runs up to 24 hours, so a deadline is routinely tomorrow. A bare
+ *  "until 09:15" read at 14:00 points at a time that already passed. Same-day
+ *  is compared in the user's configured timezone (`isSameDayInUserTz`).
+ *
+ *  Absent when the moment is unparseable or missing, rather than rendering an
+ *  "Invalid Date": a row states no fact its event does not carry. */
+function waitMoment(iso: string | undefined): string | undefined {
+  if (!iso) return undefined;
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return undefined;
+  return isSameDayInUserTz(at, new Date())
+    ? formatShortTime(at)
+    : `${formatShortDate(at)} ${formatShortTime(at)}`;
+}
+
+/** What Undo will do to the workspace, in words, from the counts the engine
+ *  recorded when it diffed the checkpoint's two snapshots.
+ *
+ *  `null` when both are 0, which is a checkpoint written before the counts
+ *  existed rather than one that changed nothing: a command changing nothing
+ *  git-visible emits no card. Saying "restore 0 files" there would invent a
+ *  fact, and saying nothing leaves the diff as the way to find out. */
+export function checkpointUndoScope(restores: number, removes: number): string | null {
+  const parts: string[] = [];
+  if (restores > 0) parts.push(`restore ${formatFileCount(restores)}`);
+  if (removes > 0) parts.push(`remove ${formatFileCount(removes)} this step created`);
+  return parts.length > 0 ? `Undo will ${parts.join(' and ')}.` : null;
+}
+
+/** The command-guard checkpoint card (ADR 0002, Phase 4). An inline affordance
+ *  for an in-workspace destructive command. Its one-click Undo restores the
+ *  workspace from the snapshot taken before the command and removes the files
+ *  it created. Diff opens the change between those two snapshots, so the Undo
+ *  beside it is not a blind button. It is the same `.action-btn` Diff the
+ *  changes list and the change banners carry, not a one-off link. Once
+ *  reverted, Undo is replaced with a reverted marker and the diff stays
+ *  available. */
+export function CheckpointCard({ event }: { event: Extract<ResponseEvent, { type: 'checkpoint' }> }) {
+  const pending = useSignal(false);
+  const onUndo = async () => {
+    if (pending.value || event.reverted) return;
+    pending.value = true;
+    try {
+      // Success flips `reverted` via the SSE CommandCheckpointReverted event,
+      // which re-groups into this exchange and re-renders the card.
+      await postCommandCheckpointUndo(event.checkpoint_id);
+    } catch (e) {
+      showToast('Undo failed: ' + errorDetail(e), 'error');
+    } finally {
+      pending.value = false;
+    }
+  };
+  const scope = checkpointUndoScope(event.restores, event.removes);
+  return (
+    <div class="step-note-card checkpoint-card" data-role="checkpoint-card">
+      <span class="step-note-icon" aria-hidden="true">{'⎌'}</span>
+      <div class="step-note-body">
+        <div class="step-note-summary">{event.summary}</div>
+        <code class="step-note-detail">{event.command}</code>
+        {scope && <div class="checkpoint-scope">{scope}</div>}
+      </div>
+      <div class="checkpoint-actions">
+        <button
+          type="button"
+          class="action-btn"
+          data-role="checkpoint-diff"
+          onClick={() => { checkpointDiffModal.value = event; }}
+        >
+          Diff
+        </button>
+        {event.reverted ? (
+          <span class="checkpoint-reverted">Reverted ✓</span>
+        ) : (
+          <button
+            type="button"
+            class="action-btn action-btn-danger"
+            data-role="checkpoint-undo"
+            disabled={pending.value}
+            onClick={onUndo}
+          >
+            {pending.value ? 'Undoing…' : 'Undo'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,536 @@
+import { describe, it, expect } from 'vitest';
+import type { ComponentChildren, VNode } from 'preact';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+import { mcpServerRow, mcpServersBody, type McpServersBodyProps } from '../McpServersPage';
+import {
+  describeMcpRowError,
+  mcpHeaderSummary,
+  mcpServerCostLine,
+  mcpServerStateLabel,
+  disabledWireNames,
+  patchToolDisabled,
+  sortToolsByCost,
+} from '../mcpCost';
+import type {
+  McpBudget,
+  McpCostTotals,
+  McpServerStatus,
+  McpServersResponse,
+  McpToolStatus,
+} from '../../../api/client';
+import type { Loadable } from '../../../store/types';
+
+/** Flatten a vnode tree to a string. Same shallow walk as the helper in
+ *  `directory-picker-loadable.test.tsx`, with two differences the row needs.
+ *
+ *  A COMPONENT vnode keeps its tag and its scalar props. The row draws most of
+ *  its text through `<SkText class=...>`. It also hands each switch its
+ *  accessible name as a prop, so dropping either would hide what is asserted.
+ *
+ *  Only `children` is recursed into. A vnode merely PASSED as a prop, such as a
+ *  `<LoadingFade>` skeleton, therefore does not count as rendered: it is
+ *  constructed on every render and drawn on almost none. */
+function vnodeToText(node: ComponentChildren): string {
+  if (node === null || node === undefined || typeof node === 'boolean') return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(vnodeToText).join('');
+  const v = node as VNode<Record<string, unknown>>;
+  const props = (v.props ?? {}) as Record<string, unknown>;
+  const scalar = (value: unknown) =>
+    typeof value === 'string' || typeof value === 'number' || value === true;
+  const attrs = Object.entries(props)
+    .filter(([k, value]) => k !== 'children' && scalar(value))
+    .map(([k, value]) => ` ${k}="${String(value)}"`)
+    .join('');
+  const tag = typeof v.type === 'string' ? v.type : ((v.type as { name?: string })?.name ?? 'C');
+  return `<${tag}${attrs}>${vnodeToText(props.children as ComponentChildren)}</${tag}>`;
+}
+
+function tool(over: Partial<McpToolStatus> = {}): McpToolStatus {
+  return {
+    name: 'post_message',
+    wire_name: 'mcp__slack__post_message',
+    description: 'Post a message to a channel',
+    disabled: false,
+    chars: 500,
+    tokens: 200,
+    ...over,
+  };
+}
+
+function server(over: Partial<McpServerStatus> = {}): McpServerStatus {
+  return {
+    id: 'slack',
+    name: 'Slack',
+    running: true,
+    auto_approve: false,
+    dispatchable: true,
+    tools_source: 'live',
+    tools_observed_at: new Date(Date.now() - 3 * 86400000).toISOString(),
+    tools: [tool()],
+    chars: 500,
+    tokens: 200,
+    disabled_chars: 0,
+    disabled_tokens: 0,
+    ...over,
+  };
+}
+
+function totals(over: Partial<McpCostTotals> = {}): McpCostTotals {
+  return {
+    servers: 1,
+    running_servers: 1,
+    tools: 1,
+    chars: 500,
+    tokens: 200,
+    stopped_tools: 0,
+    stopped_chars: 0,
+    stopped_tokens: 0,
+    disabled_tools: 0,
+    disabled_chars: 0,
+    disabled_tokens: 0,
+    ...over,
+  };
+}
+
+/** The engine's figures for a 200k window: 288k request chars, a quarter of
+ *  it for MCP. */
+function budget(over: Partial<McpBudget> = {}): McpBudget {
+  return {
+    request_chars: 288000,
+    mcp_ceiling_chars: 72000,
+    sent_tools: 1,
+    sent_chars: 500,
+    sent_tokens: 200,
+    dropped: [],
+    warning: null,
+    ...over,
+  };
+}
+
+function response(over: Partial<McpServersResponse> = {}): McpServersResponse {
+  return {
+    servers: [server()],
+    totals: totals(),
+    model: 'claude-sonnet-5',
+    context_window: 200000,
+    budget: budget(),
+    ...over,
+  };
+}
+
+const NOOP = () => {};
+
+function body(data: Loadable<McpServersResponse>, showLoading = false): string {
+  const props: McpServersBodyProps = {
+    data,
+    showLoading,
+    expanded: new Set<string>(),
+    pending: {},
+    errors: {},
+    onToggleExpanded: NOOP,
+    onSetRunning: NOOP,
+    onSetAutoApprove: NOOP,
+    onRemove: NOOP,
+    onSetToolDisabled: NOOP,
+  };
+  return vnodeToText(mcpServersBody(props));
+}
+
+describe('mcpServersBody (Loadable discipline)', () => {
+  it('not-loaded renders the page chrome and no figures, rows or error', () => {
+    const text = body({ status: 'not-loaded' });
+    expect(text).toContain('Context cost');
+    expect(text).toContain('Servers');
+    expect(text).not.toContain('showSkeleton="true"');
+    expect(text).not.toContain('mcp-cost-headline');
+    expect(text).not.toContain('mcp-server-block');
+    expect(text).not.toContain('empty-state');
+    expect(text).not.toContain('<LoadableError');
+  });
+
+  it('raises the skeleton once the delay elapses, and shows no figure', () => {
+    const text = body({ status: 'loading' }, true);
+    expect(text).toContain('showSkeleton="true"');
+    expect(text).not.toContain('tokens per request');
+    expect(text).not.toContain('mcp-server-block');
+  });
+
+  it('holds the skeleton back before the delay, so a fast load never flashes', () => {
+    expect(body({ status: 'loading' }, false)).not.toContain('showSkeleton="true"');
+  });
+
+  it('failed renders the error, distinct from empty, and drops the list', () => {
+    const text = body({ status: 'failed', error: 'Connection refused', httpCode: 500 });
+    expect(text).toContain('<LoadableError');
+    expect(text).toContain('noun="MCP servers"');
+    expect(text).toContain('error="Connection refused"');
+    expect(text).not.toContain('empty-state');
+    expect(text).not.toContain('mcp-server-block');
+  });
+
+  it('loaded with no servers renders the empty state, not an error', () => {
+    const text = body({ status: 'loaded', data: response({ servers: [], totals: totals({ servers: 0, running_servers: 0, tools: 0, chars: 0, tokens: 0 }) }) });
+    expect(text).toContain('No MCP servers registered');
+    expect(text).not.toContain('Failed to load');
+    expect(text).not.toContain('mcp-server-block');
+  });
+
+  it('loaded renders a row per server plus the header figures', () => {
+    const text = body({ status: 'loaded', data: response() });
+    expect(text).toContain('Slack');
+    expect(text).toContain('mcp-server-block');
+    expect(text).toContain('1 server on, 1 tool, ~200 tokens per request');
+    expect(text).not.toContain('empty-state');
+  });
+
+  it('says once that a running server only runs for this session', () => {
+    const text = body({ status: 'loaded', data: response() });
+    expect(text).toContain('Nothing starts an MCP server when the engine starts');
+  });
+});
+
+describe('the skeleton row is the real row', () => {
+  it('draws the same structure with no data in it', () => {
+    const text = vnodeToText(mcpServerRow({ sk: true }));
+    for (const cls of ['mcp-server-block', 'mcp-server-heading', 'label label-neutral', 'mcp-server-id', 'mcp-server-cost', 'mcp-switch', 'action-btn-danger']) {
+      expect(text, `the skeleton row dropped ${cls}`).toContain(cls);
+    }
+    expect(text).not.toContain('Slack');
+    expect(text).not.toContain('tokens');
+  });
+});
+
+describe('header cost figures', () => {
+  it('reports servers on, tools, tokens and the share of the request budget', () => {
+    const summary = mcpHeaderSummary(
+      totals({ running_servers: 2 }),
+      200000,
+      'claude-sonnet-5',
+      budget({ sent_tools: 23, sent_chars: 72000, sent_tokens: 28800 }),
+    );
+    expect(summary.live).toBe('2 servers on, 23 tools, ~29k tokens per request');
+    // Chars over the request's char budget: a quarter of it is 25%, where
+    // tokens over the raw window would have said 14%.
+    expect(summary.share).toBe('25% of what a request to claude-sonnet-5 can carry (200k context window)');
+  });
+
+  it('never reports a real cost as 0% of the budget', () => {
+    const summary = mcpHeaderSummary(totals(), 200000, 'claude-sonnet-5', budget({ sent_chars: 300 }));
+    expect(summary.share).toBe('Under 1% of what a request to claude-sonnet-5 can carry (200k context window)');
+  });
+
+  it('states a 1M window as 1M, matching the marker the id carries', () => {
+    const summary = mcpHeaderSummary(
+      totals(),
+      1_000_000,
+      'claude-opus-5[1m]',
+      budget({ request_chars: 1_488_000, sent_chars: 0 }),
+    );
+    expect(summary.share).toBe('0% of what a request to claude-opus-5[1m] can carry (1M context window)');
+  });
+
+  it('omits the share when the engine reports no budget', () => {
+    expect(mcpHeaderSummary(totals(), 0, 'mystery-model', budget({ request_chars: 0 })).share).toBeNull();
+  });
+
+  it("shows the engine's warning as it was written, and nothing when there is none", () => {
+    const warning = '3 tools are left out of every request.';
+    expect(mcpHeaderSummary(totals(), 200000, 'm', budget({ warning })).warning).toBe(warning);
+    expect(mcpHeaderSummary(totals(), 200000, 'm', budget()).warning).toBeNull();
+  });
+
+  it('renders the warning line in the header once the engine sends one', () => {
+    const warning = '3 tools are left out of every request.';
+    const text = body({ status: 'loaded', data: response({ budget: budget({ warning }) }) });
+    expect(text).toContain('mcp-cost-warning');
+    expect(text).toContain(warning);
+    expect(body({ status: 'loaded', data: response() })).not.toContain('mcp-cost-warning');
+  });
+
+  it('counts the off servers separately from the per-request total', () => {
+    const summary = mcpHeaderSummary(
+      totals({ running_servers: 1, stopped_tools: 40, stopped_tokens: 12000 }),
+      200000,
+      'claude-sonnet-5',
+      budget({ sent_tools: 3, sent_tokens: 900 }),
+    );
+    expect(summary.live).toBe('1 server on, 3 tools, ~900 tokens per request');
+    expect(summary.stopped).toBe('40 more tools available, ~12k tokens if switched on');
+  });
+
+  it('states the disabled subtotal so the per-tool switch visibly pays', () => {
+    const summary = mcpHeaderSummary(totals({ disabled_tools: 3, disabled_tokens: 800 }), 200000, 'm', budget());
+    expect(summary.disabled).toBe('3 tools switched off, keeping ~800 tokens out of every request');
+  });
+
+  it('has nothing to say about off servers or off tools when there are none', () => {
+    const summary = mcpHeaderSummary(totals(), 200000, 'm', budget());
+    expect(summary.stopped).toBeNull();
+    expect(summary.disabled).toBeNull();
+  });
+
+  it('states what a request sends, not the offered total, once tools are dropped', () => {
+    const summary = mcpHeaderSummary(
+      totals({ running_servers: 2, tools: 500, chars: 750000, tokens: 300000 }),
+      200000,
+      'claude-sonnet-5',
+      budget({ sent_tools: 48, sent_chars: 71000, sent_tokens: 28400 }),
+    );
+    expect(summary.live).toBe('2 servers on, 48 tools, ~28k tokens per request');
+    expect(summary.share).toBe('25% of what a request to claude-sonnet-5 can carry (200k context window)');
+  });
+
+  it('does not claim a cost when no server is on', () => {
+    const summary = mcpHeaderSummary(totals({ running_servers: 0, tools: 0, tokens: 0 }), 200000, 'm', budget());
+    expect(summary.live).toBe('No servers on, so MCP adds nothing to a request');
+  });
+});
+
+describe('per-server cost, stated in the tense its state allows', () => {
+  it('a running server pays now', () => {
+    expect(mcpServerCostLine(server())).toBe('1 tool, ~200 tokens in every request.');
+    expect(mcpServerStateLabel(server())).toBe('Running, this session');
+  });
+
+  it('a stopped server states it conditionally and stamps the manifest', () => {
+    const line = mcpServerCostLine(server({ running: false, tools_source: 'cache' }));
+    expect(line).toContain('Would add 1 tool, ~200 tokens if switched on.');
+    expect(line).toContain('Tools last seen 3d ago.');
+    expect(line).not.toContain('in every request');
+  });
+
+  it('a never-observed server is not a zero-cost server', () => {
+    const unobserved = server({
+      running: false,
+      tools_source: 'never-observed',
+      tools_observed_at: null,
+      tools: [],
+      chars: 0,
+      tokens: 0,
+    });
+    const zeroCost = server({
+      running: false,
+      tools_source: 'cache',
+      tools: [],
+      chars: 0,
+      tokens: 0,
+    });
+    expect(mcpServerCostLine(unobserved)).toBe(
+      'Tools never observed, so what this server would cost is unknown. Start it once to find out.',
+    );
+    expect(mcpServerCostLine(zeroCost)).toContain('Would add 0 tools, ~0 tokens if switched on.');
+    expect(mcpServerCostLine(unobserved)).not.toBe(mcpServerCostLine(zeroCost));
+  });
+});
+
+describe('the undispatchable row', () => {
+  const backstage = server({
+    id: 'back.stage',
+    name: 'Backstage',
+    running: false,
+    dispatchable: false,
+    tools_source: 'cache',
+  });
+
+  it('offers Remove and no way to start', () => {
+    const text = vnodeToText(mcpServerRow({ server: backstage }));
+    expect(text).toContain('Remove');
+    expect(text).toContain('data-state="undispatchable"');
+    // Both switches are gone: with nothing callable, neither has anything to
+    // act on, and a Run toggle would invite a retry that can never work.
+    expect(text).not.toContain('mcp-switch');
+    expect(text).not.toContain('ariaLabel="Run Backstage"');
+  });
+
+  it('says why, where the user is looking', () => {
+    const text = vnodeToText(mcpServerRow({ server: backstage }));
+    expect(text).toContain("This server's id cannot be used on the wire");
+    expect(mcpServerStateLabel(backstage)).toBe('Unusable id');
+  });
+
+  it('is distinct from an ordinary stopped row, which does offer Run', () => {
+    const text = vnodeToText(mcpServerRow({ server: server({ running: false, tools_source: 'cache' }) }));
+    expect(text).toContain('ariaLabel="Run Slack"');
+    expect(text).toContain('data-state="stopped"');
+  });
+});
+
+describe('a row mid-verb and a row that failed', () => {
+  it('shows pending rather than flipping the switch', () => {
+    const text = vnodeToText(mcpServerRow({ server: server({ running: false, tools_source: 'cache' }), pending: 'start' }));
+    expect(text).toContain('Starting...');
+    expect(text).toContain('disabled="true"');
+  });
+
+  it('holds the tool switches while a server verb runs', () => {
+    // The verb reloads the list when it settles, and that reply predates a
+    // flip made under it, so an open switch here would bounce back.
+    const busy = vnodeToText(mcpServerRow({ server: server(), expanded: true, pending: 'start' }));
+    const idle = vnodeToText(mcpServerRow({ server: server(), expanded: true }));
+    expect(busy).toMatch(/disabled="true" ariaLabel="Offer /);
+    expect(idle).not.toMatch(/disabled="true" ariaLabel="Offer /);
+    expect(idle).toContain('ariaLabel="Offer mcp__slack__post_message to the agent"');
+  });
+
+  it('renders the failure inline on the row, tagged by kind', () => {
+    const text = vnodeToText(
+      mcpServerRow({
+        server: server({ running: false, tools_source: 'cache' }),
+        error: { kind: 'start-failed', message: "MCP server 'slack' failed to start: npx not found" },
+      }),
+    );
+    expect(text).toContain('mcp-row-error');
+    expect(text).toContain('data-kind="start-failed"');
+    expect(text).toContain('npx not found');
+  });
+});
+
+describe('describeMcpRowError', () => {
+  function apiError(httpCode: number, reason: string): Error {
+    return Object.assign(new Error(`${httpCode} ${reason}`), { httpCode, reason });
+  }
+
+  it('separates the three route failures the engine distinguishes', () => {
+    expect(describeMcpRowError(apiError(422, 'id cannot be used')).kind).toBe('unusable-id');
+    expect(describeMcpRowError(apiError(502, 'npx not found')).kind).toBe('start-failed');
+    expect(describeMcpRowError(apiError(404, "MCP server 'x' not found")).kind).toBe('gone');
+  });
+
+  it('carries the message from the engine, so the user can see what to fix', () => {
+    expect(describeMcpRowError(apiError(502, 'npx not found')).message).toBe('npx not found');
+  });
+
+  it('falls back for anything that is not an ApiError', () => {
+    const described = describeMcpRowError(new Error('Load failed'));
+    expect(described.kind).toBe('other');
+    expect(described.message).toBe('Load failed');
+  });
+});
+
+describe('the tool list', () => {
+  const cheap = tool({ name: 'a', wire_name: 'mcp__slack__a', tokens: 10 });
+  const dear = tool({ name: 'b', wire_name: 'mcp__slack__b', tokens: 900 });
+  const middling = tool({ name: 'c', wire_name: 'mcp__slack__c', tokens: 100 });
+
+  it('is ordered by descending cost, because the expensive one is the point', () => {
+    const sorted = sortToolsByCost([cheap, dear, middling]);
+    expect(sorted.map((t) => t.wire_name)).toEqual([
+      'mcp__slack__b',
+      'mcp__slack__c',
+      'mcp__slack__a',
+    ]);
+  });
+
+  it('shows the spelling the server uses only where it differs from the wire name', () => {
+    const renamed = tool({ name: 'catalog.get-entity', wire_name: 'mcp__x__catalog_get_entity' });
+    const expandedRow = (t: McpToolStatus) =>
+      vnodeToText(mcpServerRow({ server: server({ tools: [t] }), expanded: true }));
+    expect(expandedRow(renamed)).toContain('The server calls it catalog.get-entity');
+    expect(expandedRow(tool({ name: 'same', wire_name: 'same' }))).not.toContain('The server calls it');
+  });
+
+  it('offers no switch for a tool with no usable wire name', () => {
+    const orphan = tool({ name: 'broken', wire_name: null, tokens: 0 });
+    const text = vnodeToText(mcpServerRow({ server: server({ tools: [orphan] }), expanded: true }));
+    expect(text).toContain('data-state="uncallable"');
+    expect(text).toContain('it can never be called and costs nothing');
+    expect(text).not.toContain('ariaLabel="Offer');
+  });
+});
+
+describe('the optimistic per-tool switch', () => {
+  const a = tool({ name: 'a', wire_name: 'mcp__slack__a' });
+  const b = tool({ name: 'b', wire_name: 'mcp__slack__b', disabled: true });
+
+  it('sends the whole set, by wire name, read off the flipped page', () => {
+    const before = response({ servers: [server({ tools: [a, b] })] });
+    const off = patchToolDisabled(before, 'slack', 'mcp__slack__a', true);
+    expect(disabledWireNames(off.servers[0]).sort()).toEqual([
+      'mcp__slack__a',
+      'mcp__slack__b',
+    ]);
+    const on = patchToolDisabled(off, 'slack', 'mcp__slack__b', false);
+    expect(disabledWireNames(on.servers[0])).toEqual(['mcp__slack__a']);
+  });
+
+  it('carries an earlier flip along, so two quick clicks cannot undo each other', () => {
+    // Both writes send the same final set, whichever order their round trips
+    // settle in. The bug this pins: a set computed per click sends [A] and
+    // [B], and whichever lands last re-enables the other tool.
+    const base = response({ servers: [server({ tools: [a, tool({ name: 'b', wire_name: 'mcp__slack__b' })] })] });
+    const first = patchToolDisabled(base, 'slack', 'mcp__slack__a', true);
+    const second = patchToolDisabled(first, 'slack', 'mcp__slack__b', true);
+    expect(disabledWireNames(second.servers[0]).sort()).toEqual([
+      'mcp__slack__a',
+      'mcp__slack__b',
+    ]);
+  });
+
+  it('never invents a wire name for a tool that has none', () => {
+    const orphan = tool({ name: 'broken', wire_name: null, disabled: true });
+    expect(disabledWireNames(server({ tools: [orphan] }))).toEqual([]);
+  });
+
+  it('moves the switch and no figure, so no ratio is ever derived here', () => {
+    const before = response({ servers: [server({ tools: [a, b] })] });
+    const after = patchToolDisabled(before, 'slack', 'mcp__slack__a', true);
+    expect(after.servers[0].tools[0].disabled).toBe(true);
+    expect(after.servers[0].tokens).toBe(before.servers[0].tokens);
+    expect(after.servers[0].disabled_tokens).toBe(before.servers[0].disabled_tokens);
+    expect(after.totals).toBe(before.totals);
+  });
+});
+
+describe('every figure comes from the API', () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const SOURCES = ['../McpServersPage.tsx', '../mcpCost.ts'].map((p) =>
+    readFileSync(resolve(here, p), 'utf8'),
+  );
+
+  it('never turns chars into tokens in the frontend', () => {
+    // The Context Viewer once reported a measured 205k prompt as 361k, because
+    // a hand-copied chars-per-token ratio lived in TypeScript. `chars` is
+    // rendered nowhere and converted nowhere: the page formats `tokens`.
+    for (const src of SOURCES) {
+      expect(src).not.toMatch(/chars\s*[*/]/);
+      expect(src).not.toMatch(/[*/]\s*2\.5/);
+      expect(src).not.toMatch(/estimateTokens/);
+    }
+  });
+});
+
+describe('an SSE reload never reverts a switch flipped under it', () => {
+  // The page's write races live inside the component, so this is a source
+  // scan rather than a render. What it pins is the pairing: the SSE-driven
+  // reload reads `localWrites` before it starts and drops its reply if the
+  // counter moved, and BOTH local write paths move it. Drop either half and a
+  // reload fired by the user's own flip reverts the next one (`18874e1da`).
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src: string = readFileSync(resolve(here, '../McpServersPage.tsx'), 'utf8');
+
+  it('drops an SSE reload whose reply predates a local write', () => {
+    expect(src).toMatch(/const startedAt = localWrites\.current;/);
+    expect(src).toMatch(/refresh\(\(\) => localWrites\.current === startedAt\)/);
+  });
+
+  it('bumps the counter on the optimistic tool flip', () => {
+    // Before the optimistic paint, so a reload started after it sees the move.
+    expect(src).toMatch(/localWrites\.current\+\+;\s*\n\s*showData\(patchToolDisabled\(/);
+  });
+
+  it('bumps the counter on a row verb', () => {
+    expect(src).toMatch(/localWrites\.current\+\+;\s*\n\s*setPending\(/);
+  });
+
+  it('keeps the counter a ref, so no render is needed to read it', () => {
+    // A reactive signal would be read at render time, and the reply arrives
+    // between renders. It has to be readable exactly when the data lands.
+    expect(src).toMatch(/const localWrites = useRef\(0\);/);
+  });
+});
