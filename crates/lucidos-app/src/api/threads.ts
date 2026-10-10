@@ -1,0 +1,597 @@
+import { API, ApiError, json, mutatingFetch, throwIfNotOk } from './client';
+import type { ThreadSection, ThreadInitiator, ThreadAggregate, EventWaitSummary, ThreadComposeState } from '../store/thread-events';
+import type { ThreadStatus } from '../generated/thread-lifecycle';
+import type { ComposeSelectionOverride } from '../store/composeSelections';
+import type { UnproposedReason } from '../generated/thread-event-wire';
+import type { AppKind } from '../store/types';
+
+/** What a coding-agent thread's branch holds, as the engine projects it (ADR
+ *  0400). `none`: no work against main. `unproposed`: work with no pending
+ *  change, and `reason` says why a turn end withheld it. `proposed`: a pending
+ *  change, which Apply acts on. The summary and the aggregate carry the same
+ *  object, so its inner keys stay snake_case in both. */
+export type CodingAgentChangeState =
+  | { kind: 'none' }
+  | { kind: 'unproposed'; reason: UnproposedReason | null }
+  | { kind: 'proposed'; requires_restart: boolean };
+
+export interface ThreadSummary {
+  thread_id: string;
+  title: string;
+  channel: string;
+  initiator: ThreadInitiator;
+  created_at: string;
+  last_activity: string;
+  /** When the user last drove this thread forward. The drawer sorts by this so
+   *  background agent churn no longer reshuffles the list. Always sent by the
+   *  engine; optional only so test mocks needn't supply it. */
+  last_user_action?: string;
+  /** When the agent (or trigger) last did something. Drives the thread-row
+   *  tooltip's "Agent ·" line, distinct from `last_user_action`. */
+  last_agent_action?: string;
+  message_count: number;
+  /** Whether the user parked this thread in the Saved section. `GET
+   *  /api/v1/threads` also says this structurally (saved threads come back in
+   *  its own `saved` array, which is what `loadAllThreads` reads); this field is
+   *  what makes the by-id fetch self-sufficient, since one bare summary carries
+   *  no such array. Both come from `thread_summaries.is_saved`, so they agree.
+   *  Optional only so test mocks needn't supply it. */
+  saved?: boolean;
+  /** Whether this is the workspace's home thread (ADR 0362). The engine sends
+   *  it only when true. */
+  home?: boolean;
+  section: ThreadSection;
+  active_children_count: number;
+  /** Direct children idle on their own live event wait. Such a child has not
+   *  finished (ADR 0254), so the parent waits on it as on an active one.
+   *  Absent on an engine that predates the field. */
+  waiting_children_count?: number;
+  total_children_count: number;
+  /** Count of descendants (transitive) currently in a state that blocks this
+   *  thread from being archived. Maintained by EventBus on
+   *  `thread_summaries.blocking_descendant_count`. Consumed by
+   *  `resolveActions` via `count > 0`; the raw count enables UI like
+   *  "3 sub-threads still busy". */
+  blocking_descendant_count: number;
+  /** Count of descendants (transitive) currently in a state that needs user
+   *  attention (WaitingForUserAnswer, or an in-workspace coding-agent thread with
+   *  pending changes). Strict subset of `blocking_descendant_count` — drops
+   *  the Running case. Consumed by `displaySection` via `count > 0` to bubble
+   *  the parent to REVIEW even when sibling descendants are still running. */
+  attention_descendant_count: number;
+  /** Whether this thread is a *stopped child* (ADR 0252). Absent on an engine
+   *  that predates the field. */
+  is_stopped_child?: boolean;
+  /** The *read request* (ADR 0409). Absent on an engine that predates it. */
+  read_requested?: boolean;
+  /** How many event waits this thread holds unresolved. Consumed by
+   *  `resolveVisualStatus` via `count > 0` to paint the Waiting status dot: a
+   *  thread watching for an event is not finished, and this is what says so on
+   *  a row whose events were never loaded. */
+  live_event_wait_count: number;
+  /** The same waits the count counts, spelled out. This is the whole content of
+   *  the waiting indicator, and carrying it here is what lets a snapshot
+   *  correct it. The client used to build the list ONLY by folding a thread's
+   *  own `EventWait*` events. One missed `EventWaitDelivered` then left a
+   *  resolved wait on screen with a live countdown, permanently.
+   *
+   *  Optional so test mocks needn't supply it, and absence is NOT emptiness:
+   *  `upsertThread` leaves an existing list alone when the field is missing and
+   *  clears it only on an explicit `[]`. */
+  live_event_waits?: EventWaitSummary[];
+  /** Thread status computed by the backend. One of the generated `ThreadStatus`
+   *  values. Nothing writes 'waiting' any more; historical rows may hold it. */
+  status: ThreadStatus;
+  /** The row's version (`ThreadMeta.summaryVersion`). */
+  summary_version: number;
+  /** What the coding-agent branch holds (ADR 0400). See `CodingAgentChangeState`. */
+  coding_agent_change_state: CodingAgentChangeState;
+  /** Whether the coding-agent thread is working on an external repo. */
+  coding_agent_is_external_repo: boolean;
+  /** When the thread last entered 'running' state (ISO string or null). */
+  last_revived_at: string | null;
+  /** Parent thread that spawned this one (null for user-initiated threads). */
+  parent_thread_id?: string | null;
+  /** Cached title of the parent thread — null when no parent or no title yet. */
+  parent_thread_title?: string | null;
+  /** Trigger that fired this thread (only for `channel === 'trigger'`). */
+  trigger_id?: string | null;
+  /** Trigger name at fire-time (snapshot — falls back when the trigger is renamed/deleted). */
+  trigger_name?: string | null;
+  /** Repository the coding-agent thread bound to (only for `channel === 'claude_code'`). */
+  cc_repo_id?: string | null;
+  /** Current repo name from the registry — null when the repo was deleted. */
+  cc_repo_name?: string | null;
+  /** Coding-agent thread flavor: 'lucidos' | 'app' | 'external'. Drives
+   *  app-specific affordances like the WIP preview button and the app-icon
+   *  branch chip. Null for non-coding-agent threads and legacy coding-agent rows (consumers
+   *  default null → 'lucidos'). */
+  coding_agent_kind?: 'lucidos' | 'app' | 'external' | null;
+  /** Canonical folder the coding agent operates on. For `coding_agent_kind ===
+   *  'app'`, the last segment is the app id (`<ws>/data/apps/<id>/`). Null
+   *  for non-coding-agent threads and legacy rows. */
+  coding_agent_folder?: string | null;
+  /** Which backend drives this thread: 'claude-code' | 'codex'. Null for
+   *  non-coding-agent threads and legacy coding-agent rows (consumers default null →
+   *  'claude-code'). */
+  coding_agent?: 'claude-code' | 'codex' | null;
+  /** Compose state machine: 'composing' (draft) | 'active' | 'discarded'. The
+   *  archive flag lives on the separate `archive_state` field — an archived
+   *  thread carries `state='active'` plus `archive_state='archived'`. */
+  state: ThreadComposeState;
+  /** In-progress compose text. Empty when nothing typed. */
+  compose_text: string;
+  /** Currently-attached compose image URLs. Empty array when none. */
+  compose_images: string[];
+  /** User's mode preference while composing. Null once the thread is no longer composing. */
+  compose_mode?: 'lucidos' | 'claude_code' | null;
+  /** Per-draft dropdown selections (target/scope, coding agent, Lucidos model +
+   *  reasoning, coding-agent model + reasoning) — the DB-backed authoritative
+   *  store, so a reload rehydrates the draft's picks. A partial override; absent
+   *  fields resolve to the account default. Null/absent = no per-draft picks. */
+  compose_selection?: ComposeSelectionOverride | null;
+  /** The thread's *compose epoch*: how many times a submission has consumed its
+   *  compose slot. Echoed back on every compose PUT so the engine can refuse a
+   *  write composed before a submission that has since landed. Absent on a
+   *  pre-epoch engine, which leaves those writes unfenced. */
+  compose_epoch?: number;
+}
+
+export interface ThreadsResponse {
+    saved: ThreadSummary[];
+    archive: ThreadSummary[];
+    /** Total size of the archived pile (`archive_state='archived'`, unsaved) —
+     *  NOT just the loaded `archive` window. The Archive section's
+     *  count badge reads this so it shows the true total. Optional for graceful
+     *  degradation: an older engine (or a test mock) that omits it falls back
+     *  to the loaded count. */
+    archive_count?: number;
+    active: string[];
+    active_threads: ThreadSummary[];
+    /** Threads in `composing` state — the Drafts surface. Newest-first. */
+    composing: ThreadSummary[];
+    /** Ancestors + descendants of the other lists that aren't already in them.
+     *  Loaded eagerly so the drawer's family-aware sort can nest every child
+     *  under its parent — see `ThreadDrawer.tsx → categorizeThreads`. These
+     *  threads MUST NOT advance the pagination cursor; treat them as
+     *  display-only fill-in. */
+    family_threads: ThreadSummary[];
+    /** Included when the focused thread isn't in the other lists. */
+    focused_thread?: ThreadSummary;
+    /** The home thread, whatever window the lists above cut. Null before the
+     *  engine has created it; absent from an older engine or a test mock. */
+    home_thread?: ThreadSummary | null;
+}
+
+export async function fetchThreads(focusedThreadId?: string): Promise<ThreadsResponse> {
+    const params = focusedThreadId ? `?focused=${encodeURIComponent(focusedThreadId)}` : '';
+    return json(`${API}/threads${params}`);
+}
+
+/** One thread's summary by id, or null when the engine has no such thread.
+ *
+ *  The cheap complement to `fetchThreads`: that endpoint assembles saved +
+ *  recent archive + active + composing + the family base, which on a large
+ *  workspace is hundreds of milliseconds of server time (measured p50 262ms /
+ *  p90 359ms at ~5k threads) before any network cost. Bootstrapping ONE thread
+ *  through it, which is what a notification tap landing outside the loaded
+ *  window does, pays that whole bill to learn about a single row.
+ *
+ *  A 404 is a verdict ("no such thread") and returns null; every other failure
+ *  throws, because callers holding durable navigation state must distinguish
+ *  "gone" from "could not ask" and retry only the latter. See
+ *  `focusThreadOrBootstrapResult` and `landThreadHash`. */
+export async function fetchThreadById(threadId: string): Promise<ThreadSummary | null> {
+    try {
+        return await json<ThreadSummary>(`${API}/threads/${encodeURIComponent(threadId)}`);
+    } catch (err) {
+        if (err instanceof ApiError && err.httpCode === 404) return null;
+        throw err;
+    }
+}
+
+async function postThreadAction(path: string, body: Record<string, unknown>): Promise<Response> {
+    const res = await mutatingFetch(`${API}/threads/${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    await throwIfNotOk(res);
+    return res;
+}
+
+export async function saveThread(threadId: string): Promise<void> {
+    await postThreadAction('save', { thread_id: threadId });
+}
+
+export async function unsaveThread(threadId: string): Promise<void> {
+    await postThreadAction('unsave', { thread_id: threadId });
+}
+
+/** A cascade member the archive left unarchived, and why. `reason` is
+ *  `apply_in_progress` / `discard_in_progress` when a change claim holds its
+ *  session, `not_archivable` otherwise; `message` is the engine's own words. */
+export interface ArchiveSkippedMember {
+  thread_id: string;
+  reason: string;
+  message: string;
+}
+
+/** Cascading archive — backend archives the target thread and every
+ *  descendant in one transaction. Returns the list of thread IDs whose
+ *  ThreadArchived event was emitted (excludes descendants that were
+ *  already archived), and the members it had to leave unarchived. 409
+ *  surfaces as ApiError with the engine's structured reason
+ *  ("parent_not_archivable" | "descendants_blocking" |
+ *  "apply_in_progress" | "discard_in_progress", each with `message`).
+ *  `skipped` is optional because an older engine does not send it. */
+export async function archiveThread(
+  threadId: string,
+): Promise<{ archived: string[]; skipped?: ArchiveSkippedMember[] }> {
+    const res = await postThreadAction('archive', { thread_id: threadId });
+    return res.json();
+}
+
+/** What Archive all would do to the Current section (ADR 0349). It counts
+ *  inbox threads, sub-threads included, as the Current badge does. `safe`
+ *  lists the family roots to send back; `safe_thread_count` counts the threads
+ *  their archives take. A pinned family sits in Pinned and is not counted.
+ *
+ *  `kept` counts each inbox thread that stays. A kept family counts once under
+ *  its first reason: `question` | `pending_change` | `unproposed_work` |
+ *  `draft` | `failed_run` | `busy`. Its other threads count under
+ *  `ARCHIVE_ALL_SAME_FAMILY`. A pinned sub-thread of a safe family counts under
+ *  `ARCHIVE_ALL_PINNED_SUB_THREAD`. */
+export interface ArchiveAllPreflight {
+  safe: { thread_id: string; title: string }[];
+  safe_thread_count: number;
+  kept: Record<string, number>;
+  kept_thread_count: number;
+}
+
+/** A confirmed family Archive all left open: `thread_count` is its inbox
+ *  threads, root included. */
+export interface ArchiveAllKept {
+  thread_id: string;
+  reason: string;
+  slug: string;
+  thread_count: number;
+}
+
+export async function archiveAllPreflight(): Promise<ArchiveAllPreflight> {
+    return json<ArchiveAllPreflight>(`${API}/threads/archive-all-preflight`);
+}
+
+/** Archive the confirmed threads that are still safe. `archived` lists every
+ *  member the cascades took, which is what Undo hands back to `unarchiveThreads`. */
+export async function archiveAll(
+  threadIds: string[],
+): Promise<{ archived: string[]; kept: ArchiveAllKept[] }> {
+    const res = await postThreadAction('archive-all', { thread_ids: threadIds });
+    return res.json();
+}
+
+/** Move archived threads back to the inbox. Archive all's Undo names every
+ *  id; the thread menu's Move to Current passes `withSubThreads`, so the
+ *  engine brings the family back as Archive took it. */
+export async function unarchiveThreads(
+  threadIds: string[],
+  { withSubThreads = false }: { withSubThreads?: boolean } = {},
+): Promise<{ unarchived: string[] }> {
+    const res = await postThreadAction('unarchive', { thread_ids: threadIds, with_sub_threads: withSubThreads });
+    return res.json();
+}
+
+/** One family member the delete cascade refuses to run over. */
+export interface DeleteBlockingMember {
+  thread_id: string;
+  title: string | null;
+  /** `running` | `waiting_for_user_answer` | `pending_change` | `agent_session_live`. */
+  reason: string;
+}
+
+/** Everything the delete confirmation may say, from one locked read on the
+ *  engine. Each flag gates exactly one line of the dialog, so a warning that
+ *  does not apply is never shown. */
+export interface DeletePreflight {
+  thread_count: number;
+  sub_thread_titles: string[];
+  memory_count: number;
+  /** Model-written summary tree lines the delete sends back to be rebuilt,
+   *  each one background model call. */
+  summary_rebuild_count: number;
+  has_unapplied_branch_work: boolean;
+  has_applied_changes: boolean;
+  backups_present: boolean;
+  blocked_by: DeleteBlockingMember[];
+}
+
+/** What the delete would take, asked before the dialog opens.
+ *
+ *  Owner-gated like the delete itself: it carries sub-thread titles, so an
+ *  agent that cannot delete must not read the family through it either. */
+export async function deletePreflight(threadId: string): Promise<DeletePreflight> {
+    return json<DeletePreflight>(
+        `${API}/threads/delete-preflight?thread_id=${encodeURIComponent(threadId)}`,
+    );
+}
+
+/** Delete a thread and every sub-thread under it. There is no undo.
+ *
+ *  Returns the ids that went, so the caller can drop them from the thread map
+ *  without waiting for the `ThreadsDeleted` frame to come back round. A 409
+ *  surfaces as `ApiError` carrying the same `{reason, blocking}` body archive
+ *  answers with. */
+export async function deleteThreadFamily(
+    threadId: string,
+): Promise<{ deleted: string[]; event_count: number; memory_count: number }> {
+    const res = await postThreadAction('delete', { thread_id: threadId });
+    return res.json();
+}
+
+/** Move a child thread to top level (ADR 0278). Its former parent stops
+ *  waiting for it. The child keeps running. */
+export async function detachThread(threadId: string): Promise<void> {
+    const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/detach`, {
+        method: 'POST',
+    });
+    await throwIfNotOk(res);
+}
+
+/** Report that the user saw the reply a *read request* points at (ADR 0409),
+ *  as of the thread's `summaryVersion`. Clears the request; a second device
+ *  seeing the same reply adds nothing. A 409 means the thread changed since. */
+export async function markReplySeen(threadId: string, summaryVersion: number): Promise<void> {
+    const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/read-request/seen`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ summary_version: summaryVersion }),
+    });
+    await throwIfNotOk(res);
+}
+
+export async function renameThread(threadId: string, title: string): Promise<void> {
+    await postThreadAction('rename', { thread_id: threadId, title });
+}
+
+export async function suggestTitle(threadId: string): Promise<string> {
+    const res = await postThreadAction('suggest-title', { thread_id: threadId });
+    const data = await res.json();
+    return data.title;
+}
+
+export interface ThreadSearchResult extends ThreadSummary {
+  score: number;
+}
+
+export async function searchThreads(query: string, signal?: AbortSignal): Promise<ThreadSearchResult[]> {
+  const data = await json<{ results: ThreadSearchResult[] }>(
+    `${API}/threads/search?q=${encodeURIComponent(query)}`,
+    { signal },
+  );
+  return data.results;
+}
+
+export interface OlderThreadsResponse {
+    threads: ThreadSummary[];
+    /** Family members of `threads` not already in the loaded set. See
+     *  `ThreadsResponse.family_threads` — display-only, never drives the
+     *  pagination cursor. */
+    family_threads: ThreadSummary[];
+    has_more: boolean;
+}
+
+export async function fetchOlderThreads(
+  before: string,
+  limit = 15,
+  /** Preferred source names are `chat`, `trigger`, `coding-agent`; the backend
+   *  also accepts legacy `claude_code` for compatibility. */
+  sources?: string[],
+  triggerIds?: string[],
+  repoIds?: string[],
+  appIds?: string[],
+): Promise<OlderThreadsResponse> {
+    const params = new URLSearchParams({ before, limit: String(limit) });
+    setDrawerFilterParams(params, sources, triggerIds, repoIds, appIds);
+    return json<OlderThreadsResponse>(`${API}/threads/older?${params}`);
+}
+
+/** The drawer filter as query params. An absent or empty list sets nothing. */
+function setDrawerFilterParams(
+  params: URLSearchParams,
+  sources?: string[],
+  triggerIds?: string[],
+  repoIds?: string[],
+  appIds?: string[],
+): void {
+  if (sources && sources.length > 0) params.set('sources', sources.join(','));
+  if (triggerIds && triggerIds.length > 0) params.set('trigger_ids', triggerIds.join(','));
+  if (repoIds && repoIds.length > 0) params.set('repo_ids', repoIds.join(','));
+  if (appIds && appIds.length > 0) params.set('app_ids', appIds.join(','));
+}
+
+/** True size of the archived pile (`archive_state='archived'`, unsaved) matching
+ *  the active drawer filter. It drives the Archive badge, so the number
+ *  reflects the filter and stays stable regardless of how many rows are loaded.
+ *  Mirrors `fetchOlderThreads`'s filter params (no cursor — it's a COUNT). Omit
+ *  all four to count the whole pile. */
+export async function fetchArchivedCount(
+  sources?: string[],
+  triggerIds?: string[],
+  repoIds?: string[],
+  appIds?: string[],
+): Promise<number> {
+  const params = new URLSearchParams();
+  setDrawerFilterParams(params, sources, triggerIds, repoIds, appIds);
+  const qs = params.toString();
+  const data = await json<{ count: number }>(`${API}/threads/archived-count${qs ? `?${qs}` : ''}`);
+  return data.count;
+}
+
+/** One selectable drawer-filter facet (trigger / repo) returned by
+ *  `/api/v1/threads/filter-facets`. `id` is the trigger id / repo UUID;
+ *  `last_activity` is the newest thread for that facet (ISO8601), used to
+ *  order deleted entries. `name` is populated for the repos facet (resolved
+ *  server-side from the live registry → `repo_names` projection, so a removed
+ *  repo carries its historical name); NULL for trigger facets, whose labels
+ *  the client resolves from its own registry. */
+export interface FilterFacet {
+  id: string | null;
+  name: string | null;
+  last_activity: string | null;
+}
+
+/** An app folder a coding-agent thread worked in, labelled by the engine
+ *  (`AppFilterFacet` in `core/store/threads/mod.rs`). The apps list never holds a widget
+ *  (ADR 0402), so only the engine can say what a facet is. A removed folder has
+ *  no `name`, and keeps the `kind` its deletion recorded (ADR 0404). */
+export interface AppFilterFacet {
+  id: string;
+  name: string | null;
+  kind: AppKind | null;
+  deleted: boolean;
+  last_activity: string | null;
+}
+
+export interface FilterFacets {
+  triggers: FilterFacet[];
+  repos: FilterFacet[];
+  apps: AppFilterFacet[];
+}
+
+/** Complete set of selectable filter facets — every trigger/repo/app that has
+ *  at least one thread, so the drawer "Show" dropdown lists them all regardless
+ *  of what's currently loaded. */
+export async function fetchFilterFacets(): Promise<FilterFacets> {
+    return json<FilterFacets>(`${API}/threads/filter-facets`);
+}
+
+export type ThreadEventRow = {
+  sequence: number;
+  event_type: string;
+  payload: Record<string, unknown>;
+  created: string;
+  event_id: string;
+};
+
+/** Wraps `events[]` with `currentAggregate` so the historical-replay path
+ *  applies meta from a fetched snapshot — same source-of-truth model as live
+ *  SSE per-event aggregate. Without it, refresh paths can't reconstruct meta
+ *  from events alone (event types no longer carry derivation rules). */
+export type ThreadEventsSnapshot = {
+  events: ThreadEventRow[];
+  currentAggregate: ThreadAggregate | null;
+  /** Older events remain behind `events[0]`. Absent on an unpaged read, which
+   *  by definition carries them all. */
+  hasMore?: boolean;
+  /** The highest `sequence` the whole thread holds, sent only for a PAGE.
+   *
+   *  A page cannot supply it: a sequence is allocated globally and can run
+   *  against the clock, so the newest row by clock often does not hold the
+   *  highest one. Absent on an unpaged read, whose own rows are the watermark. */
+  maxSequence?: number;
+};
+
+export interface FetchThreadEventsOptions {
+  afterSeq?: number;
+  /** Opt the snapshot back into full `ContextCaptured` payloads. Default
+   *  false — the strip is on so heavy threads load fast. `exportThread.ts`
+   *  passes true so bug-report dumps stay complete. */
+  includeContext?: boolean;
+  /** Serve only the newest N events. Omitted means the whole history, which is
+   *  what the export path wants and what a short thread gets either way. */
+  limit?: number;
+  /** Page backwards from this event. Both halves travel together, because the
+   *  server orders rows by the pair. Take them from the oldest row you hold. */
+  before?: { created: string; sequence: number };
+}
+
+export async function fetchThreadEvents(
+  threadId: string,
+  options: FetchThreadEventsOptions | number = {},
+): Promise<ThreadEventsSnapshot> {
+  // Back-compat: callers passing a bare `afterSeq` number (the historical
+  // signature) keep working. New callers pass an options object.
+  const opts: FetchThreadEventsOptions = typeof options === 'number'
+    ? { afterSeq: options }
+    : options;
+  const params = new URLSearchParams();
+  if (opts.afterSeq !== undefined) params.set('after', String(opts.afterSeq));
+  if (opts.includeContext) params.set('include_context', 'true');
+  if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+  if (opts.before) {
+    params.set('before_created', opts.before.created);
+    params.set('before_seq', String(opts.before.sequence));
+  }
+  const query = params.toString() ? `?${params.toString()}` : '';
+  return json(`${API}/threads/${encodeURIComponent(threadId)}/events${query}`);
+}
+
+/** Payload returned by the lazy-load endpoint for one `ContextCaptured`
+ *  event. The snapshot endpoint strips these to keep the events list small;
+ *  the step-detail modal fetches them on open. Mirrors Rust
+ *  `ContextCapturePayload` in `api/threads/events_snapshot.rs`. */
+export interface ContextCapturePayload {
+  sections: import('../store/types').ContextSection[];
+  tools: string[];
+}
+
+/** Lazy-fetch `sections` + `tools` for one `ContextCaptured` event. Keyed on
+ *  `eventId` only — the route does not depend on the thread id, since the
+ *  modal can't always tell which thread the snap belongs to (it may be open
+ *  while focus has navigated elsewhere). */
+export async function fetchContextCapture(
+  eventId: string,
+): Promise<ContextCapturePayload> {
+  return json(`${API}/events/${eventId}/context`);
+}
+
+/** Payload returned by the lazy-load endpoint for one `ToolResult` event.
+ *  The snapshot endpoint strips `result` to keep the events list small;
+ *  the step-detail modal fetches it on open. `result` is `null` for
+ *  image-only tool results (no textual result was ever written).
+ *  Mirrors Rust `ToolResultPayload` in `api/threads/events_snapshot.rs`. */
+export interface ToolResultPayload {
+  result: string | null;
+}
+
+/** Lazy-fetch the `result` string for one `ToolResult` event. Same
+ *  event-id-only routing as `fetchContextCapture`. */
+export async function fetchToolResult(
+  eventId: string,
+): Promise<ToolResultPayload> {
+  return json(`${API}/events/${eventId}/tool-result`);
+}
+
+/** Payload returned by the lazy-load endpoint for one coding-agent tool call.
+ *  The snapshot strips `args` to keep the events list small; the step-detail
+ *  modal fetches it on open. `args` is `null` for a call that recorded none.
+ *  Mirrors Rust `ToolArgsPayload` in `api/threads/events_snapshot.rs`. */
+export interface ToolArgsPayload {
+  args: unknown;
+}
+
+/** Lazy-fetch the `args` for one coding-agent tool call. Same event-id-only
+ *  routing as `fetchContextCapture`.
+ *
+ *  Returns the RAW args, not a rendered string: the modal runs them through
+ *  `fullCommandForCCTool`, the same helper the inline fold uses, so a stripped
+ *  row and a live one format identically. */
+export async function fetchToolArgs(eventId: string): Promise<ToolArgsPayload> {
+  return json(`${API}/events/${eventId}/tool-args`);
+}
+
+/** Where one event lives. `thread_id` is `null` for an event that belongs to no
+ *  conversation (a workspace domain event, an app event, a trigger event): a
+ *  real answer, distinct from the 404 an unknown event id returns. Mirrors Rust
+ *  `EventLocation` in `api/threads/events_snapshot.rs`. */
+export interface EventLocation {
+  thread_id: string | null;
+}
+
+/** Resolve the thread one event belongs to. Same event-id-only routing as
+ *  `fetchContextCapture`. Used by the event-wait step's "show it", whose
+ *  matched event is normally in some OTHER thread. */
+export async function fetchEventLocation(eventId: string): Promise<EventLocation> {
+  return json(`${API}/events/${eventId}/location`);
+}

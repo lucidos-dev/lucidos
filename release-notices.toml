@@ -1,0 +1,167 @@
+# Release notices: what a user has to KNOW or DO after upgrading.
+#
+# Most releases carry none, and that is the point. The modal only appears when
+# a release actually needs something from the reader, so it stays rare enough
+# to be read. What merely CHANGED belongs in CHANGELOG.md.
+#
+# Entries are OLDEST FIRST, and the file order is the order the reader is
+# walked through them in. Append at the end. Never reorder an entry, never
+# delete one, and never reuse an id: a workspace remembers the last notice it
+# resolved BY ID, and its place in this file is what "after that one" means.
+#
+# Fields, all validated at parse time by
+# crates/lucidos-engine/src/engine/release_notices.rs:
+#
+#   id             stable forever, kebab-case. Names the notice, not its release.
+#   since          the release this applies FROM, plain semver, no leading "v".
+#                  A floor, not a stamp: the notice is invisible until the
+#                  engine reports that version or newer. For UNRELEASED work
+#                  that is the NEXT PATCH, never a guess at the eventual number:
+#                  a floor already reached by the release that ships it, and a
+#                  higher one would hide the notice if a patch shipped first.
+#                  Pick a further one only to hold a notice back deliberately.
+#                  A dev build reports the next patch itself (it is past the
+#                  published RELEASE), so it shows such a notice before it
+#                  ships and you can read the real card. A shipped install is
+#                  never release-dirty and sees it on its own release.
+#   title          one line. The modal's heading and the panel row's label.
+#   body           markdown. A link is how a notice points at a settings page.
+#   action_label   optional, and paired with action_prompt. Draws one button.
+#   action_prompt  optional. The button SENDS this sentence as a new message,
+#                  so write what the user would say, and make sure the knowhow
+#                  meant to answer it routes on those words. Say only enough to
+#                  REACH that knowhow. Spelling out what it will then do
+#                  restates what the recipe owns, and goes stale the day the
+#                  recipe moves.
+#
+# One action per notice, at most. Two things to do is two notices, because
+# acting closes the modal and moves the reader on to the next one.
+#
+# Reuse an action_prompt verbatim when a notice asks for the same thing as an
+# earlier one. Among the notices a workspace owes, the modal draws a shared
+# action only on the last, so a reader who skipped releases runs it once.
+
+[[notice]]
+id = "run-a-workspace-audit"
+since = "0.29.0"
+title = "Run a workspace audit"
+body = """
+Lucidos keeps moving, and your workspace does not move with it. An app built \
+against an older SDK, a trigger subscribed to an event that has since been \
+renamed, a recipe still describing the old way to reach an API: all of them \
+keep sitting there, and a trigger on a renamed event simply stops firing with \
+nothing to see.
+
+A workspace audit sweeps what you have on disk and reports the drift. It \
+changes nothing on its own: it writes a report, and you decide what to fix.
+
+Worth doing now, and worth doing again after any release that moves a lot.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "deprecated-spawn-aliases-removed"
+since = "0.38.1"
+title = "Two deprecated spawn aliases were removed"
+body = """
+Two long-deprecated shortcuts are gone. `run_coding_agent` no longer accepts \
+`repo` (use `folder`), and `lucidos spawn-thread` no longer accepts `--parent` \
+(use `--relation child`). Both had carried a deprecation warning for a while.
+
+Almost every workspace already uses the new forms and needs nothing. But a \
+recipe, trigger or script that still passes an old form will now fail with a \
+clear rename error instead of running.
+
+A workspace audit finds any such straggler on disk and tells you the one-line \
+fix. Worth running once now.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "apps-run-isolated"
+since = "0.38.3"
+title = "Your apps now run isolated"
+body = """
+An app used to run in the same browser process as Lucidos itself, which is how \
+one busy app could freeze the whole page. Each app now gets its own process. It \
+can no longer hang the rest of Lucidos, and it can no longer read the shell, \
+your device id, or another app.
+
+The cost lands on apps that reached for the browser directly. An app that \
+stored something in `localStorage`, or called the engine with its own `fetch`, \
+loses that. Everything it does through `lucidos.*` is unchanged.
+
+**This one is quiet.** Most apps wrap a storage call in a `try`, so the app \
+still opens and simply stops remembering your settings. A workspace audit finds \
+every affected app and says what each one needs. Expect real changes rather \
+than renames, and a few that wait on us: an app reaching a corner of the API \
+the SDK does not cover yet has nothing to move onto.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "thread-summary-drops-coding-agent-applying"
+since = "0.40.2"
+title = "A thread field your apps could read was removed"
+body = """
+Thread summaries no longer carry `coding_agent_applying`. Lucidos never acted \
+on it, and it could stay `true` long after a merge had finished.
+
+An app, script or recipe that still reads it usually gets nothing back, with \
+no error to say so. A workspace audit finds any code that still reads it and \
+says what to do.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "cli-misrouted-looks-and-config"
+since = "0.40.2"
+title = "Some files you saved may be in the wrong folder"
+body = """
+`lucidos data write` used to file three folders under `artifacts/`: \
+`config/`, `auth-modules/` and `scripts/`. So an `apis.json` saved that way \
+never loaded, and a signer or script saved that way was never found. Nothing \
+said so.
+
+The command now writes each file where it belongs. A file saved before the \
+fix still sits under `artifacts/`, where nothing reads it. A workspace audit \
+finds any such file and says how to move it.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "spawn-thread-cc-model-removed"
+since = "0.40.2"
+title = "One old spawn flag was removed"
+body = """
+`lucidos spawn-thread` no longer accepts `--cc-model`. Use \
+`--coding-agent-model` instead, with the same value. The new name has been \
+documented since 0.39.2.
+
+A recipe, trigger or script that still passes the old flag will now fail with \
+an unknown-argument error instead of running. A workspace audit finds any \
+such call and says what to change.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "every-workspace-has-home"
+since = "0.47.2"
+title = "Every workspace now has Home"
+body = """
+Home is one conversation that never ends. Open it from the Home icon in the \
+thread header: at its start on desktop, beside the Lucidos mark on a phone. From Home, Lucidos can follow up any of your threads, and it \
+presses your buttons only when you ask it to in that message.
+
+It used to sit behind a switch under Experimental. The switch is gone, so \
+Home shows even if you had it off. Its history is still there.
+
+Home costs nothing while you leave it alone: it works only when you write in \
+it.
+"""

@@ -1,0 +1,558 @@
+import { signal, useSignal } from '@preact/signals';
+import type { ComponentChildren } from 'preact';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { cancelThreadEventWait } from '../../api/client';
+import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { focusThreadOrBootstrap } from '../../store/actions/threads';
+import {
+  effectiveThreadStatus,
+  eventConditionDoor,
+  focusedThreadId,
+  isMidTurn,
+  showToast,
+  threadMap,
+} from '../../store/store';
+import type { EventSubscription, EventWaitSummary, ThreadMeta, ThreadState } from '../../store/thread-events';
+import {
+  awaitedSubject,
+  formatRemaining,
+  groupSubscriptions,
+  plainEventMeaning,
+  secondsRemaining,
+  waitSubscriptionLabel,
+} from '../../store/thread-events';
+import { errorDetail } from '../../utils/errorDetail';
+import { viewportIsMobile } from '../../utils/viewport';
+import { EventWaitClockIcon } from '../shared/icons';
+import { Overlay } from '../shared/Overlay';
+import { SurfaceHead } from '../shared/Surface';
+import { useEscapeStep } from '../../hooks/useEscapeStep';
+import type { EventCondition } from '../../store/store';
+import { eventConditionBody, eventConditionTitle } from './eventConditionBody';
+import { ThreadStatusIcon } from '../shared/ThreadStatusIcon';
+import { threadVisualStatus } from '../shared/threadVisualStatus';
+import type { HeaderActionSpec } from '../layout/headerActions';
+
+/** What the panel is positioned against, or null while it is closed.
+ *
+ *  Module-level, and one signal for both ways in. The indicator folds into the
+ *  composer row's ⋯ menu on a short row, so the button that opens the panel may
+ *  not exist. A press on the row button passes itself. A press on the menu row
+ *  passes the ⋯ trigger, the box the reader pressed. */
+const waitingPanelAnchor = signal<HTMLElement | null>(null);
+
+/** The condition the panel has drilled into, or null on the list. A popover
+ *  never opens a second layer, so the condition replaces the list in place,
+ *  with a way back. Exported for the tests. */
+export const waitingPanelCondition = signal<EventCondition | null>(null);
+
+function openWaitingPanel(anchor: HTMLElement | null): void {
+  waitingPanelCondition.value = null;
+  waitingPanelAnchor.value = anchor;
+}
+
+/** Close the panel. Called by the composer when a fold moves controls around,
+ *  since an anchor can leave the DOM under an open panel. */
+export function closeWaitingPanel(): void {
+  waitingPanelAnchor.value = null;
+  waitingPanelCondition.value = null;
+}
+
+function backToWaitingList(): void {
+  waitingPanelCondition.value = null;
+}
+
+/** How often the countdown re-renders. One second is the granularity the text
+ *  actually shows below a minute. Above that the text is coarse enough that the
+ *  extra ticks are invisible, and a slower interval would make a `4m 12s` row
+ *  visibly stutter. */
+const COUNTDOWN_TICK_MS = 1000;
+
+/** The sub-thread half of a wait: the unfinished children this client can
+ *  name, and how many more the server counts. */
+export interface SubThreadWait {
+  /** Unfinished children resolved from the loaded `threadMap`, oldest first. */
+  threads: ThreadState[];
+  /** Unfinished children the server counts that the loaded map cannot name,
+   *  so the panel can say so instead of showing a short list. */
+  unresolved: number;
+}
+
+const NO_SUB_THREADS: SubThreadWait = { threads: [], unresolved: 0 };
+
+/** The focused thread's unfinished children, for the *waiting indicator*.
+ *
+ *  **The server's count decides, and the map only names.** The count is
+ *  `unfinishedChildCount`, reconciled in-transaction against ground truth.
+ *  `threadMap` is a paginated cache, which may hold all of a parent's children
+ *  or none.
+ *
+ *  So a count of zero returns before walking the map at all. That keeps this
+ *  O(1) on almost every thread. The prompt row re-renders on every `threadMap`
+ *  flush, so scanning every loaded thread each time would cost real work.
+ *  Almost no thread is waiting on children. The price is one SSE round trip of
+ *  lag on a child seen starting before its parent's aggregate lands.
+ *
+ *  Unfinished means mid-turn (`isMidTurn`, the engine's
+ *  `active_thread_statuses()`), or idle while holding its own live event wait
+ *  (ADR 0254). Those are the engine's two counts. A child parked only on a
+ *  proposed change has reported, so it is not listed.
+ *
+ *  The subtraction runs one way. A shortfall becomes an "and N more" row, and a
+ *  surplus is listed rather than cut (`docs/code-review-priors.md`). */
+export function unfinishedSubThreads(
+  parentId: string,
+  threads: ReadonlyMap<string, ThreadState>,
+  unfinishedCount: number,
+): SubThreadWait {
+  if (unfinishedCount <= 0) return NO_SUB_THREADS;
+  const found: ThreadState[] = [];
+  for (const thread of threads.values()) {
+    if (thread.meta.parentThreadId !== parentId) continue;
+    if (!isMidTurn(effectiveThreadStatus(thread)) && thread.meta.liveEventWaitCount <= 0) continue;
+    found.push(thread);
+  }
+  found.sort((a, b) => a.meta.createdAt.localeCompare(b.meta.createdAt));
+  return { threads: found, unresolved: Math.max(0, unfinishedCount - found.length) };
+}
+
+/** How many children the server says have not finished: the two counts are
+ *  disjoint, so they add. */
+function unfinishedChildCount(meta: ThreadMeta | undefined): number {
+  return (meta?.activeChildrenCount ?? 0) + (meta?.waitingChildrenCount ?? 0);
+}
+
+/** The **waiting indicator**: what this thread is waiting for, readable at any
+ *  time without scrolling the transcript.
+ *
+ *  Two things park a thread, and the status dot already merges them: a live
+ *  *event wait*, and *sub-threads* not yet finished (`resolveVisualStatus`). Both
+ *  say the same thing to the reader. This is not finished, and something else
+ *  will wake it. So one control carries the detail for both.
+ *
+ *  For an event wait this is the primary surface, and the transcript card is
+ *  the historical record. The split exists because a wait survives an
+ *  interruption (S6b). A thread can be watching for something while it reads as
+ *  `idle` and shows an ordinary reply. So "is anything subscribed" cannot be
+ *  answered by the status dot, nor by the transcript's scroll position.
+ *
+ *  Reads `meta.liveEventWaits` (projected in `handleEvent`) so the render path
+ *  is O(1), exactly like the todo indicator next to it. See
+ *  `docs/plans/2026-08-22-one-waiting-indicator-for-subscriptions-and-sub-threads.md`. */
+export function waitingIndicatorAction(): HeaderActionSpec | null {
+  const id = focusedThreadId.value;
+  const meta = id ? threadMap.value.get(id)?.meta : undefined;
+  const waits = meta?.liveEventWaits ?? [];
+  const subThreads = id
+    ? unfinishedSubThreads(id, threadMap.value, unfinishedChildCount(meta))
+    : NO_SUB_THREADS;
+  const summary = waitingIndicatorSummary(waits, subThreads);
+  if (!summary) return null;
+  return {
+    key: 'waiting-indicator',
+    dataRole: 'waiting-indicator',
+    label: summary.menuLabel,
+    tooltip: summary.tooltip,
+    icon: () => <EventWaitClockIcon />,
+    render: (attrs) => waitingIndicatorBody({
+      waits,
+      subThreads,
+      attrs,
+      // Re-pressing the button closes, which is the toggle the anchor exemption
+      // in <Overlay> leaves to the control's own handler.
+      onClick: (e) => {
+        if (waitingPanelAnchor.value) closeWaitingPanel();
+        else openWaitingPanel(e.currentTarget as HTMLElement);
+      },
+    }),
+    onMenuClick: openWaitingPanel,
+  };
+}
+
+/** The panel itself, mounted by the composer rather than by the control.
+ *
+ *  It has to outlive the fold: the control it belongs to moves between the row
+ *  and the ⋯ menu, and neither is a place a panel can live.
+ *
+ *  `portal` because the panel is `position: fixed` and the composer's ancestors
+ *  animate `transform` (the thread reveal, the compose FLIP). A transformed
+ *  ancestor becomes the containing block for a fixed descendant, which would
+ *  resolve the hook's viewport coordinates against that ancestor instead.
+ *  Portaling to <body> keeps the viewport as the containing block, and the
+ *  dismiss / anchor / Escape contracts are unaffected (see <Overlay>). */
+export function WaitingPanelHost() {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const id = focusedThreadId.value;
+  const meta = id ? threadMap.value.get(id)?.meta : undefined;
+  const waits = meta?.liveEventWaits ?? [];
+  const anchor = waitingPanelAnchor.value;
+  // Gated on the panel being OPEN, and not as a micro-optimisation. The walk is
+  // O(loaded threads) on a thread with unfinished children, and the prompt row
+  // re-renders on every `threadMap` flush. The control's own spec already walks
+  // once to decide whether to render, so a closed panel costs nothing.
+  const subThreads = anchor && id
+    ? unfinishedSubThreads(id, threadMap.value, unfinishedChildCount(meta))
+    : NO_SUB_THREADS;
+  const isOpen = anchor !== null && isWaitingForAnything(waits, subThreads);
+  // Clamp into the thread pane that owns the indicator. On desktop that keeps
+  // the panel out of the content pane. On a phone the pane IS the viewport, so
+  // the same clamp is what stops it running off the right edge. Passing a
+  // null anchor while closed makes the hook recompute from scratch on open,
+  // rather than reusing coordinates measured before the last scroll.
+  // On a phone it centres like the Lucidos menu, whose width it takes.
+  const pos = useAnchoredPosition(
+    isOpen ? anchor : null,
+    panelRef,
+    '.thread-pane',
+    viewportIsMobile.value ? 'container-center' : 'start',
+  );
+  // A condition whose event type no live wait watches any more is stale. The
+  // panel renders the list at once, and the signal is reset pre-paint so a
+  // stale drill-in never draws a frame.
+  const drilled = waitingPanelCondition.value;
+  const condition = drilled
+    && waits.some((w) => w.on.some((sub) => sub.event_type === drilled.eventType))
+    ? drilled
+    : null;
+  useLayoutEffect(() => {
+    if (drilled && !condition) backToWaitingList();
+  }, [drilled, condition]);
+
+  // Escape steps back to the list before it closes the panel.
+  useEscapeStep(isOpen && condition ? backToWaitingList : null);
+
+  // A drill-in replaces the control that held focus, so focus follows it: to
+  // the back link going in, and to the door it came through coming back out.
+  const drilledFrom = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    const from = drilledFrom.current;
+    drilledFrom.current = condition?.eventType ?? null;
+    if (!panel || from === drilledFrom.current) return;
+    const target = condition
+      ? panel.querySelector<HTMLElement>('[data-role="surface-back"]')
+      : panel.querySelector<HTMLElement>(`[data-role="event-wait-condition"][data-event-type="${CSS.escape(from ?? '')}"]`);
+    target?.focus();
+  }, [condition]);
+
+  return (
+    <Overlay
+      open={isOpen}
+      onClose={closeWaitingPanel}
+      anchor={anchor}
+      backdrop={false}
+      portal
+      panelClass="surface anchored-popover waiting-panel"
+      // `--anchored-popover-fit` is the thread pane's usable width, the box
+      // the hook clamped this panel's position into. The stylesheet's own
+      // value is viewport-based, which on desktop lets the panel run out of
+      // the pane and into the content pane.
+      panelStyle={pos
+        ? {
+            top: `${pos.top}px`,
+            left: `${pos.left}px`,
+            '--anchored-popover-fit': `${pos.maxWidth}px`,
+          }
+        : { visibility: 'hidden' }}
+      panelRole="dialog"
+      panelProps={{ 'aria-label': 'What this thread is waiting for' }}
+      dataRole="waiting-panel"
+      panelRef={panelRef}
+    >
+      {isOpen
+        ? waitingPanelBody({
+            threadId: id ?? '',
+            waits,
+            subThreads,
+            condition,
+            onBack: backToWaitingList,
+            onClose: closeWaitingPanel,
+          })
+        : null}
+    </Overlay>
+  );
+}
+
+/** True when the thread is parked on something the panel can show. The button
+ *  and the panel share it, so neither can render while the other would be
+ *  empty. */
+function isWaitingForAnything(waits: EventWaitSummary[], subThreads: SubThreadWait): boolean {
+  return waits.length > 0 || subThreadCount(subThreads) > 0;
+}
+
+function subThreadCount(subThreads: SubThreadWait): number {
+  return subThreads.threads.length + subThreads.unresolved;
+}
+
+/** Everything the indicator says about a wait, in one place.
+ *
+ *  `null` when the thread is parked on nothing, which is what hides the
+ *  control. A lone subscription reads as its own reason, the most useful thing
+ *  the button can say. Anything else counts each kind instead, because two
+ *  reasons do not fit on a tooltip. */
+export function waitingIndicatorSummary(
+  waits: EventWaitSummary[],
+  subThreads: SubThreadWait,
+): { tooltip: string; ariaLabel: string; menuLabel: string } | null {
+  if (!isWaitingForAnything(waits, subThreads)) return null;
+  const children = subThreadCount(subThreads);
+  const soleReason = waits.length === 1 && children === 0 ? waits[0].reason : null;
+  const counted = [
+    waits.length > 0 ? plural(waits.length, 'event') : null,
+    children > 0 ? plural(children, 'sub-thread') : null,
+  ]
+    .filter((part): part is string => part !== null)
+    .join(', ');
+  // The tooltip carries the reason as the model wrote it, and supplies no verb.
+  // The aria-label DOES supply one, so it takes the subject instead: a reason
+  // opening "waiting for the release build" would otherwise be spoken as
+  // "Waiting for waiting for the release build".
+  const spoken = soleReason ? awaitedSubject(soleReason) : counted;
+  return {
+    tooltip: soleReason ?? counted,
+    ariaLabel: `Waiting for ${spoken}. Click to expand.`,
+    // The menu row's words. A folded indicator has no glyph state at all, so
+    // this is the whole of what it reports.
+    menuLabel: `Waiting for ${spoken}`,
+  };
+}
+
+export function waitingIndicatorBody({
+  waits,
+  subThreads,
+  onClick,
+  attrs,
+}: {
+  waits: EventWaitSummary[];
+  subThreads: SubThreadWait;
+  onClick: (e: MouseEvent) => void;
+  /** The row attributes the composer's fold cluster stamps on every member. */
+  attrs?: Record<string, string>;
+}) {
+  const summary = waitingIndicatorSummary(waits, subThreads);
+  if (!summary) return null;
+  return (
+    <button
+      {...attrs}
+      type="button"
+      class="icon-btn header-icon"
+      data-role="waiting-indicator"
+      data-tooltip={summary.tooltip}
+      aria-label={summary.ariaLabel}
+      onClick={onClick}
+      data-row-item
+    >
+      <EventWaitClockIcon />
+    </button>
+  );
+}
+
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? '' : 's'}`;
+}
+
+/** One section per kind of wait, each rendered only when it has rows.
+ *
+ *  Returns the panel's CONTENTS, not its box: the box is the `<Overlay>` panel
+ *  itself, which is what `useAnchoredPosition` measures and positions.
+ *
+ *  A section is LABELLED only when both kinds are present, because a label
+ *  earns its line by telling two lists apart. On the common panel it restated
+ *  the "Waiting for" title one step in, so a single list arrived under two
+ *  stacked uppercase labels. */
+export function waitingPanelBody({
+  threadId,
+  waits,
+  subThreads,
+  condition = null,
+  onBack = backToWaitingList,
+  onClose,
+}: {
+  threadId: string;
+  waits: EventWaitSummary[];
+  subThreads: SubThreadWait;
+  condition?: EventCondition | null;
+  onBack?: () => void;
+  onClose: () => void;
+}) {
+  const closeLabel = 'Close what this thread is waiting for';
+  if (condition) {
+    return (
+      <>
+        <SurfaceHead
+          back={{ label: 'Waiting for', onClick: onBack }}
+          title={eventConditionTitle(condition)}
+          onClose={onClose}
+          closeLabel={closeLabel}
+        />
+        <div
+          class="anchored-popover-body"
+          data-role="waiting-condition"
+          data-surface-step={`condition:${condition.eventType}`}
+        >
+          {eventConditionBody(condition)}
+        </div>
+      </>
+    );
+  }
+  const labelled = waits.length > 0 && subThreadCount(subThreads) > 0;
+  return (
+    <>
+      <SurfaceHead title="Waiting for" onClose={onClose} closeLabel={closeLabel} />
+      <div class="anchored-popover-body" data-surface-step="list">
+        {waits.length > 0 ? (
+          <section class="waiting-panel-section" data-role="waiting-subscriptions">
+            {labelled ? <span class="waiting-panel-section-label">Events</span> : null}
+            <ul class="event-wait-list">
+              {waits.map((wait) => (
+                <EventWaitRow key={wait.wait_id} threadId={threadId} wait={wait} />
+              ))}
+            </ul>
+          </section>
+        ) : null}
+        {subThreadCount(subThreads) > 0 ? (
+          <section class="waiting-panel-section" data-role="waiting-sub-threads">
+            {labelled ? <span class="waiting-panel-section-label">Sub-threads</span> : null}
+            <ul class="waiting-panel-child-list">
+              {subThreads.threads.map((child) => (
+                <SubThreadRow key={child.meta.id} child={child} onOpen={onClose} />
+              ))}
+              {/* The server counts more unfinished children than this client can
+                  name. Say so, rather than show a list that contradicts the
+                  thread's own Waiting dot. */}
+              {subThreads.unresolved > 0 ? (
+                <li class="waiting-panel-child-more" data-role="waiting-sub-threads-more">
+                  {`and ${subThreads.unresolved} more`}
+                </li>
+              ) : null}
+            </ul>
+          </section>
+        ) : null}
+      </div>
+    </>
+  );
+}
+
+/** One active child. It links and does not stop: ending a sub-thread is done on
+ *  the sub-thread, where its own Stop and its transcript are.
+ *
+ *  Opening one closes the panel, because the panel describes the thread it was
+ *  opened from. Left open it would re-read against the child, and then either
+ *  hang there showing the child's own waits or vanish. */
+export function SubThreadRow({ child, onOpen }: { child: ThreadState; onOpen: () => void }) {
+  const title = child.meta.title?.trim() || 'Untitled thread';
+  return (
+    <li class="waiting-panel-child">
+      <button
+        type="button"
+        class="waiting-panel-child-link"
+        data-role="waiting-sub-thread"
+        data-thread-id={child.meta.id}
+        onClick={() => {
+          onOpen();
+          focusThreadOrBootstrap(child.meta.id);
+        }}
+      >
+        <ThreadStatusIcon status={threadVisualStatus(child)} />
+        <span class="waiting-panel-child-title">{title}</span>
+      </button>
+    </li>
+  );
+}
+
+/** The watched event types on one line, in plain words, with a filtered one
+ *  pressable so its `condition` is one tap away.
+ *
+ *  Segments rather than `describeWaitSubscription`'s joined string, because a
+ *  string cannot carry a button. The joined LOOK is unchanged: still one muted
+ *  line reading `watching for A or B`, and a type with no condition stays plain
+ *  text carrying its raw type as a tooltip. Repeats of one type fold into one
+ *  entry, as on the transcript row.
+ *
+ *  A filtered entry drills the panel into its condition in place, since a
+ *  popover never opens a second layer. Escape steps back to the list. */
+export function subscriptionLine(on: EventSubscription[]): ComponentChildren[] {
+  return groupSubscriptions(on).flatMap((g, i) => {
+    const glue = [<span key={`glue${i}`}>{i === 0 ? 'watching for ' : ' or '}</span>];
+    const label = waitSubscriptionLabel(g);
+    const door = eventConditionDoor(g);
+    return [
+      ...glue,
+      door ? (
+        <button
+          key={`sub${i}`}
+          type="button"
+          class="event-wait-subscription-filter"
+          data-role="event-wait-condition"
+          aria-label={door.label}
+          data-tooltip={door.label}
+          data-event-type={g.event_type}
+          onClick={() => { waitingPanelCondition.value = door.condition; }}
+        >
+          {label}
+        </button>
+      ) : (
+        <span key={`sub${i}`} data-tooltip={plainEventMeaning(g.event_type)}>{label}</span>
+      ),
+    ];
+  });
+}
+
+/** The countdown as a phrase: `4m 12s left`, or `due now` at zero. */
+export function countdownText(seconds: number): string {
+  return seconds > 0 ? `${formatRemaining(seconds)} left` : formatRemaining(seconds);
+}
+
+/** One live subscription. The countdown lives in component-local state, never
+ *  in a signal: a per-second store write would re-flush `threadMap` (and
+ *  therefore every subscribed component, most expensively `ChatExchange`) once
+ *  a second for every subscribed thread. */
+function EventWaitRow({ threadId, wait }: { threadId: string; wait: EventWaitSummary }) {
+  const [now, setNow] = useState(() => Date.now());
+  const stopping = useSignal(false);
+
+  useEffect(() => {
+    const handle = setInterval(() => setNow(Date.now()), COUNTDOWN_TICK_MS);
+    return () => clearInterval(handle);
+  }, []);
+
+  const onStop = async () => {
+    if (stopping.value) return;
+    stopping.value = true;
+    try {
+      // Success removes the row via the SSE `EventWaitCanceled`, which the
+      // store projection filters out of `meta.liveEventWaits`.
+      await cancelThreadEventWait(threadId, wait.wait_id);
+    } catch (e) {
+      showToast('Could not stop waiting: ' + errorDetail(e), 'error');
+      stopping.value = false;
+    }
+  };
+
+  return (
+    <li class="event-wait-item">
+      <div class="event-wait-main">
+        {/* The panel's title already says "Waiting for", so the reason drops
+            its own leading "waiting for". */}
+        <span class="event-wait-reason">{awaitedSubject(wait.reason)}</span>
+        <code class="event-wait-subscription">{subscriptionLine(wait.on)}</code>
+      </div>
+      <div class="event-wait-foot">
+        <span class="event-wait-meta">
+          <span class="event-wait-countdown">
+            {countdownText(secondsRemaining(wait.expires_at, now))}
+          </span>
+        </span>
+        <button
+          type="button"
+          class="action-btn action-btn-danger event-wait-stop"
+          data-role="event-wait-stop"
+          disabled={stopping.value}
+          onClick={onStop}
+        >
+          {stopping.value ? 'Stopping…' : 'Stop waiting'}
+        </button>
+      </div>
+    </li>
+  );
+}

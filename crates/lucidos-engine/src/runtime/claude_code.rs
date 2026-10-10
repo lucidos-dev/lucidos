@@ -1,0 +1,1810 @@
+use async_trait::async_trait;
+use std::path::{Path, PathBuf};
+// One signal-name table for the whole engine — shared with `TaskOutcome`, which
+// renders the same names for the bash tools. See `format_exit_status`.
+use crate::core::shell::signal_name;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use super::agent_runtime::{
+    AccountPin, AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, InputWithdrawal,
+    RunningAgent, SpawnArgs, WithdrawRequest,
+};
+use super::lucidos_cli::{
+    ensure_workspace_bin_symlink, lucidos_cli_dir, place_lucidos_cli_skill, LUCIDOS_BIN_NAME,
+    LUCIDOS_CLI_SKILL,
+};
+use super::spawn_env::{apply_lucidos_env, drain_stderr};
+
+/// One `/model` or `/effort` picker entry. Claude Code's model rows come from
+/// discovery (`cc_model_discovery`), with `cc_menu_options.json` as the
+/// fallback. Codex's come from `codex_menu_options.json`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct CcMenuOption {
+    pub value: String,
+    /// The concrete model this row runs, when the backend said so. A session
+    /// reports this id at Init, and the thread records it, so a spawn must
+    /// accept it too. Only discovered Claude Code rows carry it.
+    #[serde(default)]
+    pub resolved_model: Option<String>,
+    pub label: String,
+    pub description: String,
+    /// Optional model compatibility metadata used by Codex reasoning efforts.
+    /// Claude Code and universally supported Codex options leave it absent.
+    #[serde(default)]
+    pub supported_models: Option<Vec<String>>,
+    /// The window a session on this model actually runs under, in tokens.
+    ///
+    /// Absent on almost every row, because it is an OVERRIDE of what
+    /// `llm::model_registry::context_window_for` infers from the id. Declare it
+    /// only where the backend's window differs, and read it through
+    /// [`crate::runtime::coding_agent_context_window`].
+    ///
+    /// The two answers differ because they describe different requests. The
+    /// registry describes the one LUCIDOS makes, where 1M mode is gated on our
+    /// own `[1m]` suffix. A coding agent makes its own request and picks its
+    /// own context mode, so nothing here bounds a prompt the engine packs.
+    #[serde(default)]
+    pub context_window: Option<usize>,
+    /// The tiers this model accepts, when the backend said so per model.
+    /// `None` derives them from the effort rows (`efforts_for_model`).
+    #[serde(default)]
+    pub reasoning_efforts: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CcMenuOptionsFile {
+    models: Vec<CcMenuOption>,
+    reasoning_efforts: Vec<CcMenuOption>,
+}
+
+const CC_MENU_OPTIONS_JSON: &str = include_str!("cc_menu_options.json");
+
+static CC_MENU_OPTIONS: std::sync::LazyLock<CcMenuOptionsFile> = std::sync::LazyLock::new(|| {
+    serde_json::from_str(CC_MENU_OPTIONS_JSON)
+        .expect("cc_menu_options.json is malformed — see runtime/cc_menu_options.json")
+});
+
+/// The curated rows in `cc_menu_options.json`: the picker until discovery
+/// succeeds, and the overlay that declares context windows.
+pub fn curated_cc_model_options() -> &'static [CcMenuOption] {
+    &CC_MENU_OPTIONS.models
+}
+
+static CURATED_CC_MODEL_OPTIONS: std::sync::LazyLock<std::sync::Arc<[CcMenuOption]>> =
+    std::sync::LazyLock::new(|| curated_cc_model_options().into());
+
+/// The Claude Code `/model` picker: what Claude Code itself listed, or the
+/// curated rows until it has answered.
+pub fn cc_model_options() -> std::sync::Arc<[CcMenuOption]> {
+    pick_cc_model_options(super::cc_model_discovery::discovered_options())
+}
+
+/// The discovered rows when there are any, else the curated ones. Never a mix.
+fn pick_cc_model_options(
+    discovered: Option<std::sync::Arc<[CcMenuOption]>>,
+) -> std::sync::Arc<[CcMenuOption]> {
+    discovered.unwrap_or_else(|| CURATED_CC_MODEL_OPTIONS.clone())
+}
+
+pub fn cc_reasoning_effort_options() -> &'static [CcMenuOption] {
+    &CC_MENU_OPTIONS.reasoning_efforts
+}
+
+/// Map a full CC CLI model ID (e.g. `claude-sonnet-4-6`) back to the short
+/// alias we originally sent (e.g. `sonnet`).  Returns the input unchanged if
+/// it already is a known `cc_model_options()` value or doesn't match any alias.
+pub fn normalize_cc_model_id(full_id: &str) -> &str {
+    if cc_model_options().iter().any(|m| m.value == full_id) {
+        return full_id;
+    }
+    if full_id.starts_with("claude-sonnet-4") {
+        return "sonnet";
+    }
+    if full_id == "claude-opus-4-6" || full_id.starts_with("claude-opus-4-6-") {
+        return "opus";
+    }
+    if full_id.starts_with("claude-haiku-4") {
+        return "haiku";
+    }
+    full_id
+}
+
+/// Reconcile CC's stream-json model name with the engine-supplied alias.
+/// CC strips the `[1m]` suffix when echoing the model in Init and Usage frames.
+/// A naive `normalize_cc_model_id` therefore loses the 1M-context signal that
+/// `context_window_for` keys on. Re-attach the suffix when the engine pinned
+/// `[1m]` and CC reports the same base model.
+pub fn reconcile_cc_model(original: Option<&str>, cc_reported: &str) -> String {
+    let normalized = normalize_cc_model_id(cc_reported);
+    if let Some(orig_base) = original.and_then(|o| o.strip_suffix("[1m]")) {
+        if orig_base == normalized || orig_base == cc_reported {
+            return format!("{}[1m]", normalized);
+        }
+    }
+    normalized.to_string()
+}
+
+#[path = "claude_code_parse.rs"]
+mod parse;
+pub use parse::{parse_line, CcStreamState};
+
+/// The reasoning tiers `model` is offered, read out of the effort rows.
+///
+/// An effort with no `supported_models` is universal; one that names models is
+/// offered only to those. The `default` row matches nothing by name, so it
+/// takes the universal set. That is the right answer for a model the backend
+/// has not resolved yet.
+pub(super) fn efforts_for_model(model: &str, efforts: &[CcMenuOption]) -> Vec<String> {
+    efforts
+        .iter()
+        .filter(|e| {
+            e.supported_models
+                .as_ref()
+                .is_none_or(|allowed| allowed.iter().any(|m| m == model))
+        })
+        .map(|e| e.value.clone())
+        .collect()
+}
+
+/// Render one backend's `set_model` and `set_reasoning_effort` option lists.
+///
+/// The JSON files keep the hand-maintained effort-to-models shape, because that
+/// is how upstream announces a tier: one line naming the models that accept it.
+/// The wire carries the transpose, `reasoning_efforts` per MODEL row, matching
+/// what `GET /api/v1/models` serves for the Lucidos Agent. One picker rule then
+/// covers both surfaces: ask the model row what it offers.
+pub(super) fn model_and_effort_options(
+    models: &[CcMenuOption],
+    efforts: &[CcMenuOption],
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let model_options = models
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "value": m.value,
+                "resolved_model": m.resolved_model,
+                "label": m.label,
+                "description": m.description,
+                "reasoning_efforts": m
+                    .reasoning_efforts
+                    .clone()
+                    .unwrap_or_else(|| efforts_for_model(&m.value, efforts)),
+            })
+        })
+        .collect();
+    // No `supported_models` on the wire: the model rows now carry the same
+    // information in the shape the picker reads.
+    let effort_options = efforts
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "value": e.value,
+                "label": e.label,
+                "description": e.description,
+            })
+        })
+        .collect();
+    (model_options, effort_options)
+}
+
+/// Model families, strongest first: the order the picker groups them in.
+const CC_FAMILIES_STRONGEST_FIRST: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+
+/// The model a row runs: the id Claude Code resolved it to, else its own value.
+fn model_run_by(option: &CcMenuOption) -> &str {
+    option.resolved_model.as_deref().unwrap_or(&option.value)
+}
+
+/// A model id's family rank and version, read from its dash-separated parts.
+/// `claude-opus-4-8[1m]` is Opus 4.8. A version-free alias such as `opus`
+/// has an empty version, so it sorts after every numbered one in its family.
+/// A dated id's date part is not a version, so a number stops the read.
+fn family_and_version(id: &str) -> (usize, Vec<u32>) {
+    let base = id.split(['[', '@']).next().unwrap_or(id);
+    let parts: Vec<&str> = base.split('-').collect();
+    for (rank, family) in CC_FAMILIES_STRONGEST_FIRST.iter().enumerate() {
+        if let Some(at) = parts.iter().position(|p| p == family) {
+            let version = parts[at + 1..]
+                .iter()
+                .map_while(|p| p.parse::<u32>().ok().filter(|_| p.len() <= 2))
+                .collect();
+            return (rank, version);
+        }
+    }
+    (CC_FAMILIES_STRONGEST_FIRST.len(), Vec::new())
+}
+
+/// The rows the Claude Code picker shows, in the order it shows them.
+///
+/// Default first, then the strongest family first, newest version first. A
+/// row that runs the same model as a row above it is left out, Default
+/// excepted. Display only: a spawn validates against the full list, so the
+/// id of a row left out here is still accepted.
+pub(super) fn cc_picker_rows(options: &[CcMenuOption]) -> Vec<CcMenuOption> {
+    let mut sorted: Vec<&CcMenuOption> = options.iter().collect();
+    sorted.sort_by_cached_key(|o| {
+        let (family, version) = family_and_version(model_run_by(o));
+        (o.value != "default", family, std::cmp::Reverse(version))
+    });
+    let mut shown_models = std::collections::HashSet::new();
+    sorted
+        .into_iter()
+        .filter(|o| o.value == "default" || shown_models.insert(model_run_by(o)))
+        .cloned()
+        .collect()
+}
+
+/// Render the menu of supported control commands for the frontend's `/model`
+/// picker. CC-specific: Codex and other agents have their own menus.
+pub fn cc_command_definitions() -> serde_json::Value {
+    let (model_options, effort_options) = model_and_effort_options(
+        &cc_picker_rows(&cc_model_options()),
+        cc_reasoning_effort_options(),
+    );
+    serde_json::json!([
+        {
+            "subtype": "set_model",
+            "label": "Model",
+            "params": [{ "key": "model", "label": "Model", "options": model_options }]
+        },
+        {
+            "subtype": "set_reasoning_effort",
+            "label": "Reasoning Effort",
+            "params": [{ "key": "effort", "label": "Reasoning Effort", "options": effort_options }]
+        }
+    ])
+}
+
+/// Serialize a `ControlRequest` to the JSON line that CC expects on stdin.
+/// `None` for a request CC refuses: see [`crate::runtime::CodingAgent::control_reach`].
+pub fn cc_control_request_to_json(request: &ControlRequest, request_id: &str) -> Option<String> {
+    let body = match request {
+        ControlRequest::Interrupt => serde_json::json!({ "subtype": "interrupt" }),
+        ControlRequest::SetModel { model } => {
+            serde_json::json!({ "subtype": "set_model", "model": model })
+        }
+        ControlRequest::SetReasoningEffort { .. } => return None,
+    };
+    let line = serde_json::to_string(&serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": body,
+    }))
+    .expect("ControlRequest serialization cannot fail");
+    Some(line)
+}
+
+/// The one stream-json line a side question writes: the instructions and the
+/// question as a text block, then each image as a base64 block.
+fn side_question_message(question: &str, images: &[crate::api::ChatImage]) -> String {
+    let instructions = crate::engine::agent_session::side_question::SIDE_QUESTION_INSTRUCTIONS;
+    let mut content = vec![serde_json::json!({
+        "type": "text",
+        "text": format!("<system-reminder>{instructions}</system-reminder>\n\n{question}"),
+    })];
+    content.extend(images.iter().map(|image| {
+        let fitted = image.clone().fit_for_llm();
+        serde_json::json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": fitted.mime_type, "data": fitted.base64 },
+        })
+    }));
+    let mut line = serde_json::to_string(&serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": content },
+    }))
+    .expect("side question serialization cannot fail");
+    line.push('\n');
+    line
+}
+
+/// What a side question's copy answered, with what it cost.
+#[derive(Debug)]
+pub struct SideQuestionReply {
+    /// The answer, or why there is none.
+    pub answer: Result<String, String>,
+    /// The copy's usage, summed over its turns. `None` when it reported none.
+    pub usage: Option<crate::engine::ApiUsage>,
+    /// The model the copy's init line named.
+    pub model: Option<String>,
+}
+
+/// The model a stdout `init` line names. `None` for any other line.
+fn init_model(line: &str) -> Option<String> {
+    if !line.contains("\"init\"") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    (value.get("subtype")?.as_str()? == "init")
+        .then(|| value.get("model")?.as_str().map(str::to_string))
+        .flatten()
+}
+
+/// Whether a stdout line is Claude Code's replay of an input it read.
+fn replays_an_input(line: &str) -> bool {
+    line.contains("\"isReplay\"")
+        && serde_json::from_str(line.trim()).is_ok_and(|value| parse::is_input_replay(&value))
+}
+
+/// The usage block of a `result` line. Claude Code reports the uncached input
+/// alone, and `ApiUsage.input_tokens` is the total, so the cache counts are
+/// added in, as the main session's capture does.
+fn result_usage(value: &serde_json::Value) -> Option<crate::engine::ApiUsage> {
+    let usage = value.get("usage")?;
+    let count = |key: &str| {
+        crate::llm::clamp_provider_token_count(
+            usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0),
+            "ClaudeCode",
+        )
+    };
+    let cache_read_tokens = count("cache_read_input_tokens");
+    let cache_creation_tokens = count("cache_creation_input_tokens");
+    Some(crate::engine::ApiUsage {
+        input_tokens: count("input_tokens")
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_creation_tokens),
+        output_tokens: count("output_tokens"),
+        cache_read_tokens,
+        cache_creation_tokens,
+        modality: None,
+    })
+}
+
+/// Read a stdout line as the copy's closing `result`: the answer or why there
+/// is none, and the usage it reports. `None` for any other line.
+fn side_question_result(
+    line: &str,
+) -> Option<(Result<String, String>, Option<crate::engine::ApiUsage>)> {
+    if !line.contains("\"result\"") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if value.get("type")?.as_str()? != "result" {
+        return None;
+    }
+    let subtype = value.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+    let text = value
+        .get("result")
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    let is_error = value.get("is_error").and_then(|e| e.as_bool()) == Some(true);
+    let answer = match subtype {
+        "success" if !is_error && !text.is_empty() => Ok(text.to_string()),
+        "success" if !is_error => Err("Claude Code sent an empty side answer".to_string()),
+        "error_max_turns" => {
+            Err(crate::engine::agent_session::side_question::kept_reaching_for_tools("Claude Code"))
+        }
+        _ if !text.is_empty() => Err(text.to_string()),
+        _ => Err(format!("Claude Code could not answer ({subtype})")),
+    };
+    Some((answer, result_usage(&value)))
+}
+
+/// The `cancel_async_message` control request: drop a user message still
+/// waiting in CC's queue. CC answers `cancelled: false` once it has read it.
+fn cc_cancel_async_message_json(input_uuid: uuid::Uuid, request_id: &str) -> String {
+    let mut line = serde_json::to_string(&serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "cancel_async_message", "message_uuid": input_uuid },
+    }))
+    .expect("withdraw serialization cannot fail");
+    line.push('\n');
+    line
+}
+
+/// CC's response body, or its error text when it gave one.
+type ControlBody = Result<serde_json::Value, Option<String>>;
+
+/// Read a `control_response` line: its request id, then CC's response body or
+/// its error. `None` for any other line.
+fn control_reply(line: &str) -> Option<(String, ControlBody)> {
+    if !line.contains("\"control_response\"") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if value.get("type")?.as_str()? != "control_response" {
+        return None;
+    }
+    let response = value.get("response")?;
+    let request_id = response.get("request_id")?.as_str()?.to_string();
+    let body = if response.get("subtype").and_then(|s| s.as_str()) == Some("success") {
+        Ok(response
+            .get("response")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    } else {
+        Err(response
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(str::to_string))
+    };
+    Some((request_id, body))
+}
+
+fn withdrawal(body: ControlBody) -> InputWithdrawal {
+    match body.map(|b| b.get("cancelled").and_then(|c| c.as_bool())) {
+        Ok(Some(true)) => InputWithdrawal::Withdrawn,
+        Ok(Some(false)) => InputWithdrawal::AlreadyRead,
+        Ok(None) => InputWithdrawal::Refused("Claude Code sent no withdraw result".to_string()),
+        Err(Some(e)) => InputWithdrawal::Refused(format!("Claude Code refused the withdraw: {e}")),
+        Err(None) => InputWithdrawal::Refused("Claude Code refused the withdraw".to_string()),
+    }
+}
+
+/// Withdraws the driver has written and CC has not answered yet, by request
+/// id. Dropping one tells its caller the process ended first.
+type PendingReplies =
+    std::collections::HashMap<String, tokio::sync::oneshot::Sender<InputWithdrawal>>;
+
+/// Parse one stdout line. A reply to a pending withdraw goes to its caller and
+/// yields no event, so it never reaches the session's history.
+fn route_stdout_line(
+    state: &mut CcStreamState,
+    pending: &mut PendingReplies,
+    line: &str,
+) -> Vec<AgentEvent> {
+    if let Some((request_id, body)) = control_reply(line) {
+        if let Some(reply) = pending.remove(&request_id) {
+            // A caller that gave up dropped its receiver; the reply has nowhere to go.
+            let _ = reply.send(withdrawal(body));
+            return Vec::new();
+        }
+    }
+    parse_line(state, line)
+}
+
+/// A cold process group: a side question or a model probe. It is killed if
+/// its caller goes away before the normal teardown runs, as when the browser
+/// abandons the request.
+struct ColdProcessGroup(Option<u32>);
+
+impl ColdProcessGroup {
+    /// Hand the leader's pid to the normal teardown, which reaps it.
+    fn disarm(&mut self) -> Option<u32> {
+        self.0.take()
+    }
+}
+
+/// Kill a cold process group and reap its leader, whatever the exchange did.
+/// Signals the group only while the leader is unreaped: a reaped pid may be
+/// recycled.
+async fn tear_down_cold_child(mut group: ColdProcessGroup, child: &mut Child, what: &str) {
+    if let (Some(pid), Ok(None)) = (group.disarm(), child.try_wait()) {
+        crate::runtime::spawn_env::kill_child_process_group_now(pid);
+    }
+    let _ = child.start_kill();
+    if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        log!("[ClaudeCode] {what} process did not exit after SIGKILL");
+    }
+}
+
+impl Drop for ColdProcessGroup {
+    fn drop(&mut self) {
+        // Armed means nothing has reaped the leader yet, so its pid is still ours.
+        if let Some(pid) = self.0 {
+            crate::runtime::spawn_env::kill_child_process_group_now(pid);
+        }
+    }
+}
+
+/// Answer a side question from a copy of the thread's session.
+///
+/// The copy is the session's own command resumed with `--no-session-persistence`,
+/// so it reads the transcript and writes nothing back. It keeps the session's
+/// tools, model and system prompt, so the transcript reads from the prompt
+/// cache. Its settings refuse every tool. Its process group dies
+/// once it answers, fails, passes `deadline` or loses its asker.
+/// `args.resume_session_id` names the session and is required.
+pub async fn ask_side_question(
+    args: SpawnArgs<'_>,
+    question: &str,
+    images: &[crate::api::ChatImage],
+    deadline: tokio::time::Instant,
+) -> Result<SideQuestionReply, Box<dyn std::error::Error + Send + Sync>> {
+    if args.resume_session_id.is_none() {
+        return Err("This thread has no Claude Code session to ask yet".into());
+    }
+    if let Some(path) = args.binary_override {
+        super::spawn_env::resolve_binary_override(
+            path,
+            "Claude Code (`claude`)",
+            crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
+        )?;
+    }
+    let settings =
+        crate::engine::cc_settings::write_cc_side_question_settings(args.workspace_path).await?;
+    let mut command = build_side_question_command(&args, lucidos_cli_dir(), &settings)?;
+    let child = super::spawn_env::spawn_below_engine(&mut command.cmd)?;
+    ask_side_question_of(child, &side_question_message(question, images), deadline).await
+}
+
+/// The side question's command: the session's own flags, resumed without
+/// persisting, capped in turns, under the settings that refuse every tool.
+fn build_side_question_command(
+    args: &SpawnArgs<'_>,
+    cli_dir: Option<&Path>,
+    settings: &Path,
+) -> std::io::Result<CcCommand> {
+    let mut command = build_command_with_settings(args, cli_dir, settings)?;
+    command
+        .cmd
+        .arg("--no-session-persistence")
+        .arg("--max-turns")
+        .arg(crate::engine::agent_session::side_question::SIDE_QUESTION_MAX_TURNS.to_string());
+    Ok(command)
+}
+
+/// Send the side question's `message` to `child` and wait for its `result`,
+/// then tear the process group down whatever happened. `child` must lead its
+/// own group.
+///
+/// Only a `result` after the question's replay answers it. A resumed session
+/// may first close older work with an empty `result`, such as a background
+/// task it reports stopped.
+async fn ask_side_question_of(
+    mut child: Child,
+    message: &str,
+    deadline: tokio::time::Instant,
+) -> Result<SideQuestionReply, Box<dyn std::error::Error + Send + Sync>> {
+    let group = ColdProcessGroup(child.id());
+    let mut stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
+    let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+    // Input stays open until the teardown below. At end of input the copy
+    // could exit on its own, and a reaped leader is one whose group is no
+    // longer safe to signal.
+    let exchange = async {
+        stdin.write_all(message.as_bytes()).await?;
+        stdin.flush().await?;
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let mut model = None;
+        let mut question_read = false;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err::<SideQuestionReply, Box<dyn std::error::Error + Send + Sync>>(
+                    "Claude Code exited before it answered".into(),
+                );
+            }
+            if let Some(named) = init_model(&line) {
+                model = Some(named);
+            } else if replays_an_input(&line) {
+                question_read = true;
+            } else if let Some((answer, usage)) =
+                side_question_result(&line).filter(|_| question_read)
+            {
+                return Ok(SideQuestionReply {
+                    answer,
+                    usage,
+                    model,
+                });
+            }
+        }
+    };
+    let outcome = tokio::time::timeout_at(deadline, exchange).await;
+    tear_down_cold_child(group, &mut child, "side-question").await;
+
+    let reply = outcome.map_err(|_| {
+        crate::engine::agent_session::side_question::side_question_timeout_message("Claude Code")
+    })?;
+    let failure = match &reply {
+        Err(e) => Some(e.to_string()),
+        Ok(SideQuestionReply { answer: Err(e), .. }) => Some(e.clone()),
+        Ok(_) => None,
+    };
+    if let (Some(e), Some(mut stderr)) = (failure, child.stderr.take().map(BufReader::new)) {
+        let tail = drain_stderr(&mut stderr).await;
+        log!(
+            "[ClaudeCode] side question failed: {} (stderr: {})",
+            e,
+            tail.trim()
+        );
+    }
+    reply
+}
+
+/// How long a model probe may take. Claude Code runs the user's session-start
+/// hooks before it answers, so a slow hook is the usual cause of a timeout.
+pub const CC_MODEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The `initialize` control request: what the Agent SDK sends first, and the
+/// one request whose reply lists the models Claude Code offers.
+fn cc_initialize_request_json(request_id: &str) -> String {
+    let mut line = serde_json::to_string(&serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "initialize" },
+    }))
+    .expect("initialize serialization cannot fail");
+    line.push('\n');
+    line
+}
+
+/// Ask Claude Code which models it offers, under the binary, env and settings
+/// a session built from `args` would run with.
+///
+/// Sends only `initialize`, never a prompt, so it costs no tokens, and writes
+/// no transcript. Pass no `resume_session_id`.
+pub async fn probe_cc_models(
+    args: SpawnArgs<'_>,
+) -> Result<super::cc_model_discovery::CcModelCache, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(path) = args.binary_override {
+        super::spawn_env::resolve_binary_override(
+            path,
+            "Claude Code (`claude`)",
+            crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
+        )?;
+    }
+    // The session command names this file with --settings, and a fresh install
+    // may probe before any session wrote it.
+    if let Err(e) = crate::engine::cc_settings::write_cc_settings(args.workspace_path).await {
+        log!(
+            "[ClaudeCode] model probe could not write cc-settings.json: {}",
+            e
+        );
+    }
+    let deadline = tokio::time::Instant::now() + CC_MODEL_PROBE_TIMEOUT;
+    let mut command = build_command(&args, lucidos_cli_dir())?;
+    command.cmd.arg("--no-session-persistence");
+    let cc_version = super::probe_agent_version(
+        CodingAgent::ClaudeCode,
+        Path::new(command.cmd.as_std().get_program()),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let models = probe_models_of(
+        super::spawn_env::spawn_below_engine(&mut command.cmd)?,
+        deadline,
+    )
+    .await?;
+    Ok(super::cc_model_discovery::CcModelCache {
+        cc_version,
+        discovered_at: chrono::Utc::now(),
+        models,
+    })
+}
+
+/// Send `initialize` to `child` and read the model list out of its reply,
+/// then tear the process group down whatever happened. `child` must lead its
+/// own group.
+async fn probe_models_of(
+    mut child: Child,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<super::cc_model_discovery::DiscoveredModel>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let group = ColdProcessGroup(child.id());
+    let mut stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
+    let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let exchange = async {
+        stdin
+            .write_all(cc_initialize_request_json(&request_id).as_bytes())
+            .await?;
+        stdin.flush().await?;
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err::<ControlBody, Box<dyn std::error::Error + Send + Sync>>(
+                    "Claude Code exited before it answered".into(),
+                );
+            }
+            if let Some((id, body)) = control_reply(&line) {
+                if id == request_id {
+                    return Ok(body);
+                }
+            }
+        }
+    };
+    let outcome = tokio::time::timeout_at(deadline, exchange).await;
+    tear_down_cold_child(group, &mut child, "model-probe").await;
+
+    let models = match outcome {
+        Err(_) => Err(format!(
+            "Claude Code did not answer initialize within {} seconds",
+            CC_MODEL_PROBE_TIMEOUT.as_secs()
+        )),
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(body)) => body
+            .map_err(|e| e.unwrap_or_else(|| "Claude Code refused initialize".to_string()))
+            .and_then(|body| super::cc_model_discovery::parse_initialize_models(&body)),
+    };
+    if let (Err(e), Some(mut stderr)) = (&models, child.stderr.take().map(BufReader::new)) {
+        let tail = drain_stderr(&mut stderr).await;
+        log!(
+            "[ClaudeCode] model probe failed: {} (stderr: {})",
+            e,
+            tail.trim()
+        );
+    }
+    Ok(models?)
+}
+
+fn is_valid_effort(value: &str) -> bool {
+    cc_reasoning_effort_options()
+        .iter()
+        .any(|m| m.value == value)
+}
+
+/// Where one Claude Code session finds its defaults, read fresh per spawn.
+///
+/// It sees exactly the env the spawned CC sees. The engine's raw process env
+/// would not do: it holds the workspace env vars as of engine startup, so a
+/// value read there goes stale the moment a variable changes.
+pub struct CcSettingsScope<'a> {
+    /// The workspace env vars the spawn injects (`SpawnArgs::user_env_vars`).
+    pub env: &'a [(String, String)],
+    /// What CC inherits for a name `env` does not set. Production passes
+    /// `core::inherited_env_var`, and tests pass a stub.
+    pub inherited: fn(&str) -> Option<String>,
+    /// The `CLAUDE_CONFIG_DIR` the session runs under, holding the user settings.
+    pub config_dir: Option<&'a Path>,
+    /// The session's cwd, whose `.claude/` holds the project settings.
+    pub project_dir: &'a Path,
+}
+
+impl CcSettingsScope<'_> {
+    /// The effort CC runs at when no caller pinned one.
+    pub fn default_effort(&self) -> Option<String> {
+        self.resolve("CLAUDE_CODE_EFFORT_LEVEL", "effortLevel", |v| {
+            let v = v.to_lowercase();
+            is_valid_effort(&v).then_some(v)
+        })
+    }
+
+    /// The model CC picks when no `--model` is passed. `None` means CC's
+    /// built-in default, which only its Init event names.
+    pub fn default_model(&self) -> Option<String> {
+        self.resolve("ANTHROPIC_MODEL", "model", |v| {
+            let v = v.trim();
+            (!v.is_empty()).then(|| v.to_string())
+        })
+    }
+
+    /// CC's own order, highest first: the env var, then the local project,
+    /// project and user settings files. The source order is CC's
+    /// `userSettings < projectSettings < localSettings < flagSettings`. The
+    /// engine's `--settings` file (flagSettings) sets neither key, so it is
+    /// skipped here.
+    fn resolve(
+        &self,
+        env_var: &str,
+        settings_key: &str,
+        accept: impl Fn(&str) -> Option<String>,
+    ) -> Option<String> {
+        let env_value = self
+            .env
+            .iter()
+            .find(|(k, _)| k == env_var)
+            .map(|(_, v)| v.clone())
+            .or_else(|| (self.inherited)(env_var));
+        if let Some(v) = env_value.as_deref().and_then(&accept) {
+            return Some(v);
+        }
+        let claude_dir = self.project_dir.join(".claude");
+        [
+            Some(claude_dir.join("settings.local.json")),
+            Some(claude_dir.join("settings.json")),
+            self.config_dir.map(|d| d.join("settings.json")),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|path| {
+            let content = std::fs::read_to_string(path).ok()?;
+            let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+            accept(parsed.get(settings_key)?.as_str()?)
+        })
+    }
+}
+
+/// `AgentRuntime` implementation backed by the `claude` CLI.
+pub struct ClaudeCodeRuntime;
+
+#[async_trait]
+impl AgentRuntime for ClaudeCodeRuntime {
+    fn kind(&self) -> CodingAgent {
+        CodingAgent::ClaudeCode
+    }
+
+    async fn spawn(
+        &self,
+        args: SpawnArgs<'_>,
+        cancel: CancellationToken,
+    ) -> Result<RunningAgent, Box<dyn std::error::Error + Send + Sync>> {
+        let cli_dir = lucidos_cli_dir();
+        // Resolve the permission-prompt MCP server's binary up front so a
+        // missing `lucidos` CLI fails the spawn rather than surfacing as
+        // "Available MCP tools: none" mid-stream. See `resolve_lucidos_binary_in`.
+        resolve_lucidos_binary(cli_dir)?;
+        // A user-configured `claude` path must point at a real executable, so
+        // fail the spawn naming the setting rather than probing past a typo.
+        // See `spawn_env::resolve_binary_override`.
+        if let Some(path) = args.binary_override {
+            super::spawn_env::resolve_binary_override(
+                path,
+                "Claude Code (`claude`)",
+                crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
+            )?;
+        }
+        place_lucidos_cli_skill(
+            args.worktree_path,
+            args.coding_agent_kind,
+            LUCIDOS_CLI_SKILL,
+        )
+        .await;
+        ensure_workspace_bin_symlink(args.worktree_path, cli_dir);
+
+        // Materialize the config CC reads via --settings: the PreToolUse hooks
+        // and the widened directory scope. Log-and-continue on failure: the
+        // session then runs without its hooks and cards every reach into
+        // `data/`, but the rest of it still works.
+        let cc_settings_path =
+            crate::engine::cc_settings::cc_settings_path_for_workspace(args.workspace_path);
+        if let Err(e) = crate::engine::cc_settings::write_cc_settings(args.workspace_path).await {
+            crate::log!(
+                "[ClaudeCode] failed to write cc-settings.json at {}: {}. Hooks will not fire and data/ is not granted",
+                cc_settings_path.display(),
+                e
+            );
+        }
+
+        let CcCommand {
+            mut cmd,
+            system_prompt_file,
+            run_marker,
+        } = build_command(&args, cli_dir)?;
+        let stream_state = CcStreamState::with_notes_relayed(relays_vertex_calls(&cmd));
+        let mut child = super::spawn_env::spawn_below_engine(&mut cmd)?;
+        let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
+        let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+        let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
+
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<ControlRequest>();
+        let (withdraw_tx, withdraw_rx) = mpsc::unbounded_channel::<WithdrawRequest>();
+
+        let initial_session_id = args.resume_session_id.map(str::to_string);
+        tokio::spawn(async move {
+            driver_task(
+                child,
+                stdin,
+                BufReader::new(stdout),
+                BufReader::new(stderr),
+                events_tx,
+                input_rx,
+                control_rx,
+                withdraw_rx,
+                cancel,
+                initial_session_id,
+                stream_state,
+            )
+            .await;
+            drop(system_prompt_file);
+            super::agent_run_marker::reap_marked_groups(run_marker, GROUP_TEARDOWN_GRACE).await;
+        });
+
+        Ok(RunningAgent {
+            kind: CodingAgent::ClaudeCode,
+            events_rx,
+            input_tx,
+            control_tx,
+            // CC permissions flow out-of-band: its MCP permission-prompt
+            // subprocess POSTs /api/v1/internal/permission-prompt directly.
+            permission_rx: None,
+            withdraw_tx: Some(withdraw_tx),
+        })
+    }
+}
+
+/// Resolve the `claude` executable for spawn. The user-configured override wins
+/// outright (the spawn path already validated it, see
+/// `spawn_env::resolve_binary_override`), then the common install locations,
+/// then a bare PATH lookup.
+///
+/// Probing is needed because the CC native installer symlinks
+/// `$HOME/.local/bin/claude`, and an engine launched by launchd or an IDE
+/// inherits a PATH without `~/.local/bin`. A bare `Command::new("claude")` then
+/// ENOENTs even though the binary is installed. The probe list mirrors
+/// `resolve_codex_binary`: native installer, the older `~/.claude/local`
+/// install, then the Homebrew prefixes. Bare `"claude"` is last, so
+/// `Command::spawn` does its own PATH lookup for npm globals and custom
+/// symlinks. `home` is injected to keep the function pure and testable.
+pub(crate) fn resolve_claude_binary(
+    home: Option<&Path>,
+    override_path: Option<&Path>,
+) -> std::ffi::OsString {
+    if let Some(p) = override_path {
+        return p.as_os_str().to_os_string();
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        candidates.push(home.join(".local/bin/claude"));
+        candidates.push(home.join(".claude/local/claude"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
+    candidates.push(PathBuf::from("/usr/local/bin/claude"));
+    for c in candidates {
+        if c.exists() {
+            return c.into_os_string();
+        }
+    }
+    std::ffi::OsString::from("claude")
+}
+
+/// Resolve the absolute path to the `lucidos` CLI binary that backs the CC
+/// permission-prompt MCP server (`lucidos mcp-permission-server`).
+///
+/// Prefer the bundled binary next to the engine (`cli_dir`, found by
+/// `find_lucidos_cli_dir`), else a `PATH` lookup. Returns a descriptive `Err`
+/// when neither has it, so the spawn fails at once instead of surfacing as a
+/// silent "Available MCP tools: none" mid-stream abort. The most common cause
+/// is a packaged build that bundles `lucidos-engine` but forgets the sibling
+/// `lucidos` CLI.
+///
+/// `path_env` is injected to keep the lookup pure and testable.
+fn resolve_lucidos_binary_in(
+    cli_dir: Option<&Path>,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(dir) = cli_dir {
+        let candidate = dir.join(LUCIDOS_BIN_NAME);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    if let Some(found) =
+        super::spawn_env::find_on_path(std::ffi::OsStr::new(LUCIDOS_BIN_NAME), path_env)
+    {
+        return Ok(found);
+    }
+    Err(format!(
+        "the bundled `{bin}` CLI (required for the Claude Code permission-prompt \
+         MCP server) was not found next to the engine binary nor on PATH — a \
+         packaged build must ship `{bin}` alongside `lucidos-engine`",
+        bin = LUCIDOS_BIN_NAME
+    )
+    .into())
+}
+
+fn resolve_lucidos_binary(
+    cli_dir: Option<&Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    resolve_lucidos_binary_in(cli_dir, std::env::var_os("PATH").as_deref())
+}
+
+/// Byte-idle deadline we hand Claude Code for its own streaming watchdog, in
+/// milliseconds. 30 minutes, the maximum CC accepts (it clamps
+/// `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` to `[10_000, 1_800_000]`).
+///
+/// CC aborts a turn when no bytes arrive on the SSE body for its deadline,
+/// which defaults to 300_000 ms. It does not recover: no non-streaming
+/// fallback, and at most one retry. A large cache-cold prompt can be silent
+/// on the wire for longer than that.
+///
+/// The point is to push CC's deadline PAST the engine's own silence detectors
+/// (`agent_session::lifecycle::WATCHDOG_INACTIVITY_LIMIT_MS` and
+/// `agent_session::external_watchdog::EXTERNAL_WATCHDOG_LIMIT_MS`), whose
+/// response is a non-destructive kill plus auto-resume. The shorter deadline
+/// decides the outcome, so CC's must be the outer one. Disabling CC's
+/// watchdog outright would remove the backstop it was shipped to be.
+///
+/// Temporary measure, see `docs/temporary-measures.md`
+/// ("CC byte-idle deadline raised past the engine watchdog") and
+/// `docs/investigations/2026-08-02-cc-stream-idle-timeout.md`.
+const CC_BYTE_STREAM_IDLE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
+/// A `claude` command and the file that holds its appended system prompt.
+///
+/// The prompt never rides on argv. Linux caps one argv string at 128 KiB, and
+/// a long thread's history outgrows that, so every spawn would fail with
+/// `E2BIG` for good. Argv is also world-readable in `/proc/<pid>/cmdline`.
+/// The file is 0600 and is deleted on drop, so hold this until the child exits.
+struct CcCommand {
+    cmd: tokio::process::Command,
+    system_prompt_file: Option<tempfile::TempPath>,
+    run_marker: super::agent_run_marker::AgentRunMarker,
+}
+
+/// Where the system prompt files live. Inside the workspace rather than the
+/// shared temp dir, so this engine's boot sweep owns every file in it.
+fn system_prompt_dir(workspace: &Path) -> PathBuf {
+    workspace.join(".lucidos/cc-system-prompts")
+}
+
+/// Write `prompt` to a fresh file only its owner can read.
+fn write_system_prompt_file(workspace: &Path, prompt: &str) -> std::io::Result<tempfile::TempPath> {
+    let dir = system_prompt_dir(workspace);
+    std::fs::create_dir_all(&dir)?;
+    let mut file = tempfile::Builder::new()
+        .prefix("system-prompt-")
+        .suffix(".md")
+        .tempfile_in(&dir)?;
+    std::io::Write::write_all(&mut file, prompt.as_bytes())?;
+    Ok(file.into_temp_path())
+}
+
+/// Delete the system prompt files an earlier engine left behind. An engine
+/// that exits never drops its live sessions' file guards.
+///
+/// Call at boot, before any session spawns. A file younger than a minute may
+/// already belong to this engine, so it waits for the next boot.
+pub fn sweep_stale_system_prompt_files(workspace: &Path) {
+    let Ok(entries) = std::fs::read_dir(system_prompt_dir(workspace)) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| modified < cutoff);
+        if stale {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                log!(
+                    "[ClaudeCode] failed to delete stale system prompt file {}: {}",
+                    entry.path().display(),
+                    e
+                );
+            }
+        }
+    }
+}
+
+/// Build the `claude` Command with all flags and env vars. Extracted so unit
+/// tests can inspect args/env without spawning. `cli_dir` is the directory
+/// containing the `lucidos` binary, prepended to PATH; pass `None` to skip.
+fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> std::io::Result<CcCommand> {
+    build_command_with_settings(
+        args,
+        cli_dir,
+        &crate::engine::cc_settings::cc_settings_path_for_workspace(args.workspace_path),
+    )
+}
+
+/// [`build_command`] under a given `--settings` file. Only a side question
+/// passes its own: settings hold hooks and directories, never the tool list,
+/// so both commands keep one prompt prefix.
+fn build_command_with_settings(
+    args: &SpawnArgs<'_>,
+    cli_dir: Option<&Path>,
+    settings: &Path,
+) -> std::io::Result<CcCommand> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let claude_bin = resolve_claude_binary(home.as_deref(), args.binary_override.map(Path::new));
+    let mut cmd = tokio::process::Command::new(claude_bin);
+    // The user's `coding_agent_claude_permission_mode`, defaulting to
+    // acceptEdits: in-cwd writes auto-approve, and out-of-cwd writes plus Bash
+    // route through --permission-prompt-tool to a PermissionCard. The flag is
+    // passed unconditionally, and CC takes the CLI value over any settings
+    // file. So this is the only place the mode can be chosen.
+    let permission_mode = resolve_permission_mode(args.permission_mode);
+    if let Some(sid) = args.resume_session_id {
+        cmd.arg("--print").arg("--resume").arg(sid);
+    }
+    cmd.arg("--input-format")
+        .arg("stream-json")
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--verbose")
+        // Claude Code echoes each stdin input when it consumes it. That echo is
+        // the only proof an input was read (ADR 0268).
+        .arg("--replay-user-messages")
+        .arg("--permission-mode")
+        .arg(permission_mode.flag())
+        .arg("--permission-prompt-tool")
+        .arg(CC_PERMISSION_PROMPT_TOOL)
+        // Added to Claude Code's own MCP sources, never in place of them, so
+        // enabled plugin servers start too. A same-named server cannot replace
+        // it. No `--strict-mcp-config`: see ADR 0398.
+        .arg("--mcp-config")
+        .arg(permission_mcp_config_json(cli_dir))
+        .arg("--settings")
+        .arg(settings);
+    for dir in args.additional_directories {
+        cmd.arg("--add-dir").arg(dir);
+    }
+    if args.additional_directories.is_empty() {
+        cmd.env_remove(CC_ADDITIONAL_DIRECTORIES_ENV);
+    } else {
+        let dirs: Vec<_> = args
+            .additional_directories
+            .iter()
+            .map(|dir| dir.to_string_lossy())
+            .collect();
+        cmd.env(
+            CC_ADDITIONAL_DIRECTORIES_ENV,
+            serde_json::Value::from(dirs).to_string(),
+        );
+    }
+    cmd.current_dir(args.worktree_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env_remove("CLAUDECODE");
+    // Always request partial-message streaming, on fresh AND resumed sessions.
+    // The `stream_event` deltas become `AgentEvent::StreamActivity` liveness
+    // pings that keep the watchdog's inactivity clock fresh through one long
+    // step. Omit it on `--resume` and the heartbeat ticks only at step
+    // boundaries, so the watchdog kills long unattended steps mid-work. The
+    // flag is a streaming-output option, orthogonal to `--resume`.
+    cmd.arg("--include-partial-messages");
+
+    if let Some(tools) = args.allowed_tools {
+        cmd.arg("--allowedTools").arg(tools);
+    }
+    if let Some(m) = args.model {
+        cmd.arg("--model").arg(m);
+    }
+    let system_prompt_file = args
+        .system_prompt
+        .map(|prompt| write_system_prompt_file(args.workspace_path, prompt))
+        .transpose()?;
+    if let Some(file) = &system_prompt_file {
+        cmd.arg("--append-system-prompt-file").arg(file);
+    }
+    // Agent-independent Lucidos env contract (workspace, host protection,
+    // PG*, subprocess origin, spawn metadata, compile env, PATH), shared
+    // with every other AgentRuntime via `spawn_env::apply_lucidos_env`.
+    let run_marker = apply_lucidos_env(&mut cmd, args, cli_dir, "ClaudeCode");
+    // Push CC's own byte-idle streaming deadline out past the engine's
+    // inactivity watchdog, so a provider stall auto-resumes instead of killing
+    // the turn. See `CC_BYTE_STREAM_IDLE_TIMEOUT_MS` for the full reasoning.
+    //
+    // A tunable default, not a contract, so a workspace env var of the same name
+    // wins. Set AFTER `apply_lucidos_env`, which strips a deleted workspace var
+    // and would take this default with it if it were written first.
+    const IDLE_TIMEOUT_ENV: &str = "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS";
+    if !args
+        .user_env_vars
+        .iter()
+        .any(|(k, _)| k == IDLE_TIMEOUT_ENV)
+    {
+        cmd.env(IDLE_TIMEOUT_ENV, CC_BYTE_STREAM_IDLE_TIMEOUT_MS.to_string());
+    }
+    // Replay the thread's account pin. Set AFTER `apply_lucidos_env`, which
+    // applied any user-managed `CLAUDE_CONFIG_DIR` first, so the pin wins. An
+    // unset pin must stay unset: Claude Code reads another keychain entry and
+    // another `.claude.json` once the variable exists, even at its default
+    // path, and then reports "Not logged in".
+    match args.account_pin {
+        Some(AccountPin::ExplicitConfigDir { dir }) => {
+            cmd.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        Some(AccountPin::DefaultConfigDir { .. }) => {
+            cmd.env_remove("CLAUDE_CONFIG_DIR");
+        }
+        None => {}
+    }
+    // The effort the thread records is the effort CC runs at. So it goes AFTER
+    // `apply_lucidos_env`, where a workspace `CLAUDE_CODE_EFFORT_LEVEL` cannot
+    // overwrite a pin.
+    if let Some(effort) = args.reasoning_effort {
+        cmd.env("CLAUDE_CODE_EFFORT_LEVEL", effort);
+    }
+    // Auto mode's opt-in, for the same reason and by the same rule as the pin
+    // above: engine-owned, so it goes AFTER `apply_lucidos_env` and a stale
+    // user-managed value cannot strand a session whose preference says auto.
+    // Set ONLY for auto, so the variable stays an explicit opt-in.
+    if permission_mode.needs_auto_opt_in() {
+        cmd.env(AUTO_MODE_OPT_IN_ENV, "1");
+    }
+    // A background job dies with the turn, yet Claude Code promises the model
+    // a notification for one. Engine-owned, so it also goes AFTER
+    // `apply_lucidos_env` (ADR 0358).
+    cmd.env(BACKGROUND_TASKS_OFF_ENV, "1");
+    // Engine-owned, so it goes AFTER `apply_lucidos_env`. A workspace value
+    // then becomes the relay's upstream instead of bypassing the relay.
+    stamp_vertex_relay(&mut cmd, args, super::vertex_relay::port());
+    // The engine permission handler waits indefinitely for the user, matching
+    // `AskUserQuestion`. CC has TWO separate MCP timeouts that both have to be
+    // lifted, otherwise whichever is shorter forces a retry that surfaces a
+    // duplicate prompt:
+    //   * `MCP_TOOL_TIMEOUT`, the per-tool-call cap, defaulting to about 28h.
+    //   * `MCP_TIMEOUT`, the per-RPC cap, defaulting to 30s.
+    // The 30-second `MCP_TIMEOUT` default is what produced an infinite loop of
+    // identical permission cards: CC's MCP client cancelled the permission RPC,
+    // the engine gc'd the orphaned waiter, and CC's model retried the original
+    // tool. Both are set to the user-answer wait, in milliseconds.
+    let user_answer_wait_ms =
+        (crate::engine::cc_settings::USER_ANSWER_WAIT_SECS * 1000).to_string();
+    cmd.env("MCP_TOOL_TIMEOUT", &user_answer_wait_ms);
+    cmd.env("MCP_TIMEOUT", &user_answer_wait_ms);
+    // No macOS TCC responsibility disclaim is attempted here, and adding one
+    // back would be inert: a `pre_exec` hook forces the `fork()` path, where the
+    // only effective knob is never consulted. See ADR 0075.
+    Ok(CcCommand {
+        cmd,
+        system_prompt_file,
+        run_marker,
+    })
+}
+
+/// Point the session's Vertex calls at the engine's relay, so an
+/// always-thinking model's notes come back (`runtime::vertex_relay`). A Vertex
+/// base URL the session would otherwise use becomes the relay's upstream.
+///
+/// Set for every session, not only Vertex ones: Claude Code reads the variable
+/// only on Vertex, and a settings file can switch Vertex on out of our sight.
+///
+/// A temporary measure: `docs/temporary-measures.md` § "Claude Code's Vertex
+/// calls go through the Vertex relay".
+fn stamp_vertex_relay(
+    cmd: &mut tokio::process::Command,
+    args: &SpawnArgs<'_>,
+    relay_port: Option<u16>,
+) {
+    use super::vertex_relay::{relay_base_url, ENV_VERTEX_BASE_URL};
+    let Some(port) = relay_port else { return };
+    let user_base = args
+        .user_env_vars
+        .iter()
+        .find(|(name, _)| name == ENV_VERTEX_BASE_URL)
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var(ENV_VERTEX_BASE_URL).ok());
+    match relay_base_url(port, args.thread_id, user_base.as_deref()) {
+        Some(url) => {
+            cmd.env(ENV_VERTEX_BASE_URL, url);
+        }
+        None => crate::log!(
+            "[ClaudeCode] no signing secret, so thread {} runs without the Vertex relay",
+            args.thread_id
+        ),
+    }
+}
+
+/// Whether `cmd` sends its Vertex calls through the relay. Read back off the
+/// command, so the parser's view cannot drift from what the spawn stamped.
+fn relays_vertex_calls(cmd: &tokio::process::Command) -> bool {
+    let name = std::ffi::OsStr::new(super::vertex_relay::ENV_VERTEX_BASE_URL);
+    cmd.as_std().get_envs().any(|(key, value)| {
+        key == name
+            && value
+                .and_then(|v| v.to_str())
+                .is_some_and(super::vertex_relay::is_relay_url)
+    })
+}
+
+/// Which of Claude Code's own permission modes a session runs in, resolved
+/// from the `coding_agent_claude_permission_mode` preference.
+///
+/// Only two of CC's six are offered. `bypassPermissions` removes the card
+/// outright, `plan` cannot write, and `default` is strictly worse than
+/// `acceptEdits` here because it stops auto-approving in-worktree writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CcPermissionMode {
+    /// In-worktree writes auto-approve; everything else raises a card.
+    AcceptEdits,
+    /// CC's safety classifier approves routine actions instead of carding.
+    Auto,
+}
+
+/// Env var CC requires before it will enter auto mode on a non-first-party
+/// provider. We run on Vertex, and without it CC's gate drops the session to
+/// `default`, which cards MORE than `acceptEdits` does.
+const AUTO_MODE_OPT_IN_ENV: &str = "CLAUDE_CODE_ENABLE_AUTO_MODE";
+
+/// Removes `run_in_background` from the `Bash` and `Agent` schemas, and makes a
+/// timed-out command fail rather than move to the background.
+const BACKGROUND_TASKS_OFF_ENV: &str = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS";
+
+/// The session's `--add-dir` list as a JSON array of strings. Claude Code reads
+/// agent definitions from those directories, and the hook payload does not
+/// name them, so `lucidos cc-agent-guard` reads them here.
+const CC_ADDITIONAL_DIRECTORIES_ENV: &str = "LUCIDOS_CC_ADDITIONAL_DIRECTORIES";
+
+impl CcPermissionMode {
+    /// CC's own spelling, for `--permission-mode`.
+    pub(crate) fn flag(self) -> &'static str {
+        match self {
+            Self::AcceptEdits => "acceptEdits",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// Whether this mode needs [`AUTO_MODE_OPT_IN_ENV`] set.
+    pub(crate) fn needs_auto_opt_in(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+/// Read the stored preference value as a mode.
+///
+/// The handle resolves an unset or unrecognised value to the catalog default,
+/// `accept-edits`. Never to `auto`, which nobody asked for, and never to CC's
+/// `default`, which cards more. Every arm names a catalog value, so a renamed
+/// value cannot hide behind a catch-all.
+pub(crate) fn resolve_permission_mode(preference: Option<&str>) -> CcPermissionMode {
+    let mode = crate::core::prefs::CODING_AGENT_CLAUDE_PERMISSION_MODE.resolve(preference);
+    match mode.as_str() {
+        "accept-edits" => CcPermissionMode::AcceptEdits,
+        "auto" => CcPermissionMode::Auto,
+        // `every_catalogued_permission_mode_maps` walks the catalog's list.
+        other => unreachable!("the catalog admits no permission mode {other:?}"),
+    }
+}
+
+/// MCP server name Claude Code mounts `lucidos mcp-permission-server` under
+/// (the `mcpServers` key in [`permission_mcp_config_json`]). CC prefixes every
+/// MCP tool with `mcp__<server>__`, so this is also the first half of both wire
+/// names below. Codex mounts the SAME binary under the name `lucidos`, so its
+/// question tool ([`super::CODEX_ASK_USER_QUESTION_TOOL`]) has a different wire
+/// name for the same server-side tool.
+const CC_PERMISSION_MCP_SERVER: &str = "lucidos_perm";
+
+/// The tool CC is pointed at with `--permission-prompt-tool`: every gated tool
+/// call arrives here and is forwarded to `/api/v1/internal/permission-prompt`.
+pub const CC_PERMISSION_PROMPT_TOOL: &str = "mcp__lucidos_perm__approve";
+
+/// The question tool as CC sees it. Same server-side `ask_user_question` Codex
+/// calls, under CC's mount name, so it is a THIRD wire name for one flow.
+///
+/// It is reachable because CC's `--mcp-config` advertises every tool the server
+/// lists, and the server lists both `approve` and `ask_user_question`. So a CC
+/// session can raise a QuestionCard through here rather than through its native
+/// `AskUserQuestion`. Everything keyed on the name has to know that:
+/// [`super::is_user_question_tool`] is the one place that decides.
+pub const CC_MCP_ASK_USER_QUESTION_TOOL: &str = "mcp__lucidos_perm__ask_user_question";
+
+/// Claude Code's OWN built-in question tool, intercepted by the PreToolUse hook
+/// in `crate::engine::cc_settings` rather than routed over MCP. Not prefixed,
+/// because it is not an MCP tool.
+pub const CC_NATIVE_ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
+
+/// Build the `--mcp-config` JSON for the lucidos permission server. CC spawns
+/// `lucidos mcp-permission-server` over stdio; the server reads
+/// `LUCIDOS_THREAD_ID` and `LUCIDOS_WORKSPACE` from the inherited env.
+///
+/// `--permission-only` narrows the server to its `approve` tool. The same
+/// binary also serves Codex's `ask_user_question`, and CC has no per-server
+/// tool filter. Without the flag, that tool lands in CC's list as a duplicate
+/// of its native `AskUserQuestion`. Calling it then raises a permission card,
+/// because CC routes every MCP tool through `--permission-prompt-tool`.
+///
+/// Asking the user a question is not a permission-worthy act: the tool does not
+/// belong to this backend. See `mcp_permission_server::ToolSet` for the other
+/// half of the split.
+///
+/// `command` is the ABSOLUTE path to the resolved `lucidos` binary, not the
+/// bare name. The MCP server must not depend on the engine's modified `PATH`
+/// surviving the spawn chain through `claude` into the server. `spawn()` has
+/// already `?`-checked the same resolution, so the bare-name fallback here only
+/// keeps this builder infallible.
+fn permission_mcp_config_json(cli_dir: Option<&Path>) -> String {
+    let command = resolve_lucidos_binary(cli_dir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| LUCIDOS_BIN_NAME.to_string());
+    serde_json::json!({
+        "mcpServers": {
+            CC_PERMISSION_MCP_SERVER: {
+                "command": command,
+                "args": ["mcp-permission-server", "--permission-only"]
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Format a user input as the JSON line CC expects on stdin. `session_id` is
+/// the Claude Code session id (from the latest Init event, or the resumed id).
+fn format_user_input(input: &AgentInput, session_id: Option<&str>) -> String {
+    let content = if input.images.is_empty() {
+        serde_json::Value::String(input.text.clone())
+    } else {
+        let mut blocks = Vec::new();
+        if !input.text.is_empty() {
+            blocks.push(serde_json::json!({
+                "type": "text",
+                "text": input.text,
+            }));
+        }
+        for img in &input.images {
+            blocks.push(serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.mime_type,
+                    "data": img.base64,
+                },
+            }));
+        }
+        serde_json::Value::Array(blocks)
+    };
+    let msg = serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": content,
+        },
+        "session_id": session_id.unwrap_or("default"),
+        "parent_tool_use_id": null,
+        "uuid": input.uuid,
+    });
+    let mut line = serde_json::to_string(&msg).expect("user input serializes");
+    line.push('\n');
+    line
+}
+
+/// Write one line to CC's stdin and flush it. `false` means the pipe is gone
+/// and the driver should stop; the failure is logged here.
+async fn write_stdin_line(stdin: &mut ChildStdin, line: &str, what: &str) -> bool {
+    if let Err(e) = stdin.write_all(line.as_bytes()).await {
+        log!("[ClaudeCode] failed to write {} to stdin: {}", what, e);
+        return false;
+    }
+    if let Err(e) = stdin.flush().await {
+        log!("[ClaudeCode] failed to flush stdin after {}: {}", what, e);
+        return false;
+    }
+    true
+}
+
+/// True when an exit status indicates the process was killed by a signal.
+/// Either the kernel delivered it (`status.signal()` is set), or the child
+/// followed the Node.js `128 + signum` convention after handling it.
+/// Distinguishes a stray external kill (auto-resumable) from a clean exit.
+/// Mirrors the case analysis in `format_exit_status`, and lives next to it so
+/// the two stay in lockstep.
+#[cfg(unix)]
+pub(crate) fn exit_indicates_signal_kill(status: &std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    if status.signal().is_some() {
+        return true;
+    }
+    matches!(status.code(), Some(code) if (129..=159).contains(&code))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn exit_indicates_signal_kill(_status: &std::process::ExitStatus) -> bool {
+    false
+}
+
+/// Decode a `child.wait()` result into a debuggable string. `{:?}` on
+/// `ExitStatus` prints `unix_wait_status(36608)`, useless when a
+/// session-ending CC death lands in production logs. Three cases:
+///
+/// * `exit=N`: a clean exit with code `N` below the signal-convention range.
+/// * `exit=N (probable SIGNAME)`: the Node.js convention, where a child with a
+///   signal handler re-exits `128 + signum` after cleanup. The hint reads the
+///   cryptic 143 and 137 codes back as SIGTERM and SIGKILL at log-read time.
+/// * `signal=NAME (N)` / `signal=N`: the kernel delivered the signal as
+///   cause-of-death, so the child never got to clean up.
+///
+/// `signal_name` falls through to bare numbers for anything unmapped, so the
+/// log never silently drops information.
+pub(crate) fn format_exit_status(
+    wait_result: &std::io::Result<std::process::ExitStatus>,
+) -> String {
+    match wait_result {
+        Err(e) => format!("wait_err: {e}"),
+        Ok(status) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = status.signal() {
+                    return match signal_name(sig) {
+                        Some(name) => format!("signal={name} ({sig})"),
+                        None => format!("signal={sig}"),
+                    };
+                }
+                if let Some(code) = status.code() {
+                    if (129..=159).contains(&code) {
+                        if let Some(name) = signal_name(code - 128) {
+                            return format!("exit={code} (probable {name})");
+                        }
+                    }
+                    return format!("exit={code}");
+                }
+                "no_status".to_string()
+            }
+            #[cfg(not(unix))]
+            {
+                match status.code() {
+                    Some(code) => format!("exit={code}"),
+                    None => "no_status".to_string(),
+                }
+            }
+        }
+    }
+}
+
+/// Grace a cancelled CC process group gets to tear itself down (SIGTERM) before
+/// the engine force-kills it (SIGKILL). Sized for a Playwright runner to close
+/// the browsers it tracks: those `setsid`-escape the group, so only the runner's
+/// own teardown reaps them and a bare SIGKILL leaves them orphaned. Runs in the
+/// detached `driver_task`, off the cancel UX path, so the wait costs no
+/// interactive latency. See `spawn_env::graceful_kill_child_process_group`.
+///
+/// Shared with both Codex drivers, the background-task registry and MCP server
+/// shutdown, which tear down the same way and reap the same browsers. An MCP
+/// Stop waits this grace out in the foreground. Tuning this upward is the
+/// documented answer to a fresh pile-up, and a caller holding its own literal
+/// would sit out that fix.
+pub(crate) const GROUP_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Drive the CC process: forward stdout → events_tx, input/control → stdin,
+/// and react to cancellation. Always emits `AgentEvent::Exited` (best-effort)
+/// before returning so consumers can distinguish a clean close from a panic.
+#[allow(clippy::too_many_arguments)]
+async fn driver_task(
+    mut child: Child,
+    mut stdin: ChildStdin,
+    mut stdout_reader: BufReader<ChildStdout>,
+    mut stderr_reader: BufReader<ChildStderr>,
+    events_tx: mpsc::UnboundedSender<AgentEvent>,
+    mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
+    mut control_rx: mpsc::UnboundedReceiver<ControlRequest>,
+    mut withdraw_rx: mpsc::UnboundedReceiver<WithdrawRequest>,
+    cancel: CancellationToken,
+    mut session_id: Option<String>,
+    mut stream_state: CcStreamState,
+) {
+    // Capture the child pid before the wait arm consumes the Child:
+    // `tokio::process::Child::id()` returns `None` once `wait()` resolves, and
+    // the diagnostic log line below is the one place that needs it.
+    let child_pid = child.id();
+    // The process's NATURAL exit status, captured only when the OS reports the
+    // child gone on its own, BEFORE any engine-side teardown kill. It drives
+    // `killed_by_signal`, so a stray external SIGTERM (exit=143) is told apart
+    // from a clean exit and from an engine-initiated cancel. `None` means the
+    // engine tore the child down, which is not auto-resumable.
+    let mut natural_exit_status: Option<std::process::ExitStatus> = None;
+    // True once the child has been reaped (`wait()` resolved). Gates the
+    // group-kill below: after reaping, the pid (hence the group id) may be
+    // recycled, so signalling the group would risk unrelated processes.
+    let mut child_reaped = false;
+    // `stream_state` spans lines of THIS stream, and only this one. The driver
+    // task owns it, so it lives and dies with the subprocess.
+    //
+    // Bytes, read with `read_until`, because that is the cancel-safe read. The
+    // select below drops the read whenever another arm wins, and a large line
+    // arrives in several chunks. `read_until` keeps the chunks already read in
+    // `line_buf`. `read_line` holds them inside its future and loses them.
+    let mut line_buf: Vec<u8> = Vec::new();
+    let mut pending_replies = PendingReplies::new();
+    loop {
+        tokio::select! {
+            read_result = stdout_reader.read_until(b'\n', &mut line_buf) => {
+                match read_result {
+                    Ok(0) => {
+                        // `read_until` counts only this call's bytes. A dropped
+                        // read can leave a last line that EOF ends without a
+                        // newline, so forward what `line_buf` still holds.
+                        if !line_buf.is_empty() {
+                            let events = route_stdout_line(
+                                &mut stream_state,
+                                &mut pending_replies,
+                                &String::from_utf8_lossy(&line_buf),
+                            );
+                            for ev in events {
+                                let _ = events_tx.send(ev);
+                            }
+                        }
+                        log!("[ClaudeCode] driver stdout EOF — closing session");
+                        break;
+                    }
+                    Ok(_) => {
+                        let events = route_stdout_line(
+                            &mut stream_state,
+                            &mut pending_replies,
+                            &String::from_utf8_lossy(&line_buf),
+                        );
+                        for ev in events {
+                            if let AgentEvent::Init { session_id: ref sid, .. } = ev {
+                                session_id = Some(sid.clone());
+                            }
+                            if events_tx.send(ev).is_err() {
+                                // Consumer dropped: stop forwarding this line's
+                                // remaining events. This `break` leaves the
+                                // `for` only; teardown is the `cancel` /
+                                // `child.wait()` arms' job, and dropping the
+                                // receiver goes hand in hand with cancelling.
+                                line_buf.clear();
+                                break;
+                            }
+                        }
+                        line_buf.clear();
+                    }
+                    Err(e) => {
+                        log!("[ClaudeCode] stdout read error: {}", e);
+                        break;
+                    }
+                }
+            }
+            input = input_rx.recv() => {
+                let Some(input) = input else { break };
+                let line = format_user_input(&input, session_id.as_deref());
+                if !write_stdin_line(&mut stdin, &line, "user input").await {
+                    break;
+                }
+            }
+            req = control_rx.recv() => {
+                let Some(req) = req else { break };
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let Some(mut line) = cc_control_request_to_json(&req, &request_id) else {
+                    log!("[ClaudeCode] Dropped a control request Claude Code refuses: {:?}", req);
+                    continue;
+                };
+                line.push('\n');
+                if !write_stdin_line(&mut stdin, &line, "control_request").await {
+                    break;
+                }
+            }
+            // A dropped sender only disables this arm: withdraws are optional.
+            Some(withdraw) = withdraw_rx.recv() => {
+                // Inputs and withdraws arrive on separate channels. Writing
+                // every input already handed over first keeps a cancel from
+                // overtaking the message it names.
+                let mut flushed = true;
+                while let Ok(input) = input_rx.try_recv() {
+                    let line = format_user_input(&input, session_id.as_deref());
+                    flushed = write_stdin_line(&mut stdin, &line, "user input").await;
+                    if !flushed {
+                        break;
+                    }
+                }
+                if !flushed {
+                    break;
+                }
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let line = cc_cancel_async_message_json(withdraw.input_uuid, &request_id);
+                pending_replies.insert(request_id, withdraw.reply);
+                if !write_stdin_line(&mut stdin, &line, "withdraw").await {
+                    break;
+                }
+            }
+            _ = cancel.cancelled() => {
+                log!("[ClaudeCode] cancellation signalled — terminating CC process");
+                break;
+            }
+            wait_result = child.wait() => {
+                // Always-on subprocess exit handler. Fires the instant the
+                // OS reports the child is gone, regardless of stdout state.
+                //
+                // A grandchild that inherited stdout (rustc under cargo, a
+                // backgrounded Bash tool) keeps the pipe open after CC's main
+                // process dies. Polling `try_wait` on a timer instead is
+                // starved by continuous grandchild noise, because
+                // `tokio::select!` re-creates its futures each iteration. The
+                // engine then wedges at status='running' forever.
+                //
+                // After the exit, drain remaining stdout with a bounded
+                // timeout. A final `Result` line CC flushed before exiting is
+                // still forwarded, without blocking on a noisy grandchild.
+                log!(
+                    "[ClaudeCode] CC process exited (pid={} status={}) — draining remaining stdout",
+                    child_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
+                    format_exit_status(&wait_result),
+                );
+                // The child died on its own — record its true status before any
+                // teardown so the safety net can auto-resume a stray-kill turn.
+                natural_exit_status = wait_result.ok();
+                child_reaped = true;
+                // `line_buf` may hold the start of a line the dropped read had
+                // begun. The drain below appends the rest to it.
+                let drain_deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(500);
+                loop {
+                    match tokio::time::timeout_at(
+                        drain_deadline,
+                        stdout_reader.read_until(b'\n', &mut line_buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(_)) => {
+                            let events = route_stdout_line(
+                                &mut stream_state,
+                                &mut pending_replies,
+                                &String::from_utf8_lossy(&line_buf),
+                            );
+                            for ev in events {
+                                if events_tx.send(ev).is_err() {
+                                    line_buf.clear();
+                                    break;
+                                }
+                            }
+                            line_buf.clear();
+                        }
+                    }
+                }
+                // A last line CC wrote with no newline before it exited.
+                if !line_buf.is_empty() {
+                    let events = route_stdout_line(
+                        &mut stream_state,
+                        &mut pending_replies,
+                        &String::from_utf8_lossy(&line_buf),
+                    );
+                    for ev in events {
+                        let _ = events_tx.send(ev);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // A call cut off mid-stream still billed its prompt.
+    if let Some(usage) = stream_state.close_open_call() {
+        let _ = events_tx.send(usage);
+    }
+    for usage in stream_state.release_held_usage() {
+        let _ = events_tx.send(usage);
+    }
+    let _ = events_tx.send(AgentEvent::OutputEnded);
+
+    // If the child already died on its own but a different select! arm won the
+    // race, reap it here BEFORE any teardown kill. Its true exit status then
+    // still classifies the death. A still-running child yields `None` and stays
+    // unreaped.
+    if !child_reaped {
+        if let Ok(Some(status)) = child.try_wait() {
+            natural_exit_status = Some(status);
+            child_reaped = true;
+        }
+    }
+
+    // Tear down the whole process group, so no descendant is left orphaned
+    // holding the stdout pipe. Graceful-first: SIGTERM the group, wait out
+    // `GROUP_TEARDOWN_GRACE`, then SIGKILL. Only while the child is unreaped,
+    // see `signal_child_process_group`'s pid-recycle caveat. Bash calls run in
+    // groups of their own; the launcher reaps those by agent run marker.
+    #[cfg(unix)]
+    if !child_reaped {
+        if let Some(pid) = child_pid {
+            crate::runtime::spawn_env::graceful_kill_child_process_group(pid, GROUP_TEARDOWN_GRACE)
+                .await;
+        }
+    }
+
+    // Make sure the child is gone before draining stderr — otherwise stderr
+    // could keep producing output and we'd block.
+    let _ = child.start_kill();
+    if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+
+    let stderr_tail = drain_stderr(&mut stderr_reader).await;
+    if stderr_tail.is_empty() {
+        // Absence-of-evidence is itself evidence. Without this log we
+        // can't distinguish "stderr was empty" (e.g. SIGKILL or clean
+        // SIGTERM-handled exit) from "we forgot to log stderr".
+        log!("[ClaudeCode] Claude Code stderr: <empty>");
+    } else {
+        log!("[ClaudeCode] Claude Code stderr: {}", stderr_tail.trim());
+    }
+    let killed_by_signal = natural_exit_status
+        .as_ref()
+        .map(exit_indicates_signal_kill)
+        .unwrap_or(false);
+    let _ = events_tx.send(AgentEvent::Exited { killed_by_signal });
+    // events_tx drops here — channel closes, consumer sees None.
+}
+
+#[cfg(test)]
+#[path = "claude_code_tests/parsing.rs"]
+mod parsing_tests;
+
+#[cfg(test)]
+#[path = "claude_code_tests/commands.rs"]
+mod commands_tests;
+
+#[cfg(test)]
+#[path = "claude_code_tests/build_command.rs"]
+mod build_command_tests;
+
+#[cfg(test)]
+#[path = "claude_code_tests/driver.rs"]
+mod driver_tests;

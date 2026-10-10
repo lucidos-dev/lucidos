@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lucidos-build-slot",
+    "crates/lucidos-engine",
+    "crates/lucidos-gateway",
+    "crates/lucidos-app",
+    "crates/lucidos-cli",
+    "crates/lucidos-e2e",
+    "crates/lucidos-eval",
+    "crates/lucidos-file-backup-exclusion",
+    "crates/lucidos-frame-capability",
+    "crates/lucidos-installs",
+    "crates/lucidos-local-token",
+    "crates/lucidos-tailscale",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Full debuginfo made every coding-agent worktree's target 15 to 24 GB.
+# Our crates keep file and line in panics and backtraces (ADR 0311).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

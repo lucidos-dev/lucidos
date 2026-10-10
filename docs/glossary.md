@@ -1,0 +1,4834 @@
+# Glossary (dev)
+
+Internal terms used in the Lucidos codebase, PRs, design docs, and CC sessions. Extends [`system-knowhow/glossary.md`](../system-knowhow/glossary.md) — read that first for user-facing terms (app, artifact, intent, knowhow, plugin, trigger, thread, event, …) and the user-facing advanced-coding-agent terms (Apply, change, Claude Code, coding agent, coding-agent thread, external-repo coding-agent thread, hardening). This file only adds dev-internal concepts the workspace LLM doesn't need.
+
+One term, one definition. When prose anywhere in the repo names a term below, it uses *this* meaning — never a synonym. If you're tempted to write *child thread* for the transitive *sub-thread* concept, *coding agent session* for *agent session*, or *cmd thread* for *coding-agent thread*, use the canonical word.
+
+If a needed concept genuinely isn't in either glossary, add it here (if dev-only) or to `system-knowhow/glossary.md` (if user-facing) in the same change.
+
+## Terms
+
+### Account pin
+The Claude Code profile a *coding-agent thread* is permanently bound to: the one its **first** session ran as. It is two facts, the config dir and whether `CLAUDE_CONFIG_DIR` was set at all. Claude Code treats an unset variable and one set to its default `~/.claude` as different logins, with different keychain entries and `.claude.json` files. Replaying the unset case as `CLAUDE_CONFIG_DIR=~/.claude` made every respawn report "Not logged in". The Rust type is `AccountPin` (`DefaultConfigDir` / `ExplicitConfigDir`).
+
+`lookup_pinned_cc_config_dir` reads the earliest recorded `claude_config_dir` and `claude_config_dir_explicit` across the thread's `CodingAgentSettingsChanged` / `CodingAgentIdled` events. The engine replays the pin on *every* later spawn: resume, fresh, post-stale-resume retry, recovery and side question. So a live `CLAUDE_CONFIG_DIR` toggle never moves an existing thread to another account. Only a thread's very first turn adopts the live toggle, and thereby establishes the pin.
+
+Rows from before the marker resolve as the default profile when their dir is `~/.claude`, unless the live env sets exactly that path. The auto-detected resume session id is scoped to the pinned dir (`lookup_latest_cc_session_id_for_config_dir`). Claude-Code-specific: Codex records no config dir, so it has no pin. See `crates/lucidos-engine/src/runtime/agent_runtime.rs`, `crates/lucidos-engine/src/engine/agent_session/resume.rs` and `run_session/run.rs`.
+
+### Auxiliary model call
+A model call the engine makes for itself rather than as an agent's turn, or
+one an app or script makes through the credentialed proxy. Each is listed with
+what it is in `system-knowhow/thread-events.md` § Which call each purpose
+names. Each emits a `ContextCaptured` stamped `producer: auxiliary`, plus a
+`purpose` naming which one it was. Token accounting then sees the engine's own
+spend, instead of undercounting by everything on that list.
+
+**Every model call the engine makes is one of these or a turn** (ADR 0242).
+The *model call service* is the only path to a model, so a call that records
+nothing does not compile. Six calls were silent until that ADR, the command
+guard's judge since ADR 0107 named the gap and left it open.
+
+**`voice` is the one that is not a single HTTP call.** The talker holds a
+socket, so a row is written per spoken reply and the purpose's `AuxBudget` is
+never asked for. It carries a `request_chars` of zero, because audio has no
+chars, and its `usage` block is the only real number on the row.
+
+Built only through `engine::AuxCapture`, which pairs the producer with the
+purpose so the two cannot disagree. Recorded per ATTEMPT: a resampled title
+and a retried extraction are separate API calls that each spent tokens. A call
+no thread caused records on the *home thread*, created at that call if boot
+has not made it yet, never on an invented id. The transcript renders none of them
+(`isAuxiliaryCapture` drops them from the exchange fold). A capture binds to
+the step it follows, so an auxiliary row would overwrite that step's context
+chip.
+
+### Call token
+`llm::metered::CallToken`: the permission every billable provider method
+(`LlmProvider::chat`, `JudgmentProvider::ask`, `ImageProvider::generate`,
+`WebSearchProvider::search`) takes. Only `llm::metered` can make one, and
+every function there hands the call's cost to a `CostSink` before it returns.
+That is what makes the *model call service* the only way to call a model.
+
+`lucidos-eval` builds its tokens through `CallToken::for_eval_harness`, since
+it scores models outside any workspace. A test fails if an engine source calls
+it.
+
+### Fresh input
+The part of a request the model actually read, with the cached part taken out.
+`input_tokens - cache_read_tokens - cache_creation_tokens`, saturating.
+
+The subtraction is needed because the stored `input_tokens` is a TOTAL and
+already contains both cache counts. Anthropic reports three disjoint counts and
+`anthropic_wire` sums them; OpenAI's `prompt_tokens` covers its cached tokens
+to begin with. So the three fields are a total and two of its parts, and only
+fresh input is billed at the full input rate.
+
+Three readers derive it: `ContextCapturePanel` (as `cacheMiss`), the Token Cost
+app, and `lucidos-eval`. Only the eval has a type for it, `InputSplit`, whose
+private fields make the overlapping total unreachable from a price. The eval
+priced the total flat until 2026-08-23, which overstated every dollar figure it
+had ever printed about fourfold (ADR 0110).
+
+### Modality split
+How one call's tokens divide across text, audio and image. Carried by
+`ModalityUsage` on the `usage` block's optional `modality` key, and only a
+*voice session*'s REALTIME talker reports one: that API bills audio at eight
+times the text input rate, so its four flat counts cannot be priced. A Live
+talker reports no tokens at all, because it bills by the second (ADR 0181).
+
+Every field is a PART of a flat count, named after the count it belongs to.
+Three sums hold: input text + audio + image is `input_tokens`, cache-read text
++ audio + image is `cache_read_tokens`, output text + audio is
+`output_tokens`. Same shape as *fresh input*: a total and its parts, never
+classes to add up.
+
+Absent on every other producer, so a chat or coding-agent payload is
+byte-identical to what it always was. It is all-or-nothing: `done_usage` fills
+it only when the `response.done` frame carries both detail blocks, because a
+zeroed split reads as a real turn that spoke nothing. When the parts stop
+summing to the totals, the totals win, the parts are stored as reported, and
+the engine logs the drift. Nothing rescales.
+
+### Reconstructed capture
+A `ContextCaptured` rebuilt after the fact from events that were never
+captured live, stamped `reconstructed: true` by
+`core::aux_context_backfill`. Its `estimated_total_tokens` is a reconstruction
+from the stored prompt and output text, and it deliberately carries no
+`usage`, because none was ever recorded.
+
+That absence is load-bearing. A cost rollup filtering on a present `usage`
+block keeps reporting measured spend only, so estimates never mix into a
+number meaning real API cost. The backfill's own undercount is known and named
+in
+`docs/plans/2026-08-22-auxiliary-llm-calls-are-visible-to-token-accounting.md`:
+query classification, history summarization, and every resample left no trace
+to rebuild from.
+
+### Actor
+The originator of an event: who or what caused it. Captured on persisted events as `actor: Option<MessageOrigin>`. Set by the mutating HTTP handler via `api::actor::user_actor(&headers, device_id_override)`; engine-internal emits pass `None`. The frontend reads it raw to render the actor-chip popover. *ActorMode*, derived from `MessageOrigin`, drives the UI label (Lucidos Agent / Lucidos Engine / device name).
+See also: `.claude/rules/rust.md` § "Mutating endpoints stamp the actor".
+
+### ActorMode
+The request-initiation mode — `Human` / `Agent` / `Engine`. Drives the UI actor-chip label via `mcp_client_name(ActorMode)`: `Human` → device label, `Agent` → `"Lucidos Agent"`, `Engine` → `"Lucidos Engine"`. Carried on the `Api { mode }` and `Workspace { mode }` `MessageOrigin` variants so SDK callers and cross-workspace requests can declare themselves explicitly; defaults to `Human` for back-compat. Distinct from *MessageOrigin* itself: ActorMode is the live-request classification; MessageOrigin is the persisted origin record.
+
+### Agent session
+The subprocess + worktree pairing managed under `crates/lucidos-engine/src/engine/agent_session/`. Generic across *CodingAgent* variants (the runtime map in `engine_impl.rs:655` is keyed by `CodingAgent`). When the subprocess is *Claude Code* specifically, call it a *Claude Code session* (see entry; or just *CC session* in conversation). Auto-resumes on engine restart unless the branch is already merged. Replaces the older "CC session" term, which baked the product name into the concept.
+
+### Agent run marker
+A random token every coding-agent spawn carries in its environment as `LUCIDOS_AGENT_RUN` (`runtime/agent_run_marker.rs`, ADR 0391). Every process the agent starts inherits it, whatever process group it lands in. When the agent's driver ends, the engine tears down every process group holding a process that carries it. Fresh per spawn, so only that agent's descendants can match. The shared sccache daemon is exempt by its `SCCACHE_START_SERVER=1` entry.
+
+### Follow-up order
+The per-thread chain that keeps a thread's coding-agent follow-ups in the order they were sent (`engine/chat/follow_up_order.rs`, ADR 0281). The chat handler joins it before its ack. Each follow-up waits for the one before it, records and routes its message, then releases the next.
+
+### Parked follow
+The transcript's standing follow while it is armed but holds nobody (`FollowState` `'parked'` in `components/chat/scrollState.ts`). On a waiting thread, a reader's scroll off the live edge parks the follow. It turns the follow off only while the thread is live streaming. That split is the user's explicit instruction (ADR 0064). The toggle stays lit and nothing moves the reader. The thread going live, a submit, or scrolling back to the edge makes it ride again.
+
+### Phantom session
+An `agent_sessions` entry with no run loop behind it. `run_session` inserts the entry and removes it on every *completion* path, but a run future that is **dropped** rather than polled to completion (a cancelled caller, an aborted task) runs none of those removals — so the entry survives with `process_exited == false`, which only the loop ever sets. Membership in the map is therefore not liveness; **`AgentSession::is_live()`** is (`!process_exited && !msg_tx.is_closed()` — the receiver is owned by the run future, so the channel closes the moment the loop is gone, with no cleanup required). Every liveness reader goes through it. A phantom is also *transient*: `SessionEntryGuard` (`run_session/entry_guard.rs`) reaps the entry on drop — identifying its own by `msg_tx.same_channel`, so a recovery hand-off's replacement survives — and settles the thread with `ResponseAborted{cause: SessionDropped}` unless the engine is shutting down. Named for the 2026-07-28 incident where one fooled three readers at once (worktree cleanup, the chat follow-up fast path, and the resume guard), wedging a thread on "A coding agent is already running for this thread" with no subprocess anywhere on the box.
+
+### Announced surface
+A place the engine stores user-visible state whose mutations must reach the rest
+of the system as a `SystemEvent`. Enumerated in
+`crates/lucidos-engine/src/core/announced_surfaces.rs`: every Postgres table and
+every `data/` writer, each classified `Announced` (the owning module emits from
+inside its write path, and its raw writers are private so no caller can skip
+it), `Projection` (the table materializes an already-announced event stream, so
+its writes are downstream of an announcement rather than needing one), or
+`Silent` (engine-internal state nothing observes, with the reason inline). The
+classification is enforced by source-scan tests, so a new table or a raw write
+outside its owning module fails rather than shipping. Named for the property
+that matters: a write nobody hears about is invisible until a page reload, which
+is how an agent-registered repository stayed missing from every client's list
+(the bug that produced the registry). The guarantee is about **reachability**,
+not atomicity: the row or file commits first and the emit follows through
+`emit_or_log`. See also *EventBus*, *SystemEvent*.
+
+### Subscribing surface
+A place the frontend SHOWS engine state, and the receiving mirror of an
+*announced surface*. Every such surface hears the event that mutates what it
+shows. An open page therefore repaints from the frame, with no reload and no
+navigation (ADR 0118). Two shapes carry it: reading a store signal IS the
+subscription, and a settings page that fetches its own data instead subscribes
+through a *version counter*.
+
+Enforced by `store/actions/sse-event-coverage.test.ts`, which reads
+`SystemEvent::RESERVED_TYPE_NAMES` out of the Rust source. Every wire name
+needs an arm in `thread-sync.ts` or `entityReferences.ts`, or a row in that
+test's `NO_UI_STATE` table stating what state it does not touch. Never a poll,
+an interval, a focus or visibility listener, or an invalidate-on-navigation:
+each makes one symptom go away and leaves the rule unenforced. See also
+*server-backed field*, *version counter*.
+
+### Server-backed field
+A form field whose value IS engine state until the user edits it,
+`useServerBackedField` in `crates/lucidos-app/src/hooks/useServerBackedField.ts`.
+Untouched it holds no copy at all and returns the served value, so every frame
+that moves the entity repaints it. Touched it holds the user's draft and
+ignores frames, since unsaved work is not the server's to overwrite. A setter
+call landing back on the served value returns the field to untouched.
+
+It replaces seeding a `useState` from an entity. That initializer runs once per
+mount, so a component keyed on an entity id keeps its first snapshot for good.
+That is what left the trigger detail page showing an old group after three
+`update_trigger` calls landed. A whole-editor draft pauses its re-read instead,
+and the pause defers rather than drops: see the allowlist editors and the app
+source editor. See also *subscribing surface*.
+
+### Version counter
+An integer signal an SSE dispatcher increments so a surface that fetches its own
+data can subscribe to a frame: `mcpServersVersion`, `webhooksVersion`,
+`permissionGrantsVersion`, `backupStatusVersion`, `backupPreferencesVersion`,
+`appSourceEpoch`. The surface passes it to `useVersionedRefresh`, which re-reads
+on a move and never on mount. Its `paused` argument holds the re-read off while
+that surface has a write or an unsaved draft in flight, and releases rather than
+drops it. Used where a store signal would be the wrong home, because the data is
+one settings page's and nothing else reads it. See also *subscribing surface*.
+
+### Summary version
+`thread_summaries.summary_version`, carried as `summary_version` on a thread
+summary and `summaryVersion` on an aggregate. It goes up by one on every change
+to the row, and two Postgres triggers own it, so no writer can skip or choose
+it. The client keeps the highest one it has seen in `ThreadMeta.summaryVersion`
+and refuses any older summary, through `applySummaryVersion`, the only writer
+of `ThreadMeta.status`. That is what stops a stale read putting an old status
+back on screen. Not a *version counter*: that one is a client-side signal.
+ADR 0329.
+
+### User profile cache
+The engine's hot copy of `artifacts/user_profile.md`, `UserProfileCache` in
+`crates/lucidos-engine/src/engine/user_profile.rs`. Loaded once at construction
+and read from memory by every chat turn (it renders the User Profile context
+section) and by memory extraction, so a writer that updates the file without
+updating the cache leaves the engine serving the profile it booted with until a
+restart. That was live until 2026-08-10: only the LLM's own `write_file` /
+`edit_file` tools refreshed it, so an app writing through the SDK, a trigger
+script, `lucidos data write`, a `copy_file` onto it, or a `delete_file` of it
+landed a profile no chat turn ever saw. Every route that lands text at that
+exact path now refreshes it through the one type,
+which also owns the path rule: the match is on the whole artifact path, so
+`imported/user_profile.md` is a different artifact. Distinct from an *announced
+surface*, which is about a mutation reaching other processes over the
+`EventBus`; this is one process's own copy going stale, which no event
+delivery fixes.
+
+### Data prefix
+A typed top-level folder under a workspace's `data/`, such as `artifacts/`,
+`themes/` or `scripts/`. `MUTABLE_PREFIXES` and `READ_ONLY_PREFIXES` in
+`crates/lucidos-engine/src/core/data_prefixes.rs` are the one list. The data
+route, the agent file tools, email attachments, the `lucidos` CLI and the
+frontend all read it, the last two through source-reading pin tests. A path under
+no data prefix gets `artifacts/` in front, which is how a hand-kept copy of the
+list misroutes a file.
+
+### Always-loaded set
+`CLAUDE.md` plus every `.claude/rules/*.md` carrying no `paths:` frontmatter: the instructions that enter a coding-agent session unconditionally, as a user message after the system prompt. One of the two unconditional layers, the other being the *engine system prompt*, and together they are the whole budget an agent pays before reading a line of code. Measured and gated by `scripts/check-context-budget.sh` on two arms: total size against `CONTEXT_BUDGET_CEILING` (a ratchet, lowering needs no ceremony and raising needs a reason in the commit message), and membership against `CONTEXT_BUDGET_EXPECTED_ALWAYS`, which is the regression detector for a rule meant to be path-scoped that silently became resident (the four ways that happens: a `globs:` key, a `path:` typo, a `paths:` of exactly `**`, and frontmatter that never closes). The set is not uniform in reach: `CLAUDE.md` alone also reaches a *Codex session*, because both Codex drivers point codex's project-doc fallback list at it (`CODEX_PROJECT_DOC_FALLBACKS`), while the unscoped rule files reach *Claude Code* only. It owns *repo truth*; session truth belongs to the *engine system prompt*, and `docs/agent-config.md` § Which surface owns a rule states the split.
+
+### Engine system prompt
+The block of rules the engine appends to an *agent session*'s system prompt. It is built in `crates/lucidos-engine/src/engine/agent_session/prompts.rs`. It arrives with system-prompt authority, which outranks the *always-loaded set*'s user-message delivery. *Claude Code* reads it from a 0600 file named by `--append-system-prompt-file`, and *Codex* gets it as `developerInstructions`.
+
+There are seven flavors, one per session shape: Lucidos-source worktree, external repo, app worktree, their three recovery variants, and conflict resolution. Each is assembled from shared consts plus per-flavor inline text. `append_backend_rules` adds the backend-specific tail and swaps the Claude-style question rule for the Codex one.
+
+It is the only instruction surface reaching a session with **no Lucidos checkout**: the external-repo and app-worktree flavors, four of the seven, where no `CLAUDE.md` exists to read. It owns *session truth*, meaning anything true only because the engine spawned this session; repo truth belongs to the *always-loaded set*. Size is ratcheted per flavor by a test in `prompts.rs` driving `all_prompt_flavors()`, the engine-side counterpart of `check-context-budget.sh`.
+
+### Always-on engine service
+In a packaged macOS desktop build, the *Workspace gateway* runs as a persistent launchd **LaunchAgent** (`~/Library/LaunchAgents/com.lucidos.engine.plist`, `RunAtLoad` + `KeepAlive`), independent of any window, so triggers, scheduled tasks, *agent sessions*, and mobile push keep running headless in **every** registered workspace after the UI is closed. The desktop **service** role (`Lucidos --service`, run by launchd via `run_service` in `crates/lucidos-app/src/desktop.rs`) spawns + supervises the standalone **`lucidos-gateway`** binary on the *stable gateway port*; the gateway in turn owns one shared Postgres cluster, provisions one database per workspace, and spawns one `lucidos-engine` per workspace (by path via `LUCIDOS_ENGINE_BIN`). The **client** role (the GUI app, `launch`) installs/bootstraps the *service agent* and the *login agent*, waits for `/~/api/v1/health`, then points the window at a workspace (`/<slug>/`) or the picker (`/~/`). Closing the window (red X / Cmd+W / Cmd+Q) leaves the service running: the client uses a **menu-bar (tray) model** and stays resident in the menu bar; only the explicit **Quit and Stop Background Service** action (menu-bar tray + app menu, `launchctl bootout`) stops it (tearing down the gateway *and* its spawned engines). Mobile devices reach the gateway over Tailscale (`serve`, tailnet-private; see **Settings → Access**, `crates/lucidos-app/src/mobile.rs`). Supersedes the single-engine-on-the-stable-port model (ADR 0014 refines 0013 refines 0012). Dev runs the same gateway (`scripts/web-dev.sh`), Docker-backed shared Postgres; `LUCIDOS_NO_GATEWAY=1` falls back to the legacy single-engine launcher.
+
+### Service agent
+The launchd job that runs the *always-on engine service*: label `com.lucidos.engine`, plist `~/Library/LaunchAgents/com.lucidos.engine.plist`, `RunAtLoad` + `KeepAlive`, `ProgramArguments` = `Lucidos --service`. Headless by construction (the service role never touches AppKit), so it hosts no window, no menu-bar item and no notification. Written by the client role on every launch, never from an *unstable bundle location* (`desired_service_plist` / `install_or_update_service_plist` in `crates/lucidos-app/src/desktop.rs`). Booted out by **Quit and Stop Background Service** and by uninstall. The label is historical (`engine`, from before the *Workspace gateway* owned the stack) and cannot change without orphaning every installed plist. Distinct from the *login agent*, which is the same file mechanism for the other role.
+
+### Login agent
+The launchd job that brings the **client** back at login: label `com.lucidos.client`, plist `~/Library/LaunchAgents/com.lucidos.client.plist`, `RunAtLoad`, no `KeepAlive` (quitting the client must not respawn it). Its `ProgramArguments` is a `/bin/sh -c` one-liner that runs `/usr/bin/open -g -a <bundle> --args --login`, retrying a bounded number of times in case LaunchServices is not ready yet at login. `open` rather than the bundle's inner binary, because on an already-running client LaunchServices activates that instance instead of starting a second one. The `--login` argument tells the client to come up **menu-bar-only** (tray item, no window, no `Accessory` Dock icon), which is why the `main` window is declared `"visible": false`: this is the one launch that never shows it, where every other launch shows it as a *deferred startup show*. Without this agent a restarted Mac has the *always-on engine service* running but nothing client-side, so the user gets no menu-bar item, no Dock badge and no native notifications (only the client can show those) until they open the app by hand. Not installed for an unbundled binary, and switching the item off in System Settings → General → Login Items sticks, because the disable is a launchd override keyed by the label and nothing in the code calls `launchctl enable`.
+
+### Unstable bundle location
+A place the packaged `.app` runs from but cannot keep: a mounted `.dmg` (a read-only volume), or a Gatekeeper App Translocation copy (a read-only mount with a fresh random path per launch). From either, the *service agent*'s plist would pin a path that vanishes, and the updater's first rename fails with EXDEV. So the client quits with a "Move Lucidos to Applications" dialog before writing the plist. The updater separately refuses a bundle on another device than `$TMPDIR`, which also covers a writable external disk. Classified in `crates/lucidos-app/src/bundle_location.rs`; ADR 0271.
+
+### Deferred startup show
+Why the packaged macOS client's `main` window reaches the screen only once there is something painted in it. The window is declared `"visible": false` in `tauri.conf.json` and `setup` (`crates/lucidos-app/src/lib.rs`) no longer shows it. It decides whether this launch gets a window at all (`should_show_window_at_startup`, false for the *login agent*'s `--login` start) and arms `StartupShow`, a one-shot gate that two racers can claim. The **ready-to-show signal** is the frontend's `window_ready_to_show` command, sent by `windowReadyToShow` (`utils/tauri.ts`) once the theme is resolved on the document and the next paint carries content. The **fallback** is a 3s timer in `setup` (`STARTUP_SHOW_FALLBACK`), because a frontend that never signals (a webview crash, a bundle that does not load) must not leave a client with a tray icon and no discoverable window. Whichever arrives first shows the window and the other becomes a no-op, which is also what stops a late signal re-showing a window the user has since dismissed to the menu bar; a login start arms the gate false, so neither racer shows anything.
+
+Two frontend call sites, not one, because neither covers both launches. The packaged cold launch paints the *boot splash* from the pre-gateway document and returns before `<App/>` mounts, so `applyThemeMode` never runs there. In the workspace document, `loadPreferences` skips `applyThemeMode` when the stored theme mode is unchanged. The one-shot lives in `utils/tauri.ts` so both share it.
+
+Before any of this, the window layer is tinted the color the frontend last asked for. `set_titlebar_color` persists it to `<app-data>/config/titlebar-color` and it is validated on read, so a light-mode user is not launched into the dark-mode `TITLE_BAR_DEFAULT_COLOR`. Distinct from the *boot splash*, which is what the window shows once it is up.
+
+The claiming racer does not show the window itself. It marshals three steps onto the main thread, `STARTUP_SHOW_STEPS`: settle the geometry, refit the page over it, then show. So `show_startup_window` returning `true` means the block is scheduled, not that the window is up. They ride here because this is the first moment after the run loop has drained tao's deferred setters. It is therefore the first moment anything can judge the geometry `main` will wear (ADR 0193).
+
+**Geometry is one step with two answers, never both** (ADR 0202). A workspace the record holds a frame for is the client CHOOSING: that rect goes through `window_restore::sanitized_frame`, judged before it is written. A workspace it holds nothing for leaves `main` wearing what `tauri-plugin-window-state` restored, and `clamp_restored_geometry` reads and judges that. Clamping after a placement would read the rect the placement is about to replace. `app_window::settle_main_geometry` is the one settler, shared with the tray reopen, which is what settles a *login start* the show never reached.
+
+### On screen (a window)
+Whether the packaged macOS client believes one of its windows is on the screen.
+A fact the client OWNS (`crates/lucidos-app/src/window_screen.rs`), rather than
+one it asks AppKit for. Every show records the label. Every hide clears it.
+
+Three inputs decide it, and `[NSWindow isVisible]` is deliberately not one:
+
+- **Our own intent**, which covers every hide the client performs itself.
+- **The app-hide flag**, because Cmd-H orders every window out behind our back.
+  Tracked from `NSApplicationDidHide` and its unhide twin.
+- **AppKit's miniaturized flag**, the one axis the user drives alone.
+
+The *crash watchdog* reads it to tell a page that died from one parked on
+purpose. Reloading a parked page throws away the state ADR 0141 keeps.
+`isVisible` is excluded for a reason. A report showed it answering NO for a
+window the user was clicking. A watchdog asking the same question stands down
+exactly when it is needed.
+
+**Not the question `native-window-active` asks.** That one asks whether the user
+is LOOKING at the window. A visible but unfocused one is deliberately not
+active, and gets an OS banner rather than an in-app toast.
+
+### Desk fit
+What the packaged macOS client does when the attached displays change under a
+window sized for one that has gone. The **desk** is every display attached right
+now. A **desk fit** is the pass that asks each app window whether the desk can
+still hold it (`crates/lucidos-app/src/window_desk.rs`, ADR 0204).
+
+**The trigger is the desk, never a window event.**
+`NSApplicationDidChangeScreenParametersNotification` is the one signal every
+variant shares: unplug, clamshell, a resolution change, a rearrangement. tao
+emits `ScaleFactorChanged` only when the backing factor actually changes. An
+undock between two same-factor displays is therefore silent, and a resolution
+change under a still window emits nothing at all.
+
+**The rule is the restore clamp's own, gated down to the size half.**
+`window_restore::fit_to_displays` corrects only a frame no attached SCREEN can
+hold, then hands the work to `sanitize`. So a window the user sized, dragged or
+parked is untouched while some display can hold it. That is the lenient reading
+ADR 0193 chose for a restore, and what it leaves alone is a row in
+`docs/known-gaps.md`.
+
+**Two hazards are excluded by the choice of trigger rather than by tuning.** A
+live drag posts no screen-parameters change, so the pass cannot fire under the
+pointer. Neither `set_position` nor `set_size` posts one, so a correction cannot
+cause another. The pass still WAITS out a quiet period, because AppKit posts
+several times per reconfiguration and can post before it has relocated the
+windows.
+
+Distinct from the *restore clamp*, which judges a rect read off a file just
+before a window reaches the screen. Distinct too from `refit_webview`, which is
+about the PAGE filling its window rather than the window fitting a display.
+
+### Display anchor
+The display a remembered window frame was captured on, stored beside the frame
+in `.window-session.json` (`window_restore::DisplayAnchor`, ADR 0269). It holds
+the display's identity (tao's monitor name plus its logical size) and its frame
+at capture time.
+
+**Why it exists.** macOS measures every window from the primary display's
+corner, and docking or undocking can change which display that is. A frame in
+raw global coordinates then replays on the wrong display. A restore shifts the
+frame by however far its anchor display has moved since.
+
+No single matching display, or no anchor at all, restores the raw frame, and
+the *restore clamp* judges it as before. A frame whose title bar is on no
+attached screen gets no anchor, and the capture keeps what the record held.
+
+### Traffic-light placement
+Where the packaged macOS client puts the three window buttons, and how the
+header row stays clear of them. Under `titleBarStyle: "Overlay"` the webview
+owns the full window height. The buttons float above it in an AppKit layer, so
+our HTML never reflows around them. Both numbers are therefore ours to choose
+(`crates/lucidos-app/src/traffic_lights.rs`).
+
+**Vertically** the cluster's centre sits on the centre of the one bar the user
+sees, which is `--titlebar-inset` plus `--app-header-height`. So the lights obey
+the same centring rule as every other control in the row (`--header-band-lift`),
+instead of being the one that sits higher.
+
+**The bar height can only come from the page.** `--desktop-bar-height` is `3rem`
+and the root font size is the user's UI-scale preference. A surface DECLARES its
+band with `data-titlebar-band`, and the frontend measures that element and pushes
+the height through `set_traffic_light_offset` (`store/actions/trafficLights.ts`).
+Two surfaces declare one: the app shell's `.app-header`, and the picker's own
+invisible strip. The picker mounts no shell and runs at the browser default
+scale, so it would otherwise inherit a bar it does not have.
+
+**The push FOLLOWS that band**, through `watchTitlebarBand`, rather than riding
+the applies that move it. A surface starts watching when it mounts and stops
+when it unmounts. The measurement is therefore never older than the layout, at
+any UI scale and in either the desktop or the mobile arrangement.
+
+**A height belongs to the window that reported it**, keyed by label, since two
+windows can show surfaces with different bars. The last value any page pushed is
+also remembered in `<app-data>/config/titlebar-bar-height`. That copy is a SEED
+only. It covers the frames between a window appearing and its own page
+measuring.
+
+**Horizontally** `--titlebar-lights-reserve` is arithmetic on
+`--titlebar-lights-x`, the x the shell stamps pre-paint from the constant it
+placed with. Add the cluster's measured 60px, and a gap held EQUAL to that x. The
+row keeps 80px clear, so the 20px of slack is split evenly. The drawn cluster
+then sits centred in it, with 11px of air on each side.
+
+Moving the lights within the reserve therefore moves nothing of ours. The reserve
+is the same 80px whichever way the slack is split. Three things are laid out
+against it and none notices. The header's lead inset places the drawer toggle
+and leads the drawer row. The Canvas row floors at it, and so do the pane floors
+in `paneMinimums.ts`.
+
+Tauri 2.11.4 exposes no runtime setter, and the `main` window is
+config-declared. The dispatcher method exists a layer down, but nothing public
+wraps it. So the placement drives AppKit directly through `Window::ns_window()`.
+AppKit reverts it on **every** window resize, fullscreen enter and exit included,
+which is why it is re-applied on `Resized`. It is re-applied on `Moved` too, as
+the net for a revert no probe reproduces (ADR 0074). Distinct from the reclaimed
+title-bar band itself (`.titlebar-strip`), which is the blue the CSS paints
+behind them.
+
+### Login-shell hydration
+What the *Workspace gateway* does to its own environment at boot, in `crates/lucidos-gateway/src/shell_env.rs` (ADR 0326). A service that launchd or systemd starts never ran `~/.zprofile` or `~/.zshrc`. So a user's exported provider keys are absent, and `PATH` is a bare system one. The gateway therefore runs the user's login shell once (`$SHELL -ilc`) and reads its environment back null-delimited behind a marker. It applies an **allowlist** of it to its own process, which every engine and every *agent session* below it inherits. The gateway is the root both shipped installs share, the `.app` and the headless install, so one call covers both.
+
+It runs only when `LUCIDOS_PACKAGED=1` is set and `SHLVL` is absent, so a terminal run and the dev gateway are unaffected. Four properties define it:
+
+- an allowlist of credentials, the paths credentials live at, and `PATH`. It is never a wholesale copy, so a profile cannot repoint a shipped install's model, topology or storage;
+- a variable already set in the process always wins, `PATH` excepted, which is merged shell-first over the inherited one;
+- a hard timeout after which boot continues un-hydrated, with the shell's whole process group killed;
+- names-only logging, never a value.
+
+Distinct from and composed with the engine's static PATH floor (`crates/lucidos-engine/src/core/user_path.rs`), which prepends the well-known install dirs with no subprocess. Hydration picks up a version manager's shims, and the floor covers what hydration missed. The allowlist itself is documented in the `lucidos-env-vars` skill.
+
+### Stable gateway port
+The fixed TCP port the **packaged gateway** binds, default `5252`, so the mobile connect URL is constant across restarts. The legacy single-engine launcher took a random free port instead. Consumed by the gateway as `LUCIDOS_API_PORT`.
+
+The gateway binds all interfaces (`Ipv6Addr::UNSPECIFIED`), so it is network-reachable once the port is stable. Everything behind it is not: the per-workspace engines bind **loopback only** (`LUCIDOS_BIND_LOOPBACK=1` is also set as the `behind_gateway` signal) and Postgres stays loopback-only too. The gateway is the sole network-facing surface.
+
+Dev binds the same way since ADR 0096. Its **one shared dev gateway** takes **`5251`** by default (override `LUCIDOS_DEV_GATEWAY_PORT`). That is one below the packaged `5252`, so a dev gateway and an installed `Lucidos.app` coexist out of the box. See *Workspace gateway* and ADR 0014's dev-topology table.
+
+**It never moves to dodge a squatter, and that is a decision rather than an omission** (ADR 0189). `resolve_engine_port` reads the persisted `<app-data>/config/engine-port` or the default, and probes nothing. Paired-device URLs and the Tauri capability URL pattern are addresses other things hold.
+
+`install.sh` DOES step around an occupied port for a brand-new instance: an instance's port is a mutable property of its slug, not a published address. So an `install.sh` install laid down first keeps 5252, and the packaged app collides with it. The product reports that collision instead of resolving it. See *install inventory* and *port contention*.
+
+### Install vehicle
+One of the three ways Lucidos gets onto a machine, each writing a distinct set of paths: the macOS **`.app`** from the DMG, an **`install.sh`** headless install (one or more slug-keyed instances sharing a runtime), and a **source checkout** run by `scripts/web-dev.sh`. A machine can carry all three at once, and each uninstaller reaches only its own. `crates/lucidos-installs` is the one place the layouts are written down. `scripts/lib/service.sh` mirrors the `.app`'s four paths for the shell uninstaller, and `service_test.sh` reads the Rust constants to keep the two in step.
+
+### Install inventory
+Every *install vehicle* this user can see, as `lucidos-installs::scan` reports it. Per install: kind, name, root, version, data dir, port, the launch agents that can start it, whether the asking process belongs to it, and the removal command. Read from paths and from an `Info.plist`, **never by running a discovered binary** (`no_execute_and_no_write` pins that by scanning the source). A field the filesystem cannot answer is `None` and renders as "unknown": a plausible default here would be the lie this surface exists to end. Served by `GET /~/api/v1/control/installs`, deliberately off `gateway/status` (the picker polls that every two seconds). Rendered by Settings, System, Overview; also read by the client's startup preflight and by both uninstallers' leftovers reports.
+
+### Port contention
+Two or more entries of the *install inventory* configured for the same gateway port. Only one can bind it, and the winner is whichever started first. So the client can end up driving an engine from an install nobody chose.
+
+**This is the whole discriminator between a deliberate multi-install and the trap** (ADR 0189). Coexistence on two ports is a supported setup, reported silently. Contention raises a warning on System, Overview, a native dialog at client startup (once per `PortConflict::fingerprint`), and a block in the gateway's boot log. No marker file, environment variable or setting expresses the difference, because the ports already do.
+
+### Peer install
+An entry of the *install inventory* that the asking gateway neither belongs to (`running_here` false) nor shares a port with. The port arm covers *port contention*: only one of two installs on a port binds it, so if that one is the asker, the other's URL lands back on the asker. It has its own gateway, port, registry and Postgres, and this gateway can manage nothing inside it. What a peer install answers for is *where a workspace lives*: `crate::peers` reads its `config/workspaces.json` from disk to resolve one name, and probes its `/~/api/v1/health` to learn the scheme it serves and whether it is up. Two installs carrying one workspace name is refused rather than guessed, the same way *port contention* addresses nobody. One install found twice (two bundles sharing a data dir) is deduplicated, because that is one install rather than two.
+
+**A thread link into a peer install resolves through `GET /~/api/v1/control/workspace-location?name=…`** and opens the peer gateway's OWN origin, `<scheme>://<host>:<peer port>/<slug>/#thread=<uuid>` (ADR 0196). Nothing is proxied and no workspace data crosses: the peer authenticates the browser itself (ADR 0132, ADR 0094). The URL is composed by swapping the port, so the client builds one only when `location.port` matches the stamped `GATEWAY_PORT`. Its tab is keyed on `<peer port>-<slug>`, since two installs may both serve a slug. The user-facing behaviour is *cross-gateway link* in `system-knowhow/glossary.md`.
+
+### Shadowed engine
+A workspace served by an OLDER Lucidos than the client showing it, which is what *port contention* usually produces. Not always: the gateway re-adopts an engine that outlived it, so a survivor of a failed restart reads the same. The surfaces therefore state the two versions and point at *install inventory*, rather than asserting a cause. `shadowedEngine()` derives it from the engine's own `/health` `release` against `window.__LUCIDOS_APP_VERSION__`. So it holds against a gateway too old to say anything for itself, which is exactly the gateway this happens with. It is the fifth `UpdateCheckVerdict`, returned BEFORE the client-updater fallback: that fallback compares the client's version and nothing else, and answered "Lucidos is up to date" over an engine ten releases behind.
+
+### Workspace gateway
+The standalone headless reverse-proxy + control plane — the **`lucidos-gateway`** binary (`crates/lucidos-gateway/`, ADR 0014), with **no dependency on `lucidos-engine`** so the only network-facing process links proxy + supervise + registry code, not the engine's heavy core. Runs as the *Always-on engine service* (launchd on the *stable gateway port*; also used in dev). Owns the workspace registry (`<app-data>/config/workspaces.json`: stable slug → {display name, dir, engine port, optional legacy `database_url`, **auto-start flag**}; **membership is durable** — a workspace stays registered, and thus listed in the picker, until explicitly deleted), provisions one database per workspace in a shared Postgres cluster (`lucidos_<slug>`) and supervises that workspace's engine (spawned by path via `LUCIDOS_ENGINE_BIN`). A legacy `database_url` is a migration source only: if the shared database is missing, the gateway/dev launcher dumps/restores the old per-workspace `lucidos` database, verifies the shared database, re-points the engine to it, and leaves the old cluster intact until the explicit decommission script removes it.
+
+On boot the gateway **re-adopts** already-running engines, **spawns** the *auto-start* workspaces, and leaves the rest **stopped** (listed but not running; **lazy-started** on the first proxy hit / explicit open). It reverse-proxies `/<slug>/*` to that workspace's engine as a **pure streaming forward**: it strips `/<slug>`, adds an `X-Forwarded-Prefix: /<slug>/` request header, and forwards the response **untouched** (body streamed, compression + SSE intact, no HTML rewrite — the engine stamps `<base href>` / re-scopes app refs from the forwarded prefix instead). The PWA manifest is the deliberate exception: gateway-served picker and workspace manifests use `scope: "/"` so a PWA installed from the stable port (`5252` packaged, `5251` dev) can switch between `/<slug>/` workspaces without opening a separate browser context. All gateway-owned surface lives behind the reserved *sigil namespace* `/~/`: the workspace **picker** (served from `LUCIDOS_STATIC_DIR` with `<base href="/~/">`), the control API (`/~/api/v1/control/*`), and health (`/~/api/v1/health`). `/` is **smart**: a sole workspace → redirect into it; otherwise the picker. A single client (Tauri window or web/PWA over one Tailscale `serve` mapping) addresses multiple workspaces concurrently by path prefix.
+
+Postgres backends are shared-cluster backends: **Docker** (dev, one `lucidos-pg-shared` container/volume) or **Embedded** (packaged, one bundled cluster under `<app-data>/pgdata`). Workspace delete drops that workspace's database and leaves the shared cluster running for peers.
+
+Failure-isolated. A stack that fails to boot or crash-loops shows as `unhealthy` in the picker, and takes down neither the gateway nor its peers. That row offers start / stop / retry / delete, plus the per-workspace *auto-start* toggle. Supervision is health-probe based, with a boot grace, crash backoff, restart cap, and re-adoption of already-running engines across a gateway restart (engine-statelessness).
+
+The frontend is base-path-aware (`crates/lucidos-app/src/utils/basePath.ts`, reading the stamped `<base href>`) so one bundle serves under `/`, `/<slug>/` and `/~/`. The service worker scopes per prefix.
+
+**Every engine binds loopback, packaged and dev alike (ADR 0096).** `LUCIDOS_BIND_LOOPBACK=1` is set as the `behind_gateway` signal, the TLS cert is stripped, and the gateway proxies and probes over http. The gateway is therefore the sole network-facing surface in both builds. `http://localhost:5173/` still reaches a dev workspace app directly (base `/`), from THAT machine only. Every other device goes through the shared dev gateway at `/<slug>/`, on its fixed port (default **5251**, override `LUCIDOS_DEV_GATEWAY_PORT`). `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0` restores the old all-interfaces topology, and reopens the bypass ADR 0096 closed.
+
+Dev's gateway data (registry, pidfile, log) is machine-global under `$HOME/.lucidos/gateway`, NOT per-workspace, so one gateway fronts every workspace launched from any `web-dev.sh`.
+
+### External engine
+An engine the *workspace gateway* did not start, found answering `/api/v1/health` on the port its registry allocated. The supervise tick adopts one, so the workspace is healthy in the picker, proxied, stoppable and restartable like any other (`GatewayState::adopt_running_engines`). Gateway startup adopts one the same way, for a workspace no auto-start flag or restore record asked to run (`boot_action`). This is what an adopted workspace needs in order to be a real one. `POST /~/api/v1/control/workspaces/adopt` registers a directory and starts nothing, so its caller boots the engine itself, as the eval arms do.
+
+The gateway reports and proxies such an engine, and never replaces it. When it exits, the stack is released and the workspace reads as stopped (ADR 0101). A stop is recorded too. The engine draining out of a Stop is then not read as a fresh one, since only a later `started_at` is adopted. A Restart or a Retry transfers ownership, because that is a person asking the gateway to take the workspace over. Modelled as `EngineKeeper::External`, against `EngineKeeper::Gateway` for every engine the gateway was asked to run.
+
+### lucidos-tailscale
+The tiny shared crate (`crates/lucidos-tailscale/`, `libc` its only dependency) that owns everything the tree knows about Tailscale: reading this machine's **tailnet address** from the interface list (`getifaddrs`, matched on a Tailscale interface *and* the `100.64.0.0/10` range, since an ISP can hand a CGNAT lease to `en0`), resolving its **MagicDNS name** by reverse lookup, and locating the **Tailscale CLI**. Depended on by `lucidos-engine`, `lucidos-gateway` and `lucidos-app`. It exists because those three each grew their own copy, which is how the 2026-07-31 `PATH` fix landed in two of them and missed the third, leaving **Settings → Access** showing a Sign in button that silently did nothing on a Mac already on its tailnet. ADR 0014 §1 sanctions the shape (the shared surface is "extracted to a tiny shared util **or** duplicated"), and the `libc`-only rule is what keeps it depend-able from the gateway without dragging in the engine. Two properties it exists to protect: **reading state runs no subprocess**, so a packaged process with no `PATH` and a user with no CLI both get an accurate answer; and `/Applications/Tailscale.app/Contents/MacOS/Tailscale` is **never** a CLI candidate, because it is the GUI executable and exits 0 while printing `Tailscale.CLIError error 3`. A CLI is still required for `tailscale serve`, which has no other interface.
+
+### Sigil namespace
+The single reserved path prefix — `~` — under which **all** *Workspace gateway*-owned surface lives: `/~/api/v1/health`, `/~/api/v1/control/*`, and the picker + its bundled assets (`/~/assets/*`, `/~/sw.js`, …). Introduced by ADR 0014 to make the first path segment unambiguous between a workspace and the gateway's own root files **without a growing reserved-word list**: the only rule is that a workspace slug can never start with the sigil — and slugs are `[a-z0-9-]`, so that's automatic (`gateway::registry::slugify`/`is_valid_id`). Replaces 0013's `/ws/<id>/` prefix (which kept workspaces in their own namespace) by flipping it: workspaces get the bare `/<slug>/` and the gateway retreats behind `/~/`.
+
+### Open mode
+Where activating a *workspace* row puts that workspace. `in-place` replaces this view; `separate` puts it beside. One rule for every surface that lists workspaces, in `crates/lucidos-app/src/utils/workspaceWindow.ts` (`WorkspaceOpenMode`). Three read it, so they cannot disagree: the *workspace picker*, the *in-app workspace switcher*, and the Lucidos menu's notifications rows.
+
+Every row has a **default mode** and an **alternate mode**. A plain activation takes the default; a right-click offers the alternate as a row of its own. The client shape picks the pair:
+
+| Client | Default | Alternate |
+|---|---|---|
+| Packaged desktop app | `separate`, a native window | `in-place`, "Switch this window" |
+| Browser tab | `in-place` | `separate`, a tab; also cmd-click and middle-click |
+| Installed PWA | `in-place` | none |
+
+A PWA has none because `window.open` there ejects the user into the browser. An alternate is otherwise withheld wherever it would say nothing new. An `unhealthy` row offers neither mode. `in-place` is offered only when this view is already on some OTHER workspace, which is why the picker never shows it.
+
+A `separate` activation is only a REQUEST on the desktop client. The shell answers it with a *window target*, since only the shell can see every window.
+
+### Context menu
+What a right-click (or a ctrl-click on a Mac) shows. One of three things, per ADR 0285:
+
+| Target | Shows |
+|---|---|
+| An **object** with a ⋯ menu, such as a drawer row | The **object menu**: that same ⋯ menu, opened at the pointer |
+| **Content**: an input, a link, media, a selection, or the text inside code, rendered markdown (`.markdown-content`) or a region marked `data-native-context-menu` (the transcript) | The **native context menu**, the platform's own |
+| **Chrome**: anything else | Nothing in the desktop app; the native menu in a browser tab |
+
+Option+right-click always shows the native context menu. The decision lives in `crates/lucidos-app/src/utils/nativeContextMenu.ts`. A right-click on a workspace row offers its *open mode*'s alternate instead, which that row's overflow menu also carries.
+
+### Workspace landing
+A view INSIDE a workspace that an opener asks it to arrive on. The *open mode* beside it decides which window or tab shows the workspace. A closed set with one member today, `notifications`, which the Lucidos menu's notifications rows ask for.
+
+It travels as a URL fragment, the target being a different document and often one not loaded yet. `crates/lucidos-app/src/utils/workspaceLanding.ts` owns the name and the fragment; `store/actions/hash-deeplink-router.ts` is the receiving half. Under the packaged client the NAME crosses to Rust (`window_target::WorkspaceLanding`), which composes the URL itself for the reason ADR 0028 gives.
+
+A landing also changes the *window target*. A window already on the workspace is navigated rather than merely fronted, since only a navigation carries a fragment into a loaded page.
+
+### Window target
+Which client window should show a *workspace*. Decided in Rust, because only the client process can see every window, read what each is pointed at, and create one (`crates/lucidos-app/src/window_target.rs`).
+
+`choose_workspace_target` answers a row activation with one of three:
+
+- **`Focus`**: a window is already on that workspace, so front it. This is what keeps a second window off a workspace that has one. With a *workspace landing* asked for, this becomes a `Navigate` at that same window instead.
+- **`Navigate`**: the CALLING window is on no workspace, i.e. the picker, so repoint it rather than leave a stray behind.
+- **`NewWindow`**: neither, so build one.
+
+Its sibling `choose_tap_target` answers a native notification banner instead. That one has no calling window. So it may take ANY neutral window, and may aim the boot navigation (`LaunchInto`), neither of which a click may do. Both read the same URL classification (`WindowContext`: `Unnavigated`, `Neutral`, `Workspace(slug)`) and the same `preferred_label`, so they cannot disagree about what a window is. Keyed on the *workspace address* slug throughout, which is also what the *window session* (ADR 0123) remembers a frame by.
+
+### In-app workspace switcher
+The Lucidos menu's **Workspaces** row, and the list it unfolds inside the menu
+panel (`crates/lucidos-app/src/components/layout/WorkspaceSwitcher.tsx`). It
+lists every workspace the *Workspace gateway* serves. Each row carries the
+status dot the picker draws, the same `.ws-picker-dot` vocabulary over the same
+`workspaceState` reading. One tap opens that workspace in this client's default
+*open mode*.
+
+An `in-place` activation is a plain navigation to the *workspace address*
+(`openWorkspace`). So a stopped workspace lazy-starts behind the gateway's
+*boot splash*, exactly as it does from the picker. An `unhealthy` one is never
+opened, since that lands in a dead app shell. Its row links to the picker
+instead, where Retry lives.
+
+**Not a second workspace picker, and never called one.** The *workspace picker*
+is the gateway's own page under the *sigil namespace*. It keeps everything the
+menu deliberately cannot do: create, rename, delete, restore, start, stop,
+auto-start, Network access. The list's last row, *Manage workspaces*, is the way
+there.
+
+Gated on **two** conditions that are deliberately not the same one. That is the
+whole subtlety of the row, and `WorkspaceSwitcher.tsx`'s own header comment
+spells out the trap.
+
+- `canList` (`WORKSPACE_ID !== null`) is whether the control plane is reachable.
+  The client addresses `/~/api/v1/control/*` as an absolute PATH, so it resolves
+  only while the gateway is this page's ORIGIN, i.e. while we are served under
+  `/<slug>/`. That, and only that, makes the row an expander.
+- `manageHref` (`gatewayPickerHref() !== null`) is the weaker question of
+  whether there is a picker to LINK to. A direct engine-port page can still
+  answer it from the stamped gateway port. Every relative control call there
+  would hit the engine and 404, so that page keeps the plain link out.
+- Neither, on a legacy no-gateway engine: the row stays as the static label that
+  names the workspace you are in.
+
+Collapsing the two into one gate puts an expander on the middle case, and
+answers a tap with a 404.
+
+The listing is fetched when the row is UNFOLDED, never when the menu opens, and
+refetched on every unfold. It also feeds `adoptWorkspaceDisplayName`, so a
+rename made in the picker reaches the header without a reload. The row restores
+the one-tap hop that
+`docs/plans/2026-08-08-lucidos-menu-absorbs-the-workspace-switcher.md` gave up
+when it retired `ControlPanel`. That component's other three jobs (the brand
+badge, Refresh, the restart guards) stayed in the menu and are not part of this.
+
+### Flat back stack
+The invariant that a Lucidos document never leaves another one on the browser's history stack. Every navigation between them replaces the current entry instead of pushing one. `utils/documentNavigation.ts` owns the rule for the navigations a user triggers, and a source scan pins `utils/openExternalUrl.ts` as the only remaining `location.href` assignment. It matters on mobile, where a swipe right from the left screen edge IS iOS's back gesture. `shouldSuppressEdgeNavigation` cannot cancel every touch, so leaving the previous workspace one entry back turned each hole in it into a silent teleport. The cost is that browser back no longer returns to the *workspace picker*, which the *in-app workspace switcher*'s Manage workspaces row reaches instead.
+
+### Appearance boot contract
+The single source for what a device's theme, UI font, ligature settings, UI scale and *style remote* overrides resolve to: `packages/lucidos-sdk/src/appearance.ts`, a pure module with no DOM and no storage. Four surfaces have to agree on those values and each used to carry its own copy: the host store (`store/actions/preferences.ts`), the two **appearance boot scripts**, and the SDK's `ui.applyPreferences()`. They paint at different moments of one page load, so a disagreement between any two is a visible flash. Source-scanning guards that could only compare literals once held the copies together. The defaults themselves come from the *preference catalog*, through its generated TS copy, so this module resolves values and holds none.
+
+### Appearance boot script
+The parser-blocking script that writes the *appearance boot contract* onto `<html>` before any stylesheet is parsed or any module loads, so the first frame is already the user's appearance rather than a default that gets corrected. **One program, embedded in two documents**: the app shell inlines it into `index.html`'s `<head>` (the `lucidos-appearance-boot` Vite plugin substitutes it for a marker comment, in `serve` as well as `build`), and the engine serves the same program to every app iframe as `/api/v1/sdk-prefs.js` (`api/sdk_prefs.rs` `include_str!`s it). Both are built by esbuild from `packages/lucidos-sdk/src/boot/`, which is what makes "cannot import at runtime" stop meaning "cannot share a source"; the two entry points differ only in a `styleReset` boolean, and the shell's boot-splash gradient and theme telemetry stay in its own entry rather than the shared program. The bundles are CHECKED IN under `src/generated/`, unlike `dist/sdk.js`: the engine bakes one in, so `cargo build` must not require npm to have run, and unlike the SDK bundle a boot script has no usable "not built yet" fallback. `appearanceBoot.staleness.test.ts` rebuilds and diffs, so an unrebuilt source edit fails the test run instead of silently shipping the previous script.
+
+### Boot splash
+The brand cover shown while a workspace comes up: the gradient wash, the white Lucidos mark, and one status line under it. **One splash, rendered by two documents.** The *Workspace gateway* serves it as a 503 page while the engine starts (`proxy.rs::splash_page_html`, labelled with the current *boot phase* or a *boot failure*); the app document then serves it inline in `crates/lucidos-app/index.html`, painted on the first frame before the bundle loads. Both live at the SAME url, so a cold launch crosses from one to the other mid-boot and any difference between them reads as the brand jumping.
+
+They cannot differ, because there is only one definition. index.html holds the stylesheet and the mark markup, between its `lucidos-boot-splash-css` / `lucidos-boot-splash-mark` markers. The gateway `include_str!`s that file and lifts both out at compile time. It overrides only what is genuinely its own: a wrapping status line, no breathe under its meta-refresh, a tappable escape link, and its own label.
+
+Two rules follow from the shared-across-documents shape:
+
+- **Every length in it is px, never rem.** The app's root font-size is `var(--user-ui-scale)` and the gateway's is the browser default, so one rem value paints at two sizes. That was the 2026-07-31 seam bug, where the mark grew from 240px to 330px at 137.5% scale.
+- **The built mark is handed over rather than rebuilt** (`boot-splash-formed`). A per-tab `sessionStorage` flag tells the next document the mark is already standing on screen. So it is revealed once per boot, not again on every gateway refresh and on the swap. The app document consumes the flag as it reads it.
+
+Some documents deliberately show **no mark at all**. A *quiet boot cover* (`data-boot-splash-quiet` on `<html>`) is what a document paints when its load continues a session rather than starting one. Not to be confused with the iOS `apple-touch-startup-image` PNGs: those are solid-color launch images the OS draws before any document exists.
+
+It **leaves in two beats**, which only the app document ever plays (`boot-splash-leaving`): the status fades in 0.18s and the mark in 0.3s, and only then does the gradient veil finish dissolving over 0.65s, so nothing branded is left standing over the app's own content while the veil is thin enough to read through. Fading all three on one curve is what made the hand-off read as unsmooth, and it is also why the answer to "the transition is too fast" is not simply a longer fade. Two things follow for anyone touching it. The mark's exit is **appended** to its animation list with the entries ahead of it restated verbatim, so the reveal keeps its start time and the exit composites over the *breathe* instead of snapping the mark back to full opacity first. And `animationend` **bubbles**, so `dismissBootSplash` removes the node only for the splash's OWN fade: acting on the mark's shorter one tore the splash out at 57% veil opacity, and the same reasoning sets the fallback timer above the veil's duration rather than at it.
+
+### Quiet boot cover
+The *boot splash*'s no-ceremony mode, for a document whose load CONTINUES a session rather than starting one. It has two triggers:
+
+- **A refresh the user asked for.** `refreshClient` stamps the one-shot `lucidos-splash-quiet` flag before it reloads. That covers the control-panel button, the "New version available" toast, the applied-change and reconnect toasts, the recovery Reload buttons and the stale-chunk auto-reload.
+- **A notification deep link on the URL.** WebKit gives a push tap no reload-free channel into an open PWA window, so the tap arrives as a full cross-document load. That URL design is registered in `docs/temporary-measures.md`. The cover is not, since the refresh trigger is permanent (`system-knowhow/notifications.md` §4.5).
+
+An inline script in the `<head>` of `crates/lucidos-app/index.html` decides it, and sets `data-boot-splash-quiet` on `<html>`. It must decide there: every body script waits for the bundle stylesheet, and WebKit paints a frame when that lands. A body-side decision would show one frame of the blue launch splash.
+
+The cover drops the mark, the baked "Opening your workspace…" status and the brand gradient. It paints the app's own `--bg-primary` on the splash and on both canvas layers. `bootSplashPlaysNoReveal()` lets `useBootSplashReady` skip the min-reveal floor. Without it, such a reload plays a cold-launch animation over a session the user was already in.
+
+Quiet, not silent: the *delayed* status still writes past `STATUS_DELAY_MS`, so a stuck load still says so. It stands down when the *Workspace gateway* handed this document a standing mark (`boot-splash-formed`). That is a cold boot the user already watched, not a continuation.
+
+### Client startup
+`startClient()` in `crates/lucidos-app/src/store/startup.ts`: the initial loads, the event stream, and the document-level listeners and polls the data layer needs. `main.tsx`'s `boot()` calls it before it renders anything, so the startup fetches run while the *shell chunk* loads (ADR 0288). It returns its teardown. A listener only a drawn UI can need belongs in *shell startup* instead. It was the `useStartup` hook inside `<App/>`, which made every fetch wait for the whole UI to parse and render once.
+
+### Shell chunk
+The built chunk holding `<App/>` and everything only the UI reaches: header, drawer, panes, the transcript and composer. `main.tsx` imports it lazily and asks for it as soon as the entry evaluates, and `index.html` modulepreloads it (`vite/shellChunkPreload.ts`). It loads beside the entry chunk, under the *boot splash*, while *client startup* is already fetching. So the entry chunk is the data layer alone, held to its *entry chunk budget* (ADR 0288). Anything a cold open can draw in its first frame belongs here, not behind an *idle prefetch*.
+
+### Shell startup
+`startShell()` in `crates/lucidos-app/src/shellStartup.ts`: the document-level listeners only a drawn UI can need. `main.tsx`'s shell loader runs it once the *shell chunk* resolves, before `<App/>` first renders, so nothing it installs can be needed earlier. It holds the composer and toast diagnostic probes and the *seen target* watch. It also holds the app keybindings sync, the app frame messages, the UI scale wheel, and the pending upload and unsent message restores. Their code then ships in the shell chunk rather than the entry chunk (ADR 0353). It returns its teardown.
+
+### Entry chunk budget
+The first-paint ceiling on the built entry chunk, `build.chunkSizeWarningLimit` (600 kB), enforced by `vite/entryChunkBudget.ts`. Past it, every single-shot build fails. Past the **soft line** at 90 %, every build warns with the headroom left, so the nightly goes red before an Apply is blocked. The dev *shared build-watch* only reports an overrun, recorded as `entryChunk` in `.build-watch/status.json`. It names itself to the plugin through `LUCIDOS_DEV_BUILD_WATCH`, honoured only when the value is the build's parent pid (ADR 0288, ADR 0353).
+
+### Safe-area floor
+The insets `utils/safeAreaFloor.ts` publishes as `--safe-area-floor-*` when an iOS home-screen app has lost its `env(safe-area-inset-*)` values. After a phone call, WebKit can report them as 0, which puts the header under the clock, and the loss may outlast a relaunch. The floor is the last real reading for the same orientation and width, kept in storage. It applies while the top, left or right side reads 0 against that reading and no side has gained an inset. Every stylesheet reads the insets through `var(--safe-area-*)` (`styles/global/base.css`), never `env()` directly, so the floor reaches all of them. A temporary measure (`docs/temporary-measures.md`).
+
+### Idle prefetch
+Loading the chunk of a surface that only opens on demand once the *boot splash* has lifted (`prefetchWhenIdle` in `utils/idlePrefetch.ts`, started by `dismissBootSplash`). The surface's opener waits for its `preload()` before it opens, so it never opens empty. Only for a surface a cold open cannot draw: one whose open state survives a reload stays in the *shell chunk* (ADR 0288).
+
+### Boot phase
+A named step of a workspace's cold boot, rendered as the label on the *Workspace gateway*'s "Workspace starting…" 503 boot splash (`crates/lucidos-gateway/src/proxy.rs::splash_page_html`) so the wait is legible instead of opaque (ADR 0014 §11). The `BootPhase` enum (`crates/lucidos-gateway/src/boot_phase.rs`) maps each phase to a human label; the gateway holds the current phase per workspace in an in-memory `boot_phases` map (cleared when the workspace goes healthy or is stopped, so a later cold open starts clean). Two producers feed it: **gateway-observed** phases the gateway sets directly (`provisioning-database`, `starting-engine`), and **engine-reported** phases the engine POSTs to `/~/api/v1/control/workspaces/:id/boot-phase` during its own startup, before its HTTP server is up, via best-effort, fire-and-forget telemetry (`crates/lucidos-engine/src/boot_report.rs`: `migrating` and `recovering`). The embedding model (which powers vector memory) is deliberately NOT a boot phase: it loads in the background and never blocks boot (see `memory::EmbedderSlot`). The kebab-case wire values are the cross-layer name root (`BootPhase::from_wire`); an unknown value is tolerated and ignored (so a retired phase like the former `downloading-memory-model` degrades to keeping the previous label). Not persisted, not an *event*, just boot-window UI state. An attempt that *fails* rather than progresses is a **boot failure**, not a phase, and while one is recorded and still being retried it is the failure's message the splash shows, not the phase it failed during.
+
+### Boot failure
+A workspace boot attempt that failed, held per workspace by the *Workspace gateway* (`BootFailure` in `crates/lucidos-gateway/src/boot_failure.rs`) as a reason plus a **disposition**, `Terminal` or `Retrying`. Distinct from a *boot phase* in three ways: it describes death rather than progress, it is **awaited** rather than fire-and-forget when an engine reports one (`crates/lucidos-engine/src/boot_failure.rs`: the process exits immediately after, so `boot_report`'s detached task would never run), and it **changes gateway behavior** rather than being pure telemetry. Two producers. An **engine-reported** one is always `Terminal`: the engine POSTs it to `/~/api/v1/control/workspaces/:id/boot-failure` on its way out, and only for a failure it has classified as unfixable, the canonical case being a database migrated by a NEWER Lucidos than the running binary (sqlx `MigrateError::VersionMissing`), which is what an app downgrade produces. The engine builds that user-facing sentence itself (only it knows which migrations it carries), naming the size of the version gap but never a target version to install, because migrations carry no app-version tag, so the newest unknown migration id cannot be mapped back to a release. A **gateway-observed** one comes from a failed Postgres provision and is classified via `ProvisionErrorKind`: an environment condition that can clear (a Docker daemon that has not finished starting) is `Retrying`, one that cannot (an invalid workspace id, no `docker` on PATH) is `Terminal` (ADR 0014, 2026-08-03). The disposition is what the rest of the system reads. A `Terminal` failure renders on the boot splash with **no auto-refresh** plus the escape link (`proxy.rs::failed_page`) and **stops auto-respawning**: five pointless cold boots only delayed the message by ~30s in the 2026-07-29 downgrade incident. A `Retrying` one is instead rendered as the label of the ordinary auto-refreshing splash, carrying the reason and the attempt count, and is promoted to `Terminal` ("did not start after N attempts") when the restart budget runs out, so the page never keeps refreshing under a promise of an attempt that is not coming. Either way it is set as the stack's `last_error`, so it doubles as the picker's health-dot tooltip. First engine report of a boot episode wins, so the migration site's specific message is never overwritten by `main`'s generic backstop. Cleared when the workspace next boots healthy, is stopped, or a fresh attempt begins, never when it is marked `Unhealthy`, which is the state the message exists to explain. Not persisted, not an *event*.
+
+### Service crash-loop report
+What the packaged client's *boot splash* says instead of its wait counter, once the *always-on service* has started three times inside one wait. Built by `crash_loop_label` in `crates/lucidos-app/src/desktop.rs` (ADR 0120). Three lines: how many times it has started without coming up, the reason the gateway or the service gave, and the path to `<app-data>/logs/engine-service.err.log`. One layer above a *boot failure*. That is a workspace that will not start; this is the service hosting every workspace not starting at all.
+
+The discriminator is a **restart count, not a clock**. A slow boot writes exactly one boot marker for at least `ENGINE_HEALTH_TIMEOUT`, the only deadline that makes the service exit. So a cold-machine `initdb` never reaches the threshold. A fatal staging check kills the gateway in under a second and launchd respawns it every `ThrottleInterval`. The client records the log's length when it begins waiting and counts only markers written after that, so a previous session's crashes stay out. It never stops retrying, and the report promises nothing: a repaired bundle or a reinstall still recovers the window.
+
+Rendered by the splash's wrapping report state (`boot-splash-status-report`), which `setBootStatus` selects on a label carrying line breaks.
+
+### Database reachability
+Whether a **running** engine can still reach its own database (ADR 0037). The engine reports it as the boolean `database_reachable` on `GET /api/v1/health`, and the frontend mirrors it into a signal of the same name.
+
+This is a different question from whether the engine answers. An engine outlives its database. Dev keeps every workspace's Postgres in a Docker container (ADR 0014 §6/§7). So quitting Docker Desktop leaves the process answering `/health` perfectly while every query behind it fails.
+
+A background probe produces it: `crates/lucidos-engine/src/engine/db_health.rs`, on a 5s ticker, with a 1s-capped `SELECT 1`. The probe writes one three-state atomic (`DatabaseHealthCell`), and the handler reads it once per response. So a database outage never adds latency to the endpoint the *Workspace gateway* health-checks.
+
+Three properties are load-bearing:
+
+- **The endpoint keeps returning 200** with `"status": "ok"`. The status code is about the engine process, and the field is about its dependency. Failing it would turn the gateway's respawn machinery against a condition respawning cannot fix (ADR 0014's "never cull an alive engine").
+- **The value starts `true`.** Two consecutive failed probes flip it, and one success restores it. The engine only reaches `serve` after connecting and migrating, so anything else would be a claim without evidence.
+- **An absent field reads as reachable.** An older engine omits it, and the client never invents an outage.
+
+It differs from a *boot failure*, which is an attempt that never got the workspace up. This is one that did, and then lost its dependency. The client renders it as one authoritative toast plus a *workspace unavailable window*, and the boot splash releases on it rather than timing out.
+
+When the database does not answer, the probe also says why. A direct connection outside the pool tells the two apart. If it answers, the database is fine and the engine's pool has no free connection, so `/health` also reports `database_pool_exhausted: true`. That field is only ever true while `database_reachable` is false, and an older engine omits it. The slowness warning reads both to name the fix (ADR 0301).
+
+The one case where `/health` does not answer 200 is a teardown. From the moment an engine starts shutting down it answers 503 with `"status": "shutting_down"`, so no gateway adopts an engine that is about to exit.
+
+### Slow sign
+What one supervisor probe showed about a workspace that was slow, kept by the gateway's slowness watch (`SlowSign` in `crates/lucidos-gateway/src/slowness/mod.rs`, ADR 0301). There are three. *No answer*: the engine did not answer its health probe within 5 seconds.
+
+*Database not answering* and *database pool exhausted*: the engine answered promptly, but its `/api/v1/health` body said the database is down, and why (see *database reachability*; `DatabaseProblem` in the gateway and TS). Two signs for one workspace in one sample merge to the greater. *No answer* is greatest, because a starved host makes the database probe fail too. The slowness warning names the database only when at least half the window holds a database sign.
+
+### Workspace unavailable window
+A period when the workspace cannot serve requests for a single known reason. During it the frontend suppresses incidental failure toasts in favour of the one authoritative status toast that names the cause. The check is `workspaceUnavailable()` in `crates/lucidos-app/src/store/store.ts`, and the opt-out is `showWhileUnavailable` on `showToast`.
+
+Three ways in, one concept: an engine restart (`engineRestarting`), a packaged update past its point of no return (`appUpdateCommitted`), and an unreachable database (`!databaseReachable`, see *database reachability*). In each, every request in flight fails at once for the same cause, so a per-request toast adds nothing. `startClient` alone fans out ~20 independent loads. That is how one dead database became a column of "Failed to …" toasts naming no cause.
+
+**The suppression is only honest with its toast.** So each producer owns one, and the database one is non-dismissable with no auto-dismiss. A window with nothing on screen would be the "No Hidden Errors" violation (`.claude/rules/frontend.md`) this exists to avoid. The name covers the whole window rather than one member. The flag was `showDuringRestart` while it already guarded two conditions, and a third made that name plainly wrong (`.claude/rules/glossary.md`).
+
+### Animation speed scale
+What every animated duration in the client is multiplied by. It comes from the diagnostic **Animation speed** slider (Settings > System > Debugging). One concept lives in three layers under one name root:
+
+- the `durationScale` computed in `store/store.ts`: the reciprocal of `speedMultiplier`, which is `10^(slider/10)` over a -10..10 slider, so 1 at centre and 0.1x to 10x at the ends;
+- the `--duration-scale` custom property, which `store/effects.ts` publishes onto `:root`;
+- the `scaledDurationMs(baseMs)` helper, which TS reads it through.
+
+Every `--duration-*` token in `styles/global/base.css` is its 1x literal times that property, and nothing else carries the slider into CSS. Before that, only the JS-driven animations followed it (the thread-row FLIP, the toast stack). The hundred-odd token-driven transitions ran at 1x, so opening the thread drawer and maximizing a pane ignored it.
+
+Two rules follow from the token form:
+
+- A TS timer that exists to **outlive** a CSS transition passes its 1x base through `scaledDurationMs`. It adds its safety slack OUTSIDE the call (`scaledDurationMs(PANE_TRANSITION_MS) + 100`), since slack is a fixed margin rather than animation. An unscaled timer fires partway into the transition it should outlive, and blanks the drawer mid-slide at 0.1x.
+- An **indefinite** animation (a spinner, a shimmer) keeps its literal duration and no token. It is an activity indicator rather than a transition.
+
+Reduced motion sets the scale to the SDK's `REDUCED_MOTION_DURATION_SCALE`, which wins over the slider.
+
+The engine's `api/sdk_iframe.css` mirrors the same 1x literals and pins the scale at 1. The host publishes the property as an inline style on its own `:root`, and a custom property does not cross a document boundary. So an app frame animates at 1x, except under reduced motion, where its own `:root[data-motion="reduce"]` rule sets the same reduced value.
+
+`durationScale`, `speedMultiplier` and `scaledDurationMs` live in `utils/motion.ts` beside the reduced-motion signal. `store/store.ts` re-exports them.
+
+*Motion* (`system-knowhow/glossary.md`) wins over the slider. While it resolves to reduced, `durationScaleFor` returns `REDUCED_MOTION_DURATION_SCALE`. That is a tiny positive constant rather than 0, so a scaled transition ends at once and still fires its end event.
+
+### Reduced motion (resolved)
+The client's single answer to "should this device move less?": `reducedMotion` in `utils/motion.ts`, resolved by `resolveReducedMotion` in `@lucidos/appearance` from the *Motion* preference and the OS `prefers-reduced-motion` switch, which counts only under `system`. It is published as `data-motion` on `<html>`, first by the boot script before any paint and then by `installMotionAttribute`. Every stylesheet keys its calm rules on `:root[data-motion="reduce"]` and every script reads the signal, never the media query: a direct read would ignore a user who chose Reduce or Full in the app. `styles/__tests__/reduced-motion-guard.test.ts` enforces both halves, plus a calm rule for every indefinite or literal-duration animation. `__tests__/animation-end-fallbacks.test.ts` audits every end-event listener for a way to finish when the animation never runs.
+
+### Ring room
+Space that a scrolling or clipping box keeps at an edge, so a control flush with that edge keeps its whole focus ring. It is `--focus-ring-width` (`styles/global/base.css`), the band of the outward `--focus-ring` shadow. A shadow adds nothing to scrollable overflow, so without ring room the clip cuts the ring. The room is padding, handed back by an equal negative margin or taken from a neighbour's padding, so nothing moves. A clip-path gets it as negative insets. `e2e/focus-ring-not-clipped.spec.ts` checks it in a browser; the rule is `.claude/rules/frontend-css.md` § Focus rings.
+
+### Activity group
+The Lucidos menu's rows for work in flight, one per job, above its notifications rows (`components/layout/ActivityMenuRows.tsx`). It is what the spinning *brand badge* stands for, and the one place progress is told: no apply, build or download raises a progress toast (ADR 0306). A row shows the job on one line with its elapsed time, bytes or position. A tap unfolds its detail in place, through `<Disclosure>`, and the menu stays open:
+
+- a build shows what it brings, from the engine's commit groups, or what follows it when git cannot count;
+- the embedding download shows its progress and the memory caveat;
+- an *Expose run* shows its step and its actions;
+- the Apply All batch shows "Change N of M" with the time until all are applied, a progress bar, the thread in flight and **Cancel**;
+- a single-thread apply (an Apply Now, or a Changes-panel apply that is hardening or resolving a conflict) shows its thread. So does an Apply All member parked on a conflict (ADR 0314), read off the snapshot's `resolving_change_ids`.
+
+An apply's thread is a link to the event its phase started at. A *pending engine version* takes a row too, drawn with the badge's dot rather than a spinner, which re-opens its toast. The group renders nothing, separator included, when nothing runs. The badge and the menu read one derivation, `activityRows` in `store/actions/activityRows.ts`, so the badge cannot spin for a job the menu does not list. Each row carries its unfolded body as data (`ActivityBody`).
+
+### Background activity
+Long-running work surfaced on the **brand badge** and as a row in the *activity group*, which unfolds to its detail. None of it raises a progress toast (ADR 0306), with one exception: an *Expose run* narrates in its own toast, because one of its steps waits on a link only that toast offers. A download this document watched reports its outcome once, in a toast of its own.
+
+Four activities today: a dev engine rebuild (`engineBuilding`), the frontend rebuild after a frontend-only Apply (`frontendRefreshDetail`), the *embedding model* download, and an *Expose run*. The first three are work the user did not start and need not watch. The Expose run is a button press. It belongs here anyway, because it is long-running and outlives the pane that launched it.
+
+The derivation is pure (`crates/lucidos-app/src/store/backgroundActivity.ts`: `backgroundActivities`, `embeddingModelOutcome`, `tailscaleServeOutcome`). The Expose toast and the download's outcome live in `store/actions/backgroundActivity.ts`.
+
+Only work genuinely **in flight** counts toward the badge. So the few-second post-download ONNX load, a backed-off retry and an abandoned load are excluded. The first would flash a spinner on every boot, the other two would spin it forever on an offline machine, and both already have notifications.
+
+A download's outcome (`ready` / `waiting` / `failed`) is reported ONLY if this document saw the model downloading (`downloadSeen`), and once per outcome. `ready` is the resting state of every warm-cache workspace, so without the gate every boot would announce a model that was never not ready.
+
+An activity may carry **action descriptors** (`{kind: 'open-url' | 'cancel-tailscale-serve', label, ...}`) rather than callbacks, so the derivation stays pure. `activityAction` maps each onto a real button action, for the Expose toast and the menu detail alike. A finished *Expose run* reports in a **separate** toast (`SERVE_OUTCOME_TOAST_KEY`), so closing its narration never swallows a failure. A user who closes the narration mid-run is not shown it again: later frames only update a toast still on screen. Distinct from a *boot phase*, which narrates the gateway's pre-health boot window: background activity is post-boot, inside the running app.
+
+### Background task registry
+The in-memory registry behind the `run_bash_background` / `run_python_background` / `bash_output` / `bash_kill` tool set (`BackgroundBashRegistry`, `engine/tools/bash_background.rs`). Holds one `BackgroundTask` per spawned child: its two capped output buffers, a per-reader **drain cursor** so each `bash_output` returns only what arrived since the last call, the typed *TaskOutcome*, and `finished_at`, which is the single source of truth for "has the watchdog finished?". It is a cache over the event store, not an authority: every completion is persisted as `BackgroundBashCompleted`, and `bash_output` falls back to that row for anything the registry no longer holds.
+**Retention window.** A completed task is NOT evicted when its completion event is emitted. It stays drainable for `FINISHED_RETENTION_SECS` (5 minutes) past `finished_at`. It is also capped at `MAX_RETAINED_FINISHED` (16) completions, oldest first, swept lazily on every registry lock so no sweeper task exists.
+
+The cap counts only completions somebody has CLAIMED, because a claim is the promise to write the durable `BackgroundBashCompleted`. Dropping an unclaimed one would leave the task with no record anywhere, so a burst of more than sixteen simultaneous completions overshoots the cap instead. Expiry ignores that exemption and is the only thing bounding the overshoot, since a failed emit hands its claim back.
+
+Completion and eviction used to be one call (`take_finished`, which did `tasks.remove`). The dispatch site's order is read, build, emit. A drain landing in that span found neither the entry nor the not-yet-written event row, and reached the agent as `unknown task_id`. Five scheduled trigger runs silently lost a successful result that way between 2026-07-29 and 2026-08-02.
+
+Reading the final state is now `completion_record`, which returns an owned `CompletionRecord` and touches neither the map nor the drain cursor. It is ONE-SHOT: taking the record claims the right to write the event, so a second caller gets `None` even though the entry is still drainable. Retention deliberately does NOT make a finished task look running: `has_running_for_thread` filters on `!is_finished()`, because the engine arms an *event wait* over every task that answers true. Every production spawn goes through `LucidosEngine::start_background_task`, shared by the chat tool and a coding agent's `lucidos background-task` route (the user-facing *background task*).
+
+**Stop requested.** A task whose stop signal somebody has taken but which has not been reaped yet: a stop, `kill_for_thread`, or the teardown. `RunningTaskHandle::stop_requested` reports it, and the engine never arms an *event wait* for such a task. A stop is two steps, `begin_stop` then `PendingStop::send`, so a thread stopping its own task stands its own waits down in between. Signalling first would let a prompt SIGTERM exit deliver the completion before the stand-down (ADR 0369). Worktree cleanup and the todo consumer still count the task as running, which it is.
+
+### Abandoned background task
+A *background task* whose engine went away under it. The child belongs to the engine process. A restart, a crash or an OOM kills it, and no watchdog is left to reap a status. Until 2026-08-26 nothing then wrote `BackgroundBashCompleted`, so the `Started` row was the task's last word. The engine-armed *event wait* on that `task_id` sat to its own deadline and then re-opened the thread to blame the deadline. `bash_output` said `unknown task_id`, which reads exactly like a typo.
+
+Both entry points live in `engine/tools/bash_background_recovery.rs`. `settle_running_background_tasks_at_teardown` runs on the graceful path. It KILLS each unfinished task first, waits for the reap, and records it only then, so the row keeps the task's whole output. Recording before killing would be a claim about the future: the teardown then awaits seconds of session and browser cleanup, and a command finishing inside that window really does finish.
+
+It also hands over a task that FINISHED with its completion unclaimed. That watcher may never be scheduled again, and the next boot would then report a success as an engine loss. `settle_abandoned_background_tasks` runs at boot as the fail-closed floor, for the deaths no hook sees, and its anti-join over the event store makes the two idempotent.
+
+Neither note promises the work stopped. After a crash no destructor ran, so `kill_on_drop` never fired. The teardown's kill is a SIGKILL to the task's whole process group (ADR 0263), which still misses a process that detached into its own session. Both rows carry `abandoned: true`, no `exit_code` and no `signal`, and neither is `killed` (which means `bash_kill`, a decision somebody made). `finished_at` is when the loss was recorded, so on the boot path it spans the downtime rather than the task's runtime.
+
+Exactly one completion reaches a task, gated by `BackgroundTask::completion_claimed`. Both the teardown and the task's own watchdog take it through `completion_record`, under the registry lock, and the loser writes nothing. `bash_output` reads the last row, so two of them would let a successful release come back reported as abandoned.
+
+The boot sweep is deliberately unbounded in time. An earlier draft settled only tasks inside their own `timeout_secs`, to keep the first boot quiet. That bought a one-time tidiness with a permanent hole: an engine down past the budget left the task unsettled forever. The backfill is cheap by comparison, since the event is `metadata` to the projection and every wait that old was resolved long ago. `bash.rs` still asks `task_start_time` before calling a drained id unknown, for the tasks neither path recorded.
+
+Three readers are served by the row: the engine-armed *event wait*, which is the delivery, `bash_output`'s persisted fallback, and the *turn-gap note*. The note reports only a completion no event wait delivered. See `docs/plans/2026-08-26-a-background-task-always-reaches-a-terminal-event.md`.
+
+### Brand badge
+The marker riding the *Lucidos mark*'s corner in the header. There are **two**, on opposite corners, and "brand badge" unqualified means the first. The **state badge** (`BrandBadge`, top-right) runs a one-slot `busy > ready > pending` ladder: busy while any *activity group* row exists, then the engine lifecycle (see *pending engine version*). Both badges are purely visual and click-through, so a tap anywhere on the mark opens the Lucidos menu, which explains every state. No pointer or screen reader ever lands on a badge, so the mark speaks both in its own label and tooltip (`unreadBadgeLabel`, `brandBadgeLabel`). The **unread badge** (`UnreadBrandBadge`, bottom-right) is the cross-workspace unread count, and reads `crossWorkspaceUnreadTotal`, the same computed `syncWorkspaceAppBadge` writes onto the *app-icon badge*.
+
+Two corners rather than one ladder, because both are resident and each hides the other in one slot. Which corner is not arbitrary either. `LucidosMarkIcon` draws its sparkle top-right, so a badge there costs the brand its distinguishing element. The state badge pays that only while a build runs or an update waits. A count is resident, so it takes the corner the artwork can spare. Both are positioned off one inherited `--brand-badge-corner` on `.brand-mark-slot`, pinned by `styles/__tests__/header-mark-geometry.test.ts`.
+
+### Glyph badge
+A badge that draws text: a count, a sign such as the state badge's "!", or a word such as "Custom". Every one renders through `GlyphBadge` (`components/shared/GlyphBadge.tsx`), which centres the text's **ink** rather than its advance. It measures the drawn glyph in its computed font (`drawnInkShift` in `utils/inkCentre.ts`) and states the gap as the **ink shift**, `--badge-ink-shift`. `styles/badges.css` then moves the text's `.badge-ink` span by it. A dot draws no text, so it is not a glyph badge. Why, and the WebKit residual: ADR 0361.
+
+### Icon shape regime
+Which of three treatments a generated brand icon gets, decided by how hard its destination masks the art. `crates/lucidos-app/scripts/generate-brand-icons.mjs` is the single source of truth, and `src/brand-icons.test.ts` guards the result.
+
+**macOS-shaped** carries Apple's template itself: art at 824 of a 1024 canvas, corner radius 185.4, and a transparent margin. It covers `icon.icns` and the manifest `purpose: "any"` PNGs, because nothing masks those reliably. macOS 15 and older composite nothing, and a PWA install's custom-icon path is unmasked even on Tahoe.
+
+**Full-bleed** is opaque corner to corner, for a destination that masks its own: `apple-touch-icon.png` (iOS) and the `purpose: "maskable"` PNGs (Android). A pre-rounded source there shows dark fringes inside the mask. The favicon family is full-bleed too, at its own scale, because browsers do not mask a tab icon.
+
+Distinct from the *mark scale* (`SCALE_FULLBLEED` / `SCALE_MASKABLE`), which is how much room the mark leaves inside whatever art square it sits in. A regime picks the shape of the canvas; a scale picks the size of the mark within it. See `docs/plans/2026-09-16-macos-icon-shape.md`.
+
+### Effective shutdown
+The answer to "is this *agent session* shutting down?", which is the OR of two
+signals that are each wrong alone. `AgentSession::shutting_down` is a
+**snapshot**: `shutdown_agent_sessions` sets it on the sessions present in
+`agent_sessions` when its pass ran, so a session inserted after that pass reads
+`false` through a teardown it is fully part of. `LucidosEngine::is_shutting_down()`
+is **durable** (`mark_shutting_down()` is the first statement of
+`abort_in_flight_for_restart`, before any boundary is emitted) but says nothing
+about a particular session. `LucidosEngine::session_is_shutting_down` is the one
+definition (`thread_session_is_shutting_down` is the same question for a caller
+that must look the session up first); in the three production files that decide
+a terminal, a variable named `is_shutdown` always holds its result, pinned by a
+source-scan test. `run_session/entry_guard.rs` is the sanctioned exception and
+reads the per-session flag alone: it is asking who owns the terminal for a
+dropped run future, not classifying one.
+The distinction is not academic: a coding-agent session spawn takes seconds
+(worktree provisioning), so the window in which a session registers *after* the
+teardown snapshot is wide, and reading the snapshot half alone has cost twice.
+`finalize_direct_agent` once ran full cleanup on a late-registering session and
+deleted a still-resumable branch; `emit_stop_terminal` once classified a *Switch
+to new version* as a user Stop, wrote `ResponseCanceled{user_stop}` on a turn
+nobody stopped, and thereby cost that thread the auto-resume its transcript had
+already promised. See
+`docs/plans/2026-08-06-a-session-that-registers-mid-teardown-is-shutting-down.md`.
+
+### Expose run
+One press of **Expose** in Settings -> Access: the supervised `tailscale serve` run that gives this Mac an `https://<machine>.<tailnet>.ts.net` address. Modelled as a phase sequence rather than a single blocking call, because one of its steps can legitimately last minutes. Rust owns it (`crates/lucidos-app/src/mobile.rs`: `ServePhase`, `serve_run`, `supervise_serve`, single-flight via `MobileAccessRuns`) and streams `starting` / `checking-tailnet` / `configuring` / `awaiting-tailnet-approval` / `waiting-for-https` / `done` / `failed` / `cancelled` over the `tailscale-serve-progress` Tauri event; the page mirrors them as `TailscaleServeProgress` and holds the live one in `tailscaleServeRun`, which is what the Expose button reads (a page-local flag would be lost on navigation). `awaiting-tailnet-approval` is the step that matters: on a tailnet without Serve enabled the CLI prints a `login.tailscale.com/f/serve` link and BLOCKS polling until a human visits it, so the run surfaces that link as a button, waits under a ten-minute budget instead of the twenty-second configure one, and completes by itself once the approval lands. Narrated as a *background activity*; its outcome is a separate toast. See `system-knowhow/remote-access.md` § The Expose run.
+
+### Engine host / reading device
+The two things **Settings → Access** is about, kept apart on purpose. The **engine host** is the machine the Lucidos Engine runs on, and its tailnet state is a property of that machine: it holds a `100.x` address or it does not, and it fronts HTTPS via an *Expose run* or it does not. The **reading device** is whatever is displaying the page right now, and its tailnet state is a property of the reader: it has joined the tailnet or it has not. Neither implies the other, with exactly one exception, which the page does use: a **loopback** hostname means the request never left the machine, so the reading device *is* the engine host. Both are derived and rendered independently (`hostTailnetState` and `deviceSetupState` in `MobileAccessPage.tsx`), and the page shows both on every platform. Only the *actions* are platform-gated, because `tailscale up` / `tailscale serve` are Tauri commands with no HTTP equivalent; the *reporting* is not, because the host's address arrives over plain HTTP as `detected_tailscale_ip`. Muddling the two is a recurring bug rather than a hypothetical: the page once chose one of them by platform, so a browser saw only the reading device's half, and an install offer went to every device reaching a gateway bound to its own tailnet address. That address is also the reading device's **third proof** of membership: matched exactly against what the engine reported, never inferred from the `100.64/10` range, which is real CGNAT space (see *lucidos-tailscale*). See `system-knowhow/remote-access.md` § Settings → Access.
+
+### Embedding model
+The ONNX sentence embedder that powers vector memory (`multilingual-e5-small`, 384-dim, ~465 MB from the Hugging Face hub on a cold cache), loaded through `fastembed` behind the `EmbeddingProvider` trait and held by `memory::EmbedderSlot`. **Not** the "Memory model" in Settings > Models: that is the `model_memory` preference, the *LLM* the memory extractor calls. Two different things, so user-facing copy says "embedding model" for this one, matching the loader's own notifications. Selected by `LUCIDOS_EMBEDDING_MODEL`; a swap to a same-width model is migrated automatically by `reembed_stale`, while a different width is refused at load time (see *embedding model status*).
+
+### Embedding model status
+Where the background embedding-model load has got to: `downloading { downloaded_bytes, total_bytes }` / `loading` / `ready` / `waiting { attempt }` / `failed { message }`. One name root across every layer: the `EmbeddingModelLoadState` enum on `memory::EmbedderSlot` (which owns it, so an installed provider cannot still claim to be loading), the `EmbeddingModelStatus` struct, the `GET /api/v1/memory/embedding-model-status` snapshot, the transient `EmbeddingModelStatusChanged` SSE event, and the matching TS types. The snapshot and the event serialize identically on purpose, pinned by test: a client that connects mid-download has missed every frame, which on a fresh workspace is the normal case since the download starts at engine boot. Byte progress comes from `memory::model_download`, which fetches the model files itself through `hf-hub`'s `Progress` trait because `fastembed` exposes no hook. `failed` is terminal: the loader has stopped, so the slot's degraded error drops its "keeps retrying" promise, and the two ways to reach it are a corrupt cached model and a model whose vector width disagrees with the live `memory_entries.embedding` column.
+
+### Aggregate
+The grouping a persisted event belongs to — a `text` column on the `events` table. Determines how the EventBus routes the event and which projection (if any) materializes from it. Today's values: `"thread"`, `"app"`, `"trigger"`, `"artifact"`, `"plugin"`, `"change"`, `"notification"`, `"preference"`, `"presence"`, `"device_presence"`, `"device"`, `"repository"`, `"credential"`, `"model"`, `"oauth_account"`, `"data_file"`, `"pinned_app"`, `"ops"`, `"domain"`. **Not** a per-event-type discriminator — multiple variants share the same aggregate. Set by `SystemEvent::aggregate(&self)` in `event_bus_system_event.rs`.
+
+### Aggregate_id
+The `text` column on `events` that ties events together inside an aggregate. For threads, this is the thread UUID as text. **Always cast when joining**: `aggregate_id = c.thread_id::text`. The older `thread_id` column on `events` is legacy; prefer `aggregate_id`.
+See also: `.claude/rules/db.md`.
+
+### Blocking descendant
+Internal name for the predicate in `is_blocking` (`engine/thread_lifecycle.rs`): a thread whose state currently makes it unsafe to cascade-archive its ancestor. Materialized as `thread_summaries.blocking_descendant_count` and maintained by `propagate_blocking_change` (`engine/event_bus_projection.rs`). User-facing definition lives under *Blocking descendant* in `system-knowhow/glossary.md`.
+
+### blocking_descendant_count
+`thread_summaries` column (`INT`, default `0`) holding the rolled-up count of a thread's *blocking descendants* (transitive). Maintained by EventBus; consumed by `available_thread_actions(..., descendants_block_archive: bool)` via `count > 0`.
+
+### Attention-needing descendant
+Internal name for the predicate in `is_attention_needing` (`engine/thread_lifecycle.rs`): a thread whose state requires user attention to progress, i.e. `WaitingForUserAnswer`, or an in-workspace *coding-agent thread* with pending *changes*. Strict subset of *blocking descendants*, dropping the `Running` arm. Running threads are delegated work and attention-needing threads are pending user action; both render in the merged *Current* section, distinguished by the per-row status icon (running) vs. the attention badge / filter (your turn). Materialized as `thread_summaries.attention_descendant_count`, maintained by the same `propagate_blocking_change` walk that maintains the blocking count. Relationship: `is_blocking = is_attention_needing OR status == Running`. A thread merely holding an *event wait* is neither: a subscription does not hold its thread's turn, so such a thread is plain idle.
+
+### Event row
+The transcript's one marker for everything that arrives from outside a thread, and for what the thread is waiting on: `components/chat/EventRow.tsx` plus `styles/chat/event-rows.css`. Four kinds share it, because they all answer the same question: an *event wait* (waiting, done, gave up, stopped), an *event delivery*, a *child thread* callback (`ChildThreadCompleted`), and a *trigger* fire (`TriggerStarted`). A held message, a *form request* and a change resolution (`ChangeApplied`, `ChangeDiscarded`, `ChangeReverted`, `ChangeApplyFailed`) wear it too. So does every turn the agent did not write: a resume, an engine notice, a system abort, and your own cancel or stop.
+
+The shape is a card: `subject + state` on one line, then the facts line, then an optional fold and an optional action row. No glyph leads the subject. Every kind's subject is the event itself as a pill (`Trigger fired`, `Child thread returned`, `Waiting for`, `Change`), and the specifics sit on the facts line. A wait and a change also carry a sentence on the detail line under the pill: the wait's reason, and the change's headline. The same markup serves both positions the family occupies: a response body (the wait) and an *initiator panel*'s details (the other kinds). That is what lets one primitive cover them all.
+
+The child kind also draws the `ChildThreadStopped` note on a parent, and the notice that ends a *stopped child*'s transcript (ADR 0252).
+
+Four rules make the kinds coherent, and each has a test:
+
+- **The subject wraps**, because every kind's subject is a sentence somebody wrote.
+- **The state is words** in a tinted pill: `until 09:10`, `✓ 09:40`, `arrived`, `gave up at 09:10`, `stopped`, `success`, `failure`, `no changes`, `canceled`, `fired`, `applied`, `discarded`, `reverted`, `failed`. The tint groups the words rather than replacing them.
+- **An event type is always the `.event-name` chip.** It shows the type in plain words (`plainEventName`) and keeps the raw type on its tooltip.
+- **One fold, labelled `Details`.** A change card keeps `Error` and its commit list, and a failed apply's `Error` fold starts open.
+
+**A wait row says its outcome once.** Its subject is a `Waiting for` chip in every state, with the agent's reason on the line under it. Only the state word changes, so a live one carries the deadline rather than repeating "waiting". It never names the event that matched: the row records the arming, and the delivery card names the arrival. The UI never says *event wait*, which is the internal name.
+
+**The card is lighter than `.step-note-card`**, and the ranking is the surviving half of a rule that used to forbid the box outright. The heavy box is what an inline *affordance* earns, such as the command-guard checkpoint with its Undo. So an event row lifts on `--bg-secondary` with a hairline, not the tertiary fill and full border. A record never looks like something you can act on. It was unboxed until 2026-08-10 on the stricter reading of that rule. In the transcript that put the subject, the facts and the fold on three loose lines between the step list and the prose.
+
+**Two rows carry actions**: an open form request (Open) and a change resolution (Diff, Revert).
+
+**Only agent output wears a turn header.** A turn the agent did not write draws chromeless, like a change card: its time, which opens the route popover, above an event row. `withoutActorHeader` in `ChatExchange.tsx` decides it from the starter's actor: the engine, the system, or an iconless control press. A resume goes one step further and sits as a card inside the reply it resumed. It exists because a second header per turn repeated who and when. A starter that was only a line of text also read as loose prose.
+
+**A jump belongs on the card the event ARRIVED at, never on the one that armed the wait.** On the delivery and an event-fired trigger the chip itself is the jump. The arming card has none, and it does not name the matched type either: its state word says how the wait ended. The link sat on the arming card until 2026-08-10, where it pointed at something that happened hours after the moment that card records.
+
+**A pressable chip is not always a jump.** On the arming card a subscription chip carrying `matching only` opens that subscription's `condition` in a popover at the chip (`components/chat/EventConditionPopover.tsx`, via the `eventConditionPopover` signal). That is the same moment the card records, not a route out of it, so it does not reopen the rule above. The chip's label is a summary and says only that a filter exists, which left "filtered how" unanswerable from any surface until the popover. Every chip therefore states in its accessible name what pressing it does, led by the raw event type. The visible text names only the event either way.
+
+**The condition view is the one place the raw type is the visible text.** Its reader is writing or checking a condition, and a condition is written against the raw type. So its subject chip swaps the row's two halves: the raw type shows, and the plain name moves to the tooltip.
+
+**Both PRESSABLE surfaces saying "matching only" open it, through one door.** The other is the *waiting indicator*'s subscription line. That one is a joined `watching for A or B` rather than chips, so a filtered entry there is an underlined segment instead. `eventConditionDoor` (`store/store.ts`) answers three things at once: whether an entry has a condition, what pressing it is called, and what it opens. So neither surface can acquire its own wording or its own idea of when a filter is there. Both show one body (`eventConditionBody`): the chip opens it in its own popover, and the panel drills in to it in place, since a popover never opens a second layer.
+
+Explicitly not a *step*: an event row is a record of a fact, so it takes no step outcome class. It replaced an `.inline-step` rendering that put a green success check on a subscription which might sleep for hours. That rendering also ellipsized the reason and the subscription, the only two things the row had to say. The child-thread row is the one that legitimately shows a verdict, and the verdict it shows is the *child's*.
+
+A row also states no fact its event does not carry. So a scheduled trigger names no cron, since `TriggerStarted` has none. A delivery names no arming reason: that lives on the `EventWaitStarted`, routinely outside the loaded window. And a deadline is stated rather than counted down, because the live countdown belongs to the *waiting indicator* (ADR 0047). See `docs/plans/2026-08-10-one-event-row-for-the-transcript.md`.
+
+### Event wait
+The internal name for a **thread subscription**, and the one the code uses throughout: `EventWaitStarted`, `await_event`, the `live_event_waits` / `live_event_wait_count` column pair, `meta.liveEventWaits`, the `engine/event_wait/` module. Those names are on disk in persisted rows and in a shipped tool name, so they stay as they are. The user-facing vocabulary lives in `system-knowhow/glossary.md`: *event subscription* as the genus, *trigger subscription* and *thread subscription* as the two species.
+
+A thread's one-shot subscription to an event, registered by the `await_event` LLM tool (Lucidos Agent) or the `lucidos await-event` CLI subcommand (coding agent, over `POST /api/v1/threads/<id>/event-waits`, the same registration underneath). Registration returns immediately and does NOT hold the turn: the turn ends with an ordinary terminator, the thread is plain `idle` while it watches, and the engine re-opens it when a matching event lands (or the deadline passes). Same `{event_type, condition}` shape and the same matcher as a *trigger*'s `on:` list (`core::event_subscription`), differing in what happens on a match: a trigger spawns a NEW thread and stays armed, a wait resumes an EXISTING one and is spent. Persisted as `EventWaitStarted` (which carries `armed_at`, the arming time the agent-facing list reports; rows written before 2026-08-07 fall back to the event row's own `created`), resolved by exactly one of `EventWaitDelivered` / `EventWaitExpired` / `EventWaitCanceled`, none of which writes a status. There is no table: the event IS the wait, and the dispatcher (`engine/event_wait/`) rebuilds its live set from the event store at boot.
+
+**The agent owns all three verbs on its own subscriptions** (`engine/event_wait/agent_surface.rs`): `await_event` arms, `list_event_waits` reads, `cancel_event_wait` stands down, mirrored as `lucidos await-event` / `lucidos event-waits list` / `lucidos event-waits cancel`. All three are scoped to the CALLING thread and take no thread argument, which is what stops one thread reading or ending another's; it is also why the family is a deliberate non-domain in the *capability parity manifest*, whose generators would have to make the thread id an ordinary flag. The read exists because an agent cannot otherwise know: a subscription is spent when it fires and can expire or be stopped while the agent is not running, and one told its user twice that a watch was armed when it had been dead for two hours.
+
+**Ending one is never silent, and a thread-level Stop is not one of the ways.** Stop ends the turn only (removed 2026-08-07; `EventWaitCancelCause::ThreadCanceled` is retired but still deserialized for old rows). The live causes are `UserStop` (the **Stop waiting** button), `AgentStandDown`, `ThreadArchived` and `ThreadDiscarded`. `AgentStandDown` also covers a thread stopping a background task it watched, through `bash_kill`, `lucidos background-task stop` or `lucidos hardened mark` (ADR 0369). The archive confirms first, naming every subscription the cascade would stop, and every stop leaves a mark in the transcript when it happens.
+
+A `UserStop` leaves a **turn**, drawn as a headerless event row like *Response canceled* and *Paused by restart*. The device that pressed the button shows in its origin popover: a person did something to this thread, and the moment is the point. Every other cause is somebody acting inside a turn, most sharply an agent's mid-turn stand-down, so it leaves an *event row* where it happened.
+
+A stop never rewrites the *arming* row, which is a true statement about a different moment. Only a delivery or an expiry resolves that row in place. `EventWaitCanceled` carries `on` and `reason` so the mark is self-contained on replay, the same reason `EventWaitDelivered` carries its matched event.
+
+The `ThreadStatus` is `idle`, but the thread does not *read* as idle: the four resolution-and-registration arms maintain `live_event_waits` and derive `live_event_wait_count` from its length, and `resolveVisualStatus` turns that count into the same `waiting` VisualStatus active children produce. So the status enum stays out of it, the axis ADR 0049 cleared. The user still sees that the thread is asleep on purpose rather than finished. That same count also withholds `Apply` and `Discard` (ADR 0106): a change the thread is still producing cannot be resolved under it. **Stop waiting** is the way out before the 24 h ceiling. User-facing definition lives under *event wait* in `system-knowhow/glossary.md`.
+
+### Attached wait (retired)
+The shape an *event wait* had until 2026-08-06: `await_event` ended the turn with its `tool_use` deliberately unpaired, so the delivered event arrived as that call's `tool_result` and the model resumed mid-thought inside one exchange. It bought continuity and it cost an unpaired `tool_use`, which is a provider 400 the moment anything else runs on the thread, so it needed detach-on-interruption with a filler result, an attachment probe at every resolution site, a `was_attached` field on every resolution, two *re-entry anchor* shapes, a `waiting_for_event` status, a restart preserve guard, and a bar on the chat injection fast path. That last one is what broke: an attached re-entry's prompt was the empty string, so it queued behind a running turn and the 60 s Thread Queue backstop evicted the turn to let it in (`ResponseAborted { safety_net }`, 2026-08-06). Every wait is now what the *detached* one already was. Kept as an entry so the shape is recognisable in old event rows (`was_attached`) and is not re-proposed; see ADR 0049 and `docs/plans/2026-08-06-every-event-wait-is-detached.md`.
+
+### Injected prompt
+Text fed into a thread's agentic loop outside the ordinary send path, recorded as a `PromptInjected`. It lands mid-turn or opens a new turn. `mode: ActorMode` names the sender: a human interjection, an agent's follow-up into its child thread, or the engine (a resume note, a *re-entry anchor*). Only a human one is a user action for *last_user_action*.
+
+This is not the security sense of "prompt injection": nothing here is untrusted input smuggled into a prompt. The event was called `UserPromptInjected` until ADR 0389, and that name is now retired.
+
+### Re-entry anchor
+The event a resolved *event wait* hangs its re-entry on, and the second half of every resolution. `emit_delivery` / `emit_expiry` write the resolution and then exactly one anchor, a `PromptInjected` carrying the payload as prose. It is an `EXCHANGE_START_TYPES` member on the frontend, so the delivery renders as the new turn it genuinely is.
+
+It does two jobs in one shape. It is what `PreEmittedOrigin::WaitReentry` points at. It also makes a lost re-entry recognisable at boot. A resolution followed only by its own anchor is one whose turn never ran (`lost_wait_reentries`, mirroring `refire_unprocessed_child_completions`).
+
+It carries an engine origin with the `event_wait` reason: the outcome, the watched event types and the agent's reason. That is how the transcript and the route popover say where its words came from. Its `mode` stays `agent`, because `held_deliveries` keys on it. Older anchors carry no origin, and `waitReentryReason` reads their shape instead.
+
+The anchor sets the thread `running`, except on a thread parked on a question. There the re-entry waits for the answer (ADR 0255), so the anchor keeps `waiting_for_user_answer` and the card reads as not read yet. See `docs/plans/2026-09-24-a-delivery-never-unparks-a-question.md`.
+
+It waits even when a restart dropped the question's turn: see *held delivery*.
+
+Called the **wake anchor** until 2026-08-13, and the whole family with it (`EventWake`, `WakeFromEvent`, the transcript's `Woke on <event>`). The word claimed the thread had been asleep, which a delivery cannot know: registration does not hold the turn, so a wait routinely resolves into a RUNNING thread, and the engine then injects it into that live loop and tells the model it arrived "while you were working". *Re-entry* is what the code already called the act (`PreEmittedOrigin::is_engine_reentry`) and is true in both lanes. See `docs/plans/2026-08-13-a-delivery-does-not-know-the-thread-was-asleep.md`.
+
+### Held delivery
+A child report or an *event wait* re-entry that reaches a chat thread whose question outlived its turn. Only an engine restart causes that. The chat admission holds it instead of starting a turn that would overtake the card (`delivery_is_held`, `engine/chat/held_deliveries.rs`). Holding writes nothing: the child card and the *re-entry anchor* are already persisted, and the card reads as not read yet.
+
+The answer releases it. `resume_chat_after_answer` reads every delivery held since the question and folds it into the resume prompt: a wait's prose in full, a child report as a pointer to its block in history. With the question's turn still live nothing is held, because the re-entry injects into that turn (ADR 0255). Distinct from a *held message* (ADR 0256), which is a coding-agent thread's agent-sent message and carries its own `MessageHeld` event. See ADR 0321.
+
+### Watermark (event wait)
+The *committed horizon* an *event wait* records at registration. Registration, the boot rebuild and the Lagged re-scan all run the same catch-up scan forward from it.
+
+That closes two gaps with one mechanism. One is events that landed while the engine was down. The other is the live race between emitting `EventWaitStarted` and the dispatcher inserting its cache entry. Plain `MAX(sequence)` closed neither reliably, because an event below it could still commit afterwards (ADR 0364).
+
+It is **forward-only and stays that way**. The third gap, everything before the wait existed, belongs to the *arming lookback*, which reports rather than delivers. Backdating the watermark so the scan delivers an older match is the repair ADR 0047 rejects.
+
+### Committed horizon
+A sequence `H` such that every `events` row with `sequence <= H` has committed, or never will. `committed_event_horizon` (`engine/event_bus/append_horizon.rs`) reads one, and every *event wait* watermark is one.
+
+`MAX(sequence)` is not one. An append draws its sequence at the INSERT and becomes visible at commit, so a lower sequence can commit after a higher one. The read takes `MAX(sequence)`, then waits out every *in-flight append lock* held at that moment. Only the reader waits. See ADR 0364.
+
+### In-flight append lock
+The transaction-scoped advisory lock every `events` append takes as its first statement, keyed by the backend pid (`EventBus::begin_append`). It advertises "this backend may hold an uncommitted sequence", which is what makes a *committed horizon* readable.
+
+The pid key means appends never contend on it. Only a horizon read waits on it, with a shared lock. Being the first lock is load-bearing: a waiter then holds nothing, so it cannot close a deadlock cycle (ADR 0364).
+
+### Arming lookback
+The short backwards scan an *event wait* runs at registration (`arming_lookback_matches`, window `ARMING_LOOKBACK_SECS` = 3 minutes), naming in the `await_event` tool result anything matching that had already happened by the time the wait was armed. It exists for the gap the *watermark* cannot close: the stretch between the model deciding to wait for something and the call landing, which on 2026-08-06 was 84 seconds and cost a thread the `ChangeProposed` it was waiting for. **It reports, it never delivers**: no `EventWaitDelivered`, no re-entry, the wait is not consumed, and the model decides within the same turn whether the match is one it missed or one it handled itself a moment ago. Only the model can tell those apart, because only it has the turn in context, and that division of labour is what allows the window to be approximate. Bounded at 3 reported matches, newest first, each with its age; more than that sets a flag rather than a total, since counting the rest would mean reading the whole window. **Exactly one thing is suppressed**, and it is an exact set rather than a cutoff: events this thread was literally handed by an earlier wait (`delivered_event_ids`, read from `EventWaitDelivered.event_id`). Two rounds of review killed a *sequence floor* here, each time because it hid an event nobody had reported. A floor at the thread's last `EventWait*` of any kind let an unrelated `ChildThreadCompleted` delivery bury a missed `ChangeProposed`; narrowing it to a shared event *type* still let a `ChangeProposed` wait conditioned on one repo bury a `ChangeProposed` for another, and `[A, B]` bury a later `[A, C]`'s `C`. "Already told" is a property of an individual event under a specific predicate, not of a point on the timeline, and only a delivery names an individual event. The residual cost is accepted deliberately: two overlapping subscriptions may each report the same undelivered event, which is one duplicated paragraph the model is told it may ignore, weighed against the missed event this whole mechanism exists to surface. The window is deliberately a constant rather than the turn: a model decides to subscribe mid-turn, so early events in a long turn are archaeology, not a missed rendezvous. **It is measured by the database clock at both ends**, and passed to the scan as a duration rather than a cutoff instant: `events.created` is stamped by Postgres, so a cutoff the engine computed from its own `Utc::now()` would put two clocks on opposite sides of one comparison, and any drift past the window empties it silently (ADR 0053). The reported age is the same statement's arithmetic for the same reason.
+
+### Matchable payload
+What a subscription's `condition` is evaluated against: the event's own serialized fields plus `thread_id`, the thread it belongs to. Built by `core::event_subscription::matchable_payload`, and every consumer that offers a payload to `EventSubscription::matches` goes through it, so the four matching paths (the live *event wait* dispatcher, the catch-up scan from the *watermark*, the *arming lookback*, and *trigger* dispatch) cannot disagree about what a condition can name.
+
+**The thread id is injected, never stored.** It already has two canonical homes and neither is the payload: the carrier (`BusEvent::Thread { thread_id, event }`, so every thread event has exactly one by construction) and the `events.thread_id` column, which `20260314120000_strip_thread_id_from_payloads.sql` made the source of truth by removing the key from stored payloads. Persisting it per event would duplicate that column into every row forever and would still leave the next event type unscopable; injecting it into the view costs nothing on disk and makes every thread event scopable at once. So a `condition` may name `thread_id` even though no `ThreadEvent` variant declares it and no persisted payload carries it.
+
+**A system frame's envelope is flattened.** `SystemEvent` is adjacently tagged, so its stored payload is `{"type": …, "data": {…}}`. `unwrap_adjacent_tag` therefore lifts `data` to the top, live and on replay alike, which is what makes `condition: {"filename": …}` name the event's own field. The gate is the name first, then the shape. Only a name in `PERSISTED_TYPE_NAMES` writes that envelope, and a workspace cannot emit one. So a domain payload authored in that exact shape keeps what the workspace wrote.
+
+Insert-if-absent, so an event that owns the key keeps its value (a user-authored domain payload, most sharply). An event belonging to no thread gets no key rather than an invented one, which is why a **domain event is deliberately not thread-scopable**. `SystemEvent::DomainEvent` carries no thread and its row's column is NULL. Supplying an originating thread on the live path alone would rebuild the live-versus-replay asymmetry the shared view exists to prevent.
+
+**`EventMeta`'s own fields are in the view on both paths.** `BusEvent::Thread` carries the `meta` the row is persisted with, and `matchable_thread_payload` builds from it. So a `condition` on `channel`, `actor` or `request_event_id` gives the same verdict live and on replay.
+
+### live_event_wait_count
+`thread_summaries` column (`INT`, default `0`) holding how many *event waits* the thread itself currently holds unresolved, never a roll-up. The four `EventWait*` arms of `event_bus_projection_thread.rs` derive it from the length of `live_event_waits`, so the two cannot disagree. Two readers: `count > 0` in the frontend's `resolveVisualStatus`, and `available_thread_actions`, which withholds Apply and Discard while it is non-zero (ADR 0106). A subscribed thread stays non-blocking, non-attention-needing and archivable (ADR 0049). Column notes, including why it rides the thread summary and aggregate: `.claude/rules/db.md`.
+
+### Waiting child
+A *child thread* that is not in flight and holds a live *event wait*. It has not finished (ADR 0254): its parent gets no card until the turn the wait wakes ends. So the parent is waiting on it, exactly as on a running child, and reads **Waiting** with the child listed in its *waiting indicator*.
+
+Counted in `thread_summaries.waiting_children_count`, apart from `active_children_count`. ADR 0254 rejected widening the active count, which means "running" and also feeds the section, the fan-in and worktree cleanup. The two counts are disjoint, so the frontend adds them. `reconcile_parent_waiting_children_count` recomputes the parent's count from ground truth in the child's `EventWait*` arms and wherever the child enters or leaves flight. Direct children only, like the active count. See `docs/plans/2026-09-24-a-parent-waits-on-a-child-that-waits.md`.
+
+### Wake check
+The question the agentic loop puts to a chat turn about to end with no tool calls. Does the thread hold open *todo items*, and will anything re-open it? "Anything" is a live *event wait* or an unfinished background task. So this is the `Abandoned` branch of the settle (`settle_open_todos`), asked one round earlier.
+
+When there is open work and no wake, the turn is sent back ONCE with a forcing message naming the count. The agent then arms a subscription, settles the list, or says plainly that it is not watching. Bounded by `MAX_TODO_WAKE_NUDGE`: past it the turn finalizes and the settle records `Abandoned` as before.
+
+It runs BEFORE the terminator, so the user sees one reply rather than a second bubble correcting the first. It reads the in-memory registry rather than the settle's sequence-scoped anti-join, because inside a turn there is no terminator to be as-of. The reply text is never inspected: over 30 days only 25 of 365 abandoned items even contained "wait" or "watch". A Stop landing during the final LLM call skips the check. The loop's only cancel check is at the top of a round, and nudging would discard the drafted answer.
+
+Named for the thing it protects, which is that something will wake the thread. It exists because three separate sentences of prose already say a narrated watch is not an armed one, and the mistake happened twice anyway. See ADR 0071 and `docs/plans/2026-08-13-a-turn-cannot-end-claiming-to-watch.md`.
+
+### attention_descendant_count
+`thread_summaries` column (`INT`, default `0`) holding the rolled-up count of a thread's *attention-needing descendants* (transitive). Maintained by EventBus alongside `blocking_descendant_count`; consumed by `display_section(..., has_attention_descendants: bool)` via `count > 0` to bubble the ancestor chain to the *Current* section when any descendant needs user attention, even if sibling descendants are still running.
+
+### available_thread_actions
+The DB-derivable per-thread action-availability core in `engine/thread_lifecycle.rs` (renamed from `resolve_actions`). Pure function over `thread_summaries` facts (`thread_type`, `status`, `stored_section`, `has_pending_changes`, `descendants_block_archive`, `has_live_event_waits`, `has_unsent_draft`, `is_saved`), returning the available `Action`s in cascade order: `[DiscardDraft?, Discard?, Apply?, Archive?, Unsave|Save]`. `has_live_event_waits` is the *parked* fact: a delivery will wake the thread on its own branch, so `Apply` and `Discard` are withheld (ADR 0106). An active sub-thread is deliberately not an input, because the child writes its own worktree (ADR 0249). `Archive` is unaffected, having never been offered beside a pending change.
+
+Single source of truth on BOTH sides. It is codegen'd to TS (`generated/thread-lifecycle.ts`, contract-tested), so the frontend buttons derive from it. It is also called server-side via `api::threads::available_thread_actions_for`, guarding the mutating HTTP handlers (archive / apply / discard / save / unsave). So a stale frontend or raw API caller cannot invoke an action the user could not currently take. The in-process `changes` LLM tool asks it too, through *change_action_refusal*, so an agent is not a third way round it either. Verb seam: `available_*` reads only DB-derivable facts; the frontend's *resolveThreadActions* layers in client/UI state.
+
+### Bg-bash wait (retired)
+A retired concept. The engine used to refuse `ChangeProposed` at idle while a CC background bash task was still running (`may_touch_change_state_at_idle`'s bg-bash gate). A `thread_summaries.coding_agent_bg_bash_pending` column then showed a "CC waiting on background tasks" banner with no Apply button. Only a ~5-minute `BgBashWakeRequested` nudge cleared it.
+
+**Removed** (2026-05-29). The wait was worse than the rare wasted re-harden it prevented. It also wedged for good when CC checked bash completion with a shell `ps` instead of `TaskOutput`, since the in-memory tracker never saw the drain. The change then proposed the instant CC idled, regardless of background bash.
+
+A live event wait now holds that proposal instead (ADR 0395), because a wait, unlike the tracker, cannot miss its own end. Correctness is covered twice. The *proposal hold* never proposes work that never ran `/harden` (ADR 0416), and *harden-at-apply* re-runs `/harden` on any older row that slipped through.
+
+The gate, the `CCInternalBgBashTracker`, the timer, the `BgBashWakeRequested` event and the column are all gone. So are the `bg_bash_pending` params of `display_section` and `available_thread_actions` (then `resolve_actions`). The `CodingAgentIdled.bg_bash_pending` field stays as recorded history, no longer projected. Threads wedged by the old gate recover at boot through `propose_held_back_changes_on_startup`.
+
+### Bounded security-fix lane
+The one carve-out in the *plan marker* gate for a run nobody can be asked. An **unattended** session (the nightly security pass) may commit a security fix with no prior plan decision. The fix must be confined to a small, named set of files, and must ship a regression test. Recorded by `lucidos planned mark --security-fix "<reason>" --files <csv>`, which writes the `bounded_security_fix` state plus the `files` bound.
+
+It is a distinct state, not a reuse of the two satisfying states beside it, and that is the point. `acknowledged_simple` would claim a cross-module credential fix is local, `planned` would claim a human approved it, and both claims are false. Two sessions correctly refused those bypasses and stopped instead, which is what the lane exists to fix.
+
+**The bound is checked, not trusted.** The Apply floor asks what will LAND: the branch's committed diff (`branch_changed_files_checked`) plus the worktree's uncommitted files (`worktree_dirty_files`), since every apply path stages the tree before merging. Anything outside the recorded list is refused, `docs/plans/` excepted. 
+
+The check runs where an apply BEGINS, in both `apply_change` and the live-session `apply_now`, and NOT at the tier fast paths. An `Err` out of the merge helpers means "main diverged, escalate", so a bound enforced there reads as a conflict and routes the branch onward. One route those entry points cannot cover is a conflict-resolution session, which edits after the check. It is rechecked in `completion.rs`, where a failure is terminal rather than an escalation. See ADR 0154. It fails closed: an unreadable bound, or a git call that cannot answer, refuses the apply.
+
+That check is the only automated thing between this lane and `main`, because the nightly applies its own children's changes unattended. The engine caps the list at `MAX_BOUNDED_SECURITY_FIX_FILES`, trims each entry, and parses the state strictly on write so a kebab-case misspelling cannot land as `planned`.
+
+Anything wider takes the **blocked lane** instead: commit the plan, leave the marker `proposed`, and end the reply with a literal `BLOCKED ON PLAN DECISION:` line. That line is a *step outcome*, not a failure. It lets the nightly orchestrator report a decision the maintainer owes rather than a failed scan. Three things stay declared rather than proved: that the run is unattended, that the work is security work, and that a regression test exists. See ADR 0154 and the workspace knowhow `lucidos-ops/nightly-pipeline`.
+
+### Branch adoption
+Following an *agent session* onto a branch it moved itself to, instead of refusing or silently computing against the old name. The tracked branch name is a spawn-time snapshot of a fact that lives in git. The coding agent has full write access to that worktree, so `git branch -m` or `git checkout -b` from a repo skill is ordinary. The two then legitimately diverge, and adoption is the sanctioned response. It is **external-repo only**: a Lucidos-source thread keeps its engine-named *coding-agent branch* because *Apply* depends on it. A mismatch there is a hard spawn refusal (`BranchMismatch`).
+
+Adoption runs at two boundaries. At **spawn**, `verify_branch` detects the mismatch and `try_adopt_renegade_branch` (`agent_session/external_edits.rs`) adopts when both a *containment* and a *provenance* proof hold. It then prepends an *engine note* naming the new branch. At **idle**, `try_adopt_branch_at_idle` runs the same check before the turn's diff, and takes every containment proof rather than picking one.
+
+**Containment** says the branch holds every commit the thread already had. One form is that the worktree HEAD contains the anchor SHA, the previous idle's HEAD. Spawn uses it whenever it has an anchor, and a failing anchor is a veto. A stale rename entry outlives a `git reset --hard` that dropped our commits. The other form is that the tracked ref is still an ancestor of HEAD.
+
+Idle requires both, because a first idle's anchor is only the session's start HEAD rather than a SHA containing its own commits. A restart can kill a turn before it idles, leaving a mid-turn `git checkout -b` with no anchor at all. The lookup is tri-state (`IdleAnchor`), so a failed query answers `Unknown` and refuses rather than falling back to the weaker proof.
+
+**Provenance** says the branch became this thread's by the thread's own act, and is required at every arm. Containment alone goes vacuous while the tracked ref sits at the base, since every branch cut from it contains it. A thread that had committed nothing could otherwise adopt an unrelated sibling. Two proofs, both git's own account. `worktree_created_the_branch` holds when the branch's oldest reflog entry is its creation and this worktree's own HEAD reflog carries a matching `checkout: moving from <x> to <branch>` entry. Matching means the same timestamp and the same resulting sha, which is exactly what `git checkout -b` and `git switch -c` write.
+
+`branch_reflog_records_rename_from` holds when git's reflog carries the rename entry `git branch -m` writes, `Branch: renamed refs/heads/<old> to refs/heads/<new>`. One git process stamps every reflog entry it writes with one cached timestamp, so the created-here pair matches exactly however long the checkout runs. Reflog timestamps have one-second resolution, so a branch created in that same second at that same commit still passes. It holds no commit beyond our own HEAD. Creating a branch as a separate step seconds earlier is refused, as is a repo with reflogs off: no evidence, no adoption. See `docs/plans/2026-08-27-branch-adoption-proves-the-branch-is-ours.md`.
+
+The tracked ref merely being **gone** is deliberately not evidence. Checking out a sibling branch and then deleting the tracked one leaves the same absence. `merge-base --is-ancestor` answers no for a ref that is not there. Adopting on that absence would hand the thread's Diff, and a later Discard's `branch -D`, to work that was never its own.
+
+Adopting at idle too is what fixed the dark Diff button. Adoption used to run only on respawn, so a single-turn session that renamed its own branch diffed against a missing ref. Git exited 128, and the failure was recorded as "no changes". An adopted name is written back to the run loop and to `AgentSession.branch_name`, so one session never carries two names. Nothing is stamped on `CodingAgentIdled`, since `SessionStarted.branch` is already the recorded name and the next spawn re-derives from git.
+
+A branch the agent moved to is called a *renegade branch* in the code. The read-only counterpart is in `api/repositories.rs`. The Diff view prefers the worktree (`base...HEAD`), which is immune by construction. When the worktree has been reclaimed, its `resolve_recorded_branch` fallback locates the branch that still contains the thread's last known commit (`sole_branch_containing`). That is a lookup, not an adoption: it retargets one response, never the session.
+
+### BusEvent
+The wrapper enum the EventBus routes. Two variants: `BusEvent::Thread { .. }` (per-thread, becomes a *ThreadEvent*) and `BusEvent::System(SystemEvent)` (workspace-wide). Every emit goes through one of these — never bypass to write directly to the `events` table.
+
+### Auto-resume hold
+A mark the engine puts on a coding-agent child whose current terminal it is about to resume, so the child-to-parent fan-in withholds that terminal's `ChildThreadCompleted`. Taken in `hold_completion_if_api_error_resume` when the terminal is CLASSIFIED, which is before it is emitted, because a `ResponseFailed` runs the fan-in inside its own emit. `notify_parent_if_child` returns early while the hold is set, and `maybe_auto_resume_after_api_error` actuates it rather than re-deciding. The card then belongs at the REAL terminal, whatever it turns out to be.
+
+The hold decides nothing on its own: `auto_resume_after_api_error` does, so past `MAX_API_ERROR_AUTO_RESUMES` no hold is taken and the card fires as it always did. It is also deliberately blind to durable state and clears no `parent_callback_pending`. That is what lets the resumed turn report, and what makes an engine death mid-hold safe. Where a resume is decided but never actuated, `held_completion_release` answers `Announce` and the withheld failure reaches the parent after all. See ADR 0199 and `docs/plans/2026-09-16-a-terminal-the-engine-will-resume-is-not-a-completion.md`.
+
+### Parent wake hold
+The queue that holds parent wakes back while the engine cannot run a turn (`event_bus/parent_wake_hold.rs`). The card still persists; only the wake waits. Unlike the *auto-resume hold*, it withholds no card.
+
+Boot engages it before recovery and releases it after the event-wait rebuild, so no woken parent races the recovery sweeps. Teardown engages it and never releases it, so the next boot's refire wakes the parent. It drops a second wake for a queued card, which is how the refire and recovery's own wake come to one turn. See `docs/plans/2026-10-03-crash-cut-child-reports-truthfully.md`.
+
+### Callback linkage
+The `parent_thread_id` field on a spawned thread's first `MessageReceived` (projected onto `thread_summaries.parent_thread_id`), and the single field that makes a thread somebody's *child thread*: it is what fires the parent callback when the child terminates (`notify_parent_if_child`), what increments `active_children_count` / `total_children_count`, what sets `parent_callback_pending`, and what `resolve_attend_mode` hops along when deciding whether a coding-agent permission card inherits a trigger's *side-effect grant*. Deliberately NOT the same thing as the *attribution* carried in `MessageOrigin::ThreadLink`, which only names the *spawning thread* for the message route popover. A `relation: "child"` spawn carries both; a *top-thread* and a *child follow-up* carry attribution with no linkage. Conflating them is what made a top-thread render its Origin as "Unknown" (`agentic_loop_special_tool::spawn_origin` versus `Relation::spawn_linkage`); anything deciding parent-ness reads the linkage, never the origin.
+
+### Call phase
+Where a live *voice session* is, as the client models it: `idle` | `connecting` | `listening` | `speaking` | `ending` (`voice/callState.ts`). `listening` and `speaking` are both live and differ only in who has the floor. The speech gate runs whoever holds it. An opening edge is a *barge-in* or a *live utterance*, and the phase is half of what decides which.
+
+**A call draws two surfaces, and neither is a caption.** Everything said lands in the transcript as thread events, and the *live utterance* row below is the only one the phase paints there. The other surface is the *call toggle*, which wears the phase: green for the whole call, deeper while `speaking`, muted grey while `ending`. Red is the pointer's promise rather than a state, appearing on hover wherever a press would end the call (ADR 0209). The handset pulses while `connecting` and again while `ending`, each at a resting brightness of its own, with no ring around it (ADR 0207). `ending` carries `aria-disabled` because `ringOff` already ignores a press, and under `prefers-reduced-motion` colour and brightness carry the four apart.
+
+Reduced motion here is the resolved `data-motion` value (*Reduced motion (resolved)*), so the in-app *Motion* setting can override the OS switch either way.
+
+The toggle also carries the call's one `role="status"` region, empty at `idle`, so each state a call arrives at is spoken as well as drawn. Ringing off is the button's own announcement, since emptying a live region says nothing. The transcript deliberately is not a live region either, because announcing every delta of a reply being spoken aloud would talk over it.
+
+**A connect that dwells stops claiming progress.** Two seconds in `connecting` usually means the browser is holding a microphone prompt over the UI. So the toggle's tooltip says it is waiting for microphone access. The status region says nothing new: the phase really is still `connecting`, and a guess about the cause does not belong in a live region.
+
+The client keeps THREE captions, and the field a word lands in says what it is worth. `CallState.heard` is the caller's finished sentence, set by `user_turn_ended`: the provider has ENDED that turn, so the sentence is final and a row may be claimed by it. `hearing` is their partial, built from `user_transcript` deltas and replaced outright by `heard`. `said` is the reply being spoken, built from `talker_transcript`, and `replyCount` beside it is which reply that is rather than a caption. An EMPTY `user_turn_ended` transcript is the engine's own word for "that was a noise", and it withdraws the row on the spot. `voice/call.rs` refuses to hold a wordless one, which is what makes that reading safe.
+
+One thing does outlive a call, the reason it could not run. `store/voice.ts` toasts that note when the phase reaches `idle`, rather than leaving it on a surface that has gone.
+See also: *barge-in*, *live utterance*, *voice session* and *call toggle* (`system-knowhow/glossary.md`), `docs/plans/2026-08-29-a-microphone-reaches-the-call.md`.
+
+### Barge-in
+The caller TAKING the floor back from the *talker*, and one of the two signals a call reads off their voice. The other is the turn end, which is the provider's and says what they said. Neither is derived from the other (ADR 0200).
+
+**The client decides it, because only the client hears them.** `onSpeech` in `voice/callState.ts` raises one when the speech gate opens, the *call phase* is `speaking`, and the caller had been quiet for `BARGE_IN_QUIET_MS`. It sends `ClientControl::BargeIn` and stops its own playback in the same step.
+
+**The quiet stretch is the whole of the distinction.** Somebody finishing a sentence the talker talked over never handed the floor over, so their next words cut nothing. The gate alone cannot tell the two apart: it shuts after 320 ms, and the breath before a trailing "please" is longer than that. `voice/call.ts` counts quiet capture frames, which are 40 ms each, so the measurement is the caller's own silence rather than a reading off a clock.
+
+**The engine is what makes the cut real.** A Live *talker* has no cancel, so it keeps speaking. `Call::the_caller_cut_in` drops the rest of that reply: no audio to the caller, no delta into its row, and the row says `interrupted`. The client silencing its speaker alone is a hole, because the talker resumes into it.
+
+One barge-in cancels once, and one with nobody speaking cancels nothing. A cancel for a response that does not exist is refused, and on the Realtime path that refusal reads as the session dying.
+See also: *call phase*, *live utterance*, *playback lead*, *talker*, ADR 0170, ADR 0200.
+
+### Playback lead
+How far ahead of now the client starts a chunk of talker audio when its queue has drained. It is the whole jitter buffer a call has. `Playback.lead` in `voice/schedule.ts`, applied by `placeChunk` and spent by `ports.ts`. A **playback gap** is the hole heard when it was not enough: the queue emptied with more of a reply still to come.
+
+**The depth is the lead and nothing more, because a Live *talker* paces its audio at the speed a person hears it.** That stream runs continuously, silence included, so the client is handed no depth of its own. A Realtime talker sends a reply in a burst instead, and builds depth on top of the lead. That is why 80 ms went unnoticed until a workspace pinned a Live model.
+
+**So every stall longer than the lead is audible, wherever it happened.** The engine's call loop is the usual source: `Call::drive` forwards audio and awaits its Postgres writes on one task, so a row costs the audio path a transaction. A caller therefore hears the first exchange of a call worst, when the thread's first rows, its name and its title all land at once.
+
+**A drained queue grows the lead to cover what it just lost, and never shrinks it.** Shrinking would re-earn the same hole, and the state dies with the call anyway. A drain past `QUIET_STREAM_SECONDS` is read as the talker stopping rather than as a fault. Otherwise every Realtime turn boundary would grow the lead to its cap.
+
+**Audio still queued is never re-led.** A chunk whose cursor sits ahead of now butts against it, however thin the lead has worn. So the rule cannot manufacture the hole it exists to absorb.
+
+`AudioDevice.playbackGaps` tallies the holes, and `voice/call.ts` logs the count once as the call comes down. Nothing acts on it: the caller heard them, and the lead has already grown.
+See also: *barge-in*, *talker*, *voice provider*.
+
+### Live utterance
+The caller's utterance before the engine's own row for it exists, and the row the transcript draws for it meanwhile. `CallState.utterance` (`voice/callState.ts`) carries it through four values. `none` is nothing heard and `live` is the speech gate open. `landing` is the gate shut with the provider still silent, and `transcribed` is the provider reporting the words.
+
+**The row carries words from the first one the provider hears.** A partial fills it while they speak (`LiveUtterance.partial`, from `user_transcript`), and the finished sentence replaces it at `transcribed` (`text`, ADR 0174). It holds a pulse only until the first partial, and for the whole utterance when the transcriber streams none. The swap costs no round trip and no frame, which is the whole point: the engine's row can be tens of seconds later, and the stretch in between used to be blank.
+
+**A partial captions and settles nothing.** It rides the synthetic row's `text` so every reader draws it as an ordinary bubble, and `_livePartial` is what marks it provisional: no response panel opens under it, and `claimUtteranceRows` skips it. Only `LiveUtterance.text` is words a persisted row may claim.
+
+**It exists because the words arrive late, not slowly.** `voice/call.rs::forward` HOLDS a transcript on `UserTurnEnded` and writes no row there. Which row it becomes depends on the *talker*: a `SpokenMessageReceived` when it answers alone, a `MessageReceived` when it delegates. Both wait on a talker tool round-trip, so the stretch from the first word to the bubble held no event and drew nothing at all.
+
+The row is a synthetic `MessageReceived` at a near-`MAX_SAFE_INTEGER` seq, marked `_liveUtterance`. It is appended at the single exit of `computeExchanges`, PAST every path through the fold, and that is the whole of its safety. The fold never sees it. So it cannot be re-anchored, cannot become a wall a re-anchor stops at, and cannot take a step off a running turn. `exchangeHoldsNoTurn` and `isUningestedMessage` then keep it out of the queue and the live-turn walk, so it takes neither the live stream nor the running badge.
+
+**`exchangeStatus` short-circuits it, and which way splits on the words** (ADR 0191). The pulse and a partial read `pending`, so a caller mid-sentence wears the Requesting shimmer. FINAL words read `done`: the engine holds those until the conversation moves, a whole reply long, and a shimmer over a sentence nothing is running for says nothing true.
+
+They live in `ThreadState.liveUtterances`, a LIST of their own rather than `pendingUserMessages` entries. Every rule that array carries would need a carve-out, `effectiveThreadStatus`'s running flip most of all, and its safety timer drops a row on a clock. A list because the engine holds one utterance at a time. A caller who carries on speaking has a second row up before the first one's lands, and a slot would drop the first one's words.
+
+**Only two things withdraw a row, and neither is a clock.** An empty `user_turn_ended` transcript takes a wordless one, which is the noise case. The caller's real words landing as an event takes the matching one, which is the swap the reader sees. A row carrying words outlives the bound on the wait AND the hangup, because `call.rs` writes down whatever it holds for every end reason. `store/liveUtterance.ts` is the one seam between a call and a thread. It upserts one row per utterance count, so a revision rewrites in place rather than adding a bubble.
+
+**A landing row claims the live row carrying the SAME WORDS, never one matching a count.** `claimUtteranceRows` is the whole rule, and `unclaimedUtterances` holds the words no row has claimed yet. A row with no final words matches nothing, which is the barge-in guarantee by construction, and a partial is not words either.
+
+**It also retires every EARLIER row of its own stretch** (ADR 0188). `call.rs` appends as it accumulates, so such a row carries a strict PREFIX of the words that land. Matched on equality alone it is an orphan: the reported one read `bit` and sat under a "Requesting" header until the hangup swept it. Prefix, never containment, or a short fragment would retire a bubble from a different sentence. The `user_turn_ended` frame carries the whole stretch for the same reason, so the bubble captions the sentence rather than its tail.
+
+**No count works, because the two sides disagree about which row is next, in both directions.** `count` is the browser's gate cycling, and a persisted row is one thing the caller SAID. A pause inside one utterance gives two counts one row. And `call.rs` writes NO row for words spent answering a question card, leaving an orphan a later row would claim. Both are traced in `docs/plans/2026-09-14-the-transcript-shows-a-call-as-it-happens.md`.
+
+**A persisted row is NOT one provider transcription item, and reading it as one is what drew seven bubbles for one sentence** (ADR 0185). A provider closes an item for its own reasons. `call.rs` accumulates across them and closes the row when the conversation MOVES: the caller's next finished words, a new thing handed to the talker to say, the doer being asked, or the call ending.
+
+**A PAUSE in the talker's words is not one of those moves, and reading it as one lost the doer's work** (ADR 0191). The pause used to write the row, which took the held words with it. The talker routinely asks a beat later, so the ask paired with nothing and the turn never ran.
+
+**Nor is a caller turn landing INSIDE a reply, unless they cut it off** (ADR 0200). The talker answers into a mid-sentence pause, so the rest of the caller's breath arrives while it is speaking. Read as a move, it cut the reply at that word and filed one sentence as two questions. Held instead, the words join the ones before them and the reply fills one row. A *barge-in* is the exception, because there they took the floor.
+
+**Trimmed on both sides, because exactly one leg normalizes.** The frame's transcript reaches `SpokenMessageReceived` verbatim and reaches `MessageReceived` through `doer.rs::wake`, which trims. `voice::call` pins the verbatim leg, so a second normalization cannot arrive unnoticed.
+
+**The words wait because the two arrive on two transports.** `call.rs` emits the persisted row BEFORE it sends `user_turn_ended`, over SSE against the call socket, so either can win. Words landing with no row to claim stay in `unclaimedUtterances`, and `store/liveUtterance.ts` claims again the moment a row gets its own.
+See also: *call phase*, *live reply*, *transcript marker*, ADR 0174, `docs/plans/2026-08-31-a-bubble-appears-as-the-caller-speaks.md`, `docs/plans/2026-09-05-a-turn-is-never-blank.md`.
+
+### Spoken merge
+The rule that reads two spoken rows back as the one thing said. A voice provider ends a speaker's turn after a fraction of a second of silence, so it cuts a sentence wherever the speaker breathes. Every turn is its own row (ADR 0201).
+
+Two rows merge when they are ADJACENT, from the same speaker, and no further apart than `MERGE_GAP_SECS` (five seconds). Adjacency does most of the work: another turn between them means the speaker said two things. The words join with one space, or with none before a clitic, so `Status` and `, please` read as one sentence.
+
+**In the transcript, a step that landed WHILE the first row was being said is not "between" them** (ADR 0206). The talker never stopped, so it separated nothing, and `spokenRowToGrow` reads past it. A step in the silence after those words is time passing and does separate them.
+
+**For the CALLER, the talker's own note is not "between" them either.** A delegation says why the talker asked for the turn. It lands within milliseconds of the fragment that prompted it, so it routinely arrives mid-sentence. The transcript draws no row for it at all: `DRAWS_NO_ROW` and `readerMetNothing`, both in `exchange-grouping.ts`. The doer's history counts it as a note rather than a turn: `SpokenTail::notes_after`. The two must answer alike, or a bubble reads as one message the model never saw as one.
+
+**A reply takes the timing rule instead, so a delegation DOES separate two of them.** The talker had stopped speaking, which puts the note in the silence after the words. That is the paragraph above, and it is why the exemption is the caller's alone.
+
+**One case still answers differently, and it predates the exemption**: a doer step between two caller fragments splits the transcript and merges the history. A step reaches `pending_steps` and never `messages`, so the history's row count cannot see it. Closing it means asking what the reader met at every record site, and proving the two alike through the fixture.
+
+It has two implementations and one definition. `core/store/messages/spoken_merge.rs` serves the agent's conversation history and generates `spoken-merge-fixture.json`; `store/thread-events/spokenMerge.ts` serves the transcript and replays that fixture. A bound could not decide a turn's END (ADR 0187, ADR 0188), because that question is asked live. This one is asked afterwards, holding both timestamps.
+
+### Live reply
+The talker's own half of a *live utterance*: the reply the transcript draws while it is being spoken, before `SpokenReplyGenerated` exists. `CallState.said` accumulates the `talker_transcript` deltas of ONE stretch, `store/liveUtterance.ts` joins the stretches into the row, and `ThreadState.liveReply` is the row.
+
+A SLOT where the caller's is a list, and the asymmetry is the engine's: `call.rs` holds the floor to one reply at a time, so a second live reply is a state that cannot exist.
+
+The row is a synthetic `SpokenReplyGenerated` marked `_liveReply`, appended past the fold beside the caller's rows and sorted with them by `created`. It wears the persisted type on purpose, so `initiatorFor` draws it as the Lucidos boundary and `exchangeHoldsNoTurn` already knows it holds none. `exchangeStatus` short-circuits it to `done`: the words moving in it are the activity, and a shimmer below would be a second one.
+
+**It outlives `said`.** The turn ending empties the caption and withdraws nothing, because the engine's row is on its way and the caller is still hearing the tail. The persisted `SpokenReplyGenerated` retires it, with `VoiceSessionEnded` as the backstop.
+
+**The ROW is one reply, and `replyCount` is one stretch of it** (ADR 0191). The count moves when a delta lands on an empty `said`, which a 700 ms hole in the talker's words is enough to cause. A new count under a standing row therefore JOINS it, keeping the row's id and the moment it went up. Drawing a row per count made four bubbles of one reply, and the reader watched sentences disappear as they were spoken.
+
+**The engine's own row retires the live one, read as a rewrite that finds no row standing.** `handleEvent` clears the slot when `SpokenReplyGenerated` lands. The bridge's next draw then learns the words are written down, and opens a fresh row for whatever follows. `writeRow` reads a claim on the caller's side in exactly that way.
+
+**A PERSISTED reply row is one provider TURN, written the moment that turn ends** (ADR 0201). So its `created` is when the words stopped, which is what lets the transcript read every row by the clock alone. `call.rs` builds it from the raw deltas, which carry their own spacing. One sentence is therefore several rows, since `TALKER_IDLE` holes of up to 3.6 s fall inside one. The *spoken merge* reads them back as the sentence they are.
+
+**The live row is drawn INSIDE the block its persisted row will land in**, as a step rather than a boundary. `withLiveCallRows` and `callRowTarget` share `liveReplyTargetIndex`, so the two cannot drift. Appended as its own exchange it drew a second Lucidos Agent header between the speech bubbles. That header then came and went as each persisted row landed.
+
+**Both rows read where the WORDS BEGAN** (ADR 0206). A reply goes down at its own turn end, so `created` is when the words stopped. `spoken_secs_before` says how long it had been speaking by then. `happenedAt` subtracts the one from the other and `callRowIndex` files the row there, reading every step it walks past the same way. The live row goes through that rule on its own `created`, the moment the bridge drew it, so the swap moves the bubble nowhere. A row with no age reads at `created`, which is where a deltaless reply and every pre-ADR-0206 row still read.
+
+**A step that landed mid-sentence does not split the bubble.** The merge wants the two fragments ADJACENT, and a row now spans time, so a step stamped inside the first one separated nothing: the talker never stopped. `spokenRowToGrow` reads it that way and the merged row keeps its place, its age grown to span both fragments. A step in the SILENCE between them is time passing, and there the reader meets two bubbles.
+
+**The exchange republishes the live row's words as `liveReplyText`.** It is a step, so its text moves under a stable seq, and the memo's step fingerprint cannot see that. Without the field the bubble stops on whatever prefix the first render caught.
+See also: *live utterance*, *live speech mark*, *call phase*, ADR 0174.
+
+### Session copy
+What answers a Claude Code *side question*: the thread's own `claude` command, resumed with `--no-session-persistence` under a settings file whose PreToolUse hook refuses every tool. It keeps the session's tools and appended system prompt, so it reads the transcript from the prompt cache. It writes nothing back to the session (ADR 0324). Code: `SessionCopy` and `session_copy` in `engine/agent_session/side_question.rs`, `ask_side_question` in `runtime/claude_code.rs`.
+
+### Session clock
+The one timeline a Live call is measured on. Both transcript deltas carry `start_ms` and `end_ms` against it. So a caller fragment and a talker fragment can be placed against each other, whatever order they arrived in (ADR 0198).
+
+`live.rs` holds each thing the caller said as a `Fragment`: its text plus the `start_ms` the provider gave it. Arrival order is not timeline order, because input transcription runs asynchronously and the provider's own guide says to expect late text.
+
+**The cut is where the caller's turn ends**, set by the talker's first WORD at that word's own `start_ms`. It takes every fragment that began before it and leaves the rest. So words the caller spoke OVER the reply stay out of the turn that reply answered. A delegation cuts on its own `offset_ms`, the same way.
+
+**A piece transcribed after its own boundary is still a turn of its own here**, and the clock cannot close that: it really was said after the reply began. What closes it is above the seam. Such a turn is no longer a MOVE, so its words join the ones before them and the reply is not cut (ADR 0200). Waiting for the piece below the seam was tried and reverted, and ADR 0198 records why.
+
+A frame carrying no timing cuts at once, on whatever is held, which is what this did before any of it read the clock. A mixed stream is joined as it arrived, since an untimed piece would otherwise sort ahead of every timed one.
+See also: *talker*, *live utterance*, ADR 0181, ADR 0198, `docs/plans/2026-09-16-a-live-call-delegates-what-it-promised.md`.
+
+### Delegation policy
+What a tool-less *talker* is told about asking for help. `DELEGATION_POLICY` in `voice/mod.rs`, composed onto the opening instructions by `live.rs::session_start`.
+
+Client delegation declares no functions, so the Realtime provider's `DELEGATE_TOOL_DESCRIPTION` has nothing to ride and never reaches a Live talker. Prompting is the provider's whole steering surface for it. The policy follows the shape its guide asks for, keeping three labels verbatim: what the backend can do, when to hand over, when not to.
+
+**Its load-bearing rule is that a promise and the handover are one turn.** A talker that says "on it" and asks for nothing leaves the caller waiting for work that never starts. That is the defect ADR 0198 was written for. No mechanical test separates it from an honest answer, so the prompt is the fix.
+
+**Handing over is also how this talker settles a question card** (ADR 0205), so the policy names both sides of that. Hand over what the caller chose, and hold back while they are still weighing it up. Told only the first, it would settle a card with somebody thinking out loud.
+
+Each provider owns how delegation is expressed, and both texts live in `voice/mod.rs`. Nothing above `voice/provider.rs` learns which provider answered.
+See also: *talker*, *doer*, ADR 0164, ADR 0181, ADR 0198.
+
+### Live speech mark
+The one mark that says the CALLER's words are still arriving: their bubble before the first word, and the same bubble mid-sentence once the provider has heard some of it. Three bars that rise and fall, `LiveSpeechMark` in `chat-exchange-parts.tsx` and `.live-speech-mark` in `styles/chat/voice-call.css`.
+
+It replaced a blinking caret, which was reported as a weird signal and was the wrong metaphor: a text cursor says somebody is typing, and nobody types on a call. One mark rather than two also makes the bubble continuous, the words pushing the bars along as they arrive.
+
+**The talker's reply carries no liveness at all**, in a mark or in its accessible name (ADR 0197). Its live row is retired by the engine's own row, written at the next move of the conversation (ADR 0188, ADR 0191). A finished sentence therefore stands there until the caller speaks again, wearing a mark that says more is coming. Gating the mark on the call phase is the obvious repair and is worse: a pause is not the end of a reply, so it would blink several times through one bubble. The caller's side keeps the mark because the client IS told when those words are final: the provider ends the turn and the *live utterance* drops its partial.
+See also: *live reply*, *live utterance*.
+
+### Capability parity manifest
+The single source of truth (`crates/lucidos-engine/src/capability_manifest/`) for which **agent surfaces** expose each capability — the LLM tools, the `lucidos` CLI, and the JS SDK (UI/HTTP are the substrate). Each *domain* declares its operations once plus domain-level `llm`/`cli`/`sdk` flags; from that one declaration the grouped LLM `ToolDefinition` is built in-crate, the CLI subcommand module is generated into `crates/lucidos-cli/src/generated/`, and the SDK capability table into `packages/lucidos-sdk/src/generated/`. Drift is a build failure: staleness tests (mirroring `navigate_targets_codegen`) fail `cargo test` when a generated file falls behind, the grouped handler's recognised-action set is checked against the manifest, and a Vitest test checks the SDK facade. Introduced to stop the agent-facing surfaces silently lagging UI/SDK/HTTP — see `docs/adr/0018-capability-parity-manifest.md`. Models *declared parity* (per-capability target surfaces), deliberately not blanket N×N parity.
+
+Each `Operation` carries the wire details (method, path, `args` with type/location) plus three knobs that let one declaration serve surfaces whose shapes diverge: **per-op surface overrides** (`llm`/`cli`/`sdk` as `Option<bool>`, `None` inherits the domain — e.g. trigger `pause`/`resume` are LLM-only, app `update`/`delete` are CLI-only); a raw **`llm_schema`** (a JSON properties object used verbatim for the grouped tool when the LLM-facing shape differs from the HTTP `args` — e.g. a trigger's `cron` string|array shorthand vs the HTTP `cron_expressions` array, or omitting a context-injected `device_id`); and **`llm_alias`** (the retired flat tool name an operation supersedes — the grouped handler maps `action` → legacy name and delegates to the existing per-verb handler, and the legacy name still resolves to the domain so cached prompts/threads keep working). `ArgType::Json` expresses complex args (objects/arrays) that scalar `Str`/`Int`/`Bool` can't — the CLI takes them as `--flag '<JSON-STRING>'` parsed onto the body.
+
+### Frame capability
+The short-lived URL pass an **app frame** carries to its own workspace files behind a gateway. One path segment, `/<slug>/~cap/<token>/…`. The engine mints it when it serves a framed app document. The gateway verifies it with a key both derive from the *machine-local token* (`crates/lucidos-frame-capability/`, ADR 0238). It exists because an app frame is opaque-origin (ADR 0227): the browser withholds the device credential from every subresource of its document, and a bridge cannot carry a `<script>` tag.
+
+It reaches `/<slug>/data/*` and `/<slug>/app/<app_id>/*`, with GET and HEAD, for one hour. It reaches no `/api/v1` route, no control plane and nothing under the picker's namespace. The engine stamps it into the document's `<base href>`, so the app's own relative refs pick it up with no attribute rewritten. A nested document's relative link then carries it one hop down for free. The host re-mints at half-life and pushes, and the SDK swaps the token into the same element.
+
+The *artifact preview frame* carries a narrower one, minted by the host for the reserved subject `artifact..preview`. It reaches `/<slug>/data/artifacts/*` and nothing else, because the document holding it is untrusted (ADR 0322).
+
+**Unrelated to the *capability parity manifest* and to a *Tauri capability*.** All three are "capability" and none of them is the others: this one is a URL pass, that one is which agent surfaces expose an operation, and the third is a Tauri ACL entry.
+
+### Tauri capability
+An entry in `crates/lucidos-app/capabilities/*.json` (or built at runtime by `desktop::gateway_capability`) granting a set of **Tauri permissions** to named webviews on a named origin — the ACL that decides whether an `invoke` from the desktop app's page is allowed to reach a command at all. **Unrelated to the *capability parity manifest* above**, which is about which agent surfaces expose an engine operation; the two senses of "capability" collide only in the word. Three parts matter: `permissions` (plugin ones like `core:default`, plus the app's own, declared in `crates/lucidos-app/permissions/`), the origin (`local` for the Tauri app URL, `remote.urls` for URLPattern-matched HTTP origins), and the scope — always `webviews`, never `windows`, because a window entry enables the capability on *every* webview of that window including the `url-preview-*` previews of third-party sites. Since tauri 2.11 a page on a non-local origin is `Origin::Remote` and ACL-checked, which is why the packaged client — whose window is navigated to the gateway — needs an explicit remote capability pinned to its resolved port. See `docs/adr/0028-the-packaged-window-is-a-remote-origin.md`.
+
+### ChangeStatusData
+The Rust model of where a *change* stands, in `core/changes.rs`: the status together with the data only that status has. `Pending` holds the Tier-3 `MergeWorktree` (path and temp branch, both or neither), the `PendingThreadState` and the `PendingApplyOutlook`. `Applied` and `Reverted` hold the `MergeShas`. `SetAside`, `Discarded` and `Withdrawn` hold nothing. `ChangeStatus` is its fieldless discriminant, the six wire strings of the user-facing *change* entry, and an unknown string fails decode. Not the thread-level *CodingAgentChangeState*, which says what a branch holds.
+
+The **archive net** sets aside branch work no change carries once its thread is archived: `spawn_branch_work_net` after each `ThreadArchived`, and `set_aside_archived_branch_work_on_startup` at boot. It skips any branch an open `changes` row already names (ADR 0328), so a withdrawn row never stops it. It flags every row it files `incomplete`, since it cannot tell whether the last turn finished. The same subscriber proposes a **held idle proposal** after an `EventWaitCanceled` that left the thread open.
+
+The engine side of a *held idle proposal* (defined in `system-knowhow/glossary.md`): `idle_change_write` returns `Resync` for a clean idle while the thread holds a live event wait (ADR 0395). That idle still re-syncs a change already open on the branch, so only a new proposal is held. `ChangeWork::Held` makes `own_blocker` refuse Archive and Delete with `held_proposal`. A delivered or expired wait re-opens the thread, and that turn's idle proposes. A wait canceled by Stop waiting or an agent stand-down re-opens nothing, so `propose_work_a_canceled_wait_held` proposes it.
+
+An **open change** is one that is pending or set aside (ADR 0328). A thread holds at most one, and `idx_changes_unique_open_branch` allows one per branch. The reconciles and reads that enforce it say *open* in their names (`open_for_thread`, `get_open_by_branch`, `discard_open_changes_for_thread`).
+
+The `changes` table keeps its flat columns: a private `ChangeRow` maps them at the boundary and refuses half a merge pair, and `Change` serializes back to the same flat JSON. `PendingThreadState` keeps `unsettled` and `settling` as two bools because all four combinations occur. Its constructor keeps `resolving_conflict` false unless one of them holds.
+
+`PendingApplyOutlook` says when a slow apply phase began, and carries the conflict prediction of the *apply estimate*. `list_pending_for_readers` fills it and `PendingThreadState` alike; neither is stored.
+
+**No pending change is incomplete** (ADR 0400). `changes.incomplete` now marks only the archive net's set-aside rows. Bring back of such a row withdraws it (`withdraw_for_redecision`) and decides again: a fresh proposal if the last turn finished, otherwise `ProposalWithheld`. The first boot withdraws every pending incomplete row from before ADR 0400.
+
+A **withdrawn change** has `status = withdrawn`, reached through `ChangeWithdrawn`. It is not open, so it holds no slot in `idx_changes_unique_open_branch`, and the next proposal on its branch mints a new id. When an unfinished turn moved the branch past an open change, pending or set aside, `withhold_unfinished_work` withdraws it. `branch_moved_since_last_idle` compares the head with the last idle's. So Apply never merges partial commits. A boot that resumes a session running at shutdown withdraws its pending change without asking git.
+
+### CodingAgentChangeState
+What a coding-agent thread's branch holds, in `engine/thread_lifecycle.rs` (ADR 0400). The user-facing entry is *change state*. Three variants, each with only its own detail:
+
+- `None`;
+- `Unproposed { reason: Option<UnproposedReason> }`;
+- `Proposed { requires_restart }`.
+
+`ChangeStateKind` is its fieldless discriminant. `thread_summaries` stores it in three columns: `coding_agent_change_state` (`none` / `unproposed` / `proposed`), `coding_agent_unproposed_reason` and `coding_agent_requires_restart`. `CHECK` constraints keep a reason only on `unproposed` and a restart only on `proposed`. `CodingAgentChangeState::from_columns` reads them back.
+
+On the wire it is one tagged object: `coding_agent_change_state` on the summary, `codingAgentChangeState` on the aggregate. It replaced the three booleans `coding_agent_has_diff`, `coding_agent_proposed` and `coding_agent_incomplete`.
+
+Four writers:
+
+- `sync_thread_proposal` sets `proposed` from the pending rows. When the last pending row leaves, `landing_after` picks the landing: `none` after Apply, Discard or Revert, `unproposed` after Set aside or Withdraw.
+- `branch_work_sql` moves between `none` and `unproposed` from a git fact (`CodingAgentIdled.has_changes`, `CodingAgentDiffChanged`), and never leaves `proposed`.
+- `ProposalWithheld` writes the reason, and leaves `proposed` alone.
+- A turn start (`CodingAgentUserMessageSent`, `PromptInjected`, `ContinuationRequested`) clears the reason.
+
+### UnproposedReason
+Why a turn end left branch work unproposed, in `thread_events/cause.rs`. It maps every `ProposalHold` to a reason (`PlanMissing`, `PlanAwaitingApproval`, `OutsideBound`, `HardeningMissing`) and adds `TurnIncomplete`, so the hold reasons have one definition. A migration test pins the `CHECK` values to its serde names. `NULL` in the column means no turn end withheld the work: running, a live event wait, an external repo, or set aside.
+
+### ProposalWithheld
+The `ThreadEvent` a turn end emits when it leaves branch work and proposes none of it: `{ branch_name, files, reason }`.
+
+Proposal holds emit in `propose_change` (`withhold_unready`), for a plan hold or `hardening_missing`. Unfinished turns reach `propose_turn_work` with `finished: false`, which calls `withhold_unfinished_work`. Its callers are the live idle, session end, stale-session recovery, a canceled event wait, and a Stop on a parked question. The boot held-back sweep (`propose_one_held_back_change`) emits only when the reason differs from the projected one. A live event wait is the one withholding that emits nothing, since ADR 0395 already represents it. Classed `Metadata`, so it moves no section.
+
+### Proposal hold
+The one decision on whether a turn end's work may become a *change*: `change_ops::read_proposal_hold`, returning a `ProposalHold` or `None`. It is the *plan marker* floor (`PlanHold`), plus `HardeningMissing` for Lucidos-source work that never ran `/harden` and lands more than plan files. Every propose path asks it: `propose_change`, the boot held-back sweep, and the branch-work net. A hold emits `ProposalWithheld` with its reason, and a live agent gets one nudge per branch HEAD (`nudge_held_proposal_in_session`).
+
+So a pending change from a turn end is always *apply-ready* once its thread rests. Both Apply gates keep their own check as the backstop for older rows (`apply_must_harden`). See ADR 0416.
+
+### change_action_refusal
+The single definition of the **per-change gate**: the function in `api/changes.rs` saying why an *Apply* or Discard on one *change* is refused, or `None`. Typed, not a string, because two surfaces render it. `guard_change_action` writes the HTTP 409, and the `changes` LLM tool writes an error for the agent to read (ADR 0233). It asks *available_thread_actions* through `available_thread_actions_for`, so the button and the tool cannot drift.
+
+Five reasons. `NoFilesLeft` is a pending change whose branch left nothing to merge, and it is Apply-only. `ChangeSetAside` is an Apply on a set-aside change, which is brought back first; the HTTP 409 carries the `change_set_aside` reason. Set aside asks the same gate as Discard, so it is refused wherever Discard is.
+
+`ThreadSettling`, `ThreadParked` and `ActionUnavailable` split the thread's state, and only the first can be waited out with a *standing apply*. `standing_verdict` waits through a *settling thread*, and drops on one parked on a question card. Collapsing the three sends a caller to a control that ends on its first look.
+
+Three rows fall through with no refusal, because the engine answers them better. An unknown change id, a change naming no thread, and one already applied or discarded. Gating a terminal row would turn an idempotent retry into a 409. Engine-internal apply paths do not ask it at all, and `change_ops_tests.rs` enrolls each one.
+
+### Choice card
+The shared shape of the two cards that park a thread on `waiting_for_user_answer` behind a fixed set of on-card buttons: the **question card** (`UserQuestionAsked` → `QuestionBody`) and the **permission card** (`CodingAgentPermissionRequest` / `CommandPermissionRequested` / `McpPermissionRequested` → `PermissionBodyShell`). Not a third card type, and not a component: a contract they both implement, so keyboard behaviour is written once in `components/chat/choiceCardNav.ts`. A card opts in by putting `data-role="card-choices"` on the element wrapping its buttons, and ONLY while it is live. An answered or terminated card drops the marker, which is what keeps arrow keys and the focus seed off historical cards. Three guarantees follow: one choice takes real DOM focus the moment the card arrives (so Enter answers with no pointer), all four arrows step prev/next through the buttons in DOM order clamped at both ends, and the focused choice is always ringed wherever it can be seeded (an ungated `:focus-visible` covers ordinary keyboard focus, and a `@media (hover: hover)`-gated plain `:focus` covers the programmatic seed, which that heuristic does not reliably match). Which choice is seeded is declared per card with `data-default-choice`: the question card declares none, so its first option wins; every permission card marks **Allow once**, on the reasoning that a keyboard user answering one overwhelmingly means to allow the single thing being asked about, and the visible ring keeps that grant from ever being a hidden consequence of a reflex Enter. The seed belongs to the card's ARRIVAL and is latched to fire once per card id, so a failed send rolling the optimistic answer back cannot drag focus onto the default after the user chose otherwise. It also refuses to steal focus at all: skipped without a hover-capable pointer (`hasHoverPointer()`, the JS twin of the CSS gate, NOT a viewport-width test, since a keyboardless iPad in landscape is wider than the mobile breakpoint), while the prompt holds text, while focus is on any other control, while the transcript is scrolled up, or when the choice itself is off screen. `threadEntryFocusTarget` is the single place that decides card-vs-prompt when a thread is opened already parked on one.
+See also: `docs/plans/2026-08-04-choice-card-keyboard-focus.md`.
+
+### Claude Code session
+The *agent session* when its *coding agent* is *Claude Code*; the sibling term for `CodingAgent::Codex` is *Codex session* (see entry). Often shortened to *CC session* in conversation, comments, and commit messages. Prefer *agent session* when the discussion is agent-agnostic (the runtime map, the spawn dispatcher, recovery semantics that apply to any *CodingAgent*); reach for *Claude Code session* (or *CC session*) only when the behavior is CC-specific — `--resume` flag semantics, the `/harden` gate, the stop-reminder hook, the `cc_session_id` field on interception events. No extra mechanics beyond *agent session*; same subprocess + worktree pairing.
+
+### Codex session
+The *agent session* when its *coding agent* is *Codex* (`CodingAgent::Codex`, `CodexRuntime` in `crates/lucidos-engine/src/runtime/codex.rs`). Two drivers behind one runtime, selected by `LUCIDOS_CODEX_PROTOCOL` (ADR 0005): the default **app-server driver** (`runtime/codex_app_server.rs`) holds ONE persistent `codex app-server` child per session speaking line-delimited JSON-RPC over stdio — `thread/start` / `thread/resume`, `turn/start` per input, real per-token streaming via `item/agentMessage/delta`, graceful `turn/interrupt`, and approval requests bridged onto the engine's PermissionCard flow (`approvalPolicy: on-request`); the **exec escape hatch** (`LUCIDOS_CODEX_PROTOCOL=exec`, `runtime/codex.rs`) runs one `codex exec --json` child per turn, resuming via `codex exec resume <thread_id>`, non-interactive with the sandbox as the only guard. Both share the Codex thread id (rides the same `cc_session_id` plumbing CC's session id uses — the two protocols read the same on-disk rollout, so a thread can switch protocols between sessions), the `--sandbox workspace-write` profile (network on, plus `CodexConfig.sandbox_writable_roots` — the worktree's shared git dir and the workspace's `data/` tree, without which `lucidos data write` to the parent workspace fails with `EPERM`; ADR 0004 §4), and the `lucidos` MCP server exposing `ask_user_question` (QuestionCards work on both). No slash commands / skills. Tool activity surfaces as Codex item types (`command_execution`, `file_change`, `mcp_tool_call`, `web_search`, `todo_list`) on the same `CodingAgent*` events.
+
+### Close cascade
+The progressive-close behaviour: each invocation resolves EXACTLY ONE close *layer* for the focused thread — draft (confirm-discard the unsent compose draft) → change (Apply / Discard / Cancel choice) → archive — re-running *resolveThreadActions* each time so resolving one layer surfaces the next (stateless re-eval; no cursor, no "cascade in progress" flag). `nextCloseLayer` picks the front-most layer, `runCloseCascade` invokes it; in-flight apply/discard/archive gate it to a no-op (the async bridge that keeps stateless re-eval honest). Driven by the per-thread buttons (each click resolves its own layer) and the `closeThread` keybinding (default `Ctrl/Cmd+Shift+W`) — a *keybinding registry* entry dispatched generically via `matchShortcut` / `SHORTCUT_ACTIONS` in `useKeyboardShortcuts.ts` and rebindable in Settings → Keyboard Shortcuts. Shift-modified so plain `Cmd/Ctrl+W`, the browser's reserved tab-close, is left alone (sibling of the `Ctrl+Shift+O` new-thread chord). Distinct from *Escape*, which is non-destructive and never triggers it.
+
+### CodingAgent (enum)
+The Rust enum representing which *coding agent* (the user-facing role, see system-knowhow glossary) is driving a session. Two variants: `CodingAgent::ClaudeCode` (the `claude` CLI, `ClaudeCodeRuntime`) and `CodingAgent::Codex` (the OpenAI `codex` CLI, `CodexRuntime`). Wire/DB values are kebab-case (`"claude-code"` / `"codex"` — `as_str()` and serde share the root); `CodingAgent::parse` defaults unknown/NULL to `ClaudeCode` for legacy rows. Replaces the older `AgentKind` enum, whose name didn't make the scope explicit. The engine's `agent_runtimes` registry is keyed by this enum, so adding a coding agent is variant + runtime impl + registration. A thread's backend is chosen at first send, persisted on `SessionStarted.coding_agent` → `thread_summaries.coding_agent`, and locked (no mid-thread flips — the other backend has no session to resume).
+
+### Control reach
+When an in-thread control request reaches the *coding agent*: `CodingAgent::control_reach` returns a `ControlReach`. `RunningTurn` reaches the turn in flight (an interrupt, a Claude Code model switch). `NextTurn` rides the control channel and applies when the backend's next turn starts (a Codex model or effort). `NextSpawn` is never sent: the session records it and the next spawn carries it (a Claude Code reasoning effort, which Claude Code takes only as `CLAUDE_CODE_EFFORT_LEVEL`). `POST /api/v1/claude-code/control` turns it into `takes_effect`, `now` or `next-turn`, so the menu's toast never calls a delayed change applied.
+
+### Coding-agent branch
+The git branch an *agent session* works on, named for the thread that owns it (ADR 0041, ADR 0076):
+
+`lucidos-<coding-agent>-<app|repo>-<scope-name>-<slug>-<short thread id>[-<n>]`
+
+`<coding-agent>` is `CodingAgent::as_str()` (`claude-code` / `codex`). The scope segment is the app id for an *app coding-agent thread*, and the registered repository's name otherwise. Lucidos source is `repo-lucidos`, whether or not the checkout is registered. `<slug>` is the thread's display name (title, else first message) kebab-cased, capped at 48 chars on a word boundary, falling back to `thread`.
+
+The trailing `<short thread id>` is `git_ops::short_thread_id`. It is the same 8 hex the thread's worktree directory carries (`thread-<id>`), and it is what makes the name **unique by construction**. The slug cannot do that job: it is a prompt's opening words, which parallel partitions of one job legitimately share. `-<n>` starts at **2**, allocated against the branches existing right then, so a freed name is reused. With the id in place it only ever means one thread minting twice.
+
+Examples: `lucidos-claude-code-repo-lucidos-fix-auth-timeout-401a2d19`, `lucidos-claude-code-app-habit-tracker-add-streaks-401a2d19`, `lucidos-codex-repo-example-repo-fix-auth-401a2d19`. Minted **once**, by `git_ops::branch_name::allocate_coding_agent_branch`, when the branch is created. A resumed thread keeps its branch, and a later thread rename does not move it.
+
+Three rules travel with the shape:
+
+- **Allocation is a proposal, never a reservation.** `git worktree add -b` is the source of truth. `FreshBranch::create_worktree` re-derives and retries, bounded at 10, when a concurrent spawn takes the name (`branch_name_is_taken` matches git's three name-taken messages).
+- **An unanswered `for-each-ref` is not "the name is free".** A timeout there is routine on a saturated host. Allocation falls back to `<base>-<6 hex>`, the same posture as *GitAnswer*.
+- **Matching a branch inside a string must be token-bounded.** Siblings share a prefix (`…-401a2d19` versus `…-401a2d19-2`), so a substring test is wrong. `is_merge_of_branch_into_main` was the one that mattered: a false positive there turns an *Apply* into a silent no-op.
+
+Branches created before this scheme (`claude-code/<ts>-<uuid>`, `claude-code/app/<id>/<ts>-<uuid>`) are **never renamed** and are still recognised by `git_ops::is_coding_agent_branch`, which the orphan-recovery scan uses.
+
+### Coding-agent memory file
+A note a *coding agent* writes into its own per-user memory directory, outside both the *worktree* and the workspace. For *Claude Code* that is `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/memory/`, a `MEMORY.md` plus one file per fact, beside the session transcripts the same directory holds. **Banned on a Lucidos-source session**, by `NO_MEMORY_FILES_RULE` in `engine/agent_session/prompts.rs` and by `system-knowhow/lucidos-cli.md`. Nothing else reads such a file: not Codex, not the user, not the next session on another machine.
+
+Knowledge goes in git instead, as `CLAUDE.md` or `.claude/rules/` for a convention, and the workspace's own knowhow via `lucidos data write` for a workspace fact. Only the two Lucidos-source prompt flavors carry the rule. An external repo keeps its own conventions, and an *app worktree* is the user's workspace git. Unrelated to Lucidos's own long-term memory, which *memory recall* and *memory search* (system-knowhow glossary) name: those read `data/`, which is exactly what a memory file is not.
+
+### Command checkpoint
+The `ReversibleDanger`-lane snapshot pair, undo and diff (ADR 0002, Phase 4 and the 2026-08-06 addendum) in `engine/git_ops/checkpoint.rs`.
+
+Both images are taken the same way and both respect `.gitignore`. Each is a non-invasive `git add -A` + `write-tree` + `commit-tree` through a throwaway `GIT_INDEX_FILE`. The repo's real index and working tree are never touched.
+
+- The **pre** image sits on `refs/lucidos/command-checkpoints/<id>`, taken before the command (`create_command_checkpoint`).
+- The **post** image sits on `refs/lucidos/command-post-images/<id>`, taken after it (`create_command_post_image`).
+
+`diff_checkpoint_effects` diffs the pair into `CheckpointEffects { restores, created }` via `git diff-tree -r -z --no-renames`. That diff is what makes the created set knowable. The guard emits `CommandCheckpointed` **after** the command, and only when those effects are non-empty. An empty diff means the command changed nothing git-visible, because its target was ignored. Both refs are then dropped and no card is shown.
+
+`LucidosEngine::undo_command_checkpoint` (HTTP `POST /api/v1/command-checkpoint/undo`) runs `revert_command_effects`, then emits `CommandCheckpointReverted`. The revert works in the reverse of the command's order:
+
+1. `remove_created_files` deletes each created file that git still calls unchanged against the post image. It asks through a throwaway index: `read-tree` from the post tree, an index-wide `update-index --refresh`, then `diff-files`. It prunes the directories that leaves empty.
+2. `restore_command_checkpoint` writes back, from the pre image, only the paths the command deleted, overwrote or retyped. An overwritten file must still match the post image, and a deleted one must still be absent. A later edit is kept. A checkpoint with no post image restores the whole pre image instead.
+
+Removing first is what lets a file swapped for a directory, or the reverse, come back. The refs survive the undo, because they back the card's diff viewer (`GET /api/v1/command-checkpoint/diff`). `prune_expired_checkpoints` reclaims pairs older than `CHECKPOINT_RETENTION_SECS` (30 days), at checkpoint-creation time.
+
+Remaining limit: a gitignored path never enters the snapshot, so its content stays unrecoverable. Such a command therefore shows no Undo, rather than one that does nothing. User-facing concept: *command checkpoint* in `system-knowhow/glossary.md`.
+
+### Command classifier
+The static, deterministic fast-path of the *command guard*: `static_classify(tool_name, &input, site)` in `engine/command_guard.rs`. It returns a `StaticVerdict`, either `Settled(RiskLane)` or `NeedsJudge(JudgeInput)`. The catastrophic deny-list (recursive root/home delete, fork bomb, disk format/overwrite) settles `Catastrophic`. A positive read-only / in-workspace-write allowlist settles `Safe`.
+
+Everything else is the *ambiguous middle* (`NeedsJudge`). The *judge* classifies it, or `fallback_classify` does when the judge is off or fails. The classifier also computes the out-of-workspace risk marker carried on `JudgeInput`. Zero cost, it runs on every command before any LLM call. The `site` is a *command site*.
+
+### Command guard
+The pre-dispatch safety gate over the Lucidos Agent's bash/python tools (`run_bash`, `run_bash_background`, `run_python`, `run_python_background`), inserted in `agentic_loop/run.rs` before tool dispatch (`LucidosEngine::command_guard_decision`). Each command is classified into a *RiskLane* (the static *command classifier* settles the obvious cases, the LLM *judge* handles the ambiguous middle) and handled accordingly. Off by default; toggled under **Settings → Permissions → Command safety** (the `command_guard` preference). Under that master toggle, two sub-settings (UI-disabled while the master is off): the `command_guard_judge` on/off switch and the `model_command_judge` model picker. Lanes: `Catastrophic` is refused without running (the reason fed back to the LLM); `IrreversibleDanger` on a `Chat` channel pauses and asks the user via the *command permission* lane (mirrors the coding agent); `ReversibleDanger` (in-workspace destruction) is bracketed by a *command checkpoint* pair (ADR 0002, Phase 4) and then runs, leaving a one-click Undo and a view of what it changed, unless the pair shows it changed nothing git-visible; `Safe` runs. On a `Trigger` channel there's no one to ask, so `IrreversibleDanger` is gated by the trigger's *side-effect grant* (ADR 0002, Phase 5): the judge/static fallback tags the command's *SideEffectCategory*, and the command runs only if that category is in `TriggerConfig.side_effect_grant`, and otherwise the guard returns `GuardDecision::FailTrigger`, which records the block and fails the whole trigger run (a scheduler failure notification surfaces it). Triggers therefore DO reach the judge now (they skipped it in Phase 3). Rationale and full design: ADR 0002 (`docs/adr/0002-lucidos-agent-command-safety.md`).
+
+### Command permission
+The interactive *ask* lane of the *command guard* (ADR 0002, Phase 2), the chat mirror of the coding-agent permission model. A command hitting `IrreversibleDanger` on a chat channel emits a `CommandPermissionRequested` `ThreadEvent`. The agentic loop then blocks in-process on a `PermissionEntry` broadcast (`Engine.pending_command_permission`, a `PermissionState` shared with the CC lane). The user resolves it from the same `PermissionCard` UI via `POST /api/v1/command-permission/consent`, which emits `CommandPermissionResolved`.
+
+Reuses *AllowScope* (Narrow / Broad / Session). `derive_command_allow_pattern` produces `Bash(<first-token>:*)`, `Bash` or coarse `Python` patterns. Narrow and Broad persist to `<workspace>/.lucidos/agent-allowed-commands`, per workspace since ADR 0095. Session goes to the per-thread `session_allows` instead (see *session allow*). This lane's session grants are cache-only, so unlike the coding-agent lane they do not survive a restart.
+
+The persisted file is a per-row list under **Settings → Permissions → Lucidos Agent permissions**, read and overwritten whole via `GET`/`PUT /api/v1/agent-allowed-commands`. The guard re-reads it per command, so an edit needs no restart. Code: `engine/command_permission.rs`, `api/command_permission.rs`, `api/settings.rs`.
+
+### Command site
+Where a command runs, as the *command classifier* sees it (`CommandSite` in `engine/command_guard.rs`). It decides how far the guard can check a command's paths. `Workspace(root)` is the Lucidos Agent's lane, whose commands run in the workspace root. There every path resolves on disk, symlinks and hard links included.
+
+A path that cannot be resolved, or that resolves outside the root, reads as outside. Its destruction is then `IrreversibleDanger` rather than a checkpointed `ReversibleDanger`. `TextOnly` is the coding-agent lane, which knows only the command text, so containment there stays lexical.
+
+### Escalation classifier
+
+The fifth and last gate in `cc_permission::prompt_coding_agent_permission` (`attended_escalation_allowed`, ADR 0005's 2026-09-21 addendum). Alone among the five it reads what a command DOES, rather than what was granted. It places an attended Codex `command_execution` sandbox escape through the *command classifier*, and skips the *coding-agent permission card* on `Settled(Safe)`. Every other outcome cards, and nothing here auto-denies.
+
+Scoped to `command_execution` by tool name, so it is Codex-only by construction. A Codex card means the OS sandbox blocked the command. A Claude Code `Bash` card means something else: the tool is missing from a `--allowedTools` list the user curates. `file_change` is excluded with it.
+
+Three deliberate narrowings, each closing a way a `Safe` verdict could mean less than it says. `ReversibleDanger` cards, unlike on the chat lane, because that lane brackets it with a *command checkpoint* and this gate has no undo. A `fast_path_refused` shape never reaches the *judge*, which is handed the command text alone and cannot see the refusal. And `command_guard::command_escalates_privilege` cards a command run as another user: the head walk treats `sudo` as a benign prefix, settling `sudo cat` on the strength of `cat`.
+
+The static half always runs and needs no model. The *ambiguous middle* reaches the judge only under BOTH command-guard toggles (`command_guard`, then `command_guard_judge`), so it ships off with the master. A judge that is off, absent, erroring or timed out leaves the card. Position matters: the gate sits below every grant, so a granted command never pays for a judge call, and below the unattended branch, which returns above it.
+
+### App load bar
+
+The indeterminate accent bar along the top of the app pane while an *app frame* opens (`.app-ui-load-bar`, mounted by `components/apps/AppUiInline.tsx`). It is delay-gated by `SPINNER_DELAY_MS`, so a fast open shows none. It follows "not yet loaded or ready", not the cover: when the 3 s fuse lifts an on-load app's cover first, the bar keeps running until `load`. The rules live in `components/apps/appFrameReveal.ts`, beside the user-facing *ready signal* that ends it for an on-ready app.
+
+### App frame
+
+The isolated iframe an *app UI* runs in inside the host shell (ADR 0227). Its sandbox drops `allow-same-origin`, so the browser gives it its own renderer process and an opaque origin. The process is why a busy app cannot freeze the shell. The origin is why it can read neither the shell nor a sibling app.
+
+`components/apps/appFrameSandbox.ts` holds the attribute and derives `APP_FRAME_ISOLATED` from it, so the frame, its navigation and its capture cannot disagree about which realm they are in. The price is that the frame's own `fetch`, `EventSource` and storage all fail, which is what the *app bridge* carries. An app opened in its own browser tab is NOT an app frame: it is a top-level document on the engine's origin and keeps every direct path.
+
+A second constant in the same file, `APP_FRAME_ALLOW`, says what the frame may still do. An opaque origin matches no feature's `self` default, so a permissions policy has to delegate each one by name. The list itself lives in one place, `system-knowhow/js-sdk.md` § Setup, which also says what is withheld and why. Read the constant for the code side.
+
+### Artifact preview frame
+
+The sandboxed iframe that renders a previewed HTML artifact in the content pane or the file preview modal (ADR 0322). Like an *app frame* it has no `allow-same-origin`. So the artifact's scripts run at an opaque origin, and reach neither the shell nor the engine's API. Unlike an app frame it loads no SDK.
+
+The host stamps a bridge script into the srcdoc instead (`components/files/previewFrameBridge.ts`). It carries link clicks, sibling downloads, shell chords, *pane swipes* and *find bar* answers up. It carries fragment scrolls, *frame capability* renewals and find requests down.
+
+Two SDK bundles ride inside the bridge script, the shared matcher and the pane-swipe tracker, so the artifact sees neither. The bridge hides its nonce from the artifact and posts only for a real event. The host accepts a message only from that frame's own window, at origin `"null"`, with the render's nonce. The PDF preview is NOT an artifact preview frame: it stays same-origin.
+
+### App bridge
+
+The `postMessage` channel an *app frame* reaches the host over, for the three things an opaque origin cannot do for itself: call the engine, hold the event stream, and store a value. `packages/lucidos-sdk/src/_bridge.ts` is the app half and `crates/lucidos-app/src/store/actions/app-bridge.ts` the host half, two copies because the SDK bundles standalone.
+
+The host is the trusted side and three rules keep it that way. It forwards only what *route reach* marks app-reachable, because it attaches the user's device to what it sends. A blind forwarder would be a confused deputy wearing the user's actor. It resolves the path before checking it, so a `%2e%2e` cannot land somewhere the check never saw. And it strips any `x-lucidos-*` the app supplied, before stamping the real device id and the calling app's id.
+
+Storage is namespaced (`appbridge:<app id>:<sdk|app>:`) and holds no host key, so the device id stays out of the frame. The host names the app from its own frame element, so one app cannot reach another's *app storage*. A read that must be device-scoped names the device instead, as `@device`, and the host substitutes the id on `/preferences` only.
+
+### Appearance push
+
+What the shell painted, sent to every app frame on the *app bridge*'s `appearance` channel. Only a frame that called `watchPreferences()` listens. It carries the mirrors the *appearance boot script* reads, shaped like the engine's first-paint seed and parsed the same way. The shell sends one per task in which it paints, plus one as a frame loads. So an app follows a scale drag or a theme switch with no request. From the first push on, the push owns the frame's appearance, and a slower fetch cannot paint over it.
+
+Host half: `store/actions/app-appearance.ts`. App half: `adoptHostAppearance` in `packages/lucidos-sdk/src/ui.ts`.
+
+### App authority
+
+What an *app UI* can do over `/api/v1`: everything the user can, and by design. ADR 0144 enumerates every lever that was considered against it and why each fails. The **realm** an app holds it in narrowed with ADR 0227, and now depends on where the app is open.
+
+Inside the host shell an app frame has an opaque origin. It reaches neither `window.top` nor the shell's storage nor another app. It calls the engine only through the *app bridge*, which carries what *route reach* allows. Opened in its own tab an app is a top-level document on the engine's own origin. There it does share the shell's realm and storage, and no classification binds it. Either way the call lands as the user, which is the authority this term names.
+
+The line this draws is what makes it useful in review. A finding that reduces to "an app can do what the user can do in the workspace" is accepted. What stays a defect is anything converting that authority into **code running on the host** or **a secret leaving to a third party**. Those cross the machine and the network, not the app boundary. ADR 0144 closed one of each: see *handshake script approval* and *credential scope*.
+
+Consequence for anything built later: a gate may not depend on telling an app from the shell. A `Referer` or `Sec-Fetch-Dest` rule is defense in depth at best (ADR 0117). Isolation did not retire that, it narrowed the shape it applies to: a standalone app tab is still same-origin, and `fetch` accepts a same-origin `referrer` of its choosing. Asking whether a caller is a browser AT ALL is a different question and is answerable, because page JavaScript cannot suppress `Sec-Fetch-*`.
+
+### App principal
+
+The identity a request would carry if the engine could tell which app document sent it. **There is none, and ADR 0156 decides there will not be one while apps share the origin.** The term exists so a proposal that needs one can be recognised on sight.
+
+The reason is a direction, not a list of near-misses. A capability the engine puts only in the app document is **unforgeable upward**: app A cannot present itself as app B, having never held B's capability. Nothing is **unforgeable downward**: an app presents itself as the shell and omits the capability. Every rule this concept is reached for is enforced downward. "An app may not write `config/`" refuses a request that says it is an app, and a hostile app does not say so.
+
+ADR 0227 changed what "downward" costs, without settling this. An isolated app frame can no longer run `window.top.fetch`, and the host knows which frame posted to the *app bridge*. A standalone app tab still shares the origin and needs neither. So the shape ADR 0156 rules out is unchanged; what moved is that one document shape is now identifiable at the host.
+
+**ADR 0231 takes that identification and uses it, for the shell realm only.** The bridge resolves the frame to an app id and stamps it on the call. The id is therefore the host's word, never the app's. Nothing reads it yet: it is plumbing for per-app grants. The tab realm is unchanged, so a rule written as though every app were identifiable is still the mistake this term names.
+
+For everything an identity cannot decide the boundary is **egress**, which needs no principal at all. ADR 0156 states the target and its phases; see *app authority* for the line a review draws today.
+
+### Route reach
+
+The engine's per-route answer to whether an *app frame* may call it, in `crates/lucidos-engine/src/api/app_reach.rs` (ADR 0231). Four values: `App` with the methods it opens, `Asset` for something the app document loads as a tag, `Host`, and `Agent`.
+
+**Absence is denial**, and a test scans the router for a route the table does not answer for, so a new endpoint cannot ship unclassified. The `App` rows are generated into `packages/lucidos-sdk/src/generated/app-reach.ts`, which is what the *app bridge* and `lucidos.request` both read, so the client keeps no second list.
+
+### Handshake script approval
+
+The record at `<workspace>/.lucidos/approved-handshake-scripts` deciding which `script_handshake` scripts the engine will run, keyed on workspace-relative path plus SHA-256 of the content (ADR 0144). `api::proxy_script_runner` consults it before every spawn, and runs the bytes it hashed. They go to `python3` on stdin, so no second read of the file can slip different content past the check.
+
+**Authorship, never assertion.** Two writers record: the engine's in-process file tools when they write under `data/scripts/`, and `lucidos handshake approve` through a route that refuses a browser-shaped caller. The Lucidos Agent has no approve tool, so an app cannot launder a script through it. Editing a script any other way leaves it unapproved: the Files panel, an editor, a plugin install. The next proxy call then answers 502 naming the fix, and the file preview warns before that.
+
+The location is load-bearing for the reason a *permission grant* gives: the file tools resolve nothing under `.lucidos/` except `tmp/`, so no API caller can write the record. A workspace with no record at all is seeded once from what `apis.json` already names. That is trust on first sight, and it keeps a pre-ADR-0144 install working. The file's existence is the marker, so a later start never blesses a script that appeared in between.
+
+A line carries two more bindings beside the hash, both filled the same way. `base_url` is the one upstream the script's minted token may reach. `injects` is the *handshake injected-secret set*. Every path column begins with `data/`, and that is what tells a two, three or four token line apart. So a record written before either column existed still parses.
+
+### Handshake injected-secret set
+
+The `injects` column of the *handshake script approval* record: which secrets an `apis.json` entry may hand one `script_handshake` script. Members are `c:<credential>` for a stored credential and `o:<provider>` for a connected OAuth account, so a credential named `oauth:google` stays distinct from the `google` provider. `core::handshake_approvals::injected_secrets` is the one speller.
+
+It exists because *credential scope* cannot answer here. Both fields name a secret the engine puts in the script's environment. Neither is sent to the entry's `base_url`, so the credential's own scope judges a request that never happens. What an `apis.json` rewrite can actually do is name a different secret on an already-approved script, and this is what refuses that.
+
+Filled by the boot seed from `apis.json`, or bound on the first call that would inject one, announced as `HandshakeScriptInjectsBound`. Same trust-on-first-sight trade as the `base_url` column beside it, and the same guard: only bytes that would actually run may bind. An entry injecting nothing records nothing, because no secret moves. A member carrying a comma or whitespace is refused rather than written, since the column is comma joined inside a whitespace-split line.
+
+See also: *handshake script approval*, *credential scope*, ADR 0157's amendment.
+
+### Credential scope
+
+A credential's `base_urls` treated as a binding rather than a label. The value is presented only to a request one of those URLs covers. `core::credentials::credential_scope_covers` asks the question and `credential_base_url_matches` judges each member: same scheme, host and effective port, plus a path prefix on a segment boundary. `core::git_auth` has always re-checked the same predicate on every git credential callback. ADR 0144 extended it to the proxy pipeline, at every place a credential itself travels to the entry's `base_url`: the static layers, `hmac_signed`, and a WASM signer's `credential_handles`.
+
+**It is a SET, and every member is exact** (ADR 0161). One key often covers several hostnames of one provider. A single value could not express Binance's `api.` and `fapi.` hosts at all, and refused the second. There is no wildcard, no suffix rule and no registrable-domain rule: the user names each host, and a second member widens the credential by that host alone. An empty set is legal and means the credential goes nowhere. `core::credentials::normalized_base_urls` is the one speller, refusing a member that is not a URL with a host at the write rather than at the gate.
+
+**Widening one is always the user's act, and three surfaces now reach it.** Settings edits the list directly, `lucidos credentials set-base-urls` replaces it from a script, and `request_credential` PROPOSES one: naming a host an existing credential misses reopens that row in the modal, seeded with the union and saying which hosts are new. The engine writes nothing there, so the Save is still the user's. Without that third surface, the Lucidos Agent's only move was a second service name holding the same secret. ADR 0161 rejected exactly that outcome.
+
+**The `CRED_*` injection into a handshake script is not one of them.** ADR 0144 listed it, and its 0157 amendment removed it. The script presents that credential to its provider's own token endpoint, not to `base_url`, so judging it against `base_url` refused every ordinary OAuth handshake. What binds there is the *handshake injected-secret set* instead.
+
+It closes a theft that needed no script. `data/config/apis.json` is writable over the API. An entry naming a real credential, with an attacker `base_url`, used to make the engine attach that credential and forward it. A credential carrying no scope is refused everywhere rather than sent anywhere. The startup pass gives one to any row exactly one `apis.json` entry explains, once, announced as `CredentialScopeInferred`. It stays single-valued and never appends: `apis.json` is the file the gate defends against, so widening a working scope is the user's call, through Settings or `lucidos credentials set-base-urls`.
+
+### Meta scope
+
+An OIDC or meta scope in an OAuth request: `offline_access`, `openid`,
+`profile`, `email`. None of them names a resource, and a provider may grant one
+and leave it out of the `scope` its token response echoes. Microsoft omits all
+four when the token is issued for a resource such as `outlook.office.com`.
+
+So **a meta scope is answered by evidence, never by the echo**, wherever a
+requested set is diffed against a granted one. `offline_access` has evidence:
+the account holds a refresh token, or it does not. The other three have none
+worth reading, so they are never reported as refused. Two spellers carry the
+rule: `core::oauth::missing_requested_scopes`, taking a `GrantEvidence`, and
+`missingScopes` in `components/settings/oauthConnectForm.ts`, reading the
+account's `has_refresh_token`. The `connect_oauth_account` result and the
+Accounts card therefore cannot disagree.
+
+Diffing the echo instead reported `offline_access` as refused on every working
+Microsoft connection. It also called every GitHub account short of the three
+scopes a bare Connect asks for. See
+`docs/plans/2026-09-16-offline-access-is-proven-by-a-refresh-token.md`.
+
+### Secret reveal token
+A one-shot, 30-second capability that spends for exactly one stored secret. Two secrets use it, and a token names which, so one can never open the other (`api::secret_reveal::RevealSubject`).
+
+- A **credential row**, minted at `POST /api/v1/credential-reveal-token?id=<uuid>` and spent at `GET /api/v1/credential-value?id=<uuid>&token=<token>`. That is how the Settings Copy buttons and the credential edit form reach a stored plaintext.
+- The **workspace backup key**, minted at `POST /api/v1/backup/key/reveal-token` and spent at `GET /api/v1/backup/key?token=<token>` or the idempotent `POST /api/v1/backup/key?token=<token>`. It takes no id: a workspace has one backup key. The generate route spends a token too, because on a workspace that already has a key it hands back the same plaintext.
+
+Held in engine memory (`api::secret_reveal::RevealTokens` on `AppState`), so a restart voids every live one and costs the user a click. It is **not** authentication: an app iframe is same-origin and can reach the mint route too. It buys three narrower things. No plaintext is one bare GET away. A leaked capability is worth thirty seconds against one secret. And there is a single place to emit `CredentialRevealed` or `BackupKeyRevealed`.
+
+The app-`Referer` refusal beside it is defense in depth on the same terms. ADR 0117 states the whole model and its residual, and ADR 0144 records why the residual is permanent.
+
+### Permission grant
+A remembered "Always allow" click, and the unit ADR 0095 scopes. Three files, one per gate, all under `<workspace>/.lucidos/` and all owned by `core::grants` (`GrantFile`): `agent-allowed-commands` for the *command guard*, `cc-allowed-tools` for Claude Code's `--allowedTools`, and `mcp-allowed-tools` for the Lucidos Agent's MCP gate. An MCP server's auto-approve flag widens that last gate the same way. No agent writes a permission grant: the card refuses its Always allow, and Settings refuses its writes (ADR 0362).
+
+They are **per workspace**. A grant is a decision the user made in one context, so its scope must be the scope of that context. This is *semantic* isolation and explicitly **not** a security boundary: every workspace shares a uid and has `run_bash`, so any workspace can read any other's grants. What it buys is that no decision binds outside the context it was made in.
+
+The directory choice is load-bearing. `data/config/` is writable by the agent's own `write_file` / `edit_file`, and a permission file the agent can rewrite is not a permission file. Two consequences are accepted: grants are excluded from backup (`is_excluded_workspace_path`), and they do not survive delete-and-recreate of a same-named workspace. Both are fail-closed, so the user is asked once.
+
+`core::grants::migration` seeded every workspace that existed when the files stopped being machine-global, recording that in `<user_dir>/grants-migrated-to-workspaces`. A workspace created afterwards starts empty. Distinct from a *session allow*, which is per thread and lives in memory.
+
+Editing one through Settings emits `PermissionGrantsChanged`, carrying the resulting pattern list in full (`.claude/rules/db.md` § Key event types). The write and the emit are one operation, in `api::settings::write_grant_file`, so a lane cannot be added without its audit row. An "Always allow" click emits nothing extra: its `*PermissionResolved` thread event already names the pattern and the scope.
+
+### File-level backup
+A backup taken by the operating system or a third-party product that copies files off the machine: Time Machine, restic, borg. Distinct from a Lucidos **backup**, which is the workspace's own AES-256-GCM archive with a `pg_dump` inside it.
+
+The distinction is load-bearing, because the two disagree about what is safe. A Lucidos backup deliberately drops `.lucidos/` (`is_excluded_workspace_path`), so an archive never carries the key that decrypts it. A file-level backup used to take the key and the credential database together, which is the hole ADR 0153 closes.
+
+Lucidos opts two directories out of it, at creation and again on every start: `<workspace>/.lucidos/` and `<gateway-data>/pgdata/`. The mechanism is the `lucidos-file-backup-exclusion` crate, which writes the macOS `com.apple.metadata:com_apple_backup_excludeItem` attribute and does nothing elsewhere. Verify with `tmutil isexcluded <path>`.
+
+### Conflict-resolution duty
+(short form in code comments and prose: *merge duty*.) A thread's in-flight obligation to finish an apply's merge-conflict resolution. It is event-sourced, not stored. The duty is a `status='pending'` change whose latest merge-lifecycle event is an **unpaired `MergeConflictDetected`**. Unpaired means no later `MergeResolutionCleared`, `ChangeApplyFailed`, `ChangeApplied` or `ChangeDiscarded` for that `change_id`. `ChangesProjection::pending_conflict_change_for_thread` derives it.
+
+It has three consumers:
+
+1. **The hand-off.** A stray-killed or watchdog-recovered merge session's completion hands off instead of aborting (`ConflictResolutionCleanupAction::HandOff`). An auto-recovery `ContinuationRequested{auto_recovery_after_hang}` is in flight then. The in-loop safety net signals it by its own decision, or the external watchdog by the session's `external_continuation_requested` flag. Aborting would fail the apply, and its git cleanup would race the continuation re-adopting the same worktree (the 2026-07-10 incident).
+2. **The re-attach.** The spawn consumer's `Continue` arm re-attaches the duty to the resumed session, wired like `run_merge_session_tier2`: the spawn's `conflict_change_id` plus the merge worktree. Its completion then finishes the apply (`ChangeApplied`) or aborts for real. Only a **recovery-shaped** continuation does this (`continue_should_open_resume_exchange`), and an `answered_after_idle` follow-up never binds a merge duty. It takes the **newest** open pairing when several exist. A duty it cannot carry (worktree gone, resume failed before settling) it closes with the deferred `MergeResolutionCleared` and `ChangeApplyFailed` pair, so the apply never dangles.
+3. **The merge-ownership guard** (ADR 0060). It refuses every *other* apply path while the duty is open, so a second `apply_change` cannot fast-forward `main` under the agent still resolving. It reads the change-scoped twin `ChangesProjection::conflict_pairing_open`. It pairs that with a **resolver term**: the session's *conflict binding* names this change. An open pairing that nobody carries is a crash leftover and must not block Apply forever. An ordinary later turn on the same thread is not a resolver either.
+
+The hand-off deliberately skips the closing events, so the pairing stays open: the gate and the derivation interlock. See `docs/plans/2026-07-10-conflict-resolution-survives-auto-recovery.md`.
+
+### Conflict binding
+`AgentSession::conflict`, a `ConflictBinding`: which merge-conflict resolution a live session carries, and where it works. `Detached` is a Tier-2 or Tier-3 spawn, registered with the binding and working in the merge worktree on a temp branch. `InPlace` is a Tier-1 merge, whose prompt went into a session that already existed. That session stays in the thread's own worktree and outlives its resolution.
+
+The merge-ownership guard reads the change id of either variant as its resolver term (see *Conflict-resolution duty*). The Diff button skips only `Detached`, because only that tree belongs to the merge. The binding is descriptive, never a claim: nothing clears it, and it dies with the session.
+
+### Change claim
+`AgentSession::change_claim`, a `ChangeClaim`: which operation on a live session's change holds the session. Apply Now and a Tier-1 in-place merge hold it as `Apply`, and an in-session Discard as `Discard`. It keeps two of them from running at once, which would merge twice or reset a tree under a merge. Unlike a *conflict binding* it is a real claim, so every holder releases it through `release_change_claim`, which checks the session's identity.
+
+A claim and a pending stop refuse each other. A Stop, Discard or Archive is refused while a claim is held (`claude_code::stop_refusal`). A claim is refused while a stop is ending the session (`decide_in_place_merge_claim`, `claude_code::claim_for_discard`).
+
+Every refusal names its cause, so a Discard never reads as an apply. The HTTP `409` carries the message and a `reason` slug: `apply_in_progress`, `discard_in_progress` or `session_stopping` (`claude_code::claim_refusal_reason`). The frontend shows the message, and keeps its "applying" spinner only for `apply_in_progress`.
+
+Apply Now has three more 409 slugs that are not claims: `resolving_conflicts`, `question_open` and `question_unknown` (`api::claude_code::apply_now_error`). The last two refuse a thread parked on a question, or one the engine could not check (ADR 0293).
+
+### Boundary exchange
+The extra *exchange* the fold opens when a turn ends abnormally: a `ResponseAborted` or `ResponseCanceled` is dual-purpose, terminating the exchange it belongs to (so that panel reads "Aborted ⚠" / "Canceled ✕") **and** becoming the `userEvent` of a new exchange of its own, which renders as the standalone "Paused by restart" / "Response interrupted" / "Response canceled" panel (`foldEvent` in `store/thread-events/exchange-grouping.ts`). Being the fold's `current`, it collects whatever arrives next that nothing else claims, and that is deliberate in both directions. A real turn can run under one and must render there: a `safety_net` abort fires on a turn the watchdog thought was stuck, the loop keeps going, and its whole turn folds in with no start event of its own (real thread `ebc787a4`, which applied a change and spawned a sub-thread while the UI showed only "Response interrupted"). What also lands there is the **drain**: a coding-agent subprocess being torn down keeps emitting for a few more milliseconds, and CC events fold chronologically rather than by `request_event_id`, so an Esc rejection and a final `"\n\n"` arrive ~40 ms after the abort. Telling the two apart is not a matter of degree: an **engine-down boundary** (`abortTookEngineDown`, i.e. an `engine_shutdown` abort) is closed by construction, because the engine is going down with it and its resume opens a separate `ContinuationStarted` exchange, so anything under it is drain; every other boundary has to be read from the events. That is why `exchangeStatus` treats that cause, and only that cause, as self-quiescing, and why the panel gate asks `hasRenderableResponseContent` rather than counting events (the `"\n\n"` is a `text` event that draws nothing, and it is what gave a torn-down thread a "Working" badge on 2026-08-06). The reading is on the CAUSE alone and deliberately not on the *switch* fingerprint (see *cause-gated resume*), which adds a device actor: who asked for the shutdown decides whether the engine PROMISED to resume the turn, never whether anything is still running, and a terminal `stop.sh` tears the engine down just as thoroughly as the button. Keying the two together is what left an unattributed restart shimmering "Working" with a derived live "Thinking" row for 24 seconds on 2026-08-13 (real thread b146c294) and, since that row is itself renderable, handed back the very response panel the content gate had suppressed.
+
+One boundary draws no panel of its own. A "Paused by restart" boundary with nothing rendered under it folds into the `ContinuationStarted` right after it (`restartPauseFoldsInto` in `store/thread-events/exchange-render.ts`). The resume keeps its header, and its info popover says when the turn paused and which device restarted. Until the resume lands, the pause draws as usual.
+
+### Continuation handoff
+The moment the exchange fold moves a **running** turn from one exchange to a later one, recorded as `Exchange.continuationMoved` (`store/thread-events/exchange-grouping.ts`). It happens when a boundary takes over the turn's request-id redirect. That boundary is a `ChildThreadCompleted` card raised by a spawned sub-thread finishing mid-response, or a question / permission divider.
+
+Everything the turn emits from then on groups in the new exchange. So a `Thinking` marker left pending in the old one can never be resolved by its own events. Rendering finalizes exactly those markers (`resolvePendingSteps(steps, isThinking)` in `exchange-render.ts`) instead of shimmering an old step half a screen above the work.
+
+It is deliberately narrow. A pending **tool** step is still owed a result that re-routes back by tool id, so it is left alone. The `ask_user_question` spinner is the case: it must keep running while the card is on screen.
+
+The mark lands on the exchange the redirect is moved OFF. That is usually the fold's `current`, but a queued uningested follow-up in front of the live turn makes them different exchanges. The mark clears if that exchange takes the turn back: its `PromptInjected` is absorbed, or an answered divider re-anchors to its resolution.
+
+
+**A caller's utterance is the third way, and the widest** (ADR 0201). It starts no turn, and it still takes the running one: every step the doer emits after those words happened after them, so it reads below them. The card is marked `Exchange.tookTheTurn`, which is what stops `exchangeHoldsNoTurn` stepping over the card the work is now in. A turn that had already ENDED is not handed over, since there is no continuation to move and the card would sit "Requesting" for ever.
+
+**Which boundaries take the turn is a table, not an allow-list**: `BOUNDARY_CONTINUATION_HANDOFF` in `exchange-grouping.ts`, one `ContinuationHandoff` entry per member of `EXCHANGE_START_TYPES` plus the user-stop `EventWaitCanceled`, each carrying the reason. It is a table because the *omission* of an entry is a silent bug with a shape nobody recognises. `ContinuationStarted` was added to the start types and to nothing else. So on a restart resume the turn kept its old owner: 25 minutes of work rendered above the resume card while the card spun "Requesting" (real thread `cb2f4a01`). An allow-list cannot say whether a type was declined or forgotten; `render-order.test.ts` fails on a type that reaches the fold undecided. See *render order*.
+
+### Render order
+The transcript's strictest promise: every row reads top to bottom by ONE clock, whatever its source, its actor or its `request_event_id`. It is stated as code in `renderOrderViolations` (`store/thread-events/render-order.ts`). That flattens the fold's output the way the reader meets it: each *exchange*'s boundary, then its steps, then the next exchange. It then reports every neighbour pair that decreases in `compareSortKeys`. The row key is `happenedAt` rather than `created`, which is the reading the fold files rows by. A *spoken row* therefore sits where its words began (ADR 0206).
+
+Tests are the only caller, and deliberately so: a check reorders nothing, so a per-frame run would walk the whole transcript to report a bug nobody can act on. It runs where a bug can still be stopped, in `thread-flows-helpers.ts` for every flow test and in `render-order.test.ts` over a corpus of turn shapes.
+
+**Four named exceptions, and the set is closed.** Each is a shape the fold produces on purpose. **A. A message still in the queue.** The reader types while a turn runs, so the card opens at once. The turn keeps writing above it until the loop picks the message up (`isUningestedMessage`, then the absorbing `PromptInjected`).
+
+**B. A result rejoining its call.** A permission card opens between a call and its result. The result is routed back so the call's row completes in place, rather than stranding a shimmering row on a finished tool.
+
+**C. The reader's Stop-waiting panel.** A subscription holds no turn (ADR 0049) and the button has no idle guard, so an unrelated turn keeps writing above it.
+
+**D. An unsent message.** It never reached the engine, so no agent reads it, and the running turn keeps writing above its card. A fifth shape is a bug until somebody adds it there with its own reason. See *continuation handoff* for the decision that keeps the common case in order, and `docs/plans/2026-09-20-the-transcript-reads-by-one-clock.md`.
+
+### Contract test
+A Rust↔TypeScript cross-validation generated from `crates/lucidos-engine/src/engine/agent_session/thread_lifecycle.rs`. The TS file in `crates/lucidos-app/src/generated/` is **never** hand-edited — regenerate with `cargo test -p lucidos-engine generate_typescript_file -- --ignored && cargo test -p lucidos-engine generate_cross_validation_fixture_file -- --ignored`.
+See also: `.claude/rules/testing.md` § Contract Tests.
+
+### Arrival marker
+The highlight a list row wears when it arrives while you watch: a change that turns ready with the Changes panel open, say. A change that drops back to Not finished was already there, so it does not light. It is the *navigation focus marker*'s light. The `.arrival-marker` rule shares the `.nav-focus-stuck` paint, ramp and dissolve, so "this is new" and "you landed here" read as one cue. It runs its own lifecycle in `components/shared/ArrivalList.tsx`, never `focusMarker.ts`, so an arrival cannot take the one navigation landing that turn-nav anchors on.
+
+A view shows its current state as it loads, and only what changes after that is an arrival. So opening a panel, expanding a section or a reload highlights nothing. `useArrivals` (`components/shared/arrivals.ts`) compares each loaded render's keys with the last one's. Once its roll has landed, the row must be on screen in a visible tab, or the light goes out unseen. Then it holds and dissolves on the next user action, as the nav marker does.
+
+`<ArrivalList>` draws the rows. A row that arrives while the list is drawn rolls in with the *disclosure roll*, and a row that leaves rolls out. A list that mounts with its first arrival marks it without rolling it, because its section rolls in instead. Plan: `docs/plans/2026-10-02-arrival-motion-for-list-rows.md`.
+
+### Navigation focus marker
+The persistent highlight host navigation leaves on the inner element it lands on: the "focus stick". One shared mechanism drives it: `components/shared/focusMarker.ts` (`applyNavFocus`, `clearNavFocus`, `hasNavFocus`) and the `.nav-focus-stuck` rule in `styles/global/host-components.css`. Three navigations use it: a chat event or change (`scrollState.ts`), a settings item (`SettingsView.tsx`), and a plugin row (`StoreTab.tsx`). It is a Slack-style background highlight: a wash fills the landed element's box, and a soft glow blooms past its edge. Light mode also draws a hairline border, because its wash is faint over white.
+
+Every layer is a `color-mix` over **`--nav-focus-glow`**, a neutral token this marker alone owns: white on dark, a light grey on light. It is deliberately not `--accent`, which is `--picked-surface`'s hue, so an accent wash read as a picked surface. The light grey stays lighter than `--bg-tertiary`, or a landed question card's options vanish into the wash. **`--nav-focus-border-alpha`** sets the border's strength: 60% on light, 0% on dark. Both theme blocks must define both tokens. An unresolved var invalidates the whole `box-shadow` and erases the marker.
+
+All layers ride one `box-shadow`. The inset fill paints above a host's background without competing with it in the cascade. Shadows interpolate layer by layer, so the turn-on and the dissolve are plain keyframe animations. The lifecycle is a light switched on: it ramps up over 0.45s, only ever rising. It then holds at full for at least `NAV_FOCUS_HOLD_MS`, and stays until the user acts (`USER_ACTION_EVENTS` in `utils/userAction.ts`). Then it dissolves over `NAV_FOCUS_FADE_MS`, or clears at once on a new marker or an explicit scroll.
+
+Each choice's reasoning lives at the code. The `.nav-focus-stuck` comments cover the paint and keyframes, and `base.css` covers the token values. `focusMarker.ts` covers the hold and dismissal timing, and `nav-focus-marker-paint.test.ts` pins the paint contract. Forced-colors mode strips `box-shadow`, so a transparent `outline` fallback keeps the marker visible there.
+
+Reduced motion here is the resolved `data-motion` value (*Reduced motion (resolved)*). Both timers ride the *animation speed scale*, which reduced motion collapses.
+
+**How long the marker is *visible* and how long it counts as the *current landing* are two different clocks.** `navFocusElement()` answers the second: it goes null one frame after a dismissal begins, while the classes stay on for the whole dissolve. Both consumers need it that way, and they need opposite things.
+
+- `scrollState.ts`'s turn-nav anchors index-stepping on the marked turn, precisely BECAUSE a marker means the user has not scrolled since the last nav. A marker reported as current while dissolving would make ⌘↑/⌘↓ step from the turn the user just scrolled away from. The longer the dissolve is tuned, the wider that window.
+- The Enter-toggles-the-marked-turn shortcut needs the ref to outlive the very keydown that dismissed it. The capture-phase clear runs before its bubble-phase read (`ce327ed24`).
+
+One frame satisfies both. It holds however long the dissolve is, and is the deadline the reduced-motion path had always used. The action-clear takes an optional `settleGuard`: chat passes `hasPendingEventScroll` so its own landing scroll cannot self-clear the marker before the user engages. The settings, plugin and trigger landings are synchronous and omit it. There is deliberately no timeout.
+
+**It is NOT applied to a whole-pane open**, which has no inner element to mark: a file preview, an app. A trigger used to be in that category. ADR 0112 moved its landing from the edit form to the row, which gave it an element to mark. So a trigger row is the marker's fourth surface (`TriggersView.tsx`, anchor `data-trigger-id`), alongside the three listed above. Replaced three earlier one-off pulse mechanisms (chat `event-pulse`/`event-focus-stuck`, `settings-search-highlight`, `plugin-row-highlight`).
+See also: `.claude/rules/frontend.md`; `docs/plans/2026-06-30-unified-navigation-focus-marker.md` (which unified the three mechanisms, as an outline frame); `docs/plans/2026-08-05-nav-focus-marker-spotlight-highlight.md` (which repainted that frame as this highlight).
+
+### User action
+Input the USER produced, as opposed to anything the app did on its own: the `wheel` / `touchmove` / `pointerdown` / `keydown` set (`USER_ACTION_EVENTS` + `watchUserAction` in `utils/userAction.ts`, capture-phase and passive). One definition, for the surface that must stand down once the user takes over: the *navigation focus marker* fades on it. What makes it a reliable signal is what it EXCLUDES: a programmatic `scrollTop` write, a `scrollIntoView`, a focus move and a re-render emit none of these, so the app can never mistake its own work for the user's, and a landing scroll cannot self-clear the marker it just applied. It had a second consumer until 2026-08-08, a dead notification deep-link suppressing its recovery scroll so a reader who had scrolled away was not yanked; that scroll is gone, and with it the need to ask. Distinct from the raw `scroll` event, which fires for both, and from a *navigation scroll*, which is the same distinction drawn from the other side (about the scroll rather than about the input).
+
+### Navigation scroll
+A `scrollTop` write the APP made, as opposed to the reader scrolling (`markNavigationScroll` / `isNavigationScroll`, `components/chat/scrollState.ts`). The counterpart of a *user action*, and defined for the same reason: the transcript's own writes fire `scroll` events indistinguishable from a finger's. Four consumers must tell them apart:
+
+- the mobile hide-on-scroll header, which never reads one as the reader scrolling, so no write of ours hides the *dynamic bars*;
+- the mobile scroll indicator, which does not read one as the reader summoning it;
+- the render window, which does not read one as a request for older turns. A thread with no *reading position* opens at the top of the rendered slice, so it would otherwise grow on every visit;
+- the *anchor correction*'s next-frame re-assert, which stands down for any navigation but its own (`isOtherNavigationScroll`).
+
+Two terms, and the window is the load-bearing one: a live `animateScroll` tween, OR within `NAV_SCROLL_EVENT_WINDOW_MS` (64ms, four frames, the same window `isRepaintNudging` uses for the identical problem) of a marked write. A scroll event is dispatched at the next rendering opportunity rather than synchronously, so "is a tween running" answers false for exactly the events it exists to catch: the instant navigations run no tween at all, and a tween clears its rAF handle on the frame it lands. The stamp records WHICH element was written, because `useScrollMemory` positions three different containers and two of the three consumers ask only about the transcript.
+
+Everything that places the reader is one:
+
+- the two chevrons, the *standing follow*'s toggle, ⌘↑/⌘↓ turn stepping, a deep-link landing, and `useScrollMemory` restoring or resetting on open;
+- every REVEAL the app or the browser performs without writing `scrollTop`, each saying so through `markRevealScroll`:
+  - a choice card's arrow-key step through `scrollIntoView`,
+  - the browser bringing a newly focused control into view, for Tab, Shift+Tab or a screen reader;
+- the HELD writes, all through `markHeldScroll`, which stamps this and the position together:
+  - the *standing follow*'s ride glide, and its resume on re-entry,
+  - the live-edge glide an armed submit runs,
+  - the live-edge write a REVEAL makes for an armed reader left short of the edge,
+  - a *submit landing*'s glide;
+- the *carry writes*, below, which are held writes too.
+
+The only other thing that moves the transcript is an *anchor write*, below.
+
+A held write is marked for the consumers above and for nothing else. Its OWN question, has the reader taken the container away from where we last put them, is answered by position rather than by this window: a streaming thread re-marks itself every frame, so a flick landing inside the 64ms would read as the app's. That one position stamp serves both things that hold a reader deliberately, and they are never both live: an armed follow retires any pending landing. See *standing follow* and *submit landing*.
+
+A **carry write** is the third kind (`markCarryScroll` / `isCarryScroll`): the *standing follow* keeping a rider ON the live edge as the thread moves under them, live or quiet. Its writers are `keepTheLiveEdge`, for growth, a BOX change or a PLATFORM scroll, and the ride's one-frame correction in `settleTheRide`. It is a held write in every respect but one: the mobile *dynamic bars* stay exactly where they are for it, as for an *anchor write*. A reply scrolling the thread is not the reader, and only the reader's finger moves the bars (ADR 0337). Like every write of ours, it announces itself to a delta consumer at the write (`onRebasedScroll`), so a late event moves nothing.
+
+One case stays held. A write in the same frame as another held or placement write shares that write's one scroll event, which must still reveal.
+
+An **anchor write** is the fourth kind (`markAnchorScroll` / `isAnchorScroll`). The app moved the container to keep the reader on the SAME content while the layout changed under them, so it takes them nowhere. Three writers: the *anchor correction* a reveal makes, `restoreAfterReflow`'s pane-resize correction, and the *focused-field reveal* correcting for the mobile keyboard. The first two are one act either side of the DOM/layout line. It marks a navigation like the rest, which is what stands the render window down. What it must NOT do is reveal the mobile header, because that covers the very line the write was holding still.
+
+The *anchor correction* writes a whole pixel, and a scroll offset holds nothing finer. Its sub-pixel rest goes into the **anchor spacer** (`--anchor-subpixel`, under 1px), which both top reserves of `.thread-content` add. Scroll and spacer cancel, so a press moves no line (ADR 0286).
+
+Every write of ours, of any kind, also announces itself SYNCHRONOUSLY, with its kind, to a consumer reading a DELTA rather than a position (`onRebasedScroll`). The 64ms window is a race that a large jump loses on WebKit. A thread opening at its saved place is the largest such jump, and loses it most often. So the header re-takes its baseline at the write, and again on the settling frame, since the browser clamps a shrinking transcript after it. A placement or held write that moved the container reveals the bars right there. An anchor or carry write leaves them, and so does a write that moved nothing, such as focus landing on a control already on screen.
+
+A **placement scroll** is the narrower half: a navigation scroll that is not a held or carry write (`isPlacementScroll`, private to the module). An anchor write counts as one, which reads oddly for a write that places nobody, and is deliberate: the one consumer must stand down for both.
+
+That consumer is the platform-scroll correction in the *standing follow*, and what it must not count is a held write. A settling transcript takes one every growth round, so the wide predicate is true almost continuously there. Read through it, the correction stands down on the threads it exists for. One unattributed scroll then strands an armed reader off the edge for good (`docs/plans/2026-08-21-a-held-write-is-not-a-navigation.md`). A held write's own event lands on the position stamp, which the correction's earlier term already excludes, so the narrowing costs it nothing.
+
+### Focused-field reveal
+Scrolling the focused form field back into view after the mobile keyboard has changed the viewport (`hooks/useFocusedFieldVisible.ts`, geometry in `utils/focusReveal.ts`). The browser does its own version at FOCUS time, against the viewport it can see then. The iOS keyboard shrinks the viewport after that, and the shell follows through `--app-height`. The pane's scroll container shrinks under a field the browser had just revealed, and nothing re-runs. That is what leaves a tapped field behind the keyboard.
+
+So the trigger is `visualViewport.resize` rather than focus: only then is the container's height the one the field has to fit. A `focusin` opens the window too, which covers a lower field tapped with the keyboard already up. The window opens on a field that passes `opensSoftwareKeyboard`, and closes on `focusout` or on the reader's own `touchmove`. That last one matters twice: a late resize must not yank a reader who took the container back, and any `scrollTop` write during a fling cancels iOS momentum outright.
+
+**One measurement per resize is not enough, because ours is not the last write.** WebKit runs its own scroll-into-view for the focused field as the keyboard settles. It aims at a clearance of a few pixels, and whoever writes last wins. That race is why the same form landed differently twice running. So the reveal re-measures every frame until the viewport has been quiet for `SETTLE_MS`.
+
+The placement is the nearest offset that satisfies both margins, so it is idempotent: the extra frames cost a measurement and write nothing once the field is placed. A target already written, that nothing has moved the container off, is not re-written either, since re-stamping one every frame would hold `isNavigationScroll` true. For a field taller than the gap the two margins leave, no offset satisfies both, and the TOP wins.
+
+The gap below the field is a rem plus the strip iOS covers with its keyboard accessory bar, the prev / next / Done control. `visualViewport.height` stops at the top of the keys, and since iOS 26 that bar floats above them rather than docking. So it hides content the viewport still calls visible, and a rem alone parked the field right under it. Nothing measures the bar: no API reports it, and it is in no safe-area inset. So `KEYBOARD_ACCESSORY_PX` is a constant, charged to the bottom edge alone and only while `viewportIsKeyboardShrunk` (`utils/dom.ts`) says the keys are up.
+
+**The reveal is only half of it, and the other half is CSS.** iOS brings a focused field above the keys by scrolling its nearest scrollable ancestor. When that ancestor cannot scroll far enough it offsets the whole viewport instead. The offset drags the fixed header off screen, and it moves the frame our own measurements are taken in. So which of the two iOS picked decided where the field landed. `--keyboard-band` is the slack that removes the choice: the room the keys take, published beside `--app-height` by `keyboardBandPx`, and spent as `padding-bottom` inside `.content-pane-body`.
+
+It is reserved at `focusin` from the widest band seen this session, because iOS decides before the keys have animated in. It is `0px` whenever they are down, so no view gains a dead scroll zone. Sources: `docs/plans/2026-09-19-the-keyboard-reveal-stops-fighting-ios.md`.
+
+**The band hold keeps the content still when the band drops.** Without it, a reader scrolled into the band has their `scrollTop` clamped, and a press lands its release on whatever moved there. So a lower band first sets `--keyboard-band-hold` on each scroller that needs it: the least padding that keeps its `scrollTop` valid (`heldBandPx`). The hold only shrinks, and drains as the reader scrolls back. It goes at the top, once the band covers it, or once the content it anchored shrinks. Sources: `docs/plans/2026-09-24-the-keyboard-band-holds-the-scroll-anchor.md`.
+
+**Never subtract `visualViewport.offsetTop` from a client rect here.** On iOS WebKit the layout viewport slides WITH the visual one for the keyboard. So `getBoundingClientRect` is already in the right frame, and subtracting double-counts. A source-scan tripwire holds the line.
+
+It is an *anchor write*, so the mobile hide-on-scroll header holds still for it. Mobile-only by its mount, `MobileSwipeContainer`. It changes no height in the shell's chain, deliberately: `docs/plans/2026-04-02-ios-header-keyboard-fix.md` lists what every attempt at that chain cost. See `docs/plans/2026-09-19-a-focused-field-stays-above-the-keyboard.md`.
+
+### Standing follow
+The reader's request to ride the *live edge* of a transcript, the bottom of the newest content. It is held as one explicit state in `components/chat/scrollState.ts` (`FollowState`: off, riding, *parked follow*), and stands until they say otherwise.
+
+**BELOW ONE PAGE, NOTHING MOVES.** A transcript shorter than its pane flows its turns from the top and leaves them where they were drawn. The space under the newest turn is unused VIEWPORT, and it is accepted rather than closed. The follow has nothing to do there: it writes `liveEdgeTop`, which is 0 on a transcript that does not overflow. ADR 0212.
+
+That case spent one day resting its turns on the BOTTOM instead, to close the space. Bottom-anchored, the block of turns grew upward, so every new turn pushed already-read content up the screen before there was a page of it. Reverted the same day, and pinned against by `styles/__tests__/a-short-transcript-holds-still.test.ts`. A separate gap, on a transcript that DOES scroll, is what was originally reported and is still open.
+
+**THREE STATES, and the toggle is lit for two of them.** While RIDING, the reader is ON the live edge, or a ride glide is taking them there. While PARKED, the reader scrolled off the edge on a waiting thread and nothing moves them (see *parked follow*). A lit toggle is never off the edge while the thread is live streaming: going live rides a parked follow back to the edge.
+
+**A reader's scroll turns the follow off ONLY while the thread is live streaming.** On a waiting thread it parks. That split is the user's explicit instruction (ADR 0064): do not change it without the user asking. Liveness is `isThreadStreaming` or a call up on the thread, pushed in by `watchTranscriptLiveness`.
+
+Every event keeps that true. Anything that would slide the edge out from under a rider is written back (`keepTheLiveEdge`): growth, the transcript's own box changing, and a scroll nobody made. Anything the reader did that takes them off the edge leaves the ride: their own gesture, or a placement the app made on their behalf.
+
+`keepTheLiveEdge` has one term of its own, RIDING, and three stand-downs. It waits out a tween, which is going somewhere the reader asked for more recently. It waits out a *deep-link anchor* in flight, whose landing decides the ride. And it waits out an *anchor write*, where `honourAnchoredMutation` has already retired a ride the hold left off the edge.
+
+Exactly one CONTROL arms it, and it is the reader's: the **follow toggle** in the prompt area. It is `setFollowLiveEdge(true)`, rendered by `PromptRowControls` in the second slot of `.prompt-actions-row`, directly after the backend's control menu. It wears a horseshoe MAGNET, poles down over the line that is the live edge. The arrow-onto-a-line it used to wear is `DownloadIcon`, one row above on the thread header. The reader either presses the toggle here, or pressed it earlier and carried it in as the *follow seed*. A reader who has pressed NEITHER way also rides, the seed shipping armed, which is the one arm no press stands behind.
+
+Nothing else does. Not either chevron, which navigate and nothing else. Not a *submit* in any of its five shapes, which get the *submit landing* instead. Not an SSE sync confirming a pending message. Not a change applied, a granted permission, a coding-agent action, a lazy load, a deep link, or a thread opening. Nor the question card ARRIVING, which is the agent's doing.
+
+**Being at the bottom does not arm it either.** A position is not a request. A reader who merely sits at the live edge is moved zero pixels by the same growth that carries an armed one. That distinction is the whole concept: the condition is the flag and NOTHING else. There is no proximity term (the retired 80px stickiness window) and no timing term (the retired 500ms suppression window). Both existed to INFER the request the flag now records.
+
+Two earlier arming rules are recorded here because both were deliberate and both are gone. Until 2026-08-10 a **send and an answer armed it**, so the reply dragged the reader down through itself; that is the *submit landing* now, and riding is the toggle's alone. Between those two, the arming point was briefly **the down chevron** alone, which was the same mistake one step along: it left the mode with no visible state, no way off but scrolling, and no way ON for a reader already at the live edge, since the chevron is hidden exactly there. Putting the state ON the chevron does not rescue it, because one button cannot hold both jobs: go-to-bottom, then arm, then disarm is a three-step cycle with no state left over for a plain jump to the bottom.
+
+**The toggle is shown wherever the composer is, and the compose view is the point.** It was hidden there at first, on the true observation that a compose view has no transcript to ride, which is exactly backwards: a brand-new thread is where a reader most reliably knows they want to be carried through the answer, and it was the one place the follow could not be armed at all. So the button always renders, and where there is no transcript for it to describe it shows the *follow seed* and its press records only that.
+
+**The follow seed** is the reader's last PRESS of the toggle, held in `localStorage` and read at thread open (`followSeedFromStored` / `followLiveEdgeSeed` / `applyFollowSeed`). It ships ARMED until a DISARM press, and decides what a thread with **no** *reading position* starts as. A thread that HAS a record keeps deciding for itself, in both directions. A live-edge record arms with the seed off, and an offset record declines with it on. Same shape as `selectedScope` for the destination picker: a last-used value that seeds the next thread and is never read by one that already remembers. That is what stops it leaking into threads the reader has parked in.
+
+The seed answers what the record structurally cannot, a record being written by being in a thread and a brand-new thread having none.
+
+A *deep-link anchor* owning the open is a partial exception. While the link is still in flight the seed speaks there too, arming in place so nothing is written over the landing. A link that LANDED off the live edge silences it, because a link naming one event outranks a standing preference about where threads start. One that came to rest ON the edge silences nothing, the seed and the link asking for the same place. It is the same guard the resume takes, below.
+
+**Only a press writes it.** Not a scroll retiring the ride, which is about this thread and records itself as this thread's offset. Not `focusThread`'s retire on the way into a thread, and not a deep-link landing. One accidental flick must not cancel a standing preference for every future thread. It is device-scoped rather than account-scoped, because whether to ride the live edge is a property of the screen in front of the reader. It has to be right on the first paint with no round trip.
+
+A seeded arm DOES write the thread's record, so the seed decides a thread's FIRST open and no more. From then on that thread owns the answer like any other.
+
+ Turning the seed off later changes what NEW threads do, rather than what a thread the reader has already ridden does. It is recorded from the ride starting (`onFollowRideStarted`) rather than from the scroll the arm may or may not produce. That subscription is made before the positioning branch that seeds. Whether arming MOVES the container is incidental: a shared `.thread-content` arriving on the outgoing thread's offset moves, and a thread already at its live edge does not. Recording off the scroll gave those two readers different persistence for the same act.
+
+**The toggle REFLECTS the follow; it does not own it.** The flag is one signal exported as a `ReadonlySignal<boolean>` (`followingLiveEdge`), which the compiler refuses to let a component assign, so the button can render the state without being able to fake it. Turning it ON glides to the live edge and arms, which is the whole of what the chevron used to do. Turning it OFF disarms and writes NO scroll, because turning a mode off is not a request to be moved. The reader's own scroll still retires the follow underneath it and the button goes off with it, which is why the off tap is a convenience rather than the mechanism. Its placement is what lets it be armed BEFORE a send, which is exactly when a reader knows they want to be carried through the answer, and which no affordance floating over the transcript can offer, being hidden until the transcript is scrollable.
+
+**What retires it: the reader, and nothing else.** A scroll off the live edge leaves the ride when the reader is behind it (`scrollLeavesTheRide`). It retires the ride on a live thread and parks it on a waiting one (`leaveTheRideByScroll`).
+
+That is either a GESTURE (`readerGestureActive`: a wheel notch, a finger travelling, a drag, a scroll key, a scrollbar hold) or a PLACEMENT the app made for them (`isPlacementScroll`). A placement covers a reveal (`markRevealScroll`), an anchor write, and a navigation. A scroll that is neither is the platform's: the iOS keyboard, a PWA resume, a restored session. That one is written back instead.
+
+A bare press is never a gesture, so answering a card or granting a permission keeps the ride.
+
+Four acts retire it themselves, because a scroll event cannot speak for them. The up chevron and turn stepping away from the edge retire it on any thread. `focusThread` retires it on opening another thread. A *deep-link anchor* retires it where the landing rests OFF the live edge.
+
+**A turn control's press holds the control that was pressed** (ADR 0147), from every position. Where that hold leaves an armed reader off the live edge, `honourAnchoredMutation` retires the ride. The press never moves, and the toggle never stays lit over a reader it no longer holds.
+
+**The deep-link retirement takes a POSITION term: a landing retires the ride only where it comes to rest OFF the live edge.** The ride asks for one place, and a landing resting there has asked for the same thing. So a link to the BOTTOM of a thread ends nothing, and the reader keeps riding as they answer it. Turn stepping measured its own landing from the start, and the deep link did not: it retired on every tap. That cost the reader a ride over a navigation that never happened (reported 2026-08-14). One threshold answers for both now (`isLiveEdgeTop`), and the link measures the number its own scroll aims at (`landingTargetOf`).
+
+**Pixels moved is the wrong measure.** A link carrying the reader back down to the live edge can move them a long way. It puts them exactly where the ride wanted them, so the question is the PLACE and never the distance.
+
+**A landing the ride survives is served by the ride itself.** Where that landing IS the edge, the reader is taken there by the ride's own glide rather than by the element tween. Both rest in the same spot, the browser clamping the element's target back to the edge. Only the ride's motion marks its frames as HELD, which is what keeps `followSurvivesScroll` true through the glide. So the thread records the live-edge form of its *reading position*, rather than an offset that would open it parked with the toggle dark. The glide also re-reads a growing bottom per frame, where the element's own top stops being the edge the moment the reply resumes.
+
+**The request belongs to a thread and outlives leaving it**, even though the flag does not. `focusThread` retires the flag on every open. So the request used to end the moment the reader looked at another thread. They came back to the pixel offset the transcript had when they walked away, with everything produced meanwhile below them and nothing following. It is written down instead, as part of that thread's *reading position*, and `resumeFollowingBottom` re-arms it on re-entry.
+
+All three ways of leaving count, since they end at one localStorage value: a thread switch, a reload, and the app being BACKGROUNDED. That last one runs no teardown and no attach, so it needs a signal of its own (`onPageWake`, in `utils/pageVisit.ts`). The wake reads the RECORD rather than the flag, deliberately. The flag survives a suspend and dies on a discard, and the wake itself can destroy it. A bfcache scroll restore fires an event shaped exactly like the disarm. Reading the record makes the answer independent of when the browser dispatches that restore, and gives the suspend and the discard one answer.
+
+That is the same request resumed rather than a fourth arming point: it can only fire for a thread the reader armed. A reader who merely parked at the bottom records the place and comes back to it following nothing. The position-is-not-a-request rule holds across re-entry too.
+
+Two mechanisms carry it, both narrow enough to have exactly one caller apiece. `followSurvivesScroll` says whether the follow survives the scroll being handled, and so whether the reading position is the live edge. It asks the disarm's own rule, so the answer does not depend on which of `.thread-content`'s two scroll listeners runs first. An older build's `following:` marker in front of a place reads as the bare place, holding no follow.
+
+`onFollowRideStarted` is the second: it broadcasts a ride starting and never the retirement. That is what lets `focusThread` retire the flag without erasing the record of it. The asymmetry also catches an arm that produces no scroll event at all. A reader already at the bottom pressing the chevron on an idle thread is one.
+
+**The resume has TWO PLACEMENTS** (`FollowResumeFrom`), because one open is not the hook's to position: a *deep-link anchor*. Ordinarily it writes today's live edge and rides from there. That write is required rather than tidy, since `.thread-content` arrives holding the outgoing thread's offset. On a deep-linked open the link owns the POSITION and the record owns the REQUEST, and those are two answers that both hold. The reader gets the event they tapped AND the ride they never asked to end.
+
+Without it the retire above had no matching resume on exactly that open. That is the one place a *standing follow* could be lost without anybody deciding to end it. A notification tap into a thread the reader was riding landed them on the event with the toggle dark. Reported 2026-08-12, from a thread parked on a user question. The thread switch it rode in on was doing that, and the resume it skipped is what puts it right.
+
+It declines on two states it must not overwrite. An ALREADY ARMED follow, whose stamp it would clear. And a link that has already landed OFF the live edge (`deepLinkLandedOffLiveEdge`), where the landing ended the ride on purpose. So what it holds open is a link still IN FLIGHT, or one that came to rest where the ride was heading anyway.
+
+That second guard asked whether the AGENT was running until 2026-08-12, the wrong proxy in the case a notification deep-link is most common. `waiting_for_user_answer` is quiescent, so a thread parked on a question card read as idle. This re-armed over a landing that had already happened. Answering the question then woke the thread and carried the reader off the event the notification pointed at. It asked merely whether the link had LANDED until 2026-08-14, which lost a ride the landing had agreed with.
+
+The same placement answers the *page wake*, a push tap being able to resume the app and resolve a link in one breath. One guard rather than an ordering rule per site is what keeps the two callers agreeing.
+
+**Both resolve orderings must reach the same place**, which is why that guard reads the landing's PLACE. A cached thread renders its target on the commit's microtask checkpoint, before Preact runs the attach. An unloaded one lands long after. Asking only whether the link had LANDED kept the ride in the second ordering and dropped it in the first. The toggle's state after a notification tap must not depend on whether the thread's events happened to be cached.
+
+**A resumed ride TAKES OVER a landing that has already happened**, rather than arming beside it (`rideToLiveEdge`). The ordinary cross-thread tap is why: `focusThread` retired the ride before the link resolved, so the landing ran as a plain element tween. `.thread-content` arrives holding the OUTGOING thread's offset, so those frames travel a long way marking plain navigation. Each one records an offset, and the ride the reader never ended is lost on the way back in. In flight it still writes nothing, the link owning a position nobody knows yet. Its stamp then follows the reader's own position: none off the edge, one on it.
+
+See also: `docs/plans/2026-08-08-transcript-never-auto-scrolls.md` (which removed the pin), `docs/plans/2026-08-08-transcript-follows-the-live-edge-when-asked.md` (which added this), `docs/plans/2026-08-09-the-follow-survives-leaving-the-thread.md` (which gave it a lifetime), `docs/plans/2026-08-10-a-submit-rides-the-live-edge.md` (which narrowed the landing to the reader who was not already following), `docs/plans/2026-08-10-every-submit-lands-on-the-agent-status-line.md` (which took arming away from the submit and gave the follow a button), `docs/plans/2026-08-11-reader-owned-live-edge-follow.md` (which made the retirement read a GESTURE rather than infer one from the position), `docs/plans/2026-08-11-a-deep-link-ends-the-ride-only-while-live.md` (which gave the follow's WRITES the same live term its retirements already had, and split ARMED from CARRYING), `docs/plans/2026-08-12-a-deep-link-owns-the-position-not-the-request.md` (which gave the resume its second placement, so a deep-linked open stops being the one open with a retire and no resume), `docs/plans/2026-08-13-a-rotation-keeps-the-live-edge.md` (which added the box-change branch), `docs/plans/2026-08-13-a-platform-scroll-does-not-strand-the-rider.md` (which gave the gesture term its second half, so a scroll the reader did not make is undone rather than merely tolerated).
+`docs/plans/2026-08-14-a-deep-link-to-the-live-edge-keeps-the-ride.md` gave the deep link's retirement its position term. `docs/plans/2026-09-25-a-lit-follow-toggle-always-holds-the-live-edge.md` made the follow one state.
+
+**A ride verifies its own landing** (ADR 0222). `holdPosition` stamps from the same measurement a held write used. A write that came to rest short would record itself as a landing on the edge. So every held write schedules ONE frame that re-measures and writes again. The held stamp guards it, so it can fight neither the reader nor a navigation.
+
+### Submit landing
+The ONE reaction every *submit* gets: a glide to the **live edge** (`followSubmit` in `components/chat/scrollState.ts`). For the four that ask the agent for something it is a bounded HOLD there, ending when the agent starts. For a CANCEL it is a one-shot, since a cancel asks the agent to finish. What the reader submitted is then on screen with the **agent status line** and the agent's first row under it.
+
+A **submit** is any user action in the transcript the agent is expected to respond to. There are five: sending a message, answering a question card, deciding any of the three permission-shaped cards, Continue after an abort, and the prompt row's Cancel. They differ only in how each decides its own turn has rendered, and in whether they hold. That is what makes "same reaction everywhere" structural rather than five copies kept in step by hand.
+
+**The live edge, and not the newest turn's own bottom edge.** Between the two lies the transcript's `padding-bottom`, `--prompt-fade + --nav-focus-reach`. That is the room the composer dissolve paints over. Any rest short of the live edge parks the turn's last row inside that band. On a fresh send that row is the agent status line, which is the row the reader is waiting for. ADR 0080 is the decision.
+
+Its resting place has moved twice. Until 2026-08-11 it rested the status line on the viewport's bottom edge, spending the whole screen to answer "did it go through". The ask then became UPWARD, to the *landing line*, measured so that an unreachable line dropped to "show the turn". ADR 0080 replaced that measured ask, because it left an unarmed reader one `padding-bottom` short of where an armed rider rested.
+
+**It arms nothing.** The landing is over when the agent has started, and the *standing follow* is a separate request with a separate button. Until 2026-08-10 a send and an answer armed the follow instead. A reader who only wanted to see their message go through was then dragged through the whole reply.
+
+**It splits TWO ways, and only in WHEN.** *Already riding the live edge* goes at once, since the armed follow carries the reader through the turn rendering anyway. A rider already ON the edge gets no write at submit time, which is what keeps an iOS momentum scroll alive. The follow then glides them once to the turn their submit created, rather than snapping (`glideToSubmittedTurn`), and snaps every round after. *Everyone else* waits for the turn they acted on to render.
+
+**Every glide here moves at the *send pace*.** That covers each landing round and a rider's arrival glide. Going earlier would aim at the bottom the transcript had BEFORE the submit, which is the blind jump the wait exists for.
+
+It shipped splitting FOUR ways, and the two extra branches were the same mistake twice. Each asked about the transcript AS IT STANDS, to predict where a turn that had not rendered would sit. *At the live edge* wrote nothing, on the reasoning that the reader already sees the newest content. That holds until the submit APPENDS a turn below the fold, and sending from the bottom is the ordinary case. *Nowhere to take anybody* (`hasSomewhereToLand`) got the brand-new thread wrong the same way, since it holds no `.chat-exchange` at submit time. Both were reported on 2026-08-10.
+
+What those branches reached for survives as ONE test in the right place. `landAtLiveEdge` writes nothing for a reader already ON the live edge, by the module's one threshold. That is physics rather than policy, it is asked AFTER the turn exists, and it subsumes both. It is asked once per round rather than once per submit. That is what makes a reader at the bottom cost nothing while the hold waits.
+
+**Nothing is anchored on an element.** The target is the container's own live edge, re-read every frame (ADR 0065). A turn that leaves the layout mid-glide therefore cannot strand it, and a detached node's all-zero rect cannot aim it backwards. What the acted-on turn decides is WHEN, never where.
+
+**It is a HOLD, not a one-shot, for the four that ask the agent for something.** That is the second thing the acted-on turn decides. Each growth round re-aims at the live edge, and each writes nothing when there is nowhere to go. It lets go on the first CHANGE to the rows the turn had at submit time, which is the agent starting. A change and not a growth: `getCollapsedVisibleEvents` drops earlier prose when a new text block arrives, so the count can fall.
+
+Rows means `DRAWN_ROW_SELECTOR` (`scrollState.ts`), never `.response-body`'s own children: those are the section wrappers, and a resuming agent appends inside the one already there. It looks inside each row's `<Disclosure>` for the same reason, since a run of steps is one Disclosure and a new step joins it. A Thinking row (`data-thinking-row`) is not a row the agent drew. An answer resumes the agent with one at once, and its reply can come many seconds later.
+
+The hold's LAST glide freezes its target, resting the reader where the agent's first row put them. Every earlier round tracks the live edge, which is what catches the opening instalments. Without the freeze a second row arriving inside that tween carries them on to it, reported as scrolling past the first step.
+
+The releasing round REACHES a glide already running, and the growth branch stands down for every tween but this one. A fast reply lands wholly inside one glide, so a swallowed round left the release waiting for the tween's end. A turn the submit CREATED counts from zero, for the same reason. It can render with the agent's opening already in it, and reading its rows then swallows them.
+
+A QUEUED follow-up also lets go at once, after its one aim. Holding for a turn that never draws would chase the reader through the reply above it. It is recognised POSITIVELY, by the remove button its queued status carries. Inferring it from a missing `.response-panel` reads true for an unanswered card divider too, which renders none and is about to draw. `LANDING_AGENT_START_MS`, a minute, is the backstop for a turn that draws no row: a dead request, a collapsed turn, a coding-agent turn running tool calls with the step log off. It is long because a coding agent resuming on a cold cache can take tens of seconds to write.
+
+Shipping it as a one-shot, spent the first round its turn was addressable, produced two reports within the hour. A card is addressable the instant it is tapped, so a reader at the bottom got no write and everything their answer caused arrived after. A send was spent when its row rendered, so the agent's opening rows landed below the fold. ADR 0080 carries both, and why a fixed time window is not the bound.
+
+**It does not wait for the status line to AIM.** From 2026-08-10 to 2026-08-11 a pending landing resolved only once the turn had a `.response-header`, because that row WAS the target. The response panel can mount a commit or two after the row it belongs to. A landing aimed while it was missing stopped one row short. Aiming waits for nothing now: the glide re-reads the live edge every frame, and the hold above covers whatever lands after it.
+
+That wait was also, silently, what kept a QUEUED follow-up from landing, since such a turn renders no response panel at all. It lands like every other submit now. Nothing sits under it but the transcript's own bottom padding, so the live edge is just past its bubble. A bubble rendering ABOVE where the reader stands still moves nobody, because a landing never scrolls BACKWARDS.
+
+**Two of the four are DEFERRED at the START**, because their turn does not exist when the reader acts. A send waits for a `.initiator-panel-user` that is not the one already there. Its optimistic row arrives a frame or more later, while the composer collapsing has already fired a resize. Continue waits for a `.chat-exchange` that is not the one already last. The continuation arrives over SSE after the POST, and carries no user message. Both move nobody until it renders.
+
+A deferred landing that never becomes addressable LAPSES after `LANDING_ADDRESSABLE_MS`, and still moves nobody rather than falling back to the live edge. The fallback existed only because the send once armed a follow that had to be honoured. The case the deadline covers is a turn with nothing to show. That is the second and later queued follow-ups, folded into a closed `<details class="queued-message-group">` whose contents have no box.
+
+The two card submits resolve at once, from the card's own id, since the card is on screen by construction. `cardTurn` answers with the turn around it, which the hold then reads for drawn rows. The composer calls in TWICE for one send, its own tap and then the optimistic insert, in one synchronous task. So a landing already pending is KEPT rather than replaced. A second `awaitsNewTurn` built after the row rendered would wait for a message that will never come.
+
+**The reader's own scroll cancels it**, both while it waits and mid-glide, and it is not dragged back. That used to come free as a side effect of the follow's disarm. With a submit arming nothing, the landing takes a position stamp of its own the moment it is scheduled (see *navigation scroll*). Until its turn renders there is no write to read the gesture against. It asks only whether the reader MOVED, where the follow's disarm also asks whether they are off the live edge. One term is enough here: there is no standing request to protect, so a gesture simply ends the whole hold.
+
+### Send pace
+How a *submit*'s glide moves: a 450 ms floor and an ease-in-out curve (`SEND_PACE` in `components/chat/scrollState.ts`). Every other transcript glide moves at the navigation pace, a 240 ms floor and an ease-out curve that reacts at once to a tap. A submit has already reacted at the tap, in the composer or on the card, and its distance is short. So the navigation pace threw the turn into view. Both are paces of the one tween in ADR 0065, whose amendment records the split.
+
+It covers every *submit landing* glide, and a rider's one glide to the turn their submit created (`glideToSubmittedTurn`).
+
+### Landing line
+Where a turn comes to rest when the app navigates to it: `scroll-margin-top` below the transcript's top edge, clear of the chrome stacked there (`turnLandingClearancePx` in `components/chat/scrollState.ts`, reading `.chat-exchange`'s computed value from `styles/chat/response.css`).
+
+ONE number for both navigations that put a turn at the top. They must agree, or the same turn would rest in two places depending on what took it there. A *deep-link anchor* gets it from `scroll-margin-top` natively. ⌘↑/⌘↓ turn stepping animates to an explicit offset, so it reads the resolved px. The *submit landing* rested here until ADR 0080 sent it to the live edge. It is declared in CSS rather than written in TypeScript because what it clears differs per breakpoint and is described there: the desktop top-fade band and the floating up-chevron, the mobile app header and sticky thread-title row, plus the *navigation focus marker*'s own bloom.
+
+### Skeleton hold
+**Removed on 2026-08-14, the day it shipped.** For one day the transcript could put its loading skeleton on screen AHEAD of the shared delay gate. The trigger was a landing snapshot that looked expensive to render. ADR 0081 records the whole decision, including why tuning that trigger could not help.
+
+The entry survives its removal because the idea is the obvious one to reach for again. The reasoning that kills it is short. A hold raises the loader early and then blocks the main thread with the render. So it can only look like a loader that appears instantly and never animates. The transcript answers to `SPINNER_DELAY_MS` alone now, like every other loader in the app.
+
+### Type scale
+The closed set of ten `--font-size-*` steps (`3xs` through `display`, 9px to 36px) that every `font-size` in the app reads, declared in `styles/global/base.css` and mirrored value-for-value into the engine's `api/sdk_iframe.css` so app iframes get the same rungs. Not a palette to pick freely from: the rule is snap to the nearest step, never a hand-dialed `rem` (`.claude/rules/frontend-css.md`).
+
+**Its anchor is offset from the platform's, and that offset is why the recurring bug is always "too big".** `--font-size-xl` is exactly `1rem` and is a *section heading*. The host's body is `--font-size-md` at `0.8125rem`. Running text in chat, apps and HTML artifacts is `--font-size-sm` at `0.75rem`, the *chat prose step* (ADR 0319).
+
+On the rest of the web `1rem` is body, so every instinct, snippet and reconstructed-from-memory scale lands high. The root font-size is deliberately not a step at all. It is `var(--user-ui-scale)`, the multiplier every `rem` in the app rides, geometry included. That is also why the anchor cannot move without rescaling the whole app.
+
+The consequence is the **text defaults layer**, the two `base.css` declarations that make an omitted `font-size` harmless: `body` carries `--font-size-md`, and `input, textarea, select, button` carry `font-family: inherit; font-size: inherit` (a control inherits nothing on its own, because the UA stylesheet applies the `font` shorthand to it, and the shorthand must never be used to hand it back, since it also resets `font-weight` and `font-feature-settings`). Before those existed, text that named no size fell through to the root and rendered as a heading, which is what shipped in Settings > System > What's New on 2026-08-12. Pinned by `styles/__tests__/text-defaults-guard.test.ts` and, in the only check that resolves the cascade, `e2e/type-scale.spec.ts`.
+
+### Tail room
+**Removed on 2026-08-12.** For one day (from 2026-08-11) the transcript reserved a screenful under its NEWEST turn, `clientHeight - padding-bottom - clearance`, measured in `components/chat/scrollState.ts` and applied as a `min-height` in `styles/chat/response.css`, so that a *submit landing* could always rest that turn's top on the *landing line* and the reply would grow into the room rather than past the fold. The entry survives its removal because the idea is the obvious one to reach for again.
+
+It was reserved AIR, and air below the last turn misreports how much thread there is. Three reports in two days, each a different reader meeting the same screenful:
+
+- **A rider was carried into it.** The room extends the scrollable range past where the content ends, so the *live edge* the *standing follow* writes them to on every growth round stopped meaning "the newest content at the bottom of the screen" and started meaning "the newest TURN at the top, over reserved air". Two messages fired at a live coding-agent thread with the toggle on, and the second took the first and its whole running reply off screen.
+- **Withholding it from a rider fixed that and bought worse.** The air's absence then depended on the follow being ARMED, so any path that failed to re-arm showed a screenful of blank as its symptom. A layout that reads the follow flag turns every arming bug into a visible one, and the flag has a lifetime with several ways to lose it (`focusThread` retires it on every open; see *standing follow*).
+- **It arrived MID-TURN either way**, because the room was withheld from a QUEUED follow-up (which grows no reply) until the agent picked the message up. The transcript then grew by a screen in one step under a reader who was riding it.
+
+What replaced it is nothing: the transcript ends where its content ends, and the landing measures instead of reserving. A long reply reaches the line on its own once it has streamed past a screenful; a fresh turn does not, and gets shown rather than clamped. Pinned by `e2e/transcript-ends-where-its-content-ends-desktop.spec.ts`, which has to be a browser test because air is layout and the unit suite drives a fake container with a hand-set `scrollHeight`.
+
+### Render window
+How much of a thread the transcript actually draws (`components/chat/threadWindow.ts`, applied by `ThreadView`). Always a contiguous TAIL ending at the newest turn, because the streaming turn must stay in the DOM. Four readers depend on it being one: `edgeHasMoreAbove`, the scroll-up expansion, the up chevron, and the *reading position*'s walk. It exists because rendering a large thread whole blocks the main thread for hundreds of ms, which a skeleton cannot cover (ADR 0081).
+
+**Its top edge has two dimensions**, and the second is what the first could never bound. `exchange` is the index of the oldest turn drawn. `rowsHidden` is how many of THAT turn's leading rows are left out. It is zero for every other turn in the window, which is what keeps the slice contiguous. Admission is budgeted in each: `STEP_BUDGET` raw events picks the turns, `ROW_BUDGET` drawn rows clamps the oldest one.
+
+The row dimension was added because the turn budget did nothing on the shape that needed it most. A coding-agent turn routinely outweighs a whole transcript. The reported thread held five turns costing 1, 65, 684, 425 and 1 steps against a budget of 160. So "at least one turn must draw" was the only rule that ever fired, and the window drew a turn of everything (`docs/plans/2026-08-30-what-a-thread-open-costs-on-mobile.md`).
+
+**An EDGE, never a count, in both dimensions.** A count slides forward as the live turn grows, so appending a turn would evict the oldest one the reader was shown. Stored per thread in a module Map, so a PARTIAL edge survives a switch-away-and-back: the reader grew it by scrolling, and re-seeding would make them walk back up on every return.
+
+**A render-all does not survive it** (`reseedOnReopen`). A *deep-link anchor* and the scroll-to-top chevron both set the edge to `WHOLE_THREAD`, which is right for the visit that asked. Nothing narrowed it again, so one tap bought every later open of that thread a full render: a reported 13,683-event thread drew 4,069 rows an open against the 37 its window would have drawn. A fresh open now re-seeds, and the *reading position* walks the window back to the turn the reader was on. **Who stored the window decides it, never its value** (`StoredWindowKind`), since a reader who scrolls up to the first turn also holds `WHOLE_THREAD`.
+
+**Growth is scroll-driven and has no control of its own.** Rows first, then turns: scrolling up into the oldest turn uncovers a budget of its head, and only once that turn is whole does the window reach past it. A per-turn "Show earlier steps" expander shipped twice and was removed twice. The second removal happened because the user disliked it from the first message, so a source-scan tripwire fails if one comes back (`components/chat/__tests__/floor-turn-row-clamp.test.ts`).
+
+A GESTURE covers the second case a scroll cannot. A container already at `scrollTop` 0 fires no scroll event, however hard the reader wheels. So the transcript listens for the wheel, the touch drag and the upward scroll keys itself. Only an upward one asks: the event arrives before the browser moves the container, so a reader leaving the top still measures as pinned there. No navigation guard applies, since nothing in the app dispatches a gesture. It is bounded to a transcript that scrolls, leaving the shape below to the capped filler (ADR 0232).
+
+`fillAction` covers the case a scroll cannot: a slice shorter than the pane produces no scroll event. It answers grow, page or none, and ThreadView acts until it answers none. That is either a transcript that scrolls or a thread loaded and drawn to its first event. **The page arm is what paging made necessary**, since the window running out of loaded turns no longer means the thread has no more.
+
+A turn the *reading position* names must render WHOLE, not merely be present, because the restore measures that turn's own top edge (ADR 0152). A ROW it names needs only that row drawn (`edgeMustReachRow`).
+
+**The stored edge names its turn BY KEY as well as by index** (`storeEdge` / `storedEdge`). A fold of older history grows the list at the front, so a bare index named an older turn for the fold's commit. That render drew every turn the fold brought in, and a restore landed on that page before the re-point shrank it. A render-all is stored with no key, pinned to the first turn. **A reopen reseeds in RENDER**, not in an effect: Preact flushes a component's effects before re-rendering it, so a restore attached against the old window and was moved when it shrank.
+
+**A position the loaded pages do not hold is CHASED, within a bound** (ADR 0234, `readingChaseAction`). The walk reads older history in 2000-event pages, at most `MAX_READING_CHASES` of them, until the turn or row is loaded. Past the bound the thread opens at the top of the newest page, since an unbounded chase would spend exactly what paging bought. The record survives, so a client holding the history still lands on it. A position INSIDE the loaded pages is honoured exactly, and that is what the walk is for.
+
+### Transcript scrollbar
+The scrollbar beside the transcript. It measures the drawn slice, the *render window*, not the whole thread (ADR 0258). No estimate of the undrawn history is right on every thread, since a folded turn draws hundreds of events as a few rows. So on a long thread the thumb jumps and shrinks when older turns draw or a page lands, as in any infinite scroll. The content does not move: the anchor write and the *history hold* keep the reader still.
+
+**While the reader holds the native scrollbar, nothing lands above them.** Window grows and fetched pages wait for the release, since Chromium puts its own drag position back and would undo the anchor write.
+
+**On desktop it is the native scrollbar. On mobile it is a drawn touch indicator** (`components/chat/scrollIndicator.ts`, `hooks/useThreadScrollIndicator.ts`), because the fixed header covers the native one. A touch drag summons it, and it fades once motion stops.
+
+### Scrollbar hold
+A primary press on the transcript scroller's own box, from the `pointerdown` to its release (`isScrollbarHeld` in `components/chat/scrollState.ts`). That box holds its classic gutter, and an overlay thumb, which sits inside the client box. While the hold lasts, nothing lands above the reader: Chromium puts its own drag position back and would undo the anchor write. So a window grow waits, and a fetched page waits at its *landing gate* (ADR 0258).
+
+A pointerup ends it, as do a move with no button held, a real loss of focus and a teardown. A frame after the release, the window grows if the hold put a grow off (`onScrollbarReleased`). Distinct from the *history hold*, which records where the reader was while a read is in flight.
+
+### Landing gate
+What a history read awaits between fetching its events and folding them into the thread (`HistoryLandingGate` in `store/actions/thread-loading.ts`). The read stays in flight meanwhile, so no second one starts. The transcript passes `scrollbarReleased`, so a page lands only after the *scrollbar hold* ends.
+
+### Whole history loaded
+The client holds every drawable event of a thread: its first page has loaded, and the server reports nothing older (`wholeHistoryLoaded` in `components/chat/threadSkeletonGate.ts`). Every terminal transcript verdict needs it: "No messages", "could not be displayed", and the working shimmer. Until then the thread is loading, and the skeleton shows. A loaded page alone is not enough, because a page can draw nothing while older pages hold the messages.
+
+A page holds *drawable history*: `get_thread_events_page` skips auxiliary captures (`AUXILIARY_CAPTURE_SQL`, the SQL twin of `isAuxiliaryCapture`), which the transcript never draws. The unpaged and delta reads keep them. Distinct from the *history hold*, which records where the reader was during a read.
+
+### History hold
+Where the reader was, recorded while a read of older history is in flight, so the fold can put them back (`historyHoldByThread` in `components/chat/ThreadView.tsx`). A page lands at the FRONT of the transcript. WebKit implements no scroll anchoring, so the container keeps its offset while the content under it slides down. Two readers take one: the scroll-driven backfill, and the whole-history fetch a *deep-link anchor*'s render-all needs.
+
+**It records the reader's TURN as well as the frame**, and `holdTargetTop` prefers the turn. A height delta says only how much taller the transcript got, so the correction has to assume every pixel landed above the reader. A live thread drawing a reply BELOW them breaks that, and it fires no scroll event, so the refresh never sees it. A whole-history fetch runs for seconds, which is long enough for that to be a screenful.
+
+**Distinct from the WINDOW's own re-point** (`anchorKey`, `anchorAfterBackfill`), which a backfill needs and a render-all must not have: the *render window* is already drawing every turn and has to keep them.
+
+**It is advisory.** `requestBackfill` asks the store whether a read is running, rather than reading that off the hold. So a hold nothing consumed cannot refuse pages for the rest of a visit.
+
+### Arrival hold
+Where the reader has just ARRIVED, held where they came to rest (`_arrivalHold` in `components/chat/scrollState.ts`). Two arrivals take it: a *deep-link anchor* that has landed, and a restore that put the reader back on their saved turn or row (`holdRestoredPlace`). After either, the turns above the target keep drawing, images decode, and older history folds in. None of it fires a scroll event, and WebKit implements no scroll anchoring. So without the hold the target slid away from a reader who had not moved. A reopened thread showed the saved place, then the reader's first scroll found them somewhere else.
+
+**It puts the target back where it rested in the viewport**, on each growth round, never toward its landing line. Growth below the target therefore moves nobody, which is what keeps a landing clamped at the bottom from riding a streaming reply down (ADR 0064). A correction that already put the target back, such as a history fold's own hold, leaves it nothing to add.
+
+**It ends on anything the reader does**: a scroll gesture, a scroll key, focus on a transcript control outside the target, a turn-control press, a submit, or any other navigation. A ride taking the live edge ends it too, and so does the target leaving the DOM.
+
+**Otherwise it ends once the transcript settles**: after `ARRIVAL_HOLD_QUIET_MS` with no correction while no image above the target is still loading, or at `ARRIVAL_HOLD_MAX_MS`. Each correction that moves the transcript restarts the quiet window. A transcript image reserves no height, and on a phone the images above the target can keep decoding for seconds after the arrival.
+
+**A restored offset takes no hold.** An offset names no content, so there is nothing to keep on screen. Only a turn or a row record is held.
+
+**Distinct from the *history hold***, which puts the reader back on their own turn across one fold. The arrival hold follows the target across every kind of growth.
+
+### Continuation fragment
+The exchange the fold opens to hold steps whose turn starts off the loaded page (`Exchange.continuationFragment`, written by `openContinuationFragment` in `store/thread-events/exchange-grouping.ts`). A long thread opens on its newest page, and that page routinely begins mid-turn. Without a fragment the fold drops every step ahead of the page's first boundary, and a page holding none draws nothing at all.
+
+It draws no initiator panel, because nothing loaded says who started the turn (`drawsInitiatorPanel`). Its `userEvent` is its own first step, which gives `exchangeKey` a real id to hold. That id is never STAMPED into the DOM, though. `exchangeStarterId` withholds it, a step being addressable only as part of its turn.
+
+**Every reader asking what KIND of turn this is has to know about it.** The usual answer comes from `userEvent.type`, and a fragment's is a step type. `canQueueBehind` is the one that bit. Read as holding no turn, it handed a chat follow-up the running turn's stream.
+
+**Opened only while the thread reports older events unloaded**, which is the single signal separating a paged page from a corrupt thread. Both reach the fold as steps with no boundary behind them. A thread served whole and missing one really is broken, and the transcript must keep saying so.
+
+Transient by construction: the page behind it carries the boundary, and the fold then merges its rows into the real turn. A backfill re-points the window by identity through that merge (`anchorAfterBackfill`). The measurements, and the three fixes weighed against this one, are in ADR 0230.
+
+### Reading position
+Where a reader had parked in a transcript, remembered across a thread switch, a reload, and the app being backgrounded (`lucidos-scroll-thread-<id>` in localStorage, written and restored by `hooks/useScrollMemory.ts`). Since the transcript stopped scrolling itself to the bottom (see *navigation scroll*, and *standing follow* for the one thing that rides the bottom now, on request and never on open), this is the ONLY thing that decides where a thread opens, and it answers every form of the question: a saved position is restored, and a thread with none opens at the TOP of what is rendered (`resetOnEmpty`, which matters because `.thread-content` is one element reused across threads and would otherwise inherit the previous one's offset). There is a THIRD answer, because the transcript is WINDOWED: an offset recorded against a taller render (a session that scrolled up, a *deep-link anchor*'s render-all) is routinely out of reach of the trailing slice the next open renders, and an offset that cannot be honoured opens the thread at the top as well. Never at the bottom. `Math.min(saved.top, max)` used to say otherwise in both places that gave up (the restore deadline, the dead-link rescue below), and since a clamp can only run when the offset is unreachable, `max` was the whole of it: the live edge, three seconds after the reader arrived and settled. The wait itself is spent parked at the top for the same reason rather than on the borrowed offset the shared container arrived holding, so a restore that never becomes possible has already left the reader somewhere honest instead of on a number the save listener would then persist as theirs. EVERY position is saved, the bottom included, and `0` persists as a real position distinct from no save at all. The save is debounced and committed from the attachment's teardown AND on `onPageHide`, because a background is neither: a frozen page's pending timer never runs if the page is then discarded, so the reader's last act would be lost, and the direction that does damage is a lost DISARM (the stale live edge outliving them, so the next open drags them to a bottom they scrolled away from).
+
+**THE TRANSCRIPT RECORDS THE STEP ROW AT THE LINE** (`row:<relTop>:<rowEventId>`), by its tool call's event id, where the turn at the line has one. Otherwise it records the TURN (`anchor:<relTop>:<eventId>`). Both sit behind the `anchorsToContent` opt-in. The row is the finer answer. A coding-agent turn holds hundreds of rows, and the window draws its tail first. A turn anchor measured there landed the reader above their place (ADR 0152).
+
+A row behind the loaded page is chased, at most two 2000-event reads (ADR 0234). Each open reports which rule placed the reader (`[Client/scroll] restore` in engine.log).
+
+For the turn form: It names the turn at the top of the viewport, plus the exact offset that turn's own top sat at. The id it names by is the `.chat-exchange` stamp a *deep-link anchor* also resolves against, so the two cannot disagree about which turn is which. The paragraph below describes the OFFSET form, which every other container still records: neither the content pane nor the thread drawer is windowed.
+
+A pixel offset cannot describe the transcript, whose HEIGHT is not reproducible. Only a trailing slice is rendered, and that slice's top edge is session state, re-seeded from the newest turns on every reload (see *render window*). A number recorded against one slice measures from an edge that has since moved. It either overshoots the next slice, which parked the reader at the top, or lands on different content once the thread has grown. Both were reported together (`docs/plans/2026-08-28-the-transcript-remembers-a-turn-not-a-pixel.md`), and the second is why measuring from the BOTTOM is no answer either: that form survives a resize and breaks the moment a turn is appended.
+
+A turn does not move, so the restore is EXACT rather than approximate, `relTop` carrying the sub-turn pixels. It is exact at any DEPTH too. Where the seed did not take the anchored turn, ThreadView walks the window up to it one budgeted round per commit (`windowMustReachIndex`, `reachAnchor`). Never a seed straight to it: that jump would render every turn in between in one blocking pass (ADR 0081).
+
+The restore waits out the walk, re-arming its deadline while the transcript grows and re-asking on every mutation. `ANCHOR_RESTORE_CEILING_MS` bounds that, so a thread growing for ever cannot hold its observers. Reachability is asked BEFORE each write, never inferred from a clamp afterwards: a clamped write has already come to rest at the live edge.
+
+The maximum IS taken, deliberately, where the anchored turn is RESOLVED but the content can no longer reach its offset. That turn is still on screen there, and refusing would give the top of the window instead. It lands at once, whatever the overshoot. Everything below a rendered turn is already drawn, so no wait can bring the offset back (ADR 0152). A turn drawn with its head CLAMPED (`data-head-clamped`) is not resolved yet: its rows are still arriving, so the restore waits for the walk. A bare offset never takes the maximum at all, naming no content to be near.
+
+**The record follows the CONTENT, not only the scroll.** A windowed and paged transcript can change which turn is at the top with no scroll at all. The oldest loaded turn is a *continuation fragment* until the page behind it arrives. It carries no id, so the record names the turn below it. The fold then stamps the id in place, and the answer changes under a reader who has not moved.
+
+So an anchoring container watches its own content (`watchContent`) and re-reads the place, throttled. It keeps a record CURRENT and never opens one. A thread the reader has not moved in is the one state the *follow seed* speaks for. That qualifies the snapshot rule below. A teardown flush re-measures too, under the same `isCurrent` question the scroll listener asks.
+
+**A position is one PLACE, or the live edge.** The forms share one slot, so a thread opens in exactly one place. `live-edge` is the one form that holds a *standing follow*, since an armed reader is always on the edge. Restoring it writes today's bottom and re-arms.
+
+An older build wrote a `following:` prefix in front of a place, for a follow held away from the edge. That state is gone (ADR 0064), so the prefix reads as the bare place and arms nothing.
+
+**A position is an offset OR the live edge**, never both: a thread opens in one place, so the two answers share one slot (the `live-edge` sentinel value, `parseSavedScroll` returning a discriminated union) and cannot disagree about it. The second form is a *standing follow* the reader left armed here, and restoring it writes today's bottom and re-arms rather than landing there once, so a thread they were watching is still being watched when they return, however far it ran meanwhile. It needs none of the offset form's observer retries, because an offset can only be honoured once the transcript is tall enough to hold it while the live edge is wherever the content currently ends. Only the transcript opts in (`followsLiveEdge`): the follow is one global and this hook serves three containers, so an ungated recording would stamp the transcript's request onto whatever the content pane or the thread drawer was showing, and the *follow seed* is read inside that same opt-in for the same reason. Having NO position is its own answer rather than an absence: it is the only case the seed speaks for, so a thread the reader has never parked in opens riding the live edge when that is what they last chose. A position is never retired for being old, and never for the reader having ridden the live edge; both used to happen, and both existed to serve the open's own scroll to the end. Retiring a position now only converts "return the reader where they were" into "send them to the top", which is the move the rule exists to stop, so the revision stamp that made staleness answerable (`formatSavedScroll` / `savedScrollIsStale` / `dropStaleSavedScroll`) is gone. `parseSavedScroll` still reads the offset out of a `<offset>:<revision>` value left in a browser by an older build, so nobody loses their place to the change itself. Two orderings are load-bearing: a save is snapshotted when the scroll happens rather than when its debounce fires, because the teardown runs after the render that switched threads and would otherwise write the incoming thread's offset onto the outgoing key; and the restore stands down for a live *deep-link anchor*, since it is an observer that retries until the content is tall enough and could otherwise fire long after the landing. That stand-down is DELIVERED rather than re-read: asked once at attach it answers only for a claim already in place, and two ordinary orderings leave a restore armed across the claim (a deep-link into the thread the reader is ALREADY in re-attaches nothing, and a thread whose events arrive while the tap is still resolving attaches first), where the claim's own render-all is precisely the growth that restore had been waiting for. Re-asking would not close it either, since a synchronous landing releases the claim within a second while the restore stays armed for three. So the claim is broadcast (`onDeepLinkClaimed`, the same shape and the same arm-only asymmetry as the *standing follow*'s) and an armed restore stands down on it, scoped by the same `shouldRestore` gate so the content pane and the thread drawer keep theirs. Standing down is ONE function (`standDownForDeepLink`) taking all THREE of its obligations, called from both sites, because the ones after the first are what a second site would forget: retire the restore, arm the rescue that covers the link turning out dead, and RESUME the *standing follow* this thread recorded, in place so nothing is written over the landing (see the resume's two placements there). The third is the one that was missing until 2026-08-12: standing down means "do not place the reader", and every branch it replaces places them, so the request was handed over along with the position and the toggle went dark on a notification tap into a thread the reader was riding. The record is RE-READ at that moment rather than taken from the attach-time snapshot, since a claim broadcast can arrive long after the reader's own scroll changed the answer, and the *follow seed* answers a thread with no record exactly as it does on any other open. A deep-link that never lands is rescued rather than left on a borrowed offset: the open waits out `EVENT_RESOLVE_DEADLINE_MS` and then positions itself (the saved offset when the render can hold it, the top when it cannot), but only if nothing has moved the container in the meantime, and a second link tapped inside that window re-arms it on its own budget (measured against the FIRST link's reference point, so a dead second link cannot haul the reader off a first one's landing). Whether it landed is likewise TOLD rather than inferred from the container having moved, because a landing with nowhere to move is indistinguishable from a dead link by pixels alone: arriving in a shorter thread clamps the shared container to its bottom, and a link to that thread's last turn resolves to exactly where it already sits. Told BOTH ways, which is the general shape of this problem rather than a belt and braces: a resolve is delivered to whoever is listening (`onDeepLinkResolved`) and asked by whoever attaches afterwards (`deepLinkHasResolved`), since a broadcast reaches only listeners that already exist and the ordinary cross-thread tap resolves on the microtask checkpoint of the commit that rendered the target, before Preact runs the effect that would subscribe. The moved-container test stays beside it, answering the other reason not to move somebody: they scrolled themselves. The restore's own WAIT answers the same question differently, and has to: it runs for up to three seconds while the content renders, which is long enough for the reader to have settled in and started reading, so the first thing they DO retires it (`watchUserAction`, the same signal the *navigation focus marker* fades on). Asked as a GESTURE and never as a change in `scrollTop`, because a pixel delta cannot tell the reader from the app there: the app writes `scrollTop` all through that window without a navigation stamp, clamping a shared container when shorter content swaps in, holding the reader still across a pane resize (`restoreAfterReflow`), compensating for the height the render window just prepended, and nudging ±1px five times over the first second of every open to recover an iOS compositor layer. Reading any of those as the reader would abandon their position for good. Going to a link also SETS this record: the landing is a reading position like any other, so re-entering the thread returns the reader to the event they were sent to rather than to whatever they had parked on before they followed it. Recorded explicitly rather than left to the scroll listener, because the two landings whose scroll event that listener never sees are ordinary ones: under reduced motion the whole landing is a single synchronous write that lands before the attachment exists, and a landing with nowhere to move writes nothing at all. An animated landing is recorded at its start and corrected by its own frames, each of which pushes the save's debounce out again, so what reaches storage is where it settled. It goes through the same one expression the scroll listener uses, and for a landing that MOVED the reader that expression answers with the OFFSET, which is the ordinary case: going to a link is asking to be at one place, so coming back returns them to the event rather than to a live edge they left when they followed the link. It holds twice over on any thread, since the landing retires the *standing follow* before it records, whatever the agent is doing. The expression still asks the POSITION rather than the flag, and for a reason that has nothing to do with deep links: `.thread-content` carries two scroll listeners, the disarm in one and the save in the other, and a flag test would answer differently depending on which ran first. Both were once wrong the other way, while the follow survived EVERY landing: the case the recorder exists for, a landing that moves NOBODY, is exactly the state in which the container has not left the follow's stamp, so writing the number would have thrown away a request that was still live. Distinct from the *content view key*'s per-view offsets, which are the same mechanism keyed on a content-pane view instead of a thread.
+
+### Deep-link anchor
+The element a deep-link into a transcript actually targets, which is not always the event it points at. Only two elements ever carry `data-event-id`: the `.chat-exchange` root (stamped with the turn's STARTER) and the `.exchange-error` failure card (stamped with its own `ResponseFailed`). `stampedEventIds` (`store/thread-events/exchange-render.ts`) declares that closed set once. A source-scan tripwire over `ChatExchange.tsx` pins it, so the resolver cannot drift from what the component renders.
+
+`deepLinkAnchorForEvent` maps an event to its anchor: the event itself when it stamps its own element, otherwise the containing turn's starter, and `null` when no turn holds it. Every event deep-link uses the mapping, through `landOnEvent`. A *notification* needs it too: the engine checks only that the event is in the thread, so a form request raised mid-turn is an unstamped step. The *event wait* step's "show it" also finds the owning thread first. A wait can match ANY event type, and in practice matches a `CodingAgentIdled`, which stamps nothing anywhere.
+
+Landing on the containing turn is the honest answer for such an event. The alternative is not a worse landing but no landing at all. An unstamped id resolves to nothing, spends the whole `EVENT_RESOLVE_DEADLINE_MS`, and ends in a toast saying so, with the transcript left where it was. Distinct from the *navigation focus marker*, which is what the landing then leaves on the anchor.
+
+**The link's budget is ELASTIC, and the report at the end of it is a VERDICT.** A target's absence says nothing while the thread's events are still arriving, so the resolve deadline re-arms while `threadEventsStillArriving` says more are coming. `EVENT_RESOLVE_MAX_WAIT_MS` bounds the total, so a stalled thread still gets an answer. The dead-link rescue in `useScrollMemory` defers on the same budget, reading the held claim rather than `shouldRestore`. A flat wall-clock deadline ran shorter than the load it was racing, and reported a change the reader could see on screen. ThreadView's own stuck-load fuse waits 8s, against the 4s the link used to spend.
+See also: `system-knowhow/notifications.md` § "Where a `navigate` tap LANDS".
+
+### Seen target
+The place a notification points at, once the reader has actually looked at it. Looking at it is what clears the row (`store/actions/seen-target.ts`). A *read request* rides the same watch: its target is the bottom edge of the thread's newest turn, and seeing it reports `ThreadReplySeen` (ADR 0409). A tap naming an event is seen when that event's own card is in the transcript's visible band. The measure is `isEventInViewport`, the same one the *PresenceCheck* pong uses.
+
+A tap naming a place with no card is seen when that place is on screen. That covers an app, a file, a trigger, a settings sub-section and a panel. On screen means the current pane on mobile, or a pane the *split* gives real width on desktop. A desktop reader is therefore at two places at once.
+
+Either form must hold for `SEEN_DWELL_MS` (1000 ms) with the page active, because a glimpse is not a read. Five things put a target briefly in front of somebody who never asked for it. Drawer browsing, a swipe through the middle pane, an archive hand-off, an optimistic bootstrap, a fast scroll. Leaving cancels the wait rather than pausing it, so the time has to be continuous.
+
+This is Row 1 of the §4 matrix made STANDING rather than one-shot. Being the same test is what leaves the matrix undisturbed: Row 2 still toasts a notification whose card is scrolled away. A `modal` tap has no seen target, its place being the notification detail, which opening already marks read. Neither does a notification's own `thread_id`, which is provenance rather than a destination. One set of constructors (`store/actions/visitKeys.ts`) spells both the place a tap names and the place the shell shows, so the two cannot disagree. See `system-knowhow/notifications.md` §4.
+
+Reaching the target clears every in-app surface the row holds, not just the badge. The toast goes with it, because a notification toast lives exactly as long as its row is unread (`installNotificationToastLifetime` in `store/actions/in-app-notification-toast.ts`). This rule owns no part of that: it marks read, and the toast follows the unread set like the badge does.
+
+### Disclosure roll
+How a block unfolds in place: it slides down from under the row above it and fades in, and whatever sits below moves with it in lockstep. Folding runs it backwards. Rows passing under that row dissolve into it rather than meeting a hard edge, as the transcript does under the thread title. The fade reaches only as far as the rows have slid, so content at rest is never dimmed (`FADE_REACH`). One curve and one distance-based length (`utils/disclosureMotion.ts`) serve every site, scaled by the *animation speed scale*.
+
+Two mechanisms draw it. The thread drawer rolls FLIP copies of its rows (`hooks/useFlipAnimation.ts`), because they live in a fixed-height scroller. Every other inline disclosure uses `<Disclosure open>` (`components/shared/Disclosure.tsx`), which animates its own height with the body anchored to the growing clip's bottom edge. Closed content is unmounted, and leaving content stays only for its exit, inert. A box wholly off screen snaps instead of rolling.
+
+The transcript's full-response and steps toggles roll each prose chunk and each run of steps this way (`responseBody` in `store/event-rendering.ts`). Plans: `docs/plans/2026-09-26-one-disclosure-roll.md`, `docs/plans/2026-09-27-turn-toggles-roll.md`.
+
+### Section header
+The heading over one section of a list panel: the thread drawer, Triggers, Changes and Thread queue. All four draw the same one. The label is bold and uppercase at the body step, with no band and no caret. The count is a bare number while the section is open and springs into a pill when it collapses. Every section in those panels collapses, and its body takes the *disclosure roll*.
+
+One markup and one stylesheet serve all four: `components/shared/SectionHeader.tsx` and `styles/section-header.css`. The drawer draws the label and count only (`SectionHeaderContent`), inside its own tree-navigable header. The other panels use `SectionHeader`, whose toggle is a button with any actions beside it. A panel remembers its collapsed sections per device, in localStorage.
+
+The same stylesheet draws the **row hairline**: a line on each row's bottom edge, inset to the content column at both ends. A collapsed header carries the same line, as does the Changes panel's button row. A panel opts its list in with `.list-rows-divided`, while the drawer sets per-row insets so a nested thread's line starts at its indent. Settings is not a list panel and keeps its own headings. The app-facing `.list-section-title` base is unchanged. Plan: `docs/plans/2026-09-30-list-panel-section-headers.md`.
+
+### Keep-awake hold
+An `AwakeHold` (`core/keep_awake.rs`): an RAII value a piece of work holds for as long as it runs. While one or more live, the engine holds one macOS `PreventUserIdleSystemSleep` assertion. Its name gives the workspace and the work in flight, so `pmset -g assertions` says what Lucidos is waiting on. Lid close and an explicit Sleep still win.
+
+Five sites take one: a chat-pipeline turn (`ThreadGuard`), a coding-agent session (`run_direct_agent`), a background task (its watchdog), a Thread Queue entry (its joiner) and a backup (`BackupGuard`). Each is a field or a local of the value every exit path drops, so success, error, panic, cancel and kill all release it. ADR 0366 records why the engine owns it.
+
+### Keyboard handoff
+How a menu with a filter box treats an on-screen keyboard that is already up. Say a text field, usually the prompt, holds the keyboard as a touch menu opens. The menu moves focus to its own filter box, so typing filters the menu instead of the field. A step with no text field hands focus back to the field in the same tap. Closing hands it back too, so the keyboard never drops and the panel never jumps. With no keyboard up, a menu raises none.
+
+One module serves every such menu: `components/shared/keyboardHandoff.ts` (`keyboardHolder`, `returnKeyboard`). Its callers are `Dropdown`, `ModelSelectionPicker` and both prompt-bar control menus. A filter box that takes the keyboard is pinned to 16px on a coarse pointer, so iOS does not zoom into it.
+
+### Navigation cover
+The opaque theme surface that hides a pane's view swap, so a view switch is a fade rather than a hard cut. It is `NavigationCover` (`components/shared/NavigationCover.tsx`) with `.nav-cover` in `styles/global/host-components.css`. Two panes host it, each on its own view key and with its own *motion* (`NAV_COVER_MOTIONS`):
+
+- **The content pane**, on every change of the *content view key* (`ContentPane.tsx`). It plays the **arrival**: the leaving view has already unmounted, and the cover clears off the arriving one (`nav-cover-clear`, `--duration-normal`).
+- **The thread drawer**, on every change of what it shows (`ThreadFilterCover.tsx`, key `drawerSwapKey`: `'filters'`, or `'threads:<status>'`). That covers the Threads/Filters swap and every status filter change, whoever makes it. It plays the **dip**: it rises over the leaving view, holds opaque while the CSS swaps the views, and clears off the arriving one (`nav-cover-dip`, `--duration-slow`). The leaving view stays on screen to the midpoint: the panel, or a *leaving-view drawing* of the list. ADRs 0291 and 0359 record why.
+
+It hides the swap frame, which is busier than it looks in the content pane. The old subtree unmounts, a lazy chunk mounts, a remembered scrollTop is restored, and the incoming skeleton settles. It never *waits* on any of that: content shows through the moment it paints, and a slow view uncovers its own skeleton.
+
+It generalises `.app-ui-cover`. The app cover waits on the frame's `load`, because it hides a document the host does not author. This one plays its own animation. A fuse (the motion's `animMs` under the *animation speed scale*, plus fixed slack) unmounts it even when reduced motion drops the animation.
+
+**The pane titles do not move with it.** Both the content title and the drawer's Threads/Filters title switch word at once, with no fade of their own: only the view below them moves (ADR 0291).
+
+Three shape decisions:
+
+- **A cover, not an opacity on the content.** Half the content pane's views host an iframe. A frame WebKit must re-composite up from transparent is the shape of that pane's iOS paint-loss bugs.
+- **A keyed element replaying an animation, not a class-toggled transition.** A transition's opaque start has to reach the screen before the clearing class lands, and it silently hard-cuts when it loses that race. Keyed on the view, so a navigation mid-fade restarts the animation.
+- **Mounted as a sibling of what it covers**, never inside the scroller, so it does not scroll away with the content.
+
+A **cover**, never a "reveal": `revealContentPane()` is a different thing (swipe to the pane on mobile, focus its pane group on desktop). Every surface that hides a not-yet-ready view is a cover (`.app-ui-cover`, the *quiet boot cover*).
+
+Reduced motion here is the resolved `data-motion` value (*Reduced motion (resolved)*), not the OS media query alone.
+
+### Connection banner
+The bar under the header row that says, in words, that this client cannot reach
+this workspace's engine (`components/layout/ConnectionBanner.tsx`,
+`.connection-banner` in `styles/panels/shell.css`). It exists because the
+*Lucidos mark* carries the same state in strength and motion alone, which says
+that something is wrong and never what: the explanation was in the Lucidos
+menu's connection notice, behind a tap, and on a phone there is no hover tooltip
+either. Its words are the notice's, from the one table in
+`utils/connectionNotice.ts`, so the bar, the menu, the mark's accessible name and
+System > Overview cannot make different claims about one state. It is also the
+surface that states the FULL detail. The menu notice and the mark's tooltip take
+the short form, the explainer having wrapped that panel to three lines.
+
+Present for exactly the states the mark recedes in, which is the whole gate.
+`disconnected` shows at once: reaching it already costs four consecutive failed
+`/health` polls, each made with the page in view. `connecting` shows only past a
+fuse, since it is the ordinary state of a cold start. Nothing to dismiss, unlike the backup
+reminder it sits above: that one stays true until the user acts, where this
+retracts itself on the next good poll, so a dismissal could only hide a live
+fault. An *app-shell banner*, and the second one: both mount once per layout and
+each publishes its own height property into `--app-header-bottom`.
+
+Deliberately NOT text beside the mark. The mark sits in `.header-nav-cluster`, a
+fixed-width box centred on the row's axis whose clearance from both edge clusters
+is a structural guarantee pinned by `e2e/mobile-threads-title-alignment.spec.ts`,
+so text there would push the mark off that axis and spend clearance the spec
+measures. A bar costs the row's width budget nothing at any viewport.
+
+### Progress dialog
+The modal that says the workspace is going away and coming back
+(`components/shared/ProgressDialog.tsx`). Third surface in the taxonomy, beside
+the toast and the banner. It is for a message that is neither ignorable nor
+something the user can work around, and exactly two flows are entitled to it:
+the engine restart or version switch, and the packaged (DMG) update install.
+
+It carries a title, one sentence, and a spinner. A determinate bar appears ONLY
+where the operation has an honest percentage, and a Cancel only while cancelling
+can still work. It has no close X, and Escape does not dismiss it: the operation
+continues whatever the user presses, so hiding it would remove the only account
+of what is happening. The copy comes from the pure builders in
+`store/progressDialogCopy.ts`, which the surface gallery calls too, so the
+preview cannot drift from the real thing.
+
+**Visibility is DERIVED, never written per site**, and that is what keeps a
+modal from stranding anyone. `activeProgressDialog` (`store/store.ts`) reads the
+signal each flow already keeps: `engineRestarting` for the restart, and
+`appUpdateProgress` for the install. Every existing clear of those closes the
+dialog for free: reconnect, the 300s restart safety timeout, a restart spawn
+failure, and each terminal update frame. The restart takes precedence, since two
+at once is not a state that exists.
+
+A FAILURE is a toast rather than a dialog, and both failure paths clear their
+signal first. So the dialog can never suppress the message that explains its own
+ending. See `docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md`.
+
+### Progress note
+A short note a Claude model writes between tool calls, saying what it just
+found and what it does next. Models whose *thinking mode* is always-on (Opus
+5.5, Fable 5.x) return these as `thinking` blocks, empty unless the request sets
+`thinking.display: "updates"` with its beta. The engine always asks for them.
+A note is a short summary of what the model wrote, never the full text. So the
+chat agent puts what the user must read before a card into the card's
+`message`, which the engine shows in full.
+
+`parse_claude_stream` (`llm/anthropic_wire.rs`) turns a finished note into
+answer text: it streams whole at its `content_block_stop` and joins `content`
+in block order. It also lists each note in `LlmResponse::progress_notes`. A
+note cut before its stop stays hidden reasoning, so a dropped stream still
+retries. Never shown on any other model, where `thinking` text is reasoning.
+
+A Claude Code session gets its notes through the *Vertex relay*. Its parser
+emits each one as `AgentEvent::ProgressNote`, by the same rule
+(`anthropic_wire::progress_note`). It is stored as its own
+`CodingAgentTextStreamed` event, flagged `progress_note`.
+
+The agent believes the user read its whole text, so the engine tells it
+otherwise. A chat round that carried a note quotes it in the instruction after
+its tool results. A card raised right after a note, with no `message`, is
+refused by the question card gate. See `docs/temporary-measures.md` § "A
+progress note stands in for the text before a tool call".
+
+### Vertex relay
+The engine's loopback hop between Claude Code and Vertex
+(`runtime/vertex_relay.rs`). Each Claude Code session's
+`ANTHROPIC_VERTEX_BASE_URL` points at it, carrying a signed per-thread token.
+For an always-thinking model it sets `thinking.display: "updates"` and the
+beta, so *progress notes* come back. It forwards everything else unchanged. A
+temporary measure until Claude Code asks for notes on Vertex itself; see ADR
+0260.
+
+### Thinking mode
+What a Claude adaptive-thinking model does with thinking when a request does
+not configure it. The `ThinkingMode` column of `ADAPTIVE_THINKING_MODELS`
+(`llm/anthropic_wire.rs`) records one of three:
+
+| Mode | Models | Effort `none` sends |
+|---|---|---|
+| `OffByDefault` | Opus 4.7, Opus 4.8 | no `thinking` field |
+| `OnByDefault` | Opus 5, Sonnet 5 | `thinking: {type: "disabled"}`, no effort |
+| `AlwaysOn` | Opus 5.5, Sonnet 5.5, Fable 5.x | `low`, since `none` is not offered |
+
+`reasoning::supported_efforts` drops `none` for `AlwaysOn` models, so a stored
+`none` snaps to `low` at the routing chokepoint. An `AlwaysOn` model also asks
+for *progress notes*.
+
+### End space
+The room every content-pane view keeps below its last element: `--space-xl` plus the home-indicator inset (`--pane-end-space` on `.content-pane-body`). It is a spacer, `.content-pane-body > :not(.content-view-full-bleed)::after` in `panels/content.css`, so a view's own padding cannot cancel it.
+
+It is **default-deny**. A view loses it only by carrying `content-view-full-bleed`, which says it fills the pane and scrolls inside itself (an app, a preview). A phone's flowing file preview opts back in.
+
+A column view grows with its content instead of taking the pane's height. Pinned, its content would overflow its own box and run past the spacer. `FillSkeleton` subtracts the spacer, so a full-pane skeleton still fits. Pinned by `styles/__tests__/content-pane-end-space.test.ts` and `e2e/content-pane-end-space.spec.ts`.
+
+### Content view key
+The content pane's single answer to "has this pane navigated" (`components/layout/contentViewKey.ts`). It resolves the *panel overlay* (else the active menu item) down to the identity of the thing on screen. Its consumers must agree, or they break together in the same direction. The scroll memory would restore the outgoing view's offset onto the incoming one. The *navigation cover* would hard-cut the same swap.
+
+Every overlay resolves to what it displays: a preview's path or url, a notification's id, an inline form's own identity via `inlineFormKey`. There is **one deliberate exception**: `app-ui` is one key for every app. An app switch reuses the iframe, and the frame's own load cover already holds until the incoming document's `load`. The body is `overflow: hidden` under an app, so there is no scroll to keep apart.
+
+`inlineFormKey` is exhaustive by construction rather than by a `default` branch. So a new `InlineForm` variant has to state what identifies it, instead of silently collapsing into `'form'` as all seven once did.
+
+### Budget delta
+The chars one `ContextSection` ADDS to a request, beyond what other sections already count (`budget_delta_chars`, `engine/types.rs`). It is the number to SUM. The sections of one `ContextCaptured` add up to the chars behind `estimated_total_tokens`. That is what lets the *context viewer* show each row as a share of the headline total.
+
+Its sibling `content_chars` is the section's own size, measured whether or not the body was persisted or truncated. Ask that one how big a region was, and never sum it. On almost every section the two are equal, because nothing else counts that section's chars.
+
+**`Conversation` is the exception, and the reason both fields exist.** Every other section is already concatenated into `messages[0]`, so the loop's row carries only what the tool loop added on top. Over one measured eval run its real size ran 35% above its delta. On a round where the array was small next to the bundle it ran 300x. A region sized off the delta under-reads by the whole bundle.
+
+**Legacy alias: `char_count`.** The stored value always was the delta, so `serde(alias)` carries months of rows across. Two read paths serve `payload->'sections'` verbatim rather than through serde, so `api::threads::events_snapshot::rename_legacy_section_size` renames the key for them. A direct SQL query over history reads `coalesce(x->>'budget_delta_chars', x->>'char_count')`.
+
+### Context viewer
+The modal showing what the model was actually SENT for one LLM call: the budget bar, the sections grouped by API role, and the cache/usage breakdown (`components/chat/ContextViewerModal.tsx` wrapping `ContextCapturePanel.tsx`; opened via the `contextViewer` signal, backed by one `ContextCapture`). Its one door is the **context counter** on a *step row*: the `135k / 1M (13%)` chip (percentage alone on mobile, per `contextLabel`); the rest of the row opens the *step detail* instead. The split is the point and is enforced by not duplicating: the step detail deliberately does NOT render this panel, because a second copy would make the counter a pointless door. So the two views answer two different questions, "what did this step DO" and "what was the model LOOKING AT when it decided to". The counter is a `<button>` only where a snapshot exists: a legacy row carrying bare `context_tokens` renders it as inert text rather than a button that opens nothing. Sections arrive lazily when the snapshot endpoint stripped them (`GET /events/:event_id/context`), so the panel is `Loadable`-shaped inside.
+
+Every token figure in it is a share of one number, the **headline total**: `usage.input_tokens ?? estimated_total_tokens`, i.e. the provider's measured prompt when it reported one and the engine's estimate otherwise. The budget bar shows it whole and each section row shows its proportional slice. Both read `headlineTokens` / `sectionTokenScale` (`components/chat/sectionTokens.ts`), so the tree sums to the bar by construction. This is the fix for the panel dividing its own chars by a ratio: it used the *trim budget*'s conservative 1.5 chars/token, so the rows summed to 361k under a header reading 205k.
+
+Only the section rows are shares, and a section carries a *budget delta* rather than a token count of its own. The split assumes uniform token density, which is why the rows stay labelled `≈` even when the total was measured exactly. Do not reintroduce a chars-to-tokens constant on the frontend. If you change how the bar picks its number, change `headlineTokens` rather than inlining the choice at either site.
+
+### Coding-agent context window
+The window a *coding-agent thread*'s session actually runs under, which is not the window Lucidos would request for the same model id. Two different requests answer it. `llm::model_registry::context_window_for` answers for the call the ENGINE makes, where 1M mode is gated on our own `[1m]` suffix. A bare `claude-` id is therefore 200k there, and correctly so: the packer must not exceed the mode the request selected. The exception is a family whose default window is 1M (Opus 5, Opus 5.5, Sonnet 5.5, Fable 5.x), whose bare builtin rows declare it. Claude Code and Codex make their own calls and pick their own context mode, so a bare Sonnet 5 session really does run 1M.
+
+Declared per model on the curated rows (`context_window` in `runtime/cc_menu_options.json`), which stay the overlay after Claude Code's *discovered model list* replaces them as the picker. Read through `runtime::coding_agent_context_window`, which never follows an alias to the model it runs: a legacy id folds onto its alias, so the alias's current model says nothing about the session. Absent means the registry's answer stands. Only the `ContextCaptured` emit for a coding-agent session reads it. That capture REPORTS a call rather than budgeting one, so nothing here can make the engine pack an oversized prompt. Declare it on a pinned id only, never on an alias row: `normalize_cc_model_id` folds old dated ids onto `sonnet` / `opus` / `haiku`.
+
+Without it the *context viewer* rendered a real 240k Claude Code prompt as `203k / 200k (100%)`, which is also why `contextPercent` no longer clamps at 100. See `docs/plans/2026-08-22-coding-agent-capture-window-is-the-backends-window.md`.
+
+
+### Discovered model list
+The Claude Code `/model` picker as Claude Code itself reports it, in place of the hand-kept `runtime/cc_menu_options.json`. The engine asks a cold Claude Code process with an `initialize` control request and no prompt, so it costs no tokens (`runtime::claude_code::probe_cc_models`). The reply's `models` array is the list; the signed-in account in the same reply is dropped by the typed rows.
+
+It is cached in `.lucidos/cc-models.json` (`runtime::cc_model_discovery`). A background probe refreshes it when missing, a day old, or when a session's handshake names a new Claude Code version. The picker is exactly this list: a model Claude Code does not list is not offered, even one it would accept (ADR 0325). Until the first probe succeeds the curated JSON is the picker, and it stays the context-window overlay. `GET /api/v1/claude-code/commands` reports which one is in force as `models_provenance`.
+### Older region
+The part of `[CONVERSATION HISTORY]` before the last `HISTORY_RECENT_MESSAGES` turns, built in `chat/process/history.rs`. It is NOT one compressed blob. Since ADR 0102 it renders chronologically, with the two roles treated differently. A **user turn is verbatim**. The **assistant turns collapse into the *conversation summary***, emitted once at the position of the oldest turn it covers.
+
+The split is the point. A constraint the user stated in conversation is said once and has no recovery route, so the harness guarantees it survives. Assistant work left artifacts, events and files behind, so a paragraph plus an address is enough. `HISTORY_OLDER_USER_BUDGET` bounds the verbatim side newest-first, and one count line names `query_events` for any remainder. A median user message is 63 chars, so it almost never bites.
+
+An assistant turn NEWER than the summary's boundary is not summarised yet, and renders compacted rather than being dropped. That is what keeps the gap between refreshes lossless.
+
+Under *self-curated context mode* the summariser does not run at all: the agent writes its own notes as it goes, so a second model compressing the same region blind is redundant (ADR 0109). The cached paragraph still renders where a thread already has one.
+
+### Conversation summary
+The one paragraph standing in for a thread's older **assistant** turns, produced by `memory::summarize_conversation` and cached as a `ConversationSummarized` thread event. The event IS the cache: there is no table, so the paragraph survives an engine restart because the event does.
+
+It runs on its **own *model selection***, `model_conversation_summary` paired with `reasoning_conversation_summary`, and under its own `ContextPurpose::ConversationSummary`. Both used to be shared with fact extraction and query classification. So Settings named no summariser, and the wire could not tell a 94,903-char summariser call from a 6,800-char extraction. Its model key follows no other key: while unset it runs the first of the compactor's three models a configured provider serves, then the *auxiliary default* (ADR 0377). The effort defaults to `low`: the measurements say output length does not track it.
+
+Re-summarising is the exception, not the rule. `SummaryPlan::refresh_boundary` reuses the cached paragraph and calls the model only when three things hold:
+
+- the turns past `covers_through_event_id` exceed `HISTORY_SUMMARY_REFRESH_AFTER`,
+- *self-curated context mode* is off,
+- the newest covered turn has an event id to key the cache on.
+
+A failed or timed-out call emits nothing, so **one success sticks** for the rest of the thread.
+
+**The refresh is detached, so it lands one turn late** (ADR 0102). The turn that decides a refresh is owed renders from the cache as it stood, and the fresh paragraph reaches the NEXT turn. Awaiting it put a call of tens of thousands of tokens, under a 90 second deadline, in front of the user's first agentic step. It only ever improved a prompt they had already paid for. `SummaryInFlight` keeps one refresh per thread, since a detached task outlives the turn that started it.
+
+That inversion is what ADR 0102 bought. Before it the paragraph was rebuilt every turn and, on one measured thread, landed on 3 turns out of 24. Each miss rendered a bare "(N earlier messages not shown)" line under a header claiming the turns were resolved. The wording now splits: the resolved framing rides only where a real paragraph is present, and the no-summary form claims nothing and names the way back.
+
+**One success sticking is also the cache's new trap, and a THIN paragraph is a success.** So `summarize_or_none` applies a *thin-output floor*: an answer implausibly short for the turns it covers counts as a failure, keeping the cached paragraph and leaving the refresh gate open. Before the cache the same bad roll was discarded within the turn and re-rolled on the next one, which is why it used to self-correct. The call also runs under its own deadline from `engine::aux_purpose`. That deadline holds one full attempt plus the whole retry backoff, where the old one could only cut the first attempt off. See ADR 0107.
+
+### Cache seam
+Retired with ADR 0109, along with the body region it split off. It was a `ContentBlock::CacheSeam` marker inside the turn's user message, which `llm/anthropic_wire.rs` read to attach `cache_control` to the block in front. Removing the region left it with no producer, so the variant and its four per-wire arms went too.
+
+Anthropic allows four breakpoints and Lucidos spends all four: the last tool, the system block, the last message, and the one in front of it. That fourth anchor is the one a later round can still read. The context mode rewrites the tail every round, and a rewritten block is not a hit. A first round carrying a single message spends three, since nothing sits in front of the tail. A fifth is a 400, so nothing is left to claim.
+
+### One-round rule
+Retired, replaced by the *swept window*. A tool result reached the model exactly once, and at the top of the next round it became a *round stub* keeping its `evt-<hex>` address.
+
+**It was an interruption, not a schedule, and that is why it went.** The premise holds: four in five tool results are never observably used again. But the fifth that survives is wanted a median of three rounds later, and 78% of read-backs landed at distance 2. That is the earliest this rule allowed, so the model was asking for the thing back on the first round it was gone.
+
+It replaced ADR 0085's *arrival window*, which asked the same question of an assembled *body* against the thread's previous request.
+
+### Swept window
+What replaced the *one-round rule*. `sweep_expired_pairs` (`chat/process/context_mode.rs`) runs every `self_curated_context_sweep_every_rounds` and removes every `tool_use` and `tool_result` more than `self_curated_context_expire_after_rounds` old, whole, with no stub. On the defaults an item lives 6 to 15 rounds and averages ten. It applies to everything on the same schedule, so the engine picks no victims and the model picks what stays by holding it open.
+
+**Nothing moves on any other round, and that is the whole reason it is a schedule.** A pair removed from the middle of the array invalidates every cached byte after the cut, and both message-tier breakpoints sit behind it. Nine rounds in ten are pure appends and keep the discount; the tenth pays once for what a per-round drop would pay for ten times.
+
+One exemption survives, and only at the wall: a result that errored is never cut by the trimmer. A *keep* moves the item's clock and exempts nothing.
+
+### Comment-ablation eval
+A hand-run eval asking whether comments that defend a limitation make coding agents paper over bugs. Each task is a past fix on `main`, given to a headless agent at the fix's parent as a symptom-only bug report. Its *arms* differ only in which comments the tree keeps. `scripts/eval-comments/eval-comments.sh` drives it, and it spends money, so nothing runs it from a test. The pilot's plan and results are in `docs/plans/2026-09-25-comment-ablation-pilot*.md`.
+
+### Withheld test
+The regression test from a task's real fix, kept out of the agent's tree and installed only at grading. It calls only code that existed before the fix, so it grades behaviour, not the shipped fix's names. `prepare --verify` proves each one fails on the buggy base and passes on the fix.
+
+### Context-handling benchmark
+What the ADR 0087 *context-mode eval* became under ADR 0110. It measures one *configuration* doing fourteen tasks in a seeded workspace, and reports five absolute axes: task quality, cost, rounds, wall time and *context utilisation*. It is a binary in `crates/lucidos-eval`, run by hand through `scripts/eval-context-mode.sh`, never a test and never in CI. Its fixture is `eval/context-mode/`.
+
+No criterion may name an internal of the *self-curated context mode*, and `Fixture::validate` refuses one that does. What replaced the old graduation and kill bars is nothing: a human reads the axes.
+
+### Delivery
+The *context-handling benchmark*'s first quality scorer: the share of tasks whose deliverable exists and is right, one *completion probe* each. It asks whether the job got done, where *fidelity* asks whether the facts survived. An agent can pass one and fail the other, which is why they are separate axes rather than one number.
+
+### Fidelity
+The benchmark's second quality scorer: the share of *planted probes* whose fact survived. A pass is a pass whatever route kept the fact there. A failure is split three ways: the agent asked, it said out loud it had lost the fact, or it got the fact wrong quietly. Reported per *recovery tier* as well as in total.
+
+### Configuration
+What one run of the *context-handling benchmark* measures: a model, a reasoning effort, the *self-curated context mode* flag, and a declared *context window*. It is what the report groups by, and what a *budget sweep* varies.
+
+### Budget sweep
+The same task set run at several declared *context windows*, pooled at analysis time by naming every run id. It applies budget pressure without rewriting a task, because the engine derives its char budget from the seeded `models.context_window` row. Its headline is the smallest window at which delivery and fidelity both stay within five points of the largest window's.
+
+### Context utilisation
+The benchmark's fifth axis: peak and mean request size, headroom at the peak against the declared window, the peak as a share of it, and which trim passes fired. A smaller window used well is a win rather than a constraint.
+
+### Full capture
+An eval arm storing whole `ContextCaptured` bodies rather than the usual 8,000-char head-and-tail truncation. It needs two things: the `capture_context` preference, which the fixture seeds, and `LUCIDOS_EVAL_FULL_CAPTURE` on the arm's engine, which the harness sets. A section's two sizes are the assembled lengths either way, so nothing that reads a size changes. `lucidos-eval replay` walks a thread round by round out of it. No other workspace does this, because three consumer paths would ship hundreds of megabytes.
+
+### Arm
+One condition of an eval. In the *context-handling benchmark* it is `control` (nothing removed) or `lean` (the mode on). In the *comment-ablation eval* it is A (code as is), B (every comment stripped) or C (the justifying comment blocks stripped). The rest of this entry is the benchmark's.
+
+A benchmark run measures one arm by default. Naming both seeds them from one fixture and requires them to differ in exactly one preference row. They then interleave per task, so provider drift lands on both at the same point.
+
+### Run label
+What separates one *context-handling benchmark* run's *arm* workspaces from a concurrent run's. An arm workspace is `eval-<run label>-<arm>-<repeat>`, and its database is that same name under a `lucidos_` prefix. Without it, two runs against different providers both want `eval-lean-1` and both try to create `lucidos_eval-lean-1`.
+
+An arm is a context-mode configuration and stays one: the model is a separate axis, and the label is where it lands. The label defaults to the model id, sanitised to `[a-z0-9-]` and followed by six hex digits of a digest of the untouched id. The digest is what makes it injective, because sanitising merges ids as readily as truncating does. `LUCIDOS_EVAL_RUN_LABEL` overrides the default. Reach for the override to run the SAME model twice at once, such as two windows of a *budget sweep* started together.
+
+It is recorded on the results file's run row, and joins the arguments a resume is checked against. A post-run `score`, `replay` or `report` reads it from there rather than from its own environment. Otherwise it opens whichever model's arms the shell happens to be pinned to. An empty one is a run recorded before the label existed, whose workspaces carry no label segment at all.
+
+### Model set under test
+Every model a set of concurrent *context-handling benchmark* runs pins, declared in `LUCIDOS_EVAL_MODEL_SET`. The judge is refused if it names any of them. A run knows only its own pin, so a judge cleared against one run can still be grading its own output in a sibling. Unset, the set is the run's own model and the check is the per-run one it has always been.
+
+### Sequence run
+One arm's full pass through the fourteen-task set, in a fixed order, in one workspace. The unit of analysis for the *context-handling benchmark*, and never the task. The fourteen threads share a workspace and later ones depend on named earlier ones, so their outcomes are one cluster rather than fourteen independent samples. A *repeat* is one sequence run per arm. The harness is planned in `docs/plans/2026-08-18-context-mode-eval-harness.md`.
+
+### Fact register
+The twenty-three facts a *context-handling benchmark* run establishes and later probes, `F01` to `F23`, in `eval/context-mode/facts.toml`. Each carries a *recovery tier* and three regexes. What counts as stating it in the handover. The loose form proving the establishing task said it. And what a question about it looks like.
+
+`established_by` names the route that stated it. A prompt, a scripted reply, the work itself, or `seed`, a document the task is told to read. The three `seed` facts sit in the *ceiling task* corpus, where no prompt can carry them.
+
+### Recovery tier
+How cheaply a *planted probe*'s fact can be fetched back once the prompt stops carrying it. Tier 1 is a fact in a file and tier 2 a fact in an event payload. Tier 3 is a fact from an earlier thread's conversation, and tier 4 one stated earlier in the same turn. Under ADR 0109 the mode reaches tier 4 alone: a tool result leaves after one round, and a conversation turn rides in the prompt on both arms. Tiers 1 to 3 are therefore the benchmark's controls: a loss there means the agent stopped looking rather than stopped remembering. The tier groups the fidelity axis and scores nothing on its own.
+
+### Probe outcome
+What one probe of the *context-handling benchmark* resolved to. Five values under ADR 0110. `pass` is the fact surviving, whatever route kept it there. `asked` and `lost-loud` are visible failures, and `lost-silent` is wrong-and-quiet, which is the one that matters most. `void` means the probe measured nothing, never a failure: an upstream failure, a *classifier disagreement*, a *scope divergence*, or an *unrecovered empty completion*.
+
+ADR 0087 split PASSING four ways too, by the route that explained it: `in-prompt`, `from-notes`, `recovered` and `unknown-pass`. That vocabulary is retired. Two of the four were arm labels rather than results, and the other two had the harness guessing which tool call explained a pass.
+
+### Classifier disagreement
+A paired *context-handling benchmark* task where one *arm* retrieved memory and the other did not, on the same task of the same repeat. The engine asks an LLM classifier whether a turn needs memory, and it can answer differently in the two arms. Such a pair measures that classifier rather than ADR 0085's flag (ADR 0087, amended). The harness voids the task's probes in both arms, and keeps its thread rows out of the cost and rounds medians. A pair where BOTH arms skipped retrieval is kept, because the flag genuinely saves less on such a turn. The signal is a `MemoryRecalled` event on the thread, which the engine emits only when the classifier answered yes.
+
+### Recall census
+One of the *context-handling benchmark*'s four quality scorers, reported as `handover`. It is the proportion of registered facts stated correctly, with the specific value rather than a paraphrase, in the last thread's handover document. It was ADR 0087's primary endpoint, on a variance argument for a two-arm test. With no such test to power, it measures the last task rather than the run, and sits beside delivery and fidelity.
+
+It covers the facts the handover could carry, and not the whole *fact register*. The census probes come from `T12` and everything upstream of it, so a fact from a task `T12` never needed is out. The three *ceiling task* facts are out for that reason. Scoping is structural and never a per-fact key, which would be a tunable lever on a pre-registered endpoint.
+
+### Completion probe
+The one assertion per task in the *context-handling benchmark* that asks whether the job got done, in `eval/context-mode/completion.toml`. Every other scorer asks whether the agent still knew a fact it was told. Before these, an arm writing an empty but correctly named file scored like one that did the work.
+
+Deliberately not a *planted probe*, and in its own file for that reason. It carries no fact, no *recovery tier* and no recovery route, and its outcome is `pass`, `fail` or `void` rather than a *probe outcome*. It reaches no fidelity rate and no tier breakdown: delivery and fidelity are separate axes.
+
+Where a probe names its tempting wrong answer, a completion probe names its `deliverable`, one line saying what the task owed in its own terms. Producing nothing is the failure it looks for rather than the one it has to rule out.
+
+The harness scores it the moment its own task finishes, against the tree that task left, and never with the probes after the run. P02.5 is why: it asserts eight `BuildObserved` events, T10 emitted eleven more, and the first pilot records it lost in both arms on scoring order alone. Its scorer is always an assertion, since the judge runs after the whole run.
+
+**Completion rate** is the share of scored tasks an arm delivered, per *sequence run* and then averaged. A control arm exceeding the lean arm's rate by more than 5 points kills the flag, whatever the cost says (ADR 0087's fifth amendment).
+
+### Scope divergence
+A paired *context-handling benchmark* task one *arm* delivered and the other did not. It voids the pair for cost and for the *planted probes*, by the same rule and the same machinery as a *classifier disagreement*. The arms did different amounts of work, so neither comparison is about the mode.
+
+The completion outcomes themselves survive that void, and that is load-bearing. Suppose they were voided too. The arms would then agree on every surviving task by construction, both completion rates would be identical, and the kill could never fire. A divergent pair is the completion signal and the cost confound at once.
+
+### Unrecovered empty completion
+
+A *context-handling benchmark* turn that came back with no text and no tool call every time the driver posted it. The third thing that voids a pair, beside a *classifier disagreement* and a *scope divergence*.
+
+It is the harness's own reading of an *empty completion*, and it is narrower than the engine's. The engine classifies one model response. The harness asks about a whole turn: no `ResponseGenerated` in it carried text, AND it made no tool call. So a turn of tool work that closes with an empty message is not one, and neither is a terse answer. Input tokens corroborate the reading and never decide it.
+
+The driver re-posts the same prompt into the same thread, at most twice per turn (`REPOSTS_PER_TURN`, shared with a *refused turn*). A turn that recovers is scored like any other, and the thread row keeps the count. A turn that never recovers is `TaskStatus::Empty`, written as `empty-completion`, which is not a *finished* status: the task's probes void in both arms, its completion outcome is `Void` rather than `Fail`, and its downstream tasks void in that arm.
+
+The distinction it protects is that a thread which never ran did not fail to deliver. Scoring one as a delivery failure is what produced the phantom completion kill in the run ADR 0087's amendment records. The count is reported and never judged, and since ADR 0110 there is nothing left that could judge it.
+
+### Refused turn
+
+A *context-handling benchmark* turn the engine failed with `stop_reason: refusal` and no output. The provider's safety classifier withheld a whole reply, often on benign work. It says nothing about the configuration under test.
+
+The driver reads it off the turn's `ResponseFailed` text, apart from "produced nothing", because a refusal often follows tool calls in the same turn. It re-posts the prompt from the same budget as an *unrecovered empty completion*. A turn that recovers is scored like any other. One that outlasts the budget keeps its `failed` status and counts as a failed task. The thread row records `refusals` and `refusal_retries`, and `report` prints them per arm and per task, so a recovered refusal stays visible. See the ADR 0110 amendment.
+
+### Scope rule
+The one instruction appended to every *context-handling benchmark* prompt, declared once as `scope_rule` in `tasks.toml`. It tells the agent to do what was asked, not to extend the work, and to name anything else at the end of its reply.
+
+It exists because over-delivery is not self-punishing in an A/B: the bill lands on the arm rather than on the agent, so an uncontrolled scope difference reads as the mode being expensive. T06 of the first pilot cost the lean arm $19.19 against control's $5.08, entirely on a second job it invented.
+
+Three things it deliberately avoids. It invites no question, since "ask me" turns scope creep into a round plus a fallback reply. It forbids no tool, so a task asking for a sub-thread or six jobs stays in scope. It states no fact, and the loader refuses one matching a fact's `census_regex`.
+
+It lives in the fixture rather than in code because `fixture_hash` covers `tasks.toml`. A constant in Rust would let the measured treatment change while the recorded hash stayed put. Its partner is the driver's unscripted fallback, which now closes scope instead of replying "use your judgment".
+
+### Differential silent loss
+What the *lean arm* lost silently that the *control arm* kept, as a share of the probes both arms scored. ADR 0087's kill condition on `lost-silent`, retired with the rest of that bar. It replaced an absolute share of the lean arm's own scored probes (ADR 0087's third amendment).
+
+The absolute version could not separate a body the mode dropped from a fact no arm could reach. So the first pilot fired it at 19.3% in the lean arm, while the control arm sat at 31.6% on the same 57 probes.
+
+A pair counts when both arms scored the probe, the control arm passed it, and the lean arm recorded `lost-silent`. A probe lost in both arms is a fixture defect and counts against neither. The threshold is 5%, half the old absolute one, because a paired numerator loosens the criterion twice over.
+
+Both arms' absolute rates are still reported, and so is the count either way round. The kill is one-directional on purpose: a mode that trades one loss for another has still dropped what the user had.
+
+### Ceiling task
+`T13` or `T14` of the *context-handling benchmark*: the two tasks whose seeded material is large enough to fill a context window. They read a five-document corpus of roughly 190 KB, and every other task leaves the budget about half empty. A constant in `analyse.rs` and never a key in `tasks.toml`, so no mode can be rescued by moving a task out.
+
+They exercise the two trim paths, which fail differently. `T13` fills up inside one turn, where `trim_context_if_needed` stubs an oversized tool result and leaves its call visible. `T14` crosses a turn boundary, where the turn setup drops memory context and then the oldest history, with no stub and no event. So `ContextCaptured.trimmed` reports the first path only, and `T13` alone says whether the run reached the ceiling at all.
+
+The two conditions that once read these tasks are retired with the rest of the bar (ADR 0110). What survives is the question they asked, which a reader still asks: at the ceiling, which arm loses more. Read lean-only silent loss against the control arm's own, never against zero (ADR 0087's 2026-08-21 amendment).
+
+### Task follow-up
+A second user message a *context-handling benchmark* task sends into the same thread, declared as `followup` in `tasks.toml`. Only `T14` carries one. It is what makes a *ceiling task* cross a turn boundary. The cross-turn trim runs at turn setup, so a single-turn task never reaches it.
+
+The driver posts it only once turn one has genuinely finished and holds no live event wait. A prompt landing mid-round would blur the two turns into one, and the task would measure nothing. It must also name the thread: `/api/v1/chat/stream` reads a missing `thread_id` as "mint one". The task's timeout covers both turns, and a first turn that times out sends no follow-up.
+
+### Cost per round
+A configuration's dollars over its rounds, both summed across its threads. Reported beside cache read and cache write per round, which are what tell a healthy cache from one that re-creates its prefix every round.
+
+It was a median of per-run ratios while the retired bar read it, because a median of two medians is a number no run had. With nothing dividing two arms, the pooled total is the honest figure and the per-task table carries the spread.
+
+It exists because *cost per run* charges the mode for the agent taking more rounds. Round count is variance rather than a property of the mode. The first pilot was at 1.42 per run, with three tasks supplying 94% of the excess purely on rounds, against 1.017 per round.
+
+Why both bases exist, from when a bar still read them (ADR 0087's fourth amendment): per run is the bill the user pays, and per round asks whether the optimisation worked. Both are still reported, and now nothing judges either. Input tokens per round are computed the same way.
+
+**Unmeasured cost** is the state a model priced at zero leaves behind. Every dollar figure is then $0.00, and any ratio taken over it divides zero by zero. `CostResult.cost_measured` is what tells free from cheap: false when the control arm cost $0.00. It survives the retired bar because the reader needs it just as much: a cost axis of zeroes says nothing was weighed, not that the run was cheap (ADR 0087's 2026-08-22 amendment). Rounds per task and input tokens per round are priced by nothing, so both stay readable.
+
+### Driven task status
+How the *context-handling benchmark*'s driver saw one task end, and what the results row records. `idle` and `idle-after-wake` are finishes and score their probes. `parked`, `timeout`, `empty-completion` and a settled status such as `failed` are not, so their probes are `void`.
+
+The pair exists because a thread parked on an *event wait* reads `status = idle` in the projection, ADR 0049 having retired `waiting_for_event`. Leaving at the first idle recorded a partial task as a clean one. So the driver reads `live_event_wait_count` beside the status, and keeps waiting while a wait is open.
+
+`idle-after-wake` means the thread parked and then finished. `parked` means the deadline arrived with the wait still open, which is a visible non-finish rather than a silent one. `empty-completion` means every attempt at a turn produced nothing, and it has its own entry: *unrecovered empty completion*.
+
+### Manipulation check
+The gate that proves the *lean arm* is actually running *self-curated context mode*. It reads the section list `ContextCaptured` already carries. Every round of the lean arm must carry a `Context Panel`, and no round of the control arm may. A violation aborts the repeat and is never recorded as a result, because a silent no-op flag produces a null that reads as a pass.
+
+ADR 0109 made it stricter in two steps. It reads the panel where it used to read the `Context Ledger`. And a panel is rendered on every lean round including the first, because it always states the budget. So the per-exchange narrowing is gone, and no round is left unasserted.
+
+It counts `producer = main_llm` rows alone. An *auxiliary model call* also writes `ContextCaptured` on the same thread, for the memory classifier, the title and the summariser. Each carries one section named for its purpose and never a panel. Without that filter the classifier's row lands first and fails the gate on every lean repeat.
+
+### Deferred-DMG release
+A release published while Apple's notarization verdict is still outstanding, with the signed-but-**unstapled** `.dmg` attached and labelled, then swapped for the stapled one when the ticket lands. Entered with `build-dmg.sh --defer-notarization` (via `release.sh --verify-build --defer-notarization`, which also works against an already in-flight submission and so rescues a Phase A stuck on a slow verdict); finished with `release.sh --attach-notarized <version>`. It exists because notarization gates exactly ONE artifact — the DMG a browser downloads. The headless tarball (`curl … | sh`) and the Tauri updater (`.app.tar.gz` + `.sig` + `latest.json`) are never quarantined, so Gatekeeper never assesses them, which is why existing users and terminal installs get the release immediately and unaffected. The state lives in the *staging manifest*'s `notarized` field, never in a flag, so the *notarization-pending banner*, the site link, and the deferred cleanup cannot disagree with the bytes; an **absent** key means notarized (the pre-2026-07-29 writer staged only after `Accepted`). A deferred publish deliberately does NOT clean up the Phase A worktree, staging, state file, notarize handle, or submitted-bytes pin — those are the attach step's only inputs, and a rebuild is exactly the cost being avoided. See ADR 0027 and `docs/plans/2026-07-29-deferred-dmg-release-mode.md`.
+
+### Notarization-pending banner
+The warning a *deferred-DMG release* carries on its GitHub Release body: the DMG is signed but has no Apple ticket yet, what to do to open it anyway (the five-step macOS Sequoia/Tahoe flow — the Control-click override was removed in Sequoia, so it is deliberately not offered), and the two paths that need nothing extra (the in-app update, the one-line installer). Composed by `release_notes_compose_pending` in `scripts/lib/release_notes.sh` from the staging manifest's `notarized` field, so it cannot be forgotten. It goes on the **Release body only** — never into `$NOTES_FILE`, which feeds `latest.json` and therefore the *in-app updater's* release notes, whose readers are unaffected by notarization; telling them to visit System Settings would be a lie. Removed by `release.sh --attach-notarized`, which rewrites the body with the plain changelog section produced by the same shared extractor (`release_notes_extract_section`), so the text it lands on is byte-identical to what the publish wrote.
+
+### Draft GA release
+The state every release now passes through. `release-to-lucidos.sh` creates the GitHub Release for `v<version>` with `--draft` and attaches the DMG + updater trio. It then gets the four per-platform tarballs and their `.sha256` sidecars onto it, publishes with `gh release edit --draft=false`, and emits *LucidosReleased*. So a release is COMPLETE at the moment it becomes public. Before 2026-08-04 it was published first and completed 11 to 35 minutes later (v0.21.0: published 15:49:28Z, Intel Mac tarball attached 16:24:14Z). Inside that window the advertised `curl … | sh` genuinely 404'd for whichever platform had not landed.
+
+The tarballs arrive one of two ways, and the log says which. Normally it ATTACHES the ones the *release candidate*'s own `release-tarballs.yml` run built during Phase A, an hour earlier. That path pins the run by `head_sha == RC_COMMIT`, re-verifies each tarball against its sidecar, and takes seconds (`release_draft_attach_from_rc_run`). Where it cannot be proven, for any reason, the release falls back to WAITING for the run the tag push started. That fallback is the original behaviour, and the slow one.
+
+The wait lives in `scripts/lib/release_draft.sh` and is bounded at 90 minutes. It watches the tarball run, so a FAILED build fails the wait at once rather than expiring against a website. It dispatches one backfill when a run finishes having attached nothing. It ignores `rc/`-branch runs, which attach nothing and would otherwise read as exactly that. Nothing is public while any of this runs, which is what makes it interruptible.
+
+`release.sh --publish-draft <version>` resumes from a draft whose assets may or may not be there, and finishes the job with no rebuild. A missing tarball REFUSES the publish; `--allow-missing-tarballs` is the only way past, and it is a decision a person types. Distinct from the *release candidate*'s `rc-<version>` draft, which is a gate artifact that is never published at all. See ADR 0042 and `docs/plans/2026-08-25-release-wall-clock.md`.
+
+### Recorded mirror-history exception
+A commit known to sit on the public mirror's `main` without a release of its own, recorded in `RELEASE_MIRROR_HISTORY_EXCEPTIONS` (`scripts/lib/release_tree.sh`) as `<40-hex sha>|<YYYY-MM-DD>|<one-line reason>` and subtracted from the commit count `release_mirror_history_is_complete` compares against the `v*` tag count. It exists because that check's second arm rested on "nothing in the pipeline can put an untagged commit on `main`", which is false for one shape: Phase A pushes its stripped commit to `main` before it notarizes, so a run that dies in `notarize` leaves a correctly-stripped public commit no release will ever name. The *in-flight* count covers the same two-push window for the run whose tag is still COMING; an exception is a commit whose tag is never coming. Different facts about different commits, so they are subtracted independently and compose. Seeded on 2026-08-11 by the abandoned first v0.26.3 Phase A (notarytool `abortedUpload`, superseded by the run parented on it), which left the mirror at 49 commits against 48 tags and refused every release; the leftover cannot be dropped, because it is the parent of the published v0.26.3 commit and removing it would change that commit's SHA and break every clone. **Verified, never trusted**: `release_mirror_history_exception_count` re-asks the live mirror both halves on every run (still an ancestor of `main`, named by no `v*` tag), because a bare recorded number is an unconditional -1 that silently absorbs a different stray commit the day the recorded one stops being what its entry describes. A **stale** entry refuses the run naming it rather than being skipped, in three forms: now tagged, no longer in `main`'s history, or an **abbreviated SHA** (git resolves short names so the ancestry half passes, while the tag half compares against 40-char `ls-remote` output and can never match, leaving an entry that verifies forever with half its verification silently not running). Tracked as a *temporary measure* with a real removal condition, since a future mirror rebuild would re-derive a chain with no untagged commits in it. See `.claude/rules/build-release.md` § "The mirror's `main` is a linear release history" and `docs/temporary-measures.md`.
+
+### Clamped divider
+The desktop pane-resize contract (`crates/lucidos-app/src/components/layout/splitHelpers.ts`; ADR 0056): a divider drag is clamped to the pane minimums AS IT MOVES, so the divider stops at the wall while the pointer keeps going, and nothing corrects it on release. The width the user drops is the width that persists. Both dividers work this way, the thread drawer's (`clampDrawerWidth`) and the split one between the Conversation and Canvas panes (`clampSplitRatio`), and so does the keyboard resize (`computeStepRatio` / `computeDrawerStepWidth`), which clamped first and which the drag was brought into line with. The minimums are all DERIVED from the root font size and live together in `store/paneMinimums.ts` (`minDrawerWidth` / `minThreadPanePx` / `minContentPanePx`, 312px, 300px and 360px at a 16px root): reading one is a DOM read, so the caller measures (`splitBounds()`) and the helpers stay pure. All three are the same on every desktop client, the drawer's included: it is sized around the packaged macOS build's traffic-lights lead in the browser too, so one workspace stops the drawer at one width wherever it is opened (ADR 0058). Scaled, the three stop summing under a 1280px screen from 150% ui-scale, which is what `clampToRange`'s empty-range branch answers: the leading pane keeps its minimum and the trailing one takes what is left. **A drag never collapses a pane** (collapse belongs to the toggles, `⌘⇧1` / `⌘⇧↵`, and the double-clicks), and that pairing is what makes the clamp safe rather than dangerous: the collapse states (`data-thread-collapsed` / `data-content-collapsed` / `data-thread-drawer-open`) flip at a ratio of exactly 0 or 1, a clamped drag cannot reach either, so the header icon groups they swap cannot dance between hosts mid-drag. While a drag is live, `data-pane-resizing` on `:root` disables the header/drawer geometry transitions so the header regions track the panes 1:1; an explicit ratio change (a toggle, a maximize, a keyboard step, a layout reset) animates through `.pane-animate` instead. Replaced the **deferred snap** on 2026-08-09: that contract let a drag land anywhere and corrected a below-minimum pane ~400ms after release, to its minimum or to hidden, which meant the divider moved after the user let go and a minimum could only be discovered by violating it.
+See also: `.claude/rules/frontend.md` § "Pane Resize".
+
+### Close path
+Which of three routes saw the software keyboard close. Carried as `path` on `keyboardCloseState()`, and written onto a `silent-since-keyboard` ledger line as `closePath` (`components/layout/keyboardCloseRelayout.ts`; ADR 0245). `resize` is the `visualViewport` event, the first responder. `wake` is the app ruling the keys gone on a resume, which iOS performs without firing a resize. `poll` is the scheduled reading finding a transition nothing announced.
+
+The third value is what the composer-wedge investigation reads for. Every other signal the page takes comes from an event. So "the page was never told" and "nothing happened" have been one silence for nineteen rounds. A wedged page keeps its timers while it takes no touch, which makes a reading possible where an event is not. A `poll` close is therefore direct evidence that WKWebView stopped delivering to the page.
+
+The poll rides the *Perf instrumentation* toggle and is off by default. The other two paths always run. A close is retired when a cover reading returns, so the field never describes a keyboard that has come back up.
+
+### Composer fold
+The `.prompt-actions-row` contract: it is ONE row, nothing leaves its box, and the way it gives way is to move members into a `⋯` overflow menu. Three mechanisms used to disagree about that. A sub-row lift and a `flex-wrap` on the right-hand cluster are gone, and the fold is the only one left.
+
+Exactly two members never fold: the control menu first and the send button last. Those two fit at any width the app supports, so a row too narrow for its members is not a state it can settle in. Everything between them folds.
+
+Fold order, first to fold: todo indicator, waiting indicator, WIP preview, attach image, clear draft. Then the banner's members: Diff, the standing apply, the change actions. Then the call toggle, and the follow toggle last. That is the row's own order, so a row with room to spare looks unchanged. The fold takes a PREFIX, so the last member standing is the one nearest the thumb.
+
+The two toggles fold LAST, which is what keeps their fixed second and third slots at every width that can show them. A slot the row cannot draw protects nothing.
+
+`computePromptCollapse` takes WIDTHS rather than counts, because an icon box sits beside an Apply split button several times its size. It walks every count from 0 to N and takes the smallest that fits. No rule says "never fold one": folding one icon saves nothing and will not fit, while folding one wide button saves its width.
+
+**A measured width cannot lie, because no member may shrink.** Every member is `flex-shrink: 0`. Without that, `.action-btn`'s `min-width` lets a button squeeze while its nowrap label spills, and the fold reads the squeezed box and folds nothing. Every other input is a count or a remembered width, never a read of the rendered set, so the decision cannot oscillate. A folded member's width is remembered by key, and the cluster's gaps are counted from the candidate rather than from the DOM.
+
+A foldable member carries its `data-role` and its `extraClass` on BOTH renderings, so one selector reaches it wherever it landed. A folded status readout says in words on its menu row what its colour and pulse said in the row. Its panel is mounted by the composer rather than by the control (`TodoPanelHost`, `WaitingPanelHost`), since the control unmounts when it folds. A menu row anchors that panel to the `⋯` trigger, which `OverflowMenuContext` carries.
+
+Implementation: `crates/lucidos-app/src/hooks/usePromptActionCollapse.ts`. Plan: `docs/plans/2026-09-19-the-composer-row-is-one-row.md`.
+
+### Native cursor mirroring (retired)
+A mechanism that shipped in v0.30.2 and was reverted the same day. It forwarded the hovered element's computed CSS `cursor` to `Window::set_cursor_icon` over IPC. The aim was to end a supposed race between tao and WebKit over the packaged app's cursor.
+
+**It never worked, and the race it targeted did not exist.** wry evicts tao's content view, so the invalidate the command triggers lands on a view AppKit holds no rects for. The real writer is WebKit alone, and it declines to set the cursor whenever any of four native guards holds. A restart later cleared the symptom in a bundle that still carried the mirroring, which confirms it was never the variable. ADR 0134 records the evidence and the guards; ADR 0129 is kept as the record of the wrong turn. The term survives here only so a reader meeting it in those documents can look it up, and no code implements it.
+
+### Deterministic repo id
+A *repository*'s stable identity: `repositories.id = uuidv5(REPO_ID_NAMESPACE, git root-commit SHA)`, falling back to `uuidv5(namespace, canonical path)` for a repo registered with no commits yet (`core::repositories::deterministic_id`; the root-commit SHA is read from disk by `git_ops::root_commit_sha` and stored in the `repositories.root_commit_sha` column). Because it is derived from the repo's git history rather than minted randomly, re-registering, moving, renaming, re-cloning, or re-seeding the same checkout yields the *same* id, so `thread_summaries.cc_repo_id` bindings never orphan. Replaces the former random `gen_random_uuid()` surrogate PK, whose regeneration across a checkout's rename/move history (e.g. cognos→lucidos→Lucidos) was the source of "(deleted)"/missing-repo badges in the drawer's repo filter (`repoFilters.ts` keys live-vs-deleted on id). `RepositoryStore::register` upserts keyed on this id and atomically collapses stale rows (a legacy random-id row at the same path; the same history registered at a different path), and announces the result: `RepositoryAdded` for the surviving identity, plus `RepositoryRemoved` for a collapsed id that just stopped existing. A git remote URL is *not* part of the identity (remotes get rewritten ssh↔https; local-only repos have none). One-time historical cleanup of already-orphaned bindings is the marker-guarded `EventStore::backfill_cc_repo_id_to_deterministic` startup step, and every `coding_agent_kind = 'lucidos'`/legacy-NULL thread targets the Lucidos source by definition, so it is re-pointed to the default repo's deterministic id.
+
+### Panel refresh contract
+What a *content pane* view owes the *pull to refresh* (`system-knowhow/glossary.md`) and the header's Refresh. Whatever part of the open panel owns fetched data registers a refresh action with `usePanelRefresh` (`hooks/usePanelRefresh.ts`). Each action must:
+
+1. settle only once the new data is on screen, or has failed visibly;
+2. keep loaded data on screen while it re-reads, never blanking to a skeleton;
+3. start a new read, never join a fetch that began before it was asked.
+
+`runPanelRefresh` (`store/panelRefresh.ts`) runs every action the open panel registered, together, one refresh at a time. It toasts each rejection by the noun it was registered under. A page with two data owners, such as Permissions' two allowlist editors, therefore registers two. A form holding an unsaved edit registers `null` until the edit is saved or reverted, as its SSE re-read pauses.
+
+Settings sections drawn by a function rather than a component are refreshed from `SETTINGS_SECTION_REFRESH` (`components/settings/settingsSectionRefresh.ts`). `store/__tests__/panel-refresh-coverage.test.ts` holds every menu item, overlay and settings subview as refreshable or static, so a new panel cannot skip the choice.
+
+A catalog read returns the engine's cached marketplace scan, so the Plugins panel keeps rule 3 by asking for a fresh scan (`rescanPluginCatalogAndSettle`). It settles on the first read after its request that finds no scan running. The scan's `PluginCatalogScanned` frame starts that read, and a reconnect does too, since SSE replays no frame.
+
+Two refreshes still break rule 3. The Marketplaces settings section and the Apps view call `refreshPluginCatalog`, which joins a read already in flight. Plan: `docs/plans/2026-09-27-app-pull-to-refresh.md`.
+
+### Panel preview
+The desktop client's URL preview, as the Rust side tracks it, in
+`crates/lucidos-app/src/panel_preview.rs`. A URL preview is a native CHILD
+WEBVIEW (`url-preview-*`) rather than a DOM iframe. WKWebView cannot render an
+arbitrary remote page inside our own document, and most sites refuse to be
+framed. The commands and events driving it keep the older `panel_webview` /
+`panel-url-changed` spelling.
+
+**One preview per WINDOW, hosted on the window that owns it.** The **owner** is
+the window whose page asked for the preview, and the owner decides when it
+dies: a navigation or a close of THAT window is what invalidates it. The
+**host** is the window the child is attached to, and it is the owner. So a
+preview is always drawn over the page that asked for it, and every panel
+command keys on its caller.
+
+`PanelPreviewSlots` is the map from owner window label to child webview label.
+It replaced a single process-wide slot, under which every child was parked on
+`main`: a second window's preview rendered over the first, and any page could
+move, navigate, hide or close a preview it did not own.
+
+Host and owner stay two words because they answer different questions, and one
+of them is what ADR 0140 is about: a HOSTING window stops answering tauri's
+`WebviewWindow`-flavoured lookups. Any app window can host one now, so that
+blindness is no longer confined to `main`.
+
+### Repo-encoded preview path
+The file-preview overlay path form that addresses a file inside a registered *repository* clone instead of the workspace data tree: `repo:<repoId>:<mode>:<repo-relative path>`. `<mode>` is `file`, `file#<ref>`, `diff` or `diff#<changeId>`. The change id rides inside the mode segment, so a diff preview survives nav-history persistence where the runtime-only `repoDiff` does not. `<repoId>` is the *deterministic repo id*. Built by `encodeRepoPath`, decoded by `parseRepoPath` (`crates/lucidos-app/src/store/repoPath.ts`), which is the **single predicate** for "is this a repo path". `ContentPane` routes a parsing path to `RepoFilePreview` and everything else to `FilePreviewInline`; `normalizeDataPath` passes one through instead of prefixing `artifacts/`; `openEncodedRepoFilePreview` binds `repoSource` to it.
+
+Every segment must be non-empty, because the form reaches the parser from OUTSIDE the app. It arrives through an app iframe's `lucidos.ui.navigate('file', { file_path })` (see `system-knowhow/js-sdk.md`) or an LLM `navigate_ui`. A partial encoding like `repo::file:x` would otherwise yield an empty repoId or an empty path. That opens a preview which can only 404, rather than falling back to the data-path preview.
+
+A `repo:` *link* in rendered markdown may name the repository by its registry `name` instead of its id. That covers a chat reply, a notification and a previewed artifact. `openRepoFileLink` (`store/actions/repoFileLink.ts`) resolves it by id first, then exact name, then name in any case, and opens the id-encoded path. It re-reads the registry before calling a repository missing, and toasts a missing or ambiguous one rather than guessing. The overlay path itself always carries the id.
+
+### Drawer grouping
+How the thread drawer groups its list: the *Folders grouping* or the *Ongoing grouping* (both in `system-knowhow/glossary.md`). It is `DrawerGrouping` in `store/store.ts`, persisted in `localStorage['lucidos-drawer-grouping']` by its one writer, `setDrawerGrouping`. The Ongoing grouping's selected group is `selectedOngoingGroup`, never null, persisted in `lucidos-drawer-selected-ongoing-group` by `setSelectedOngoingGroup`. An unknown stored value restores Folders and Blocked. So does a value from when the grouping was called Status or had an Idle group, and `attention`, Blocked's old name. `__tests__/drawer-grouping-owner-guard.test.ts` pins both owners.
+
+Design and decisions: ADR 0393, ADR 0394, ADR 0401, ADR 0409, `docs/plans/2026-10-08-drawer-folders-status-grouping.md`, `docs/plans/2026-10-08-drawer-grouping-followups.md` and `docs/plans/2026-10-10-agent-read-request.md`.
+
+**The grouping button** (`ThreadGroupingButton` in `components/layout/ThreadsHeaderControls.tsx`) swaps it, in the threads header on both layouts. One slot for two groupings: its glyph is the grouping a press goes to (`otherGrouping`), since `ThreadsPaneTitle` already names the one on screen (`GROUPING_LABEL`). Its two glyphs crossfade in one `.crossfade-glyph` stack, as Filter's do. The Blocked count (`blockedThreadCount`) rides it under Folders only (`groupingButtonBadgeCount`). A press into Ongoing also picks the selected group (`ongoingGroupOnSwitch`): Blocked when badged, else the stored group while it has rows, else the first group with rows, else the stored group.
+
+The header row holds two controls at each end: the toggle and Filter lead, Grouping and Search trail. `computeMinDrawerWidth` floors the drawer at those ends alone. The title is whole or hidden: a word wider than the room between the ends is marked `data-cramped` and fades out. The drawer itself holds only `.thread-drawer-tree`, with the list's `role="tree"`, its tab stop and its keys.
+
+**The Ongoing list** (`OngoingList`) reads `ongoingGroupLists`, the memoized `ongoingGroups()` in `family-graph.ts`, in the fixed `ONGOING_GROUPS` order. Each group reads its own predicate, so a tile counts exactly its rows, and Blocked matches its badge (`blockedThreadCount`):
+
+- **Blocked**: `threadIsBlocked`, ordered by `blockedThreads`.
+- **Review**: `threadInReview`, a settled thread with a ready change or a *read request* (`meta.readRequested`), ordered by `reviewThreads`.
+- **Drafts**: `draftThreads`.
+- **In flight**: `threadIsInFlight`, nested by `inFlightThreads`.
+
+A thread matching none is in no group. Only In flight is disjoint from the others.
+
+`OngoingTiles` always draws all four `OngoingTile`s in `.drawer-ongoing-tiles`, and only the selected group's rows follow. A tile's count stays blank until the threads load, so a cold boot never claims a group is empty. A selected group with no rows shows its own empty state. A click or Enter on a tile selects it and opens its first row (`pressOngoingTile`, ADR 0401). On the phone that open needs a group of exactly one (ADR 0409).
+
+←/→ step along the tiles, and ← from a row returns to its tile. The rows roll from under the grid on a switch (`useFlipTransitions`, keyed on the selection).
+
+The grid sticks on desktop. On the phone it scrolls with the rows.
+
+A Blocked or Review row opens through `openOngoingThread` (`landingGroupFor`), which lands on `landingTarget` rather than the saved reading position. From Blocked that is the open card or the failure. From Review it is the turn that proposed the ready change, else the newest turn. Show in Folders always switches to the Folders grouping (ADR 0410).
+
+**The thread filter** shapes the Folders grouping only. Its button shows only there: under Ongoing its `.filter-slot` fades out in place and goes `inert`. `store/effects.ts` closes the panel on a switch to Ongoing, and `openThreadFilterPanel` refuses there. The filter shortcut under Ongoing switches to Folders first.
+
+Distinct from the Rust `display_section` *REVIEW* section bubbling, which is untouched.
+
+### Thread filter panel
+The filter surface: which thread types the *Folders grouping* lists, plus Include deleted. It is `ThreadFilterPanel` (`crates/lucidos-app/src/components/layout/ThreadFilterPanel.tsx`), rendered INSIDE the thread drawer pane by `ThreadDrawer`, covering the thread list while it is up. One instance serves both layouts, because `ThreadDrawer` is the single component behind the desktop drawer column and the mobile threads pane.
+
+It is deliberately **not** an `<Overlay>`: a pane view floats over nothing, so it neither dismisses-and-swallows an outside click nor makes anything inert. Escape reaches it through a panel-less `overlayStack` registration rather than through an overlay panel. That registration follows the open STATE rather than the `openThreadFilterPanel` call. In `store/threadFilterPanel.ts` the signal, the persisted key and the stack entry move together, and only there. A panel restored open is never opened by a call, so it would otherwise be on screen and deaf to Escape.
+
+Being up is a state OF THE DRAWER, so it survives a reload the way the *drawer grouping* and channel selection do. The key is `localStorage['lucidos-thread-filter-panel-open']`, cleared rather than written `false` for the default, so a pristine state restores pristine. It survives a drawer collapse too: reopening the drawer lands back on the filters. Only the Escape entry follows visibility. `ThreadDrawer` reports it through `setThreadFilterPaneVisible`, so a panel on a collapsed drawer holds no stack entry and never eats an Escape.
+
+The threads header carries its title ("Filters") and its toggle, and that toggle is also the way out. While the panel is up the toggle is pressed (`view-selector-active`, from `filterButtonState`). Pressed means open and nothing else, and the glyph keeps reporting the filter, so a filtered list never looks like a panel left open. The panel itself carries neither a title row nor a footer, so while it is up its cover IS the pane's scroller. The cover takes `.thread-drawer-list`'s own padding, which puts the rows, headings and hover bands on the thread rows' own column and edges.
+
+The covered list stays mounted, but it renders and pages from the *applied thread filter*, which holds still while the panel covers it. So a run of ticks settles into one reload at the close. It replaced the anchored **Filter dropdown** on 2026-08-08. On 2026-08-09 it dropped its own Close footer for the header's Filter button. Its status list went to the *drawer grouping* (ADR 0393).
+
+### Thread filter cover
+The box the *thread filter panel* shows in: `.thread-filter-cover`, rendered by `ThreadFilterCover` (`crates/lucidos-app/src/components/drawer/ThreadFilterCover.tsx`) inside `ThreadDrawer`. It is the opaque, scrolling, `position: absolute; inset: 0` layer over the list. It and the panel inside it stay mounted, hidden while shut, so opening costs no render.
+
+The two views **dip through the pane background** under the *navigation cover*, the same both ways. The cover rises over the leaving view, holds opaque while the views swap, and clears off the arriving one. Never a crossfade: the panel wears the list's own geometry, so both drawn at once print rows and options on the same lines. The pane title switches word at once.
+
+A grouping change with the panel shut dips the same way, through a *leaving-view drawing* (ADR 0359).
+
+Everything else follows the open signal at once: Escape, the overlay stack, the drawer's keys and the pressed Filter button. Escape and the stack entry also wait for the drawer to be visible. A shut cover is hidden and `inert`, so it takes no pointer and no focus, and so is an open cover on a collapsed drawer. A swap during a dip restarts the dip. The plans are `docs/plans/2026-09-25-filter-transitions.md`, `docs/plans/2026-09-26-drawer-filter-swap-uses-the-navigation-cover.md` and `docs/plans/2026-09-26-drawer-filter-swap-dips-through-the-background.md`.
+
+### Leaving-view drawing
+An inert clone of the thread drawer's list, held over the list while a *drawer grouping* change dips (`LeavingViewDrawing`, `crates/lucidos-app/src/components/drawer/LeavingViewDrawing.tsx`, `.thread-view-drawing` in `drawer.css`). It plays the closing panel's part when only the grouping changes: the old list stays on screen until the dip's midpoint, and a CSS animation hides it there. The arriving list renders at once underneath.
+
+It is taken in `getSnapshotBeforeUpdate`, before the list's DOM changes, and drops `id`, `data-thread-nav` and `data-flip-id`, so no lookup finds it. A drawing still showing when a new dip starts re-keys itself and holds to the new midpoint. It ends on the cover's fuse. Reduced motion hides it from its first frame. ADR 0359 records why.
+
+### Crossfade stack
+A crossfade between a fixed set of layers stacked in one grid cell: `CrossfadeStack` (`crates/lucidos-app/src/components/shared/CrossfadeStack.tsx`) with `.crossfade-stack` in `host-components.css`. Every layer stays mounted and only the current one is opaque. A swap is then an opacity transition on nodes that already exist. It reverses mid-way and starts in the same frame as its neighbours, which a freshly mounted element may not: WebKit can start its animation a frame late.
+
+The threads Filter and grouping-button glyphs use it. Their wrapper, `.crossfade-glyph`, carries the header's translucency as `opacity` (`--header-fg-muted-alpha`) and paints its shapes opaque. Two translucent shapes stacked mid-fade would paint their overlap twice, and the funnel's rim would flare.
+
+### Applied thread filter
+The thread-filter selection the drawer LIST is currently rendering and paginating from: `appliedThreadFilter` (`crates/lucidos-app/src/store/appliedThreadFilter.ts`). It is one `ThreadFilterSelection` object carrying the channel set plus the trigger / repo / app id sets. It matches the live signals the *thread filter panel*'s checkboxes write (`threadChannelFilter`, `selectedTriggerIds`, `selectedRepoIds`, `selectedAppIds`), **except while that panel is up**. Then it holds its previous value and catches up in one pass on close.
+
+Why hold: the panel covers the list completely (`position: absolute; inset: 0` over the pane's opaque background), so a tick changes nothing the user can see. Read live, each tick re-ran the drawer's O(threads) categorization, rebuilt and re-diffed every row, and fired `reloadAfterFilterChange`. That reload fills page by page, one round trip each. The render half is synchronous, so the paint that shows the box as ticked waited on all of it.
+
+The reported symptom was the Coding Agent checkbox lagging behind the tap. It was worst on that row because coding-agent threads carry sub-threads. A collapsed family's descendants drop out of the rendered list, so the fill loop kept paging without the sentinel ever moving.
+
+It is the single source for display AND fetch (`currentThreadFilterParams`, and therefore `loadOlderThreads`' cursor and `refreshArchivedCount`). The cursor deliberately uses the same predicate as the display, so the two cannot drift.
+
+Its **identity** is the contract. `ThreadList` memoizes its categorization on the object, and its refetch effect fires on a change of it. So the sync compares CONTENTS, and leaves the same object in place when nothing really changed. That covers a panel opened and closed unchanged, and a selection toggled away and back.
+
+That identity is also what `stampLoadedFilterSelection` records and `filterChangedSinceLoad` compares, so one reference test replaces four. The reload is owed until a fetch settles for the selection the drawer is showing, whatever is mounted at the time.
+
+The sync `effect` lives beside the signal rather than in `store/effects.ts`, because it is the signal's contract. On a covered pass it reads only `threadFilterPanelOpen`, which unsubscribes it from the four live signals until the close re-runs it.
+
+Holding is only honest because `ThreadList` is the one surface that renders from it, and it is exactly what the panel covers. Everything else reads the live signals and answers the tap at once: the panel's own checkboxes, its option lists (`repoFilterOptions` / `appFilterOptions` / `triggerFilterOptions`), and the header's Filter glyph (`threadFilterActive`).
+
+### Edge swipe zone
+One of the two transparent host-owned strips pinned to the left and right screen edges on the mobile layout. They are `.edge-swipe-zone` + `.edge-swipe-left` (2.5rem) / `.edge-swipe-right` (1.25rem) in `crates/lucidos-app/src/styles/mobile.css`. The `EdgeSwipeZones` component (`components/layout/EdgeSwipeZones.tsx`) renders them as a pair.
+
+They are the topmost thing at the screen edge, ABOVE any app iframe, so a touch there reaches the host document instead of the frame. That lets `MobileSwipeContainer`'s touchstart handler see an edge touch and `preventDefault()` it. Nothing else suppresses WebKit's native back/forward navigation gesture in the standalone iOS PWA:
+
+- no CSS opt-out exists, since neither `touch-action` nor `overscroll-behavior-x` disables it;
+- WebKit's edge recognizer commits before the in-app 8px horizontal lock, so an `onTouchMove` preventDefault runs too late.
+
+They are no longer the only place a *pane swipe* over a frame can begin. An iframe captures every touch it covers, so code inside an app frame or the HTML artifact preview tracks drags and posts them up. One gesture model, `SwipeTouch` in `packages/lucidos-sdk/src/paneSwipe.ts`, decides the lock and the commit on both sides. The host reaches it through the `@lucidos/pane-swipe` alias.
+
+An app frame posts `lucidos:app:swipe` (`dx`) and `lucidos:app:swipe-end` (`paneDelta`), measured in screen coordinates because the frame moves with the drag. The host accepts them only from a current app frame. The HTML preview runs the same tracker from a stamped bundle (`preview-swipe.js`) and posts `swipe` / `swipe-end` over its nonce-checked bridge (`previewFrameBridge.ts`). It runs only on the phone layout, and it leaves every sideways drag to an artifact page wider than its frame. Both reach `MobileSwipeContainer` through one channel (`store/actions/frame-swipe-bridge.ts`), which moves the track with the same code as its own touches. The PDF and URL previews have no tracker: a native viewer or a foreign page owns their touches.
+
+The strip widths are mirrored by `EDGE_NAV_GUARD_LEFT_REM` / `EDGE_NAV_GUARD_RIGHT_REM`, the bounds of the pure `shouldSuppressEdgeNavigation` decision. Change a width without its constant and a touch lands on a strip the suppression does not cover. A band like that once popped the PWA out to the workspace gateway picker.
+
+Mounted in **two** places:
+
+- inside every `.mobile-swipe-pane`, rather than on the swipe container, so they share a stacking context with `.prompt-area` and its `z-index: 2` buttons stay clickable;
+- inside a *pseudo-fullscreen* app overlay, which is `position: fixed` at `var(--z-app-fullscreen)` over the whole viewport and covers the panes' own strips.
+
+**Mounted does not mean a pane swipe is available**: `shouldStartPaneSwipe` turns the pane swipe off entirely while an app is fullscreen. The strips there earn their place purely by keeping WebKit's gesture suppressed. They go `pointer-events: none` under `:root[data-keyboard-active]`, so an edge touch while the on-screen keyboard is up belongs to whatever is underneath.
+
+### History bounce
+The installed iOS app's rule that it never rests on a page it reached by going back: that page steps forward again at once. An inline `<head>` script in `crates/lucidos-app/index.html` does it, on a `back_forward` load or a back-forward cache restore, gated on `navigator.standalone`. The *edge swipe zone* guard cannot catch every touch. An iOS notification tap loads a new document, which leaves the previous page one entry back. A browser tab and an Android install keep their back, since there it is the user's. Why: ADR 0340.
+
+### Em-dash gate
+The deterministic enforcement of `.claude/rules/em-dashes.md`. A banned dash is an **unspaced** U+2014 EM DASH (a non-whitespace character touches it) or any U+2015 HORIZONTAL BAR. A spaced em dash passes, and U+2013 EN DASH is never checked.
+
+- **One definition.** `banned()` in `scripts/lib/em_dash_scan.sh`, which also owns the characters (as byte escapes) and the advice text.
+- **Write time.** `.claude/hooks/em-dashes.sh`, a `PreToolUse` hook on `Edit`, `Write` and `Bash`. The `Bash` arm covers `git commit`. It fails **open**, so a hook bug cannot brick a session.
+- **Review time.** `scripts/check-em-dashes.sh`, in `/harden` Phase 4.5 on every diff. It covers Codex, which has no hooks, and fails **closed**.
+- **Added lines only.** The rule is not retroactive. Rewording a line that keeps an unspaced dash counts as adding one.
+- **No exemption list**, by design. Tested by `scripts/lib/em_dash_scan_test.sh`.
+
+The chat renderer also spaces an unspaced dash that slips through (`spaceUnspacedEmDashes`). ADR 0332 records why spaced is allowed.
+
+### Early suite run
+The Phase 4.5 test suites that `/harden` starts at the Phase 1 kickoff, alongside the review phases, via `scripts/harden-suites.sh start --early`. Its result counts only if every path changed since its start commit is on the harden safe-path allowlist (`HARDEN_SAFE_PATHS` in `scripts/lib/harden_suites.sh`). Any other change voids it, and the suites run again. A fix outside the allowlist stops the run before the edit.
+
+The run skips the two Codex driver test modules, which `wait` runs alone after the Codex review is joined. Codex-backend runs have no early start. See [ADR 0292](adr/0292-harden-early-suite-run.md).
+
+### Merge-only diff
+A branch whose every commit since its last `/harden`, apart from commits already on `main`, is a merge. `/harden` Phase 0.4 detects it with `scripts/harden-scope.sh`, fed by `lucidos hardened sha`. The review then covers only the resolution (`git show --remerge-diff` per merge) and the *overlap*: files the branch changed that a merge also changed. Every suite the branch selects still runs. Anything the script cannot establish answers `FULL`, so a doubt takes the full procedure. See [ADR 0295](adr/0295-merge-only-hardening.md).
+
+### Incremental diff
+A branch with commits of its own since its last `/harden`, apart from commits already on `main`. The typical case is a fix made during a merge session. `scripts/harden-scope.sh` answers `INCREMENTAL` and lists each such commit, plus any merge and its overlap. The review then covers only those commits' patches and the merges' resolutions.
+
+Codex reviews against the hardened SHA only when no merge is in range. Every suite the branch selects still runs. A merge that brings in commits `main` lacks answers `FULL`. See [ADR 0315](adr/0315-incremental-hardening.md).
+
+### Prose gate
+The deterministic enforcement of `.claude/rules/prose.md` (write plain English, concisely, in a logical order). Four limits, all in one shared library, `scripts/lib/prose_scan.sh`: 20 lines per comment block, 25 words per sentence, 6 sentences per paragraph, and no ISO date in a comment. **Write time:** `.claude/hooks/prose.sh`, a `PreToolUse` hook on `Edit` and `Write`, failing **open** on infrastructure trouble so a hook bug cannot brick a session. **Review time:** `scripts/check-prose.sh`, run by `/harden` Phase 4.5 on every diff including docs-only, failing **closed**, which is what covers Codex (no hooks). Both are **diff-scoped, added lines only**, so the tree's existing comment lines decay as files are touched.
+
+The gate measures shape; the rule's headline outranks it. **The best comment is the one the code made unnecessary**: where the code already says it, the comment is deleted rather than shortened. An agent must never start a repo-wide sweep on its own, because that is an unreviewable diff colliding with every in-flight branch. The maintainer can **commission** one, and it then runs per file, one commit each, against a plan. See `docs/plans/2026-08-13-comment-sweep.md` for the commissioned run and the rules of engagement it works to.
+
+The sentence and paragraph limits come from ASD-STE100 Issue 9, Simplified Technical English. ISO 24495-1:2023 supplies the frame: a reader should find what they need, understand it, and use it. ASD owns STE's copyright and its text may not be redistributed, so the rule cites the limits and quotes none of it.
+
+STE's controlled dictionary is deliberately not adopted, since it would override the canonical terms `.claude/rules/glossary.md` owns. Three of its rules stay unmechanized, for want of part-of-speech tagging: the 20-word limit for an imperative step, active voice, and 3-word noun clusters. Those are a `code-review` angle instead. Sibling of the *em-dash gate*, built on the same two-layer shape. Tested by `scripts/lib/prose_scan_test.sh`.
+
+### Empty completion
+A chat agentic-loop turn that ends with no text and no tool calls. `classify_empty_completion` (`crates/lucidos-engine/src/engine/agentic_loop/helpers.rs`) classifies it by *why* it was empty, uniformly across providers and thread types. It first maps the raw provider finish reason through `normalize_finish_reason` onto `FinishClass::{Clean, Truncated, Blocked, Unknown}`. The mapping ignores case, so Anthropic `end_turn`, Gemini `STOP` and OpenAI `completed` all collapse to `Clean`.
+
+A **benign empty completion** is a `Clean` stop with no dropped-output signal: the model ended its turn and simply produced no text. It emits an *empty* `ResponseGenerated`, so the thread completes Idle with no red dot. The UI renders a neutral "empty response" note (`ResponseEvent { type: 'empty' }`).
+
+The genuine-failure shapes emit `ResponseFailed`:
+- `Truncated` or `Blocked`.
+- Dropped output: `output_tokens > 16` with neither thinking text nor a thinking block, or `unknown_sse_dropped > 0`. Both signals are Anthropic-only.
+- `Unknown`, as a fail-safe.
+
+See ADR 0009 and `system-knowhow/thread-events.md` (`ResponseGenerated` / `ResponseFailed` rows). Distinct from a *terminal* like `ResponseCanceled` (user) or `ResponseAborted` (system): an empty completion is the model's own clean end-of-turn.
+
+Right for the product, and wrong for an eval task turn. So the *context-handling benchmark* reads it per turn rather than per response, and retries it. See *unrecovered empty completion*.
+
+### ENGINE_BUILD_ID
+Deterministic-per-source id baked into the engine binary by `crates/lucidos-engine/build.rs` (git short SHA + a hash of any uncommitted engine-source diff; a source-tree hash when git is unavailable). Mirrors the gateway's `GATEWAY_BUILD_ID`. Printable via `lucidos-engine --build-id`; a running engine reads the on-disk binary's `--build-id` (behind an mtime cache, `LucidosEngine::engine_disk_build_id`) and `version_status` compares it against this baked const to detect that a newer version has been built — the dev half of *New version available / Switch to new version* (see `system-knowhow/glossary.md`). Byte-identical source → identical id → no spurious "new version". Consumed by `GET /api/v1/engine/version-status`; the packaged half of the flow uses the release updater instead. See `crates/lucidos-engine/src/engine/engine_version.rs`.
+
+**`update_available` means NEWER, not merely DIFFERENT** (`LucidosEngine::disk_binary_is_upgrade`). Co-located dev workspaces share one checkout and one *launch binary*, so the binary on disk is routinely written by something other than the workspace reading it — a peer's `--engine-build`, or a build whose `build.rs` ran before an Apply moved HEAD. A bare `disk != running` therefore announced an OLDER binary as an update, and *Switch* **downgraded** onto it; the downgraded engine was then genuinely behind HEAD, self-heal rebuilt, the switch re-surfaced, and the pair ping-ponged (the 2026-07-26 endless-toast loop). So direction is decided by git ancestry over the two ids' commit prefixes (`git merge-base --is-ancestor`, memoized per on-disk build id): a disk commit that is a **strict ancestor** of the running commit is provably older and vetoes the update, and the downgrade is logged once. Everything indeterminate — unrelated commits, a `src-…` id, git unavailable — keeps the difference test, because *missing* a real update strands the user on an old engine, the worse failure. The same method gates self-heal's "a fresh binary is already on disk" skip, so the two can't disagree, and `gateway_update_available` carries a hand-synced copy of it (`crates/lucidos-gateway/src/build_id.rs`) so the picker's reload can't re-exec the gateway backwards. See `docs/plans/2026-07-26-downgrade-switch-toast-loop.md`. The *cause* of a wrong binary being there at all — one uplift path shared by every cargo variant — is fixed separately by publishing a *launch binary* per build variant (ADR 0022); this guard remains the authority on direction.
+
+Because that binary-diff signal is silent when the background rebuild **fails or never runs** (the on-disk binary stays == running, so `update_available` never flips), `version_status` ALSO reports **`source_behind_head`**: the engine SOURCE is behind HEAD by a restart-requiring change (the SAME `engine_source_matches_head` git classifier the frontend-only-Apply INV-A veto uses), so a new engine version is discoverable even before a fresh binary exists. A dev-only **self-heal** driver (`self_heal_engine_version_if_needed`, on the ~10s periodic loop) then (re)triggers a coordinated background rebuild, bounded per HEAD, and serialized across co-located workspaces by a checkout-shared advisory build lock (`<repo_root>/.launch/.lucidos-engine-build.lock`, deliberately outside `target/`: `flock` binds to an inode, so a `cargo clean` deleting the file mid-build would let the next builder take an uncontended lock on a fresh one) so they never run concurrent cargo builds on the shared `target/`. So a *Switch* can't become a dead-end when a rebuild fails. See `docs/plans/2026-07-03-engine-version-switch-selfheal.md`. `source_behind_head` carries the same direction guard as `update_available`: its underlying two-dot `git diff` is symmetric, so an engine running a commit HEAD is an *ancestor* of is explicitly not "behind", since otherwise a workspace already ahead of its checkout would show a permanent pending-version toast and rebuild every 10s. And self-heal gives up for a HEAD the moment a rebuild it triggered **succeeds without advancing the binary**: that is a wedged build configuration, not a transient miss, so it logs once instead of retrying forever (a compile *failure* still keeps the retry budget).
+
+While a rebuild is in flight, `version_status` also reports what the build's row in the *activity group* shows. **`build_elapsed_ms`** is how long THIS engine's own build has been running, and **`pending_commits`** (`{ total, groups }`) is what a switch would bring. Both are dev-only and absent otherwise. They encode three rules.
+
+- **The elapsed time is a DURATION, not a start timestamp.** The client anchors it to its own `Date.now()` at receipt and counts up locally. So a disagreeing engine and browser clock can never produce a wrong or negative build age.
+- **`pending_commits` absent means unknown**, never "nothing pending". A `git log` that failed or timed out says nothing about what is coming (`.claude/rules/rust.md`: a probe that could not run is UNKNOWN). Only a present `total: 0` may be read as "nothing to bring".
+- **It describes rather than recites.** Merges are excluded (`--no-merges`), since an Apply lands as a merge whose content is already in the range. Every other commit is classified by its conventional-commit type into a `CommitGroup` (`new` | `fixed` | `improved` | `other` | `housekeeping`). Each group carries its own count and up to 5 `descriptions`: the subject with its type stripped and its scope kept. `housekeeping` (docs/chore/test/ci/build/harden) is counted with no descriptions.
+
+`total` is derived from the group counts by the one constructor, so the headline number cannot drift from the list under it. The lookup is TTL-cached and runs only while a build is in flight or the source is behind HEAD. So an idle workspace's ~4s-per-client poll forks no git at all. A co-located PEER's build spins the badge (`shared_build_in_progress`) but reports no elapsed, since its clock is not this engine's to read. See `docs/plans/2026-08-03-building-new-version-toast-details.md` and `docs/plans/2026-08-11-build-toast-scrolls-and-describes-the-build.md`.
+
+A frontend-only Apply has its own twin, **`frontend_refresh_elapsed_ms`**: how long this engine has waited for the build-watch to republish `dist/`. It is present only while that wait is the latest refresh generation, so a refresh the peer sync superseded reads as over. The badge narrates it as "Building frontend", and `FrontendRefreshStateChanged` pokes the client at its start and end. See `docs/plans/2026-09-27-frontend-build-indicator.md`.
+
+`pending_commits` leaves out **what the served client already carries**. The engine records the trunk HEAD each served snapshot was taken at, at boot and on every successful swap (`served_frontend_commit`). The list is every commit since the running engine that this commit lacks. So a frontend-only Apply served in-process drops out, while one INV-A held back, or whose rebuild failed, stays. See `docs/plans/2026-09-24-the-switch-lists-only-what-it-brings.md`. The headline reads "N commits come with the new version".
+
+### Shared build-watch
+The one `dev-build-watch.mjs` process per CHECKOUT that republishes `crates/lucidos-app/dist/` on every frontend source change (ADR 0014). A checkout-level singleton, not a per-workspace one: every workspace launched from the same checkout serves that same directory, so the first `--built` launch owns the watch and later ones reuse it (`start_frontend_built`). Its pid and log live in `crates/lucidos-app/.build-watch/`, and `scripts/lib/workspace.sh` is the only thing that starts or stops it.
+
+It has three states, and the distinction is load-bearing. Only one of them licenses telling the user their change will arrive on its own. **Running**: the pidfile names a live process. **Stopped**: the pidfile is gone, unreadable, or names a dead process, so nothing will republish until the stack is relaunched. **Unknown**: there is no `.build-watch/` at all, so this checkout never ran one, which in practice means packaged serving. `classify_build_watch` (`engine/frontend_refresh.rs`) is the one definition, and only Stopped reaches the wire, as `build_watch_stopped` on *FrontendUpdateStranded*.
+
+The directory outlives the watch, because the teardown removes only the pidfile. So a one-shot stack over a `dist/` that `web-dev.sh` once watched (e2e, `run.sh`) reads Stopped, which is the honest answer: nothing is watching it, and a relaunch is what republishes.
+
+**`.build-watch/status.json` cannot answer that question, and reading it as though it could is what produced the incident.** The status records the last COMPLETED build, so a watch that dies leaves a healthy `{"ok": true}` behind it. A teardown once killed the watch under a live workspace and `dist/` froze for five hours. Every frontend Apply in that window read the stale success, found no build error to name, and promised the change would appear on its own.
+
+The status file says *why the last build failed*; the pidfile beside it says *whether anything is still building*. Two questions, two files. See `docs/plans/2026-09-19-a-live-workspace-keeps-its-build-watch.md`.
+
+**Teardown is ref-counted, and the authority is a live engine rather than a marker file** (ADR 0226). `teardown_shared_build_watch_if_idle` takes two keep-alive votes, and either alone spares the watch: the `frontend.pid` marker scan (`running_frontend_workspaces_in_project`), and `engines_serving_checkout_dist`, which asks the process table for a live `lucidos-engine` whose `LUCIDOS_STATIC_DIR` falls inside this checkout. The second exists because only `start_frontend_built` writes a marker. An engine the gateway started (a lazy start, the restart control API, any *Switch to new version*) therefore carried none and was invisible. An unreadable process table is unknown and never authorizes the kill, and every refusal prints which vote spared the watch.
+
+### Pending engine version
+A new engine version that exists in SOURCE with nothing built behind it: `source_behind_head` with no `update_available`, no build of ours in flight, and no co-located peer holding the shared build lock. The third thing the *brand badge* can say, after busy and ready, and deliberately the quietest: a dot rather than the ready `!`, because it reports a fact rather than an action that is waiting. Its own surface (`engineVersionPending` in `store/store.ts`, the pending branch of `pollEngineVersion`), and distinct from *ready* in the way that matters to the user: ready means "there is something you can switch onto right now", pending means "there is new code, and it has not become a version yet". Offering a Switch here would respawn the same engine.
+
+It is announced by the same keyed toast the Switch uses. That sharing lets one turn into the other in place when a build lands.
+
+What makes it dismissable is the **announced engine version id**, the identity of the version the toast is about. That is the `disk_build_id` when a build is switchable, and the checkout's **`head_commit`** when the version exists only in source. See `noteAnnouncedEngineVersion` and `wasEngineVersionDismissed` in `hooks/sw-update.ts`. They share one preference whose stored key still says `switch`, so existing dismissals survive the widening.
+
+Until 2026-08-13 the pending case had no id, so its X hid the toast and the 4s poll drew it again. The poll may now CREATE the toast only when it has not been deferred. Otherwise it only UPDATES one already on screen, the rule *background activity* follows, so it never resurrects what the user closed. The pending row in the *activity group* is how they ask for it back.
+
+### Wedged rebuild
+A *pending engine version* that rebuilding has been PROVED unable to deliver: a build for the checkout's current HEAD already finished successfully and produced nothing switchable, so re-running it compiles the same source and lands in the same place. Reported as **`rebuild_wedged`** on `version_status` and derived by one pure predicate, `rebuild_is_wedged` (`engine_version.rs`), which the self-heal driver's own give-up is also expressed in terms of so the wire and the driver cannot disagree.
+
+**The verdict is the engine's to make, and it is scoped to a HEAD.** `BuildState::Ready` carries the `built_head` the build was STARTED from (started-from, or an Apply landing mid-build would make the finished build claim a commit it never compiled), and that is the only reason the question is answerable: a frontend deriving it from `build_state === 'ready'` alone would call a workspace wedged when a build merely predates newer commits, and refuse the rebuild that would in fact help. Commits landing after that build therefore re-arm it, and an unknown on either side is not a proof, so it falls to false and keeps the escape hatch offered.
+
+What it changes is the advice. The pending toast normally carries *Rebuild*; a wedged one withholds it, turns `warning`, and names the relaunch instead, because pressing the button runs a few-second no-op build and puts the same toast straight back (the loop reported on 2026-08-13). The badge tints amber for the same reason: this one will not clear on its own. The chat agent's ENGINE BUILD prompt section carries the case too, so it stops advising a Switch or a Rebuild that cannot work. The canonical cause is ADR 0063's one-shot transition, where the running engine watches a launch path nothing will write again; see `docs/plans/2026-08-13-pending-engine-version-is-a-first-class-surface.md`.
+
+### Joined build
+An engine background build that an Apply or a self-heal tick arrived at while it was running (`engine::background_build`, ADR 0412). The request leaves the build alone, sets no state and emits no `EngineBuildStateChanged`. When the build finishes, the task asks whether its result covers HEAD: the published binary's commit for a success, the started-from commit otherwise. If a restart-requiring change sits between that commit and HEAD, the same task builds once more, still `Building`. So any number of joins costs at most one follow-up.
+
+Distinct from a **restarted** build, which only the explicit Rebuild (`POST /api/v1/engine/rebuild`) causes: that aborts the build in flight and SIGKILLs its process group.
+
+### Restart intent
+The engine's record that a HUMAN asked for the teardown it is about to undergo, and which device they were on: an actor stashed at restart-REQUEST time (`stash_restart_actor`) and read back at ACTUAL teardown (`begin_teardown` → `abort_in_flight_for_restart`). It exists because `SIGUSR1` carries no sender, so without it the engine cannot tell a restart somebody clicked from a crash, and *cause-gated resume* (below) turns that difference into what the user sees: `paused` + "Paused by restart" + auto-resume, versus `failed` + "Response interrupted" + a manual Continue.
+
+The **teardown actor** is that same answer, spent once and then held for the whole teardown (`open_teardown` moves the stash into `LucidosEngine::teardown_actor`, which every later `EngineShutdown` emit reads). It is a distinct field because *who tore the engine down* is a property of the teardown, never of when a thread became in-flight, and three sites emit that boundary: the pre-emit `abort_in_flight_for_restart`, the `shutdown_active_threads` fallback for a chat thread that reached `processing_thread_ids()` after the pre-emit's snapshot, and `emit_stop_terminal`'s abort arm for a coding-agent session registered after `shutdown_agent_sessions` took its flag pass. Until 2026-08-07 only the first had the actor and the other two hardcoded `MessageOrigin::system()`, so one *Switch to new version* produced two verdicts: a chat thread re-entered by an `await_event` delivery 1.5 seconds into the teardown got "Response interrupted" and a manual Continue while its two siblings got "Paused by restart" and resumed by themselves. The stash is still *spent* at teardown, so a later teardown nobody asked for cannot inherit a device actor; what changed is that spending it no longer means losing it. See `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`.
+
+Those three sites are the ones that emit *during* the teardown. A **fourth** speaks about the same teardown from the NEXT boot: `settle_unresumed_switch_threads`, the floor that withdraws a resume promise this boot could not keep (ADR 0045). A boot cannot read `teardown_actor`, since that lived in the process that died, so it inherits the actor off the switch abort it is withdrawing, alongside the `request_event_id` it already took from the same row. Both fields describe the teardown rather than the withdrawal, and the selection predicate (`SWITCH_TEARDOWN_ABORT_SQL`) matches only a device actor, so the human is always there to inherit. It hardcoded `MessageOrigin::system()` from 2026-08-05 to 2026-08-09, which is why a user's own switch could still come back as "⚙ System / Response interrupted" over a red thread after the 2026-08-07 sweep: the sweep covered the teardown-time emits and this one is on the boot path. The `RecoveryAfterRestart` cause is unchanged and still does the work of re-arming Continue and settling `failed`, because *who* ended the turn and *whether anything is bringing it back* are separate axes.
+
+Three producers, one per way a user can ask this engine to go down. All three land in the same slot, so nothing downstream can tell them apart. The in-workspace *Switch to new version* stashes in its own handler, `/api/v1/restart`, then asks the gateway to respawn the stack. The **gateway workspace picker's Restart / Stop** goes the other way round. The picker sends its device id on the control request. The gateway then POSTs `/api/v1/internal/restart-intent` on the engine's own port, immediately before it signals the process (`stack::notify_restart_intent`).
+
+That notify is best-effort and bounded (2s), because the restart must happen whether or not attribution does. It is awaited rather than spawned: losing the race to the signal would silently restore the crash shape.
+
+The **packaged desktop client** is the third producer, and the only one that is not a gateway. `launchctl kickstart -k` and `launchctl bootout` reach the engines as a bare `SIGUSR1` through the service supervisor. There is no control-plane hop to carry a device, so `desktop::announce_restart_intent` POSTs each running engine directly. It uses the port that workspace's `.lucidos/ports` names, and the id from the client's own slug-to-device map. It runs immediately before the launchctl call, and covers the app update, *Switch to new version*, *Restart Engine* and *Quit and Stop Background Service*. ADR 0203 records why it does not route through the gateway.
+
+Absent attribution stays absent, which is the half that keeps the loop-safety guarantee. Nothing stashes for a crash, `stop.sh`, a bare external `SIGUSR1`, or the gateway supervisor's health-driven respawn. None of them names a device. The gateway skips the notify entirely without one, and the engine refuses a call that carries none. An `Api` actor is not the fingerprint, so stashing it would promise no resume while replacing an honest System attribution. The endpoint also refuses any request that arrived through the gateway proxy.
+
+A page on the gateway origin could otherwise set the actor and defeat exactly that protection. Precedence between producers is **first writer wins** (`stash_first_restart_actor`). The switch stashes before it triggers the gateway's notify, so the click's own actor survives. That rule is only safe because a stash whose restart never happened is cleared by the caller that made it. Every respawn failure in `restart_engine` leaves the process running. An abandoned stash would then not merely mis-attribute the next teardown: it would REFUSE that teardown's own actor.
+
+The packaged client is the one producer that cannot clear what it stashed, since the stash lives in another process. It announces immediately before the launchctl call, so only launchctl failing can strand one. That case is logged and left: a stale device actor and the device actor it would refuse give the same verdict.
+
+### Cause-gated resume
+The rule that a thread interrupted by an engine restart only **auto-resumes** when the restart was a **user-initiated switch** (or another *restart intent*, above). The fingerprint is a teardown `ResponseAborted` that is BOTH `cause = engine_shutdown` AND device-attributed, with no newer start event. That is `switch_was_user_initiated` in `agent_recovery/recovery.rs`, the single definition, exposed to both resume gates as the `SWITCH_TEARDOWN_ABORT_SQL` + `THREAD_START_EVENTS_SQL` fragments. **Both halves of the fingerprint are load-bearing:** `AbortCause::StaleSettle` deliberately carries the actor of the user button that exposed a stuck row (Stop / Apply / Discard / Archive / Interrupt, via `settle_stuck_running_thread`), so an actor-only predicate reads a user *Stop* as a switch and re-runs work the user just abandoned.
+
+Two halves consume it. **Coding-agent threads** queue a `ContinuationRequested{reason: auto_resume_after_switch}` (`enqueue_switch_resume`, emitted from `main.rs` after the spawn dispatcher subscribes) and re-enter via `--resume`. **Chat / trigger threads** are selected at boot by `chat::recovery::switch_resume_candidates` and driven through `continue_chat` — the same entry point the manual **Continue** button uses, so the resumed turn gets the identical `ContinuationStarted` boundary and side-effect engine note. That pass runs later in boot than the coding-agent one (after `thread_queue.spawn_settle_subscriber()`): a chat resume re-enters the agentic loop directly and immediately reads as `running`, so the settle subscriber must already be live to reconcile its queue slot, and it must follow `recover_orphan_tool_calls` or the re-entered turn rebuilds an unpaired `tool_use` block.
+
+A **crash / OOM / panic / agent-killed** engine leaves no such boundary, so the thread keeps the manual **Continue** affordance (for coding agents, the Phase 5.3 `engine_restart_interrupt` idle) and is NOT auto-resumed: work that may have crashed the engine can't loop. The start set counts `ContinuationStarted`/`OrphanRecoveryStarted` so a consumed switch-abort can't re-fire (the loop-breaker), and because `continue_chat` emits `ContinuationStarted`, chat inherits that loop-breaker unchanged. A thread parked on an unanswered `UserQuestionAsked` is preserved by recovery either way (`thread_has_unanswered_question`) and is structurally excluded from both resume gates (no abort was ever emitted for it): answering resumes it instead. "Parked" is strict: the question must still be the newest event on the thread. Anything in `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES` landing after it means the agent raced past, the card is already dead client-side, and the thread goes back through the ordinary abort-plus-Continue path.
+
+A switch teardown therefore reads as a **resume promise**. The status, the UI and the boot all honour it through the one predicate.
+
+- **The projection** reads it as `AbortCause::promises_auto_resume`. It writes the *paused* **status verdict** for exactly this fingerprint, so `paused` never appears on a turn nobody is coming back for. Everything else settles at `failed`, in the Blocked count, with its Continue button.
+- **The UI** mirrors the same fingerprint in TypeScript: `abortPromisesAutoResume` in `store/thread-events/exchange-render.ts`, consumed by `continuableAbortIndex`, and `isSwitchTeardownAbort` where it is defined. It **withholds the Continue button** on a switch-teardown abort, because the engine is already resuming that turn. Offering the button races the engine's own recovery. That happened once: a click nine seconds into a restart turned "Resumed after engine restart" into a human "Continued the response".
+- **The engine keeps or withdraws the promise**, never a timer in the browser. A switch that triggers a rebuild can leave the engine down for minutes. Any wall-clock guess would re-show the button while the resume is still pending.
+
+`settle_unresumed_switch_threads` runs last in the boot sequence, after both drains. It emits a fresh `ResponseAborted { RecoveryAfterRestart }` for any thread still holding an unkept promise:
+
+- over the chat resume cap;
+- a `continue_chat` that errored;
+- a `ContinuationRequested` that failed to persist;
+- a candidate scan that failed;
+- a branch recovery skipped;
+- an archived thread neither drain selects.
+
+Archived threads are in scope here on purpose, though every other sweep excludes them. The floor emits no work and cannot resurrect the row. Leaving one out was a permanent dead end, since nothing else would ever restore its button. That boundary is not a switch abort, so the newest-abort scan re-arms Continue on its own. The status then follows it off `paused` onto `failed`, which makes a withdrawn promise visible instead of leaving the pause glyph in place.
+
+It excludes the resumed threads **by id** rather than by query. A coding-agent resume has only emitted `ContinuationRequested` at that point, and that type is deliberately absent from the start set.
+
+### Status verdict
+A `thread_summaries.status` value that states how a turn ENDED, as opposed to a resting state the next event may overwrite. Two of them: `failed` (the turn errored, or was interrupted with nobody coming back for it) and `paused` (the user's own *Switch to new version* interrupted it and the engine is resuming it; see *Paused (thread status)* in `system-knowhow/glossary.md`). Listed once in `PRESERVED_STATUS_VERDICTS` and enforced by `preserving_verdict` (`engine/event_bus/mod.rs`), which every status write that merely *closes out* a turn routes through: the trailing activity stream, `CodingAgentIdled`, `SessionEnded`, `ResponseCanceled`. Only a real start event clears one. The guard exists because a coding-agent turn keeps emitting after its terminal (the subprocess outlives it and the drain keeps forwarding), and for `paused` the exposure is sharper still: recovery emits the closing `CodingAgentIdled` itself, one boot later, so nothing in the turn's own lifetime protects the verdict. `last_revived_at` skips exactly the same set, so a preserved verdict does not reshuffle the IN PROGRESS sort order. Written by `AbortCause::status_sql()`, which keys the failed-vs-paused split on `AbortCause::promises_auto_resume()`: `paused` is the *promise* of an auto-resume, so it needs the abort's ACTOR as well as its cause, and it is the same predicate that withholds the Continue button on the frontend. It keyed on `AbortCause::is_transient()` until 2026-08-06, which had no actor axis and so read a crash as a pause.
+
+**The set is exactly two, and `ChangeProposed` joins the writes that route through the guard.** A coding-agent session commits and proposes on its way out, seconds after the teardown abort. That write is a trailing event like the drain. A third verdict value is not a widening of the set but a hole in it. `status_sql` used to answer `waiting` whenever a change was pending, and the drain overwrote that within milliseconds. The ordering the override expressed is kept, in the frontend's `resolveVisualStatus`, which ranks both verdicts above the changes dot.
+
+### Chat resume anchor
+Which `request_event_id` a re-entered chat/trigger turn is stamped with, and therefore which exchange the resumed work renders under. It is `ChatResumeAnchor` in `engine/chat/rerun.rs`, consumed by the single re-entry site `spawn_chat_resume`. Two forms.
+
+**New boundary**: the manual **Continue** after a genuine interruption. The previous turn really ended (a `ResponseAborted` sits in the timeline), and the user asked for a new attempt. So the resume opens its own boundary and anchors on it. That boundary is `ContinuationStarted` ("Continued the response") plus the engine note as a `PromptInjected` ("Reminded the model about N prior tool calls").
+
+**Existing turn**: the answer-driven resume of a thread parked on an unanswered `ask_user_question` that a restart *preserved*. No abort was emitted (see *cause-gated resume*). Nothing was interrupted from the user's point of view, and nothing needs their action. So the resume emits **no** boundary and anchors on the turn that asked. The resumed reply then groups under the question card exactly as it would have without the restart. This is the chat parity of the coding agent's silent `--resume`.
+
+### Engine supervisor
+Bash wrapper (`scripts/lib/engine_supervisor.sh`, function `run_supervised`) that runs the engine binary in a restart loop. SIGKILL / OOM / panic exits trigger an exponential-backoff respawn (1–30 s) and rewrite `engine.pid`; clean exits (0 / 130 / 138, i.e. `graceful_shutdown` or SIGUSR1/SIGINT defaults) break the loop. Traps SIGTERM/SIGINT on itself so `web-dev.sh`'s `kill_stale_processes` (which `pkill -P`s the supervisor as a direct child) forwards SIGUSR1 to the engine and exits cleanly instead of respawning the engine that's about to be rebuilt. The pid the supervisor writes is always the *live* engine, so `stop.sh`, `is_protected_host_pid`, and `kill_stale_processes` keep working across restarts. Wired in from `start_engine` (`scripts/lib/workspace.sh`); exported as `ENGINE_SUPERVISOR_PID` for `web-dev.sh`'s wait branch. Call it the **engine supervisor**, never "watchdog" or "babysitter" — the canonical noun lines up with the file/function/variable names. The "never call it watchdog or babysitter" rule applies to *this* concept (engine-binary respawn) only. The *in-loop watchdog* and *external watchdog* inside *agent session* are canonically watchdogs — they watch for stuck Lucidos *agent sessions* and emit `ContinuationRequested`, never restart the engine.
+
+### Engine startup lease
+A per-database Postgres **session-scoped advisory lock** each *engine* holds on a dedicated connection for its entire process lifetime, so a freshly-spawned engine never runs its startup reset / recovery sweeps against a database the *previous* engine is still mutating. Acquired in `main.rs::run` (before any reset/recovery) via `crate::engine::startup_lease::acquire_startup_lease` and held as a `run()` local; released only when `run()` returns — i.e. after this engine's own graceful shutdown (`abort_in_flight_for_restart` + `shutdown_agent_sessions`) has persisted, or instantly when the connection dies on a crash. This exists because a respawn is **not** atomic: the *workspace gateway*'s `respawn_stack` spawns the new engine before the old one exits (it reaps the old child in a detached task), so without the lease the successor's `recover_orphaned_worktrees` read state before the predecessor's device-attributed switch-abort boundary landed (auto-resume misfired to manual Continue) and before its interrupted *agent session* subprocesses finished draining (their late no-actor activity events re-projected the thread to a phantom `running`). The key is a database-scoped constant (each workspace has its own database, so no cross-workspace collision). **Fail-open + bounded**: if the lock is still held after `DEFAULT_MAX_WAIT` (45 s, well inside the gateway's 120 s `BOOT_GRACE`), or the lease connection can't be opened, the engine logs and proceeds *without* serialization (degraded — a hung predecessor must never wedge boot). Distinct from the *engine supervisor* (restart loop) and the *gateway supervisor*: those manage the process lifecycle; the lease serializes what a booting engine does *inside* that lifecycle. See `docs/plans/2026-07-01-engine-startup-lease-recovery-race.md`.
+
+### Launch binary
+The copy of `lucidos-engine` / `lucidos-gateway` / the `lucidos` CLI that a workspace actually **launches**, published by `build_or_find_engine` (`scripts/lib/workspace.sh`) into `.launch/<profile>/<variant>/`, where `<profile>` is `debug` | `release` and `<variant>` is `plain` for a default build or a slug of `ENGINE_BUILD_FEATURES` (`e2e-test-hooks`). `ENGINE_BIN` / `GATEWAY_BIN` / `LUCIDOS_ENGINE_BIN` and the engine's own `current_exe()` all resolve here. Distinct from **cargo's uplift path** (`target/<profile>/lucidos-engine`), which every cargo variant in the checkout writes to and which nothing launches from any more: a workspace-scope `cargo test`, an e2e feature build, and a build whose `build.rs` ran before an Apply moved HEAD all compete for that one path, so launching from it ran (and compared `ENGINE_BUILD_ID` against) a binary from another commit or another feature configuration: the cause half of the 2026-07-26 downgrade/toast loop. A launch dir is written **only by completed builds of the same profile AND variant**, published by temp-file + atomic rename (a failed publish leaves the previous binary intact, because the launch path must never go missing), verified against HEAD with one bounded rebuild, and signed with the stable dev identity. Staying inside the CHECKOUT is load-bearing, but staying inside `target/` is not (ADR 0063): *repo root* resolution walks `current_exe()`'s ancestors for `scripts/web-dev.sh` and so is indifferent to which top-level dir holds the binary, and ADR 0021's worktree refusal is a pure substring test for `/.lucidos/worktrees/` on `LUCIDOS_ENGINE_BIN`. Both hold for a checkout-local dot-dir, and the dir sits outside `target/` precisely so a `cargo clean` cannot delete the `lucidos` CLI the engine puts on PATH for every spawned trigger and coding-agent session (the 2026-08-13 eight-hour outage). Reclaim the disk with `rm -rf .launch`. See ADR 0022, ADR 0063, and `docs/plans/2026-07-27-launch-binary-published-per-variant.md`.
+
+### Gateway supervisor
+Dev-only bash wrapper (`scripts/lib/gateway_supervisor.sh`, function `run_gateway_supervised`) that runs the **machine-global workspace gateway** binary in a restart loop. Same respawn shape as the *engine supervisor* (exponential-backoff respawn on SIGKILL/OOM/panic, rewrites `gateway.pid`, clean exits 0/130/138 break the loop, writes a `gateway.last-death.json` sidecar) but **deliberately decoupled from it**, with the opposite signal policy: it `trap '' SIGHUP SIGINT SIGTERM` — IGNORING terminal/launcher signals — so closing the launching terminal, Ctrl-C on `web-dev.sh`, or a stray SIGTERM can't orphan the shared gateway. The only legitimate stop is SIGUSR1 to the gateway *child* (the gateway ignores SIGTERM and exits 0 on SIGUSR1; `start_gateway`'s `-b` stop + port-reclaim do exactly that). Wired in from `start_gateway` (`scripts/lib/workspace.sh`) and launched `disown`ed with `ENGINE_SUPERVISOR_PID` left empty, so `web-dev.sh` never `wait`s on the daemon. This exists because the gateway is one shared daemon fronting every workspace, not a per-workspace process tied to a dev session. The **packaged** app needs no bash equivalent — there the Rust `--service` process (`crates/lucidos-app/src/desktop.rs::run_service`) supervises the gateway under launchd `KeepAlive`. Call it the **gateway supervisor**; keep it distinct from the *engine supervisor*.
+
+### GitAnswer
+The tri-state result of a yes/no question the engine asks git (`engine/git_ops/mod.rs`): `Yes`, `No`, and `Unknown`. **`Unknown` means git could not be asked at all** (spawn failure, or the call exceeded `GIT_TIMEOUT`), which is routine while the host is saturated and NOT the same as git answering "no". Produced by `git_answer` / `git_answer_with` (exit status is the answer) and `git_answer_when_ok` (a non-zero exit is a failure rather than an answer, as with `git status --porcelain`, which exits non-zero when the path is not a work tree at all). The type deliberately has no `Into<bool>`: collapsing it goes through `GitAnswer::or_unknown(true|false)`, which forces the call site to name the side `Unknown` falls to, in the open where a reviewer sees it. The rule for picking that side is that **an unanswered probe must never authorize a destructive or discarding action** (`.claude/rules/rust.md`); the whole type exists because a timed-out `git rev-parse` read as "this branch and this worktree are gone" and the recovery path that followed ran `git worktree remove --force` over a live coding-agent worktree on 2026-08-03. Every current predicate and its chosen default are tabulated in `docs/plans/2026-08-03-unknown-git-state-must-not-delete-worktrees.md`.
+
+### WorktreeLookup
+The tri-state answer to which worktree holds a branch (`engine/git_ops/worktree.rs::find_worktree_for_branch`): `Found(path)`, `NotFound`, and `Unknown`, the path-carrying sibling of *GitAnswer*. **`Unknown` means git could not be asked**: `git worktree list` failed to spawn, exited non-zero, or exceeded `GIT_TIMEOUT`. Folding that into `NotFound` handed four destructive arms a probe that never ran. They force-remove a live hardening worktree, downgrade a Tier 2 merge to the temp-tree path, move a discarded branch ref, or close a conflict duty. There is no collapse to `Option<PathBuf>`, so each caller matches three arms and logs the branch its `Unknown` skipped. Every site and the arm it refuses are tabulated in `docs/plans/2026-08-24-find-worktree-for-branch-is-a-tri-state.md`.
+
+### ShortThreadLookup
+The tri-state result of resolving a worktree directory's 8-hex thread-id prefix back to a thread (`engine/worktree_cleanup_ops.rs::lookup_thread_by_short`): `Found(uuid)`, `NotFound`, and `Unknown`. The DB-side sibling of *GitAnswer*, and it exists for the same reason: **`Unknown` means the question could not be answered** (a sqlx error, or a prefix that matched more than one thread), which is NOT the same as answering "no such thread". The distinction is load-bearing because the two answers route to opposite arms of the *worktree reclamation* sweep: `NotFound` reaches `try_orphan_path`, the one tier that removes without consulting `active_threads::is_active`, while `Unknown` skips the entry entirely. Folding both into a bare `None` meant a Postgres blip during the 15-minute sweep could `git worktree remove --force` the worktree of a live coding-agent session parked on a question. `inventory_worktrees` skips `Unknown` on the same footing, so the disk-usage figure and the sweep agree about what they can see. Same rule as GitAnswer: an unanswered probe never authorizes a deletion.
+
+### Host-pid kill guard
+`is_protected_host_pid` (`scripts/lib/ports.sh`) — the check that decides whether a pid is a live Lucidos host process the dev scripts must never signal. Consulted by `kill_unprotected_pids`, by `_try_reclaim_stale_lucidos_on_port` (the only path that sends the engine's real stop signal, `kill -USR1` — it ignores SIGTERM), and as a backstop by `webkit_reaper.sh::reap_once`. **Four arms**, and the split between them is the point: `LUCIDOS_HOST_PID` / `LUCIDOS_FRONTEND_PID` and a pidfile scan of `<home>/workspaces/*/.lucidos/{engine,frontend}.pid` read state the **caller owns** and can switch off; the **ancestor** arm (this process and every pid it descends from, a cached `ps -o ppid=` walk from `$$`) and `pid <= 1` **cannot be defeated by the caller**, because a process cannot unset its own parentage. The pidfile scan also covers the **password-database home** (`dscl` / `getent`, never `eval`), so reassigning `HOME` doesn't hide sibling workspaces' engines either. The two undefeatable arms exist because both original arms failed open on 2026-07-28 and `ports_test.sh` — doing nothing worse than sandboxing `HOME` and unsetting env vars, as a good test should — killed the machine's live dev engine twice. Consequence worth knowing before writing a test: **sandboxing `HOME` isolates the port registry but deliberately does NOT disarm host protection**; a pid you need unprotected must be dead (the `kill -0` liveness gate) or synthetic. Distinct from `.claude/hooks/pre-kill.sh`, which blocks `kill`/`pkill`/`lsof | xargs kill` typed directly into a Bash tool call by inspecting the command string, and so cannot see a kill several frames deep inside a sourced shell library. See ADR 0025.
+
+### Host memory watch
+A launchd agent on a development Mac that runs `scripts/memory-watch.sh --once` every 30 seconds, independent of any Lucidos process. Each tick reads every process's physical footprint from one `top` sample. A process over a share of RAM is recorded while it is alive, with its command line, working directory and parent chain, in `~/.lucidos/memory-watch/memory-watch.log`. A process past physical RAM is killed once its record is written. Pid 0 and 1, a pid the *host-pid kill guard* protects, and another user's process are never killed.
+
+A runaway `grep` once filled the VM compressor and froze the host. The jetsam reports kept too little to say who started it, and this watch keeps the rest. Install it from your own checkout with `scripts/memory-watch-install.sh install`, never from a worktree. Distinct from the e2e memory guard in `scripts/lib/host_memory_guard.sh`, which only watches an e2e run. See `scripts/lib/memory_watch.sh`.
+
+### e2e lock
+The single-writer lock on the shared e2e-test workspace (`<e2e-workspace>/.lucidos/e2e.lock`, `scripts/lib/e2e_lock.sh`), acquired by every e2e entry point before it starts the workspace or spawns a browser. **Machine-wide, not per workspace**: it is one file on one path, so a run in `dev` and a run in `myws` contend for the same lock. Four states (no lock, live-PID lock, stale lock without orphans, stale lock with orphans), the last two being the orphan-safe reclaim; the details and their incidents live in `docs/e2e-test-decisions.md`. A hold is announced by two domain events, `E2ELockAcquired` and `E2ELockReleased`, so a refused run can subscribe with `lucidos await-event` and end its turn instead of sleeping in a loop. **Both endings emit**: a normal release, and a reclaim, which announces the *dead* owner's hold ending because that owner's EXIT trap never ran. The announcement is best effort and bounded, and it is emitted into the emitting subprocess's own workspace, which is why a cross-workspace waiter is delivered nothing and recovers on its `--timeout-secs` deadline instead (ADR 0057). Agent-facing rules: `.claude/skills/e2e-lock-wait/SKILL.md`.
+
+A reclaim of a stale lock is one step, taken under a `flock`. So when two runs reclaim the same stale lock, exactly one wins and the other refuses.
+
+### e2e run marker
+The random id one hold of the *e2e lock* carries. The orphan sweep and the WebKit reaper use it to tell that run's browsers from everyone else's. `acquire_e2e_lock` writes it to the lock file as `RUN_ID=` and exports it as `LUCIDOS_E2E_RUN_ID` plus `__XPC_LUCIDOS_E2E_RUN_ID`, which every process the run starts inherits. The `__XPC_` twin is what reaches WebKit's launchd-started XPC helpers on macOS.
+
+A `browser` orphan needs two facts: its argv[0] lies in the Playwright browsers cache, and its environment holds the marker. The cache path alone matched every Playwright browser on the host. Teardown sweeps its own run's marker, a reclaim the dead owner's, and a lock file with no `RUN_ID` finds no browser orphans. Read from the environment only, never argv (ADR 0251).
+
+### GitHub mode (e2e)
+Where the e2e scripts run by default: the selected suites run on GitHub's runners instead of this host, and the report and exit code stay the same. `--local`, a local-only flag or variable (a `*_SHOTS` screenshot switch, say), or an unmet precondition keeps a run here. `LUCIDOS_E2E_LOCAL=1` carries that choice to nested scripts (ADR 0386). `--github` insists, and fails rather than falling back. The driver pushes a *stripped release tree* of `HEAD`, parentless and scanned, to an *e2e run branch* of the mirror. `.github/workflows/e2e.yml` runs the shards from that push, and the driver deletes the branch when the run ends.
+
+The run has two legs. The *remote leg* is everything GitHub runs. The *local leg* is the few specs with a test tagged `@real-claude-code`, which need a logged-in Claude Code. They run on this host under the *e2e lock*, which the leg waits for rather than failing. A selection without those specs has no local leg and takes no lock. See `scripts/lib/e2e_github.sh` and ADR 0382.
+
+### Fake Claude Code
+The stand-in `claude` CLI that answers the engine on *GitHub mode*'s browser shards: `crates/lucidos-app/e2e/fake-claude-code/claude.mjs`. It speaks the stream-json lines the engine parses and answers `Say exactly: "X"` with X. Any other prompt gets a fixed `no rule` reply, so a spec that needs a real model fails loudly. Each shard links it to `$HOME/.local/bin/claude`, only on a runner and never over an existing file. A spec that needs the real CLI tags its test `@real-claude-code` and stays on the *local leg*. The *drift check* (`drift-check.mjs`), run daily by the workspace trigger `claude-code-fake-drift` when Claude Code's version changed, diffs the fake against the real CLI (ADR 0388).
+
+### e2e run branch
+The `e2e/<run-id>` branch on the public mirror that one *GitHub mode* run pushes and its workflow runs from. The run id is a UTC timestamp plus a random suffix, so the sweep can age a branch without asking the API. The driver deletes its own branch at the end. Each run also sweeps finished ones over a day old. Only refs matching that shape are ever deleted (`e2e_github_is_run_branch`). Not the *temp branch* of a merge worktree.
+
+### Per-spec memory sample
+One line the Playwright reporter `crates/lucidos-app/e2e/memSampleReporter.ts` appends at each test end, macOS only. It records the macOS compressor pages, their limit, the change since the previous test in the same worker slot, and the live WebKit GPU processes. The lines go to the run's `mem-samples.log` and to its *mirror*, `~/.lucidos/e2e-mem/<run id>.log`, named for the *e2e run marker* so it outlives worktree cleanup. `report_e2e_mem_top_deltas` ranks them at the end of a run. Format and rationale: `docs/e2e-test-decisions.md` § "Per-spec compressor sampling".
+
+### Build memory gate
+The check every heavy cargo build passes before it starts: `scripts/build-memory-gate.sh`, run by `scripts/with-build-slot.sh` before it asks for a slot and by `scripts/harden-suites.sh` before each cargo suite. Its verdict is the pre-flight gate's rule, applied by `host_memory_gate_verdict` in `scripts/lib/host_memory_guard.sh`. On NO-GO it waits up to 15 minutes for the host to recover, then exits 72, which says the build never started. A host it cannot read is GO. A pass holds for 60 s in the process tree, so a nested build skips the readings (ADR 0351).
+
+### Agent compile env
+The environment every coding agent's compiles get, from `agent_compile_env` in `crates/lucidos-engine/src/runtime/spawn_env.rs`. Both the agent spawn and the agent's background tasks take it, so every cargo run in a worktree agrees. A setting that changes a build's fingerprint belongs here and nowhere else. Set in one place but not another, it would rebuild the whole tree each time the two alternate.
+
+It routes `rustc` to the agents' own sccache daemon (ADR 0343), and adds a Lucidos source tree's *compile mode*. It reaches every coding agent, external-repo sessions included, so a Lucidos-only setting must first check the tree (ADR 0392). Apply and release builds never take it.
+
+### Debug object generation
+The set of `<artifact>.<cgu>.<generation>.rcgu.o` files one build of a binary or test target writes into `target/<profile>/deps`. Under unpacked split-debuginfo, cargo's macOS dev default, the binary reads its debug info from them, so they must outlive the link. Cargo never deletes an older generation. Rustc hardlinks reused codegen units, so generations can share an mtime, and only the binary's `OSO` stabs say which one it links. Every engine build runs `prune_stale_debug_objects`, which keeps the linked generation plus the newest other one (ADR 0408).
+
+### Compile mode
+What a Lucidos-source agent build compiles with that changes its fingerprint: today, whether OpenSSL is vendored or linked from the shared prebuilt. `runtime/compile_mode.rs` decides it, and only for a tree carrying `crates/lucidos-engine/Cargo.toml`. The first decision is pinned in `target/.lucidos-compile-mode`, and every later spawn and background task reads the pin. So a worktree never alternates, which would rebuild its whole tree each time.
+
+A target that already holds vendored output stays vendored. A pin naming a prebuilt that has gone, or a version the lockfile no longer pins, is decided again. The prebuilt lives under `<user cache>/lucidos/openssl/`, keyed by the lockfile's `openssl-src` version and the host. `scripts/build-openssl-prebuilt.sh` seeds it once per version, started by the first agent build that finds it missing (ADR 0392).
+
+### Memory-stop resume
+What the e2e harness does after its own memory stop, instead of ending the run. `recover_after_memory_stop` in `scripts/e2e-browser.sh` tears down, waits for the host to recover, restarts the engine on a fresh database, and carries on. A boundary stop resumes at the next chunk, an in-chunk stop runs its chunk again, and a stop in nav never re-runs the CC phase. Recovered means three clean readings in a row: the running guard's boundary rule, load under the host-load cap, and no recent jetsam report. A run spends at most three resumes, each wait is bounded, and `LUCIDOS_E2E_RESUME_BY` caps them at a local time. A run whose host never recovers exits 71 and names the exact chunks with no verdict (ADR 0351).
+
+### Chunk ceiling
+The wall-clock limit on one mobile-webkit chunk invocation, 20 minutes by default (`LUCIDOS_E2E_CHUNK_CEILING_SECS`). A watchdog beside the runner interrupts it past the limit, through the guard's pid-tree stop. The second net beside the in-chunk stop: that one catches a chunk that starves the host, this one a chunk that hangs without starving it. A tripped chunk is a failure, the engine restarts before the next chunk, and a second trip ends the project (ADR 0351).
+
+### Pre-flight engine reclaim
+The nightly step that stops every `lucidos-engine` which should not be running, ahead of the pipeline's memory gate. Entry point `scripts/preflight-reclaim-engines.sh`, logic in `scripts/lib/preflight_reclaim.sh`, offline-tested by `preflight_reclaim_test.sh`. Three rules are load-bearing, and each replaces a way the pasted bash snippet it grew out of was a silent no-op.
+
+**It stops a workspace only through `scripts/stop.sh`, never with a raw signal.** The engine ignores SIGTERM on purpose. A bare SIGUSR1 leaves the gateway supervisor free to respawn the engine in the same second with a fresh pid. Only the path that asks the gateway to drop the workspace first makes a stop stick. It has to be the gateway that OWNS it, so `stop.sh` reads `LUCIDOS_GATEWAY_PORT` off the target engine: the dev gateway on 5251 and the packaged one on 5252 hold different registries (ADR 0179).
+
+**It reads the path out of the engine's own environment.** `LUCIDOS_WORKSPACE_ID` and `LUCIDOS_WORKSPACE` come from `ps -E`, and no path is built from an assumed layout. A non-dev workspace lives under `~/.lucidos/gateway/workspaces/<slug>`, so a guessed `~/workspaces/<slug>` makes `stop.sh` exit 1 on "Workspace not found", which reads like a clean no-op.
+
+**It watches the host afterwards**, exiting non-zero on any reclaimable engine still up or back again. A reclaim that cannot show what it freed must not look like success, which is why the before-list and the available-memory delta are printed too. The watch polls every 2s and needs 39s of continuous absence. That comes from `DEAD_MISS_THRESHOLD`, `SUPERVISE_INTERVAL` and `RESPAWN_BACKOFF`, plus the client's 15s boot watchdog and its one retry. It was a flat 10s sleep, shorter than the respawn it exists to catch.
+
+A workspace that returns inside that window is a failure, and the warning quotes the gateway log line naming which path returned it: `respawning '<ws>'` (the stop never reached the owning gateway) or `lazy-starting '<ws>'` (a client window navigated back).
+
+The **keep list** (`LUCIDOS_RECLAIM_KEEP`, default `dev personal`) is matched exactly, so `devbox` is not caught by `dev`. An engine whose workspace id cannot be read is left alone, and never counted as a survivor. Available memory is read through `scripts/lib/host_memory_guard.sh`'s own function, so this step and the in-run floor share one formula. Distinct from the *host-pid kill guard*, which is about never signalling a protected pid: this step signals nothing.
+
+### Network bind config
+The durable, user-configurable control over what address the *workspace gateway* and each *engine* listen on, with a loopback-first security default. Lives machine-globally in `~/.lucidos/network.toml`: `[gateway] bind = "loopback" | "all" | "<IP>"` (the gateway's own bind, machine-wide, since it binds before any workspace is chosen) and `[engine] inherit = true | false` (true: every engine binds the gateway's bind; false: each engine reads its own per-workspace **`network_bind`** preference, so `dev` can be on the tailnet while `myws` stays loopback). Resolved at process start by `crates/lucidos-{engine,gateway}/src/net_config.rs`: two **deliberately duplicated** modules, since the gateway has no dependency on the engine (ADR 0014 §1). Precedence (highest first): the engine's `LUCIDOS_BIND_LOOPBACK` floor (a packaged behind-gateway engine never faces the network) → the `LUCIDOS_BIND_ADDR` / `LUCIDOS_GATEWAY_BIND_ADDR` env (a literal IP, e.g. a Tailscale `100.x`) → the `LUCIDOS_BIND_ALL` / `LUCIDOS_GATEWAY_BIND_ALL` env → the file / per-workspace pref → loopback. A malformed value fails safe to loopback, **never** to all-interfaces. Edited from the **workspace picker** (the gateway bind + inherit toggle, via `/~/api/v1/control/network-config`) and per-workspace **Settings → Access → Network access** (the engine bind, via `/api/v1/network-config`). A change takes effect only after a gateway / engine **restart**: a live socket cannot be re-bound. Env vars override the file so launch scripts / e2e are unaffected.
+
+The gateway splits its resolved addresses into **required** and **optional** (`net_config::bind_plan`), which is not a second config knob but the answer to what a bind FAILURE means. A literal `<IP>` is always served alongside loopback, and only loopback is required: the gateway serves on it immediately and retries the configured address in the background (capped backoff) until the interface exists, then listens on it too, with no restart. That is the one exception to the restart sentence above, and it exists because launchd starts the packaged service before `tailscaled` has assigned the machine's `100.x` address, so binding it fails with `EADDRNOTAVAIL`. Until 2026-08-07 that failure aborted the whole `serve()` (one `try_join_all`, fail-fast on any address), taking the loopback listener with it and stranding the desktop window on its startup splash for the service's full health timeout. `loopback` and `all` have no optional half, so a bind failure there is still fatal, correctly: it means the port is held, not that an interface is missing. Addresses still being waited on are reported by `GET /~/api/v1/health` as `pending_binds`.
+
+### Event store
+The persistence layer for events — the `events` table plus the append semantics that write to it. Today the *write* path is inlined inside *EventBus* (raw `INSERT INTO events` at `event_bus.rs:218, 276`) — `EventBus::emit` is the only API that appends. The `EventStore` struct (`core/store/mod.rs`) still exists, but only as a **read-only query facade** (`query_events`, `count_events`, `get_event_by_id`, …); its historical `append` / `append_thread_event` write methods were removed when persistence moved to *EventBus*. The term remains valid for the concept.
+
+One table, not one per enum: persisted *ThreadEvent* rows, persisted *SystemEvent* rows and workspace-emitted *domain event* rows all land in `events`, distinguished only by the `aggregate` / `aggregate_id` columns, and every read surface returns all three. `system-knowhow/thread-events.md` § "One table, two enums" is the canonical statement; do not restate it here.
+
+### EventBus
+The in-process emit/subscribe mechanism. `EventBus::emit(BusEvent)` is the **sole** entry point for event persistence — it owns the *event store* directly. Consumers (SSE, projections, scheduler matcher, side-effects) subscribe to the bus, never poll the table.
+
+### EventChannel
+Also called **channel**. The source-channel tag merged into every persisted event's payload via `EventMeta::channel`, distinguishing which thread surface emitted the event. The Rust enum `EventChannel` lives in `engine/thread_events.rs`; today's variants are `Chat`, `ClaudeCode`, and `Trigger`, serialized to the wire strings `"chat"`, `"claude_code"`, and `"trigger"` respectively. The `"claude_code"` wire string is the persisted historical coding-agent channel for every *coding-agent thread*; it is backend-agnostic, while the `coding_agent` column / event field records the product (`"claude-code"` or `"codex"`). Public source filters call the bucket `coding-agent` and accept `"claude_code"` as the legacy persisted alias. `Trigger` is the umbrella for all trigger-driven runs (scheduled, event, hybrid); the precise invocation that fired a given run is recorded separately on `TriggerStarted.invocation`.
+
+### EventMeta
+Cross-cutting fields the EventBus merges into a persisted event's payload at write time: `request_event_id`, `channel`, `actor`, etc. Built per-variant by the helpers in `engine/thread_events.rs`. New variants take `EventMeta::with_actor(actor)` rather than reading the device header themselves.
+
+### External watchdog
+The 12-minute backstop that ticks from its own `tokio::spawn` outside every per-thread loop (`agent_session/external_watchdog.rs`, `EXTERNAL_WATCHDOG_LIMIT_MS`, tick interval `EXTERNAL_WATCHDOG_TICK_SECS = 30 s`). Scans `agent_sessions`; for any session past the limit where the gate (`is_waiting` / `tools_in_flight`) says we'd otherwise have fired, drops the entry from `agent_sessions` and emits a `ContinuationRequested { reason: AUTO_RECOVERY_AFTER_HANG_REASON }` which the spawn dispatcher consumes to issue a fresh `--resume`. Same outcome as the *in-loop watchdog*'s auto-recovery path, but reachable from outside a wedged `select!`. The 12 > 10 min gap gives the in-loop watchdog first crack; the external tick is a no-op when the in-loop succeeded. It honours the same **hung-tool ceiling** (`WATCHDOG_HUNG_TOOL_CEILING_MS`, 45 min) as the in-loop watchdog — a tool stuck in flight past the ceiling recovers (`ResumeIfRunning`, gated on a `thread_is_running` re-check) instead of skipping forever — and additionally recovers a `process_exited` session still stale past the limit, where the in-loop cleanup is wedged. Distinct from *Engine supervisor*.
+
+The same tick also runs the **orphan reconciliation pass** (`settle_orphaned_running`). It asks the CONVERSE question: for a coding-agent thread the projection shows `running`, is there a live session at all? Scanning `agent_sessions` cannot see a thread that fell OUT of the map. That is what a subprocess dying without a terminal leaves behind. Before this pass, only a user Stop or the boot sweep cleared one. It settles through the same `settle_stuck_running_thread` helper those two use, so there is no third terminal shape.
+
+A candidate must clear five tests. Two come from the projection: a coding-agent thread at `status = 'running'`, with `last_activity` older than the limit. Two more are a NEWEST event proving the agent produced output, and no `queued` `thread_queue` row. The fifth is no live `agent_sessions` entry, re-read under the lock at settle time. The tick's opening snapshot is a DB round-trip stale, and a session can register in that gap. The window is resolved by the database clock (ADR 0053).
+
+The newest-event test is the load-bearing one, and it replaced a negative formulation. "Old `last_activity` and no live session" reads as proof that nothing is coming, and is not: a thread waiting for a capacity slot matches it exactly. Nor can the waiters be enumerated in SQL, since `thread_queue` holds only background spawns and the user-initiated pool is in memory (`reconcile_user_slot`). Agent output as the newest event is a positive claim the thread's own log settles, and nothing merely waiting satisfies it. The list is enumerated rather than inverted so an unknown event type never settles.
+
+### Family
+A root thread plus every transitive descendant reachable through `parentThreadId` — the unit the thread drawer renders together. Distinct from *sub-thread* (any single descendant): a family is the whole set. The drawer routes families as one (highest-priority section wins: current > saved > archive — any live or attention-needing member keeps the whole family in Current, with the CTA rendered inline on the responsible child row). *Saved* and Archive sort families by the freshest user action anywhere in the subtree, so a parent automatically rises with its descendants; *Current* sorts by *thread* creation time (newest first) instead, so it doesn't reshuffle as agents work. Either way `nestByParent` puts each child directly under its parent. The **family root** is the topmost ancestor present in the currently-rendered list; an orphan child (parent paginated out / filtered) is its own root. Implemented in `crates/lucidos-app/src/components/drawer/family-graph.ts` as the `FamilyGraph` (`{ byId, rootByThread }`) and `FamilyKeys` (`{ recentKey }`) types, built by `computeFamilyGraph` and `computeFamilyKeys`.
+
+### Family extension
+The ancestor + descendant threads of a paginated set that get loaded eagerly so the drawer can render them under their parent, even when their own `last_activity` falls below the loaded window. Backend helper `EventStore::fetch_family_extension` (recursive CTE over `thread_summaries.parent_thread_id`); HTTP layer returns them in a separate `family_threads` field on `GET /threads` and `GET /threads/older`. The frontend upserts them into `threadMap` like any other thread but tracks their ids in `familyExtensionIds` (in `store/actions/thread-loading.ts`) so they're **excluded from the `loadOlderThreads` pagination cursor** — without that exclusion, a single old child would advance the cursor past every intervening thread. An id is removed from the set when natural pagination later returns it as a base thread.
+
+### Older-threads cursor
+Where the drawer's Archive pagination asks the server to continue from: the `before` param on `GET /threads/older`. It has two inputs, and the one reaching further back wins (`earlierCursor` in `store/actions/thread-loading.ts`). The **loaded-row** half is the oldest loaded archived thread passing the *applied thread filter*, minus every *family extension*. The **server-progress** half is `olderThreadsCursor`: the `created_at` of the oldest row the last page returned. It is paired with the selection it was fetched for, because a different filter is a different cursor space.
+
+The second half is what keeps pagination moving. That endpoint pages EVERY thread by `created_at`. The initial window already holds every inbox and saved thread, whatever its age. So a page can hold nothing this device lacks, and the loaded-row half does not move on one. Treating that as an exhausted archive is the wrong verdict, and it hides the rest of the pile until a reload.
+
+Server progress also gives the drawer's fill loop its termination proof. Every returned row is strictly older than the `before` that fetched it. So the cursor moves strictly back on each landed page.
+
+### Awaited thread
+The focused thread this client is **waiting for**, held in `awaitedThreadId` (`crates/lucidos-app/src/store/store.ts`). It is not in `threadMap` yet, and its absence is expected rather than stale.
+
+That distinction is the whole point. `ThreadView` clears a `focusedThreadId` it cannot find in the map, as stale-pointer cleanup during render, and an unfocused thread pane **is** the compose view. So a focus placed on a thread whose row has not landed is silently undone, and the user reads it as "the button did nothing".
+
+Two producers claim the await, always before they focus. `focusThreadOrBootstrapResult` claims it on its miss path, so a notification tap moves the pane at once while the metadata fetch runs. `focusSpawnedThread` claims it for a thread the engine has just spawned and named in its response: a plugin setup thread, an upstream-patch thread, the Store card's Setup button.
+
+That second case has two ways to be absent, and neither is an error. The row reaches this client over SSE, which can land after the response. And a spawn the *Thread Queue* has only queued owns no `thread_summaries` row at all, which is also why a bootstrap fetch is wrong there: it would 404.
+
+While the await stands, ThreadView shows its delay-gated skeleton, and the transcript appears the moment the row arrives. Two releases, because a leaked await would exempt a genuinely stale pointer for the rest of the session. `ThreadView` drops it on arrival, being the exemption's only reader, and `setFocusedThread` drops it when the focus moves anywhere else. The bootstrap additionally restores the previous focus when its fetch says the thread does not exist (`releaseAwait`). Pinned by `components/chat/__tests__/awaited-focus-survives-cleanup.test.ts` and `store/actions/threads-ensure-status.test.ts`.
+
+### Focused pane
+Desktop-only signal (`focusedPane`, `FocusedPane = 'drawer' | 'thread' | 'content'` in `crates/lucidos-app/src/store/store.ts`) tracking which of the three desktop panes the user is working in. All three are user-facing terms defined in `system-knowhow/glossary.md`: `drawer` → *thread drawer* (`.thread-drawer`), `thread` → *thread pane* (`.pane-thread`), `content` → *content pane* (`.pane-content`) — so a UI string may name any of them directly. The *Conversation* / *Canvas* pair sits one level up and names the two **sides**, not panes; use it only when the subject is a whole side (see *Pane group*). Set on pointer-down inside a pane (`focusPane`) and by the thread-pane / content-pane keyboard toggles (`toggleThreadPane` / `toggleContentPane` via `focusPaneAndControl`, which also moves real DOM focus via `focusPaneMainControl`). The drawer splits pointer vs keyboard the same way: the drawer **icon** (`toggleThreads`) is a pure show/hide that never *sets* `focusedPane` — it only drops a hidden-but-focused drawer's focus back to the thread pane so the focus wash never strands on an invisible region — while the `toggleThreadDrawer` **shortcut** (⌘⇧1, `focusOrToggleThreadDrawer`) IS focus-aware: a three-stage open+focus / focus / close that moves real DOM focus into the drawer (re-expanding the Conversation side first if it was collapsed) so the drawer's existing ↑/↓/Enter list-nav is reachable from the keyboard. **Navigation also activates the matching pane group**, signal-only (no DOM focus moved — the first Tab pulls focus in via `handlePaneTab`): `revealContentPane` sets `content` for any content navigation (menu switch, settings subview, app / file / URL / trigger / change — Search Everywhere included), and `focusThread` re-activates `thread` when arriving from the Content group (`focusedPane === 'content'`, so drawer browsing is left undisturbed). Without this the view lands but Tab stays stuck on the previously-focused pane. See *Pane group*. **Desktop-only** — mobile has no focused pane: panes there are *navigated, not focused* (via the header / swipe, tracked by `mobileView`, the *visible pane*), and the pane keyboard shortcuts don't exist on mobile. Pane-scoped keyboard actions target the focused pane: resize (`stepThreadPaneWidth` / `stepThreadDrawerWidth` in `store/actions/pane.ts`) and history navigation. The Back / Forward shortcuts (`historyBack` / `historyForward`, ⌘⌥↓ / ⌘⌥↑) route through `store/actions/focused-pane-history.ts` to the focused pane's OWN history stack: the content pane walks the panel nav stack (`navigation.ts`, `navBack` / `navForward`), while the thread and drawer panes share the thread nav stack (`thread-navigation.ts`, `threadNavBack` / `threadNavForward`). Each pane header's dedicated Back / Forward buttons drive their own stack directly regardless of focus; only the keyboard shortcut is focus-routed. Canonical term — don't say "panel" or "view"; *view* is already taken by `MobileView` (the mobile swipe position).
+
+A programmatic focus that crosses panes takes the marker with it. Opening a thread from the drawer focuses its live choice card or the prompt through `focusIntoPane` (`components/layout/paneFocus.ts`). That marks the thread pane, so Tab cycles where focus actually is. The turn-step shortcut and an answered choice card do the same. An agent navigation while the reader types in another pane leaves the marker there (`holdFocusedPaneWhileTyping`), though the reader's own navigation still moves it. A choice card seeds focus only while the marker is on the thread pane.
+
+### Pane group
+Desktop-only partition of the three *Focused pane* values into two maximizable groups: the **Threads pane group** (`drawer` + `thread` — the user-facing *Conversation* side) and the **Content pane group** (`content` — the user-facing *Canvas* side). The maximize shortcut (⌘⇧↵, `maximizePaneGroup` → `toggleMaximizeFocusedPaneGroup` in `store/actions/pane.ts`; labelled "Maximize focused side (Conversation or Canvas)" in Settings → Keyboard shortcuts, since *pane group* is dev-only) collapses the opposite group so the focused group fills the content row — `splitRatio → 1` (Threads; the drawer rides `splitRatio > 0`, so it stays open) or `splitRatio → 0` (Content) — and a second press restores the remembered pre-maximize ratio (falling back to `DEFAULT_SPLIT_RATIO`, since the remembered ratio is in-memory and doesn't survive reload). Structural code/keyboard names for the two user-facing sides (*Conversation* / *Canvas* in `system-knowhow/glossary.md`).
+
+### Split
+The desktop side-by-side layout (`SplitLayout`, `splitRatio` in `crates/lucidos-app/src/store/store.ts`, `splitHelpers.ts`): the integrated back-and-forth between the user-facing *Conversation* and *Canvas*. `splitRatio` ∈ [0, 1] is the thread pane's fraction, persisted to `localStorage` (`lucidos-split-ratio`, default `0.4`): `0` collapses the *Threads pane group* (Canvas full), `1` collapses the *Content pane group* (Conversation full), in between is a live two-up split. Mutated only via `setSplitRatio` (animates + persists); a *clamped divider* drag writes it directly, already inside the pane minimums. The surface of *live co-creation* (user-facing): both sides stay live at once so a single conversation reshapes data and presentation together.
+
+### Side-by-side diff
+The two-column rendering of a repository diff in the Files panel: the original on the left, the changed file on the right, aligned row for row with a *filler* row wherever one side has no line (`sideBySideDiff.tsx`, `diffSideBySide` in `crates/lucidos-app/src/store/store.ts`, persisted to `localStorage` as `lucidos-diff-side-by-side`). Its counterpart is the **unified** rendering, the `-`/`+`/context hunks carrying both files' line numbers in one column, which is also what a surface too narrow for two columns falls back to (`fitsSideBySide` against `SIDE_BY_SIDE_MIN_REM`, measured off the diff's own container by the one `DiffView` that passes `measureFit`). Both are modes of the same *diff body* (`diffBodyKind` in `store/diffBody.ts`, which also names the whole-file and rendered-markdown bodies) and both render their lines through `LineNumberedCode`; a column passes `selection: 'none'`, since its numbers are the old file's on the left and the new file's on the right and one file-level `selectedLines` cannot mean both. **Never call this a "split diff"**: *Split* is already taken, one entry up, for the desktop pane layout (`splitRatio`, `SplitLayout`), and the collision is easy to make because that entry's own definition calls the pane layout side-by-side. In the UI the toggle reads "Show side by side" / "Show unified".
+
+### Header shorthand
+The short form of a destination's name that the header bar renders when the full one does not fit there (`SettingsNavItem.short` in `crates/lucidos-app/src/store/store.ts`, resolved by `settingsSubviewShortLabel` and reached through `getContentTitleShort` in `components/layout/headerHelpers.ts`). The bar is the narrowest surface a name ever appears on: on a phone the title is the one shrinkable member of a fixed-width cluster between the two nav chevrons (`.header-title-cluster`), which leaves it around a dozen characters, fewer at a raised UI scale, and fewer again in a monospace font. **Authored, never derived.** Shrinking the font to fit was the alternative and is rejected on the same grounds the iOS and Material top-bar conventions give: a title whose size changes from screen to screen makes the bar jitter as the user navigates, and this header already carried a JS measurement for exactly this problem (`--mobile-content-title-max`) that was deleted for the complexity. Higher screen density buys none of it back, since a phone's CSS-pixel width is the same however many dots the panel has. **Only the bar reads it**: the Settings home list, Search Everywhere, the back/forward history menu (`navEntryTitle`) and the title's own tap tooltip all keep the full label, so a shorthand never becomes the category's real name and the canonical-term rule (`.claude/rules/glossary.md`) is not in play: dropping the qualifier off a compound chrome label is not choosing a different word for the concept. Each of the four keeps its head noun, which is also the check to apply to a new one. Four exist today (Appearance & Behavior, Keyboard Shortcuts, Environment Variables, Coding Agents); a category that fits gets none, and the character budget is pinned in `store/settings-nav.test.ts` so a new long category has to author one. The ellipsis survives underneath for the titles we do NOT author: file names, app names, web page titles, thread titles.
+
+### Menu item
+One of the seven top-level destinations the *content pane* shows when no *panel overlay* is open. `MENU_ITEMS` in `crates/lucidos-app/src/store/types.ts` is the list: files, apps, plugins, triggers, settings, changes and notifications. `activeMenuItem` holds the current one, and `switchMenuItem` navigates to it, loading its data, pushing nav state and revealing the pane. `MENU_ITEM_LABELS` is the one map naming them, read by the **menu drawer**'s rows, the header title, the history menu and Search Everywhere's `menu` category. The set is not the menu drawer's rows: Notifications is reached from the bell, and the drawer's Browser row opens a URL preview. A menu item's name is also a `CategoryIcon` key, so a search result or a history row wears the page's own glyph.
+
+### In-loop watchdog
+The 10-minute inactivity timer inside `run_session`'s `select!` (`WATCHDOG_INACTIVITY_LIMIT_MS` in `crates/lucidos-engine/src/engine/agent_session/lifecycle.rs`). When an *agent session* has been silent past the limit while the watchdog gate (`is_waiting` / `tools_in_flight`) says it should have fired, the in-loop watchdog cancels the agent token and the loop emits a `ContinuationRequested` so the spawn dispatcher issues a fresh `--resume`. The `tools_in_flight` skip is bounded by a **hung-tool ceiling** (`WATCHDOG_HUNG_TOOL_CEILING_MS`, 45 min): a tool call that never returns (e.g. a hung `/harden` sub-agent — the thread-72120ca6 incident) can't disarm the watchdog forever — past the ceiling the gate returns `FirePastCeiling` and the watchdog fires anyway, but only after re-confirming the thread is still `running` (a pending question/permission card sits at `waiting_for_user_answer` and is also counted in `tools_in_flight`, so it is never euthanized). First line of defense against a hung subprocess — useless when the `select!` itself is wedged (e.g. an event-handler await waiting on a slow subscriber). See *External watchdog* for the floor that catches that case. Distinct from *Engine supervisor*, which operates at the engine-binary level.
+
+### Implementation plan
+The pre-edit planning artifact for complex implementation work: ADR-backed or design-thread-backed work, cross-layer changes, routing/topology/storage/security/migration/process changes, or any non-local implementation. Created via the repo-owned `implementation-plan` skill before code edits and always written to a checked-in file at `docs/plans/YYYY-MM-DD-<slug>.md` (the committed file is the source of truth; a short summary may also appear in the conversation). It consumes the user prompt, any `grill` or design thread, ADRs/plans, and code reconnaissance, then records settled decisions, non-goals/deferred work, phase order, load-bearing implementation invariants, and verification for each invariant. It is an execution contract, not a retrospective `/harden` audit: unresolved load-bearing questions block edits, and implementation phases re-read the invariants before changing behavior.
+
+### Judge (command guard)
+The fallible half of the *command guard* (ADR 0002, Phase 3), in `engine/command_judge.rs`. It classifies the *ambiguous middle*: the commands the static *command classifier* returns as `NeedsJudge`. It asks two typed Choice questions of the site's *judgment provider*: the chat model `model_command_judge` names (Haiku by default), or a System One row picked in the same control (ADR 0363). The judge picks a *RiskLane* (`Safe` / `ReversibleDanger` / `IrreversibleDanger`, never `Catastrophic`), and code derives the one-line `summary` the permission card shows.
+
+For the `IrreversibleDanger` lane it also tags a *SideEffectCategory* (`email` / `external_api` / `cloud_cli` / `out_of_workspace_destruction` / `other`). The trigger *side-effect grant* check keys on that category. The judge errs toward *ask* through thresholds in Rust: a weak, missing or malformed answer resolves to `IrreversibleDanger` with category `Other`, on every provider.
+
+It returns `Err` only when nothing answered: no provider, a failed call, or a timeout. The guard then falls back to `fallback_classify` and `static_side_effect_category`. `command_guard_judge` gates it, and defaults on when the guard is on. Verdicts are cached per response by `JudgeInput::cache_key`: the tool, the command text and the out-of-workspace marker. So a re-emit does not re-pay, and a link laid down mid-turn misses the cache.
+
+Triggers DO reach the judge now (Phase 5), since the side-effect grant needs the lane and the category. `judge_with` is the provider-agnostic core, exercised offline with stubbed judgment providers in tests.
+
+### Keybinding registry
+The customizable keyboard-shortcut subsystem. Pure registry + binding math in
+`utils/shortcuts.ts` (`SHORTCUT_DEFS`, `Binding`, `eventToBinding`,
+`matchesEvent`, `formatBinding`, `serialize`/`parseBinding`, `bindingSearchText`).
+The override-aware layer is `store/actions/keybindings.ts`: it merges per-user
+overrides — persisted as the workspace `keybindings` preference (a JSON map of
+`shortcutId → "mod+shift+o"`, synced across devices via `PreferencesChanged`) —
+over the registry defaults, exposing `bindingFor` / `setBinding` / `resetBinding`
+/ `matchShortcut` / `recordChord` and the override-aware `tooltipWithShortcut`.
+`useKeyboardShortcuts` dispatches by the current binding (so rebinds take effect
+with no code change), Settings → Keyboard Shortcuts renders the cheat sheet +
+recorder, and SearchEverywhere indexes each shortcut by its combo aliases. The
+`mod` modifier matches either Cmd or Ctrl (both fire). The one exception is
+Ctrl with a bare letter in a Mac text field, which edits text there.
+The single-key `c`/`t` shortcuts were dropped in favor of modifier chords only.
+
+A default copies the chord well-known apps use for the same action: ⌘K
+searches, ⌘, opens settings, ⌘/ shows the shortcuts, ⌘P searches files, ⌘. stops
+the running thread and ⇧Esc focuses the composer. A toast never takes focus by
+itself, so Focus newest toast (⌃⇧N) is the keyboard's only way into one
+(`docs/plans/2026-09-29-familiar-keyboard-shortcuts.md`).
+
+Every toggle in the composer row and the content header has its own entry,
+and runs the same function its button runs
+(`docs/plans/2026-10-01-shortcuts-for-every-toggle.md`). A `ShortcutDef` may
+carry a `mnemonic`, which the settings page shows only on the default chord.
+
+**A host-only shortcut** runs only from a keydown on the host document. A
+chord forwarded from an app frame or the HTML preview is refused, because that
+frame's own script can post one. `forwardableBindings` leaves it out of the
+bindings pushed to frames. Apply and the voice call are host-only, since one
+merges a change and the other opens the microphone.
+
+### Find target
+What one *find bar* session searches. An app frame and the *artifact preview frame* are each asked over their bridge. A text preview is searched in the host's own DOM. The transcript is counted from the thread's data (`store/actions/transcript-find.ts`). `targetFor` in `store/actions/find-bar.ts` picks it from the focused pane and what that pane shows. All four use one matcher, `packages/lucidos-sdk/src/find.ts`.
+
+**A contextual shortcut** claims its chord only where it applies, by a rule
+in `CLAIMS_ONLY_WHEN` (`hooks/useKeyboardShortcuts.ts`). Anywhere else
+`classifyChord` leaves the key alone, so the browser's own action still runs.
+The *find bar*'s Mod+F is the one today. It claims the key when a find bar is
+open, which the press closes, as Escape does. Otherwise it claims the key only
+when the focused pane shows something the bar can search. A keydown forwarded
+from a frame is judged against the content pane, so with no bar open the PDF
+preview keeps its own find.
+
+### last_agent_action
+`thread_summaries` column (`TIMESTAMPTZ NOT NULL`) holding when the AGENT (or trigger) last did something on a thread. That covers streaming, a terminal response, a `CodingAgentIdled`, a trigger fire/complete, and the agent asking the user. It also covers a non-human `MessageReceived` or `PromptInjected`. It is the counterpart to *last_user_action*.
+
+It is not a sort key. It drives the thread-row tooltip's "Agent ·" line (frontend `meta.lastAgentAction`). It stays distinct from `last_user_action` so the tooltip is accurate even right after the user acts. Each arm in `event_bus_projection_thread.rs` bumps it inside its existing `last_activity` UPDATE, so it adds no hot-path query.
+
+### last_user_action
+`thread_summaries` column (`TIMESTAMPTZ NOT NULL`) holding when the USER last drove a thread forward: a human `MessageReceived`, `CodingAgentUserMessageSent`, a human `PromptInjected`, `UserQuestionAnswered`, a `*PermissionResolved`, or a `ChangeApplied`/`ChangeDiscarded`. The drawer's recency sort key — `get_saved_threads`/`get_recent_threads`/`get_older_threads` and the `/threads/older` cursor ORDER BY it, so background agent churn (streaming, idle) no longer reshuffles the list. Frontend `meta.lastUserAction` (the `recencyKey` / `byRecent` comparator + the pagination cursor). Distinct from `last_activity` (max-of-both, still used for facets, the family-extension cap, and the LLM/script list surface) and *last_agent_action*. Attention bubbling (REVIEW sectioning) is unchanged — it never keyed off recency.
+
+### Local token
+The machine-local secret that proves an HTTP caller is a process on this machine running as this user: 32 random bytes at `~/.lucidos/local-token`, mode 0600, minted by the *workspace gateway* at startup and re-permissioned on every boot. Sent as `x-lucidos-local-token` by the `lucidos` CLI, the engine's gateway-bound calls (`gateway_auth::client_builder`) and the desktop app. Owned by the dependency-free `lucidos-local-token` crate, which all four crates take, for the reason `lucidos-tailscale` exists: four hand-copies of a header name and a secret path drift, and a stale copy is a caller that silently cannot authenticate.
+
+It exists because **a loopback peer address proves nothing here**. The shipped remote-access route is `tailscale serve --bg --https=443 http://127.0.0.1:5252`, which proxies from this machine. A phone's request therefore also arrives from `127.0.0.1`. Trusting loopback would trust the whole tailnet, and the public internet once Funnel fronts anything.
+
+`gateway::auth::authorize` therefore takes no peer address at all, holding the invariant in its signature. Reading a mode 0600 file is what a remote caller cannot do. It states trust that already exists, since a local shell can read every credential anyway. Same pattern as `tailscaled`'s own LocalAPI, the Docker socket and kubeconfig. Also a **pairing authority**: anything that can read it may mint a *pairing code*.
+
+Since ADR 0155 it is also the engine's own door, on a wide bind only: `api::local_auth` accepts it for every path but `/api/v1/health`, and the gateway's proxy presents it on the upstream hop. The header is *gateway-owned* on that hop, so a client-supplied one is stripped rather than forwarded.
+See also: *webhook token*, *engine scope*, *paired device* (user-facing), `docs/plans/2026-08-17-clients-pair-to-the-gateway-and-webhooks-get-their-own-socket.md`.
+
+### Webhook token
+The local token's narrow sibling: 32 random bytes at `~/.lucidos/webhook-token`, mode 0600, minted by the *workspace gateway* beside the *local token*. Sent as `x-lucidos-webhook-token`, by the *hook socket* on its engine hop and by nothing else. It authorizes exactly one engine route, `POST /api/v1/webhooks/<id>/deliver`.
+
+Two files rather than one token carrying a scope field, because **a scope the caller states is not a scope**: the bearer would state the widest one. The split has one caller behind it. A hook socket is what `tailscale funnel` may expose to the open internet (ADR 0097). Handing that hop full authority would put the whole engine API one forwarding bug behind a public port.
+See also: *engine scope*, *local token*, *hook socket*, ADR 0155.
+
+### Engine scope
+What a credential presented to an engine authorizes (`api::local_auth::EngineScope`). Two variants, resolved by WHICH secret matched rather than by anything the caller says: `Full` (the *local token*) reaches every route, and `WebhookDelivery` (the *webhook token*) reaches only the delivery route. A caller holding a real credential that does not reach the path gets 403, distinct from the 401 a caller who proved nothing gets.
+
+Checked only when the engine's resolved *network bind* is not loopback (`auth_required`). On loopback the engine requires nothing, which is every shipped topology and is why this is inert in dev, e2e and the packaged app. A non-loopback `Address` locks the loopback socket it also binds, since a `tailscale serve` hop arrives from `127.0.0.1`.
+See also: *local token*, *webhook token*, *network bind*, ADR 0155, ADR 0094.
+
+### Hook socket
+The gateway's second listener, the one that answers webhook deliveries (`crates/lucidos-gateway/src/hook_socket.rs`, ADR 0097). Its own port, derived as the gateway's `+10` so dev takes 5261 and packaged 5262, overridable with `LUCIDOS_HOOK_PORT` and switched off by `0`. Its own `Router`, carrying one route (`POST /<slug>/<hook-id>`) and an explicit 404 for everything else, a wrong method included.
+
+**A separate socket rather than a path, because `tailscale funnel` maps a port.** This is the one surface a user may point at the open internet, and no path allow-list on the main listener could express that. A router with one route cannot answer the control plane, whatever it is sent.
+
+Bound **loopback**, like the main surface. Funnel proxies from this machine, so it reaches loopback, while nothing else on the network can address the socket directly. The gateway's `enforce` middleware is deliberately absent: a webhook sender holds no device credential.
+
+On its engine hop it presents the *webhook token*, which is the narrowest credential Lucidos mints (ADR 0155). It strips every inbound `x-lucidos-*` first, so a public sender can neither supply that credential nor reach for the wider one.
+
+It forwards and decides nothing. It resolves the slug to an engine port and streams the raw body to `POST /api/v1/webhooks/<id>/deliver`, byte for byte, because the signature covers exactly those bytes. Auth belongs to the engine, which owns the secret. Nothing about the socket is fatal to the gateway: a port in use logs and is skipped, and a listener that dies later logs and stops answering.
+See also: *webhook token*, *webhook* (user-facing), ADR 0097.
+
+### Delivery ledger
+The `webhook_deliveries` table and its `DeliveryLedger` (`core/webhook_deliveries.rs`, ADR 0122): what a *webhook* claims before it emits, so a resend is recognised rather than emitted twice. Keyed `(webhook_id, delivery_key)`, where the key is a SHA-256 digest of the sender's delivery-id header or, absent one, of the body.
+
+**A nonce ledger, not a delivery log**, and that distinction is what lets it exist beside the delivery log the webhooks plan refused. It holds no payload, nothing lists it, and its only reader is the next delivery. What a delivery DID is the pinned *domain event* it emitted, which already announces. Registered `Silent` in `announced_surfaces.rs` for exactly that reason.
+
+**The primary key is the concurrency control.** `claim` is one `INSERT ... ON CONFLICT DO UPDATE ... WHERE created < NOW() - make_interval(...) RETURNING`. A returned row means the caller owns the delivery: a fresh key, or a claim past its window. No row means a live claim holds it. Two concurrent copies of one delivery serialise on that index, so exactly one emits. Read-then-write could not do this, and an in-memory cache would also lose the window on the restart that provokes most retries.
+
+A failed emit `release`s the claim, since holding it would answer the sender's retry as a duplicate for an event that never happened. `MAX_WINDOW_SECS` caps a configurable window AND is the daily sweep's horizon. One constant, so the sweep cannot drop a claim still deciding a duplicate.
+See also: *hook socket*, *webhook token*, *delivery deduping* (user-facing), ADR 0122.
+
+### Refusal run
+What a *webhook* has been turning away since it last accepted anything, on four `webhooks` columns: `refusal_run_count`, `refusal_run_since`, `refusal_run_cause`, and a per-reason `refusal_run_reasons` tally keyed by `DeliveryRefusal::key` (`core/webhooks.rs`, ADR 0235). An acceptance ends a run and nothing else clears it, so `refusals == 0` is positive evidence that the hook works.
+
+**It exists because a single stamp cannot survive being read.** `last_refusal_reason` holds the LAST refusal, so a diagnostic probe overwrites exactly the field the investigator came for. It did, during the investigation that produced this entry. A tally is appended to, so a stray probe adds one to its own reason and leaves the rest standing.
+
+**A run is homogeneous in its cause**: a refusal of the other cause restarts it rather than joining it. So the count, the start and the tally all describe one fault. A hook switched off mid-outage is otherwise reported as having thrown away deliveries it read and rejected.
+
+**Every age on it is measured by Postgres** (ADR 0053), and carried as `run_secs` and `quiet_secs`. `judge` therefore takes no clock. A host ahead of a drifting database would read every run as negative seconds old and judge every hook clear for good.
+
+**The run's span is first refusal to last**, `run_secs - quiet_secs`. For a hook that is on, the span is what must pass the 30-minute clock, so a burst followed by silence declares nothing (ADR 0365).
+
+The engine's own *ingress probe* never reaches the run. That probe presents a per-cycle bearer, and `api::webhooks::is_probe_delivery` skips the stamp on a match, or a healthy workspace would log four refusals an hour.
+
+The run is a `RefusalRun`, the `refusal_run` field on the wire, and `lucidos webhooks list` prints it. Judged by `core/webhook_refusal.rs`, which is pure.
+See also: *refusal cause*, *ingress probe* (user-facing), *delivery outcome stamps* in `.claude/rules/db.md`, ADR 0235.
+
+### Refusal cause
+Which of two shapes a *refusal run* has, and therefore which words it is reported in (`RefusalCause`, `core/webhook_refusal.rs`). `disabled` means the hook is switched off, so nothing was read. `verification` means the delivery reached the verifier and failed it. Stored on the run, so a reader never has to re-derive it from the tally.
+
+**The live `enabled` flag outranks the stored value.** The flag is one of the two causes. So `WebhookStore::update` ends the run in the statement that moves it, and a reported cause matches the flag by construction. For a row written before that, `judge` and the wording table each report `disabled` when the flag is off. A hook that is off threw the delivery away before reading it, so no run on it can support "none of them verified".
+
+**The split is one predicate**, `DeliveryRefusal::examined_the_delivery()`, the mirror of `Stage::measured_the_ingress` from ADR 0172. One arm answers no, and `DeliveryRefusal::cause` is derived from it alone. `deliver` checks `enabled` before it reads the body, so a disabled hook's 401 says nothing about the signature or the secret. Telling its owner to check the HMAC sends them where there is nothing to find, a wrong turn that has cost a long investigation once.
+
+Carried on `WebhookDeliveriesRefused` and on its retraction, which also names a `Resolution`: `accepted`, `reconfigured`, `quiet` or `removed`. Those four are exhaustive over the ways a hook can stop refusing, which is what keeps a declaration from stranding. `accepted` is read off `last_accepted_at`, never inferred from an empty run: a fresh refusal refills the run within minutes of the delivery that verified.
+See also: *refusal run*, ADR 0235, ADR 0172.
+
+### Webhook token
+The bearer token a *webhook* delivery presents, as `Authorization: Bearer <token>`. Minted at create, returned in that one response, and stored only as a SHA-256 digest in `webhooks.token_hash`. **Only an unsigned hook gets one.** `verify` requires every verifier a row carries, and a sender like GitHub attaches no bearer token. Minting one beside an `hmac` block would pin a credential the sender cannot present. Losing it means rotating it, which is the point: a token recoverable from the database is a token a database leak hands over.
+
+Distinct from the **signing secret** beside it. A token is Lucidos's own, and the sender is told it. A signing secret belongs to the sender (GitHub, Stripe, Slack). It is saved once as a *credential*, and the webhook's `hmac` block names it rather than copying it.
+
+A webhook needs at least one of the two, enforced by a CHECK constraint on the table, and every verifier it does carry must pass. Token-only would have made a real GitHub hook impossible, since GitHub sends no bearer token at all.
+
+**Which verifier a hook has is editable, and the two always move together.** `HmacChange` (`Keep` / `Set` / `Clear`) is the patch field, and `WebhookStore::update` writes `hmac` and `token_hash` under one flag so they cannot disagree. `Set` drops the token, `Clear` mints one and returns it once. Clearing had to mint rather than refuse. The CHECK forbids a row with no verifier, and refusing sends the user back to delete-and-recreate, which changes the delivery URL. Editing exists to remove exactly that failure.
+
+**Which side invents the signing secret is the sender's decision**, so `create` and `update` take a `signing_secret` beside the `hmac` block. `{"mode":"generate"}` mints 32 bytes through `mint_token` and returns them once, which is right for GitHub. `{"mode":"provided","value":"..."}` stores one Slack or Stripe issued, byte for byte, refusing surrounding whitespace by name rather than trimming it. Either writes a *credential* of type `secret` and then names it, so the client never holds a value it has to post back. On `create` an existing name is refused; on `update` it is replaced, which is rotation.
+See also: *hook socket*, *webhook* (user-facing), `crates/lucidos-engine/src/core/webhooks.rs`.
+
+### Delivery outcome stamps
+The three `webhooks` columns holding what the last delivery to a hook did: `last_accepted_at`, `last_refused_at` and `last_refusal_reason` (ADR 0143). `WebhookStore::{record_accepted,record_refused}` write them from `api::webhooks::deliver`, once the verdict is settled.
+
+They exist because **"arrived and was refused" and "never arrived" have one symptom**, no events, and unrelated causes. A rotated secret otherwise looks exactly like a dead ingress, and only a refusal tells the two apart.
+
+A failed UPDATE is logged and dropped. A delivery that already verified and emitted must not fail on a bookkeeping write. They are observations rather than decisions, so nothing is emitted when they move, and `announced_surfaces.rs` records the exemption. `updated_at` stays where it is: a delivery is not an edit.
+
+`last_refusal_reason` is a `DeliveryRefusal::reason()` string. It reaches the workspace owner on Settings > Webhooks and never the sender, because an endpoint that says why it refused helps whoever is guessing.
+See also: *probe token*, *webhook token*, *ingress probe* (user-facing), ADR 0143.
+
+### Probe token
+The bearer the *ingress probe* presents, so a delivery can recognise its own (`core/webhook_probe_token.rs`, ADR 0143). Minted before each cycle, held in memory alone, and forgotten when the cycle ends. It verifies against nothing, because the probe must be refused: no `token_hash` matches it.
+
+What it buys is one branch in `deliver`. Without it the probe's own refusal would stamp `last_refused_at` every 15 minutes, and the page would report a refusal on a healthy workspace. So `deliver` asks `is_probe_token` before stamping, refuses the delivery exactly as it refuses anything else, and skips only the timestamp. Nothing changes on the wire.
+
+**Not a marker the sender could set.** A forgeable one would let an attacker hide a signature-guessing run from the page the *delivery outcome stamps* feed. Compared in constant time, superseded by the next mint, and expired after two minutes. A leaked token therefore cannot silence the page for as long as the engine runs.
+See also: *delivery outcome stamps*, *webhook token*, *ingress probe* (user-facing), ADR 0143.
+
+### Sleep spell
+The sleep the *ingress probe* has summed since its last awake round that probed (`Watch::spell` in `scheduler/webhook_ingress/mod.rs`, ADR 0367). A round slept through when the wall clock gained on the monotonic clock, during it or since the last round. A late tick counts too. `core::host_sleep::slept` reads all three signs and is pure.
+
+**A slept-through round is not evidence.** It never declares or adds a strike, and it breaks the debounce chain. It can still recover, because sleep cannot fake a 401.
+
+The first awake round that probes closes the spell. A spell of 30 minutes or more emits `WebhookDeliveriesSleptThrough` once, so a night of dark wakes is one event in the morning. A round that could not probe carries the spell on; a closed gate (no hook, no funnel) forgets it.
+
+Memory only. A restart starts a new spell, so the cost is at most one report.
+See also: *ingress probe* (user-facing), ADR 0367.
+
+### Lifted family
+A *family* whose root's own natural display section is lower-priority than the section the family was routed to, i.e. a descendant earned the lift. Surfaces in the drawer as two coordinated cues: the parent row renders with demoted styling (muted opacity) so it reads as "I'm here because of one of my children", and any non-root descendant whose own natural section equals the routed section ("responsible child") gets a brighter accent rail in place of the default gray. When every family member naturally belongs to the routed section, the family isn't lifted and neither cue fires. Computed by `computeFamilyDecorations` (in `crates/lucidos-app/src/components/drawer/family-graph.ts`) as `{ routedByThread, liftedRoots, archivedSubThreads }`; routed section comes from the same priority pass `categorizeThreads` uses (current > saved > archive). See also: *Archived sub-thread cue*.
+
+### Archived sub-thread cue
+The drawer's disabled styling for a *sub-thread* whose own natural display section is Archive while its *family* renders in a live section (Current or Pinned). The family routes as one unit, so archiving one child does not move it out of its parent's list; without a cue it sits there looking exactly like live work. The row renders at the drawer's disabled opacity (title, timestamp, chips and status dot together) while staying fully interactive: it still opens on click and keeps its row actions. Independent of *Lifted family*, since the common case is an ordinary Current parent with one archived child and nothing was lifted at all. The family ROOT is deliberately excluded, because an archived root in a live section is exactly the lifted case and the demoted-parent cue already owns that row. It reads the NATURAL section, so a thread stored as archived that is running, carries changes, or has a waiting descendant resolves to Current and is not dimmed: it has live work to show. Computed as `archivedSubThreads` by `computeFamilyDecorations` (`crates/lucidos-app/src/components/drawer/family-graph.ts`); rendered as `.thread-row-wrap.is-archived` (the class rides the row wrapper because the status dot lives there).
+
+A member of this set whose whole branch is archived is hidden by default instead. See *Archived-reveal toggle*.
+
+### Archived-reveal toggle
+A fully archived branch — a *sub-thread* and every descendant — is hidden by default under a live parent, rather than only dimmed. A toggle switch on the parent's sub-thread line names the hidden count ("N archived"). Flipping it re-renders that branch, dimmed as the *Archived sub-thread cue* above describes. It renders only when a hidden branch exists. It shares `.thread-row-family-line` with the live "N sub-threads" chevron, with no separator, below the row's date and chips. On a narrow drawer it wraps under the chevron rather than overflowing.
+
+A branch hides only as a WHOLE. A thread with any live descendant is never hidden, and neither is anything above it — an ancestor can never make a live thread vanish. Reveal state is per-parent and localStorage-backed, mirroring the drawer's family-collapse state, under `lucidos-drawer-revealed-archived`. It does not cascade: revealing a parent's archived children leaves a further-hidden grandchild needing its own reveal.
+
+Computed by `computeHiddenArchivedThreads` (hidden ids, plus each parent's hidden direct-child count) and applied by `filterHiddenArchived`, both in `crates/lucidos-app/src/components/drawer/family-graph.ts`. `visibleChildrenCount` derives a row's "N sub-threads" count from `totalChildrenCount` minus its hidden direct children, since archiving never decrements that field. `setArchivedRevealed` / `toggleArchivedRevealed` (`ThreadDrawer.tsx`) own the reveal state.
+
+The toggle carries no Tab stop of its own (the drawer is a single tab stop). ←/→ on the highlighted row reach it instead, right after the live "N sub-threads" chevron. `leftAction` turns a revealed toggle off first, before falling back to collapsing a parent family or section. `rightAction` turns a hidden one on BEFORE descending into a live child, not after. A row can carry both at once, and checking the toggle last would make it dead code there: the descend branch always matches first. Landing on a thread some ancestor hides this way — a search hit, a notification tap — reveals the whole chain: `revealThreadInFolders` walks it via `hiddenArchivedRevealChain`, mirroring `collapsedAncestorIds` for family collapse.
+
+
+### Archive request
+The durable form of an *agent archive* aimed at the calling thread (ADR 0310). The thread is mid-turn when it asks, so the cascade gate would refuse it. `ResponseGenerated` or `CodingAgentIdled` would move it back to the inbox anyway. So the call records a persisted `ThreadArchiveRequested`, stamped `Api { mode: agent, source_thread_id }`.
+
+A request is **open** while the thread holds no newer `ThreadArchived` or `MessageReceived`, read straight from the event log. So a restart keeps it, and a follow-up message closes it.
+
+The resolver (`engine/archive_request.rs`) is a bus subscriber beside the standing apply resolver. It watches only threads with an open request and re-takes `request_verdict` on each of their events. It runs `archive_family` once the thread is idle, settled (`TurnSettle`) and not parked on a question. It also waits out a live event wait, a pending change, a blocking descendant and a pin (ADR 0312). It never drops a request: it waits or archives.
+
+The direct-child half of an agent archive needs none of this and runs the cascade at once. The ladder is `authorize_agent_archive` (`engine/chat/agent_archive.rs`), detach's ladder applied to archive.
+
+### Loadable<T>
+The four-state TypeScript type for every async-fetched value: `{ status: 'not-loaded' }` / `'loading'` / `'loaded'; data: T` / `'failed'; error: string`. Store signals **must** wrap async data in `Loadable<T>` — bare arrays are a bug because they mask loading as empty.
+See also: `.claude/rules/frontend.md` § "Async Data Loading".
+
+### Max tool calls
+The per-turn tool-call cap for *Lucidos Agent* turns, chat and trigger alike. A turn that reaches it ends with an `[ENGINE-LIMIT]` *ResponseGenerated* terminator naming the cap and pointing at the setting.
+
+- **It counts calls, not LLM rounds** (`tool_calls_made`, incremented inside the per-call loop). One response can carry several tool calls, and counting rounds would let a cap of 500 pass well over 500 calls.
+- **The response that crosses the line completes first.** Every `tool_use` needs a matching `tool_result`, so the overshoot is at most one response's worth of calls.
+- **Stored as the human-only `max_tool_calls` *preference*.** Its default and bounds live in the *preference catalog*, and `PreferenceStore::max_tool_calls` reads it through its *preference handle*. The floor of 1 rules out only `0`, which would fire the backstop before the first LLM call. The ceiling is far above any real turn.
+- **The agent must not raise its own limit**, because the cap is the backstop over its own loop. `set_preference` refuses it with a hint.
+- **Read once per turn** in `process_message_with_steps_internal` and passed to both the system-prompt builder and `run_agentic_loop`. The number the prompt quotes is the number enforced, and a mid-turn Settings change cannot move it.
+
+Distinct from the *circuit breakers*, which fire on 3 and 5 consecutive identical failures rather than on volume. A cap set below 5 pre-empts them. Settings → Models → Chat & triggers.
+
+### Wire shape
+What a *thread event*'s JSON actually looks like by the time the frontend reads it, as opposed to what the Rust `ThreadEvent` variant declares. The two differ, and the difference is the whole reason the frontend types are generated rather than derived:
+
+```
+wire = ThreadEvent variant  +  EventMeta fields  +  API stamps  -  API strips
+```
+
+`EventMeta::apply` merges `request_event_id`, `channel` and `actor` into every payload at persist and broadcast time. So all three appear on every member even though no variant declares them. The snapshot endpoint then strips `ContextCaptured.sections` / `tools`, both tool results' `result` and both tool calls' `args` for size. It stamps `sections_stripped` / `result_stripped` / `args_stripped` to say it did. The live stream strips `CodingAgentToolResult.result` and the same `args` too (`EmittedEvent::to_sse_json`), sparing a `generate_image` call's on both paths. A stripped field is required in Rust and optional on the wire.
+
+Two more things widen it. The snapshot serves the raw JSONB column, so an old row reaches the client exactly as written: a retired variant name, a retired enum arm, or a field since dropped. And a field carrying `#[serde(default)]` or `skip_serializing_if` can be absent, on an old row or a new one. Either attribute therefore makes the TypeScript property optional.
+
+`crates/lucidos-app/src/generated/thread-event-wire.ts` is the wire shape as a type, generated by `thread_events_tests/ts_codegen.rs`. Every divergence above is a declared row in that generator, never a hand edit to the output. Distinct from a *view model* such as `ContextCapture`, which adds frontend-only fields on purpose and is not a mirror of anything. See ADR 0166.
+
+### MCP tool surface
+What the running *MCP servers* contribute to the *Lucidos Agent*'s tool array right now, plus the generation stamp saying when that was true. `McpToolSurface` in `crates/lucidos-engine/src/mcp/mod.rs`, read by `McpManager::tool_surface`. Every enabled tool of every running server, under its *wire tool name*; a stopped server contributes nothing, and a *disabled tool* is absent by definition.
+
+It is fitted under the *MCP tool ceiling*, and it carries what the ceiling left out (`dropped`). The turn tells the model that in one line, so the model can tell the user.
+
+The stamp is the point. A turn reads the array once at setup and runs for many rounds, so it has to know whether what it holds is current. `tool_surface_generation` moves on exactly the four changes that move the offered set: a server connects, stops, is removed while running, or has its disabled-tools set rewritten while running. It does not move on a start of something already running, or a remove of something already stopped. The counter is bumped under the registry's write lock and read under its read lock. So a stamp always describes the array it came with, and a turn can never record a stamp newer than the tools it holds.
+
+`TurnTools` (`engine/agentic_loop/helpers.rs`) is the consumer: it holds the turn's whole array and swaps only the MCP slice when the generation has moved. Everything else is a function of workspace capability rather than of the turn (ADR 0088), fixed for the turn's whole life. Before this existed the MCP slice was fixed too, and a server the agent started mid-turn stayed uncallable until the next user message. See ADR 0195 for why the prompt-cache write that a mid-turn swap costs is the right price.
+
+### MCP tool ceiling
+The chars every running *MCP server*'s tools may take in one request together: a quarter of the request's char budget for the resolved model's window. `mcp_tool_char_ceiling` in `crates/lucidos-engine/src/mcp/mod.rs`. A `tools/list` is third-party input, and an uncapped one once took the whole budget. The conversation was trimmed to nothing, and then every turn failed.
+
+The fit is deterministic. Servers go in id order, and each gets a max-min fair share: a server asking for less than an even split keeps all of it, and the rest share what it leaves. Within its share a server keeps its tools in its own listed order and skips any that no longer fit. The request and the cost report run the same fit. The report is `McpBudget`, served as `budget` by `GET /api/v1/mcp/servers`: the request's char budget, the ceiling, what a request sends (`sent_*`), what is dropped, and a warning from 80% of the ceiling.
+
+### Wire tool name
+The name a tool is offered to the model under. Lucidos's canonical identifier for an *MCP* tool: `mcp__<server_id>__<tool>`, rewritten to satisfy the Messages API pattern `^[a-zA-Z0-9_-]{1,128}$`. Every other character becomes `_`, and the result is truncated to 128.
+
+MCP puts no restriction on a tool name, so a server may ship `catalog.get-catalog-entity`. One such name makes the API reject the **entire request**, not the one tool. That is a workspace-wide lockout: every thread fails the same way, including the one asking what broke. The only tool that could remove the server lives in the chat the server just killed.
+
+Built by `mcp::wire_tool_names` for a server's whole tool list at once, because the rewrite is lossy: `a.b` and `a_b` both reduce to `a_b`. A base only one tool rewrites to stays bare, which covers every tool on a well-behaved server. When several share one base, each is tagged with an FNV-1a hash of its own spelling and the bare name is left unclaimed. `mcp::resolve_wire_tool_name` regenerates the list and matches, which makes the reverse exact.
+
+The load-bearing property is that **a name is never reassigned**. It depends only on the tool's own spelling and on whether a sibling shares its rewrite, never on list position. A reordered `tools/list`, or an update that adds a colliding tool, can retire a name. Neither can move one onto a different tool. That matters because a persisted grant keys on the name, so a moved name would silently authorize a tool the user never approved. A retired name simply matches nothing.
+
+Only the tool half is rewritten and budgeted against the limit. Truncating the composed name can cut the `__` separator, and a name missing it passes the API but parses back to no server. A name that would refer to two tools is dropped for both rather than given to one. Every name Lucidos emits is therefore dispatchable, and the corner cases are absent instead of wrong.
+
+The server's own spelling survives in one place, the outgoing `tools/call`. Permission patterns, dedup keys and the *MCP permission card* all key on the wire name, so they cannot disagree about what was granted. A server whose names were already legal keeps them byte for byte. Otherwise every stored `mcp-allowed-tools` grant would silently stop matching.
+
+Two backstops sit either side. `McpServerStore::register` refuses a server id that is not wire-safe, or that contains the `__` separator. `llm::validate::drop_unsafe_tool_names` drops any still-illegal definition at the Claude wire, so a future source costs one tool rather than the turn. Claude Code solves this the same way, per half, plus an add-time gate on the server name. It handles neither collisions nor the length cap. See `docs/plans/2026-08-14-mcp-tool-names-must-be-wire-safe.md`.
+
+### Notable state
+A UI state worth marking that is **not** a caution — waiting, canceled, trimmed, changed, non-default provenance. Painted with `--accent-notable` (cool grey-blue), as distinct from `--accent-yellow` (muted sand), which means *caution* and nothing else. The two were one token until 2026-07-26, so every neutral marker in the app rendered in a warning hue; splitting them is what lets "the agent is waiting" stop looking like "something is wrong". `--accent-notable` is **host-only** — deliberately absent from the engine's `api/sdk_iframe.css`, so it must never be referenced from `styles/global/shared-components.css` (that file is served to app iframes, where the variable would not resolve). Two deliberate exceptions keep a warm hue despite marking non-caution states, each commented at its site: the memory-importance `high` step is part of an **ordered escalation ramp** (grey → blue → orange → red) where a cool hue would flatten the sequence, and the disk-usage `c2` slot is a **categorical chart palette** entry whose only job is differing from the other five. See `docs/plans/2026-07-26-accent-yellow-sand-retheme.md`.
+
+### Staging manifest
+`manifest.json` in a release staging dir (`.lucidos/release-staging/<version>/`) — the description of what was built, written by `build-dmg.sh` and verified before anything goes public. Carries `version`, the `source_commit` the artifacts were built from, an optional pair of build/recipe fingerprints (the compiled-input re-fold gate), an optional `notarized` boolean (see *deferred-DMG release*), and an `artifacts` list of `{name, sha256}`. Three separate guards read it: `release_staging_verify` (every listed artifact present, every checksum still matching), `release_staging_assert_commit` (the identity half — the verified tree has not moved under the artifacts), and `release_staging_is_notarized`. It is the pipeline's answer to "are these the bytes that were verified, from the tree that was gated, and do they carry an Apple ticket?" — which is why the deferred mode records its state HERE rather than in a flag: a manifest travels with the artifacts, a flag does not. Owned by `scripts/lib/release_staging.sh`.
+
+### Notarize resume handle
+The JSON breadcrumb that makes the release pipeline's notarization stage resumable: `<repo-root>/.lucidos/release-state/notarize-<version>.json`. `build-dmg.sh` submits with `--no-wait` and writes this handle **before** it starts polling, precisely so the process can die at any moment afterwards: Apple routinely takes longer than the waiter lives, and the orchestration layer caps background tasks at 3600 s, so a foreground `--wait` can never complete for a slow submission. Losing the waiter then costs a poll, not a rebuild. Owned by `scripts/lib/release_notarize.sh` (written atomically); consumed by `--resume-notarize` / `--adopt-submission` / `--adopt-app-submission` and by `release.sh`'s auto-promote of `--verify-build`. One handle covers **both** notary submissions a release makes (ADR 0033): its `stage` field is `app` or `dmg` and names the outstanding one, `artifact_path` / `artifact_sha256` describe whichever file was handed to notarytool (the app zip, or the DMG) and, at the `dmg` stage, are moved forward to the post-staple bytes the moment the ticket is stapled in, so a just-stapled release stays resumable, `app_path` / `app_cdhash` carry the bundle identity the app stage must re-assert before stapling, and `updater_tarball_path` / `updater_tarball_sha256` / `updater_sig_sha256` carry the *submitted set*'s pairing. Every key is always written (empty when it does not apply), so an ABSENT key means only one thing: a handle from before this shape, which the gate refuses by name rather than treating as a match. The resume gate refuses unless the submitted artifact still hashes to `artifact_sha256`, the paired updater payload and `.sig` still hash to what was recorded, **and** the tree is still on `source_commit` (the last because the resuming run stamps the *staging manifest*'s `source_commit` from its own HEAD, so resuming on a moved tree would let `--publish-verified`'s identity guard pass on a lie). The handle is deleted once staging succeeds, so a later run can't resume a finished release. See `.claude/rules/build-release.md` § "Notarization is resumable" and `docs/plans/2026-07-28-resumable-notarization.md`.
+
+### Resource contract
+The resources every delivery vehicle stages, and the check that proves it (`scripts/lib/resource_contract.sh`, ADR 0121). `resource_contract_names` is the ONE list: `lucidos-engine`, `lucidos-gateway`, `lucidos` (the CLI), `frontend`, `postgres`, `sdk`, `system-knowhow`, `system-widgets`. Both build scripts read `RESOURCE_NAMES`, `BUNDLED_EXECUTABLES` and the Tauri `bundle.resources` map out of it, and restate none of them.
+
+What makes it a contract rather than a list is what `resource_contract_check` compares against. It asserts a three-way set equality with the two runtime launchers, neither of which the build scripts own. Those are `service_runtime_env_pairs` plus `service_runtime_program` in `scripts/lib/service.sh`, and the `*_RESOURCE_NAME` constants in `crates/lucidos-app/src/desktop.rs`. Drop a name from the list and both still reach for it, so both vehicles' `--check` go red.
+
+The shape exists because the previous check compared two literals in one file. `build-headless.sh --check` was a `printf` and an `exit 0`, and could not fail at all. So `system-knowhow` could be dropped from `Contents/Resources` and from the tarball with every gate green. `resource_contract_assert_staged` re-reads the tree each vehicle actually wrote, since a named `stage_runtime_assemble` call can still omit a resource. `stage_runtime.sh` deliberately does not source it: `install.sh` fetches that lib over the network when piped. Offline-tested by `scripts/lib/resource_contract_test.sh`, whose load-bearing half is the RED cases.
+
+### Submitted set
+The three artifacts one release submission is accountable for, treated as a unit: the file handed to the notary service (the `.app` archive at the `app` stage, the `.dmg` at the `dmg` stage) plus the *updater payload* and its `.sig`. They are pinned together into content-addressed directories under `.lucidos/notarize-submissions/<version>/<sha12>/`, recorded together in the *notarize resume handle*, and asserted together by `assert_submitted_artifacts_are_intact` before anything is stapled or staged. The concept exists because the previous guard pinned only the DMG: its recovery branch restored build N's DMG over build N+1's, which is precisely the state in which the tarball beside it belongs to N+1, and the staging manifest then recorded a DMG and an updater payload from two different builds while `release_staging_verify` found them self-consistent (F3 in `docs/audits/2026-08-02-macos-update-path-audit.md`). The assertion **decides before it acts**: it copies nothing until every member is known intact or recoverable, and refuses having touched nothing otherwise, because restoring half a build is worse than refusing. One member's expected bytes **move once**: `xcrun stapler staple` writes the ticket into the DMG, so `notarize_record_stapled_dmg` re-records and re-pins the post-staple bytes at that moment, and every assertion after it compares against those. Skipping that step is what silently unstapled the v0.19.1 DMG, because staging's own assertion read our own staple as a concurrent rebuild and restored the pre-staple pin over the ticket. A deferred release stages before anything is stapled, so there the expected bytes stay the submitted ones for the whole run.
+
+### App notarization stage
+The first of the two notary submissions a release makes, added 2026-08-02 (ADR 0033): the signed `.app` is archived with `ditto -c -k --sequesterRsrc --keepParent`, submitted, and **stapled**, and only then is the DMG built around it. It exists because the copy of the app inside every shipped DMG had no ticket: the only copy the build ever stapled was the standalone bundle under `target/release/bundle/macos`, which is never shipped, so a DMG install's first launch needed Apple reachable (F5). The bundle's identity is re-asserted by **cdhash** rather than by a file hash, because a ticket is issued for a cdhash and because `ditto -c -k` is not byte-reproducible. Its cost is that `--defer-notarization` can defer only the DMG's verdict: the DMG is built from the stapled app, so the app's verdict is in the critical path of every release.
+
+### JIT selftest
+The last step of `sign_app_bundle`, proving the packaged engine may execute code it compiled at run time. `lucidos-engine --wasm-selftest` compiles a tiny Wasm module through the proxy signer's own `build_wasmtime_engine` config and calls it. The build refuses the bundle unless it exits 0. It runs on the bytes the function hands back, after the outer `.app` codesign, because a run against an intermediate artifact proves a weaker thing. It is answered before any engine construction, so it needs no database, workspace or network.
+
+It exists because a *readback* of the engine's entitlements cannot prove this. `com.apple.security.cs.allow-jit` reads back perfectly and the process still dies: wasmtime never asks for a `MAP_JIT` mapping, and the key covering its `mprotect` is `com.apple.security.cs.allow-unsigned-executable-memory`. Release 0.32.0 shipped with neither key, and macOS SIGKILLed the engine (`CODESIGNING`, `Invalid Page`) on every turn that reached a Wasm-signed proxy. See ADR 0160.
+
+### Updater payload
+The archive the in-app auto-updater installs: `Lucidos.app.tar.gz` plus its detached `.sig`, both attached to the GitHub Release alongside `latest.json` (which points at them). Distinct from the `.dmg`, which is the first-install artifact a browser downloads and the only one Gatekeeper ever assesses. `cargo tauri build` emits it from the `.app` as the bundler leaves it, which is BEFORE `build-dmg.sh` codesigns the bundle, so it is **repacked** from the signed `.app` (after `sign_app_bundle`, before `refresh_dmg_payload`) and its `.sig` regenerated over the new bytes; without that, every release from the introduction of the signed path through v0.19.0 shipped an ad-hoc bundle whose cdhash-anchored designated requirement made each auto-update destroy the user's macOS TCC grants. Its layout is dictated by `tauri-plugin-updater`'s extraction (`entry.path().iter().skip(1)` then `Entry::unpack`): one top-level `.app` component, no hard-link entries, no AppleDouble `._` entries. Both `stage_release_artifacts` and `upload_staged_assets` re-derive its Developer ID verdict from the bytes rather than reading a recorded one, so no stale staging dir or restamped *staging manifest* can launder an unsigned payload into a signed-looking one. Owned by `scripts/lib/updater_payload.sh`. See `.claude/rules/build-release.md` § "The updater payload is repacked from the SIGNED app".
+
+### Release check
+The gateway's hourly poll of `https://lucidos.dev/api/update-check`, and the answer it announces on `GET /~/api/v1/control/gateway/status` as `release_check`. One per install rather than one per open window, because a refresh re-polls only when the gateway's answer is older than the interval. It is fail closed, running only when `LUCIDOS_PACKAGED=1` is set and the executable resolves outside a source checkout, so a dev tree never polls. The request carries platform, arch, version and the caller's IP; `enabled` in `~/.lucidos/updates.toml` defaults true and is its one preference gate (ADR 0139). Distinct from *gateway binary check*, which asks whether a newer gateway binary sits on disk. It never installs: the client does that, via `install_app_update_and_restart` on macOS or a re-run of `install.sh` elsewhere (ADR 0108).
+
+### Update route
+What a session can do about a release newer than the one running, as the single derivation `updateRoute()` in `store/actions/app-update.ts`. Five values, and deliberately none meaning "nothing". `install` is a Tauri client fronting a bundle, which takes the update here. `check` is no newer release known, plus a check this session can run. `guide` sends the reader to Settings, System, Overview, which carries the installer command for a headless install and the rebuild for a source checkout. That page, never the `system` submenu above it: the route sets a Maintenance scroll anchor, and the submenu has nothing to scroll to.
+
+`relay` is a session that cannot install, facing a newer release and an attached desktop client that reports no *remote install blocker*. Following it asks the client to install, through the *update relay*. It is decided FIRST, ahead of `desktop`, because it is the one route that lets a phone act (ADR 0338).
+
+`desktop` is a mobile client with no relay on offer, since none of the remaining three can be reached from a phone. Lucidos ships no mobile client, so `install` is already out. A check there ends at "up to date" or at this same sentence, and `guide` spends a page load to say it. Following it shows a toast naming the machine that runs the workspace, and navigates nowhere. A phone also raises no offer toast, and no update half of the *System attention badge*. Both of those clear on an install it can never run (ADR 0190).
+
+Every surface that can name a newer release reads it: the offer toast, the *What's New* release list, and Overview's own button. The label comes from `updateControlLabel` and the click from `followUpdateRoute`, so a surface cannot invent either. `guide` and `desktop` share their words, because the reader's question is the same and only the answer's medium differs. It exists because the panel and the *release check* have independent sources. What's New routinely knows about a release no offer has named, and used to mark it `Newer` and offer nothing (ADR 0142).
+
+**A surface that has already named the release passes that fact in, so `check` never appears on it.** What's New does, by listing the published changelog. Offering a check there sends the reader to confirm what the `Newer` chip beside it just said. Overview's own button is install, relay or check, because it names no release and is where `guide` lands.
+
+### Update relay
+How a session that cannot install gets the desktop client to install for it (ADR 0338). The client's Rust side sends the gateway a heartbeat every 5 seconds, with its release (never its *client build id*) and its *remote install blocker*. A session following the `relay` *update route* posts a request. The gateway hands it to the next heartbeat, once. The client then runs the same install a click on the Mac runs, and posts each progress phase back.
+
+The state lives in gateway memory (`update_relay.rs`) and dies with the service restart the install causes. So the requesting session keeps its own in-flight marker, and proves success by the gateway's running version after it reconnects. An unclaimed request expires after 2 minutes, and a claim with no progress after 30 seconds. The heartbeat, which also carries the progress, takes only the machine-local token, so no browser session can pose as the client.
+
+### Client build id
+The desktop app's CalVer stamp (`2026.10.03.0`), embedded as `LUCIDOS_APP_VERSION` and injected as `window.__LUCIDOS_APP_VERSION__`. `build.rs` bumps it in the gitignored `crates/lucidos-app/VERSION` when the client's Rust source changes. It identifies a build, and the System page's Client row shows it. The app's *release* is a separate value, `LUCIDOS_RELEASE` from the `RELEASE` file, injected as `window.__LUCIDOS_APP_RELEASE__`.
+
+**Compare like with like.** A release is never newer than a CalVer stamp, so a build id compared against a release always reads as current. That hid the *update relay* from every phone, and put an "older Lucidos" notice on every DMG client. A build id is compared only against another build id: the engine's `latest_tauri_app_version`, which is the checkout's `VERSION` in dev. Everything compared against an engine's or a gateway's release uses `LUCIDOS_RELEASE`.
+
+### Remote install blocker
+Why an update could not run with nobody at the Mac, as the client reports it in the *update relay* heartbeat. It is the install's own blocker (a disk image, a translocated copy, a temp dir on another device). It also covers a bundle folder this user cannot write. That case sends the updater down its admin-password path, which a local click can answer and a relayed install would hang on. A client reporting one offers no `relay` route, and re-checks before it runs a request.
+
+### Release notice cursor
+The `release_notice_cursor` preference: the id of the last *release notice* this workspace answered. Everything after it in `release-notices.toml`, and at or before the running release, is still owed. One scalar is the whole of the ordering and the one-time-ness, because the authored file is an ordered append-only sequence.
+
+Workspace-global (`device_id IS NULL`) and **silent**: its catalog spec is `PrefAccess::Engine`, like `backup_last_run`. The agent must not write it, and the resolve announces `ReleaseNoticeResolved` on its own. The engine owns every write. `POST /api/v1/release-notices/resolve` moves it forward only, and a boot with no cursor may place one (`seed_cursor_at_startup`).
+
+Boot makes the home thread in every workspace (ADR 0411). Only a workspace with no other row in `thread_summaries` is placed, at the last notice AT or before the running release. It starts level and hears from the next release instead, which is what keeps a modal off the first-run welcome. A workspace that has been used is left with no cursor, so it owes every visible notice, oldest first: it has never been shown one. Stamping it past the releases it happens to have run is what ADR 0130 replaced. A stored id this build does not carry reads as nothing answered.
+
+Distinct from `whats-new-seen-release`, which is per client in localStorage and drives a dot. A notice asks for work on the workspace, done once, so its answer belongs to the workspace.
+
+### Gateway binary check
+`GatewayBinaryCheck` in the gateway: a memoized answer to "does a newer `lucidos-gateway` binary sit on disk", compared by mtime against the running executable. It drives the `update_available` field on `GET /~/api/v1/control/gateway/status`, which the workspace picker renders as a self-reload control. Named apart from *release check* because the two answer different questions, and the wire field keeps its original name because the picker reads it.
+
+### Overlay (component)
+The one shared component every overlay renders through (`components/shared/Overlay.tsx`) — modal, popover, dropdown, command palette, anchored panel, bottom sheet. It centralizes the click-outside-dismiss contract so no individual overlay can drop or mis-wire it: outside-`pointerdown` dismiss + paired-event swallow (the `click` on mouse, or the `touchend` on touch — a touch button that runs its action on `onTouchEnd` and `preventDefault()`s the synthetic click never dispatches a `click`, so the `touchend` is swallowed in the capture phase instead) + anchor exemption (via `useDismissOnOutside`) and Escape (via the *overlay stack*). While open it also makes the UI behind it **inert** — `data-overlay-open` on `<html>` (ref-counted) drives CSS that sets `.app-shell > * { pointer-events: none }` so behind-elements don't hover-highlight or activate (the panels carry `data-overlay-panel` and the opening toggle carries `data-overlay-anchor` — both re-enabled to `pointer-events: auto`, so the panel works and re-activating the anchor closes via its own handler); this is the hover analog of the swallow and applies even to backdrop-less popovers (a dropdown, the control panel). The inert targets `.app-shell`'s children, not `.app-shell` itself, so `.app-shell` stays a real hit target for the outside click that dismisses a backdrop-less popover. Positioning stays with the caller (CSS for modals, `panelStyle` + `backdrop={false}` for anchored popovers); only the contract is centralized. Replaced the older `ModalOverlay` (now deleted), which dismissed but did not swallow and couldn't serve click-through overlays — every overlay renders through `<Overlay>`, so `useDismissOnOutside` + the *overlay stack* have no other callers. See `.claude/rules/frontend.md` § "Modals & Popovers".
+
+### Explainer
+The one info-icon affordance the app explains itself through (`components/shared/Explainer.tsx`). It is a small ⓘ button beside a control, opening a popover at the icon that says what the control does.
+
+It replaces the muted prose that used to sit under the controls it describes (`.settings-section-desc`, `.settings-row-note`, `.form-hint`). That prose made Settings, the trigger editor and the credential form read as walls of grey text. Which prose moves behind an explainer, and which stays at rest, is set out in `docs/plans/2026-08-09-shared-explainer-info-icon.md`. State-dependent, next-action, step-by-step, error and empty-state copy stays.
+
+**It is an anchored popover, like the Waits panel** (ADR 0299):
+
+- it hangs below the icon, or above it when there is no room;
+- it is clamped inside the pane that holds it, and its width is capped to that pane;
+- its body scrolls, and no scrim dims the app.
+
+A tooltip cannot carry it, since `data-tooltip` is desktop-only.
+
+**Where it goes is decided by scope.** Copy about one control hangs on that control's own label. A section title takes the icon only when nothing narrower owns the copy:
+
+- a list of rows with no label between them;
+- a body with no labelled row at all;
+- several rows that one explanation covers at once.
+
+A heading icon beside a label icon is fine when the two explain different-sized things. What reads as an inconsistency is the **category error**: two sections of the same shape answering differently. That is what once put the icon on the Notifications heading while the one-control section below it carried its own on the row.
+
+**Its copy is JSX children at the call site**, not a registry keyed by topic. The prose carries `<code>`, `<strong>` and the occasional navigating link, which a string cannot hold. That is also why it does not reuse `DialogMessage`. An explanation kept away from its control drifts from it, and no two sites need the same one.
+
+**It is built on *Overlay***, with the icon button passed as `anchor`. Dismiss-and-swallow, the *overlay stack* Escape and inert-behind all come from the central contract.
+
+**The popover is portaled to `<body>`, and that is load-bearing.** An explainer sits wherever its control is, including inside a wrapping `<label>` (every checkbox row). A label forwards activation to its control for clicks on any non-interactive descendant. So an inline popover would toggle the checkbox behind it each time the user tapped a paragraph. The button itself is exempt as interactive content, which hides the hazard.
+
+**It is host-only.** Its CSS lives in `styles/global/host-components.css`, never in `shared-components.css`. So it never reaches an app iframe, which has none of the overlay machinery it needs.
+
+Two placement limits follow from it being a `<button>`:
+
+- Inside a `<fieldset disabled>` it is disabled with everything else, an accepted limitation.
+- It cannot go inside a control that is itself a button, since a nested button is invalid HTML.
+
+Where the icon must sit within a control's own text, the control becomes a `div[role="radio"]` with hand-rolled Enter and Space. That handler must ignore keys whose target is not the row itself. Otherwise the explainer's own Enter bubbles up and is `preventDefault`ed, and the popover is unreachable by keyboard.
+
+### Surface anatomy
+The one shape every toast, popover, menu and dialog is built from (ADR 0290). A `.surface` box (`styles/global/surface.css`) holds an optional head, body and foot. The head is `SurfaceHead` (`components/shared/Surface.tsx`): a back link, a tone icon or a custom glyph, the title, a meta readout, actions, and the close X. Tone lives in that icon, never in the frame, and the X is the surface's only close affordance. Every X carries a tooltip that repeats its accessible name.
+
+Radius, fill and shadow come from `--radius-surface`, `--surface-bg` and the `--shadow-*` tokens. Buttons on a surface share one size and the shared `.action-btn` family. A menu wears `.surface-box`, the frame alone: its rows keep their own line height and its buttons their own size (ADR 0299).
+
+### Surface inset
+Where a surface's text starts, measured from its frame: `--surface-inset`, 1rem, declared on `.surface` (ADR 0299). The head, the body, the foot, a popover body and a toast all read it. So a head and its body share one left edge by construction. A rule inside a surface never restates the value to line up with them. The close X's glyph lands on the inset too, because the head's right padding subtracts the button's own. Menus and dropdowns are not bound by it: their rows keep their compact padding.
+
+### Anchored popover
+A surface that opens at the control that opened it, placed by `useAnchoredPosition` and clamped inside that control's pane (ADR 0299). The Waits and Todos panels and the explainer share one shell, `.anchored-popover` (`styles/global/anchored-popover.css`): fixed position, a width capped by `--anchored-popover-fit`, and a body that scrolls. Each keeps only its own width and height caps. Menus open at their trigger too, but draw their own compact frame on `.surface-box`.
+
+### Header palette
+A surface opened from a header button that hangs just under the header, on the Lucidos menu's line (`--app-header-bottom + --header-surface-gap`): the Lucidos menu, Search Everywhere and file search (ADR 0299). On desktop it centres on the pane whose header holds its button. Search Everywhere and file search do it through `usePaneCentre` and `.surface-pane-centred`, and narrow to fit the pane through its `--pane-fit`. The Lucidos menu reads the header's own pane edges in CSS.
+
+Search Everywhere opened with no button, by a shortcut or from the Lucidos menu, centres on the focused pane group. File search with no button falls back to the Canvas pane. On mobile both centre on the screen. A palette dims nothing.
+
+### Toast tap
+What a tap anywhere on a toast card does (`toastTap` in `components/shared/toastTap.ts`). A toast with its own `onClick` runs it, whatever its type. An info or success toast with one neutral action runs that action and draws no button for it. A passive toast does nothing on a tap, since a reader may tap it looking for more and must not lose it. A warning or an error keeps its buttons, since a tap to read it must not act. So do two actions, a lone `danger` or `confirm` action, and a `deliberate` one such as Archive all's Undo.
+
+A tap on a button or a link never counts, nor does the mouseup ending a text selection inside the card. A card that acts also carries a visually hidden button for the keyboard and screen readers, labelled with the action or "Open". The card is never `role="button"` itself, since that would hide its X and links from assistive tech. A card that acts draws its X even on a timer, so closing it never means following it (`toastHasClose`).
+
+### Scrim
+The dimming wash behind a modal surface, one the app waits on until it closes: a dialog, a detail modal, the mobile drawer. A read-only dialog counts, because what dims is modality, not a pending answer. Every one reads the `--scrim` token. A menu, a popover or a palette paints none, since it blocks nothing (ADR 0290). The image viewer and the camera keep a darker scrim of their own, as lightboxes.
+
+### Drill-in
+How a popover shows more detail without a second layer (ADR 0290). The detail replaces the popover's content in place, under a head whose back link names the view it returns to. Escape steps back first, through an Escape-only registrant on the *overlay stack*, and a second Escape closes the popover. The waiting panel's condition is the worked example (`components/chat/WaitingPanel.tsx`). A dialog may still stack a confirm on itself, because a confirm needs an answer. Each view is a *surface step*, and moving between them is a *step morph*.
+
+### Surface step
+One view of a *drill-in*: the waiting panel's list or a condition, the coding-agent menu's command list, or one step of the model picker. Its root carries `data-surface-step="<identity>"`. Steps nest, so a panel's steps read outermost first (`stepSignature` in `hooks/panelStepMorph.ts`). A change in that list is what `useAnchoredPosition` treats as a step change. Any anchored popover gets the *step morph* by marking its views this way.
+
+### Step morph
+How an anchored popover moves between *surface steps*. The box glides from its old size and position to the new ones, and the new content fades in. The children hold their final size throughout and the box clips them, so no text rewraps mid-glide. Size and offset share one curve, so an upward panel keeps its bottom edge on its anchor. Reduced motion swaps instantly.
+
+Code that measures the panel mid-morph, such as a highlight's `scrollIntoView`, waits for it through `whenStepSettled`. Plan: `docs/plans/2026-10-03-popover-steps-morph.md`.
+
+### Overlay stack
+The central LIFO registry of dismissable overlays (`store/overlayStack.ts`). Every overlay *panel* registers through the `<Overlay>` component, its sole panel registrant. The panel-less pseudo-fullscreen mode pushes an Escape-dismiss entry directly. Each entry registers its `dismiss` on mount and removes it on unmount. One capture-phase dispatcher in `useKeyboardShortcuts` (`dispatchEscape`) pops the top entry, so per-instance Escape listeners no longer race.
+
+Escape policy is non-destructive. The dispatcher tries these in order:
+
+1. **While an element is NATIVELY fullscreen, stand down.** The browser takes that Escape to exit fullscreen, and no handler can stop it. The dispatcher still calls `stopPropagation`, without `preventDefault`, so `<Overlay>`'s own bubble-phase Escape cannot close the overlay as well.
+2. **Else dismiss the top overlay.**
+3. **Else leave a `data-escape-self` input to its own handler.** Fields whose blur commits work opt out this way, such as the trigger group rename field. There a blur on Escape would save instead of cancel.
+4. **Else blur a focused text input.**
+5. **Else do nothing.** Escape never touches the focused thread or discards work.
+
+*Pseudo-fullscreen* is NOT covered by the stand-down. It is painted in the normal layer and dismissed through this same stack. It registers before the overlay, so LIFO pops the overlay first and fullscreen survives. The *close cascade* has its own trigger, not Escape. So a double Escape on a cascade confirm cancels the dialog and skips no layer.
+
+**An entry either owns a panel or answers only Escape, and the two are asked different questions.** `<Overlay>` marks its entry `hasPanel`. Everything else is an **Escape-only registrant**, owning no pixels: pseudo-fullscreen, the thread filter, the *find bar*, or a step inside a panel (`useEscapeStep`). **Escape asks `topOverlay`; a POINTER asks `topPanelOverlay`.** A registrant can never receive a click, and one deliberately sits ABOVE the panel it belongs to. Answering the raw top for the pointer switched outside-click dismiss off on every model menu whose tier row was open.
+
+### Overlay layer
+The App-root group of host-rendered overlays, moved as a unit by `components/layout/OverlayLayer.tsx`. It holds:
+
+- the *file preview modal*, and the confirm and prompt dialogs
+- the toast container and the search palette
+- the scale modal and the image popup
+- the message-route panel
+- the step-detail modal and the file-search modal
+
+Normally it renders inline, as a bare fragment, so each overlay is a direct child of the app root. While an *app fullscreen host* is published, the whole group is portaled into it. That host IS the `display: contents` mount carrying `data-overlay-layer`, and the layer adds no wrapper of its own.
+
+Grouping is the point. A natively fullscreen element is painted alone, so the overlays have to move. Moving them **together** keeps their relative order (`--z-toast` above `--z-modal`), rather than letting it depend on which was raised first. The mount is also the third `pointer-events: auto` exemption in the inert-behind rule, since the portaled group sits inside `.app-shell`.
+
+Two App-root overlays are deliberately excluded. `UiBlockingOverlay` inerts its own siblings, so it must stay a child of the app root. `DropZone` renders null.
+
+### App fragment
+The place INSIDE an app that a link names, written as the fragment of an app href and delivered to the app iframe as `location.hash`. `[Some report](app:pr-understanding#pr-1645)` opens PR Understanding on report 1645 rather than on whatever the reader saw last. Both entry-point shapes carry one, `app:<id>#frag` and `apps/<id>[/index.html]#frag`, since they are the same destination. A `navigate` to an `app` target carries one as its `fragment` field. That covers a notification tap, the `navigate_ui` tool and `lucidos.ui.navigate`, which all reach `openAppById`.
+
+It is a hash and never a query parameter, and that is structural rather than stylistic: the engine's WIP-preview branch (`api/apps.rs::serve_app_ui`) rebuilds the query and keeps only `thread_id`, so a query parameter is dropped on the way in.
+
+Its path is one value handed along. `extractAppTargetFromHref` (`utils/linkifyPaths.ts`) parses it and `rewriteAppAnchor` puts it on the anchor as `data-app-fragment`. The three click surfaces read it, `openApp` stores it on the `app-ui` *panel overlay*, and `appUrl` appends it after the `thread_id` query. Living on the overlay is what makes a fragment that outlives its app open unrepresentable, and it is what a reload restores. The navigate path skips the parse: `Tap.to.fragment` travels whole through persistence, push and SSE, and `handleNavigationRequest` hands it to `openAppById`.
+
+Two properties are load-bearing, both about NOT moving a reader. **Absent is not empty**: a link naming no target leaves an open app where the reader put it. So `null` and `''` are different answers, and a bare `#` means the second. **A mounted app is moved, never reloaded** (`setAppFrameHash`): the target URL differs from the frame's only in its fragment, so the navigation is same-document and `hashchange` fires. Apps that care listen for it.
+
+That move is a `location.replace`, for the reason in `iframeNav.ts`'s header: a plain `location.hash = …` pushes a session-history entry, and on an iOS PWA the edge-swipe-back gesture replays those. A same-document navigation fires no `load`, which is why the frame's effect raises no cover on this path. One would sit over a live app until its 3s fuse.
+
+Two places deliver one, and `setAppFrameHash` is idempotent so they cannot fight. The frame's own layout effect fires on a CHANGED src. `openApp` covers the case that effect cannot: an app that reflected its selection back with `history.replaceState` leaves the src identical, so re-clicking the link the reader arrived on would otherwise deliver nothing.
+
+Deliberately NOT carried by the bare-app-ref shapes, `[X](habit-tracker)` and the bare `[X](app)` recovery, which are *temporary measures*. App-to-app navigation still uses the `localStorage` plus transient-SSE handoff.
+
+### App fullscreen host
+The empty mount element (`.app-overlay-layer`, `data-overlay-layer`, `display: contents`) that the app panel renders inside itself, published as `appFullscreenHost` (`store/appFullscreenHost.ts`) while that panel IS the natively fullscreen element, and consumed by the *overlay layer* as its portal target. It is the mount and not the panel because the panel's own children belong to Preact (the app iframe, the pseudo-fullscreen chrome), and a portal filling a container another component also fills asks two diffs to agree about DOM they each think they own. Native fullscreen is requested on the panel (`.app-ui-inline`, `data-role="app-ui-panel"`) rather than on the app iframe precisely so a mount can exist inside it: an iframe renders no DOM children, so with the iframe fullscreen there was nowhere to put a modal and nothing outside its subtree could be painted, which is why an app's `lucidos.ui.previewFile` / `confirm` / `prompt` / `toast` showed nothing in fullscreen.
+
+Always DERIVED FROM THE DOM (`resolveOverlayMount`: the mount inside a still-connected fullscreen app panel, else null), never from an element a component captured: a ref goes stale the moment its panel is replaced, and a stale host is indistinguishable from "no host", so it refuses a preview whose modal would have been perfectly visible. Identity, not presence, is the test: an app that calls `requestFullscreen` on its own content makes the *iframe* the fullscreen element, no mount resolves inside it, and `filePreviewBlockedReason` turns that into an honest refusal. A DETACHED fullscreen element is the one exception that does not refuse, since fullscreen is ending there anyway. *Pseudo-fullscreen* never sets it, because that panel is painted in the normal layer and `--z-app-fullscreen` (between the header chrome and the modal layer) already puts the overlays above it.
+
+### App popout
+The open *app* taken out of the shell into a top-level page of its own, and the header control that does it (`appPopoutAction` in `components/layout/ContentHeaderActions.tsx`, action key `open-in-tab`, class `app-open-in-tab`). ADR 0044 settles what the destination is: the bare `/<slug>/app/<id>/` app tab, with no host around it, which is why the SDK renders its own preview / toast / confirm / prompt when `window.parent === window`. Distinct from *pseudo-fullscreen* and from native fullscreen, which both keep the app inside the shell.
+
+Its shape is per-client, and the shape is the whole of it. A browser gets a real `<a target="_blank">`, so cmd-click, middle-click and "copy link address" work and the tab opens on the anchor's own user activation. An installed iOS PWA gets **no control at all**, because it cannot open a same-origin link anywhere but its own inescapable in-app web view. The packaged desktop client gets a BUTTON calling `popOutApp` (`store/actions/apps.ts`), which resolves the frame src against the document and hands the absolute URL to the OS opener, so the app lands in the user's default browser. That branch is not a preference: WKWebView drops a `target="_blank"` navigation unless wry was handed an `on_new_window` delegate, which only the panel-preview webview has, so the anchor there is a dead click with no error anywhere. Deliberately not `openUrl`, which with the experimental in-app browser on would mount the url-preview panel INSIDE the shell over the very app being popped out of it.
+
+### Panel receipt
+The read-only state a **confirmation panel** enters once the user resolves it: the same content-pane panel, now a record of what actually happened, with Close as the only action. Three exist, and they are one pattern rather than three lookalikes. The **sent receipt** (`EmailSentReceipt`, `components/email/EmailConfirmModal.tsx`) shows the recipients, subject, body and attachments that went out; the **install receipt** and **uninstall receipt** (`PluginInstallReceiptPanel` / `PluginUninstallReceiptPanel`, `components/plugins/`) show the files the engine actually wrote or deleted. All three wear the shared `.panel-receipt-*` chip + timestamp in `styles/pages.css`.
+
+A receipt is not a separate destination. The `mark*` action (`markEmailSent`, `markPluginInstalled`, `markPluginUninstalled`) rewrites the open *inline form* in place, stamping a marker (`sentAt` / `installed` / `removed`), then `replaceNavState()`s, so one action keeps the one nav-history row it already owned, relabelled past-tense by `getFormTitle` ("Email Sent", "Installed <plugin>", "Uninstalled <plugin>"). Four properties follow from the marker living on the form rather than in component state:
+
+- **It cannot re-fire.** A resolved panel can never render its Send / Install / Confirm button again after a remount (a Back/Forward walk, or a reload), which matters because the staged request id behind that button is already popped and would only 404.
+- **It survives a reload.** The marker rides in the persisted nav entry, so a restore re-seeds the receipt from the form alone. It needs no carve-out to do so: every nav entry restores its overlay on every path. ADR 0127 records why the `isTransientForm` guard that used to drop a *pending* one was deleted. The engine-staged request it claimed died with the page either does not exist or lives on the engine.
+- **It records the outcome, not the request.** The marker carries the engine's own answer (`installed_files`, `files_deleted`, the edited subject/body), never the staged request's intent, because a history round trip re-seeds the panel from the form alone.
+- **A late resolve cannot hijack the pane.** Each `mark*` compares form identity first and returns false when the user dismissed the panel mid-request, so the caller falls back to a toast instead of resurrecting the panel over whatever they opened since.
+
+The panels deliberately do not switch the active menu item (see `openEmailConfirmRequest` / `openPluginInstallRequest`); confirming a send used to teleport the user to Settings → Accounts and strand them there.
+
+### Per-thread events bump
+The frontend reactivity primitive in `crates/lucidos-app/src/store/threadActivity.ts`. It splits SSE fan-out into two channels, so a long-running streaming thread does not fire every wide `threadMap` subscriber on every token. `bumpThreadEvents(threadId)` increments a lazy-created `Signal<number>` for that thread only (RAF-coalesced), and `getThreadEventsBump(threadId)` subscribes to just that thread.
+
+Streaming events (`TextStreamed`, `CodingAgentTextStreamed`, `CodingAgentToolCalled`, `ContextCaptured`, …) bump the per-thread signal and do **not** flip `threadMap`. Meta-shape changes (status, title, channel, codingAgent flags, child counts, …) flip `threadMap` and fire the wide subscribers (`blockedThreadCount`, `ThreadDrawer.ThreadList`, every `PromptInput` effect). Focused-thread views (`activeExchanges`, `activeStreamingBuffer`, `ThreadView`'s exchanges memo) subscribe to the per-thread bump and read `threadMap.peek()`.
+
+**Contract**: every code path that mutates `thread.events`, `thread.streamingBuffer` or `thread.pendingUserMessages` MUST pair the mutation with `bumpThreadEvents(threadId)`. The SSE handler at the bottom of `handleThreadEvent` bumps unconditionally. The optimistic-message paths in `chat.ts` (`addPendingMessage`, `removePendingMessage`, the unreachable-engine fallback) bump explicitly, as does the `CodingAgentThreadSpawned` branch in `handleGlobalEvent`. It follows the same pattern as `composeDrafts` / `draftPresentThreadIds` for compose state.
+
+### MessageOrigin
+The Rust enum for *actor*, defined in `crates/lucidos-engine/src/engine/thread_events.rs`. Variants:
+
+- `Device { device_id: String }`: human at a known device. `device_id` is the TEXT primary key from the `devices` table. Never a name: a display resolves it through `DeviceStore::friendly_name` (ADR 0297).
+- `Api { user_agent: Option<String>, mode: ActorMode }` — HTTP request without a device id or cross-workspace caller. `mode` defaults to `Human`.
+- `Workspace { workspace, thread_id, event_id, user_agent, mode }` — HTTP request from another Lucidos workspace, identified by the `caller_workspace` body field. `mode` carries upstream intent (defaults to `Human`).
+- `ThreadLink { thread_id, title, spawning_event_id, mode, direction }`: bidirectional link to another thread in the same workspace. `direction = Parent` means the linked thread spawned the receiving thread; `direction = Child` means a child posting a callback. (Carries `#[serde(alias = "parent_thread")]` so historical rows from the old unidirectional `ParentThread` variant still deserialize; `direction` defaults to `Parent` when missing.) **Attribution, not linkage:** a `Parent`-direction link says who launched the thread and says nothing about whether it reports back. The callback linkage is the separate `MessageReceived.parent_thread_id` field, and a *top-thread* (`relation: "top"`) carries this origin with that field empty, as does a *child follow-up*. Anything deciding parent-ness (counting, the callback, `resolve_attend_mode`'s grant inheritance) must read the field, never the origin. See `agentic_loop_special_tool::spawn_origin` versus `Relation::spawn_linkage`.
+- `Agent { agent: AgentParticipant }`: an agent in this thread AUTHORED the event, and `agent` names which one (ADR 0150). The outbound variant, where every other one names a way in. Stamped on what the agent wrote. Never on a user action that merely ends its turn, so a `ResponseCanceled` still carries the person who clicked Stop. See *agent participant*.
+- `Webhook { webhook_id, name }`: an inbound webhook fired. `name` is what the user called it, so the timeline says which hook rather than "API caller". Mode is `Engine`, because a webhook is neither a person nor an agent.
+- `System` — internal projection / housekeeping origin (e.g. `MessageOrigin::system()`).
+- `Engine { reason: EngineReason }` — engine-internal action (e.g. `MessageOrigin::engine(EngineReason::HardenRetrigger)`).
+
+Optional on `SystemEvent` variants (`actor: Option<MessageOrigin>`); the four legacy change-event variants carry per-variant `actor` instead. `MessageOrigin::mode()` derives the *ActorMode* used for UI labelling.
+
+### agent participant
+Which agent authored a thread event, once a thread can carry more than one (`AgentParticipant` in `engine/thread_events/actor.rs`, ADR 0150). Two variants. `LucidosAgent` is the workspace's own agent and the `Default`. `Guest { label }` is any other agent sharing the thread, where `label` is the speaker name the rendered history prints. An enum rather than a name string, because our own agent is not something a caller could spell two ways.
+
+It exists because `engine/chat/process/history.rs` renders each turn as `User:` or `Assistant:`, and with two agents writing, `Assistant:` stops being a name and becomes a collision. `history::speaker_label` is the single definition of what a line prints under. The two mis-attributions it rules out are not symmetric. `Assistant` makes the doer read a guest's turn as its own prior turn, so the two converge on whatever the first said. `User` makes it obey an instruction the user never gave.
+
+Carried into the projection as `SessionMessage.agent`, read off the persisted actor by `messages::build::authoring_agent` rather than inferred from position: two agents interleave, and only the writer knew which one wrote. `None` there means a user turn, or an assistant turn from before the actor existed; both render `Assistant`. The first *guest* is the voice *talker* (`docs/plans/2026-08-28-voice-joins-a-thread-as-a-participant.md`), which is also why the label is a free string: the surface that adds a participant names it.
+
+### PreEmittedOrigin
+The Rust enum in `crates/lucidos-engine/src/engine/chat/process/mod.rs` telling `process_message_with_steps` that the turn's exchange-starter event is ALREADY persisted. So the turn must not emit its own `MessageReceived`. It has three variants, and the distinction is load-bearing rather than cosmetic.
+
+**`Message(Uuid)`** is a message a person or an agent actually sent. Examples are the chat API boundary's *emit-before-ack* and the Thread Queue executor's eager child `MessageReceived`. It routes exactly like one the turn emitted itself. So on a live thread it injects as `UserText`, is acknowledged with a `PromptInjected`, and arms the Codex redirect interrupt.
+
+**`EngineReentry(Uuid)`** is an engine-internal re-entry, anchored to an event the UI already renders. Examples are a child completion, a continuation rerun's note, and an orphaned injection being replayed. It stays silent, injecting as `ReentryFromEngine`.
+
+**`WaitReentry(Uuid)`** is the same kind of silent re-entry for an *event wait* resolution. It is split out because a live thread must inject it under its own name (`ReentryFromWait`), not as a nonexistent child completion. It anchors on whichever event carries that resolution's payload. That is the `EventWaitDelivered` / `EventWaitExpired` row when the wait was still attached, and the `PromptInjected` beside it when it had detached.
+
+The three map to their injection kinds through `PreEmittedOrigin::inject_kind`, which replaced the boolean `is_engine_reentry` branch at the fast-path call site. `is_engine_reentry` itself remains, now true for both re-entry variants.
+
+Silent means *this* code path emits nothing. A caller may still announce the re-entry on its own behalf, and the orphan replay does exactly that. `process_orphan_chain` emits a `PromptInjected` for every orphan in the batch **before** re-submitting it (`announce_orphan_batch` in `api/chat.rs`). The re-entry's starter `MessageReceived` predates the terminator that ended the previous turn. So nothing else in the re-processed turn would set the thread back to `running`.
+
+It replaced a bare `Option<Uuid>` whose readers inferred "engine re-entry" from "already persisted". That inference only held while no caller could pre-emit a follow-up on a live thread. `ThreadQueueRequest::SubThread` keeps the plain `Option<Uuid>` on the wire, since it is persisted in a `ThreadQueued` payload, and converts at the call.
+
+### Emit-before-ack
+The rule that `POST /api/v1/chat/stream` persists a chat follow-up's `MessageReceived` **before** it returns 200, so the ack means "recorded, with its sequence assigned" rather than merely "accepted". Implemented by `LucidosEngine::pre_emit_chat_message_received`, which runs after every validation gate and hands the event id to the spawned turn as a *PreEmittedOrigin*. It is what makes the frontend's *send chain* a real ordering guarantee: the handler otherwise spawns the turn and acks immediately, with the emit sitting behind a Thread Queue slot wait, so a client that waited for the ack could still have the next request's task take the lower sequence. Deliberately self-gating: a brand-new thread, a coding-agent dispatch, a non-human mode, a thread with an open question (the reply becomes `UserQuestionAnswered` and never a `MessageReceived`), and a failed emit all fall back to the turn emitting it. See `docs/plans/2026-07-30-serialize-chat-sends-per-thread.md`.
+
+### Send chain
+The per-thread promise chain in `crates/lucidos-app/src/store/actions/sendChain.ts`. It keeps at most one `POST /chat/stream` in flight per thread, so a device's messages reach the engine in the order the user pressed send. `enterSendChain` claims the slot **synchronously**, when `sendMessage` is called, not when the POST goes out. `sendMessage` can await first (`getWebviewContent()` on the Tauri panel path), and two of those awaits resolve in either order. Links settle rather than resolve-on-success, so one failed send cannot poison the chain.
+
+A send holds its slot through every *quiet retry*, so a later message never overtakes one still retrying. The wait is bounded by `SEND_CHAIN_MAX_HOLD_MS`, timed from the predecessor's own turn and derived from the retry deadline and `SUBMIT_CHAT_TIMEOUT_MS`. It is a net for a send that hangs some other way. Its engine counterpart is *emit-before-ack*; without that, the chain narrows the race but does not close it.
+
+### Quiet retry
+A send's automatic repeat of a POST that got no reply, before anything says Not sent (`withQuietRetries` in `crates/lucidos-app/src/store/actions/sendRetry.ts`). Every send path takes them: a message, an answer to a question card, and a *side question*. Only a failure that says nothing about the request retries: a transport error, an abort or timeout, or the gateway's boot splash. The schedule is `SEND_RETRY_BACKOFF_MS`, and no retry starts later than `SEND_RETRY_DEADLINE_MS` after the first attempt.
+
+A wait ends early when the browser reports the network back or the page becomes visible. What the attempts ended on opens from the Not sent label. Plan: `docs/plans/2026-10-03-auto-retry-a-send-before-not-sent.md`.
+
+### Accepted messages
+The engine's record of the client event ids that `POST /api/v1/chat/stream` already took. A re-post of the same body acks `200` with the same `event_id` and starts nothing. That is what makes an *unsent message*'s Retry safe when the first POST did land and only its answer was lost.
+
+`api::chat::message_was_already_accepted` asks two places. First `chat_event_id_is_recorded`: the events table, and the `thread_queue` projection for a spawn request still waiting for a slot. Then `AcceptedMessages` (`engine/chat/accepted_messages.rs`), which holds ids in memory for 15 minutes. A coding-agent message is recorded only after the ack, so a fast re-post finds no row yet.
+
+- **Admitted after every refusal.** A request the handler refuses leaves its id free, so the corrected retry runs. A failure later on that starts nothing calls `forget`.
+- **Lost on restart, by design.** Past a restart the events table answers, and a coding-agent turn the restart killed had nothing to duplicate.
+
+
+### Unsent message record
+The stored copy of a send on the sending device (`store/unsentMessageRecords.ts`), in a per-workspace IndexedDB database. `sendMessage` writes it before the POST, in phase `sending`. No answer marks it `unsent` with its retry count. An accepted or refused send, the engine's own row, Discard, and deleting the thread all end it. So does a new answer from this device to the question card a *typed answer* record names in `answersQuestion`. So a record found at startup is a send whose outcome the page never learned.
+
+`store/actions/unsentMessageRestore.ts` brings each one back once the engine serves the thread list, where it was sent (`sentAt`). A typed answer returns to its card while the thread still waits on it. It is adopted only if no live tab owns it (`store/pageOwner.ts`). See ADR 0352.
+
+### Send settlement
+What a sender owes once the engine decides its send after the first attempt (`SendSettlement` in `store/unsentMessages.ts`). It is data, not a callback, so an *unsent message record* settles after a reload exactly as in the page that sent it. It has three kinds:
+
+- `first-send`: accepted consumes the draft's picks, and refused rolls the draft back.
+- `follow-up`: refused appends the text to the draft.
+- `raw-new`: refused starts a fresh draft.
+
+`store/actions/sendSettlement.ts` runs them.
+
+### ModelRegistry
+The in-memory model routing map, `Arc<RwLock<HashMap<String, ModelRouting>>>` in `crates/lucidos-engine/src/llm/model_registry.rs`. A `ModelRouting` is a model's ordered *route* list, its *preferred provider*, its *vision flag* and its *default effort* (read through `default_effort`). Projected from the `models` config table (`load_from_db`) and cloned into `RoutingProvider`. The engine's `spawn_models_registry_subscriber` hot-swaps it on any `Model{Created,Updated,Deleted}` event, so re-routing a model in Settings takes effect without a restart. 
+
+`resolve_route` answers which backend serves a turn and what id to send it, taking the caller's own pick and the configured set. `provider_kind_for` answers the weaker question, ignoring what is configured, for callers holding no such set. Both fall back to a prefix heuristic (`gpt-`→OpenAi, `claude-fable`→Anthropic, else Vertex) for ids not in the table (legacy saved prefs). Distinct from the user-facing *model registry* (the `models` table + Settings UI): this is the runtime cache.
+
+### Supported reasoning tiers
+Which of the six *reasoning effort* tiers a given model actually offers. The tiers are the closed ladder `llm::reasoning::EFFORT_LADDER` (`none` … `max`). The set is derived by `llm::reasoning::supported_efforts` from the pair **(`ProviderKind`, model id)**.
+
+Keyed on the provider and not the id alone, because the id's shape says nothing about which server receives the request: `OpenAi`, `OpenRouter`, `XAi`, `OpenCodeFree` and `Local` are all the same `OpenAiProvider` struct with a different base URL. So `xhigh` is offered to a real OpenAI model and never to a third-party one behind the same wire format.
+
+`OpenCodeFree` is the one provider whose set also varies by model, and the split is measured rather than assumed. Ox Alpha (`x-preview-f-free`) accepts `low`, `high` and `max`, and answers 400 to the rest. Every other seeded free model takes the same conservative set as the other third parties.
+
+Single source of truth for two consumers that must not disagree. `RoutingProvider::effort_for_model` snaps every outgoing request onto the set (nearest tier, ties upward). The same set is served per row on `GET /api/v1/models` as `reasoning_efforts`, which is what the Lucidos Agent picker filters against. That filter is `reasoningLevelsFor` / `clampEffortFor` in `store/actions/models.ts`, guarded by a source scan so no surface reaches for the raw pair in `store/models.ts`.
+
+Derived per request rather than stored, so it is never a column and a user adding a local model is never asked to declare it. The prefix heuristic in `store/models.ts` survives only as the frontend's pre-load fallback.
+
+The coding agent's tiers come from elsewhere and are **served in the same shape**. `cc_menu_options.json` / `codex_menu_options.json` keep a hand-maintained `supported_models` matrix on their EFFORT rows, because that is how upstream announces a tier: one line naming the models that accept it. `runtime::claude_code::model_and_effort_options` transposes it when serving the menu, so the wire carries `reasoning_efforts` per model row on both surfaces and one picker rule covers both. `validate_codex_effort` still DROPS an unsupported effort, but as a backstop for API and trigger callers: the picker clamps, so the drop is unreachable from the UI. See `docs/plans/2026-08-12-reasoning-effort-follows-model.md` and `docs/plans/2026-08-22-model-selection-picker-and-summariser-split.md`.
+
+### Writer thread
+The thread whose turn wrote an artifact, carried as `writer_thread_id` on
+`ArtifactCreated`, `ArtifactUpdated` and `ArtifactImported` when one did. The
+Tree compactor and the memory indexer bill their calls about that write to it.
+Once it is deleted, they bill the home thread instead (ADR 0381). The data API takes
+it only from the token-verified caller, never from the request.
+
+### Model call service
+`engine::model_call`: the one path an engine model call takes, and the
+`ContextCaptured` row it always leaves (ADR 0242). An auxiliary call goes
+through `AuxCapture::chat`, `judge`, `generate` or `search`. The agent's own
+turn goes through `turn_chat`, whose `TurnCapture` records its usage even if
+the loop never finishes the row. Spend that arrives outside a provider call
+(voice, a coding agent's side question, the proxy) goes through
+`AuxCapture::record_usage`.
+
+It does not choose the model: `AuxCall` and the router still resolve that. It
+makes the call and records it, and the *call token* makes it the only thing
+that can.
+
+### Model selection
+A model id paired with a reasoning effort, resolved together for one surface. The tiers offered are the model's *supported reasoning tiers*, so the pair is never independently valid. Every model picker resolves one through `useModelSelection`. Distinct from *per-thread model memory*, which is where a chat thread's selection is remembered.
+
+**On the Lucidos Agent's surfaces it carries a backend too**, the *preferred provider* chosen in a third step. The step comes LAST, since the backend is the rarely changed part. It appears only where there is a real choice: two configured *routes*, or a route in force that is not configured, so a refused turn stays fixable. The tier step shows the would-be backend's tiers, and a provider pick snaps the held effort onto the chosen one's. Hosts opt in by passing each model's `providers`, so the coding-agent menu and the auxiliary rows never show the step. The backend is NAMED wherever a host passes them, choice or not: in the selection's label (`Opus 5.5 · High · Vertex`) and as each model row's muted note.
+
+**One thing, so ONE pick, reached in TWO steps.** Step 1 lists models: the one in force reads its whole pair, `Opus 5 (1M) · X-High`, and every other reads its name alone. Picking one opens step 2, that model's *supported reasoning tiers*, and choosing there reports both halves. Nothing is written between the steps, so backing out of step 2 leaves the model exactly as it was. A model with no tiers has no step 2 and commits on step 1. There is no separate Reasoning control anywhere.
+
+Stored as a **pair of preference keys** per purpose (`model_x` plus `reasoning_x`), mirroring `chat_model` / `chat_reasoning_efforts` and `TriggerConfig::model` / `reasoning_effort`. Not a JSON pair, which would need a new `PrefValue` variant. Unset, a purpose's tier binds its recommended models, and any other model runs at its *default effort* (`aux_purpose::task_effort`, ADR 0390). The engine reads one per `ContextPurpose` in `engine::aux_purpose`, whose standing invariant is **one purpose per auxiliary model preference**.
+
+The frontend half is one module, one hook and one component. `store/modelSelection.ts` answers what a model offers and builds the model rows. `useModelSelection` resolves the current pair, asks that module, clamps a stale STORED pair for display, and reports both halves on a pick. It writes no store.
+
+`ModelSelectionPicker` is the picker, and every surface mounts the same one: both prompt-bar control menus, the Settings field (`ModelSelectionField`) and the trigger form. It owns both steps, the model filter and the keyboard. A host supplies only a trigger, an overlay, and what cancelling means. Escape steps back from the tier list rather than closing, so a chosen model is never lost to a keystroke.
+
+Step 1 filters, because the registry runs to about thirty models. `filterModelRows` matches every term against the model's own name, so `opus 1m` finds `Opus 5 (1M)`. Tiers are not matched: they are the next step. Pinned by `store/__tests__/reasoning-picker-registry-guard.test.ts`. See `docs/plans/2026-08-23-two-step-model-picker.md`.
+
+The panel opens with no filter box. Typing brings it out, the way `Dropdown` reveals its own, so a panel opened to click a row shows rows. A touch device is the exception, showing the box from the start, since no keystroke can reveal it there. The test is the touch capability, never the mobile width breakpoint, which a phone in landscape is on the wrong side of. The box opens unfocused, so no on-screen keyboard rises, unless one was already up: then the *keyboard handoff* gives the box focus.
+
+### Per-model chat effort
+The account's *reasoning effort* for each chat model: the `chat_reasoning_efforts` preference, `model=tier` pairs (ADR 0390). It replaced the single `chat_reasoning_effort`. A model not listed runs at its *default effort*. Settings and the agent's `preferences` tool write it, and a pick in a thread or draft never does. The engine reads it through `PreferenceStore::user_chat_effort`, and the frontend through `accountChatEffort` and `store/chatEfforts.ts`.
+
+### Per-thread model memory
+A Lucidos Agent (chat) thread reuses the *model* and *reasoning effort* it last ran with. It does not snap back to the account default on each new message.
+
+The durable record is the `model` / `reasoning_effort` the backend stamps on every `MessageReceived`. A *trigger thread* has no `MessageReceived`, so its `TriggerStarted` carries them instead. Without that, a thread on a pinned *trigger model* would report the account default.
+
+Resolution runs in `PreferenceStore::resolve_chat_overrides_for_thread` via `last_thread_chat_settings`, excluding the in-flight turn. The model:
+
+1. an explicit per-request override;
+2. the thread's last recorded model;
+3. the account `chat_model`;
+4. the router's own default.
+
+The effort, for the model the turn runs on:
+
+1. an explicit per-request override;
+2. the thread's last tier on that same model;
+3. that model's entry in the account `chat_reasoning_efforts`;
+4. its *default effort*, else none sent.
+
+A tier is remembered WITH its model, so a thread switched to another model never carries it (ADR 0390).
+
+It is **backend-authoritative**: a follow-up with no override reuses the thread's value for any caller (chat UI, triggers, API). On the frontend the in-thread control menu resolves the same chain (`resolveActiveThreadModel` / `resolveActiveThreadReasoningEffort` in `store/threadModelSelections.ts`, ending in `accountChatEffort`). A pick there writes only THIS thread's ephemeral pending override, never the account preference.
+
+A pinned *preferred provider* is remembered the same way, but WITH its model. `provider` comes from the newest starter stamped beside the model the turn runs on. So switching a thread from Opus to Sonnet drops the backend picked for Opus. Only a pin is stamped, never a backend the row chose, so removing a credential cannot strand a thread that never chose one.
+
+Distinct from the coding agent's per-thread model, which is session-bound via `CodingAgentSettingsChanged`. See `docs/plans/2026-07-03-per-thread-model-memory.md`.
+
+### trigger model
+The *model* (and, paired with it, the reasoning effort) a *trigger*'s intent fires on, when the trigger pins one instead of following the account default. Stored as `TriggerConfig::model` / `reasoning_effort`, both `Option<String>`, in the `TriggerCreated` / `TriggerUpdated` payload and projected into `trigger.toml`. There is no table and no migration: triggers are event-sourced. `None` means the account `chat_model`, and for the effort the account's tier for the model the fire runs on, else that model's *default effort*. So a trigger may pin one and inherit the other, and a model pin alone runs that model at its own tier. **Intent triggers only**: a `TriggerRun::Script` trigger runs no LLM, and the write path forces both to `None` for one.
+
+The pin reaches the LLM as the explicit `model_override` / `reasoning_effort` of `process_trigger`. It wins over the account preference in `resolve_chat_overrides_for_thread`. The model id is deliberately **not** validated against the *model registry* at write time, matching the `chat_model` preference (`PrefValue::Text`). The effort IS checked against the closed tier set, since that vocabulary is ours. The resolved pair is stamped on the run's `TriggerStarted`, which keeps *per-thread model memory* honest for a trigger thread: it has no `MessageReceived` to read. See `docs/plans/2026-08-08-per-trigger-model-selector.md`.
+
+A trigger may also pin the backend, `TriggerConfig::provider`, when its pinned model has more than one *route*. It needs a model pin and must name one of that model's routes, and clearing the model clears it. A pin to an unconfigured backend refuses the fire rather than running elsewhere, since a trigger fires unattended.
+
+### model-tolerance measure
+A change made *only* to compensate for current LLMs making a predictable, recurring mistake — a deliberate, temporary crutch (a forgiving alias, a tolerated wrong name, a fallback that fires on a model error), not something the design needs. Removable by intent — but the bar is the *weakest* model in the *model registry*, not the newest: the measure becomes dead weight only once every routed model has stopped making the mistake, so shipping a stronger default does not by itself retire it. It is one typed category of *temporary measure*, tracked in the umbrella [`docs/temporary-measures.md`](temporary-measures.md) (§ Model-tolerance measures) with a removal condition. Distinct from genuine ergonomics / backward-compat / external-robustness, which stay regardless of model quality. The test: *would we still want this if the model were perfect?* No → it's a tolerance measure. See `.claude/rules/temporary-measures.md`.
+
+### open investigation
+A parent entry in the *temporary-measures registry* representing the *reason* one or more measures exist — an unresolved question (e.g. the `ios-pwa-blackout` iOS-PWA black-screen hunt), not a measure itself, so it has no "Lives in" site. Each measure references its parent investigation by a short kebab-case id; closing the investigation surfaces every measure now eligible for removal (search the registry for the id). See `docs/temporary-measures.md` § Open investigations.
+
+### temporary measure
+Anything in the codebase that is *meant to end* and carries a *concrete condition for when* — the umbrella concept that generalizes the old model-tolerance crutch. Four typed kinds: temporary measures & workarounds (diagnostics, scaffolding, "workaround until upstream fixes X"); *model-tolerance measures*; feature flags & sunset deprecations (flags/kill-switches awaiting cleanup + back-compat shims with a concrete removal trigger); and *open investigations* (parents — the reason a measure exists). The inclusion test: *is this meant to go away, and is there a concrete condition for when?* Yes → it's a temporary measure, tracked in the *temporary-measures registry* with a removal condition, in the same change it lands. Distinct from permanent back-compat, site-local suppressions (`#[allow]` / `@ts-expect-error` / `eslint-disable`), accepted design decisions (→ `docs/adr/`, `docs/code-review-priors.md`), and open-ended tech debt (→ `docs/plans/`), which are explicitly OUT. See `.claude/rules/temporary-measures.md`.
+
+### temporary-measures registry
+The single file [`docs/temporary-measures.md`](temporary-measures.md) that tracks every *temporary measure* and *open investigation*, one row each, under a shared per-entry schema (what · where it lives · why impermanent · removal/resolution condition + how to verify · status-with-history · parent-investigation id for measures). Generalizes the retired `model-tolerance-measures.md`. `/harden` requires a new impermanent thing in a diff (a "remove after X" / "diagnostic-only" / "temporary" comment, a feature flag/kill-switch, a sunset shim, or a `TODO`/`FIXME`/`HACK`/`XXX` marker) to have a row here; `/harden-project` flags rows whose removal condition looks already met and impermanent-looking code missing a row. Removing a measure flips its status to `removed` (kept as history), never deletes the row.
+
+### Route
+One way a *model* in the *model registry* can be served: a *provider*, the id sent to that provider, and optionally that backend's own context window. A `models` row carries an ordered list of them in its `routes` JSONB column, so one row is one model however many backends serve it.
+
+The id is optional and defaults to the row's own, because a first-party Claude id is byte-identical on Vertex and on the direct Anthropic API. It is spelled out only where a backend differs, as OpenRouter's `anthropic/claude-opus-5-5` does. Every id-shape rule reads the ROUTE's wire id, never the row's. A route with a different spelling is never judged by a string it does not send.
+
+Resolution is `llm::model_registry::resolve_route`: the turn's own pick, then the row's *preferred provider*, then the first configured route. **An explicit choice is honoured or refused, never substituted**, so a turn pinned to a parked backend errors rather than leaving for another vendor. A pick the row cannot serve at all is STALE rather than a refusal: it yields to the row's preference, then to the first configured route.
+
+A choice is parsed strictly (`ProviderKind::from_name`), at the chat request, a trigger pin and thread memory alike. So a typo is refused rather than read as a Vertex pin. Only a stored route falls back leniently (`ProviderKind::parse`), so a row a newer engine wrote still routes.
+
+Edited per row in Settings → Models → Routes, and through `routes` on `POST` / `PUT /api/v1/models`, the CLI and `manage_models`.
+
+Replaces the single `provider` and `context_window` columns. Those could not express a model served by two backends without two rows, and two rows meant two picker entries. See [ADR 0247](adr/0247-one-model-row-many-routes.md).
+
+### ProviderKind
+The Rust enum (`crates/lucidos-engine/src/llm/model_registry.rs`) naming which backend serves a model: `Vertex` | `Anthropic` | `OpenAi` | `OpenRouter` | `XAi` | `OpenCodeFree` | `Local`. `ProviderKind::ALL` is the one list of them, in the order `/health` reports. So a new variant cannot reach the router while missing from what the picker filters against. Parsed from a *route*'s `provider` (`ProviderKind::parse`, unknown → `Vertex`), and from every choice strictly (`ProviderKind::from_name`, unknown → none). `RoutingProvider::backend` is the single place that maps one onto a provider instance. What it holds, what it reports configured, and what it routes cannot disagree.
+
+### provider switch
+The per-provider on/off control on Settings → Models → Providers, and the thing that folds a provider's config rows away when it is off. Backed by the `provider_enabled_<id>` preference for the six credential- and environment-configured providers (`vertex`, `anthropic`, `openai`, `openrouter`, `xai`, `local`), resolved into `ProviderSwitches` by `llm/provider_build.rs`. Absent means **on**, so a workspace that never opened the page builds the provider set it always did.
+
+A switch is a **veto**, never an installer: off drops the provider before the router is assembled, taking its web-search backend with it, and on adds nothing that is not otherwise configured. It leaves the stored credential alone, which is the whole point of having it beside Remove: it parks a key rather than spending it. It hot-swaps, being in `PROVIDER_PREFERENCE_KEYS`, and the frontend re-probes `/health` on the same keys so the model picker tracks it. The six keys are human-only in the *preference catalog*: the provider a `set_preference` would switch off may be the one answering that turn.
+
+`opencode-free` is deliberately outside the family. It is opt-**in** under `opencode_free_enabled`, whose absence means off (ADR 0104), where these are opt-**out**. The frontend state machine is `components/settings/providerEnablement.ts`. Its three states (`on` / `switched-off` / `not-set-up`) are what tell a parked provider from one never configured. See `docs/plans/2026-08-25-provider-onboarding-and-providers-page.md`.
+
+**The System One providers have three more switches, in the family but not in that list.** `provider_enabled_typesafe`, `provider_enabled_cloudflare_workers_ai` and `provider_enabled_system_one_custom` keep the absent-means-on rule, the veto semantics and the parked-key promise, and their rows wear the same `ProviderBlockFrame` through `SystemOneProviderFrame`. What differs is everything downstream of the chat registry. A System One model holds no conversation, so it has no `ProviderKind`, never reaches `provider_build.rs`, and is absent from `ProviderSwitches`, `PROVIDER_ENABLED_SWITCHES` and `/health.configured_providers` (ADR 0220).
+
+`llm::judgment::select::system_one_for` reads them per call instead, which is what makes them hot-swap with no subscriber. Each is the master switch above every `judgment_*` preference that picked a row on its provider. Each of those is written from its site's model picker rather than a switch (ADR 0224). The rows cannot ask `/health` what is configured, so they read what the page can see in place of that list (`systemOneProviderState`): a stored key, or the custom endpoint's URL. They are human-only for their own reason: off turns the command guard's backend back to chat, and that key is already human-only. See `docs/plans/2026-09-19-typesafe-provider-row-master-switch.md`.
+
+### model-only text
+The `LlmResponse::model_only_text` field: text a model produced that the USER must not see and the MODEL must. The single reader is `LlmResponse::history_text`, which the *agentic loop* calls when it rebuilds an assistant turn. Gemini alone sets it. It narrates its plan in ordinary (non-`thought`) text parts beside a `functionCall`, which is working notes rather than a printable answer. So `content` stays `None` and nothing streams or persists.
+
+Nulling `content` alone also erased that text from the model's own history. Gemini was then the one provider re-entering a round unable to see what it had just said. Anthropic and OpenAI keep theirs in `content` and hand it back, so both leave this `None`. Never set alongside `content`: `history_text` reads one or the other, so setting both would send the same text twice. See `docs/plans/2026-08-20-gemini-keeps-its-own-turn-in-history.md`.
+
+### Persisted event
+A subset of *Event* (see user-facing glossary): past-tense, written to the `events` table by `EventBus::emit`, replayable, visible to projections, matched by triggers. The default flavor.
+
+### Preference catalog
+The one place every preference key, its allowed values and its default are written: `crates/lucidos-engine/src/core/preference_catalog.rs` (ADR 0368).
+
+- **One `PrefSpec` per key**, held by a named *preference handle* and listed in `CATALOG`. It declares the key's access, scope, `PrefValue`, `PrefDefault` and write side effect.
+- **Every key the engine names is in it.** `PrefAccess` marks who may write: `Agent`, `Human { hint }` or `Engine { hint }`. `internal_specs()` and `is_silent_key` are views of the one list, which replaced `INTERNAL_KEYS` and `SILENT_PREF_KEYS`.
+- **A default is a value, unset, or inherited.** `PrefDefault::Inherits` names another spec, so the background model keys follow each other without a second table.
+- **The agent's tools read it.** `set_preference` refuses a non-agent key with its hint, and `get_preferences` renders each default with `default_label()`.
+- **The frontend reads a generated copy**, `packages/lucidos-sdk/src/generated/preference-catalog.ts`, with a staleness test.
+- **It is not storage.** The value lives in the `preferences` table. Both write paths funnel through `LucidosEngine::apply_preference_write`, which reads the catalog only for side effects.
+
+A sync test keeps `system-knowhow/preferences.md` in lockstep, keys and stated defaults both.
+
+### Preference handle
+A typed const per catalog entry, `Pref<K>`, reached as `crate::core::prefs::X`. It is the only way engine code reads a preference.
+
+- **The kind fixes the return type.** `Flag` returns `bool`, `Number` an `f64` held in the spec's bounds, `Text` a `String`, and `Optional` an `Option<String>`. A defaulted kind never returns `Option`, so a caller has no fallback to pass.
+- **A mismatch does not compile.** Each kind's `const fn` constructor refuses a spec of another shape.
+- **`read` is total and `try_read` keeps the error**, for a caller that must choose a direction on an unreadable row. `stored` returns the raw row, for a reader with an env layer between the row and the default.
+
+### One definition per value
+The rule that a value is written in one place and every other place reads it (ADR 0368, `.claude/rules/one-definition-per-value.md`). Readers resolve defaults from the source, a second language gets a generated copy, and tests reference a constant rather than restate it. A *pin test* is the fallback where a copy can neither import nor be generated.
+
+### Pin test
+A test that reads a hand-written copy of a value and fails when it differs from the constant it copies, rendered from that constant. It is the last resort under *one definition per value*, for a copy nothing can import or generate: a shell script, or prose the LLM reads raw. The table-driven ones are `engine/value_pins_tests.rs` and the gateway's `value_pins_tests.rs`, and `harden_suites.sh` selects them when a pinned file changes.
+
+### Pending preference write
+A *preference* value the frontend has already applied locally but the engine has not accepted yet. It is parked in `store/actions/preferences.ts` and re-sent from `startClient`'s resume handler.
+
+It exists because `savePreference` applies the value before the network call: the side effect plus the optimistic `preferences` signal patch. On an installed iOS PWA, a WebKit page-suspend can abort the in-flight `PUT /preferences`. That used to leave the device showing a value the server never received.
+
+- **Parked only after an immediate re-send has ALSO failed transiently** (`isTransientFetchError`: `AbortError` / `TimeoutError` / a transport `TypeError`). A real engine verdict toasts at once and parks nothing.
+- **Keyed by preference key and last-write-wins**, mirroring the per-key overwrite of `PUT /preferences?key=<k>`. It is not a queue.
+- **Serialized per key** (a per-key promise chain), because the engine applies writes in ARRIVAL order. An older request can then never land after a newer one and overwrite the user's latest choice. Different keys still go in parallel.
+- **A write a newer `seq` has superseded stands down** instead of sending. The check runs per attempt, so it also covers the gap between a failed attempt and its retry.
+- **Deliberately in-memory**, so a page reload drops the queue. `loadPreferences` re-reads the server on boot and the UI snaps back to the stored value, which makes the divergence visible rather than silent.
+- **Silent below three consecutive undelivered writes**, then one keyed toast, retracted when the queue drains.
+- **A refetch keeps it.** `loadPreferences` lays the newest write per key over the engine's answer until the engine answers that write, in flight or parked. A write accepted while the read is out still wins, and one refused meanwhile does not.
+- **A scale preview is held the same way.** The scale panel saves on a debounce. A scale it painted but has not saved survives a refetch until it is saved or cancelled (`previewUiScale`).
+
+### Undelivered compose draft
+A thread whose *compose draft* the engine has not accepted. It is parked in `store/actions/compose.ts` (`undeliveredComposeDrafts`) and re-sent from `startClient`'s resume handler and from `runResumeSync` on reconnect.
+
+It is the compose sibling of a *pending preference write*, and exists for a sharper reason. A draft lives ONLY in the in-memory `composeDrafts` signal, with deliberately no localStorage copy. So the server IS its storage. An installed iOS PWA that loses its link and is then evicted by WebKit takes the user's typed text with it.
+
+- **Parked on any rejection `isTransientFetchError` accepts** (`AbortError` / `TimeoutError` / a transport `TypeError`). A real engine verdict, such as a 410 on a discarded thread, toasts at once under its own key and parks nothing. No retry can change an answer.
+- **Holds only the thread id**, not a value snapshot. The flush re-reads the current draft through `getDraft`, so last-write-wins is structural on the *send* side.
+- **Serialized per thread** (`runComposePushes`): one write in flight at a time, with later intents coalescing into a single queued write that re-reads the draft. So every answer belongs to the newest intent by construction. An older `seq` guard (`latestComposePushSeq`) once covered two overlapping PUTs completing out of order. The overlap is gone, and the guard with it.
+- **Re-enters through `schedulePush`** rather than issuing its own request, so the in-flight bookkeeping and the re-park on another failure stay in one place.
+- **Dropped without delivery when the draft stops being owed.** That is `cancelPendingPush` (the shared send / discard teardown) and `clearSupersededDraft`. The latter fires when the thread's own history proves the draft was already submitted, so a flush must not push it back.
+- **Silent below three consecutive undelivered pushes**, then one keyed toast naming no thread id, retracted when the queue drains.
+- **Covers a fresh draft's thread start too.** A `POST /threads` that gets no answer leaves the optimistic row, the draft and its *pending uploads* in place and the start *owed* (`threadStarts`). The flush re-runs the push, whose `awaitThreadStarted` re-sends the start. Only a refused start rolls the draft back.
+
+Distinct from **`pendingComposePuts`** in the same module, which marks a write that is in flight or inside the 250ms debounce and which every inbound clobber guard yields to. That one means "a write is on its way"; this one means "a write was owed and did not land".
+
+### Pending upload
+An image attached to a draft that is not yet a confirmed hash in it. It lives in `store/pendingUploads.ts`, out of the persisted draft, and holds its in-memory `File` so a retry needs no re-pick. Its `state` is one of six: `waiting-for-thread`, `uploading` (bytes sent of total), `finishing`, `retrying`, `offline`, and `failed` (with `retryable`). Every state but `failed` is in flight.
+
+- **One run per upload** (`store/actions/imageUploads.ts`). It retries a transient failure with backoff while connected, waits `offline` while the connection is down, and resumes on reconnect. A refusal fails at once.
+- **Nothing stays in flight forever.** The XHR transport (`postWithUploadProgress`) aborts a body that stalls, and an answer that never comes, as a `TimeoutError`.
+- **The composer draws each state** on the chip (`PendingUploadChip`), so an upload never looks finished. The X aborts the request.
+- **It survives a page reload.** Its bytes are kept in a per-workspace IndexedDB store from attach until the engine's draft holds the hash (`store/pendingUploadRecords.ts`). The next page load brings it back as a chip and resumes it, or says it was dropped because its draft is gone (`store/actions/pendingUploadRestore.ts`). A *queued upload send* waiting on it is queued again. The store is capped at 20 records, 100 MB and 7 days.
+
+### Queued upload send
+A send the user pressed while a *pending upload* on the thread was still in flight (`queuedUploadSends`). The draft stays put, Send morphs to Cancel, and the composer's upload line says what the send waits on (`uploadSendNotice`). `settleQueuedUploadSends` ends it in one of three ways: dispatched once every upload lands, cancelled by the user, or released when an upload fails for good. A release keeps the draft and the images. It marks the thread in `uploadBlockedSends`, and the upload line says why until the failed image is retried or removed. Send refuses the same way while any upload is `failed`, rather than sending without it.
+
+### Compose epoch
+How many times a submission has consumed a thread's *compose draft* slot, stored as `thread_summaries.compose_epoch` and carried on `ThreadSummary` and `ThreadComposeChanged`. It is the **write fence** for `PUT /api/v1/threads/:id/compose`: the client echoes the epoch it last heard, the UPDATE matches on it, and a mismatch is refused with `412` carrying the current value. So a write composed BEFORE a submission can never be applied AFTER it, however long it was stalled and whatever the client concluded happened to it.
+
+It counts **submissions, not writes**, and that is what keeps it invisible on the keystroke path: every compose PUT between two submissions carries the same epoch and is accepted, so a conflict is only possible for a write that straddles a submission. A per-write counter would be the textbook optimistic-concurrency shape and would be wrong here, since two writes issued before the first is acked would then fence each other out and ordinary fast typing would become a refusal loop. Advanced by the three projection arms that clear compose because something consumed it (`MessageReceived`, the coding-agent `SessionStarted`, the `UserQuestionAnswered` content match), and deliberately **not** by `ThreadDiscarded`, whose state guard already refuses every later write. Advanced even when the engine held no draft to clear, because that is the reported case: the client's write was still in flight, so there was nothing stored yet and the write landed afterwards.
+
+A `412` is a **resync, never a failure**: the client adopts the epoch, re-runs the supersede rule, and re-issues (bounded, then parked as an *undelivered compose draft*). A draft typed while this device was behind a peer's submission is deliberate new work, so it must land rather than be refused into oblivion. An absent epoch in the PUT body is accepted unfenced, permanent back-compat for a cached PWA bundle against a newer engine. Fixes the 2026-08-06 report where a message was both sent and still sitting in the composer holding an older revision of itself; the client-side half is the serialized write in *undelivered compose draft*. See `docs/plans/2026-08-06-compose-write-ordering-after-send.md`.
+
+The fence is answered **before** the endpoint's unrelated mode lock, so a stale write is reported as stale whatever else it carried. Asking about the mode first turned an ordinary send race into a `409` card. A keystroke write on a draft used to carry the channel it was not changing. It now states a mode only when the mode changes, mirroring how an unchanged image-hash array goes out as `null`. See `docs/plans/2026-08-26-compose-mode-lock-masks-the-stale-write-fence.md`.
+
+### Thread-events failures
+The threads whose per-thread event fetch is currently failing with a **verdict**, held per surface in `store/actions/thread-loading.ts` as a `ThreadEventsFailures` (`REFRESH_FAILURES` for the incremental refresh, `LOAD_FAILURES` for the full snapshot load). The read side of the reporting rule for those two fetches. The load one fans out, one full snapshot per eagerly-loaded thread on boot and per failed thread on the recovery wake, and the refresh one did too until it started marking instead (see *stale thread events*), so a per-thread toast turned one outage into a column of identical, undismissable cards. The map makes that one honest card instead, and it still earns its place on the refresh surface, where several threads can be failing at once as the user moves between them. Every change to it re-renders that card from live state (`renderThreadEventsCard`), which is what keeps the **copy** true as threads recover: nine of ten catching up must leave a card saying one, never the ten it was raised with. The copy names the thread when it is the only one failing (a title beats counting to one) and counts otherwise, including for a lone thread with no title yet, since a raw thread id names nothing the user can look up. Emptying the set **retracts** the card, because its claim is then false. A `Map<threadId, reason>` rather than a `Set` for exactly that re-render: the surviving entries have to carry the reason forward. Every mutation also reconciles the map against `threadMap` (`dropDepartedThreads`), since a thread can leave it entirely when `sendMessage` rolls back a failed optimistic send and deletes the row, and nothing would ever fetch that thread again to clear its entry. That reconcile only runs when some LATER fetch settles, and several moments leave none to settle, so they call `forgetThreadEventsFailures` directly: the two row removals (`sendMessage`'s rollback and `rollbackOptimistic` in `compose.ts`), a full load succeeding, and the SSE handler clearing `eventsLoadFailed`, which is the thread's last exit from the failed-load retry set. Without those, a card can stand for the life of the page. Each surface has its own map and its own toast key, so a landed refresh cannot retract a still-true "never got this thread's history" card. Several fetch attempts can be live on one thread (the resume guard reset and `forceRetryThreadEvents` both admit a second) and they settle in any order, so each surface has a rule for whose outcome counts. **Refresh**: only if nothing newer has already reported (`lastRefreshReport` holds the high-water attempt token), since an older one landing last would raise a card for a thread a newer attempt just refreshed cleanly, or retract one a newer failure had just earned. The high-water mark rather than the live claim in `refreshAttempts`, because a claim is released on settle whether or not the attempt concluded anything, so gating on it would swallow a genuine verdict whenever the newer attempt died transiently. **Load**: the terminal success wins regardless of order, because a load that succeeded set `eventsLoaded` and the claim "this device never got the thread's history" is then false whichever attempt got there; a failure arriving after one is dropped rather than flagging a thread that is rendering. A successful load is also the one cross-surface case: it carries no `after`, so it holds everything a refresh would have fetched, and it therefore retracts BOTH cards and raises the refresh high-water mark. By `Math.max`, never a bare set, since its own token was drawn when it started and a refresh that already reported can hold a higher one. The fetched rows are applied either way, being append-only and `lastDbSeq`-gated. The clear path may only UPDATE a card already on screen, never create one: `showToast` drops everything while `workspaceUnavailable()` holds (a database outage is exactly that, since the engine keeps answering `/health`), so without that rule the first success after the outage would be what raised the card, carrying a stale reason and counting down as the rest recovered.
+
+A thread joins **only** on a verdict, and only while `connectionStatus === 'connected'`. Anything `isTransientFetchError` accepts stays out and stays silent: a cancelled fetch, a transport `TypeError`, and a client-side `TimeoutError`, because over a dropped tunnel the request hangs rather than refusing, so the deadline firing is what an outage *looks like* here rather than evidence about the engine, which answers in single-digit milliseconds throughout. (The rule was adopted when a fan-out fired every deadline at once; it stands unchanged now that only the load surface fans out.) The timeout half is no longer a fan-out-only rule: on 2026-08-07 the thread-list refresh adopted it too (`refreshThreadList`), and that read is once-per-wake, on the finding that the engine answered `/api/v1/threads` between 12ms and 2s against a 10s deadline for the whole reported window. `refreshChangesState` and `loadUnreadNotifications` are what still draw the narrower line (`isAbortError`, `utils/errorDetail.ts`), so treat that as the exception now rather than the category. A sustained outage belongs to the debounced connection dot, and the dot's own hysteresis keeps it green through a brief blip so a verdict during one still surfaces. Deliberately **not** a `createFailureCounter`: that counts calls, which is right for a once-per-wake read and wrong here, where a boot or a recovery wake makes one load call per thread and would cross any threshold inside the first burst.
+
+### Stale thread events
+A loaded thread whose event log this device may have fallen behind on while it was not listening, recorded in `staleThreadEvents` (`store/actions/thread-loading.ts`) and paid off when the user opens the thread. The counterpart to *thread-events failures* in the same module: that map is about a fetch that failed, this set is about a fetch not made. The two meet at retraction, and the reach changed with the fan-out's removal: a refresh card for a thread the user does not return to used to be retracted by the next wake's fan-out, and now stands until that thread is opened. That is the card staying **true** rather than going stale, since its claim ("did not get the newest events for this thread") is exactly what remains the case while the mark is still set, and re-opening the thread is both what clears the mark and what retracts the card.
+
+A sync point (an iOS PWA wake, an SSE reopen after a drop, a `Lagged`, an engine restart) used to answer the possibility by fetching: `runResumeSync` and `resyncLoadedThreads` each issued one incremental `refreshThreadEvents` per loaded thread, bounded to `THREAD_EVENTS_FETCH_CONCURRENCY` at a time. Bounding turned a burst into a queue but still spent a request on every thread in the map, none of which the user was looking at. They now call `markLoadedThreadsStale()` and refresh the FOCUSED thread only; `focusThread` calls `refreshStaleThreadEvents` for the rest, one at a time, as they are opened.
+
+The open thread's mark is also retried on every health poll (`checkConnection`). The sync point's own refresh of it can die in transport, the iOS wake case, while the thread-list read beside it lands. The header then shows the new status over a transcript that stops short of it. The reported case read "Waiting for your answer" over a turn still "Working". A live SSE event never closes that gap, since it carries only itself. So the poll keeps asking until one refresh lands and clears the mark.
+
+What makes that safe is that **nothing a background thread contributes to the drawer comes from its events**. The status dot, the Current / Review / In flight / Attention sections, the badges and the counts all read `meta`. `effectiveThreadStatus` is `meta.status` plus pending rows, `getCodingAgentWaitingInfo` takes a `ThreadMeta`, and `family-graph.ts` reads no event at all. The single `loadAllThreads` request the same sync point already makes refreshes `meta` for every thread the response covers. Events are read by the transcript, which renders one thread.
+
+The known gap is a loaded thread that has fallen outside every `loadAllThreads` window: an archived row paged in earlier, or a family extension. Its meta used to refresh as a side effect of its own refresh's `currentAggregate`, and now waits until it is opened. Such a thread is terminal by construction. The identical one is already unrefreshed whenever it was never opened, since the fan-out only ever covered `eventsLoaded` threads.
+
+Three rules keep the mark honest. It is **rebuilt** from `threadMap` at each sync point rather than added to, so an entry cannot outlive its thread: both optimistic-send rollbacks delete a row carrying `eventsLoaded: true`, the exact shape that would otherwise accumulate over a long-lived PWA session (and the reason the failure maps next door need a `dropDepartedThreads` reconcile). Only a **landed** fetch clears one, and either fetch qualifies, since a full load carries no `after` and so subsumes a refresh; a transient failure, a verdict and a coalesced decline all leave it set, which is what makes re-opening a thread a genuine retry. And a fetch counts only if it **started after the gap opened**, which is what `staleMarkedAtToken` (the `fetchAttemptSeq` value at the last mark) answers when compared against the attempt's own token. A request issued before a gap carries a snapshot that predates it, and that ordering is ordinary rather than exotic: WebKit routinely leaves a fetch hanging across an iOS suspension, so "request out, device sleeps, events emitted, device wakes and marks, request lands" happens on any wake with a slow request outstanding. Same discipline as the `lastRefreshReport` high-water mark.
+
+That last rule has **two** faces, and the second is the sharper one. Such a fetch may not CLEAR the mark, since the gap it would be claiming to close is one it never covered. It may also not be COALESCED INTO: `refreshThreadEvents`' `{ coalesce: true }` declines a duplicate only when the live attempt is newer than the mark, because handing a pre-mark attempt to a caller acting on the current mark leaves that caller with no request at all, and the thread the user has just opened stays stale with nothing in flight to fix it. `resyncLoadedThreads` is where that bites, since it marks without resetting the fetch guards, so a refresh outstanding from before the `Lagged` is still claiming the slot; `runResumeSync` happens to be immune only because `clearThreadFetchGuards` drops every claim immediately before it marks.
+
+The mark is deliberately **not** one of the guards `clearThreadFetchGuards` resets. Both live in the same module, so that mistake is easy to make. That function runs at the top of `runResumeSync`, the very place the marks are set. The mark is also mutated without a paired `threadMap` signal write, unlike `eventsLoaded` / `eventsLoadFailed`, because nothing renders off it. It is read imperatively, at focus time and on each health poll, to decide whether to fetch.
+
+### Transient event
+A subset of *Event*: past-tense, broadcast over SSE only, never persisted, never reaches projections or the trigger matcher. A trigger on a transient event can never fire — it isn't even allowlistable, because the scheduler's matcher only looks at persisted events. Routing is determined by `ThreadEvent::is_persisted()` / `SystemEvent::is_persisted()`.
+
+### Private-data denylist
+The enumerated half of the deterministic private-data guard: the exact tokens (contributor names, employer domain, MDM domain, internal repo/app/project names, personal-document words, family names) that may never appear in a shipping file. Lives **only** in two marker-fenced blocks in `WORKSPACES.md` — the one file the release stubs — because a tracked patterns file that spelled the tokens out would itself be the leak it exists to prevent. `private-data-denylist` holds tokens denied everywhere; `private-data-exceptions` holds the **exceptions list** (below). Its counterpart, the generalizable **shape heuristics** (real home paths under both roots — `/Users/<name>` and `/home/<name>` — and possessive device labels), stays tracked in `scripts/lib/private_data_patterns.sh` alongside the `private_data_load_denylist` loader that reads both blocks. The loader **fails closed** — a missing, marker-less, empty, malformed or uncompilable block makes `private_data_grep_tree` exit non-zero rather than report "clean", and `release-to-lucidos.sh` refuses the push on that status. Rule: `.claude/rules/no-private-data.md`.
+
+### Private-data exceptions list
+The `private-data-exceptions` block of the *private-data denylist*: `<ERE token> => <space-separated paths>`, meaning the token is legitimate **only** at those paths. It exists for project identity — a contributor's real name is legitimate as the copyright holder, governance owner, code-of-conduct contact, or credited contributor, and illegitimate everywhere else (fixtures, examples, device labels, home paths, incidental mentions). Each such name is denied outright and its attribution sites enumerated beside it, so the same name anywhere else is a release-blocking hit. Deliberately preferred over narrowing the token to a possessive/path form, which silently permits every other bare use. Each entry is scanned in its own `git grep` pass with its paths excluded.
+
+### Proxy-origin marker
+The `x-lucidos-proxied` header the credentialed proxy puts on every request it forwards (`proxy::PROXY_ORIGIN_HEADER`). It goes on after the proxy strips the caller's `x-lucidos-*` headers, so no caller can remove or forge it. Every engine refuses an inbound request carrying it, with a 403, before any credential is read (`proxy::refuse_proxied_request`). An `apis.json` entry aimed at this engine, a sibling or the gateway therefore never reads as the shell. A self-loop dies on its first hop.
+
+### Plugin catalog cache
+What the last marketplace scan found, kept at `.lucidos/plugin-catalog.json` so a page open never waits for one. A scan git-clones every registered marketplace, which costs seconds per repo. `GET /api/v1/plugins/catalog` used to run one per request, and now reads this file instead. The scan runs on the scheduler (`scheduler::plugin_updates`), whose identical five-minute pass previously kept only the update candidates.
+
+Holds `plugins`, `errors`, `scanned_at`, `scan_started_at` and `scan_error`. Deliberately NOT the marketplace list, which is read live from the registry on every request, so a rename needs no scan behind it. The merge drops a cached plugin whose marketplace has since been unregistered, so a stale cache can never offer plugins from nowhere. Under `.lucidos/`, the rebuildable runtime cache: losing it costs one scan, so the loader treats a missing, truncated or invalid file as empty rather than failing the page. Implementation and the rejected clone-mirror alternative: `core/plugin_catalog_cache.rs` and ADR 0243.
+
+### Plan fork
+A substantive alternative to a plan as written, offered as its own option on the plan-approval question card: a narrower scope, one layer instead of two, a different approach. Nothing to do with a git fork.
+
+It is what makes the `Approve` / `Request changes` pair a **floor** rather than a fixed shape (see *plan marker*). The question tool requires at least two options. `Request changes` exists to fill the second slot when there is no fork. A fork fills that slot better, because it also carries a decision the agent can act on.
+
+Carrying `Request changes` as a *third* option beside a fork is the banned shape. It then means only "I will type what I want changed", the free-text escape every card already has. Picking a fork **is** an approval, of that variant: the agent revises the plan file to match, re-commits, then runs `lucidos planned approve`. A *new-thread handoff* option fills the slot the same way, so `Request changes` is dropped beside it too.
+
+The floor reads the same on every surface: `prompts.rs`'s two ask rules and `IMPLEMENTATION_PLAN_RULE`, `cc_plan_gate`'s deny text, the `lucidos planned mark` output, the `implementation-plan` skill, and `system-knowhow/lucidos-cli.md`. The shared ask rules state the option shape only, since they also reach external-repo prompts that have no marker. So only the plan rule, the CLI texts, the skill and the knowhow name the new-thread option.
+
+### New-thread handoff
+The `Implement in a new thread` option on a plan-approval card, and what picking it does. A thread that ran a long grill carries all of it into every later turn. The plan file alone holds what a builder needs. So the option is offered when the thread is heavy **and** the plan spans several phases or layers.
+
+It counts like a *plan fork*: `Approve` stays first, and `Request changes` is dropped whenever it appears. Picking it approves the plan as written. The planning thread runs `lucidos planned approve`, spawns a child coding-agent thread, and ends its turn. The child's worktree starts from `main` without the plan, so it merges the planning branch first. It then marks and approves the same plan without a second card.
+
+One text, `NEW_THREAD_HANDOFF` in `crates/lucidos-cli/src/planned.rs`, reaches the agent through `lucidos planned mark` and the edit gate. Plan: `docs/plans/2026-10-09-plan-approval-offers-a-new-thread.md`.
+
+### Plan marker
+Durable enforcement record that a planning decision was made before a *Lucidos-source* coding-agent branch's first edit. Modeled on the harden marker. The row is `planned_branches(repo_root, branch_name, state, plan_path, reason, files, head_sha, planned_at)`, keyed on `(canonical repo_root, branch_name)`.
+
+Four states. Only `proposed` and an absent row block the gate; the other three satisfy it. One decision, `change_ops::PlanFloor`, reads them for both proposing and applying a change, so a turn end never offers an Apply that Apply would refuse. A held turn end emits `ProposalWithheld` with the plan reason, and tells a live agent how to set the marker (a `PromptInjected` with origin `missing_plan`). Apply consumes a gate-satisfying marker, so work after an Apply needs a new one.
+
+One exception lets a plan land before approval: a branch whose landing files are all under `docs/plans/` clears the floor with a `proposed` marker (`PlanFloor::PlanOnly`). Apply keeps that marker, and `lucidos planned approve` later flips both it and the plan file's `- **Status**: Proposed` line. Such a branch also skips hardening, under either marker kind: plans have no tests, and hardening runs on the branch that implements the plan (`git_ops::needs_hardening`, ADR 0416).
+
+- **`proposed`**: a `docs/plans/<date>-<slug>.md` file was written and recorded by `lucidos planned mark --plan`. The human has NOT approved it yet, so it does **not** satisfy the gate.
+- **`planned`**: the human approved the proposed plan, flipped by `lucidos planned approve`. Also any legacy row predating the approval step.
+- **`acknowledged_simple`**: a local fix, recorded by `lucidos planned mark --simple "<reason>"`. No approval needed.
+- **`bounded_security_fix`**: the *bounded security-fix lane*, recorded by `lucidos planned mark --security-fix "<reason>" --files <csv>`. No approval needed, and `files` carries the bound the Apply floor enforces.
+
+The **human approval step** is conversational. The skill records `proposed`. The coding agent then presents the plan and asks for approval with its question tool: `AskUserQuestion` on Claude Code, `ask_user_question` on Codex. The options are `Approve` / `Request changes`, so the user answers with one tap. Once the user approves, the agent runs `lucidos planned approve` to flip it.
+
+That option pair is a **floor**, not a fixed shape. The question tool needs at least two options, so `Request changes` fills the second slot only when the plan offers no real fork. When it offers one (a narrower scope, one layer instead of two), that fork takes the slot. `Request changes` is then dropped rather than carried as a third option. Carried, it would mean only "I will type what I want changed", the dead-end shape the prompts' NEVER AUTHOR AN "OTHER" OPTION rule bans. A *new-thread handoff* option counts like a fork for this rule.
+
+A fork answer is an approval too: the agent revises the plan file to that variant, re-commits, then flips the marker. That is a deliberately light-touch, prompt-level gate, since the agent runs the flip itself.
+
+Asking with the tool rather than in prose is load-bearing, not cosmetic. Approval is a *DECISION* question the agent is blocked on. Only the tool call parks the thread in `WaitingForUserAnswer`. That state is the sole input to `is_attention_needing`: the Blocked badge, Current-section surfacing, and the "When agent needs me" notification trigger. A prose ask ends the turn instead. The thread then reads as finished and sits idle until the user happens to look and type "approve" by hand.
+
+The gate is binary **satisfying/not**, with no `Fresh`/`Stale` re-check like hardening. Planning is a settled decision a follow-up commit doesn't invalidate, so `head_sha` is diagnostic only.
+
+Three enforcement points. The `cc-plan-gate` PreToolUse hook blocks Claude Code's first source edit while the marker is Missing (deny: run the skill) or `proposed` (deny: get approval, then `planned approve`), exempting `docs/plans/` writes and repos without the skill. The shared system-prompt rule reaches *both* Claude Code and Codex, which has no PreToolUse hook. The Apply-time floor in `change_ops/apply.rs` refuses a non-satisfying Lucidos-source change, and is both the hard backstop and the only hard enforcement for Codex.
+
+Engine helpers live in `git_ops/plan_marker.rs` (`PlanMarkerState`, `PlanMarkerState::satisfies_gate` / `PlanMarkerKind::satisfies_gate`, `record_planned`, `approve_plan`, `bounded_fix_violations`, `plan_marker_files`, `consume_plan_marker`). The CLI is `lucidos planned` (`mark --plan` / `mark --simple` / `mark --security-fix` / `approve` / `state`). App coding-agent threads and external repos are exempt. Consumed on in-session apply (`apply_now`), so a reused branch re-triggers the gate for new work.
+
+### Presence (device_presence)
+Transient projection that feeds the PresenceCheck protocol's candidate list. `device_presence(device_id PK, visible_at)` records devices with any visible top-level Lucidos tab; `DevicePresenceStore::candidates` returns the device_ids fresher than 2 minutes (`PRESENCE_STALE_AFTER`). An empty list short-circuits `send_push_to_all_with_app` to `push_allowed=true` without bothering to broadcast the PresenceCheck. The projection comes from transient `SystemEvent`s (`DeviceVisible` / `DeviceHidden`) — never persisted to the events table. Frontend reporter: `device-presence.ts`, heartbeating every 30s while visible. Per-thread focus used to live in a separate `thread_presence` table updated by `ThreadFocused` / `ThreadUnfocused` events; that path was retired once the PresenceCheck pong started reporting `focused_thread_id` live (see `system-knowhow/notifications.md` §3).
+
+### PresenceTracker
+The in-memory `Arc<Mutex<HashMap<Uuid, PendingSlot>>>` on `LucidosEngine` that owns in-flight PresenceCheck slots. `expect(notification_id, expected_pongs)` registers interest and returns an `Arc<Notify>`; `record(req)` appends a pong and signals via `notify_one()` once `expected_pongs` are in (so a pong that lands before the fan-out task awaits doesn't lose its wakeup); `collect(notification_id)` drains the slot. Each `expect()` also sweeps slots older than 5 s so a panicking fan-out task can't leak entries. Lives only in memory and is wiped on engine restart; transient by design. See `crates/lucidos-engine/src/api/presence_pong.rs` and `system-knowhow/notifications.md` §3.
+
+### Prose field
+A text `<input>` or `<textarea>` holding **natural language the user writes**,
+like the chat prompt, a thread title or a trigger intent. It stands against the
+config fields the app is mostly made of, such as paths, ids, model ids and API
+keys.
+
+The distinction exists because `installNoAutofill`
+(`crates/lucidos-app/src/utils/noAutofill.ts`) stamps `autocomplete`,
+`autocorrect` and `autocapitalize` as `off` on every text field. That suppresses
+WebKit's saved-value dropdown, and it protects a config value from an iOS
+auto-capital. On a prose field it would also strip sentence capitals and
+autocorrection.
+
+A prose field spreads `PROSE_TEXT_ATTRS`, a **marker** (`data-prose`) rather
+than a value. The stamp then leaves its capitalization at the browser default.
+Its autocorrect follows the device's Autocorrect switch, on by default
+everywhere ([ADR 0262](adr/0262-ios-autocorrect-eats-the-send-tap.md)).
+`autocomplete="off"` is still stamped, so the dropdown stays suppressed.
+
+Marking beats asserting because it never touches Preact's property path.
+`autocorrect={x}` becomes `el.autocorrect = x`, and the boolean IDL attribute
+reflects the string `"off"` as `autocorrect="on"`, an inversion this codebase
+shipped for seven weeks. So no JSX ever turns autocorrect off. Pinned by
+source-scan guards in `noAutofill.test.ts`. See `.claude/rules/frontend-css.md`.
+
+### Ramp / room
+The distinction the product-philosophy lens turns on, applied to a proposal that adds a **surface** or an **integration** (`docs/philosophy.md`, `.claude/rules/philosophy.md`).
+
+A **ramp** reaches out to where the user already is and leads back into the *workspace*. Examples: an OS notification banner, a share-sheet entry, a home-screen widget showing what a *trigger* found. So is a link in an email, a data source pulled from somebody's cloud, or an app downloaded from a store. It holds no state and its whole payload is a way in, so it is wanted. Lucidos deliberately builds ramps inside Apple's and Google's systems, because that is where people already are. What keeps that honest is that we own the fallback (the headless tarball against the notarized `.dmg`).
+
+A **room** is somewhere the user works *instead* of coming to Lucidos. The transcript lives there, the formatting is theirs, the history is theirs, and the workspace is reduced to whatever their protocol can express. Rooms fragment the single memory the product rests on, so they are refused. A proposal that reads as both is a room.
+
+Two are already settled as rooms. One is a chat-platform bridge as *the* interface. The other is hosting one of our agents inside another editor via a third-party agent protocol, whether the *Lucidos Agent* or a *coding agent*. The distinction is deliberately silent on anything whose destination is our own client, such as a `lucidos://` scheme or another client of ours. Argue those on cost and mechanics, never by citing the philosophy.
+
+### Projection
+A cached materialized view maintained by EventBus inside `emit()`, in the same transaction as the source event INSERT. Examples: `thread_summaries` (from thread lifecycle events), `notifications` (from `NotificationCreated`), `pinned_apps` (from pinning events). The *event store* is the source of truth; projections are recomputable, and consistent with it under read-your-write. See the `EventBus` struct doc-comment in `crates/lucidos-engine/src/engine/event_bus/mod.rs` for the full six-phase pipeline (Serialize → Validate → Persist → **Project** → CaptureAggregate → PostCommit).
+
+### Thread append lock
+The per-thread Postgres advisory lock that every append of an `events` row with a `thread_id` takes right after its *in-flight append lock* (`EventBus::lock_thread_append`). It is the `Serialize` phase of `emit()`, and `replay_historical_event` takes it too. Held until commit, it makes a thread's events commit in sequence order, which every `sequence > after` catch-up relies on. Only the in-flight append lock may precede it, so a waiter can never close a deadlock cycle (ADR 0364). It orders one thread only, so a reader keeping a global sequence mark reads a *committed horizon* instead (ADR 0360).
+
+### Front door
+The **deployed `lucidos.dev` origin** as a delivery surface in its own right: what the advertised `curl -fsSL https://lucidos.dev/install.sh | sh` actually reaches. It is more than `install.sh`. A piped install has no checkout, so `_source_libs` fetches the helper libs from `${LUCIDOS_INSTALL_URL%/install.sh}/scripts/lib` too, and the publisher rewrites the baked `LUCIDOS_INSTALL_URL` to this origin, which makes `/scripts/lib/*.sh` part of the front door rather than an implementation detail of the repo. **`/uninstall.sh` is part of it too**, and on a sharper edge: `install.sh --uninstall` fetches it from the same origin and runs `exec bash -c "$payload"` on what comes back, while `curl -fsSL <origin>/uninstall.sh | sh` pipes the same bytes straight into a shell, so a soft-404 there does not fail, it *executes the landing page*. Worth its own term because it **regresses independently of any commit**: the *stripped release tree* can be perfect and every install-smoke job green while the origin serves something else entirely. On 2026-07-29 the Cloudflare Pages deploy published `/install.sh` but not the helper libs, and because Pages soft-404s (landing-page HTML at status **200**) `curl -fsSL` succeeded and the installer sourced HTML as shell. Guarded in three independent places, deliberately not folded into one: the publisher uploads + post-deploy-verifies the libs, `install.sh` fails closed on an HTML payload, and `install-smoke.yml`'s **`front-door`** + **`front-door-macos` jobs** run the advertised command against the origin, daily on a cron and on a `workflow_dispatch` whose `origin` input says which front door to test. The post-publish run is that dispatch, fired by the site publisher after `SitePublished`, NOT the `release: published` webhook: the Pages deploy runs outside CI, so the webhook arrives mid-deploy and would verify the previous origin. The front door is **per-platform**, which is why there are two jobs: `install.sh` resolves a different tarball per host triple, so a green `ubuntu:22.04` run says nothing about `aarch64-apple-darwin` or `x86_64-apple-darwin` (the latter being where the landing page sends Intel Mac users, since the DMG is aarch64-only). The macOS job differs only in launch shape (with `launchctl` present `install.sh` registers a launchd job and exits 0 instead of holding the foreground), so it never treats an exited installer as a failure. Since 2026-07-30 those jobs also assert the **uninstall** half in full mode (rungs 5-8): `--list` through both the delegation and the direct piped front door, a data-safe removal that must keep the data dir (and, on macOS, boot out the launchd agent), and `--all --purge` that must really remove the instance data and the shared runtime. Distinct from every other install-smoke job, which tests a *tree* or an artifact built from one. Each of those jobs resolves ONE origin per run, so a fourth job, **`front-door-parity`**, exists solely to compare this front door's *publish route* set against the *RC front door*'s. See also *RC front door*, *publish route*.
+
+### RC front door
+The *front door* of a *release candidate*: `https://rc.lucidos.dev` (its own Cloudflare Pages project, behind Cloudflare Access; installer at `/install.sh`, helper libs at `/scripts/lib/`, uninstaller at `/uninstall.sh`), published by the site publisher during the release so the RC's own copy can be gated before anything reaches the real path. `install-smoke.yml`'s `front-door` and `front-door-macos` jobs run against it in **payload mode** on every push to `rc/**`: rung 1 only, meaning fetch the served installer, parse its helper-lib list and lib base out of it, fetch those plus the served uninstaller, assert every payload is shell rather than the soft-404 landing page, then stop green. The uninstaller is in that list so an RC is gated on both halves of the advertised experience. It deliberately does **not** install. An RC `install.sh` bakes `LUCIDOS_DEFAULT_VERSION=<rc version>` and resolves its tarball to `…/releases/download/v<ver>/…`, but during an RC that tag does not exist (Phase A publishes only the `rc-<ver>` draft release with the DMG + updater `.sig`; headless tarballs live solely on real `v*` releases), so a full `curl … | sh` would 404 every run and the gate would be permanently red. Payload mode loses nothing: the soft-404 class the gate exists to catch is entirely a payload question. Three rules keep its green honest. The lib base derived from the served installer must equal exactly `<origin>/scripts/lib` (fatal here, since it is the only rung); the served uninstaller must pin its own `LUCIDOS_UNINSTALL_SELF_URL` and lib base at this origin too, or a piped uninstall silently runs GitHub main's copy; and the served installer's baked version must match the `rc/<version>` branch, so the previous RC's copy at the same URL cannot pass. Because it and the production front door are published by two separate route-discovery paths, their *publish route* sets can drift; `front-door-parity` is what catches that.
+
+### Publish route
+Any path a piped run would curl back **from its own origin** and execute, which is the whole test for whether something belongs on a *front door*. Six today: `/install.sh` (the dash re-exec re-fetches itself), `/uninstall.sh` (`install.sh --uninstall` execs it, and a direct pipe runs it), and the four `/scripts/lib/*.sh` helpers the two scripts source (`stage_runtime.sh`, `headless_tarball.sh`, `install_common.sh`, `service.sh`). A missing publish route is not a 404: Cloudflare Pages answers an unknown path with the landing page at status **200**, so `curl -fsSL` succeeds and the shell runs HTML. The set is **enforced in two places that can drift** (the site publisher discovers routes separately for production and for the *RC front door*), which is exactly how `/uninstall.sh` reached production on 2026-07-30 and not the RC, surfacing only on the next morning's `rc/0.18.0` push as three red payload legs. `install-smoke.yml`'s **`front-door-parity`** job is the repo-side guard: daily, it derives each origin's route set from that origin's OWN served scripts (`scripts/lib/front_door_parity.sh`) and fails when production serves a route the candidate does not, naming it. The reverse direction is a warning, since an in-flight candidate legitimately leads production until publish. The structural fix, one discovery path parameterised by destination, is workspace-side.
+
+### Release candidate (rc)
+The stripped *published release commit* while it is still on the gate branch, i.e. the object a release is gated on and (after *promotion*) the exact commit that becomes the mirror's `main`. Phase A (`release.sh --verify-build`) builds it with `release_tree_build`, scans it, commits it with `release_tree_commit`, and force-pushes it to `refs/heads/rc/<version>` on the `lucidos` remote (which fires `install-smoke.yml`'s clean-machine source install); the staged DMG + updater `.sig` then go onto the `rc-<version>` **draft release** at that branch, and Phase A dispatches `dmg-verify` at it with `-f dmg_tag=rc-<version>`. A draft so the gate artifact is never listed on the public releases page (as a prerelease it sat above the current GA for the whole Phase A to Phase B window), and an explicit dispatch because a draft fires no `release` event at all: see ADR 0036. Its SHA is recorded as `RC_COMMIT` in the verify-build state and pinned locally at `refs/release-candidates/<version>`. Deterministic: identity + dates are inherited from the internal release commit, and the parent is fixed, so re-deriving it yields the same object. Its parent is the mirror's `main` at the moment Phase A built it, recorded alongside as `RC_PARENT`, which is what makes the published history linear (ADR 0039); because the parent is part of the object's identity, rebuilding onto a moved mirror deliberately yields a DIFFERENT object and re-fires the gate. Never a raw branch push of the internal tree: that shipped `docs/plans/` and the release scripts to the public mirror on 2026-07-28 (ADR 0024).
+
+The rc push also builds what SHIPS. `release-tarballs.yml` has an `rc/**` arm, so the four per-platform headless tarballs are built from this exact object while Apple notarizes. They stop at the workflow artifact; Phase B attaches them, pinning the run by `head_sha == RC_COMMIT`. See *draft GA release* for the fallback when it cannot.
+
+### Published release commit
+The one commit a release puts on the public mirror: the *stripped release tree*, committed with the internal *release commit*'s identity and dates, carrying the **previous** release's published commit as its single parent. It is what the mirror's `main` and its `v<version>` tag both name, and the same object throughout: built once in Phase A, tested on `rc/<version>` as the *release candidate*, then promoted verbatim. Call it that, **not** "the orphan commit": it was parentless until 2026-08-04, which is why `github.com/lucidos-dev/lucidos` showed a one-commit history with 36 unrelated tags, and ADR 0039 chained it. A parent is safe here for one specific reason and only that reason: a push sends every reachable object while `release_tree_scan` inspects only the tip tree, so the parent is REQUIRED to be the SHA the mirror's own `main` already holds, and the push then adds nothing the public does not already have. `release_tree_ancestry_is_published` enforces exactly that (at most one parent, so a merge is refused; that parent equal to the mirror's `main`; parentless only against an empty mirror), and the push to `main` is `--force-with-lease`d against the same SHA.
+
+### Stripped release tree
+The only tree Lucidos ever publishes. It is `HEAD` (or the release commit) minus every `RELEASE_TREE_EXCLUDE_PATHS` entry, with `WORKSPACES.md` replaced by the public stub. `release_tree_scan` scans it and fails closed on a hit and on a denylist that will not load. `release_tree_build` builds it in a throwaway index, so the working tree and real index are untouched.
+
+`scripts/lib/release_tree.sh` is the single definition. The *release candidate* push, `release-to-lucidos.sh` and the e2e *GitHub mode* push all call it, because a duplicated exclusion list is how internal content leaks. The lib and its test exclude themselves.
+
+### Promotion (release)
+Phase B's publish step: pushing the **already-validated** *release candidate* commit object onto the mirror's `main` (under `--force-with-lease` against the parent it was built on) and tagging it `v<version>` **by SHA**, as opposed to rebuilding an equivalent tree at publish time, which would ship an object CI never saw. Gated by `release_promote_preflight`, which refuses when no `RC_COMMIT` was recorded, when `rc/<version>` is absent from the mirror, when it **moved** (someone re-pushed ⇒ stale gate result), when no `RC_PARENT` was recorded, when the mirror's `main` **moved** off that parent (a release landed since), when the staging manifest's `source_commit` ≠ the worktree HEAD, or when a staged artifact's sha256 drifted. It also refuses the wrong argument count, since the parent pair was appended to an older signature and a five-argument caller would skip that half in silence. Driven by `release-to-lucidos.sh --promote-rc <sha>`; `release.sh --push-rc <version>` re-arms the gate without a rebuild. See ADR 0024. The source-side half that follows it is the *release landing*.
+
+### Release commit
+The **main-line** commit of a release: the one bumping `RELEASE`, `CHANGELOG.md` and `install.sh`, created on `release/<version>` in the Phase A worktree off `main`. Distinct from the *release candidate*, which is the stripped commit built **from** it: same release, two objects, and the *release tag* names a different one on each remote. `RELEASE` is the load-bearing file: the site publisher reads the version from the local checkout's copy, so a release whose commit never reaches `main` leaves the site advertising the previous version (the v0.17.0 incident).
+
+### Release preflight
+The read-only verdict `release.sh --prep-preflight <version|auto>` gives an
+unattended caller: "should a release be prepared right now, and from what". Its
+EXIT CODE is the interface, and the three values are not interchangeable: **0 GO**,
+**10 SKIP** (a legitimate reason not to release tonight, and NOT a failure), **1
+ERROR** (something is broken and a human should look). Collapsing SKIP into
+failure is how a nightly starts crying wolf; collapsing ERROR into SKIP is how a
+broken pipeline stays broken unnoticed. One JSON object goes to stdout (verdict,
+reasons, base + `base_kind`, head, the shipped commit list, any unfinished
+release, pending Mode 2 merges, deletion drift, credentials, Actions health,
+queue depth) and human progress to stderr. It has **zero side effects**: no
+worktree, no push, no state write, so it is safe to run while another release is
+mid-flight, which is exactly when its first check matters. Checks run cheapest
+first and short-circuit on the first that trips, in this order: an unfinished
+prior release, the requested version against `RELEASE`, base selection, anything
+shippable at all, pending Mode 2 merges, deletion drift, signing credentials, CI
+weather. Two deliberate asymmetries: a mirror it cannot read fails CLOSED to skip
+(stacking a second release on an unfinished one is unrecoverable by script),
+while an unreachable CI-weather signal is `"unknown"` plus an advisory reason and
+never a skip on its own (a blip that stops releases stops them forever). `auto`
+invents no version, because sizing the bump is the LLM's judgement per the
+release knowhow. `scripts/lib/release_preflight.sh`.
+
+### Notary pending (deadline)
+What `--notarize-deadline <spec>` turns a slow Apple verdict into: a PAUSE, not a
+failed run. Without it `notarize_poll` dies at `NOTARIZE_POLL_TIMEOUT`; with it
+the poll stops at the given instant (a duration, a local wall-clock time, or the
+`@<epoch>` form `release.sh` resolves once and hands down), the run exits 0, and
+the `notarize` cockpit step is closed as **Succeeded** with the verdict recorded
+as outstanding rather than emitting `ReleaseStepFailed`. **Nothing is staged**,
+and that is the safety property rather than an omission: with no staging dir
+there is no manifest for `--publish-verified` to promote, so a run whose ticket
+never arrived cannot publish an unstapled DMG. It also works at the *app
+notarization stage*, where no DMG exists yet. Distinct from a *deferred-DMG
+release*, which is its opposite in intent: deferring STAGES the unstapled DMG so
+the release can publish behind the *notarization-pending banner*, while a
+deadline publishes nothing at all. The build, the codesigns, the signed
+artifacts, the submission and the resume handle all survive, so
+`release.sh --resume-notarize <version>` finishes it for the price of a poll.
+`scripts/lib/release_deadline.sh` plus `notarize_deadline_handoff` in
+`build-dmg.sh`.
+
+### Abandoning a release
+`release.sh --abandon <version>`: removing everything a Phase A created, in one
+command. The worktree and `release/<version>`, the local rc pin, the mirror's
+`rc/<version>`, the `rc-<version>` draft release and any stray tag, the staging
+dir, the verify-build state file and the notarize resume handle. Idempotent, with
+a per-item table of removed / already gone / FAILED, and it exits non-zero only
+when something that EXISTS survived. **Not a yank**, and it refuses to become
+one: a published `v<version>` release, a mirror whose `main` already points at
+this version's release commit, or a mirror it cannot ask about, are all
+refusals. It never touches the workspace changelog artifact (that lives outside
+the repo); the report names its path instead. It replaced five commands
+`print_verify_build_handoff` used to PRINT, which broke the rule that every
+irreversible action lives in the script behind a flag, and which no printed
+recipe can make idempotent or reportable. `scripts/lib/release_abandon.sh`.
+
+### Release landing
+Getting the *release commit*'s bump onto the live checkout's `main` at publish time. It **fast-forwards** when `main` is still an ancestor. When `main` moved during the (40+ minute) build it **merges** the release commit, and it **fails hard** on a conflict (after `merge --abort`, leaving nothing wedged). A merge, not a cherry-pick, keeps the release commit itself in main's history, so the *release tag* can name what shipped (ADR 0250).
+
+Only operator state (the checkout is not on `main`, or is dirty) still skips. The recovery commands are then reprinted in a `STILL OWED` block at the very *end* of the run. `release_main_land` in `scripts/lib/release_main_sync.sh`, run with the tag and the `origin` push by `settle_source_side`. `settle_and_announce_release` calls that before it emits *LucidosReleased*. See ADR 0029.
+
+### Release tag (per-remote)
+`v<version>` names a **different object on each remote, deliberately**. Locally and on `origin` it names the *release commit* itself, in main's history, which is what gives it ancestry. The next release counts from it, so it must never name a commit carrying work the release did not ship (ADR 0250).
+
+On the public mirror it names the *published release commit*: the GitHub Release and every download URL resolve through it. So it is pushed **by SHA** (`push --force <remote> <commit>:refs/tags/<tag>`), touching no local ref.
+
+Creating the mirror's tag locally first left 26 of 27 `v*` tags outside main's history. It made `git describe --tags main` report `v0.9.6-4946-gfb4b344cf`, and every `PREV_TAG` guard in `release.sh` vacuous. The local tag is annotated and idempotent: an already-correct one is left byte-identical, so the `origin` push stays a no-op. It is only ever created at a settled commit, so "the tag exists" implies "it names a real main-line commit". See ADR 0029.
+
+### LucidosReleased
+The domain event the release spine emits once a release is public: `{version, commit, tag}`, plus `dmg_pending: true` on a *deferred-DMG release*. Emitted by `release.sh` via `emit_lucidos_released` (`scripts/lib/release_events.sh`) in `settle_and_announce_release`. That is strictly AFTER the *draft GA release* is published, and after the *release landing*, the local tag and the `origin` push.
+
+It starts the site chain, and the site builds `install.sh` from main, so an earlier emit ships the previous installer (v0.39.3, ADR 0250). A failed landing still emits. `release-to-lucidos.sh` emits it only on a standalone run. It also marks every Release Cockpit step done.
+
+`dmg_pending` is written **only when true**. So an ordinary release's payload stays byte-identical to what existing consumers parse, and "absent" reads as false in each of them. The workspace's `bump-dmg-link-publish-on-release` trigger keys off it. Pending ⇒ leave the Download-for-Mac link on the last notarized build and add the "newer version available" notice. Otherwise ⇒ bump the link and remove the notice.
+
+### ReleaseDmgNotarized
+The domain event `release.sh --attach-notarized` emits after the stapled DMG has replaced the pending asset on a published release — `{version, tag, dmg, submission_id}`. It is what re-points lucidos.dev's Download-for-Mac link and clears the pending notice, and it is emitted **only after the upload succeeds**, so the link can never point at an asset that is not yet in place. Consumed by the same `bump-dmg-link-publish-on-release` trigger as *LucidosReleased*, through one reconciler that branches on `dmg_pending` rather than on which event fired.
+
+### Request_id
+The `request_event_id` field that links a request event (e.g. `MessageReceived`) to all its terminal events (`ResponseGenerated`, `ResponseCanceled`, `ResponseAborted`, `ResponseFailed`). Carried via `EventMeta::request_event_id`. Used by the UI to group a turn and by the engine to settle stuck-running threads.
+
+A live turn's own id is held in memory on its `ThreadHandle` and is **authoritative** for anything emitting on its behalf from outside the loop: the restart teardown, the 60 s stuck-turn eviction, and the shutdown sweep all resolve it through `engine::in_flight_request_event_id`. The `agent_session::latest_originating_event_id` query behind that is only the fallback for a thread with no live handle (boot-time recovery, `chat/rerun.rs`'s legacy Continue path). The query answers "newest originating-type event", which is a different question and a wrong answer whenever a follow-up was queued mid-turn or the running turn was started by an event its list does not name (`ContinuationStarted`, `ContinuationRequested`). An abort carrying the wrong id terminates the wrong exchange AND defeats the idempotency gate in `emit_response_canceled`, so the loop's cancel lands as a second boundary.
+
+### RiskLane
+The *command guard*'s classification of a single bash/python command (`RiskLane` enum in `engine/command_guard.rs`). Four lanes (ADR 0002): `Safe` (run), `Catastrophic` (hard-block), `ReversibleDanger` (in-workspace destruction), `IrreversibleDanger` (ask / trigger grant). The static *command classifier* only ever settles `Safe` and `Catastrophic`; the LLM *judge* produces `Safe` / `ReversibleDanger` / `IrreversibleDanger` for the ambiguous middle. `ReversibleDanger` takes a *command checkpoint* (a snapshot pair, one-click Undo and a diff of what the command did, ADR 0002 Phase 4) and runs; on the `IrreversibleDanger` lane the judge also tags a *SideEffectCategory* used for the trigger side-effect grant.
+
+### Fast-path decline
+Why the *command guard*'s Safe fast path did not settle a command (`FastPathDecline` in `engine/command_guard.rs`, returned by `bash_fast_path`). Two kinds, and they are not interchangeable.
+
+A **refusal** means the head is not what runs, or not all of it. Examples:
+
+- a command substitution, a code-injecting `VAR=value` preamble, or a path-qualified head;
+- a redirect or write outside the workspace;
+- an executable git config or output flag, or `git grep -O`;
+- curl or wget options loaded from a file or a wgetrc command;
+- a Python call that installs packages.
+
+An **omission** means the head is simply not on the allowlist, which the allowlist's own header prices at a judge call and never at safety: `cargo`, `npm`, `make`, `python`.
+
+The chat lane routes both to the *judge* and does not read the split. Two PERMISSIVE paths do read it, and both deny a refusal: the unattended coding-agent lane (`RequestVerdict::Unclassified`, ADR 0002's 2026-08-24 addendum) and `grant_covers_command`, so no stored grant covers a command whose head is not what runs.
+
+The refusal set is coarser than an attack shape, deliberately. A `/tmp` log redirect, a `./scripts/x.sh` head and `sort /etc/passwd` are all refusals, because separating them needs per-head flag arity. An unattended deny costs one request, not the run.
+
+### resolveThreadActions
+Frontend (`store/actions/threadActions.ts`) enrichment tier over the codegen'd `availableThreadActions`. Feeds `has_unsent_draft` from the live `composeDrafts` signal (fresh, ahead of the 250 ms compose debounce), applies the external-repo carve-out (a CC change that can't merge into a foreign repo → Archive instead of Apply/Discard), and maps each bare `Action` into a *TaggedAction* `{ kind, category, label, tooltip?, invoke }` whose `invoke` encapsulates the confirm + handler. Both the per-thread buttons (WaitingBanner close buttons, PromptInput Save/Unsave toggle) and the *close cascade* render/drive from these, so a shortcut can only invoke an action whose button is currently available (no enablement drift). The `available_*` / `resolve_*` verb seam marks the DB-vs-client boundary: see *available_thread_actions*.
+
+### Cron slot
+One scheduled occurrence of a *trigger*'s cron expression — the 07:45 of `0 45 7 * * *`, on a given day, in the trigger's timezone. The unit the scheduler dedupes on: a slot fires at most once, however late. A run counts as having served slot S if its *recorded run time* is at or after S, so a 07:49 fire of the 07:45 slot means the 07:45 slot has run. Distinct from the *run* itself, which is the execution that serves the slot.
+
+### Missed-slot catch-up
+The scheduler's startup path that fires a *cron slot* whose scheduled time has already passed, when the engine was down, asleep, or restarting across it (`check_and_execute_missed` in `crates/lucidos-engine/src/scheduler/task_runner.rs`). Bounded by `MISSED_TASK_GRACE_MINUTES` (60): only a slot missed within the last hour is caught up. Runs on every task-runner registration — engine start, `TriggerCreated`, `TriggerUpdated`/`TriggerEnabled`, and the health monitor's crash restart — so it is the single choke point every double-fire path passes through. **Fails closed** (`catch_up_decision`): it fires only on a positive showing that the slot is due — no run at or after the slot, and the trigger already existed then. An unreadable run history, an absent `last_run`, or a slot older than the trigger all skip. The no-run half is exact (it compares *recorded run times*, engine clock to engine clock); the trigger-already-existed half is best-effort, because `TriggerCreated` carries only a DB-clock timestamp — see `docs/code-review-priors.md`.
+
+### Recorded run time
+The instant the *engine* says a *trigger* ran, on the engine's own clock: `chrono::Utc::now()` stamped by `record_trigger_executed` into `TriggerExecuted.payload.last_run`, and rebuilt into `TriggerConfig.last_run` by `replay_trigger_events`. Deliberately **not** `events.created`, which is the Postgres server clock. The distinction is load-bearing: the *missed-slot catch-up* compares run times against slots it derived from the engine clock, and mixing the two clocks caused the 2026-07-29 double-fire (a macOS sleep left the containerized Postgres clock 280 s behind, so a run landed timestamped *before* the slot it had just served). `events.created` survives only as a fallback for legacy rows with no payload timestamp. See `docs/plans/2026-07-29-cron-slot-catch-up-double-fire.md`.
+
+### Trigger registry
+The engine's live set of *triggers*: the in-memory
+`Arc<RwLock<HashMap<String, TriggerConfig>>>` shared by the engine, the
+`SchedulerManager` and the *Thread Queue*, together with its derived on-disk
+`data/triggers/<slug>/trigger.toml` read-model (ADR 0019). A *projection* of the
+trigger event stream, never the authority: it is rebuilt from events at boot by
+`replay_trigger_events`, and one function materializes a live event into it,
+`triggers::registry::materialize_trigger_event`. Both halves move together
+because a slug rename needs the pre-image slug to delete the stale file.
+
+Updated on the **write path**: every trigger write goes through the *trigger
+write chokepoint*, so the registry already carries the change when the write
+returns. Before that (until 2026-08-03) only the scheduler's EventBus subscriber
+applied it, and the gap let a run request fire a trigger the user had just
+paused. The subscriber no longer applies at all, deliberately: a redundant
+re-apply of a `TriggerCreated` rebuilds the config from its original payload and
+would transiently undo a pause that followed it. It reads the registry (behind
+the same write lock, since the broadcast fires from inside the chokepoint's
+locked span) and confines itself to arming and disarming cron jobs. See also
+*trigger write chokepoint*, *Projection*.
+
+### Trigger write chokepoint
+`crates/lucidos-engine/src/engine/trigger_writes.rs`: the single path by which a
+trigger lifecycle event is written. Emits through the *EventBus*, then applies
+the event to the *trigger registry* before returning, so the trigger surface is
+read-your-writes for HTTP, the LLM tools, plugin resync and the thread-queue
+overflow guard alike. Emit strictly precedes apply, so a failed emit leaves the
+registry untouched rather than holding a change no event records.
+
+Callers name a `TriggerWrite` (`Created` / `Updated` / `Deleted` / `Disabled`)
+instead of building the `SystemEvent` themselves, which is what makes the
+guarantee mechanical: the `SystemEvent::Trigger*` constructors exist only in
+this module, so a write that skips the registry cannot be spelled, and a
+source-scan test holds that line. Sibling of `trigger_group_writes.rs`, which
+does the same for *trigger groups*.
+
+### Scheduler blocklist
+The `core::event_subscription::is_subscribable` predicate, consumed by the scheduler subscriber's `BusEvent::Thread` arm in `crates/lucidos-engine/src/scheduler/mod.rs`. It filters out the per-token streaming variants (`ThreadEvent::is_per_token_streaming`) and the four side-question events (`ThreadEvent::is_side_question_event`) before they reach the trigger matcher. Every other persisted `ThreadEvent` flows through and is subscribable via `on_event:`. A trigger on a streaming variant validates and persists but **never fires**. A subscription on a side-question event is refused (ADR 0320).
+See also: `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist", `.claude/rules/system-knowhow.md`.
+
+### System subscribability gate
+The `SystemEvent` counterpart of the *scheduler blocklist*, and an allowlist rather than a blocklist: `core::event_subscription::is_subscribable_system_event`. It admits any `SystemEvent::DomainEvent` plus any frame whose `is_persisted()` is true, and drops the rest as transient engine chatter. Persisted means subscribable (ADR 0113), so a new variant needs no second list. Both fan-outs call this one function, which is what makes invariant I8 structural: the scheduler subscriber's `BusEvent::System` arm and the event-wait dispatcher. A transient name is also refused at registration by `validate_awaitable_event_type`, with the persisted terminal event named where one exists.
+See also: *scheduler blocklist*, *trigger chain depth*, `docs/adr/0113-persisted-system-events-are-subscribable.md`.
+
+### Trigger chain depth
+How many trigger fires deep the current work is, carried on `EmittedEvent::depth` and capped by `CapacityPolicy::max_event_trigger_depth` (default `DEFAULT_MAX_EVENT_TRIGGER_DEPTH` = 5). `scheduler::trigger_dispatch` answers both carriers off that one number, a thread event and a system frame alike. A `DomainEvent` keeps its own persisted copy, so a replay reconstructs the depth. Past the cap an event is still stored and still reaches SSE, it just fires no further triggers, and the user is notified.
+
+Since *emitting trigger id* landed, the cap's main job is a chain running ACROSS triggers. A trigger can no longer be woken by its own fire at any depth, so the single-trigger loop the cap was written for closes earlier.
+
+**A spawn does not consume a hop, and the depth crosses every task boundary.** That is the one place it parts company with *emitting trigger id*, which deliberately stops at a spawn. The depth travels on the persisted `ThreadQueueRequest` (all four spawn-bearing variants), and the Thread Queue re-establishes it at each boundary it owns. Three carriers:
+
+- the `EVENT_TRIGGER_DEPTH` task-local, around `prepare` and the execution spawn;
+- a per-thread registration (`scheduler::user_tasks::register_chain_depth`), for work whose emits come from a spawn tree no scope reaches. Keyed by thread but owned per queue entry, so one entry completing cannot take a sibling's binding; the lookup answers the deepest live one.
+- the HMAC-signed agent-origin token, for a subprocess's `lucidos events emit`.
+
+`EventBus::emit` resolves a thread event from the deeper of the task-local and the registration. Under-counting re-opens the loop silently, while over-counting suppresses a fire the notification names.
+See also: *emitting trigger id*, *scheduler blocklist*, *System subscribability gate*, `system-knowhow/thread-events.md`.
+
+### Emitting trigger id
+Which trigger's fire emitted an event, carried on `EmittedEvent::emitting_trigger_id` beside *trigger chain depth*. `EventBus::emit` reads it from the `ACTIVE_TRIGGER_ID` task-local. `emit_as_trigger` takes it as an argument instead, for a caller that knows the owner but runs off its task. `find_matching_event_triggers` drops that trigger from the matches, so a trigger is never woken by an event its own fire emitted. Other subscribers are unaffected: this is a per-subscriber gate, the same class as the depth cap and a `condition:` filter, so ADR 0113's invariant I8 is untouched. `None` suppresses nobody, which is the fail-open direction: an extra wake, never a missing one.
+
+A task-local does not survive a `fork`, so a subprocess states the claim instead. It rides inside the *thread-bound origin token*, under the same MAC as the source thread id and the depth. So a trigger's script emits marked, whether it goes through the `lucidos` CLI or straight to `/api/v1/events/emit`. An app reaching the API through the SDK holds no minted token, so it can make no claim at all.
+
+Deliberately NOT persisted the way `depth` is on a `DomainEvent`, so it is absent from the stored row and from every replay path. The marker covers the fire, and never what the fire hands off. A sub-thread or a coding-agent session the fire starts emits unmarked, so a trigger waiting on the session it started is still woken. The *trigger chain depth* beside it deliberately does the opposite and crosses the same spawn. Each spawn site states its answer rather than reading the ambient scope: the *Thread Queue*'s fire frames carry its trigger and a sub-thread entry's carry none, and `subprocess_origin_env_vars` takes `None` at a coding-agent spawn.
+See also: *trigger chain depth*, *thread-bound origin token*, `docs/adr/0137-a-trigger-never-wakes-itself.md`, `system-knowhow/triggers.md`.
+
+### SideEffectCategory
+The kind of irreversible real-world side-effect a command may perform (`SideEffectCategory` enum in `engine/command_guard.rs`): `Email`, `ExternalApi`, `CloudCli`, `OutOfWorkspaceDestruction`, `Other`. Wire form is snake_case (`email`, `external_api`, …). Only meaningful for the `IrreversibleDanger` *RiskLane*: the *judge* tags each irreversible command with one (`static_side_effect_category` derives it for the shapes the static fallback recognises; unclassifiable → `Other`). It rides on `JudgeVerdict` / `JudgedClassification` and gates the trigger *side-effect grant* (`TriggerConfig.side_effect_grant: Vec<SideEffectCategory>`) — an unattended trigger runs an irreversible command only if its category is granted, else the run fails. The **same category + grant also gate the coding-agent permission flow** (`engine/cc_permission.rs`): an unattended (trigger-rooted) coding-agent thread classifies each permission request with `classify_coding_agent_request` (reusing `static_classify`/`fallback_classify` — no judge), then `decide_unattended` allows benign requests, allows a `SideEffect(cat)` iff `cat` is in the inherited grant, and denies catastrophic / ungranted requests — denying the single request rather than failing the run. Interactive-vs-unattended + the inherited grant come from `resolve_attend_mode` (walks the spawn tree's `MessageOrigin` chain to its root trigger). User-facing concept: *side-effect grant* in `system-knowhow/glossary.md`.
+
+`decide_unattended` has a fourth arm that no category reaches: `RequestVerdict::Unclassified`, which denies whatever the grant holds. See *fast-path decline*.
+
+### Persisted allow
+A workspace-wide permission grant: what the two **"Always allow"** buttons on a coding-agent permission card record. `AllowScope::Narrow` / `AllowScope::Broad` in `engine/claude_code.rs`, appended as a `--allowedTools` pattern to `<workspace>/.lucidos/cc-allowed-tools`. The sibling lanes use `agent-allowed-commands` and `mcp-allowed-tools`, all three per workspace since ADR 0095.
+
+**Two consumers, and that is what makes the click bind now.** Claude Code gets the file as `--allowedTools` at spawn, frozen for that subprocess's life. `cc_permission::persisted_allow_covers` reads it fresh on every prompt, before CC's own gate. Until ADR 0125 only the first consumer existed, so a click took effect one session late and the user was re-asked seconds after granting.
+
+The engine honours a stored pattern **only where `derive_allow_pattern` would have produced it for that same request**, at `Broad` or `Narrow`. `None` at both scopes means Claude Code ignores the pattern. That rules out a bare `Edit` / `Write` / `NotebookEdit` / `ExitPlanMode` line, a `Bash` command touching `.claude/` or `.git/`, and the Codex backend tools. A command additionally takes the per-segment rule of `command_guard::grant_covers_command`. The gate sits below the unattended fast path, so a grant never answers for a trigger-rooted session.
+See also: *session allow*, `docs/adr/0125-engine-gate-enforces-the-workspace-allowlist.md`.
+
+### Session allow
+A per-thread permission grant: what the **"Allow for this thread"** button on a permission card records. `AllowScope::Session` in `engine/claude_code.rs`, cached in `PermissionState::session_allows: HashMap<Uuid, HashSet<String>>`.
+
+Distinct from the *persisted allow* the `Narrow` / `Broad` scopes record. A session allow reaches further. It covers every tool and every path, CC's protected `.claude/` and `.git/` included. A persisted pattern is honoured only where Claude Code would honour it too.
+
+The pattern is produced by `derive_allow_pattern(.., AllowScope::Session)`, and matched exact-string against the same derivation on later prompts. Per-file for `Edit`/`Write`/`NotebookEdit` (`Edit(<path>)`), first-token for commands (`Bash(git:*)`), plugin-scoped for `Skill`, bare tool name otherwise. Codex's `file_change` gets *none*: its input carries no stable identifier, so one click would blanket-approve every future out-of-sandbox write.
+**Durable, despite the in-memory cache.** The grant is persisted as the resolution event's `persist_scope: "session"`; `cc_permission::hydrate_session_allows` refills a thread's set from the event store on the first prompt after an engine restart, re-deriving the pattern rather than storing it a second time. Only `allowed: true` + `persist_scope: "session"` rehydrate. Implemented for the coding-agent lane; the *command permission card* lane shares the struct but not yet the hydration (ADR 0002, 2026-07-30 addendum).
+
+### Signer
+A WebAssembly module that signs outbound proxy requests with credentials (HMAC, OAuth, vendor-specific). Loaded by the `WasmSignerLayer` in the proxy pipeline. Installed under `data/auth-modules/` as a `.wasm` + optional *signer manifest* sidecar — see user-facing *auth module*. Real-artifact tests live in `crates/lucidos-e2e/tests/wasm_signers.rs`; inline-WAT tests live in `crates/lucidos-engine/tests/proxy_wasm_engine.rs`.
+
+### Signer capability
+One of the strings a *signer manifest* declares in `capabilities` and a provider's `apis.json` grants in `granted_capabilities`. **Both halves are required** (`capability_granted` in `proxy_wasm_signer.rs`): a module cannot grant itself one by declaring it, and a blanket provider grant never reaches a module that never asked. Two exist.
+
+- **`replace_body`** lets the signer's `SignOutput.replace_body` be honored. Ungranted, a module that returns one gets a 403 naming the missing grant.
+- **`read_prior_headers`** lets the signer read the auth-header VALUES an earlier layer published into `prior_layer_outputs`. Ungranted, it still receives every header NAME, with each value replaced by the *withheld header value*. Signer modules arrive from plugins and from workspace data, so third-party code is the expected case: a signer that does not need the previous layer's `Authorization` header is not handed it.
+
+### Withheld header value
+The exact string `[withheld: grant read_prior_headers]`, which an ungranted *signer* reads where an upstream header value would be (`WITHHELD_HEADER_VALUE`). A placeholder rather than a removed key, deliberately. An author must still see that the header was present, and the value names the capability so the fix needs no doc. The real value still joins the signer's `log()` scrub list, so a signer that IS granted it cannot print it either.
+
+### Superseded draft
+A compose draft the server no longer holds, **and** whose exact content was submitted to its thread **since this device last touched it**. Exact content means the trimmed text plus the image hashes. Both halves are load-bearing.
+
+Ordering (the *draft edit watermark*) covers the ordinary case. Server state covers the case ordering cannot see. That state is `serverDraft`, this device's knowledge of what the server holds. It is written ONLY where the server reports its current compose state: a PUT ack, a thread-summary snapshot, a `ThreadComposeChanged`. The hard case is a device that re-typed the text while still behind a peer's submission. Its watermark is stale, but its own PUT re-filled the draft server-side.
+
+A thread event never writes `serverDraft`, even though the projection clears compose in the same transaction as `MessageReceived`. An event can be delivered long after it was written (lagging stream, throttled tab, replay on wake). So it is no evidence of what the server holds now.
+
+The submitted-input set is closed: `MessageReceived`, `UserQuestionAnswered { FreeText }`, and `UserQuestionAnswered { MultiSelected }` carrying typed text. The free-form answer path never emits `MessageReceived`, because `chat/process/run.rs` reroutes typed text straight to the answer. A `PromptInjected`, streaming and tool events are never submissions.
+
+Content match alone is deliberately **not** the test, because posting the same text many times must stay possible. Ordering against the *draft edit watermark* tells "the draft that got sent" from "the same text, deliberately typed again afterwards".
+
+A superseded draft is not unsent work. So every inbound clear path drops it: `hasUnsentLocalDraft` in `store/actions/compose.ts` returns false for it. `clearSupersededDraft` actively clears it on the paths that carry no clear of their own: the free-form answer, and event replay on wake / SSE reconnect.
+
+Server-side counterpart: **every projection arm that empties the compose fields announces it** with a `ThreadComposeChanged` reporting the emptied state (`compose_cleared_broadcast`). Those arms are `MessageReceived`, and `UserQuestionAnswered` when the stored draft is exactly what was submitted. That means text equal and no attached images, since an answer carries none. Neither path has a compose PUT of its own to announce it. Without the broadcast, a peer mirroring the draft would keep it until its next thread-summary reload.
+See also: `docs/plans/2026-07-28-superseded-compose-drafts.md`.
+
+### Draft edit watermark
+The **server** timestamp captured whenever this device edits a compose draft (`composeEditWatermark` in `store/actions/compose.ts`, stamped by `markLocallyEdited` from the thread's `meta.updatedAt`): the newest `thread_summaries.last_activity` the device had seen for that thread at that moment. It is the ordering reference a *superseded draft* is decided against — a submitted user input counts as evidence only when its server `created` is **strictly** newer. Both sides of that comparison are server-sourced, so client clock skew can never mis-fire the clear, and re-typing text that was just sent is safe because the fresh watermark already sits at or after that submission. Absent watermark = this device never authored the draft, so nothing can supersede it.
+
+### Step outcome
+What became of one *step* in a rendered exchange, as the frontend models it: the `StepOutcome` union `'pending' | 'success' | 'error' | 'unfinished' | 'blocked' | 'denied'` (`store/types.ts`), carried by both projections of an exchange (`Step.outcome` and the `ResponseEvent` step variant's `outcome`, both built in `store/thread-events/exchange-render.ts`). The value doubles as the CSS class (`.inline-step.<outcome>`, `.step-detail-icon.<outcome>`); `stepStatus` adds the user-facing label. Only `'pending'` shimmers, and it is the only thing `liveStepInBody` (`store/event-rendering.ts`) looks for. It answers whether such a row is DRAWN, which is half of the exactly-one-shimmer rule. `ChatExchange` marks the first pending row and narrows the answer with `useOnScreenInTranscript` before it drops the "Working" label's shimmer. A row rendered far below the fold is drawn and not seen (`docs/plans/2026-08-31-working-label-shimmers-when-the-live-step-is-off-screen.md`).
+**`'unfinished'` is the killed-mid-call state** and reads "Did not finish": the turn died (`ResponseFailed` / `ResponseAborted` / `ResponseCanceled`) while this step was still in flight, so it never reported anything. Distinct from `'error'`, which asserts the step ran and returned a failure, and from `'pending'`, which asserts something is still running. It exists because a tool call whose result event never arrived used to stay `'pending'` forever (an eternal spinner sitting above a red error card), and resolving it to a checkmark instead would have been a worse lie. Which one a still-pending step becomes is decided by the exchange's terminator kind (`TerminalKind`: `'clean'` for `ResponseGenerated` / `CodingAgentIdled`, `'unclean'` for the three above); the last terminator in the exchange wins, so a recovered engine-restart turn (abort, then a same-request `ResponseGenerated`) keeps its checkmarks. Deliberately NOT named `interrupted`: *ExchangeStatus* already uses that word one layer up for "user sent a follow-up while streaming", which renders as a neutral "Done ↳".
+**`'blocked'` and `'denied'` are the two halves of a permission decision**, reading "Needs approval" and "Denied". A gated call used to open at `'pending'`, so a command blocked on a human shimmered like one that was running. A *permission card* also parks the thread at `waiting_for_user_answer`, which the `threadIdle` sweep read as finished. The un-run row then took a green check instead, and which of the two you saw was a race. Both live outside `'pending'`, which is what exempts a held row from the sweeps and from `liveStepInBody`.
+See also: `docs/plans/2026-08-03-unfinished-step-outcome.md`, `docs/plans/2026-08-25-permission-blocked-step-state.md`.
+
+### Sub-agent step
+A step a Claude Code sub-agent took: a tool call made inside the session's own `Agent` call. Its `CodingAgentToolCalled`, `CodingAgentToolResult` and `ContextCaptured` carry `parent_tool_use_id`, the id of that `Agent` call. The transcript nests these steps under the agent's row, folded, with one line beneath it: a running agent's latest step, or an ended agent's outcome mark and how it ended, "Done" on success (`SubAgentStepGroup`). The sub-agent's own prose is a `CodingAgentTextStreamed` carrying the same field, recorded but kept out of the session's reply. A capture binds to every step sharing its *API call id*, or, without one, to the last step of its own agent. Rows written before the field render flat (ADR 0371).
+
+### API call id
+The coding agent's own id for one model API call, carried as `api_call_id` on `CodingAgentToolCalled` and `ContextCaptured`. For Claude Code it is the response's `message.id`, which every frame of that message repeats. One API call can make several tool calls, a *parallel batch*. The id is how the transcript shows that call's context figure on every row of the batch. Position cannot do it: a sub-agent's capture arrives after the first call of its batch, the session's after the last. Codex reports usage per turn, so it carries none, and neither do rows written before the field.
+
+### Step row
+One row of the transcript's step list, and **one per action**: the model's thinking and the call that thinking produced share a row rather than taking two (`.inline-step`, rendered by `InlineStep` in `components/chat/chat-exchange-parts.tsx` from either projection in `store/thread-events/exchange-render.ts`). The row is born as an unnamed `Thinking` marker when the LLM call starts, shimmers while it has nothing to say, and **renames itself** to the tool the call produced (`nameThinkingRow`), keeping the context snapshot bound to it, the reasoning it streamed, and its pending outcome, since the tool it just named is now what is running. Only the first call of a thinking pass takes the row, whether it was still pending or already resolved by the pass's own prose (see below): naming it stops it matching `isThinking`, so parallel calls push rows of their own, which they must, because a result pairs back by `tool_use_id`. A pass that answers in text calls nothing, so its row stays a resolved `Thinking` marker in place, which is where that call's context counter lives.
+A *sub-agent step* never takes the row. The `Thinking` marker is the session's own, so a sub-agent's call always opens a row of its own.
+On a **coding-agent** turn the row is DERIVED rather than born from an event, because the backend emits nothing where the engine emits `ThoughtStreamed`. Both projections append one pending `Thinking` row at the end when the turn is live and nothing is pending (`needsLiveThinkingRow`), which is precisely the moment the model holds control. There was otherwise no live row at all in two windows, and the only thing saying work was happening was the "Working" label in the response header: between a `CodingAgentToolResult` and the next `CodingAgentToolCalled`, and, on a turn that RESUMES the subprocess (which emits no `CodingAgentPromptSent`), for the fifteen to twenty seconds between `SessionStarted` and the first tool call. `SessionStarted` is therefore enough on its own to derive the row, and it is the same event that flips that header. The next tool call consumes it by taking the index it occupied, so it renames on screen exactly like the native arm's. Derived at the end and not pushed from the tool-result and text arms, for one reason: the engine flushes coding-agent text at every renderable boundary (`should_flush`), so a multi-paragraph answer arrives as several visible `CodingAgentTextStreamed` events, and a row pushed between them would defeat `mergeAdjacentTextEvents` and split a code block across two markdown documents. It is also gated on the turn being the ACTIVE exchange and on the boundary not being a *switch teardown*, since neither is live however the thread projection reads.
+**Prose does not cost a pass its row either**, and this is the half that took two goes to get right. Visible text resolves the marker, since the model saying something is genuine output, so a narrated pass leaves the arriving call nothing PENDING to name. Until 2026-08-12 the call opened a second row there, which meant every pass that explains itself before it acts printed a `Thinking ✓` above the step it produced: the Lucidos Agent narrates on nearly every pass, so the fold was in practice off for chat threads, and it became visible on every turn once the turn controls started seeded on. `nameThinkingRow` therefore falls back to claiming the pass's own RESOLVED marker, which is the last step row whenever nothing else has taken one since; an `unfinished` marker is excluded, since that turn died and a later call is not that pass continuing. The interleaved projection also MOVES the claimed row to the end, because the prose was pushed after it and renaming in place would put `Running: cd …` above the sentence introducing that command. A blank chunk is a separate case with a separate reason: it never resolves the marker at all (`hasVisibleText`, `store/event-rendering.ts`), because a checkmark there would report a pass that finished nothing. Every `CodingAgentToolCalled` is preceded by a whitespace-only `CodingAgentTextStreamed`, and since the renderer drops a blank text event, the checkmark it used to produce sat directly above the tool row and made the fold look broken on the threads that produce the most steps.
+It carries more than one click target, so it is a `<div>` around `<button>`s: a button may not contain another interactive element. `.step-main` opens the *step detail*, and the context counter `.step-context` opens the *context viewer*. An `Agent` row with sub-agent steps adds its fold toggle on both sides of `.step-main`.
+
+The reasoning ticker is the tail of the streamed reasoning, shown in the detail slot. It stops at the rename, because a truncated fragment trailing `Running: cd …` is noise. Today only Codex threads give it content. Claude Code's headless stream exposes no reasoning (the `cc-reasoning-dormant` investigation in `docs/temporary-measures.md`). A chat `ThoughtStreamed` carries a context summary rather than reasoning. An *event wait* is an *event row*, not a step row: a step row's outcome icon claimed success on a sleeping subscription.
+
+Pressing `.step-main` prefetches whatever the snapshot stripped into the *step detail cache* (`store/stepDetailCache.ts`). The step detail then opens at its final height rather than growing when the fetch lands.
+See also: `docs/plans/2026-08-06-fold-thinking-into-the-step-row.md`.
+
+### Transcript marker
+A rendered row of an exchange that records **that a thing happened**, as opposed to **how a turn did its work**. The complement of *step mechanics*, and the two together partition every `ResponseEvent` kind: `isStepMechanics` (`store/event-rendering.ts`) answers `true` for exactly the `'step'` variant, and every other kind is a marker. Markers today: the section break, a generated image, a *command checkpoint* card with its Undo, an *event row*, the spoken-reply row, the empty-response note. Named *transcript* marker rather than bare "marker". The codebase already uses that word three other ways: the *navigation focus marker*, the unnamed `Thinking` row a *step row* is born as, and the `data-prose` attribute in `.claude/rules/frontend-css.md`.
+
+**One marker per direction of a call, not two.** What Lucidos said out loud is a marker, for the sharpest reason on the list: no audio is kept, so the row IS the reply. What the caller said is not one. Every caller utterance opens an exchange boundary and draws the ordinary user bubble, whether the *talker* fielded it or delegated it. So nothing about it is a response row.
+See `docs/plans/2026-08-31-a-call-reads-as-one-conversation.md`.
+
+The distinction exists because the transcript has **two** mechanisms that hide rows, and both must hide the same set: the steps control (`stepsExpanded`, on until turned off) and the full-response control's collapse (`getCollapsedVisibleEvents`, which drops everything before the last prose block). Both are *turn controls*. Hiding mechanics loses detail the user can re-open; hiding a marker loses the fact, and no marker is reachable anywhere else once it is gone. A marker therefore renders ungated and survives the collapse.
+
+The rule was written after the *event wait* row was classed as a step and so hit both mechanisms at once: the event was in the stream and its CSS class was in the bundle, and a parked thread still showed no evidence anywhere in the transcript that it had parked, because the clock indicator holds only the live half and drops a wait the moment it resolves. The checkpoint card had the same disappearing act in the collapse alone.
+See also: `docs/plans/2026-08-07-the-event-wait-shows-in-the-transcript.md`.
+
+### Transcript seam
+**Retired.** The single point a removed run of transcript rows collapsed to.
+The anchor correction landed a reader there when their own line was one of
+them.
+
+It existed because the correction held the reader's own topmost line, which a
+*turn control* could take away. The anchor is now the control the reader
+pressed, and a control survives its own press, so nothing has to be resolved
+after the mutation. `resolveSeam` and the scan it walked are gone with it, in
+ADR 0147.
+
+The name is kept as a retired entry rather than deleted. The word is still live
+elsewhere in this glossary for the *cache seam*, and several ADRs use it for a
+generic code boundary.
+
+### Speech-only turn
+A transcript card holding speech and nothing else, which draws **no turn header** on either half: no executor chip, no *turn controls*, no status badge, no timestamp. `isSpeechOnlyTurn` (`store/thread-events/exchange-render.ts`) is the decision, and it reaches both panels: the response panel takes `headerless`, and the initiator panel joins the chipless set beside a user message and a change turn.
+
+Two people talking is a turn nobody executed. A "Lucidos Agent" row between two speech bubbles therefore names an actor the reader knows, and dates a sentence they just heard. Every card of a call the *talker* fields alone is one: the caller's utterance in either spelling (a `SpokenMessageReceived`, or a `MessageReceived` with `voice_session_id`), the talker's greeting, and either side's *live utterance* / *live reply* row. Attribution is still on the page: the left-aligned spoken-reply row against the reader's own right-aligned bubble. Both marks name the ACT in their accessible names.
+
+**The card the *doer* is working under keeps its header**, which is `Exchange.tookTheTurn`: the talker delegated, work is running here, and the Working badge is what says so. The doer's first tool call takes the card out of this by the other half, `isCallOnly`. So a call that delegates reads as speech until it asks for something, and as an ordinary turn from there.
+
+**A status badge has only the header to sit on.** So a card still waiting on its reply draws no response panel at all, rather than an empty box under the bubble (`speechOnlyHasWords` in `ChatExchange.tsx`). It carries no fold either, in either panel or from the keyboard: the collapse control is in the row that went, so a fold would hide the body with nothing to unfold it.
+See also: *turn controls*, *live reply*, *transcript marker*, ADR 0148, ADR 0201.
+
+### Turn controls
+The three controls every response turn carries, a *speech-only turn* excepted: that one draws no response header, so it has nowhere to put them. They are icon buttons in the **response header**, immediately right of the executor label (`turnControls` in `components/chat/chat-exchange-parts.tsx`, `.turn-controls` in `styles/chat/input-messages.css`). The run's rules live beside the actor/executor chip rule both headers share, because every measurement in them is taken against that chip. They split by **scope**: the first two change every turn in the transcript, the third changes only the turn it sits on. The split is carried by the third one's label and by its moving glyph, not by the spacing, which is uniform across all three.
+
+The third of them, the collapse control, is the one the **initiator header** carries too, drawn by the same `collapseControl`. A turn's two headers are read as one control. A fold announced by an icon on the reply and by a bare cursor on the message above was two answers to one question. The initiator header renders it only where there is a body to fold. That panel's body comes from its event rather than streaming in, so a control it cannot light up now it will never light up. The response's run keeps a disabled one instead (below).
+
+**ONE slot: immediately right of the actor chip**, which is the response header's own slot. It never leads a bare row, because every chipless initiator turn carries no fold at all. A **user message**, a **change turn** and a **speech-only turn** are exempt, each dropped on report. One is the reader's own text, one a summary with a file list, one a sentence somebody said. In every case the control cost a row of chrome to fold a few short lines. A fold survives where the body can run long and is not yours, such as a forwarded agent message (`canCollapseInitiator` in `ChatExchange.tsx`).
+
+- The **full-response control** (a single chevron, `detailsExpanded`) keeps every prose block of a turn, leaving only the final answer when off. Which turns actually have such prose is `hidesEarlierProse`.
+- The **steps control** (a leader-dot log glyph, `stepsExpanded`) shows *step mechanics*, and hides nothing else when off (see *transcript marker*).
+- The **collapse control** (a circled minus, `collapsedExchanges`) folds this turn down to its header, and turns into a lit circled plus.
+
+**Both transcript-wide controls default ON**, so a reader who has never touched either sees the whole of every turn, work included, and turning one off is the deliberate act. They were off by default until 2026-08-11. Flipping the seed was not enough on its own: the persisting effect writes its signal on every load, clicked or not, so every browser that had opened the app already held `false` under `lucidos-steps-expanded` / `lucidos-details-expanded`, recording the old default rather than anyone's intent. The seeds read `-v2` keys instead and the old pair is cleared at load. What stops the same trap being re-set for the next reader is that storage now holds only the DEVIATION: `persistTurnControl` (`store.ts`, beside `seedTurnControl`) removes the key when a control is on and writes it only when one is off, so an absent key means ON and a stored value always says the reader turned something off.
+
+The first two are per-user global signals rather than per-turn state, so flipping one on any turn flips it on every turn. That is why all three **render on every turn that has a header** regardless of what that turn holds, collapsed included. The reader is setting how turns read, from wherever they happen to be looking. A turn with no steps of its own is still a turn where "show steps" means something. Hiding the group on a folded turn would take away the only thing that unfolds it. The one turn without a header, the *speech-only turn*, drops the run with it and cannot fold either.
+
+Two things mark the scope split for the reader: the collapse control's label, and how each states its state (below). The label names the turn, where the other two name what they reveal. A third mark, an extra 0.3125rem of gap ahead of the collapse control, was removed on 2026-08-10. Two different gaps inside a run of three icons is a claim the eye reads before it reads any tooltip. A 2+1 break lands as "two things and a stray" rather than as a scope split. The run's even spacing must stay clear of the executor label, which is why `.turn-controls` keeps a lead gap of double the intra-run one.
+
+**A fold needs a body to fold.** The collapse control is live only while that body is drawing something: `drawsResponseRow` (`store/event-rendering.ts`), which mirrors the response renderer arm for arm and takes the steps control's state.
+
+`events.length > 0` is a different question and answers yes too early. A whitespace-only text chunk is pushed for every `CodingAgentTextStreamed`. Step mechanics are hidden from a reader who turned the steps control off. Under that gate a blank turn could fold. It hid nothing, yet its control lit up as if it had. An in-flight coding-agent turn did that for as long as it had produced only mechanics.
+
+The sibling question, whether a turn is worth a response *panel* at all, is `hasRenderableResponseContent`, and it deliberately disagrees about a hidden step: a panel carrying the control that reveals its content is not a dead end.
+
+Turning either of the first two ON also lifts the fold on **the turn it was clicked from**, and only that one (`expandExchange`). A folded turn draws no body, so a reveal clicked there would land on every other turn in the transcript and do nothing where the click was made; the setting stays transcript-wide, and what the unfold clears is the local override hiding it here. One-way on purpose: turning a reveal off never folds anything, because a fold is the reader's own explicit act.
+
+Collapsing used to be a click anywhere on a turn header row, announced by nothing but a cursor. **Both rows are inert now**, the response's since 2026-08-10 and the initiator's since 2026-08-19. A row that swallows a click fires wherever the pointer misses a chip, and it announces itself only to a mouse. The control is the affordance on both halves of a turn, and the only mark of a fold: a fold draws nothing under the header. The keyboard path is unchanged: ⌘↑/⌘↓ marks a turn and Enter folds it, through `data-collapse-kind` rather than through either affordance.
+
+The first two were text links (`More`/`Less`, `Show steps`/`Hide steps`) at the top of the response *body* until 2026-08-10, each shown only where it had something to do. Four things changed with the move: the answer no longer starts a row down, the row no longer reflows on a click (both labels changed width as they toggled), the state is in `aria-pressed` rather than in a word, and the pair no longer appears and disappears from turn to turn.
+
+**How each states its state is the scope split again, and the two scopes answer it oppositely.** The transcript-wide pair keeps ONE glyph and brightens to `--text-primary` when on: not the accent chip the app bar's icons wear, which down a long transcript reads as a column of alerts, and not a swapped glyph. The full-response control did briefly flip between unfold and fold chevrons, reasoning that the label it replaced said which way the next click went; the two forms shared a box but not their ink, so the mark visibly changed size on every click while the body under it was also moving, and the whole row read as unstable.
+
+The **collapse control is the mirror image**: its glyph swaps (minus to fold, plus to unfold, agreeing with its tooltip) and it never takes the chip. On the pair the chip means "on, you are seeing MORE", and their off state looks like nothing at all. On this control the same cue would mean FOLDED, inverted 0.125rem from the two it contradicts. Folded, its plus is drawn in the accent instead, since a fold leaves nothing else on screen to say the turn has more. `aria-pressed` carries the state on all three for a screen reader; the CSS rule excludes this one by class.
+
+Its changing glyph is a **deliberate exception** to the paragraph above. The pair keeps a fixed glyph because the chip already answers "is it on". This control has no chip, so the glyph and its colour are the state cue. The circle is the same in both forms, so the mark never changes size. `components/chat/__tests__/turn-controls.test.tsx` pins the glyph and its direction semantics.
+
+### Source of truth
+PostgreSQL (the `events` table + projections) plus the filesystem (`data/artifacts/`, `data/apps/`, `data/knowhow/`, `data/triggers/`, `data/config/`, `data/auth-modules/`, `data/scripts/`, `data/themes/`). In-memory state is **cache or active runtime only**: the engine must be restartable at any time without losing user-visible state.
+See also: `CLAUDE.md` § "Engine Statelessness".
+
+### SystemEvent
+The workspace-wide event enum. Each variant is its own `SystemEvent::Variant` — grouping is provided by `aggregate()` ("trigger", "app", …), **not** by an `event_type: String` discriminator. `DomainEvent` is one variant among many; never use it as a generic wrapper. Every variant is past-tense (the events-only model — see user-facing *Event*); persistence is set per-variant via `SystemEvent::is_persisted()`.
+See also: `.claude/rules/rust.md` § "System events are individual variants".
+
+### TaggedAction
+Frontend-only enriched action object produced by *resolveThreadActions*: `{ kind: Action, category: 'close' | 'primary' | 'save', label, tooltip?, invoke }`. `category` drives button styling. It also lets the *close cascade* target only `close`-layer actions, so it can't fire an unrelated action by accident. `invoke` runs the action, opening a confirm where the action warrants one. The UI shell of the `Action` enum that *available_thread_actions* returns bare.
+
+### ThreadQueueExecutor
+The *Thread Queue* manager's execution seam (`crates/lucidos-engine/src/engine/thread_queue/executor.rs`): `prepare` (admission-time hook, awaited inline — the sub-thread kind emits its eager `MessageReceived` here so the parent's `active_children_count` increments before the spawning tool call returns) and `execute` (run the entry's work; the manager completes the capacity slot when it resolves, panics included). Production installs `EngineThreadQueueExecutor` from `LucidosEngine::set_self_arc`; tests install gated mocks so admission mechanics are testable without an LLM.
+
+### ThreadQueueRequest
+The serializable description of one background spawn, persisted verbatim in the `ThreadQueued` event payload and the `thread_queue.request` column so a restart can re-fire entries that never ran to completion. Variants: `EventTrigger`, `Cron`, `SubThread` (the `run_thread` tool), `CodingAgent` (the `run_claude` tool), `AgentChat` (agent/engine-mode `POST /chat/submit` starting a new thread — cross-workspace tasks, `lucidos spawn-thread`). Images travel as content-addressed blob hashes, never inline base64. `kind()` maps a request to its capacity bucket (`ThreadQueueKind`: `event-trigger` / `cron` / `sub-thread` / `coding-agent`).
+
+### thread_queue (projection table)
+The *Thread Queue*'s persisted **background** state: one row per live background entry, either `status = 'queued'` (waiting) or `'admitted'` (the persisted active-session record). Event-sourced in `event_bus_projection_system.rs` from `ThreadQueued` (upsert) / `ThreadQueueAdmitted` (status flip, and it COALESCEs `thread_id` onto the row) / `ThreadQueueDropped` + `ThreadQueueCompleted` (row delete). Rows are deleted on completion; the events table keeps the audit trail. Rebuilt into the manager's in-memory queue at boot by `recover_persisted_entries`, before the scheduler starts, so per-trigger FIFO holds across restarts. One rule decides each `admitted` row there (ADR 0133): a row whose bound thread still exists hands off to thread-level recovery, and a row that bound no thread is re-queued (`requeued: true`). *User slots* are NOT rows here, see *user slot (Thread Queue)*.
+
+### user slot (Thread Queue)
+A user-initiated occupant of the shared capacity pool (a chat response or user-typed *coding-agent thread*), acquired via `ThreadQueue::acquire_user_slot` and held by a `UserSlotGuard` (RAII — releases + drains on drop, even on panic). Prioritized but not exempt (ADR 0008): it counts toward `max_concurrent_total`, drains ahead of background, ignores per-kind/per-trigger caps, and the acquire call *awaits* a free slot at true pool-max. Lives **in-memory only** in the manager's `user_active` / `user_queued` (not the `thread_queue` table) — ephemeral runtime that a restart discards rather than re-firing. The chat handler's spawned task holds the guard across `process_message_with_steps`. Merged into the panel API as `kind: "user-chat"`; the transient `ThreadQueueChanged` event (fieldless, never persisted) refreshes the panel when only user-slot state moves. `reserved_background` (on the *capacity policy*) is the floor background reclaims ahead of user slots so priority can't starve triggers/cron.
+
+### Single-flight admission
+The rule that a thread runs **at most one turn at a time**. Enforced at one point: `engine::try_register_thread` asks whether a turn is live and installs this turn's `ThreadHandle` under one `active_threads` lock. Nothing else may put a handle in that map. A refusal is ordinary: the Lucidos Agent lane injects into the live turn instead, and `admit_with_stuck_turn_eviction` waits for callers that cannot coalesce. Distinct from *Thread Queue* admission, which is system-wide capacity across threads; this is per-thread and covers user chat too. `evict_and_register` is the only replacement path, generation-checked so two waiters timing out together cannot remove each other's turn.
+
+### TaskOutcome
+How a reaped child process ended, as a typed enum (`crates/lucidos-engine/src/core/shell.rs`): `Exited(i32)` | `Signaled(i32)` | `Unknown`. Replaces the loose `exit_code: Option<i32>` that used to be threaded through the background-task machinery, which conflated four distinct states — exited 0, exited non-zero, died on a signal, and "the engine never learned the status" — so two of them collapsed onto a number an LLM reads as a normal exit. `exit_code()` returns `Some` **only** for `Exited`; `signal()` only for `Signaled`; `describe()` renders the single phrase (`"exit code 101"` / `"killed by SIGKILL (signal 9)"` / `"exit code 141 (probable SIGPIPE)"` / `"exit code unknown"`) that the `bash_output` JSON, the `BackgroundBashCompleted` payload, and the background-task completion summary all share, so those three LLM-facing surfaces cannot disagree. Nothing coerces an unavailable status to `0` or `-1`. Only the *shell's own* death is `Signaled` — a signal that kills a stage inside its pipeline comes back as an `Exited(128 + signum)`, which `describe()` decodes with a `(probable SIGNAME)` hint (same range and wording as `runtime::claude_code::format_exit_status`, with which it shares one `signal_name` table). See also *pipefail shell*.
+
+### pipefail shell
+The interpreter engine-spawned shell commands run under (`core::shell::command_shell`): a resolved `bash` invoked with `-o pipefail`, falling back to `/bin/sh` with a logged warning where no bash exists. `pipefail` is load-bearing rather than cosmetic — a POSIX shell reports the exit status of the *last* stage of a pipeline, so `cargo clippy … | tee build.log` returned `tee`'s `0` and a build that exited `101` reached the agent as a clean success (the 2026-07-26 nightly hit this four times in one pipeline, and every step had to cross-check a sidecar `.ec` file to catch it). What `pipefail` guarantees precisely: the pipeline's status is that of the *rightmost failing* stage, and `0` only when every stage succeeded — so a failing stage can never be masked by a later succeeding one, though with several fallible stages the reported code doesn't identify which failed first. Applied at all three shell call sites: `run_bash`, the *background task* registry, and trigger/scheduled scripts. Accepted consequence: a producer SIGPIPE'd by an early-closing consumer (`yes | head -1`) now reports failure instead of `0` — as exit code `141`, since the shell exits normally carrying `128 + signum` when a *pipeline stage* (rather than the shell itself) is signalled, which *TaskOutcome* renders as `exit code 141 (probable SIGPIPE)` rather than a bare number.
+
+### Talker
+The rented speech-to-speech model that holds a *voice session*: it hears, it speaks, and it decides whether an utterance needs the *doer*. `SessionOpening` (`voice/provider.rs`) has no tool field, so nothing above the seam can hand it one. A talker that gets something wrong says a wrong sentence; only the doer beside it can send an email.
+
+**Two implementations answer that seam, and `model_voice_talker` picks which.** A `gpt-realtime-*` id opens `voice/realtime.rs`, and `gpt-live-1` opens `voice/live.rs`. Nothing above `voice/provider.rs` learns which answered, and a source scan in `voice::tests` keeps it that way.
+
+A **Realtime** talker is opened with **exactly three tools** and none of them acts (ADR 0170): `delegate` (see *delegation*), `answer`, and `hang_up`. `answer` settles what is waiting on the caller, by handing back a choice id the engine issued. `hang_up` ends the call and never the work.
+
+A **Live** talker holds **none** (ADR 0181). Its API declares no tools under client delegation, so `delegate` arrives as a delegation frame instead, and the other two have no expression. Two more things follow from that protocol: it reports no tokens, because it bills by the second, and it has no turn boundaries, which `voice/live.rs` synthesizes below the seam.
+
+**It settles a question card anyway, through the frame it does have** (ADR 0205). A delegation while the doer is parked on one is read as the caller's answer, and sends their transcript through the card's own free-text choice. So the engine matches nothing, and the caller reaches the same act typing reaches. A permission card takes a decision rather than words, so that one is a tap, and so is ringing off. `VoiceProvider::holds_the_answer_tool` is what `call.rs` asks, never a provider name.
+
+**Both synthesized boundaries read WORDS, never an output stream** (ADR 0185, ADR 0187). The caller's turn ends when the talker says something, and the talker's when it stops. Audio and blank deltas decide neither, because this provider sends both between turns.
+
+**A call opens with the floor shut, and nothing it says before the caller's first word is heard** (ADR 0211). Not played, not framed, not written down, and not offered to a running round. Decided per turn by that turn's first word, so one that began unheard stays unheard. The gate is `Audience` in `voice/call.rs`, above the seam, because a provider quiet at open is quiet by accident of its protocol.
+
+**Three things open that floor, and each buys one answer** (ADR 0213). The caller saying anything. The provider reporting they started speaking, which reaches the seam as `CallerStartedSpeaking` and is the one opener no transcriber can withhold: `whisper-1` streams no partials at all. And the engine asking for the turn through `Call::say`, which is how a card parked on a silent caller still reaches them. Each hands back a whole budget of `TURNS_ONE_OPENER_BUYS` heard turns, so a caller who keeps talking keeps buying answers.
+
+**An answer is several turns, and a call is not.** The budget exists because a Live turn ends at every hole in the talker's words, so one spoken answer spans several of them: spent per turn, the engine's own answer went audible for one sentence and then cut out. Held for the whole call instead, the caller's first hello licensed a forty-nine-second recitation of the thread's own history. A heard turn carrying words spends one, at the turn END and after its row. So the turn that spends the last one is still heard whole. Counted in turns rather than seconds because the recitation's longest silence was 2.3s and a real answer on the same thread paused for eighteen.
+
+What it can answer with no wait is whatever was loaded at session open, the *resident block*. It can look nothing up mid-sentence, so for anything else it delegates, stalls truthfully while the doer works, then says what it was handed MEANS. It may not state a fact it did not receive.
+
+That block is a snapshot and nothing corrects it, which is why the tool's description biases hard toward calling. Under-calling is the expensive mistake: it answers confidently from what was true when the call opened. Over-calling costs one turn nobody hears.
+
+**A second model runs inside a Realtime socket**, the transcriber, turning the caller's audio into text. It is the only other model in the voice loop: nothing translates, and nothing summarises, because the doer's answer reaches the talker as written and the language is a rule in its instructions. `model_voice_transcriber` names it, and `voice_talker_voice` names the voice the talker speaks in. Both are read in `voice::build`, which records why neither takes a `ContextPurpose`. A **Live** talker transcribes the caller itself and reads no such setting. So on a Live call the transcriber row does nothing, and the spoken voice still applies.
+
+Internally it is a *guest* participant (`AgentParticipant::Guest`). So `history.rs` prints its turns under their own speaker label, and the doer never reads one as its own. **The user never meets that split**: the talker speaks as Lucidos, in the first person, and the transcript renders a spoken turn as Lucidos. `SpokenReplyGenerated` is what it leaves behind.
+
+Its own words also reach a doer turn already running, as an `InjectedPromptKind::SpokenAside`. That round then learns what the caller was told in its name. Offered, not forced: an idle thread has no loop to inject into, and history carries the turn to the next round anyway. A reply the talker was HANDED is skipped, since the round wrote that answer itself.
+
+**An aside rides a round, and never starts one.** `can_carry_a_turn` is the single rule, and three windows read it. Mid tool-loop the aside joins a round that continues anyway, which is the case it exists for. On the final answer, and again after teardown, it is dropped: the answer it would inform is already written, so reopening would buy a whole extra round out of the talker's own stall (ADR 0164). Nothing is lost either way, because `SpokenReplyGenerated` is in the thread and the next round reads it from history.
+See also: *doer*, *delegation*, *voice session* (user-facing), *resident block*.
+
+### Doer
+The standard Lucidos Agent, in the setting where a *talker* shares its thread. Not a second agent and not a mode: the same agent, the same tools, the same admission, the same assembled prompt. The word names a role in the pair, nothing more.
+
+**It is the Lucidos Agent and never a coding agent** (ADR 0165). `doer_for` (`voice/doer.rs`) reads `thread_summaries.source` and answers which agent holds a thread, and `wake` refuses anything but the Lucidos Agent. `api::voice::admit` asks the same question at the socket, and the *call toggle* is absent whenever the resolved destination is a coding agent. A refusal is not silent. `wake` reports that it did not take the utterance, so `call.rs` writes the caller's words down as a `SpokenMessageReceived`. The talker then says that nothing started.
+
+**Named for what it can DO.** It holds every tool and the talker holds one, so the split the pair turns on is capability rather than thinking (ADR 0149). That is the whole reason the talker delegates: not to borrow better thinking, but to reach what it cannot reach.
+
+**It is never told a session is live** (ADR 0149). It is *shown* one, by reading the talker's turns in the thread. Telling it would make one question get two answers by input channel, which the user cannot see coming. `voice::purity_tests` is a source scan over the prompt-assembly path, so a file that names nothing voice-shaped cannot say a call is up.
+
+A *delegated* utterance wakes it through the `TurnStarter` seam (`voice/doer.rs`), which runs `process_message_with_steps` exactly as a typed message does. Nothing is recorded there: the caller's words already have their `SpokenMessageReceived` row, and the turn anchors on the talker's `WorkDelegated` (ADR 0201). An utterance the talker answers alone never reaches it as a turn, only as that same row in the history it reads next time.
+
+Its answer reaches the caller's ear because `call.rs` appends it to the talker's session and asks the talker to SAY it. Never to read it: the doer writes for a reader, and `answer_to_say` is where that framing lives. Past 400 characters it asks for the headline plus an offer of the detail, and it carries the text in full either way.
+See also: *talker*, *delegation*, *single-flight admission*.
+
+### Delegation
+The talker handing an utterance to the *doer*. The tool is `delegate` (`voice/mod.rs`), taking one required argument: a short reason. It is one of the talker's three. Like the other two it mutates nothing, so ADR 0149's guarantee survives two reversals of its tool count: a talker that gets something wrong still only says a wrong sentence.
+
+**It starts no turn while the thread's doer is parked** on a question card or a permission card. The doer is blocked inside the card that is waiting, so there is no turn to start. The utterance is still written down. Settling the card is what frees the thread, and `Call::settle_or_refuse` decides what the ask means instead.
+
+For a talker holding `answer`, that is a refusal stating the fact: put the card back, and settle it with the tool. For one holding no such tool, an ask against a **question** card settles it with the caller's own words (ADR 0205). An ask against a **permission** card is refused with a note naming the screen. Each note fits the talker reading it. The old single note asked a Live talker for a tool it had never been given, and it duly promised the same thing four times.
+
+**An ask, never a wake.** The talker cannot see whether a doer turn is running, and is never told. It delegates every request needing the doer, including one made mid-turn, and *single-flight admission* decides whether that starts a turn or joins one. So an utterance during a running round still reaches that round.
+
+Every caller utterance lands as one `SpokenMessageReceived`, whichever of the three it was, and that row starts nothing. A delegation that GOES THROUGH adds a second row beside it: a `WorkDelegated` naming the talker and its reason, and THAT is what starts the turn (ADR 0201). A refused one adds nothing, since no turn started.
+
+**The reason is empty where the talker composed none** (ADR 0200), which is every ask on a protocol whose delegation frame carries no words. `build.rs` draws no row for a blank one, so the transcript shows the caller's own utterance alone. Filled from their transcript instead, it read back as `[Asked for you] <their sentence>` under the talker's speaker label, and the doer met the same words twice.
+
+`call.rs` writes a finished utterance down at once and keeps a COPY for the doer to run on. The transcript and the tool call come from different models on one socket, so either can land first. The ask outlives the talker turn that made it, since a transcript still in flight belongs to it. Nothing is ever owed a row, so an ask that never pairs loses no words.
+
+**A held ask is bounded, so there is a fourth outcome** (ADR 0198). Past `CALLER_WAITED_LONG_ENOUGH` with no words to pair with, the ask is dropped and the talker is told to say so out loud. Without it a caller heard "on it" and then silence until they hung up. A Live delegation frame carries no text at all, so a transcript that never comes leaves the ask with nothing. `Call::hold_the_ask` and `Call::take_the_ask` are the only writer and taker, so the ask and its clock cannot disagree.
+
+**The tool is the REALTIME expression of this.** A Live talker declares none, and reads a *delegation policy* in its instructions instead. So the paragraph above about the description biasing toward calling is that provider's half.
+See also: *talker*, *doer*, *delegation policy*, *voice session* (user-facing).
+
+### ThreadEvent
+The per-thread event enum (`crates/lucidos-engine/src/engine/thread_events.rs`). Every variant is past-tense (the events-only model — see user-facing *Event*); the `is_persisted()` method routes between *persisted event* and *transient event* on emit. Variant added/removed/renamed, payload changed, persistence flipped, or alias added → MUST update `system-knowhow/thread-events.md` in the same change (and `coding-agent-events.md` if the change touches `CodingAgent*` / `UserQuestion*` / `CodingAgentPermission*`).
+
+### Thread-bound origin token
+The credential every Lucidos-spawned subprocess carries so its HTTP callbacks are attributed to the thread it was spawned for. Minted per spawn by `api::actor::mint_agent_origin_token`, shaped `"<thread-id>@<depth>@<trigger-id>.<mac>"`, where the MAC is HMAC-SHA256 over the whole prefix under a per-engine-startup secret. A `-` stands in for an absent field, and is signed like any other, so a scheduled script with no thread is `"-@<depth>@<trigger-id>.<mac>"`. Injected as `LUCIDOS_AGENT_ORIGIN_TOKEN` and forwarded as the `x-lucidos-agent-origin-token` header. Every client treats the value as **opaque** and copies it verbatim: the `lucidos` CLI, the Python `.pth` shim, a coding-agent session.
+
+The word that matters is *bound*: because the token's own prefix names the thread, `MessageOrigin::Api.source_thread_id` is **authenticated**, not claimed. Until 2026-08-05 the engine minted ONE token per startup, gave the same value to every subprocess, and read the thread id off a separate unverified `x-lucidos-source-thread-id` header, so any subprocess could name any thread and every gate reading `source_thread_id` (`subprocess_chat_legitimate`, `coding_agent_diff_refresh`, `resolve_attend_mode`) was an accounting boundary rather than an authorization one. That header is gone. A token that fails verification, including a valid one re-pointed at another thread, is `SubprocessOrigin::NotSubprocess`: the failure is a downgrade in attribution, never an upgrade in reach. It is what makes the *child follow-up* route safe to expose over HTTP at all.
+
+Two more prefix fields ride under the same MAC: the *trigger chain depth*, and the *emitting trigger id* naming the fire a trigger's own script belongs to. All three fields are authenticated the same way. None can be forged, swapped or stripped without breaking the MAC, which is why neither claim is a plain header. A forgeable trigger id would let any caller mute a trigger by claiming to be it. A forgeable depth would let any caller declare 0 and escape the recursion cap.
+
+The two travel in opposite directions on purpose. The depth reaches spawned work, and the trigger stops at the handoff. `subprocess_origin_env_vars` is where a coding-agent spawn passes the depth and states `None` for the trigger.
+
+### Standing apply
+Engine state recording the *workspace owner*'s instruction to apply a *change* once its thread settles (ADR 0168 clause 5). One row per armed thread in `standing_applies`, bound to a `change_id` when the caller named one. `engine::standing_apply` owns it: `standing_verdict` is the pure decision, and a bus subscriber re-takes it on every thread event for an armed thread.
+
+A *settling thread* waits: `running`, `paused`, or watching an event. Each promises a settle, so the arm always ends. Every other state resolves it: settled fires the apply with a `StandingApplyFired`, a question card or a failed turn drops it with a `StandingApplyDropped` report.
+
+A coding-agent turn also waits between its `ResponseGenerated` and its `CodingAgentIdled`, while the run loop commits and proposes. `TurnSettle` carries that fact into every resolve, so the arm-time, lag and boot paths wait too. No session is live after a restart, so a turn cut off mid-settle drops with `TURN_CUT_OFF` instead of firing.
+
+The resolver skips `EventWaitDelivered` and `EventWaitExpired` (`thread_to_resolve`). Each clears the wait while the thread still reads `idle`, one event before the wake's anchor moves it to `running`. A verdict taken in that gap would apply work the wake is about to extend (ADR 0266). A bound arm asks about its own change, which is what keeps it off a second change the thread proposes later.
+
+The *sweep* is the same record at batch scope: `POST /api/v1/changes/apply-all?keep_going=true` arms every thread the sweep-candidate query returns, stamping each row with one `batch_id` so the Apply All Cancel button takes them all back.
+
+Taking one back has three scopes, and `DisarmScope` names the two bulk ones. `DELETE /api/v1/standing-applies/:thread_id` drops one thread's. `DELETE /api/v1/standing-applies` drops every arm here, for the prompt and the CLI. The Changes panel's Not finished toggle drops only its own arms, one `DELETE /api/v1/standing-applies/:thread_id` each. Apply All Cancel keeps `DisarmScope::Sweep`, so an arm the owner set on one change survives it. A disarm stops future settles only: `fire_standing_apply` consumes the row BEFORE it applies, so a change already in flight carries no arm to cancel.
+
+### Thread reach
+How far a verb may be aimed: the caller itself, plus every descendant, at any depth. The caller comes from the *thread-bound origin token*, so it is authenticated rather than claimed, and the ancestor chain is read from `thread_summaries`. A sibling, an ancestor and an unknown thread all refuse identically: out of reach, and nothing about whose it is. A caller with no token keeps its reach, which is the user's device and the local API surface (*unattributed caller*).
+
+**Reach answers which threads, and the *workspace owner* answers on whose behalf.** They are two questions, and reach never decides the second (ADR 0168 clause 2). A verb inside the caller's own subtree needs only reach. Anything wider is the owner's button. So `api::thread_reach` asks reach first, the *standing instruction* second and an *owner approval* third, and refuses when none covers the act.
+
+Wider than the *child follow-up* edge, which stops at direct children, and deliberately so: archive cascades to the whole family, so its authorization reasons over the same tree it tears down. The unscoped `POST /api/v1/chat/cancel` (no `thread_id`) stops everything, so it aims at the workspace rather than at a thread. A thread-bound caller needs the standing instruction for it, rather than being narrowed to itself.
+
+Enforced on all fourteen routes carrying seven of clause 4's eight verbs, per verb rather than per route: Apply, Discard, answering a question card, restarting a turn (Continue), creating a top-thread, archiving and cancelling. Three of them arrive by more than one path, and gating the first path of each is how the ungated set grew. Three LLM tools press Apply in-process (`apply_change`, `apply_when_settled`, `apply_as_they_settle`). They carry no headers, so they name their own thread and ask the same rule through `refuse_thread_without_authority`. The eighth verb, resolving a permission card, is still ungated and recorded as such in the plan. See ADR 0083's amendment for the archive and cancel half, and ADR 0168 for the rest.
+
+Three more verbs aim at a thread's agent rather than at the tree's shape: controlling a live coding-agent session (`POST /api/v1/claude-code/control`), asking a *side question* (`POST /api/v1/side-questions`), which reads the thread's whole context, and dismissing that question's card (`POST /api/v1/side-questions/dismiss`).
+
+**Deleting a thread is deliberately NOT one of these verbs.** It has no place on the ladder and no `ThreadReachVerb`, because the ladder's second question admits a thread carrying the *standing instruction*. It takes the *owner-device gate* instead, which refuses every agent outright (ADR 0192).
+
+### Owner-device gate
+`api::actor::require_owner_device`, the check in front of an action no agent may take on any authority. It resolves the caller with `require_user_actor` and then insists the answer is `MessageOrigin::Device`. It refuses four real credentials: a verified *thread-bound origin token*, the machine-local token, another workspace, and a device id naming no row. The 403 is written for the agent that will read it.
+
+**Strictly stronger than *thread reach* plus the *standing instruction*, and that is the point.** The ladder lets a thread act outside its own subtree while it carries the instruction. Any thread whose newest turn-start event has a `Device` actor carries one, so an agent inside a turn the user opened would inherit the act. Deleting a thread cannot be undone, so it takes the narrower question instead (ADR 0192).
+
+One user today, `POST /api/v1/threads/delete` and its preflight. A second one is a decision, not a convenience: every other clause-4 verb is recoverable, which is what makes the ladder right for them.
+
+### Standing instruction
+The engine mechanism behind the term `system-knowhow/glossary.md` defines for the workspace LLM. Two shapes qualify and no third (ADR 0168 clause 5), and `api::standing_instruction::carries_standing_instruction` is the single definition every clause-4 verb asks.
+
+**A turn the owner opened**: the thread's newest turn-start event carries a `Device` actor, and their words in that turn are the press. The turn-start set is shared with the recovery gates (`agent_recovery::THREAD_START_EVENTS_SQL`), so "the owner opened this turn" cannot mean two things. The read skips a `ContinuationStarted` or `OrphanRecoveryStarted` the owner did not click. So an engine resume carries the turn it resumes and never promotes one (ADR 0282).
+
+**A *trigger* firing the owner authorized**: the same decision, made in advance. A fire reaches the engine two ways, so the shape has two records. An *intent* trigger runs on a thread whose turn starts with `TriggerStarted`. A *script* trigger has no thread, and its subprocess carries the fire's id on its own token. Both inputs are prefix fields under the token's MAC, so neither is a claim a caller can edit.
+
+**Authorized means the owner wrote it or switched it on.** Read as the newest of the trigger's `TriggerCreated` / `TriggerUpdated` / `TriggerEnabled` carrying a `Device` actor. Newest, because an agent creates triggers freely: without the check, any thread promotes itself to the owner's authority by creating a trigger and firing it. A trigger nobody can show the owner authored keeps clause 3 and loses clause 5.
+
+Nothing is inherited: a thread spawned by one carrying the instruction opens its own turn with a `ThreadLink` actor and carries none. The engine checks the instruction and never its scope, which ADR 0168 records as the cost of not asking a confirmation card per act. A thread carrying none may ask for one act with an *owner approval*.
+
+### Owner approval
+The engine mechanism behind the term `system-knowhow/glossary.md` defines (ADR 0387). The card is a `UserQuestionAsked` carrying `owner_approval: OwnerApproval { verb, target_thread_id }`, and the engine wrote its question and both option labels. So the agent words nothing the owner taps.
+
+**A question card lives inside the turn that asks it**, so the card rides the agent's own blocking question tool. `POST /api/v1/owner-approvals` (`lucidos ask-owner-approval`) records an `OwnerApprovalRequested` and returns its `request_id`. The agent then asks `AskUserQuestion` with that id as its only question. `api::owner_approval::approval_ask`, in the internal ask route, swaps in the engine's card. The answer returns through the hook like any card's.
+
+**It is the third thing `api::thread_reach::weigh_authority` asks**, after reach and the *standing instruction*, and narrower than both. `api::owner_approval` finds the newest approval on the caller's thread for that verb and target that is still live. Live means three things:
+
+- **Allowed by a device.** The answer picked the option labelled Allow once, with a `Device` actor. The answer route refuses any other caller for this card, through `require_owner_device`.
+- **Unspent.** No `OwnerApprovalSpent` names its `tool_use_id`. A partial unique index refuses a second spend, so single use holds under concurrent calls.
+- **Current.** The card is newer than the thread's current turn start, read through `standing_instruction::opens_current_turn_sql`, the same fragment as `newest_turn_start`. So an engine resume keeps it, an event-wait wake keeps it, and any other turn start ends it.
+
+The thread is the one the *thread-bound origin token*'s MAC proves, on the request, the card and the spend, so no thread spends another's. `AnswerQuestion` and `ResolvePermission` cannot be proposed (`ThreadReachVerb::proposable`), and only creating a top-thread may omit a target (`ThreadReachVerb::aims_at_root`).
+
+### Workspace owner
+The person a *thread*'s authority traces back to. Named because *thread reach* answers only which threads a caller may aim at, never on whose behalf it acts. ADR 0168 splits the two: a thread acts inside its own subtree on its own authority, and anything wider is the owner's. A wider verb therefore needs evidence of the person rather than a place in the tree.
+
+Two things count as that evidence, and they are one decision made at different times. A turn the owner opened, carrying *device attribution*. A *trigger* firing the owner authorized, which is that decision made in advance. The *workspace* is the container the threads sit in and never the authority, since it opens no turn and presses nothing. A cross-workspace spawn traces to the calling workspace's owner, which is what `caller_workspace` vouches for.
+
+### Unattributed caller
+An HTTP request to `/api/v1` carrying none of the engine's three kinds of identity evidence: no *thread-bound origin token*, no *device attribution*, and no `caller_workspace`. On a loopback bind the `/api/v1` surface authenticates nobody. `api::mod::create_router` adds a body limit, compression, cache-control and a logger, and nothing else. So reach is trusted and identity is not: an unattributed caller may talk to the engine, but it may not say who it is. Concretely it **may not claim `mode: "human"`** on either chat entry point, which is a 403 (`api::chat::human_mode_is_attributed`).
+
+Named because the failure it prevents is a claim rather than an action: the 2026-08-06 incident was an agent's `curl` recorded as a turn the user typed, which the projection then counted as a user action (`thread_summaries.initiator = 'user'`, `last_user_action`). Note the inversion it closed: `subprocess_chat_legitimate` already refused `mode: Human`, but only for a caller presenting a token, so **dropping the credential used to buy more privilege than presenting it**. ADR 0050 scoped that fix to the chat path, and `user_actor` kept an `Api { mode: Human }` fallback for apply / discard / settings.
+
+**ADR 0169 ended the carve-out.** The fallback is gone: `build_message_origin` answers `None` for a caller with no credential, so no route stamps one as the user. Four credentials cover everybody, and all four already existed. The *thread-bound origin token*, the machine-local token, *device attribution*, and a `caller_workspace` body field.
+
+`api::actor::require_user_actor` is the single refusal, a 401 naming all four. A mutating handler asks it before it writes, rather than at its emit. The machine-local token (`~/.lucidos/local-token`) names the engine's own machinery and never a person. So it cannot be the evidence ADR 0168 clause 4 wants.
+
+**The gate probes device registration; attribution does not.** `user_actor` stamps any non-empty `device_id` as a *Device* actor, which a display names from the id. A gate cannot inherit that, or one typed header would be the evidence clause 4 reads. So `require_user_actor` runs `DeviceStore::is_registered` and suppresses an id that names no row, letting the caller fall through to its other credentials. This raises the bar to *registering a device*, which the *device attribution* entry already declines to call a security boundary.
+
+### Device attribution
+Evidence that a request came from a client the user has registered on this workspace: a `device_id` (the request body's field, else the `x-lucidos-device-id` header) that resolves to a row in `devices`. The browser supplies it on every mutating fetch, which is what distinguishes the user's own UI session from an arbitrary loopback HTTP caller. Probed by `DeviceStore::is_registered`, which returns `Result<bool, _>` rather than the `Option` that `display_name` collapses "absent" and "database error" into, because the caller must be able to fail OPEN on an error: this runs on the user's own send path, and refusing a real message on a database blip costs more than a mis-attributed one. Not a security boundary and not claimed as one (an agent that will curl the engine can also register a device); it removes the *accidental* path, which is the one the incident took. See ADR 0050.
+
+**Where that header came from decides what it is worth.** Through the *workspace gateway* it is the gateway's own. `auth_api::enforce` strips the client's copy and re-injects the device it authenticated, the same treatment `x-forwarded-prefix` gets. Straight to the engine's loopback port it is whatever the caller typed. That second case is the posture above, and the reason nothing reads it as authorization. See ADR 0094's amendment.
+
+### Device hand-over
+Moving one *device*'s whole row to a new id, in the one page load where a client knows both. `DeviceStore::hand_over` re-keys five tables in a single transaction (`devices`, `preferences`, `push_subscriptions`, `pinned_apps`, `device_presence`), behind `POST /api/v1/devices/hand-over`, and announces `DeviceHandedOver`. `push_log` is excluded as history, like an event payload.
+
+Exists because a browser stopped minting its own id and took the *workspace gateway*'s instead: without this it would arrive as a brand-new device and lose its push subscription and every device-scoped *preference*. Three outcomes, all 200: `moved`, `already-done` (the target already has a row) and `no-such-device`. Only a failed transaction is an error, and it answers 500 rather than a 200 carrying `success: false`. The client discards its memory of the old id once the call returns, and the frontend's `json()` rejects only on a non-2xx status.
+
+Order is forced by `push_subscriptions.device_id REFERENCES devices(id)`, which has no `ON UPDATE CASCADE`: copy the row forward, repoint the children, drop the old row last. `pinned_apps` and `device_presence` move through their owning stores rather than raw SQL here, per *announced surfaces*. See ADR 0094's amendment and `docs/plans/2026-08-22-one-device-identity-minted-at-the-gateway.md`.
+
+### Target workspace assertion
+The `x-lucidos-target-workspace` header: which workspace the caller believes it is talking to. Checked against the answering engine's own name by middleware over the whole `/api/v1` router (`api::target_workspace`); a mismatch is 409 with a body naming the workspace this engine actually serves. Easy to confuse with `caller_workspace`, and the pair is exactly opposite: `caller_workspace` is a body field saying who is CALLING (a display hint, never authorization), this is a header saying who is being CALLED. **Optional, and its absence changes nothing.** The browser is same-origin and has no workspace name to send, so a mandatory assertion would break every existing client to catch a mistake only scripted callers make. The `lucidos` CLI sends it on every request (from `$LUCIDOS_WORKSPACE`, or the resolved target for `spawn-thread --to`) and `engine::http::workspace_client` sends it on every cross-workspace POST. It exists because several engines run on one machine, one per workspace, each on its own port, and before it a wrong port was served in full by whichever engine held it. See ADR 0050.
+
+### Interrupt-and-redirect
+The one mechanism behind an *urgent follow-up*, expressed once and armed three ways. A *child follow-up* that should preempt the child's live turn interrupts it, waits for the turn to reach a boundary, and only then emits the follow-up's `MessageReceived` so the interrupted turn's terminal sequences first (coding-agent exchanges group by sequence order). The follow-up then runs as the NEXT turn, with full context, because messages are rebuilt from events.
+
+The decision is one pure predicate, `should_redirect_followup(coding_agent, is_in_flight, is_user_message, urgent)` in `engine/chat/process_helpers.rs`, and the asymmetry in `urgent` is structural rather than policy: **Codex** redirects whether or not the caller asked, because its app-server / exec protocols accept input only at a turn boundary, so queueing there is invisible rather than gentle; **Claude Code** redirects only when `urgent`, because it accepts a mid-turn follow-up on stdin and steers at its next turn boundary, which is the right default until a blocking tool call pushes that boundary out by its own timeout. The two coding-agent lanes share `arm_followup_redirect` (fires `AgentSession::interrupt`, flags `redirect_followup`, reserves the subprocess via `redirect_followup_pending` so the interrupted turn's idle keeps it alive across the window in which the message is not yet in `msg_rx`, returns `idle_notify` for the boundary wait, bounded by `REDIRECT_INTERRUPT_MAX_WAIT`). The **Lucidos Agent** lane uses `cancel_thread_for_followup` on the `ThreadHandle` token instead (dropping the in-flight tool future, which SIGKILLs its OS child via `kill_on_drop`), with `redirect_followup` as an `AtomicBool` beside `cancel_actor` and `cancel_cause_for_turn` draining it at the cancel arms; there the boundary wait is `register_thread_queued`'s existing one.
+
+Every lane lands on `CancelCause::SupersededByFollowup` rather than `UserStop`, and that is load-bearing in two places: the frontend renders it neutrally, and `notify_parent_if_child` excludes it from the terminal set, so the parent is not re-entered with a false "child canceled" card for a child that carries straight on (the cause-agnostic `reconcile_parent_active_children_count` still runs, so no counter drifts). Named `arm_codex_redirect` / `should_redirect_codex_followup` until 2026-08-06. See `docs/plans/2026-08-06-urgent-child-follow-up-preempts-in-flight-work.md`.
+
+### Round
+One LLM API call plus the execution of every tool call that response carried. A **turn** is one or more rounds: the turn runs from the user's message to the terminator, and `run_agentic_loop` (`engine/agentic_loop/run.rs`) spends it a round at a time.
+
+**A round is not a tool call, and that is load-bearing in both directions.** One response can carry several `tool_use` blocks, which execute together in that round, so the user's cap counts the CALLS and not the rounds ("Count the CALL, not the round. One response can carry several", `run.rs`), and the provider requires each of them to get a matching `tool_result` before the next request, so a round's calls can never be abandoned half-executed. In the other direction several paths `continue` the loop without executing any call, so a round is not guaranteed to advance that count either; `NON_TOOL_ROUND_SLACK` is the separate unconditional backstop over those, and it is what makes "a turn always ends" a property of the loop rather than a property of every path staying bounded forever.
+
+Named *round* rather than the three words that suggest themselves, each of which is taken or wrong. A *step row* is the transcript's rendering of one action, finer than a round in the parallel case (each concurrent call pushes its own row) and coarser in the thinking case (a round that answers in text leaves one resolved `Thinking` marker). An *exchange* is the whole user-message-to-terminator unit as the frontend groups it, which is a turn. "Iteration" says only that a loop went round again, and names neither the API call nor the tool execution that make the unit what it is.
+
+### Parallel-safe tool
+A tool in `PARALLEL_SAFE_TOOLS` (`engine/agentic_loop/helpers.rs`): a pure read the agent loop may run beside its neighbours. A **parallel run** is a block of consecutive parallel-safe calls in one response, run up to `MAX_PARALLEL_TOOL_CALLS` at once. A grouped tool counts when its `action` resolves to a listed name.
+
+**Each call in a run reports live.** It emits `ToolCalled` when it starts and `ToolResult` the moment it finishes, so results land in completion order. Every reader therefore pairs a result with its call by `tool_called_event_id`, never by position (ADR 0246). The model still receives the run's results in call order.
+
+### Turn anchor
+The event that started a *turn*, resolved as `origin_id` in `chat::process::run` and published on the thread handle. Every event the turn emits stamps it as `request_event_id`, which is how the frontend knows WHICH TURN a row belongs to. A call's turn anchors on the talker's `WorkDelegated` rather than on a `MessageReceived`, because the caller's words start nothing (ADR 0201).
+
+**It says nothing about where a row READS.** The transcript orders every row by `created` and by nothing else, so a turn the caller talks across is drawn in several cards. The anchor is not a clock in its own right either: `ChatResumeAnchor::ExistingTurn` deliberately re-uses the interrupted turn's anchor on an answer-driven resume, so it can be a day older than the turn carrying it. The clock a turn keeps for itself is the *turn start instant* below.
+
+### Turn start instant
+When a chat turn began, as the database recorded it: `MAX(created)` over the thread's events, read once at turn setup by `LucidosEngine::turn_started_at`. `engine::chat::process::turn_clock` derives the `[CURRENT TIME]` block and the history image ages from it, never from `Utc::now()`. Persisted state, so it is fixed for every round of the turn, which is what keeps the message prefix cacheable (ADR 0084). `MAX(created)` rather than the newest row by `sequence`, since `replay_historical_event` can backdate a row at a high sequence.
+
+### Cached system tier
+The `system` block as the provider's prompt cache sees it: one `cache_control` breakpoint covering the whole thing. The key is prefix bytes scoped to the API key, never a conversation. So every thread in the workspace whose leading bytes match shares one entry. One byte varying per turn or per thread therefore costs the whole tier a rewrite at 1.25x instead of a read at 0.1x. ADR 0084 is the rule that keeps it byte-stable; `llm/cache_probe.rs` reports it as `system_hash` / `system_bytes`.
+
+### Turn tail
+The blocks appended after the request line of the user message, carrying every per-turn reading the *cached system tier* may not hold: `[ENGINE BUILD]`, `[CLIENT URL]` and `[CURRENT TIME]`. Each is half of an ADR 0084 split, the other half being invariant prose in the system block that points at it by name. Owned by `chat::process::turn_tail` (the first two) and `chat::process::turn_clock` (the clock), and carried to the capture viewer as one `TurnTail` struct. Every block is read ONCE at turn setup, never per round, so the message prefix stays cacheable. Rebuilding one from a moved reading would relocate the miss from the system tier to the message tier rather than remove it.
+
+### Tool capability gate
+The condition under which a tool family is offered at all (`llm::tools::Gate`, ADR 0088). Five today: `Ungated`, `EmailAccount`, `Intent`, `ImageProvider` and `JudgmentProvider`. Every row of the two registry tables (`FAMILIES`, `CHAT_TAIL`) names one. That is how "a new family states its gate, or states that it has none" is structural rather than a review convention.
+
+A gate answers WHETHER a family is offered. What SHAPE its schemas take is the row's second half, `llm::tools::Build`. `Fixed` means the same bytes in every workspace, which is almost every row. `Shaped` means a schema that is itself a function of workspace configuration, and one row is that today: `todo_write`, which is withdrawn whole where *self-curated context mode* is on, because the checklist moved into the *working understanding*. The split keeps two questions apart, and keeps both out of an `if` at the splice site.
+
+A gate reads only `ToolCapabilities`, a snapshot of workspace configuration. It is resolved once per turn by `LucidosEngine::read_turn_capabilities`, so it can never be a function of the thread, the thread kind or the caller. That read also carries the intent snapshot the `Intent` gate came from, so the prompt's "Available Intents" listing and `execute_intent` cannot disagree. That is load-bearing: the tools array is Anthropic's FIRST cache segment, so two threads in one workspace must present identical bytes to share it. An unreadable gate resolves OPEN, since closing one withdraws a real capability and rewrites the whole tier. `configure_email` is deliberately ungated beside the four gated mailbox schemas: it is the only writer of the first `email_accounts` row, so gating it would make email setup unreachable.
+
+The intent sub-loop is the one caller that overrides a field of that snapshot, forcing `context_mode` off. The mode is an agreement between a chat turn's prompt and its tail blocks, and that loop assembles neither.
+
+### Planted probe
+A fact established deliberately in an earlier eval thread, required by a later task whose prompt never restates it. It scores whether the agent still has the fact, by any route, and it must have a tempting wrong default: a probe an agent fails loudly measures loudness rather than retention. A probe resolves to one of seven values, of which `lost-silent` is the failure ADR 0085's flag risks.
+
+### Turn gap
+The window between a coding-agent turn's *previous* boundary event and the current turn's triggering event, exclusive at both ends. It is the span in which the user and the engine act on an idle agent's work, and it is invisible to that agent when it resumes: `--resume` replays the agent's own conversation, not the events around it. The boundary set is every event type that can originate a coding-agent turn (`CC_ORIGINATING_EVENT_TYPES` in `agent_session/resume.rs`: `MessageReceived`, `CodingAgentUserMessageSent`, `TriggerStarted`, `ChildThreadCompleted`) plus `CodingAgentPromptSent`, an engine-synthesized prompt that is a real boundary even though it is an audit marker rather than an origin id. Deriving from that shared constant is load-bearing: a hand-listed boundary set silently omitted `TriggerStarted` and `ChildThreadCompleted`, so a turn re-entered by a finished child did not advance the threshold and the *turn-gap note* fired twice for the same event.
+
+### Turn-gap note
+The *resume-time note* built from the persisted events in the *turn gap* (`agent_session/turn_gap.rs`, `compute_turn_gap_note`). It covers the events a resumed coding agent cannot otherwise see, and whose absence made it describe a discarded change as awaiting Apply: `ChangeApplied`, `ChangeDiscarded`, `ChangeReverted`, `ChangeApplyFailed`, `WorktreeCleaned`, `BackgroundBashCompleted` and `ChildThreadStopped`.
+
+`ChildThreadStopped` is there because it wakes nothing. A coding-agent parent hears about a *stopped child* only through this note (ADR 0252).
+
+`BackgroundBashCompleted` is covered minus the completions an event wait delivered: the query drops one an `EventWaitDelivered` names, since that delivery is the prompt the re-opened turn carries. What reaches the note is the undelivered one, such as a task whose wait a cap refused.
+
+A restart that cut off the last turn is covered too. The note carries a restart line when the gap's newest coding-agent `Response*` terminal is a `ResponseAborted` with cause `EngineShutdown` or `RecoveryAfterRestart`. Claude Code closes a tool call stopped at teardown as "The user doesn't want to proceed", and the line says the user refused nothing. A later terminal in the gap means a resume already ran past the restart, so the line stays out.
+
+Two kinds are excluded, with the reasons recorded in the module. Ones another mechanism already delivers: `ChildThreadCompleted`, `UserQuestionAnswered` and `CodingAgentPermissionResolved`. Ones a note would only duplicate: the merge-conflict set, `ChangeHardened`, `CodingAgentSettingsChanged`, and the cosmetic thread events.
+
+**Stateless and self-clearing**: this turn's origin becomes the next turn's boundary. Each event is therefore surfaced exactly once, with no projection column and no state to clear, the `events` table being the cursor. It also returns `explains_worktree_reset`, naming a known cause for a HEAD move (an Apply, a Discard, or a tier-2 worktree clean). The external-edit detector reads it, so it does not report the reset as an unexplained hand edit.
+
+### Resume-time note
+A `[Note from engine: …]` block **reconciling what changed while the agent was idle**, prepended to a resumed coding agent's next prompt and assembled in `build_resume_prompt_text` (`agent_session/run_session/run.rs`), the single injection point for these, shared by Claude Code and Codex. Three kinds today: *branch adoption*, the *turn-gap note*, and the external-edit note. They are **not events**: nothing persists them, nothing renders them, and they ride only on the in-memory prompt text, and only on a turn with a non-empty user message so a note can never trigger an otherwise-empty LLM call. Documented user-facing in `system-knowhow/coding-agent-events.md` § "Resume-time notes prepended to the next prompt". The *answered-question recap* carries the same `[Note from engine: …]` marker but is **not** one of these: it is the resumed turn's message *body* rather than a reconciliation prepended to one, and it is assembled elsewhere. The definition is scoped by ROLE rather than by the marker text for exactly that reason.
+
+A non-empty block closes with a **referent guard** (`RESUME_NOTE_REFERENT_GUARD`), one line calling the notes engine status rather than the topic. It exists because the notes sit exactly where a short follow-up's pronoun looks for its antecedent. A commit subject naming the composer captured "It needs more height", and the agent grew the composer instead of the glyph. The guard rides on the block, so a turn carrying no note is unchanged.
+
+### Answered-question recap
+The user's answer to a coding-agent question, rebuilt from the `events` table and handed to the resumed agent as the **body** of an `answered_after_idle` continuation's message (`agent_question::answered_question_recap`, wrapped with its framing by `agent_recovery::continue_input_for_reason`). It carries the question, the answer, and whether the user picked an option or typed their own reply.
+
+It exists because an answer cannot always be delivered *in band*. Normally the engine wakes the blocked hook (Claude Code) or MCP call (Codex) and the answer returns as that tool's result, but when the subprocess was torn down while the card was on screen there is no blocked call left to wake, and Claude Code has already closed the tool call in its own transcript as rejected, so the hook never re-fires on `--resume`. Before 2026-08-10 the resume sent only "Continue from where you left off." and the answer reached the model nowhere at all, next to a transcript stamp reading "the user doesn't want to proceed": the model read the pair as approval. The recap therefore also states that an interrupted question call is a teardown artifact, neither an approval nor a refusal. Distinct from a *resume-time note* (see above).
+
+### Frontend preview
+A Vite dev server the engine spawns and supervises inside a coding-agent *worktree*, on **its own port** (`engine::frontend_preview`, ADR 0055). A TypeScript or CSS change in that branch is then visible in the real app, with hot reload, **before Apply**. Dev only, and refused on a packaged build.
+
+- **One slot per workspace**: starting it for another thread replaces the running one.
+- **The engine owns the process**, because a `vite` a coding agent starts itself dies with the agent's turn. The engine kills every process the session started.
+- **It goes through the gateway.** Vite forwards the API to the workspace's gateway, and every byte it serves needs a paired device. So there is no preview without a gateway (ADR 0267).
+- **Distinct from the WIP app preview** (`?thread_id=` in `api/apps.rs`), which serves an app's files from a worktree and covers `data/apps/` only.
+- **Distinct from a *worktree-pinned stack*,** the failure this deliberately is not. The preview never touches `LUCIDOS_STATIC_DIR`, so the workspace URL keeps serving `dist/` whether one is running or not.
+
+Reached from the coding-agent control menu, and from `lucidos frontend-preview start`. See also *dev-server bundle*.
+
+### Dev-server bundle
+The frontend as served by `vite serve` rather than built (`import.meta.env.DEV`, wrapped as `isDevServerBundle()` in `utils/devServerBundle.ts`). Since ADR 0014 the workspace is always served from a built `dist/`, so the only two contexts where this is true are a manual `npm run dev` and a *frontend preview*. One thing must differ there: **no service worker is registered**, because a dev server emits unhashed module URLs a worker would cache past a hot update, and the `sw.js` it serves still carries the unstamped `__LUCIDOS_BUILD_ID__` placeholder. Push therefore cannot be enabled on a preview, and says so by name.
+
+### Worktree
+An isolated git worktree under `<workspace>/.lucidos/worktrees/` where an *agent session* runs. All edits, builds, and test runs stay inside it. Scripts resolve paths via `SCRIPT_DIR`, so they pick up the worktree's code automatically. It is cleaned up by Apply, by the `ExitWorktree` CC tool, or by the background `worktree_cleanup` worker.
+
+That worker's reclamation is **retention-gated**. While free disk stays above `FREE_DISK_SOFT_BYTES`, a non-archived thread's worktree is never removed. Its build artifacts go after 1h idle only when the thread has *nothing pending* (ADR 0311). Full reclaim waits until the thread is *archived* (the explicit "done" signal) or disk drops below the soft threshold. Live sessions and *stranded worktrees* are handled outside the gate.
+
+For *app coding-agent threads*, the worktree is a sparse checkout (cone mode) of the workspace git, narrowed to `data/apps/<id>/` (see *app worktree*). For Lucidos-internal and external-repo sessions, it is a full checkout of the relevant git.
+
+### Disk monitor
+The engine task that owns the "Low disk space on your machine" notification (`DiskMonitor`, beside the `worktree_cleanup` worker). It never waits on the database, because a full disk is what stalls Postgres. It probes free space on the workspace volume every minute and alerts once per crossing below `FREE_DISK_SOFT_BYTES`. Each time the pressure level worsens (to soft, then to hard), it wakes the cleanup worker through an in-memory `Notify` (ADR 0311). It re-probes right before the emit, and a stalled emit is dropped and retried with a fresh reading (ADR 0302). Distinct from *worktree reclamation*, which reads free disk at each of its own decisions but needs the database to act.
+
+### Worktree reclamation
+Freeing the disk a *worktree* occupies once it is spent. **Exactly one subsystem owns it: the background `worktree_cleanup` worker** (ADR 0035). It weighs retention on evidence it gathers while nothing is racing it:
+
+- Tier 0 removes zero-information trees (clean, no pending change, no commits ahead) after a grace window.
+- Tier 1 strips untracked build artifacts at 24h idle. It runs after 1h, outside the retention gate, for a thread with *nothing pending*: no live session, no pending change, no owed fan-in, and not saved. The worktree, its source and its branch stay (ADR 0311).
+- Tier 2 removes the tree at 30d.
+- Disk pressure escalates all three. Under hard pressure Tier 0 and Tier 1 act at once on a thread with nothing live (ADR 0311 amendment).
+
+**Nothing live** means no live agent session, no coding-agent spawn in flight, and no running background task in the tree. `EngineActiveThreads` is the one probe that asks, and every tier and the Disk Usage cleanup skip an active thread.
+
+A thread **delete** is a third non-reclamation removal, and the one place the branch rule inverts. `BranchDisposal::Always` takes the branch even holding commits nothing merged. Once the thread's events are gone, `lookup_thread_by_short` cannot name the directory's thread. The worker's orphan path would then keep the tree for good (ADR 0035 amendment, ADR 0192).
+
+### Finished worktree
+A *worktree* whose removal loses nothing: no owed fan-in, no pending change, a clean `git status`, and a branch with no commits ahead of main. `is_finished_worktree` is the one definition, shared by Tier 0 and the *recommended cleanup*. Every unanswered probe answers "not finished". Liveness and pins are the caller's question. Disk Usage badges such a row *Finished*.
+
+### Recommended cleanup
+The pass behind Disk Usage's "Free up space" card (`run_recommended_cleanup`, `POST /api/v1/disk-usage/cleanup`). It removes every *finished worktree* and strips build artifacts from every other worktree. Live, pinned and stranded trees are skipped. It applies the worker's own rules without their idle windows, on explicit user request, so it is not a second *worktree reclamation* owner. The card's estimate sums the inventory's `artifact_bytes` and `is_finished` fields; the engine re-checks each tree before it acts.
+
+Two removals are deliberately not reclamation, and the worker does not own them. **Failure-path cleanup** deletes only what a failed attempt itself created: `git_ops::cleanup_failed_spawn`, and the Tier-3 merge temp tree behind `conflict_abort_deletes_temp_state`. An explicit user **Discard** deletes the tree and its branch together, because the user asked for the work to go away.
+
+The distinction is load-bearing rather than pedantic. A session **teardown** must never reclaim. It often runs *because* something went wrong. It can then be unwinding while the safety net relaunches a session into the very tree it would delete.
+
+An unconditional `git worktree remove --force` on that path destroyed two live worktrees on 2026-08-03. Once it acted on a timed-out probe (see *GitAnswer*), and once it lost that race. The call site was deleted rather than gated further. Enforced by `the_completion_path_removes_only_the_two_worktrees_it_is_allowed_to`.
+
+### Worktree-pinned stack
+A long-lived dev stack (gateway + engine + served `dist/`) whose paths resolve inside a
+*worktree* instead of the real checkout — `LUCIDOS_ENGINE_BIN`, `LUCIDOS_STATIC_DIR` and the
+gateway binary all under `<workspace>/.lucidos/worktrees/<thread>/`. A broken state, never a
+valid configuration: a worktree is a throwaway copy pinned to ONE commit, so the stack serves
+that commit's engine and frontend forever while the checkout-level `vite build --watch`
+republishes the real checkout's `dist/`, which the pinned stack never reads. The symptom is
+silent — every frontend-only *Apply* appears to do nothing (the 2026-07-26 incident, where the
+pinning worktree had even been pruned from git's registry). Self-perpetuating without the
+guards: `spawn_engine` inherits the gateway's env into every engine it spawns, and
+`reload_gateway` re-execs onto the worktree binary. Refused at launch by
+`assert_stack_not_worktree_pinned` (`scripts/lib/workspace.sh`) and at three gateway sites, with
+`LUCIDOS_ALLOW_WORKTREE_STACK=1` as the sole opt-out (set by the e2e harness, whose workspace is
+disposable). When an Apply strands anyway, the engine emits `FrontendUpdateStranded`. See
+ADR 0021 and `docs/plans/2026-07-26-worktree-pinned-stack-guard.md`.
+
+### App worktree
+The sparse-checkout *worktree* that backs an *app coding-agent thread*. Created by `git worktree add --no-checkout <path> -b <branch> main` against the workspace git, then `git sparse-checkout init --cone` + `git sparse-checkout set data/apps/<id>` materialises only that app folder plus top-level files (workspace `.gitignore`). Path: `<workspace>/.lucidos/worktrees/thread-<short>/`. Branch: `lucidos-<agent>-app-<id>-<slug>` (see *coding-agent branch*). *Apply* ff-merges the branch into the workspace git's `main` and emits `AppUiRefreshRequested` if any iframe-bundled file changed; no push to any remote (workspace git is local by default). Lifecycle helper: `git_ops::create_sparse_app_worktree`.
+
+### Stranded worktree
+A *worktree* on disk whose git admin dir (`<repo>/.git/worktrees/<name>`, pointed at by the worktree's `.git` link file) no longer exists — typically from an interrupted `git worktree remove` or a `git worktree prune` that dropped the admin entry while the working dir survived. Every `git` invocation from it then fails with `fatal: not a git repository`, so the cleanup worker's git-based tiers (which lean on `git status` / `git rev-parse`) can't act and `remove_worktree_and_optionally_delete_branch` early-returns. Detected by `worktree_cleanup::worktree_git_admin_missing` (conservative: only `true` when the link target is positively gone, resolving relative gitdirs against the worktree) and removed by `remove_stranded_worktree` (subpath-guarded plain `remove_dir_all`, never touches branch refs — committed work survives in the main repo's branch) after a fixed `STRANDED_GRACE` that does not accelerate under disk pressure. The **resume path** guards against the same hazard from the other side: `git_ops::is_live_worktree_at` (used in `spawn_context`) treats a recorded worktree as reusable only when `git rev-parse --show-toplevel` resolves to the path itself — a stranded tree instead resolves *upward* to the enclosing workspace data repo, so the spawn `clear_stranded_worktree_dir`s the residue and recreates rather than running Claude Code against the data repo. Distinct from an *orphaned temp worktree* (`harden-`/`apply-`/`merge-` left by a crashed apply/harden/merge flow), which is swept separately gated on its change row's status.
+
+### Stranded queued message
+A chat follow-up typed mid-turn that the engine owes an answer for and nothing is going to give it. Its `MessageReceived` row is persisted, but no `PromptInjected` names it in `injected_message_id`, no `QueuedMessageRemoved` names it, and no terminator carries it as `request_event_id`. It renders as a "Queued" bubble pinned to the bottom of the transcript, which only the user's trash icon clears. The cause is always the same: the follow-up rode the running turn's in-memory injection channel, and the channel died with the process.
+
+Those three markers are also the definition, so the set is a query rather than a state. `chat::queued_recovery::STRANDED_QUEUED_MESSAGES_SQL` is that query, bounded below by the turn that owns the drain and above by a sequence sampled before the reader's fence. It has two readers: the turn tail (`drain_turn_orphans`, unioned with the channel drain) and the resume (`spawn_chat_resume`, where no channel exists). Announcing one writes the marker that excludes it, which is what makes a second pass a no-op. See [ADR 0236](adr/0236-queue-membership-lives-in-the-event-store.md) and `docs/plans/2026-09-21-a-queued-follow-up-survives-the-restart.md`.
+
+### Withdraw
+The engine step that takes back a queued message a *coding agent* was already sent. The user-facing act is *remove* (the bin, or Edit), recorded as `QueuedMessageRemoved`. On the Lucidos Agent lane that is the whole of it; the frontend calls it a *retract*. On a Claude Code thread the engine has already written the message to stdin. So it first asks Claude Code to drop it, with the `cancel_async_message` control request.
+
+The session's run loop owns it (`agent_session::withdraw`). It asks by the fresh `uuid` the message's stdin write carried, never by the event id, since Claude Code dedupes user messages by uuid. The tombstone follows only `cancelled: true`; every other answer is a refusal. Codex cannot withdraw. See [ADR 0323](adr/0323-a-queued-claude-code-message-is-withdrawn-until-read.md).
+
+### Stale resume
+A `--resume` (CC) / `thread/resume` (Codex) that could not attach to the conversation it named — the persisted session id is gone (pruned transcript, agent version upgrade, a mid-flight `CLAUDE_CONFIG_DIR` switch relocating the store; see *account pin*). The recovery is always the same: shadow the dead id with `SessionEnded{StaleResume}` so no later lookup reuses it, keep the worktree and branch, and re-spawn ONCE with no resume id and the conversation reconstructed into the prompt (`prepend_reconstruction`). Detected two ways, in `is_stale_resume_signal` / `is_definitive_session_not_found`: the agent's explicit "no conversation found" error, or — only when the attach was **not** confirmed — an empty, activity-free first Result. A confirmed attach (the agent's `Init` echoes the id we asked for; a failed resume yields a different one) vetoes the second, output-shape inference outright, which is what stops a healthy-but-silent turn being killed.
+
+`SessionEnded{StaleResume}` is the one `SessionEnded` reason that does NOT settle the thread. The projection stays `running` across the retry window, so the UI doesn't flash "Aborted". That makes the retry **mandatory** at every call site. A caller that merely logs `STALE_RESUME_ERROR` leaves a thread `running` with no subprocess and no stuck-session watchdog. The stale-resume arm also drops the `agent_sessions` entry, which is the only map that scan walks.
+
+The *external watchdog*'s orphan reconciliation pass is the floor under that, settling the row once it has been quiet past the limit. It is a floor, not a substitute: it ABORTS the turn rather than retrying it. A caller that skips its mandatory re-spawn still loses the work. Distinct from a *phantom session*, which is a live-looking map entry with no run loop; a stale resume leaves no entry at all.
+
+### Resume-settle turn
+A turn the coding-agent backend runs on its OWN behalf when a `--resume` attaches, before it reads the engine's prompt from stdin: closing a `tool_use` the previous session's death orphaned (Claude Code injects a synthetic `Continue from where you left off.` / `No response requested.` pair for this) and draining any `<task-notification>` that session queued for a background Bash. Each is a full turn to the backend, so each ends with its own `result` on the wire, and the first can land *before* the engine's prompt is even dequeued.
+
+Its Result is not the engine's turn boundary, and treating it as one is the failure `is_resume_settle_result` exists to prevent: empty text plus zero tool calls classified as `Failed{EMPTY_RESPONSE_ERROR}` (an OOM diagnosis for a turn that made no API call at all), and the idle path then tore the subprocess down 137 ms after the backend had dequeued the user's follow-up and started answering it, swallowing the message (2026-08-05, thread `6398bb2f`). The run loop now skips such a Result entirely: no terminal, no idle, no teardown, keep reading. Bounded to one per session, which is all a resume settles, because the skipped Result is recorded and every later one classifies normally.
+
+The predicate is *stale resume*'s exact complement on one field: an empty, activity-free first Result means a dead session when the attach was **not** confirmed, and a settle turn when it was. It takes one further input those eight fields cannot supply, **no API call this turn** (zero `AgentEvent::Usage`, which the parser emits per real model call and never for an all-zero `<synthetic>` frame). Output shape alone cannot tell a settle turn from a model that WAS asked our prompt and answered with nothing, and skipping the latter would discard a real terminal and strand the turn until the inactivity watchdog fired; the absent API call proves the backend never asked the model anything, so the Result cannot be an answer to us. It is deliberately not a ninth `StaleResumeInputs` field: a dead resume starts a fresh conversation and may well call the model before echoing nothing back, so *stale resume* must keep reading exactly the eight it reads today.
+
+### Agent error banner
+A coding-agent backend's own report of an upstream failure, delivered on the wire in the shape of an assistant message but authored by the harness rather than the model: Claude Code emits a `<synthetic>`-model line flagged `is_api_error_message: true` whose single text block is `API Error: Stream idle timeout - no chunks received` / `API Error: Response stalled mid-stream. The response above may be incomplete.` It is a SURFACE, not output, and it is the same string the backend then returns as the turn's `result` error, which the engine records as `ResponseFailed` and the transcript draws in its failure card.
+
+So a banner taken as prose states one failure **twice**, which is what the transcript did until 2026-08-10: a paragraph in the response body and the red card immediately beneath it saying the identical thing. `claude_code_parse.rs` now skips the text blocks of a flagged line, a **sub-agent's** banner included.
+
+Recognised by the backend's own flag rather than by an `API Error` prefix, deliberately: the prefix is a *temporary measure* elsewhere (transient-vs-permanent classification, and the `is_error: true` + `subtype: success` contradiction), and reusing it here would drop a turn where the model itself writes about an API error. Two things stay downstream of the drop and are not redundant with it: the Result flush declines to emit `result.result` as text when it is verbatim the failure reason (`result_text_is_own_prose`), which is reachable precisely because the banner no longer sits in the text buffer; and the frontend's echo drop (`failureEchoPredicate`) remains the backstop for events older engines already persisted, for the chat channel, for Codex, and for a CC that stops flagging its banner.
+
+### CodingAgentKind
+Rust enum (`Lucidos | App | External`) discriminating the *coding-agent thread* flavor. Serialized as snake_case on `SessionStarted.coding_agent_kind` and persisted in `thread_summaries.coding_agent_kind`. Distinct from `CodingAgent` (which picks the backend product — Claude Code or Codex); a thread of any kind can run on any backend. The `apply_change` path reads it to decide whether to run the `/harden` gate, whether to gate engine restart via `files_require_restart`, and whether to emit `AppUiRefreshRequested` after a successful merge.
+
+### Web search backend
+One implementation of the `WebSearchProvider` trait (`llm::web_search`) — the search facility a single configured LLM provider exposes. Three exist: `vertex-grounding` (Gemini with Google Search grounding, pinned to Vertex's *global* endpoint because grounding is a global-endpoint feature and the chat region may serve no Gemini models), `anthropic-server-tool` (the `web_search` server tool on `/v1/messages`, tool version paired to the model family — `web_search_20260209` on Opus 4.6+/Sonnet 4.6+, `web_search_20250305` elsewhere), and `openai-responses` (the `web_search` tool on the Responses API). Each returns the same shape: answer text, then a numbered `Sources:` list. `Ok` means the backend answered — *including* a legitimate "no results"; `Err` is reserved for availability failures, which is what the *web search chain* falls through on. See ADR 0023.
+
+### Web search chain
+The ordered set of *web search backends* the engine will try for one `web_search` tool call (`llm::web_search::WebSearchChain`). Resolved over the **configured provider set**, deliberately *not* over the chat model's provider — search is a background capability like memory extraction, and that decoupling is what lets a user on OpenRouter or a local endpoint (neither of which has a search tool) still search via another configured provider. Fixed order `vertex-grounding → anthropic-server-tool → openai-responses`: Vertex first so existing workspaces are unchanged, Anthropic before OpenAI because only OpenAI's charges a per-call fee on top of tokens. Held on the engine behind the same swappable handle as the LLM provider and rebuilt by the same credential subscriber, so adding a key enables search with no restart. An empty chain returns `NO_SEARCH_BACKEND`, naming the three search-capable providers and where to add one. See ADR 0023.
+
+### Update phase
+One named step of a **packaged** app update, and the wire contract between `crates/lucidos-app/src/updater.rs` and the page. Serialized internally-tagged on `phase` with kebab-case values: `checking`, `downloading` (carrying `downloaded` plus a nullable `total`), `verifying`, `installing`, `restarting-services`, `relaunching`, plus the three terminal frames `cancelled` / `failed` / `bundle-swap-failed`. Every frame is delivered on the `app-update-progress` Tauri event. Mirrored in TypeScript as the `AppUpdateProgress` discriminated union (`utils/tauri.ts`), whose in-flight subset `AppUpdateRunning` is what `appUpdateNarration` maps to a sentence, a determinate fraction, and whether a cancel is still honest. Three rules travel with it. Frames are **throttled at the source** (one per percentage point, or per MiB when the size is unknown; first chunk and final byte count always sent). A **null `total` must never be rendered as a percentage**: an unknown size shows bytes alone. And **`bundle-swap-failed` is not a variety of `failed`** but a separate outcome with separate handling: it means the install left no runnable app on disk, which upstream `tauri-plugin-updater` can do by moving the current `.app` into a `TempDir` and dropping it when the final rename fails (F9 in `docs/audits/2026-08-02-macos-update-path-audit.md`), so the run does NOT restart the launchd service, does NOT relaunch, and the page shows the message verbatim without re-offering the update, because the recovery is a reinstall from the .dmg rather than a retry. It is raised from both install outcomes, the destructive one being the `Err` branch. The user-facing half of the same concept lives under *New version available / Switch to new version* in `system-knowhow/glossary.md`. Distinct from the gateway's *boot phase* (`crates/lucidos-gateway/src/boot_phase.rs`), which narrates the workspace boot AFTER the client relaunches; the two are consecutive halves of one update, not the same mechanism.
+
+### Next-boot record
+`<app-data>/.next-boot.json`, what the packaged service leaves behind for the next gateway boot (`crates/lucidos-gateway/src/next_boot.rs`; written by `lucidos-app`'s `desktop.rs`). Two shapes. `{"restore": [ids]}` names the workspaces the teardown just stopped, and the next `boot_all` brings exactly those back **regardless of `autostart`**, because a restart must return what it took: `launchctl kickstart -k` (the Restart control, and the updater's service restart) and a crash respawn all run the same teardown as a permanent stop, killing every engine, and the gateway that follows re-adopts only survivors. `{"quit": true}` is written by *Quit and Stop Background Service* BEFORE it signals launchd, so the one teardown that means *stay down* records nothing; declaring the intent first makes the ordering structural instead of a race against `launchctl bootout`. Consumed and deleted on read, so it is one-shot, and it fails soft in every direction (missing, malformed, half-written all mean "restore nothing") because it sits on the boot path of the whole stack. Distinct from *autostart*, which is the user's per-workspace boot posture: the record outranks it in one direction only, never starting a workspace the user had stopped, since a stopped workspace is not running at teardown and so never enters it.
+
+### Window session
+`<app-data>/.window-session.json`, the packaged client's record of which workspaces had a window and how big each was (`crates/lucidos-app/src/window_session.rs`; ADR 0123). Three fields answer different questions. `open` lists the workspace slugs that had a window, in restore order. A launch hands the first to `main` and builds one window for each of the rest. `geometry` holds the last frame each workspace window wore BY THE USER'S CHOOSING, which is not always its last frame: see *rescued frame*.
+
+Those frames are in **logical points**, and the third field `units` says so. macOS lays displays out in points, so that is the one space a mixed-DPI desk cannot break. tao's physical pixels are a per-object projection of it. A frame captured on a 2x panel arrived doubled on a 1x display (ADR 0173). A record carrying no `units` marker predates that fix, so `read` drops its frames and keeps `open`.
+
+It is keyed by workspace **slug** rather than by window label, which is the whole point. `tauri-plugin-window-state` keys by label, and an extra window's label is `window-<n>` off a per-process counter. That label means nothing across launches, so a second workspace could never keep its size. The plugin is therefore filtered to `main` alone (`window_persist::plugin_tracks`). Unfiltered it restored one session's second window onto an unrelated one, maximized and fullscreen included. It is also stood down while `main` wears a *rescued frame*: the same rule, for the one file the client does not write itself.
+
+`geometry` also OUTLIVES a window's closing, so reopening a workspace later lands at the size it was left. Every path that puts a workspace on screen with no window on it reads that frame back (`window_session::frame_for_url`). That is a launch restore, a reopen, a picker or switcher row, and a notification tap. File > New Window deliberately does not: it opens a second window on the workspace you are already on.
+
+Written by every geometry-save site through `persist_windows`, and by the `Destroyed` arm, which is what drops a window the user closed. A park reaches neither: Close to Menu Bar hides every window rather than destroying any, so the record still names them all and `desktop::reopen_plan` shows them again (ADR 0141). Two halves gate every write, and both rule out a launch with no arrangement yet rather than testing what is on screen now. `any_window_is_navigated` means some window is off the bundled splash, so this is not boot. `PresentedGate` means a window reached the screen at some point, so this is not a login start. A third guard, `TEARING_DOWN`, stands the `Destroyed` recapture down while a deliberate exit destroys the windows it just recorded.
+
+Fails soft in every direction, since it sits on the client's boot path. Distinct from the *next-boot record*, the service role's one-shot instruction to the gateway about *engines*. This is the client's standing arrangement about *windows*, and a restart needs both to give back what it took.
+
+### Rescued frame
+A frame a window is wearing because the CLIENT corrected it, rather than because the user put it there (`crates/lucidos-app/src/window_restore.rs`; ADR 0215). Every correction site notes the exact rect it placed, by window label: the restore clamp, the desk-change pass, and `sanitized_frame` on a frame read off the *window session*.
+
+It exists because **a correction is not an arrangement.** The debounced flush reads live geometry. So without this a repair became the recorded answer within a second, and the user's own arrangement was gone for good. `window_session::capture` therefore keeps the frame the record already held for that workspace, while the window still wears the rescued rect. With no frame held there is nothing better to keep, so the correction goes in.
+
+**The rect itself is the expiry.** `is_wearing_a_rescue` compares the live frame against the noted one. Any other frame means the user moved or resized the window, so the note is dropped and their frame is recorded. tao reports neither a cause nor a source on `Moved`, so nothing else could tell the two apart. The note is process-local and dies with the client. It is also dropped in the `Destroyed` arm, since `main` is hidden rather than closed and comes back on its workspace.
+
+One gap is deliberate. `tauri-plugin-window-state` has its own `RunEvent::Exit` hook, so Quit writes `main`'s rescued frame into `.window-state.json` whatever the client does. It costs nothing: that file is read only for a workspace the *window session* holds no frame for, and there `capture` records the correction too.
+
+### Park
+What Close to Menu Bar does to the packaged macOS client (`close_all_to_tray`; ADR 0141). Every app window is HIDDEN and none is destroyed, and the client drops to menu-bar-only. Cmd-Q is bound to it, so it is the ordinary way a Mac user puts Lucidos away. It stops nothing: the launchd service keeps running, and the only full teardown is "Quit and Stop Background Service".
+
+A parked window is still part of the arrangement. Nothing is destroyed, so no `Destroyed` re-capture runs and the *window session* still names every parked workspace. The reverse is a **reopen**: the tray's "Open Lucidos", or a Dock click. `desktop::reopen_plan` then shows every hidden window and builds any recorded workspace this process no longer holds.
+
+### Client log
+`<app-data>/logs/client.log`, where the packaged macOS **client** writes its own diagnostics (`client_log::install`, ADR 0186). LaunchServices gives a launched app a write-only sink for fd 1 and fd 2, and nothing written there reaches the unified log. So until this existed, every `eprintln!` in the client role was discarded. The redirect is a `dup2` over both descriptors, taken as the first statement of `run()`. That is also what captures a CHILD's output: the *relaunch watcher* is a detached `/bin/sh`, and this is how `open`'s own refusal is recorded. Capped, with one kept generation rotated to `client.log.1` at a start that finds it oversized.
+
+Distinct from the two agent logs beside it, `engine-service.err.log` and `client-login.err.log`, which their plists write because launchd owns those jobs. Development writes none of the three.
+
+### Relaunch watcher
+The detached `/bin/sh` the packaged macOS client spawns when it is about to relaunch itself (`desktop::schedule_relaunch_after_exit`). It waits for the client's pid to disappear, then hands the `.app` to LaunchServices with `open -a`. It exists so the relaunched client comes back **frontmost**.
+
+A fork/exec'd relaunch (tauri's `process::restart`, our `restart_process`) never asks the system to activate the new instance. Such an instance lands in front only by inheriting the front slot from its dying parent. It loses that race whenever it registers with the window server a moment too late. The 0.20 to 0.20.1 update on 2026-08-03 lost it by ~280ms, and the slot went to the next app. Launching only *after* the exit removes the race. It is also what keeps the relaunch to one instance: `open` against a live app activates it, and `open -n` would overlap two clients.
+
+Three rules travel with it. The launch is **conditional on the client actually being gone**, checked again after the wait loop. Launching at that ceiling would spend the relaunch activating a process that had not finished exiting. The ceiling bounds the **watcher's** life, not the relaunch, so it is minutes rather than seconds.
+
+And the ask **repeats until the client is confirmed back**, up to ten times, because LaunchServices can refuse and can answer without launching anything. That confirmation is a `pgrep -f` anchored at BOTH ends, since the service runs the same executable and is always up. Every refusal reaches the *client log*. Both relaunch paths use it: the *update phase* `relaunching`, and the "Restart App" action. Each falls back to a direct respawn when there is no enclosing `.app` (dev), or when the watcher cannot be spawned.
+
+### Resident block
+What a *voice session* opens knowing. The talker holds no tools (ADR 0149), so this block plus the conversation is the whole of what voice can answer with no wait. It enters the session as its FIRST history item, never as instructions, which is what lets a refresh append beside it rather than rewrite it. Rewriting would invalidate the cached prefix behind it, and one such deletion was measured to triple full-price input for that turn.
+
+**Never as instructions on a Live session either, and that took a defect to settle** (ADR 0211). That provider has no history, so the block rides `session.thinking.append`, its quiet channel. Sent on the steering channel instead, it read as new orders arriving after the session started, ending in a line of the reader's own conversation. The talker answered that line aloud, to a caller who had not spoken yet.
+
+**The conversation inside it is a FENCED record, and nothing follows its last turn** (ADR 0213). A line above says what the record is and which of `Them` and `You` is which. A line below says it ends there, that every line in it was already heard, and that none of it is to be said again. The quiet channel was not enough on its own: a talker on it recited a whole earlier call back out, in order, turn by turn. The closing line is the half that matters, because the defect is the record's last line reading as a turn nobody answered.
+
+Built from a registry of named **resident sections** (`voice::sections::SECTIONS`), each an id, a title and a builder that runs at session open. So a section reports the workspace as it is now, and adding one is a single entry plus its builder. What is in it is a product decision, not tuning: it bounds what voice answers instantly.
+
+**What is WAITING on the reader is in it, in two places.** `this-thread` carries the question this thread is parked on, in full, with its choices. `workspace-shape` names every other thread stopped waiting on an answer. Neither is a new section id on purpose: a workspace that already wrote `voice_resident_sections` gets exactly what that row lists, so a new id would reach the readers who need it least.
+
+**What is RUNNING is a second line of `workspace-shape`, beside it.** It names the threads the workspace was working on as the call opened, read through the same `status=running` filter the threads-list API uses. The two lines are deliberately unmistakable, in their labels and in a sentence above them: given the waiting line alone, a talker asked what was running read that one out instead, three times in one call. Nothing refreshes the block mid-call, so the running label says when it was read and the talker is told to ask before answering from it.
+
+The `voice_resident_sections` preference names which are on, as comma-separated ids. Settings draws it as one toggle per section, over `VOICE_RESIDENT_SECTIONS`, which the SDK's generated `engine-constants.ts` copies from the registry. An id nothing defines is ignored with a log line, rather than costing the whole block. An id the registry does not carry survives a toggle, since a newer engine may define one this client has not heard of.
+
+**A row that exists means exactly what it lists, and an EMPTY one means none.** Only a row that was never written falls back to `who-and-where`, `this-thread` and `workspace-shape`. The two used to be one case, which would have made the last toggle impossible to turn off.
+
+**How much of this thread it recalls is capped in BYTES, because length is what it costs.** A turn count is the second cap, for a thread of one-word turns. Both are needed, because the two kinds of turn are not the same size. A typed message runs to hundreds of characters, and a spoken row averages about ninety, being one breath. A turn count alone therefore bought a voice thread two minutes of a call. A caller coming back to one found their own decision had fallen out of it.
+
+A third bound sits above those two: the read window the fold is given, which a tool-heavy typed thread reaches first. All three report through one line, `(earlier turns are not loaded)`, so a block that lost anything says so.
+
+### Spoken language
+What a *voice session* is pinned to, derived from the one global `language` preference (`voice::language`). A call reads that preference twice, because its two halves want different things. The *talker* is told the **name**, as the user wrote it, and speaks in it. The transcriber is configured with an **ISO-639-1 code**, which is a value no sentence can carry.
+
+Only the code needs a lookup, so `SpokenLanguage` holds `Option<String>` beside the name. A name outside the table still reaches the talker, and the transcriber payload is then what it was before any of this existed. A typo in Settings costs nothing.
+
+**One transcriber spells that pin differently.** `gpt-live-transcribe` reads `languages`, an array of codes, where every other model reads the singular `language`. The provider refuses a payload holding both, so `realtime::transcription` writes exactly one of them. A name that resolved to no code still writes neither.
+
+**Said once, in the instructions, never in the *resident block*.** The block is what the talker KNOWS; which language to speak is a rule it follows. Stating it in both is how the two come to disagree. It is a workspace-level fact, so the cached prefix stays stable across that workspace's calls.
+
+The defect that produced it: with no code sent, the transcriber re-guesses per utterance, and Bokmål and Nynorsk are separate labels in its language set. A short Bokmål phrase duly came back as Nynorsk (`docs/plans/2026-08-29-a-call-speaks-one-language-and-gives-one-answer.md`).
+
+### Voice provider
+The seam a talker sits behind (`voice::provider`). `VoiceProvider` opens a `VoiceSession`, which hears audio, speaks audio and yields `VoiceEvent`. Swapping the implementation changes no socket payload and no event shape, because nothing above the seam names a provider. Two exist: `RealtimeProvider`, one speech-to-speech model over a WebSocket, and a scripted mock the tests drive.
+
+**It has no tool field, deliberately.** The talker's three tools are named in `voice/mod.rs` (ADR 0170). A field nobody can set beats a field every implementation must remember to fill the same way. The seam's acknowledgement member is `resolve_tool_call`, one for all three.
+
+**It does carry one CAPABILITY, `holds_the_answer_tool`.** A talker with no channel to hand a choice id back settles a question card another way (ADR 0205). So `call.rs` has to know which it is talking to. A boolean rather than a name, so nothing above the seam learns which provider answered. It defaults to true, which is what every provider was before one answered false.
+
+### Call naming (retired)
+Titling the thread a call ran on from the call's spoken exchange, at the first caller utterance that answered a talker reply (ADR 0208). It was retired once calls ran only on the home thread (ADR 0362), which never takes an automatic title, so it could never name anything. The term survives here only so a reader meeting it in ADR 0208 can look it up, and no code implements it. The per-thread naming slot it shared (`threads_being_named`) still guards the chat titler. Plan: `docs/plans/2026-10-05-retire-call-naming.md`.
+
+### Judgment
+One answer to a typed question about a state, carrying the probability of every
+option it could have taken. Distinct from a *chat completion*, which is text.
+The three question types are **Choice** (one option from a closed set), **Noul**
+(the probability a condition holds) and **Score** (a position on ordered
+levels). Independent questions over one state travel in one request, so a caller
+that splits them pays for the state twice.
+
+**The distribution is the point.** A caller applies its own threshold in Rust. A
+rule like "when unsure, pick the danger lane" becomes code with a test, rather
+than a sentence in a prompt a model may ignore.
+
+### Judgment provider
+The backend answering a *judgment* (`llm::judgment::JudgmentProvider`). A
+sibling of `LlmProvider`, never a kind of one: `chat` takes messages and returns
+text, while this takes a state plus named questions and returns typed answers.
+Two implementations (ADR 0363):
+
+- **`SystemOneProvider`** posts to any endpoint speaking TypeSafe's System One
+  API. `llm::judgment::endpoint` holds the rows: Jev, Cloudflare's Clef and
+  Clef-flash on Workers AI, and a custom endpoint URL the user sets, such as a
+  self-hosted model. Each provider has its own master switch.
+- **`ChatJudgmentProvider`** asks a chat model the same questions. The answer
+  comes back through one tool whose schema the questions define, and Rust
+  normalises it into a distribution, dropping anything malformed.
+
+**Every site speaks this trait alone.** The command guard's judge, query
+classification and the recall tools' `find` (`JudgmentSite::MemoryFind`) each
+ask through it, and each keeps its threshold in Rust. A missing answer reads as
+the site's safe default: *ask* for the guard, *load* for classification, *not
+relevant* for `find`.
+
+**A call site is never switched over by a credential.** Each one owns a
+preference naming `chat` or a System One row id (`jev`, `clef`, `clef-flash`,
+`custom`), and `chat` is the default and the unset value. So an untouched
+workspace runs every site on a chat model. A System One pick has the site's
+chat model behind it, used when the System One call fails (`for_site`).
+
+**The preference is written from the site's MODEL control, not from a switch.**
+Each configured System One row sits in that picker beside the chat models, so a
+backend is chosen where a model is (ADR 0224). Picking one writes its id and
+leaves the stored model alone; picking any model writes `chat` and the pair. A
+row is offered only when its provider is set up and on, or when the site already
+runs on it.
+
+See also: ADR 0220, ADR 0224, ADR 0363, *command guard*, *judge tool*.
+
+### Judge tool
+The agent's own route to a *judgment*, `judge` (ADR 0223). It takes a state and
+a set of typed questions, and returns the answers with their whole
+distributions. It is a *tool capability gate* rather than a *judgment site*: it
+replaces no existing path, so a configured provider is the whole condition and
+there is no third preference.
+
+**It reverses the point above.** A judgment site puts the distribution into a
+Rust threshold. This one hands it back to the model, which reasons about it in
+prose. What earns it a place is batching, calibration and cost, and its schema's
+main job is to stop a fan-out: the engine runs a round's tool calls one after
+another, where one call carrying fifty questions is a single round trip.
+
+**A failure is reported, never answered around.** The judgment sites fall back
+to their chat model when a System One call errors. This caller has none, and
+inventing an answer would be a lie about a number.
+
+### Drawn caret
+The composer caret Lucidos paints itself when the `composer-text` *theme part*
+asks for `block` or `underscore` and the browser has no `caret-shape` (WebKit,
+Firefox). A layout copy of the textarea holds a real inline caret element, so
+the browser places it. The native caret turns transparent while it shows, and
+comes back during IME composition. Chromium draws the shape natively and gets
+no drawn caret. Code: `utils/drawnCaret.ts`.
+
+See also: ADR 0317, `docs/temporary-measures.md` § Drawn caret.
+
+### Repo directory grant
+A directory outside a repo that the repo's own committed `.claude/settings.json` grants its Claude Code sessions, through a relative `permissions.additionalDirectories` entry such as `../sibling-repo/`. From a worktree that entry names nothing, so the engine resolves it against the main checkout and passes it as `--add-dir` (`engine/repo_directory_grants.rs`). Not a *permission grant*: the repo decides it, not a click, and nothing is stored.
+
+See also: ADR 0327.
+
+### Phone layout
+The layout with one swipe pane at a time (`MobileSwipeContainer`), against the desktop split. A viewport gets it when it is narrow (768px or less) or is a *phone in landscape*. The single definition is `utils/layoutMedia.ts`: `isMobile()` evaluates it, and CSS names it as `@media (--phone-layout)` or `@media (--desktop-layout)`, which a PostCSS plugin in `vite.config.ts` expands. App frames get `global/shared-components.css` raw, outside Vite, so that file keeps plain width queries.
+
+### Phone in landscape
+A viewport at most 500px tall with a coarse primary pointer. It gets the *phone layout*, so rotating a phone never swaps layouts. The phone layout keeps it clear of the Dynamic Island and the rounded corners through `--phone-side-inset` (mobile.css), the larger of the two side safe-area insets. The transcript takes it inside `--thread-pane-gutter`, so the title band still reaches both edges.
+
+See also: ADR 0342.
+
+### Title rank
+How well a search hit's title holds the query: a *title match* level plus coverage. The levels, weakest first, are `None` (matched elsewhere, or by meaning), `Phrase` (inside a word), `WordStart` and `Exact`. Coverage is the query's share of the title's length, and breaks a tie within one level. Every Search Everywhere category ranks by it before it cuts at the cap, and the All tab orders its sections by their best hit. Thread search uses the level alone, ahead of its other keys.
+
+One definition: `engine/title_match.rs` (`TitleMatch`, `TitleRank`). The frontend twin is `components/search/titleMatch.ts`, for the Settings and Menu categories it answers itself. The generated `title-match-fixture.json` holds the two to the same answers.
+
+See also: ADR 0348.
+
+### Text search
+The Search Everywhere category (`text`) that finds a literal phrase inside workspace files, ignoring case. It scans `artifacts/`, `apps/`, `knowhow/` and `triggers/` live, with no index. It skips binary files, invalid UTF-8, build output and files over 2 MB, and says how many large files it skipped. Distinct from the Files category, which matches names and paths only.
+
+One result is one matching line: the snippet with the match highlighted, plus the path and line number. Opening it shows the file at that line. The All tab shows up to five lines after every name section. The Text tab lists every match, up to 5,000 lines.
+
+One definition: `engine/text_search.rs`, served by `GET /api/v1/search/text`. Lines rank by *title rank* level on the line, then newest file, then path.
+
+See also: ADR 0383.
+
+### Summary tree
+A binary tree of summary lines over a log (ADR 0362). Each *thread* in scope
+has one over its own entries, and the workspace has one whose leaves are
+settled thread turns and artifact writes. A trigger thread is in scope once it
+holds a human message. A node covers `start+span` entries, span a power of 2.
+A message of 512 bytes or less is its own node. Not the *thread* tree, which is
+the parent and *sub-thread* hierarchy.
+
+- **The log is the events table**, read through the projection in
+  `engine/summary_tree/log.rs`. Only the nodes are stored, in
+  `summary_tree_nodes`.
+- **Positions are a function of events.** A thread delete removes its leaves,
+  so later workspace leaves move up and every merge after them is rebuilt.
+- Built by the *compactor*. A Tree workspace reads them through its *memory
+  views* and the *recall tools*. The user reads them in the *summary tree
+  browser*.
+- Each leaf stands for one *entry kind*'s message.
+
+### Entry kind
+The role one entry of a *summary tree*'s log plays (`EntryKind` in
+`engine/summary_tree/log.rs`): `prompt`, `response`, `call`, `result` and
+`report`, plus the workspace tree's `turn` and `artifact`. A prompt also names
+its sender, the *ActorMode* its event recorded, and renders as
+`prompt (human)`, `prompt (agent)` or `prompt (engine)`. A fired trigger and an
+image description are engine prompts.
+
+A response is always an agent's,
+including a turn that failed. A call and its result make one *step*. A report
+is a child report. A node no model wrote is re-derived from the log on the
+next drain, so it takes the current tags. A line a model wrote keeps the tags
+it was written with (`user`, `talk`, `tool`, `echo`, `work` before the
+rename).
+
+### Summary tree browser
+Settings → System → Memory on the Tree *memory module*, in place of Classic's
+memory inspector (`components/settings/SummaryTreeBrowser.tsx`). It shows the
+top of the workspace's *summary tree* or any thread's, from
+`GET /api/v1/memory/tree`. Each line opens one level through the *recall
+tools*' `zoom`, so it shows exactly what the agent sees.
+
+### Memory view
+What a Tree turn preloads of a *summary tree* (ADR 0362), from the fold in
+`engine/summary_tree/fold.rs`. OptChat's fold: each entry's line is appended.
+Once the view passes its budget, one batch merges the most due pairs of
+sibling lines down to half the budget.
+Source: "OptChat - HOW TO REPLICATE MY SETUP" by Victor Taelin,
+<https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449>,
+gist revision 3c190e06, read 2026-10-08. Section numbers refer to that
+revision.
+Detail fades with age in steps. Between batches the view only grows at its
+end. Every read replays the *built prefix*, where every node is built, from
+entry 0. Newer entries follow in a reserve.
+
+- The *workspace memory view* rides as a *view snapshot* plus a recent block.
+- The *thread memory view* reads an unbuilt leaf from its event.
+- Both lead the message in blocks of 4 lines, rendered as `view::ViewBlocks`.
+  The thread view marks its last whole block and the one a lookback before.
+  So the next turn reads nearly all of it from the prompt cache.
+- Sized in bytes, never tokens, per surface and per model
+  (`workspace_view_bytes_*`, `thread_view_bytes`, `memory_view_model_caps`).
+
+### Rung
+A view block of a *memory view* that takes a cache mark (`view::rungs` in
+`engine/summary_tree/view.rs`). The rungs are the last whole block and every
+20th block before it, the reach of Anthropic's lookback. The snapshot has one
+rung and the thread view two. A turn's rung finds the last turn's rung a few
+blocks back, so the next turn reads nearly the whole view from the cache. Not
+a ladder of fixed byte offsets, which the marks were before.
+
+A *compaction view* places its rungs differently (`view::trailing_rungs`): at its
+last three block ends. GPT reads an entry only at a mark in the very place an
+earlier request wrote it, with no lookback.
+
+### Built prefix
+The longest start of a *summary tree*'s log over which every node is built
+(`built_prefix_end` in `engine/summary_tree/fold.rs`). A *memory view* replays
+only this prefix, so a longer one extends the shorter one's view exactly.
+Entries past it follow as leaves. Not a *settled* turn, which is a finished
+turn of a thread.
+
+### View snapshot
+The frozen workspace *memory view* that every thread of one budget shares,
+byte for byte, within its epoch (`engine/summary_tree/view.rs`). Entries newer
+than it ride in a recent block after the thread memory view. It rolls over
+when that block passes 8 KB (or half the budget when that is smaller), or
+nearly a cache lookback of lines (`RECENT_LINES`). Its last
+whole block carries a cache breakpoint, so another thread's settled turn does
+not break this thread's cache prefix. A rollover with no batch in between only
+appends, so the next epoch reads the old snapshot from the cache. Held in
+memory: a restart folds afresh.
+
+### Compactor
+The background job that writes *summary tree* nodes on an auxiliary model,
+under the `summary_compaction` purpose (`engine/summary_tree/compactor.rs`).
+A thread leaf starts once fewer than 8 leaves before it are unbuilt
+(`LEAF_WINDOW`). The workspace's leaves build at once, since a turn leaf reads
+only its own turn's entries. It merges only built children, and a ready merge
+launches before a leaf. Each call reads a *compaction view*.
+
+Model calls run in *compactor lanes*. A failed node retries every 10 seconds without
+holding up other scopes. Progress lives in `summary_tree_scopes`, so a restart
+resumes the backfill, and the workspace row's `backfilled_at` is the ready flag. It
+runs exactly while the *memory module* is `tree`: one compactor per engine,
+paused and resumed as the preference changes. A pause clears the ready flag,
+so a workspace switched back reads Classic until the compactor catches up.
+
+### Compaction view
+The context a *compactor* call reads (`engine/summary_tree/compaction_view.rs`,
+OptChat revision 3c190e06 §4). It is a *memory view*'s fold at a smaller budget:
+the *built prefix* on a sawtooth from 32 KB down to 16 KB, then built leaves past
+it within 8 KB. It ends at the node, and never past the first unbuilt leaf. A
+drain keeps one per tree and advances it as the prefix grows, which equals a
+replay. Consecutive calls share all of it but its end, so they read it from the
+prompt cache.
+
+It goes out as view blocks with *rungs*, which the Anthropic and GPT wires both
+mark. Not a *memory view*, which a turn reads. A workspace turn leaf reads its
+thread's raw entries instead.
+
+### Compactor lane
+One provider route's share of *compactor* calls (`summary_tree/limit.rs`),
+keyed `provider/wire id`. It allows 64 calls at once to start, between 1 and
+128. Each success adds `1 / limit`; a rate limit, overload or timeout halves
+it, once per window. A call for a live event takes a freed place before any
+backfill call. Held in memory: a restart starts each lane at 64 again.
+
+### Ready window
+The threads the ready flag waits on besides the workspace tree: those active
+in the last 7 days (`READY_DAYS` in `summary_tree/mod.rs`). Older threads fill
+in after the flag is set, and until then read as raw entries (ADR 0362, I7).
+
+### Compactor models
+`COMPACTOR_MODELS` in `summary_tree/compactor_models.rs`: the models the
+compactor comparison measured, for the *Tree backfill estimate*. Each row has
+its list price, its cache rates, and a token and time seed for every tier the
+comparison measured. Every *compactor default* entry is a row, so the default always has
+a price. No picker reads it: every background picker
+offers the registry's models, its recommended ones first (ADR 0375).
+
+### Compactor default
+The model and tier the *compactor* runs on while `model_summary_compaction` is
+unset: the first of GPT-6.1 Sol, Gemini 3.8 Flash and Sonnet 5.5 that a
+configured provider serves, at `low`, else the chat model. One ordered list in
+`summary_tree/compactor_models.rs` defines it (ADR 0373). The conversation
+summary leads its *auxiliary default* with the same three (ADR 0377).
+`GET /api/v1/models/background` serves the resolved choice.
+
+### Recommended tier
+The tier a background picker badges "Recommended" for a model, and the Start
+Tree modal offers to switch to. Only the compactor has one: each *compactor
+default* entry's tier, sent as `recommended[].effort` by
+`GET /api/v1/models/background`. Every other row sends `null`, since no
+benchmark backs its default tier.
+
+### Auxiliary default
+The model an *auxiliary model call* runs on while its model preference is unset.
+It is `LUCIDOS_EXTRACTION_MODEL` when set and served, except for the command
+judge. Next comes the purpose's *lead*, the models its comparison measured best:
+GPT-5.6 Luna for fact extraction, the *compactor default*'s three for the
+conversation summary, none for the rest (ADR 0377). Then the purpose's catalog
+default when a configured provider serves it. Otherwise it is the first of
+`AUX_FALLBACKS` (Gemini 3 Flash, GPT-5.4 mini, Haiku 4.5) one serves, and with
+none of those, the chat model. The same list is what Settings recommends first.
+
+`engine/aux_purpose/default.rs` defines it, and `GET /api/v1/models/background`
+serves each row's resolution. A stored pick is never replaced by it. For image
+description the list keeps only models with the *vision flag*, and the chat
+model counts only if it has it too. "Serves" excludes a *not-served model*.
+
+### Not-served model
+A model whose provider answered that it has no such model: retired, never
+enabled for the project, or misspelled. The provider leaf returns
+`llm::ModelNotServed`, and only a model-not-found answer counts. An auth,
+quota or path failure does not.
+
+The *auxiliary model call* that met it records `ModelNotServedObserved`. For
+six hours the *auxiliary default* passes over the model on that provider, and
+the call itself retries once on the next recommended model. A stored pick is
+never moved: it fails, Settings marks its row, and a notification names it.
+The router never moves a call to another route of the same model (ADR 0247).
+Decision: ADR 0403.
+
+### Tree backfill
+The *compactor*'s pass over a workspace's history after Tree is chosen. It
+takes the workspace tree first, then threads newest first, and sets the ready
+flag once the workspace and the *ready window* are built. Until then turns run
+Classic; after, the older threads fill in and Settings shows them under Ready.
+Its progress is
+counted in trees, each in-scope thread plus the workspace, and announced as
+`TreeBackfillProgressed`, then `TreeBackfillCompleted`; leaving Tree emits
+`TreeBackfillReset` (`summary_tree::module::TreeBackfill`). Settings shows it
+as a progress bar. The bar also counts the nodes of each tree under way, so a
+long tree still moves it. It says when a failed node retries.
+The first time, Settings shows a *Tree backfill estimate* and asks for a
+confirm. Once nodes are stored, choosing Tree again resumes at once.
+
+### Tree backfill estimate
+What a *Tree backfill* of this workspace would cost, as low and high bounds
+(`summary_tree/estimate.rs`). It counts calls and tokens. Per compactor model
+and reasoning tier, it gives a price and the time until usable and until
+complete. It adds the daily upkeep from the last week's activity. A tier the comparison or the workspace's
+history measured is priced on that measurement; any other tier is a wider range. The entry counts
+are real, read in one pass over `events`. Entry sizes come from stored payload
+sizes, so they are approximate, which is why every figure is a range.
+
+### Recall tools
+The four tools of the Tree *memory module* (ADR 0362): one grouped `recall` LLM
+tool, offered only on a ready Tree workspace, plus `/api/v1/recall/*` and
+`lucidos recall`, from the capability parity manifest. A node id is
+`w/start+span` or `<thread id>/start+span`. The LLM tool takes the slot of
+Classic's `memory` tool, which a ready Tree workspace is not offered.
+
+`zoom(id, n)` opens a node `n` levels down, through turn leaves into thread
+trees and down to the exact event. `find(query)` walks the workspace tree with
+the `MemoryFind` *judgment provider* site, batching about 40 lines per request. `search(text)` is the
+trigram search over message text, returning tree addresses. `date(id)` gives
+the time range a node covers. Code: `engine/summary_tree/recall.rs`,
+`engine/tools/recall.rs`.
+
+### Retired preference key
+A *preference* key that no longer means anything, listed with what a writer
+is told in `RETIRED_KEYS` (`core/preference_catalog.rs`). Every write path
+refuses it, through `refuse_bad_value` in `engine/preferences.rs`, so a stale
+client or agent cannot bring back a row nothing reads. A migration deletes the
+rows stored before it retired. First case: `home_thread_enabled` (ADR 0411).
+
+## When to add a term
+
+Add it here if it's dev-only: engine plumbing, DB schema, test infrastructure, build tooling, CC mechanics. If users (or the workspace LLM) would ever meet it, add it to `system-knowhow/glossary.md` instead. Put it under **Core terms** if it's general, or under **Advanced (coding agents)** if only coding-agent workflows need it.
+
+## When a term changes
+
+Update this file in the same commit that renames or retires the term — same rule as `system-knowhow/glossary.md`. `/harden` flags drift.

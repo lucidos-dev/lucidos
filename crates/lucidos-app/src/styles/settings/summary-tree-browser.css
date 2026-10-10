@@ -1,0 +1,124 @@
+/* Summary tree browser: Settings → System → Memory on the Tree module. */
+.tree-browser-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm) var(--space-md);
+    margin-bottom: var(--space-sm);
+}
+
+.tree-browser-count {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+/* The thread view's Back row takes a line of its own under the tabs. */
+.tree-browser-thread {
+    order: 1;
+    flex-basis: 100%;
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    min-width: 0;
+}
+
+.tree-browser-thread-title {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tree-lines {
+    display: flex;
+    flex-direction: column;
+}
+
+.tree-line {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-sm);
+    width: 100%;
+    padding: 0.375rem 0;
+    border: none;
+    background: none;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.tree-line:focus-visible {
+    /* Transparent outline is the forced-colors fallback (box-shadow is stripped). */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+.tree-line-chevron {
+    --disclosure-chevron-size: 0.75rem;
+    flex-shrink: 0;
+    width: 1rem;
+    height: 1.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+}
+
+.tree-line-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+    min-width: 0;
+    flex: 1;
+}
+
+.tree-line-meta {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-sm);
+}
+
+.tree-line-span {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    padding: 0.0625rem 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+    white-space: nowrap;
+}
+
+.tree-line-date {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+.tree-line-text {
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    white-space: pre-line;
+    word-break: break-word;
+}
+
+/* A neutral guide line down the opened children, not an accent stripe. */
+.tree-line-children {
+    margin-left: var(--space-sm);
+    padding-left: var(--space-md);
+    border-left: 1px solid var(--border-color);
+}
+
+.tree-line-source {
+    margin: var(--space-xs) 0 var(--space-sm) 1.5rem;
+}
+
+.tree-line-note {
+    padding: 0.375rem 0 0.375rem 1.5rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}

@@ -1,0 +1,247 @@
+/// Canonical tool name constants — single source of truth for all tool name strings.
+/// Used by tool definitions (llm/tools/), tool dispatch (execute_tool, handle_special_tool),
+/// and the agentic loop for caching/circuit-breaker checks.
+// File operations
+pub const READ_FILE: &str = "read_file";
+pub const WRITE_FILE: &str = "write_file";
+pub const EDIT_FILE: &str = "edit_file";
+pub const LIST_FILES: &str = "list_files";
+pub const GLOB_FILES: &str = "glob_files";
+pub const GREP_FILES: &str = "grep_files";
+pub const COPY_FILE: &str = "copy_file";
+pub const DELETE_FILE: &str = "delete_file";
+
+// Execution
+pub const RUN_PYTHON: &str = "run_python";
+pub const RUN_PYTHON_BACKGROUND: &str = "run_python_background";
+pub const RUN_BASH: &str = "run_bash";
+pub const RUN_BASH_BACKGROUND: &str = "run_bash_background";
+pub const BASH_OUTPUT: &str = "bash_output";
+pub const BASH_KILL: &str = "bash_kill";
+
+// Browser
+pub const BROWSER_OPEN: &str = "browser_open";
+pub const BROWSER_EXTRACT: &str = "browser_extract";
+pub const BROWSER_CLICK: &str = "browser_click";
+pub const BROWSER_TYPE: &str = "browser_type";
+pub const BROWSER_EVAL: &str = "browser_eval";
+pub const BROWSER_SCREENSHOT: &str = "browser_screenshot";
+pub const BROWSER_CLOSE: &str = "browser_close";
+pub const BROWSER_FORGET_LOGIN: &str = "browser_forget_login";
+pub const BROWSER_CLEAR_DATA: &str = "browser_clear_data";
+
+// Web
+pub const WEB_SEARCH: &str = "web_search";
+pub const FETCH_NEWS: &str = "fetch_news";
+pub const HTTP_REQUEST: &str = "http_request";
+pub const PROXY_REQUEST: &str = "proxy_request";
+pub const RELOAD_PROXY_MODULES: &str = "reload_proxy_modules";
+
+// Email
+pub const SEND_EMAIL: &str = "send_email";
+pub const READ_EMAILS: &str = "read_emails";
+pub const READ_EMAIL: &str = "read_email";
+pub const CONFIGURE_EMAIL: &str = "configure_email";
+pub const SAVE_EMAIL_ATTACHMENT: &str = "save_email_attachment";
+
+// Import
+pub const IMPORT_FILE: &str = "import_file";
+pub const GIT_CLONE: &str = "git_clone";
+
+// Triggers — grouped `triggers` tool (create/list/update/delete/pause/resume),
+// built from the capability parity manifest. The flat per-verb names below stay
+// as back-compat aliases that dispatch to the same handler. See
+// `crate::capability_manifest`.
+pub const TRIGGERS: &str = "triggers";
+pub const CREATE_TRIGGER: &str = "create_trigger";
+pub const LIST_TRIGGERS: &str = "list_triggers";
+pub const UPDATE_TRIGGER: &str = "update_trigger";
+pub const DELETE_TRIGGER: &str = "delete_trigger";
+pub const PAUSE_TRIGGER: &str = "pause_trigger";
+pub const RESUME_TRIGGER: &str = "resume_trigger";
+pub const RUN_TRIGGER: &str = "run_trigger";
+
+// Trigger groups (user-visible folders that organize triggers in the panel) —
+// grouped `trigger_groups` tool (list/create/rename/reorder/delete) from the
+// manifest; flat names below are back-compat aliases.
+pub const TRIGGER_GROUPS: &str = "trigger_groups";
+pub const LIST_TRIGGER_GROUPS: &str = "list_trigger_groups";
+pub const CREATE_TRIGGER_GROUP: &str = "create_trigger_group";
+pub const RENAME_TRIGGER_GROUP: &str = "rename_trigger_group";
+pub const REORDER_TRIGGER_GROUPS: &str = "reorder_trigger_groups";
+pub const DELETE_TRIGGER_GROUP: &str = "delete_trigger_group";
+
+// Preferences — grouped `preferences` tool (get/set) from the manifest. The
+// flat get_preferences/set_preference names stay as back-compat aliases.
+// (set_preference folds in the former set_language / set_timezone /
+// enable_push_notifications tools; the catalog of settable keys lives in
+// core/preference_catalog.rs.)
+pub const PREFERENCES: &str = "preferences";
+pub const SET_PREFERENCE: &str = "set_preference";
+pub const GET_PREFERENCES: &str = "get_preferences";
+pub const GET_BACKUP_STATUS: &str = "get_backup_status";
+// Grouped env-var tool (list/set/delete). `set_environment_variable` stays wired
+// as a back-compat alias to the `set` action.
+pub const ENV_VARS: &str = "env_vars";
+pub const WIDGETS: &str = "widgets";
+pub const SET_ENVIRONMENT_VARIABLE: &str = "set_environment_variable";
+
+// Credentials & OAuth
+pub const REQUEST_CREDENTIAL: &str = "request_credential";
+pub const CONNECT_OAUTH_ACCOUNT: &str = "connect_oauth_account";
+
+// Apps (successor to Skills)
+pub const CREATE_APP: &str = "create_app";
+pub const LIST_APPS: &str = "list_apps";
+pub const EXECUTE_INTENT: &str = "execute_intent";
+pub const LOAD_KNOWHOW: &str = "load_knowhow";
+
+// App UI (handled by handle_special_tool)
+pub const REFRESH_APP: &str = "refresh_app";
+pub const CAPTURE_APP: &str = "capture_app";
+
+// Fan-out / child threads (handled by handle_special_tool)
+pub const RUN_CODING_AGENT: &str = "run_coding_agent";
+pub const RUN_CLAUDE_LEGACY: &str = "run_claude";
+pub const RUN_THREAD: &str = "run_thread";
+/// Redirect a child thread this thread already spawned. Standalone rather than
+/// a `threads` action per the hot-single-purpose guardrail: it is the third
+/// member of the run_thread / run_coding_agent family, and the `threads` domain
+/// is an introspection tool whose summary opens "Introspect threads", where a
+/// model that just called `run_thread` would not look for a write verb.
+pub const FOLLOW_UP_CHILD_THREAD: &str = "follow_up_child_thread";
+
+// Memory — grouped `memory` tool (correct/correct_by_id) from the capability
+// parity manifest; the flat names below stay as back-compat aliases. (The CLI's
+// read ops — stats/entries/source — have no LLM tool.)
+pub const MEMORY: &str = "memory";
+pub const CORRECT_MEMORY: &str = "correct_memory";
+pub const CORRECT_MEMORY_BY_ID: &str = "correct_memory_by_id";
+pub const SEARCH_MEMORY: &str = "search_memory";
+pub const MEMORY_SOURCE: &str = "memory_source";
+
+// Recall: the grouped `recall` tool of the Tree memory module (ADR 0362). The
+// per-action names are the handler keys the manifest dispatches through.
+pub const RECALL: &str = "recall";
+pub const RECALL_ZOOM: &str = "recall_zoom";
+pub const RECALL_FIND: &str = "recall_find";
+pub const RECALL_SEARCH: &str = "recall_search";
+pub const RECALL_DATE: &str = "recall_date";
+
+// Events: the grouped `events` tool (emit/query/count/event_types) from the
+// capability parity manifest. The flat per-verb names below stay as back-compat
+// aliases.
+pub const EVENTS: &str = "events";
+pub const EMIT_EVENT: &str = "emit_event";
+pub const QUERY_EVENTS: &str = "query_events";
+pub const COUNT_EVENTS: &str = "count_events";
+pub const LIST_EVENT_TYPES: &str = "list_event_types";
+
+// The grouped `threads` tool from the capability parity manifest: thread
+// reads, moving a child to top level, archiving, and thread triage. Its
+// actions are list, count, drafts, held_messages, search, detach_child,
+// archive, triage and apply_triage. The flat names below are their dispatch
+// aliases. Spawning stays with the standalone run_thread and run_coding_agent.
+pub const THREADS: &str = "threads";
+pub const LIST_THREADS: &str = "list_threads";
+pub const COUNT_THREADS: &str = "count_threads";
+pub const SEARCH_THREADS: &str = "search_threads";
+pub const LIST_DRAFTS: &str = "list_drafts";
+pub const LIST_HELD_MESSAGES: &str = "list_held_messages";
+pub const DETACH_CHILD_THREAD: &str = "detach_child_thread";
+pub const ARCHIVE_THREAD: &str = "archive_thread";
+pub const TRIAGE_THREADS: &str = "triage_threads";
+pub const APPLY_THREAD_TRIAGE: &str = "apply_thread_triage";
+
+// Changes (pending coding-agent-proposed changes) — grouped `changes` tool
+// (list/apply) from the capability parity manifest; flat names below are aliases.
+pub const CHANGES: &str = "changes";
+pub const LIST_CHANGES: &str = "list_changes";
+pub const APPLY_CHANGE: &str = "apply_change";
+/// Arm a *standing apply* on one change: it applies when its thread settles,
+/// waiting through an event wait. It drops with a report if the thread parks
+/// on a question or fails (ADR 0168 clause 5, ADR 0266).
+pub const APPLY_WHEN_SETTLED: &str = "apply_when_settled";
+/// Arm the sweep: apply everything pending that has settled, and keep going as
+/// the threads still settling land theirs.
+pub const APPLY_AS_THEY_SETTLE: &str = "apply_as_they_settle";
+/// Take a *standing apply* back: one thread's, or every one in the workspace.
+/// The off for both arms above (philosophy rule 2: prompt-first).
+pub const CANCEL_STANDING_APPLY: &str = "cancel_standing_apply";
+/// Keep a pending change for later, out of Review and Apply All (ADR 0328).
+pub const SET_ASIDE_CHANGE: &str = "set_aside_change";
+/// Return a set-aside change to pending.
+pub const BRING_BACK_CHANGE: &str = "bring_back_change";
+
+// Thread Queue (background admission-control policy + live queue) — grouped
+// `thread_queue` tool (list/update_policy) from the capability parity manifest;
+// the flat names below stay as back-compat aliases. (run-now/drop are CLI-only.)
+pub const THREAD_QUEUE: &str = "thread_queue";
+pub const LIST_THREAD_QUEUE: &str = "list_thread_queue";
+pub const UPDATE_THREAD_QUEUE_POLICY: &str = "update_thread_queue_policy";
+
+// Todo list (Lucidos Agent's runtime progress visibility — chat + trigger surfaces only)
+pub const TODO_WRITE: &str = "todo_write";
+
+// Notifications & UI
+pub const SEND_NOTIFICATION: &str = "send_notification";
+/// Grouped notification-inbox tool (list / mark_read / mark_all_read), built
+/// from the capability parity manifest. See `crate::capability_manifest`.
+pub const NOTIFICATIONS: &str = "notifications";
+/// Retired flat list-only tool name; still dispatches to the grouped handler
+/// (action defaults to `list`) for back-compat. See `Domain::llm_aliases`.
+pub const READ_NOTIFICATIONS: &str = "read_notifications";
+pub const NAVIGATE_UI: &str = "navigate_ui";
+pub const ASK_USER_QUESTION: &str = "ask_user_question";
+/// Subscribe to an event and be re-opened as a new turn when it arrives. Returns
+/// immediately and does not end the turn. See `engine::event_wait` and ADR 0047.
+pub const AWAIT_EVENT: &str = "await_event";
+/// Read the calling thread's own live subscriptions. The answer to "is that
+/// watch still armed?", which the agent previously had no way to get right.
+pub const LIST_EVENT_WAITS: &str = "list_event_waits";
+/// Stand one of the calling thread's own subscriptions down, or all of them.
+/// The revoke half of `await_event`: without it an agent told to stop watching
+/// had to admit the subscription would re-open it later regardless.
+pub const CANCEL_EVENT_WAIT: &str = "cancel_event_wait";
+/// Ask the user to read this thread's latest reply: once the turn ends, the
+/// drawer lists the thread under Review until they have seen it (ADR 0409).
+/// Scoped to the calling thread, like the event-wait tools.
+pub const REQUEST_READ: &str = "request_read";
+
+/// Ask a judgment provider a set of typed questions about one state.
+///
+/// Named for the capability rather than for Jev, because `llm::judgment` is
+/// backend-neutral and a second backend must need no rename.
+pub const JUDGE: &str = "judge";
+
+// Image generation
+pub const GENERATE_IMAGE: &str = "generate_image";
+pub const SAVE_THREAD_IMAGE: &str = "save_thread_image";
+// Pull an image posted earlier in the thread back into the model's vision.
+pub const VIEW_IMAGE: &str = "view_image";
+
+// MCP server management — grouped `mcp` tool (setup/list/start/stop/remove) from
+// the capability parity manifest; the flat per-verb names below stay as
+// back-compat aliases that dispatch to the same handler.
+pub const MCP: &str = "mcp";
+pub const SETUP_MCP_SERVER: &str = "setup_mcp_server";
+pub const LIST_MCP_SERVERS: &str = "list_mcp_servers";
+pub const START_MCP_SERVER: &str = "start_mcp_server";
+pub const STOP_MCP_SERVER: &str = "stop_mcp_server";
+pub const REMOVE_MCP_SERVER: &str = "remove_mcp_server";
+
+// Repository management
+pub const MANAGE_REPOSITORIES: &str = "manage_repositories";
+
+// Model registry management (chat model picker — add/enable/disable/remove)
+pub const MANAGE_MODELS: &str = "manage_models";
+
+// Plugins — grouped `plugins` tool (install/register_marketplace/check_updates/
+// update/uninstall) from the capability parity manifest; the flat per-verb names
+// below stay as back-compat aliases that dispatch to the same handler.
+pub const PLUGINS: &str = "plugins";
+pub const INSTALL_PLUGIN: &str = "install_plugin";
+pub const REGISTER_PLUGIN_MARKETPLACE: &str = "register_plugin_marketplace";
+pub const CHECK_PLUGIN_UPDATES: &str = "check_plugin_updates";
+pub const UPDATE_PLUGIN: &str = "update_plugin";
+pub const UNINSTALL_PLUGIN: &str = "uninstall_plugin";
