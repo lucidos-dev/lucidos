@@ -1,0 +1,2196 @@
+/* ThreadDrawer inside ThreadPane — mobile only, hidden on desktop */
+.thread-pane > .thread-drawer {
+    display: none;
+}
+
+/* thread-pane-body wrapper — transparent on desktop */
+.thread-pane-body {
+    display: contents;
+}
+
+/* Wrapper for the compose destination picker (picker row + caption + hint) */
+.input-toggles-wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.25rem;
+    width: 100%;
+    padding: 0.375rem 0 0.375rem 0.125rem;
+    transition: opacity var(--duration-slow) ease;
+}
+
+/* Fade out wrapper when transitioning to a focused thread */
+.input-toggles-wrapper.fading-out {
+    opacity: 0;
+    position: absolute;
+    width: 100%;
+    pointer-events: none;
+}
+
+/* On desktop the dropdown keeps its label's width: .input-toggles-wrapper's
+   align-items: flex-start sizes every child to its own content. */
+.compose-destination-row {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    max-width: 100%;
+}
+
+.compose-destination-row .compose-destination-picker {
+    margin-bottom: 0;
+    flex-shrink: 1;
+    min-width: 0;
+}
+
+.compose-destination-row .compose-destination-picker .dropdown-trigger {
+    min-width: 0;
+}
+
+/* On a phone the label alone nearly spans the pane, so a content-width
+   dropdown ends just short of .prompt-box's edge and reads as misaligned.
+   There the row stretches to the wrapper's width and the picker fills it. The
+   coding-agent chip keeps its content width (flex-shrink: 0), so the picker
+   absorbs the stretch. */
+@media (--phone-layout) {
+    .compose-destination-row {
+        width: 100%;
+        align-self: stretch;
+    }
+
+    .compose-destination-row .compose-destination-picker {
+        flex: 1 1 auto;
+    }
+
+    .compose-destination-row .compose-destination-picker .dropdown-trigger {
+        width: 100%;
+        justify-content: space-between;
+    }
+}
+
+.compose-destination-row .compose-destination-picker .dropdown-sizer > * {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.compose-coding-agent-chip {
+    flex-shrink: 0;
+}
+
+.compose-destination-caption {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+/* The composer column. Width + centering match the transcript's turns
+   (`.thread-content > *`, also capped at --content-max-width and centered), and
+   the --turn-body-inset padding reproduces the inset a turn puts between that
+   box and its visible content (.initiator-panel / .initiator-body / .response-
+   content). So the composer box's left and right edges land exactly on the
+   message text, question cards and user bubbles above it, on every pane width:
+   below the cap both are gutter-to-gutter, above it both are the same centered
+   50rem box. Whatever the transcript's scroll gutter takes on the right is
+   already subtracted by .prompt-area's padding. */
+.prompt-input-container {
+    width: 100%;
+    max-width: var(--content-max-width);
+    margin: 0 auto;
+    padding-inline: var(--turn-body-inset);
+    position: relative;
+}
+
+/* Above the prompt box, edge to edge with it: why the focused thread's work
+   is not ready, where Apply would otherwise be (ADR 0400). */
+.not-ready-strip {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.375rem;
+    padding: 0.375rem 0.5rem 0.375rem 0.75rem;
+    border: 1px solid var(--accent-orange);
+    border-radius: calc(var(--radius-control) * 0.75);
+    font-size: var(--font-size-xs);
+    font-family: var(--font-ui);
+}
+
+.not-ready-strip-reason {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0;
+    border: none;
+    background: none;
+    text-align: left;
+    color: var(--accent-orange);
+    cursor: pointer;
+}
+
+.not-ready-strip-icon {
+    width: 0.875rem;
+    height: 0.875rem;
+    flex-shrink: 0;
+}
+
+.not-ready-strip-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.not-ready-strip-label {
+    font-weight: 500;
+}
+
+.not-ready-strip-hint {
+    color: var(--text-secondary);
+}
+
+.url-context-pill {
+    padding: 0.25rem 0.625rem;
+    margin-bottom: 0.375rem;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-radius: calc(var(--radius-control) * 2);
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    cursor: default;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    max-width: 100%;
+}
+.url-context-pill svg {
+    flex-shrink: 0;
+    opacity: 0.7;
+}
+.url-context-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Side-question mode: Send asks the box as a side question. The × leaves it. */
+.side-question-mode-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-bottom: 0.375rem;
+    padding: 0.125rem 0.125rem 0.125rem 0.625rem;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-radius: calc(var(--radius-control) * 2);
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}
+.side-question-mode-leave {
+    width: 1.25rem;
+    height: 1.25rem;
+    padding: 0;
+}
+
+.image-preview-strip {
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.5rem 0;
+    flex-wrap: wrap;
+}
+
+.image-preview-item {
+    position: relative;
+    width: 5rem;
+    height: 5rem;
+    border-radius: calc(var(--radius-surface) * 0.5);
+    border: 1px solid var(--border-color);
+}
+
+.image-preview-thumb {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    cursor: pointer;
+    border-radius: calc(var(--radius-surface) * 5 / 12);
+    overflow: hidden;
+}
+
+/* Overlay close button for image thumbnails */
+.image-preview-remove {
+    position: absolute;
+    top: -0.375rem;
+    right: -0.375rem;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: var(--radius-round);
+    background: rgba(0, 0, 0, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    color: #fff;
+    padding: 0;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.image-preview-remove svg {
+    width: 0.75rem;
+    height: 0.75rem;
+}
+
+@media (hover: hover) {
+    .image-preview-remove:hover {
+        background: var(--accent-red);
+        color: white;
+        border-color: var(--accent-red);
+    }
+}
+
+/* A pending upload (`PendingUploadChip`): a scrim over the thumbnail with a
+   progress ring or an action. White on a dark scrim, because it sits over
+   image content whatever the theme. */
+.image-preview-pending-failed {
+    border-color: var(--accent-red);
+}
+
+.upload-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.125rem;
+    padding: 0;
+    border: 0;
+    border-radius: calc(var(--radius-surface) * 5 / 12);
+    background: rgba(0, 0, 0, 0.45);
+    color: #fff;
+    /* Taps reach the thumbnail underneath, which opens the preview. */
+    pointer-events: none;
+}
+
+.upload-caption {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+}
+
+/* No `transform` here: `@keyframes spin` declares only its `to` frame, so a
+   base transform becomes the start frame and every turn snaps back. The bar
+   starts at twelve o'clock through its own SVG `transform` instead. */
+.upload-ring {
+    width: 1.75rem;
+    height: 1.75rem;
+}
+
+.upload-ring circle {
+    fill: none;
+    stroke-width: 3;
+}
+
+.upload-ring-track {
+    stroke: rgba(255, 255, 255, 0.3);
+}
+
+.upload-ring-bar {
+    stroke: #fff;
+    stroke-linecap: round;
+    transition: stroke-dashoffset var(--duration-normal) ease;
+}
+
+/* A wait of unknown length turns. An indefinite animation keeps a literal
+   duration (frontend-css.md). */
+.upload-ring-spin {
+    animation: spin 1s linear infinite;
+}
+
+:root[data-motion="reduce"] .upload-ring-spin {
+    animation: none;
+}
+
+.upload-retry,
+.upload-refused {
+    background: rgba(0, 0, 0, 0.6);
+    pointer-events: auto;
+}
+
+.upload-retry {
+    cursor: pointer;
+}
+
+.upload-retry svg,
+.upload-refused svg {
+    width: var(--icon-size-lg);
+    height: var(--icon-size-lg);
+}
+
+/* What a send is waiting on, or why it did not go (`uploadSendNotice`). */
+.upload-send-notice {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    margin-bottom: 0.375rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+.upload-send-notice-blocked {
+    color: var(--accent-red);
+}
+
+.upload-send-notice svg {
+    flex-shrink: 0;
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+/* User image thumbnails in chat exchange */
+.user-images {
+    display: flex;
+    gap: 0.375rem;
+    margin-top: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.user-image-thumb {
+    width: 5rem;
+    height: 5rem;
+    object-fit: cover;
+    border-radius: calc(var(--radius-surface) / 3);
+    border: 1px solid var(--border-color);
+    cursor: pointer;
+    /* Skeleton-toned fill so the loading <img> doesn't show the dark page
+       background through it (the visible "black flash" on iOS PWA when
+       the preview re-fetches after HTTP-cache eviction). */
+    background-color: var(--bg-tertiary);
+}
+
+/* Generated image inline in response */
+.generated-image {
+    margin: 0.75rem 0;
+}
+
+/* The textarea's own row, and it holds nothing else: the clear button used to
+   sit here as a second flex item pinned to the top-right corner, and moved to
+   the prompt row below (see PromptInput.tsx). So no `gap` and no
+   `align-items` here any more, both of which only ever described that pair. The
+   flex context itself stays, because `.prompt-row .prompt-textarea` is
+   `flex: 1`, and so does the wrapper: every composer-specific textarea rule
+   (this file's two below, mobile.css's iOS-zoom font-size floor,
+   e2e/prompt-transcript-alignment.spec.ts's selector) keys off `.prompt-row` to
+   miss the trigger form's Intent field, which is a `.prompt-box` without one. */
+.prompt-row {
+    display: flex;
+    position: relative;
+}
+
+/* `.prompt-row` wraps the textarea in the CHAT composer only; the trigger form's
+   Intent field sits directly in `.prompt-box`. So this is where the composer's
+   own type scale belongs, rather than on the shared `.prompt-box` shell where it
+   used to sit and leak into the form. */
+.prompt-row .prompt-textarea {
+    flex: 1;
+    font-size: var(--font-size-lg);
+}
+
+/* Put the typed text on the same content edge as a question card's text, the
+   surface the composer docks under. That edge is --turn-surface-inset from
+   .prompt-box's outer edge, so the box's own border is subtracted here
+   (base.css). The shared shell's `padding: 0.5rem 1rem` (panels/previews.css)
+   carried a wider inset than a card's, which left the composer's text a few px
+   right of the card text directly above it even with the two boxes edge-aligned
+   to the pixel. Only the horizontal half is overridden; the vertical 0.5rem
+   stays with the shell, and the trigger form's Intent field (no `.prompt-row`)
+   keeps the shell's padding untouched.
+
+   Two things about this selector are deliberate:
+   - The leading `.prompt-box` is redundant for MATCHING (`.prompt-row` only ever
+     renders inside one) and is there purely for specificity: the shell's rule is
+     a `padding` SHORTHAND at the same 0,2,0 as `.prompt-row .prompt-textarea`,
+     so without the extra class this override only wins because chat.css is
+     imported after panels.css in main.tsx. Reordering those imports would
+     silently put the composer's text back off the card edge.
+   - It is a SEPARATE rule rather than a third declaration on the block above,
+     because raising that block to 0,3,0 would also shadow mobile.css's
+     `.prompt-row .prompt-textarea { font-size: 0.9rem }` (0,2,0), which is
+     pinned ≥16px so focusing the composer doesn't trigger iOS Safari's input
+     zoom. Keep the font-size at 0,2,0 and only the padding here. */
+.prompt-box .prompt-row .prompt-textarea {
+    padding-inline: calc(var(--turn-surface-inset) - var(--prompt-box-border-width));
+}
+
+/* The composer declares NO resting height of its own, on either breakpoint. It
+   rests at the shared shell's floor (panels/previews.css, with a shorter
+   mobile.css value): a line plus the box's padding, and a little slack over
+   that on a desktop pane. It grows on typing, which resizeTextarea does.
+   A multi-line floor here is a settled no, see docs/adr/0221. */
+
+/* `.prompt-clear` intentionally has NO rule of its own. It is one of the prompt
+   row's icons now, so `.icon-btn.header-icon` sizes and colours it and the nudge
+   below aligns it, exactly as for the three buttons beside it. The class is kept
+   purely as the selector the drafts e2e clicks. Giving it a size or a colour
+   here is what re-forks it from its neighbours, which is the defect the move
+   removed: see the guard in
+   components/chat/__tests__/composer-single-right-anchor.test.ts. */
+
+.prompt-actions-row {
+    display: flex;
+    align-items: flex-end;
+    padding: 0 0.75rem 0.5rem 0.5rem;
+    /* Anchor for absolutely-positioned fade-out children. The row width is
+     * stable across cluster reflows, unlike .prompt-actions-right (which has
+     * margin-left:auto and shifts when its leftmost child leaves flow). */
+    position: relative;
+}
+
+/* NOTHING IN THIS ROW MAY SHRINK, and that is what makes the fold honest.
+ *
+ * The fold measures each member's laid-out width and folds until the row fits.
+ * A member that can be squeezed reports a width smaller than it needs, so the
+ * measurement concludes the row fits while a label spills off the screen. That
+ * is what shipped: `.action-btn` sets `min-width: 3.5rem`, which REPLACES a
+ * flex item's automatic min-content floor, so an Archive button shrank to
+ * 3.5rem and its `white-space: nowrap` label ran past the screen edge.
+ *
+ * With no shrink anywhere, a laid-out width IS the member's true width, and a
+ * false reading stops being representable. Pinned by
+ * styles/__tests__/prompt-row-one-row-guard.test.ts.
+ *
+ * Every descendant, not just the row's own children: `.prompt-actions-right`
+ * is a flex container, so its buttons would shrink inside it. */
+.prompt-actions-row > *,
+.prompt-actions-right > * {
+    flex-shrink: 0;
+}
+
+.image-attach-anchor {
+    position: relative;
+}
+
+/* Center-align the 2.25rem image icon with the shorter action buttons:
+ * shift its visual box ~6px down so the SVG center matches the action
+ * button center. Tap area moves with it but stays inside the row's
+ * 0.5rem bottom padding. */
+.prompt-actions-row .icon-btn.header-icon {
+    transform: translateY(0.375rem);
+}
+
+/* An icon in the RIGHT-hand group (the standing apply, and Diff beside it) has
+ * to undo both halves of the rule above, because that group is laid out the
+ * other way round: it centres its own children rather than sitting them on the
+ * row's flex-end, and it is only as tall as a 1.5rem `.action-btn` beside a
+ * 1.625rem send button.
+ *
+ * So the transform would push the glyph below its neighbours instead of level
+ * with them. And the 2.25rem tap target would become the group's height, which
+ * lifts the send button 5px the moment a standing apply appears and drops it
+ * again when it goes. The negative block margins hand that box back the
+ * 0.375rem it takes at each end, so the target overhangs the group instead of
+ * setting its height, and the glyph lands where the pill it replaced sat.
+ *
+ * Same specificity as the rule above, so this must stay after it. */
+.prompt-actions-right .icon-btn.header-icon {
+    transform: none;
+    margin-block: -0.375rem;
+}
+
+/* The prompt row's TOGGLES in their on-state. Each already carried `.active`
+ * and `aria-pressed`, and `.active` styled nothing at all, so the WIP toggle
+ * announced its state to a screen reader and to nobody else.
+ *
+ * They take DIFFERENT on-state paints, so each is selected by its own
+ * `data-role` rather than by a shared `.active` (which would have to be a
+ * negation to tell them apart, and would read as a rule about the follow toggle
+ * while styling the other one). A new toggle in this row therefore has to opt
+ * into one of the shapes below; it inherits none of them by accident.
+ *
+ * WIP PREVIEW: framed, the same paint as `.icon-btn.filter-active`
+ * (host-components.css). Not a blanket `.icon-btn.active`, which would also
+ * frame `.pin-thread-btn.active`, whose own rule takes the accent and NO frame
+ * on purpose. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="wip-preview-toggle"] {
+    color: var(--accent);
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-control) * 0.75);
+}
+
+@media (hover: hover) {
+    .prompt-actions-row .icon-btn.header-icon.active[data-role="wip-preview-toggle"]:hover {
+        background: var(--bg-quaternary);
+        color: var(--accent);
+    }
+}
+
+/* FOLLOW: the `.pin-thread-btn.active` shape instead, accent only and no frame.
+ * Following the live edge is a standing mode that is on for most of a thread's
+ * life, and a filled box held down that long at the end of a row of otherwise
+ * unframed icons reads as a button jammed in rather than as a mode. The accent
+ * and the magnet's own fill carry the state, the fill for looks whose accent is
+ * the text colour (Mono). The ordinary `.icon-btn:hover` background still
+ * applies transiently, like every icon-btn. No hover override is needed to keep
+ * the accent: this selector (0,5,0) already outranks `.icon-btn:hover` (0,2,0),
+ * so the color holds under the pointer. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="follow-live-edge"] {
+    color: var(--accent);
+}
+
+/* WAITING: the follow toggle's shape again, accent only and no frame, but with
+ * no `.active` to hang it on. The waiting indicator is not a toggle: it renders
+ * only while the thread is parked on a subscription or on a sub-thread, so its
+ * presence IS the on-state and there is no second state to tell apart.
+ *
+ * The token is `--accent`, deliberately, and not `--accent-notable`, the
+ * neutral tone this palette keeps for a waiting STATUS. This is the armed thing
+ * behind the status, so it reads with the row's other live modes. */
+.prompt-actions-row .icon-btn.header-icon[data-role="waiting-indicator"] {
+    color: var(--accent);
+}
+
+/* CALL: a third shape, and the only one in this row that is not blue.
+ *
+ * The two above are modes the reader arms and forgets. A call is neither: it
+ * holds the microphone open and it is spending money, so it says so for as long
+ * as it runs.
+ *
+ * GREEN is a call that is up, the whole way through, which is what every
+ * presence light means. RED is the hang-up. It appears under the POINTER only,
+ * where it is a promise about the press rather than a claim about the call
+ * (ADR 0209). The hover rules sit at the end of the phase group below, so one
+ * promise beats every phase's own paint.
+ *
+ * Framed, like the WIP toggle, because a call is temporary and wants the box. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"] {
+    color: var(--accent-green);
+    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
+    border-radius: calc(var(--radius-control) * 0.75);
+}
+
+/* CALL PHASES. The rule above is the LIVE paint, and it was the only one a
+ * call had. It covered four phases, two of which are work rather than a steady
+ * mode: the connect takes seconds and the hang-up takes a network round trip.
+ * Both read as a dead press, and a caller reported exactly that.
+ *
+ * So each phase paints itself, off the `data-call-phase` the toggle carries.
+ * Three rules hold across all of them.
+ *
+ * The BOX never moves. Every phase paints colour, opacity or a transform, so a
+ * floor flip reflows no part of the prompt actions row. No phase draws a ring
+ * or any other mark of its own, and that is settled: see ADR 0207 before
+ * proposing one.
+ *
+ * MOTION is the honest signal for work, and it is never the only one. Each
+ * transitional phase rests at a brightness of its own as well as a colour, so
+ * the reduced-motion block at the end of this group takes the movement away and
+ * leaves the state legible.
+ *
+ * The glyph moves, never the button. An animation on the button would take its
+ * hover background and its focus ring with it, so a keyboard user would watch
+ * the ring fade in and out (the same call as the todo indicator's waiting
+ * pulse, chat/todo-list.css). */
+
+/* CONNECTING: arriving. It names no colour of its own, because the live paint
+ * above is already the green a call is placed in on every phone. What it adds
+ * is the pulse, so the wait reads as work while the microphone opens and the
+ * session comes up.
+ *
+ * A fade with a breath of swell behind it, gentle enough to read as the handset
+ * breathing rather than as a glyph blinking.
+ *
+ * The 0.7 is the RESTING look, which shows whenever the animation is off: the
+ * reduced-motion reader, and the dwelt connect below. It sits here rather than
+ * in the reduced-motion rule so the dwelt rule can beat it on source order and
+ * hand the glyph back at full. */
+.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="connecting"] svg {
+    opacity: 0.7;
+    /* Indefinite, so it carries a literal duration and no `--duration-*`
+       token: an activity indicator does not ride the animation-speed scale.
+       See .claude/rules/frontend-css.md. */
+    animation: call-toggle-connect-pulse 1.2s ease-in-out infinite;
+}
+
+/* CONNECTING, DWELT: the connect has run long enough that the browser is
+ * probably holding a microphone prompt in front of the reader. We are waiting
+ * on them, not the other way round, so the control stops claiming progress.
+ *
+ * `--accent-notable`, the tone this palette keeps for waiting, and NOT
+ * `--accent-yellow`, which is the caution tone. A browser asking permission is
+ * not a caution, and the todo indicator made the same call beside this row
+ * (chat/todo-list.css).
+ *
+ * The pulse stops and the glyph comes up to FULL, where the pulsing connect
+ * rests dim. A control at full and holding still is not mid-progress, and that
+ * is what tells this from the plain connect once the motion is gone. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-wait] {
+    color: var(--accent-notable);
+    background: color-mix(in srgb, var(--accent-notable) 15%, transparent);
+}
+
+.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-wait] svg {
+    opacity: 1;
+    animation: none;
+}
+
+/* SPEAKING: Lucidos has the floor, so the tint deepens and the glyph breathes.
+ * Deliberately no badge and no second glyph: this is one control in a row of
+ * five, and a mark appearing inside it would read as a light show.
+ *
+ * The deeper fill is the whole difference at rest, which is what keeps the two
+ * live phases apart with the motion taken away. LISTENING adds nothing at all:
+ * the caller has the floor, and a control at rest is what says so. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="speaking"] {
+    background: color-mix(in srgb, var(--accent-green) 35%, transparent);
+}
+
+.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="speaking"] svg {
+    /* Indefinite, so it takes a literal duration and no token, as above. */
+    animation: call-toggle-floor 1.4s ease-in-out infinite;
+}
+
+/* ENDING: leaving, and the one phase with no press left in it. `ringOff`
+ * returns the state unchanged, so the control reads as spent: the green drains
+ * to the muted grey, the frame fades with it, and the glyph pulses on the
+ * app's own waiting keyframes.
+ *
+ * It rests DIMMER than the connect, and the frame all but drains away, which is
+ * what tells the two apart once the motion is gone. One is being placed, the
+ * other is running down. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="ending"] {
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--accent-green) 8%, transparent);
+    cursor: default;
+}
+
+.prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="ending"] svg {
+    /* Indefinite, so it takes a literal duration and no token, as above. */
+    animation: progress-pulse 2s ease-in-out infinite;
+}
+
+/* THE POINTER SAYS WHAT A PRESS DOES, and it says the same thing in every phase
+   a press can end: red, the hang-up colour on every phone ever made. The call
+   itself stays green throughout, so red is never a claim that anything is wrong
+   (ADR 0209).
+
+   This block sits after every phase above, because the tie is settled on
+   source order: a phase's own paint carries the same weight as the shared
+   hover. Declared earlier, the promise would lose to the connect's and the
+   dwell's tones, and it would hold in some phases and not others.
+
+   The hover also has to override `.icon-btn:hover`'s own background. Left to
+   that rule, the tinted frame vanishes under the pointer at the moment the
+   reader is aiming at it. */
+@media (hover: hover) {
+    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"]:hover {
+        color: var(--accent-red);
+        background: color-mix(in srgb, var(--accent-red) 25%, transparent);
+    }
+
+    /* Deeper, so the floor still reads under the pointer. */
+    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="speaking"]:hover {
+        background: color-mix(in srgb, var(--accent-red) 40%, transparent);
+    }
+
+    /* A dead control brightens under the pointer for nobody, and it must not
+       promise a hang-up it will not perform. So ENDING keeps its resting paint
+       and takes no red at all. */
+    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="ending"]:hover {
+        color: var(--text-muted);
+        background: color-mix(in srgb, var(--accent-green) 8%, transparent);
+    }
+}
+
+/* A fade with a breath of swell behind it. The swell is small on purpose: it is
+ * what keeps this from reading as the plain fade ENDING runs, and any more of
+ * it would read as the SPEAKING swell in another colour. */
+@keyframes call-toggle-connect-pulse {
+    0%, 100% {
+        opacity: 0.45;
+        transform: scale(1);
+    }
+
+    50% {
+        opacity: 1;
+        transform: scale(1.06);
+    }
+}
+
+@keyframes call-toggle-floor {
+    0%, 100% {
+        transform: scale(1);
+    }
+
+    50% {
+        transform: scale(1.14);
+    }
+}
+
+/* Still says the same thing, and says it without moving. Each phase rests at a
+ * brightness of its own: CONNECTING at the 0.7 its own rule declares, ENDING
+ * dimmer still at the 0.55 its pulse would have carried it to, and the two live
+ * phases at full. SPEAKING keeps its deeper fill, which was never the
+ * animation's to give. */
+:root[data-motion="reduce"] .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="connecting"] svg {
+    animation: none;
+}
+
+:root[data-motion="reduce"] .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="speaking"] svg {
+    animation: none;
+}
+
+:root[data-motion="reduce"] .prompt-actions-row .icon-btn.header-icon[data-role="call-toggle"][data-call-phase="ending"] svg {
+    animation: none;
+    opacity: 0.55;
+}
+
+/* STANDING APPLY: the follow toggle's shape again, accent only and no frame,
+ * but GREEN. Arming one is an Apply the owner presses early, and every other
+ * Apply in the app is `--accent-green` (`.action-btn-confirm`), so the colour
+ * says which action is waiting rather than only that a mode is on. No frame,
+ * because it stays armed for the rest of the thread's life. The flag's own
+ * fill carries the state too, so the two states differ in shape as well. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="standing-apply"] {
+    color: var(--accent-green);
+}
+
+/* THE ROW IS ONE ROW, and a second one is unrepresentable rather than merely
+ * avoided. This cluster used to carry `flex-wrap: wrap-reverse` as a safety
+ * net, beside an `is-stacked` column variant that lifted the Diff button onto a
+ * sub-row. Both drew a second line above a phone's keyboard, and the two
+ * disagreed with the fold about which of them should give way.
+ *
+ * The fold is the only mechanism now. Every member between the control menu and
+ * the send button folds into the ⋯ menu, so there is always a count the row can
+ * hold and nothing is left to wrap. */
+.prompt-actions-right {
+    --send-round-size: 1.625rem;
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-left: auto;
+    justify-content: flex-end;
+}
+
+/* The --space-lg gutter matches the .list-row change rows below, so the right
+   edge lines up with their content. The bottom padding matches a divided
+   row's, so the hairline sits as far below the buttons as it does below a
+   row. */
+.changes-bulk-actions {
+    padding: 0 var(--space-lg) var(--space-md);
+}
+
+/* Never wraps. Packed right, so the apply button holds the right edge with or
+   without Discard All, whose auto margin takes it to the left edge. Stretched,
+   so a label that wraps makes every button taller, not just its own. */
+.changes-bulk-buttons {
+    display: flex;
+    justify-content: flex-end;
+    align-items: stretch;
+    gap: 0.5rem;
+}
+
+/* Equal shares of the line, capped so a wide pane keeps them button-sized. On a
+   narrow phone a long label wraps inside its share rather than being clipped. */
+.changes-bulk-buttons > .action-btn {
+    flex: 1 1 0;
+    max-width: 10rem;
+    white-space: normal;
+}
+
+.changes-bulk-buttons > .action-btn-danger {
+    margin-right: auto;
+}
+
+.change-description {
+    display: block;
+    font-size: var(--font-size-sm);
+    font-weight: 400;
+}
+
+.control-menu {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+/* The composer's leading control button wears the destination's mark: the
+   Lucidos mark, the Claude mark, or the Codex mark. It is one of the prompt
+   bar's icons, not a brand badge, so it carries `.icon-btn.header-icon` like
+   the todo / subscription / attach buttons beside it and inherits their box
+   (2.25rem), their glyph size (--icon-size-lg), their baseline nudge and their
+   gray. Every glyph therefore paints in `currentColor` and nothing here sets a
+   colour: the row reads as one cluster instead of one badge and three icons.
+   The colored marks survive everywhere else they appear (thread rows,
+   transcript actor chips, nav history, the header mark).
+
+   It needs no box rules of its own for the same reason: `flex-shrink` and the
+   colour transition both come from `.icon-btn`, and the local
+   `transition: color` this used to carry silently dropped that rule's
+   background half, so the hover fill snapped in while every neighbour's faded.
+
+   OPTICAL SIZING, the second half of "reads like its neighbours": the same BOX
+   is not the same SIZE. The row's other glyphs are drawn to one grid and each
+   paints exactly 0.75 of its own viewBox (measured painted extent, stroke
+   included: todo, the subscription clock and attach are 0.750 to three
+   decimals). The three agent marks are foreign artwork and are not: Claude
+   fills 0.997 of its box, Codex 0.880, and the Lucidos mark only 0.525, because
+   `LucidosMarkIcon` draws inside a `translate(13 13) scale(0.74)` group. So
+   handing all six `--icon-size-lg` painted Claude a third larger than the
+   checkbox beside it and the mark a third smaller, which is exactly how it
+   looked and what it was reported as.
+
+   Each mark is therefore sized by its OWN fill fraction, to land the ink the
+   run lands, which is what the eye compares. `--mark-art-fill` defaults to the
+   run's own 0.75, so a glyph nobody has measured just gets the run's box back.
+
+   Scoped to this row on purpose. The same artwork keeps its own treatment
+   everywhere else it appears, and the header's copy of the mark already carries
+   its own compensation for this identical inset (`--header-mark-size`,
+   styles/header-mark.css). Its `--header-mark-art-scale: 0.74` is NOT this
+   0.525 and the two must not be folded into one: that number is the group's
+   transform, this one is the painted extent, and they differ because the shapes
+   do not fill their own 0..100 grid either. The taller run is y 12 to 83, so
+   the ink is 0.74 * 0.71.
+
+   The fractions are pinned beside the formula in
+   `__tests__/prompt-mark-optical-size.test.ts`, which also re-derives the
+   mark's from the geometry in `icons.tsx`, so redrawing it without re-measuring
+   fails there rather than shipping the wrong size a second time. */
+.commands-btn {
+    --run-ink: calc(var(--icon-size-lg) * 0.75);
+    --mark-art-fill: 0.75;
+}
+
+.commands-btn .claude-icon {
+    --mark-art-fill: 0.997;
+}
+
+.commands-btn .codex-icon {
+    /* The Codex mark strokes `--codex-mark` through a presentation attribute,
+       so it keeps that colour on other surfaces. An author rule beats a
+       presentation attribute, so this rule repaints it here alone. Its stroke
+       WIDTH stays as drawn. The fraction below puts the mark in a smaller box,
+       which thins the stroke to 1.76px against the checkbox's 1.67px. */
+    stroke: currentColor;
+    --mark-art-fill: 0.88;
+}
+
+.commands-btn .lucidos-mark-icon {
+    --mark-art-fill: 0.525;
+}
+
+/* Three classes, so this beats `.icon-btn.header-icon svg` (two) outright
+   rather than on the order the two sheets happen to be imported in. */
+.icon-btn.header-icon.commands-btn svg {
+    width: calc(var(--run-ink) / var(--mark-art-fill));
+    height: calc(var(--run-ink) / var(--mark-art-fill));
+}
+
+/* `.commands-btn-active` is set once the backend answers with a command list,
+   which is also when the button starts opening something (openMenu bails until
+   then). Until then the mark is dim, and it never moves. Only the coding-agent
+   control has the state at all, hence the exclusion: the Lucidos model picker
+   never carries the class and is always ready. */
+.commands-btn:not(.lucidos-commands-btn):not(.commands-btn-active) {
+    opacity: 0.45;
+}
+
+/* Placed by `useAnchoredPosition`, which writes viewport `top`/`left` inline
+   and flips the panel above its button. The panel is portaled to <body>,
+   because a mobile swipe pane clips at its own edge. It must lay over the
+   header, at the level of the other portaled popovers. The offsets below only
+   park the hidden panel inside the viewport while it is measured.
+
+   The height caps against `--app-height`, the visualViewport height, the only
+   value that shrinks with the iOS keyboard. The hook clamps `top` as the
+   guarantee; the cap keeps that clamp from covering the button. */
+.control-dropdown {
+    position: fixed;
+    top: 0;
+    left: 0;
+    min-width: 12rem;
+    height: min(20rem, calc(var(--app-height, 100dvh) - 8rem));
+    overflow-y: auto;
+    z-index: calc(var(--z-control-panel) + 1);
+}
+
+/* The Lucidos Agent picker (LucidosControlMenu) reuses the coding-agent
+   control-menu styles, but it holds one list rather than a filter box over
+   several sections, so a fixed 20rem height would leave a large empty panel on
+   a short registry. Size to content, capped so a long list still scrolls. */
+.control-dropdown-auto {
+    height: auto;
+    max-height: min(24rem, calc(var(--app-height, 100dvh) - 8rem));
+}
+
+/* On a phone the panel takes the header palette width, so a long skill name
+   cannot stretch it to the screen edges. The menus centre it in the pane
+   ('container-center'). */
+@media (--phone-layout) {
+    .control-dropdown {
+        width: var(--header-surface-width);
+    }
+}
+
+/* The frontend preview's direct actions. Buttons rather than `.control-item`
+   rows, because they act on a supervised process here and now, while every
+   other row in this menu selects a command to send to the agent session. */
+.control-preview-row {
+    display: flex;
+    gap: var(--space-sm);
+    padding: 0.25rem 0.625rem;
+}
+
+/* Until the slot's status is known, the controls wait dimmed: the popover keeps
+   its height and names no state it has not read. */
+.control-preview-row:is([data-state="not-loaded"], [data-state="loading"]) {
+    opacity: 0.5;
+    pointer-events: none;
+}
+
+/* `.action-btn` is an <a> here as well as a <button>, and the anchor needs the
+   button's own box back: link defaults would leave it baseline-aligned and
+   underlined next to its sibling. */
+.control-preview-row .action-btn {
+    display: inline-flex;
+    align-items: center;
+    text-decoration: none;
+}
+
+.control-preview-hint {
+    padding: 0.125rem 0.625rem 0.375rem;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}
+
+.image-attach-menu {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 0.25rem;
+    overflow: hidden;
+    z-index: var(--z-dropdown);
+    min-width: 8.75rem;
+}
+
+.image-attach-menu button,
+.image-attach-menu label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    background: none;
+    border: none;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    font-family: var(--font-ui);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+@media (hover: hover) {
+    .image-attach-menu button:hover,
+    .image-attach-menu label:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.image-attach-menu button svg,
+.image-attach-menu label svg {
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+/* Camera capture overlay: an `overlayClass` on a backdrop <Overlay>, so
+   `.modal-overlay` already supplies the fixed box on the visible viewport and
+   the centring.
+   A darker backdrop is the only thing that differs.
+   It also carried `z-index: 500`, and this sheet loads after global.css, so
+   that beat `--z-modal` on source order: the camera drew BELOW the floating
+   header chrome at 2200. <Overlay> now writes the band level inline, which
+   outranks any class rule, so the 500 was dead as well as wrong. Never name a
+   z-index in an overlayClass (modal-overlay-z-index.test.ts scans for it). */
+.camera-overlay {
+    background: rgba(0, 0, 0, 0.7);
+}
+
+.camera-container {
+    overflow: hidden;
+    max-width: 40rem;
+    width: 90%;
+}
+
+.camera-video {
+    width: 100%;
+    display: block;
+    background: #000;
+}
+
+.camera-controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    padding: 0.75rem;
+}
+
+.camera-capture-btn {
+    width: 3rem;
+    height: 3rem;
+    border-radius: var(--radius-round);
+    border: 0.1875rem solid var(--text-primary);
+    background: none;
+    color: var(--text-primary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity var(--duration-fast);
+}
+
+@media (hover: hover) {
+    .camera-capture-btn:hover {
+        opacity: 0.8;
+    }
+}
+
+.thread-content-wrap {
+    flex: 1;
+    position: relative;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* The transcript's own scroll indicator is MOBILE ONLY (styles/mobile.css gives
+   it its geometry and turns it on). On desktop `.thread-content-wrap` sits below
+   the header in normal flow, so the native scrollbar is already aligned with the
+   content. Hidden by default rather than conditionally rendered, so the mobile
+   rules are the only place the element's layout is described. */
+.thread-scroll-indicator {
+    display: none;
+}
+
+.thread-content {
+    display: none;
+    min-height: 3.75rem;
+    /* Use absolute positioning instead of height: 100% — iOS Safari (WebKit) doesn't
+       resolve percentage heights correctly when the parent's height comes from flex: 1.
+       Parent .thread-content-wrap has position: relative, so inset: 0 fills it. */
+    position: absolute;
+    inset: 0;
+    overflow-x: hidden;
+    /* `scroll` rather than `auto`, PAIRED with the stable gutter: the transcript
+       must reserve the same width whether or not it currently overflows, so its
+       centered turns don't shift sideways the moment a thread grows past one
+       screen (and so the composer below can compensate by a constant). The two
+       declarations cover each other across engines: Chromium honours the stable
+       gutter on a non-overflowing container but WebKit does not, while `scroll`
+       makes WebKit draw the scrollbar unconditionally. Both are no-ops where
+       scrollbars are overlay (iOS, default macOS), and the track is painted in
+       --bg-primary, so an always-present empty track is invisible.
+
+       utils/scrollbarGutter.ts publishes what THIS element reserves as
+       --scrollbar-gutter-width, which every non-scrolling sibling that must line
+       up with the transcript adds to its own right inset. Before one is mounted
+       it falls back to a probe declaring EXACTLY this pair, so changing these two
+       lines means changing the probe. */
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
+    overflow-anchor: none; /* manual scroll anchoring — prevent browser interference */
+    overscroll-behavior: contain;
+    /* Bottom padding reserves room for the last turn's navigation focus marker
+       (.nav-focus-stuck): past the prompt dissolve (--prompt-fade), plus the
+       marker's reach (--nav-focus-reach). The last turn cannot scroll clear of
+       the dissolve, so the padding is what gives it room. Mobile re-sets
+       padding-bottom in mobile.css.
+
+       The top reserve holds no fade clearance. The first turn starts right
+       under the thread title, where the top fade begins, and its own feed
+       padding is the gap. That padding also outreaches the marker, and the
+       fade is off at rest at the top (below). Mobile uses a ::before header
+       spacer instead.
+
+       --anchor-subpixel is the scroll anchor's sub-pixel rest, under 1px, set
+       inline by withScrollAnchor. It is all the desktop top reserve holds, and
+       both top reserves add it (ADR 0286). */
+    padding:
+        var(--anchor-subpixel, 0px)
+        var(--thread-pane-gutter)
+        calc(var(--prompt-fade) + var(--nav-focus-reach));
+}
+
+.thread-content.visible {
+    display: block;
+}
+
+/* THE FEED IS A PLAIN BOX ROUND THE TURNS, and it has no rule of its own on
+   purpose. It exists so the turns can be addressed apart from the mobile chrome
+   sharing their scroller: the last-turn padding rule below selects through it,
+   and the reading position resolves a turn inside it.
+
+   NOTHING MAY ALIGN IT OR FLOOR IT. Below one page of content the turns flow
+   from the top and hold still, and a rest plus a percentage floor is how that
+   was broken (ADR 0212). Pinned by
+   styles/__tests__/a-short-transcript-holds-still.test.ts. */
+
+/* The transcript is a keyboard-focusable scroll region (tabindex=0) so Arrow/Page
+   keys scroll it. It never shows a focus outline: a whole-pane ring around the
+   entire conversation while arrow-scrolling reads as chrome, not affordance. The
+   per-turn navigation marker (.nav-focus-stuck) already shows which turn is
+   focused (by washing it, not by ringing it), so the pane itself stays borderless
+   in both keyboard and pointer focus. */
+.thread-content:focus,
+.thread-content:focus-visible {
+    outline: none;
+}
+
+/* Constrain transcript children to the same width as the prompt below so
+   messages line up with it on wide screens. The scroll container itself
+   stays full-width to keep the scrollbar at the pane edge. */
+.thread-content > * {
+    max-width: var(--content-max-width);
+    margin-left: auto;
+    margin-right: auto;
+}
+
+/* Spinner is always visible — no opacity animation. iOS Safari drops CSS
+   animations inside scroll-snap containers after prolonged use, leaving
+   the spinner permanently at opacity:0 and the screen completely blank. */
+
+/* Clipping container for thread-view slide animation — thread slides in
+   from the bottom, clipped so it doesn't bleed over the prompt area. */
+.thread-view-clip {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* Slide the entire thread (title + content) up from below.
+   The parent .thread-view-clip clips the sliding element. */
+.thread-view.revealing {
+    animation: thread-slide-in var(--duration-slow) ease-out both;
+}
+
+@keyframes thread-slide-in {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+}
+
+:root[data-motion="reduce"] .thread-view.revealing {
+    animation: none;
+}
+
+.scroll-to-top,
+.scroll-to-bottom {
+    position: absolute;
+    right: calc(1.125rem + var(--phone-side-inset));
+    width: var(--scroll-chevron-size);
+    height: var(--scroll-chevron-size);
+    border-radius: var(--radius-round);
+    background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+    backdrop-filter: blur(0.5rem);
+    -webkit-backdrop-filter: blur(0.5rem);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    /* `translate` glides with the mobile dynamic bars (styles/mobile.css). */
+    transition: opacity var(--duration-normal), background-color var(--duration-fast),
+        color var(--duration-fast), border-color var(--duration-fast),
+        translate var(--bars-glide-duration, 0s) ease;
+    z-index: calc(var(--z-float) + 1);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+}
+
+.scroll-to-top svg,
+.scroll-to-bottom svg {
+    width: var(--scroll-chevron-glyph);
+    height: var(--scroll-chevron-glyph);
+}
+
+.scroll-to-top { top: max(calc(var(--safe-area-top) + 0.75rem), calc(var(--mobile-header-height, 0rem) + 0.25rem)); }
+.scroll-to-bottom { bottom: 0.75rem; }
+
+.scroll-to-top.visible,
+.scroll-to-bottom.visible {
+    opacity: 0.85;
+    pointer-events: auto;
+}
+
+/* On touch a near miss still scrolls, rather than reaching the step row under
+   the circle, whose context counter shares this right edge. The reach is
+   transparent and absolute, so the circle and the glyph stay put. It rides the
+   button's layer, above the transcript, and inherits `pointer-events`, so a
+   hidden chevron's reach takes no tap. */
+@media (pointer: coarse) {
+    .scroll-to-top::before,
+    .scroll-to-bottom::before {
+        content: '';
+        position: absolute;
+        inset: calc(-1 * var(--scroll-chevron-reach));
+    }
+}
+
+@media (--desktop-layout) {
+    /* Keep the chevrons INSIDE the centered transcript, a fixed margin in from its
+       right edge — never floating out in the gutter. The scroll container is
+       full-width but its content is capped at --content-max-width and centered
+       (.thread-content > *), so the content's right edge is `50% - --content-max-width/2`
+       from the pane's right. Add 0.75rem so the chevron's right edge sits 0.75rem
+       inside that content edge. max() floors it at 1.5rem from the pane edge on
+       narrow panes where the gutter collapses (content then fills the 0.75rem
+       .thread-content padding box, so 1.5rem keeps the same 0.75rem inset); the two
+       expressions meet exactly at the collapse width, so the inset stays constant. */
+    .scroll-to-top,
+    .scroll-to-bottom {
+        right: max(1.5rem, calc(50% - var(--content-max-width) / 2 + 0.75rem));
+    }
+
+    /* Fade the top of the transcript so messages dissolve as they scroll up
+     * under the transparent thread title header, instead of cutting off at a
+     * hard edge. Desktop only: on mobile this scroll container holds its own
+     * sticky title bar (.mobile-thread-title-row), which must not be masked.
+     * The fade height is --thread-top-fade (base.css) so the deep-link scroll
+     * clearance (.chat-exchange scroll-margin-top, chat/response.css) tracks it.
+     *
+     * TWO mask layers, because a mask applies to the element's WHOLE rendering,
+     * scrollbar included, and the scrollbar is chrome, not content: a
+     * single full-width fade dissolved the top of the scrollbar thumb along
+     * with the messages. Layer 1 is the fade over everything left of the scroll
+     * gutter; layer 2 is a fully opaque strip exactly --scrollbar-gutter-width
+     * wide pinned to the right edge, which is where a classic scrollbar is
+     * painted (the mask origin is the border box, and the gutter is taken out
+     * between the border edge and the padding box). The var is 0px wherever
+     * scrollbars are overlay, and layer 2 then collapses to nothing while layer
+     * 1 covers the full width, so this is a no-op there. */
+    .thread-content {
+        -webkit-mask:
+            linear-gradient(to bottom, rgb(0 0 0 / var(--thread-top-fade-floor, 0)) 0, #000 var(--thread-top-fade))
+                left top / calc(100% - var(--scrollbar-gutter-width)) 100% no-repeat,
+            linear-gradient(#000, #000)
+                right top / var(--scrollbar-gutter-width) 100% no-repeat;
+        mask:
+            linear-gradient(to bottom, rgb(0 0 0 / var(--thread-top-fade-floor, 0)) 0, #000 var(--thread-top-fade))
+                left top / calc(100% - var(--scrollbar-gutter-width)) 100% no-repeat,
+            linear-gradient(#000, #000)
+                right top / var(--scrollbar-gutter-width) 100% no-repeat;
+        transition: --thread-top-fade-floor var(--duration-normal) ease;
+    }
+
+    /* At rest at the top nothing sits under the title, so the fade could only
+       dissolve the first turn. With no fade clearance above it, that turn sits
+       inside the fade band. So the floor rises to opaque here, keeping the turn
+       and its marker whole. It eases back down once the reader scrolls, with
+       the title row's own band, so the first turn never pops to half opacity. */
+    .thread-view-header:not(.scrolled) + .thread-content-wrap > .thread-content {
+        --thread-top-fade-floor: 1;
+    }
+}
+
+/* The top fade's opacity at the transcript's top edge: 0 is the full fade, 1
+   is no fade. Registered so it can transition inside the mask gradient. */
+@property --thread-top-fade-floor {
+    syntax: '<number>';
+    inherits: false;
+    initial-value: 0;
+}
+
+@media (hover: hover) {
+    .scroll-to-top { top: max(var(--scroll-chevron-top), calc(var(--safe-area-top) + var(--scroll-chevron-top))); }
+    .scroll-to-top:hover,
+    .scroll-to-bottom:hover {
+        opacity: 1;
+        background: var(--bg-hover);
+        color: var(--text-primary);
+        border-color: var(--text-muted);
+    }
+}
+
+.artifacts-desktop {
+    padding: 0.25rem 0.5rem;
+    min-height: 6.25rem;
+}
+
+.artifacts-desktop:empty::before {
+    content: 'No files yet';
+    display: block;
+    text-align: center;
+    padding: 1.5rem;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+/* The status word and the timestamp beside it share one size and differ
+   plainly: the word is brighter and a dim dot parts them. Near-equal sizes in
+   one grey read as a mistake. The glyphs below keep their own size and colour. */
+.exchange-status-label {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}
+
+/* The dot hangs off the status, out of flow, in the room the timestamp's
+   margin leaves. Two cases draw none. A status ending in a glyph needs no
+   dot, because the glyph already parts the two. A pair stacked on two lines
+   needs none either: the status then sits flush on the cluster's right edge,
+   so its dot lies past that edge, where the clip below hides it.
+   The dot box is 1.25rem: the cluster's 0.5rem column gap plus this margin. */
+.exchange-status-label:not(:has(.exchange-status-glyph)):has(+ .response-timestamp, + .initiator-timestamp) {
+    position: relative;
+}
+
+.exchange-status-label:not(:has(.exchange-status-glyph)):has(+ .response-timestamp, + .initiator-timestamp)::after {
+    content: '\00b7';
+    position: absolute;
+    left: 100%;
+    width: 1.25rem;
+    text-align: center;
+    color: var(--text-muted);
+}
+
+.exchange-status-label:not(:has(.exchange-status-glyph)) + .response-timestamp,
+.exchange-status-label:not(:has(.exchange-status-glyph)) + .initiator-timestamp {
+    margin-left: 0.75rem;
+}
+
+/* A timestamp after a status never holds the status off the executor's line.
+   The zero width takes it out of the cluster's minimum. The cluster then keeps
+   its place beside the controls while the status alone fits there. The
+   max-content basis still wraps it to line two whenever the pair does not fit.
+   On that line it is wider than the cluster, and `justify-content: flex-end`
+   lets it overflow to the left, under the controls, flush right. */
+.exchange-status-label + .response-timestamp,
+.exchange-status-label + .initiator-timestamp {
+    width: 0;
+    flex: 0 0 max-content;
+}
+
+/* Clips only what lies past the right edge, where a stacked status puts its
+   dot. The 0.25rem slack keeps the focus ring of the rightmost field. The dot
+   centres 0.625rem past the edge, so it stays outside the slack. The left
+   inset is wide open for the stacked timestamp that overflows leftward. A
+   cluster holding a glyph draws no dot, so it skips the clip: the queued bin's
+   chip and focus ring reach further past the edge than the slack allows. */
+.response-meta:not(:has(.exchange-status-glyph)),
+.initiator-meta:not(:has(.exchange-status-glyph)) {
+    clip-path: inset(-1rem -0.25rem -1rem -100vw);
+}
+
+.exchange-status-x {
+    color: var(--accent-red);
+    font-size: var(--font-size-md);
+    font-weight: bold;
+}
+
+/* A typed answer whose POST got no answer: the card waits on the user again. */
+.exchange-status-not-sent {
+    color: var(--accent-red);
+}
+
+/* Sized in em so the triangle follows the status word. At 1.15em its base
+   sits on the word's baseline and its tip just clears the capitals. */
+.exchange-status-warning {
+    color: var(--accent-yellow);
+    width: 1.15em;
+    height: 1.15em;
+    flex-shrink: 0;
+}
+
+/* Target, nominal and correction all come from `.icon-btn.inline-icon`
+   (host-components.css): this trash interrupts a line of text rather than
+   sitting beside one, which is a band of its own, one step under the trigger
+   group heading's pair. It used to be hand-sized here, at 1.25rem around a
+   0.85rem glyph on no icon step: a target a thumb misses, holding a glyph off
+   the scale entirely. Being smaller than the heading's trash was never the
+   defect; being off the scale in an undersized box was. Only the colour stays
+   local. */
+.queued-message-edit,
+.queued-message-remove {
+    color: var(--text-muted);
+}
+
+@media (hover: hover) {
+    .queued-message-edit:hover {
+        color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 12%, transparent);
+    }
+
+    .queued-message-remove:hover {
+        color: var(--accent-red);
+        background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+    }
+}
+
+.queued-message-group {
+    padding: 0.2rem 0 0;
+}
+
+.queued-message-group-summary {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.375rem;
+    min-height: 1.75rem;
+    padding: 0.25rem var(--turn-body-inset);
+    color: var(--accent);
+    cursor: pointer;
+    user-select: none;
+    font-size: var(--font-size-sm);
+}
+
+.queued-message-group-summary::-webkit-details-marker {
+    display: none;
+}
+
+.queued-message-group-label {
+    font-weight: 600;
+}
+
+@media (hover: hover) {
+    .queued-message-group-summary:hover {
+        color: var(--accent-light);
+    }
+}
+
+/* Inline in the status word, so it rides the word's baseline. The row's
+   centre line would not do: where a line box centres depends on the font's
+   ascent and descent. An inline SVG's baseline is its bottom edge. The box is
+   14 of the icon's 12-unit cap, lowered by 2, so the stem starts on the cap
+   line and the head hangs just below the baseline, in any font. The margin is
+   the label's gap, and the em values are the fallback where `cap` is unknown. */
+.exchange-status-continued {
+    color: var(--text-secondary);
+    margin-left: 0.375rem;
+    width: 0.82em;
+    height: 0.82em;
+    vertical-align: -0.12em;
+    width: calc(1cap * 14 / 12);
+    height: calc(1cap * 14 / 12);
+    vertical-align: calc(-1cap * 2 / 12);
+}
+
+
+.progress-dot {
+    display: inline-block;
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: var(--radius-round);
+}
+
+/* The spinner is the question badge's size. At the dot's size its open ring
+   read as a small mark sitting low on the title. */
+.thread-status .mini-spinner {
+    width: 0.7rem;
+    height: 0.7rem;
+}
+
+.progress-dot-waiting {
+    background: var(--text-secondary);
+    animation: progress-pulse 2s ease-in-out infinite;
+}
+
+/* A read request (ADR 0409): the filled dot that reads as "unread". */
+.progress-dot-read-request {
+    background: var(--text-secondary);
+}
+
+/* A ready change names itself with the diff glyph, at the question badge's
+   size, so it never reads as the unread dot. */
+.thread-status-changes-icon {
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-secondary);
+}
+
+.thread-status-changes-icon svg {
+    width: 0.7rem;
+    height: 0.7rem;
+    stroke-width: 2.5;
+}
+
+/* The "?" font lives HERE, not on the `::after` that draws it. `badges.css`
+   centres this badge by trimming its line box to a cap band, and the trim
+   measures the font of the BLOCK CONTAINER, which is this element. A glyph a
+   step smaller than the inherited body text therefore sat on that band's
+   baseline. It rode 2.0px low in Chromium and 1.7px in WebKit, on a 14px
+   badge. Stated here, the band the trim centres IS the glyph. */
+.thread-status-question-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    /* The design size, which `badges.css` rounds to whole pixels. */
+    --badge-height: 0.7rem;
+    min-width: var(--badge-box, var(--badge-height));
+    height: var(--badge-height);
+    background: var(--text-secondary);
+    font-size: var(--font-size-3xs);
+    font-weight: 700;
+    line-height: 1;
+}
+
+html[data-theme-mode="light"] .thread-status-question-badge {
+    background: var(--text-muted);
+}
+
+.thread-status-question-badge::after {
+    content: "?";
+    color: var(--text-on-accent);
+}
+
+html[data-theme-mode="dark"] .thread-status-question-badge::after {
+    color: #000;
+}
+
+.progress-dot-loading {
+    background: var(--border-color);
+    animation: progress-pulse 2s ease-in-out infinite;
+    opacity: 0.5;
+}
+
+/* Paused: the user's own switch to a new version interrupted the turn. The
+   standard pause glyph (two bars) rather than a dot, because this is the one
+   status a universal symbol states outright instead of leaving to a color the
+   user has to learn. Deliberately NOT the failed red, because nothing failed and
+   the engine resumes the turn on its own within seconds. --accent-notable is the
+   palette's neutral tone for an in-between state. */
+.thread-status-paused-icon {
+    display: inline-flex;
+    align-items: center;
+    color: var(--accent-notable);
+}
+
+/* Sized to PauseIcon's own 12:16 viewBox so the bars fill the box exactly, with
+   no letterboxing. The status slot is a flex row that left-aligns its children
+   and every other occupant fills its box, so a centered glyph would leave a
+   paused row indented against every neighbouring row's dot. It is as tall as
+   a dot. */
+.thread-status-paused-icon svg {
+    width: 0.3rem;
+    height: 0.4rem;
+}
+
+.progress-dot-failed {
+    background: var(--accent-red);
+}
+
+/* The app's "waiting" motion, used by the two progress dots above. Keyframes
+   are global, so a new waiting surface reuses these rather than declaring a
+   twin. */
+@keyframes progress-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+/* Reduced motion: the dots rest at their base look. Colour already tells
+   waiting from loading. */
+:root[data-motion="reduce"] .progress-dot-waiting,
+:root[data-motion="reduce"] .progress-dot-loading {
+    animation: none;
+}
+
+/* --- Initiator turn — flat, card-less (Twitter-style feed). A human message
+   renders as a right-aligned gray bubble; every other initiator (agent/engine/
+   trigger/change/child/question/permission) is a flat transcript turn: icon +
+   plain (uncolored) name over a flush body. Turns are separated by a full-width
+   hairline. Attribution lives in the route popover, opened from the actor chip,
+   the timestamp, or (for change turns) the summary line. */
+.initiator-panel {
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+}
+
+/* Feed-style padding on every turn — adjacent turns separate by this vertical
+   rhythm alone; there is no divider line between turns (borderless feed). The
+   navigation focus marker hands this back as margin when it tightens a focused
+   turn to a uniform gap (chat/response.css).
+
+   The RIGHT inset mirrors the content's LEFT inset (which lives on the header/
+   body padding-left), so a turn's content sits symmetrically inside the pane.
+   This symmetry is load-bearing for the navigation focus marker: with content
+   flush right, the marker had to reach var(--turn-body-inset) further right
+   than left to keep a uniform content gap — jutting into .thread-content's
+   gutter until its border sat flush against the pane edge while the left kept
+   its breathing room ("border is all the way to the right"). With the inset in
+   the base layout the marker needs no horizontal box tricks at all. */
+.initiator-panel,
+.response-panel {
+    padding: var(--turn-feed-pad-y) var(--turn-body-inset) var(--turn-feed-pad-y) 0;
+}
+
+/* The LAST turn drops the bottom half of that rhythm, because the rhythm is
+   what separates a turn from the NEXT one and there is no next one. Below the
+   last turn sits the transcript's own bottom padding
+   (--prompt-fade + --nav-focus-reach, which reserves the composer dissolve and
+   the focus marker's reach), and the feed rhythm stacked on top of that read as
+   a hole under the running step: the reply's live edge floated well clear of
+   the composer it was about to be answered in.
+
+   Both panel kinds, because either can be the turn's last child: a turn whose
+   response has not started yet ends on its initiator panel. An ERROR turn ends
+   on neither (`.exchange-error` follows the panels), so it keeps the rhythm,
+   which is right: the error box carries no feed padding of its own.
+
+   `:not(.nav-focus-stuck)` yields to the PANEL-level navigation focus marker,
+   which washes the panel box edge to edge and normalizes all four sides to
+   var(--turn-body-inset) (chat/response.css). At (0,5,0) this rule out-ranks
+   that (0,2,0) one, so without the exclusion a deep link landing on the last
+   turn would paint the wash flush against its last line while the other three
+   sides kept their inset, which is the exact asymmetry the marker rule exists
+   to remove, and its margin hand-back would stop netting to zero. The
+   WHOLE-TURN marker needs no such yield: its own rule already zeroes the last
+   panel's padding-bottom, so the two agree. */
+.thread-feed > .chat-exchange:last-child > .initiator-panel:last-child:not(.nav-focus-stuck),
+.thread-feed > .chat-exchange:last-child > .response-panel:last-child:not(.nav-focus-stuck) {
+    padding-bottom: 0;
+}
+
+/* A stopped child's notice (ADR 0252) closes the feed. It sits on the turns'
+   content edge, with no bottom half for the same reason the last turn drops
+   its own: the transcript's bottom padding follows. */
+.stopped-child-notice {
+    padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
+}
+
+/* Side-question answers (ADR 0320) sit where they were asked. Each is a nested
+   surface on the turn body edge, like a question card, so its text shares
+   their column. */
+.side-questions {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0;
+}
+
+/* Inside a turn's body, between its rows. The panel already pads the right
+   edge, so the box keeps only the left inset, and air on both sides. */
+.response-body > .side-questions {
+    padding: var(--space-sm) 0 var(--space-sm) var(--turn-body-inset);
+}
+
+/* The head and body carry the padding, so the whole head is the toggle's hit
+   area and the body rolls with its own bottom inset. */
+.side-question-card {
+    --side-question-inset: calc(var(--turn-surface-inset) - 1px);
+    --side-question-folded-inset: calc(var(--space-sm) - 1px);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
+    min-width: 0;
+}
+
+/* Top-aligned: a note wrapped onto two lines keeps the label on its first.
+   Folded, the head is the whole card, one line with the question cut off.
+   Its padding moves on the disclosure roll's curve as the body rolls. */
+.side-question-head {
+    position: relative;
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-sm);
+    width: 100%;
+    padding: var(--side-question-inset) var(--side-question-inset) 0;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-surface);
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: padding var(--duration-slow) cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.side-question-card[data-collapsed] .side-question-head {
+    padding: var(--side-question-folded-inset) var(--side-question-inset);
+}
+
+/* The head is about 1.75rem tall, so the hit area reaches half the rest of
+   the 44px (2.75rem) touch target above and below it, into the air there. */
+.side-question-head::before {
+    content: '';
+    position: absolute;
+    inset: -0.5rem 0;
+}
+
+.side-question-head:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+.side-question-body {
+    padding: 0 var(--side-question-inset) var(--side-question-inset);
+}
+
+.side-question-label {
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+}
+
+.side-question-summary {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+.side-question-card[data-collapsed] .side-question-summary {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Points down folded and up open, turning as the body rolls. */
+.side-question-chevron {
+    display: flex;
+    align-self: flex-start;
+    color: var(--text-secondary);
+}
+
+.side-question-chevron svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    transform: rotate(180deg);
+    transition: transform var(--duration-slow) cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.side-question-card[data-collapsed] .side-question-chevron svg {
+    transform: none;
+}
+
+@media (hover: hover) {
+    .side-question-head:hover .side-question-chevron {
+        color: var(--text-primary);
+    }
+}
+
+/* Surface, radius, padding and leading come from `.user-bubble`, so the card
+   reads as the thread's own question-then-answer shape. This adds the right
+   alignment, and keeps a long unbroken token from widening the card. */
+.side-question-question {
+    width: fit-content;
+    margin: var(--space-sm) 0 var(--space-md) auto;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+.side-question-card .markdown-content > :last-child {
+    margin-bottom: 0;
+}
+
+.side-question-thinking {
+    min-height: 1lh;
+    color: var(--text-muted);
+}
+
+.side-question-error {
+    color: var(--accent-red);
+    overflow-wrap: anywhere;
+}
+
+/* The error and its Retry share one row. Retry is quiet text with no box, and
+   its padding is handed back so the word sits on the card's content edge. */
+.side-question-failure {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+}
+
+.side-question-retry {
+    display: inline-flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: var(--space-xs);
+    margin: calc(-1 * var(--space-xs)) calc(-1 * var(--space-sm));
+    padding: var(--space-xs) var(--space-sm);
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+}
+
+.side-question-retry svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+.side-question-retry:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+@media (hover: hover) {
+    .side-question-retry:hover {
+        color: var(--text-primary);
+    }
+}
+
+/* `flex-start` plus a row unit on every field, exactly as `.response-header`
+   (chat/response.css), which is where the reasoning lives: the fields are all
+   one --turn-header-line tall and centre their own content, so a one-row header
+   is unchanged and a wrapped one keeps the actor's name level with the status
+   beside it instead of dropping half a line to centre against the stacked
+   pair.
+
+   NEITHER turn header is a click target, so neither carries a cursor or a
+   hover tint. Both once folded on a row click, and both lost it to the collapse
+   control: a row that swallows a click fires wherever the pointer misses a
+   chip, and announces itself only to a mouse. The hover cues that remain are
+   the chips' own (button.initiator-actor, the timestamp and summary buttons). */
+.initiator-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    padding-left: var(--turn-body-inset);
+    /* Shared with `.response-header` (chat/response.css), where the reasoning
+       for the value lives: it is one measurement and must move with it. Pinned
+       equal by components/chat/__tests__/turn-header-gutter.test.ts. */
+    margin-bottom: 0.5rem;
+    min-height: var(--turn-header-line);
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+}
+
+.initiator-icon {
+    flex-shrink: 0;
+    font-size: var(--font-size-lg);
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+}
+/* Every actor chip's glyph is a component now, so the size applies to all of
+   them: the Lucidos mark, the coding-agent logos, and the four chrome icons
+   (trigger, System, You, API caller) that replaced this slot's emoji on
+   2026-08-13. */
+.initiator-icon svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+/* The Claude mark's colour, and ONLY for the Claude logo. The chrome icons in
+   this slot ("You", "System") inherit `currentColor` from the header, so a rule
+   on `.initiator-icon svg` would paint them the brand colour too. Mirrored by
+   `.response-executor-icon .claude-icon` in chat/response.css, which is the
+   same claim about the executor chip. */
+.initiator-icon .claude-icon {
+    color: var(--claude-mark);
+}
+
+.initiator-label {
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+    min-width: 0;
+}
+
+/* Right-aligned header cluster: optional status chip (question/permission
+   resolution) + the timestamp.
+
+   Deliberately identical to `.response-meta` (chat/response.css), which is
+   where the reasoning for every declaration below lives: this is the row's
+   elastic field, it stacks its two fields against the right edge instead of
+   being bumped whole onto a row of its own, `white-space` is what puts the
+   break between them rather than inside the timestamp, and the gaps are
+   longhands because `row-gap: 0` is load-bearing. The two headers sit one
+   above the other in a turn, so they have to degrade the same way. Not one
+   shared selector, because each header's rules live with its own component;
+   `styles/__tests__/turn-meta-stacking.test.ts` is what holds the two copies
+   together. */
+.initiator-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    column-gap: 0.5rem;
+    row-gap: 0;
+    flex: 1 1 0;
+    white-space: nowrap;
+}
+
+/* The field that shares the actor's line carries the header's row unit, so the
+   two sit on one line once the cluster stacks. Copy of the `.response-meta`
+   rule (chat/response.css), which is where the reasoning lives, including why
+   it is the first field only. Which field that is varies: the status, or the
+   timestamp on a chromeless turn with none. The fold is never in here: it
+   leads the header row, outside this cluster, on every turn. */
+.initiator-meta > :first-child {
+    display: flex;
+    align-items: center;
+    min-height: var(--turn-header-line);
+}
+
+.initiator-timestamp {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* Chromeless turns (user bubble, change events) carry no actor chip, so the
+   timestamp is the route-popover trigger. */
+.initiator-timestamp-button {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    padding: 0;
+}
+@media (hover: hover) {
+    .initiator-timestamp-button:hover {
+        color: var(--text-secondary);
+        text-decoration: underline;
+        text-underline-offset: 0.15rem;
+    }
+}
+
+.initiator-actor,
+.response-executor {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    /* The vertical padding is a local var because the min-height below has to
+       add it back: it is cancelled by the negative margin under it (the hover
+       chip reaches past the text without taking any layout space), and a flex
+       line measures MARGIN boxes. Sized off the bare row unit, the chip's
+       margin box would come out 2 padding steps SHORT of it and the name would
+       ride that far above the status. */
+    --actor-chip-pad-y: 0.125rem;
+    padding: var(--actor-chip-pad-y) 0.375rem;
+    margin: calc(-1 * var(--actor-chip-pad-y)) -0.375rem;
+    min-height: calc(var(--turn-header-line) + 2 * var(--actor-chip-pad-y));
+    min-width: 0;
+    background: transparent;
+    border: none;
+    border-radius: calc(var(--radius-control) * 0.5);
+    color: inherit;
+    font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
+    transition: background var(--duration-fast);
+    text-align: left;
+}
+button.initiator-actor,
+.response-executor {
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    button.initiator-actor:hover,
+    .response-executor:hover {
+        background: var(--bg-hover);
+    }
+}
+
+/* The turn controls (`turnControls` / `collapseControl`): three on a response
+   header (the full response, the step log, and the turn's fold), one on an
+   initiator header (the fold). Their rules live here, beside the chip rule both
+   headers share, because every measurement below is taken against that chip.
+
+   The run always sits immediately right of that chip, on both headers. The two
+   chipless initiator turns carry no fold at all, so no run ever leads a row: a
+   user message and a change turn are both exempt (`ChatExchange`).
+
+   One gap for all three, the collapse control included. It used to carry an
+   extra 0.3125rem so its narrower scope read as a group break. The break is
+   gone: its label and its turning glyph carry that scope on their own, and two
+   different gaps inside a run of three icons are a claim the eye reads before
+   it reads any tooltip, which landed as "two things and a stray" rather than
+   as a scope split. The class stays, since the pressed-chip rule below still
+   singles the control out by it. */
+.turn-controls {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.125rem;
+    flex-shrink: 0;
+    /* One row unit tall, so the header can align its fields at flex-start
+       without the icons riding up off the label's line. The buttons are the
+       tallest thing on the row at 0.875rem plus their 0.25rem of padding, which
+       is under the unit, so this reserves the difference rather than adding
+       any: the run keeps the height it already had inside the header's
+       min-height. */
+    min-height: var(--turn-header-line);
+    /* Pulled back out of the header's 0.5rem gap, because that gap is measured
+       between BOXES and the eye measures ink. The button adds 0.125rem of
+       padding, and the bubbles glyph starts 3/24 of the way in. With the flex
+       gap alone, ~9px of white sits between the label's last letter and the
+       first stroke, and the controls read as adrift. At 0.25rem it is ~7px.
+
+       Bounded on both sides, and the floor is now the binding one. With the
+       group break gone this is the ONE gap in the run that differs, so it is
+       the only thing keeping the label out of the run: a 0.375rem pull leaves
+       0.125rem between the boxes, exactly the gap the icons hold between
+       themselves, and the label reads as a fourth item in the row. 0.25rem is
+       double the intra-run gap, which is enough to group.
+
+       The ceiling: the actor/executor chip carries 0.375rem of trailing padding
+       cancelled by an equal negative margin (above), so its hit area and its
+       hover chip both run that much past the text with only the header's
+       0.125rem of real gap after them. This pull laps 2px of that padding,
+       where 0.375rem lapped 4px; the label's own text is still exclusively the
+       chip's, but going further starts eating a target the user can feel and
+       only sees on hover.
+
+       One position, so one job: there is no chipless turn with a fold to land
+       on the transcript's own column. */
+    margin-left: -0.25rem;
+}
+
+/* Tighter than the base .icon-btn's 0.25rem, deliberately: at 0.125rem the
+   button is the 0.875rem glyph plus 0.25rem, which fits inside the header's
+   existing 1.2rem min-height, so adding the controls grows no row anywhere in
+   the transcript. The base padding would push a control-bearing header ~3px
+   past a control-less one, and a row height that varies by turn TYPE reads
+   worse than a uniformly compact one. Everything here is rem, so the button is
+   ~20px on the 18px mobile root and ~27px at 150% ui-scale; the 18px is the
+   plain-desktop floor, not the common case.
+
+   What it costs, at a 16px root with the widest state ("Lucidos Agent" plus
+   "Requesting" plus the timestamp): the header's one-line width goes from
+   251px bare to 293px with two controls and 313px with three, and a thread
+   pane dragged to its 300px floor gives the header less than that. So at the
+   floor an in-flight turn's header runs to two rows, settling back to one when
+   the status shrinks to "Done" (269px with all three). Accepted rather than
+   fixed: wrapping is what that degradation is for, it keeps every field
+   readable where truncating the executor name would not, and a finished turn,
+   which is the whole transcript bar one row, still fits at the floor. Where
+   the break lands is `.response-meta`'s job, not this row's: the meta gives up
+   its width first and stacks the timestamp under the status, so the second row
+   costs the pair its own line rather than costing the whole header one. An
+   initiator header pays the first figure only, having one control.
+
+   Those two figures are arithmetic off the measured bare one, not fresh
+   measurements: the run costs 22px for its first control (an 18px box after
+   the 8px header gap less the 4px pull) and 20px for each one after it (the
+   box plus the run's 2px gap), which is 42px and 62px. They therefore move
+   whenever either gap above does, so keep them in step rather than reading
+   them as fixed. */
+.turn-controls .icon-btn {
+    padding: 0.125rem;
+    color: var(--text-muted);
+}
+
+/* A lighter stroke than the artwork's 2 keeps the run quiet beside the bold
+   executor label. The colour stays full muted, above 3:1 contrast. */
+.turn-controls .icon-btn svg {
+    stroke-width: 1.75;
+}
+
+/* Hover lifts a control's glyph to secondary and draws NO chip. The chip is
+   the ON state here, and it is the shared `.icon-btn` hover colour. A hover
+   chip would make an off control under the cursor read as on.
+
+   Out-specifies the shared hover and the muted default above (2 classes + a
+   pseudo-class). The ON rule below out-specifies this one too, since its
+   `:not()` argument counts, so a pressed control keeps its chip while hovered. */
+@media (hover: hover) {
+    .turn-controls .icon-btn:hover {
+        color: var(--text-secondary);
+        background: transparent;
+    }
+}
+
+/* On: the glyph sits on a pressed chip, the toolbar-toggle look. The chip is
+   the quiet hover grey, deliberately NOT the accent chip that the app bar's
+   active icons wear (.icon-btn.filter-active in host-components.css). These
+   repeat on every turn, and a column of accent chips reads as a column of
+   alerts. Secondary glyphs match the status text, so the pair never outshouts
+   the executor label beside it.
+
+   The collapse control is excluded, and the scope split is why. For the pair
+   it belongs to, the chip means "on, and you are seeing MORE". Their off state
+   looks like nothing at all. Without the chip, a turn with no steps drawn looks
+   the same as a turn whose steps are hidden. A chip on
+   the collapse control would mean the turn is FOLDED, the same cue inverted,
+   sitting beside the two it contradicts. So it never takes the chip, and
+   `aria-pressed` carries the state for a screen reader.
+   Pinned by styles/__tests__/turn-control-pressed-chip.test.ts. */
+.turn-controls .icon-btn[aria-pressed="true"]:not(.turn-control-collapse) {
+    color: var(--text-secondary);
+    background: var(--bg-hover);
+}
+
+/* Folded: the plus glyph is lit, with no chip. A fold draws nothing under the
+   header, so this glyph is the only thing on screen saying the turn has more.
+   It stays lit under hover: it matches the hover rule's specificity and comes
+   after it. */
+.turn-controls .turn-control-collapse[aria-pressed="true"] {
+    color: var(--accent);
+}
+
+.initiator-body {
+    color: var(--text-primary);
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    /* Match the LLM response body's left inset so change cards, questions, and
+       every other initiator turn line up with the response text above them. */
+    padding-left: var(--turn-body-inset);
+}
+
+/* A turn waiting behind an open question: a queued message, or a callback
+   whose body has no card to carry the note. */
+.initiator-panel[data-held] {
+    opacity: 0.55;
+}
+
+.initiator-held-note {
+    margin-top: var(--space-xs);
+    font-size: var(--font-size-xs);
+    font-style: italic;
+    color: var(--text-secondary);
+}
+
+/* User message → right-aligned bubble with the accent tint (the same surface as
+   a picked question answer), no border. */
+.initiator-panel-bubble .initiator-body {
+    display: flex;
+    justify-content: flex-end;
+}
+.user-bubble {
+    background: var(--picked-surface);
+    border-radius: calc(var(--radius-surface) * 1.2);
+    padding: 0.55rem 0.85rem;
+    max-width: 85%;
+    /* Matches .response-content, so a user bubble and the reply under it set
+       their text on the same rhythm. */
+    line-height: 1.5;
+}
+.user-bubble .markdown-content p:last-child {
+    margin-bottom: 0;
+}
+
+.initiator-summary {
+    font-weight: 500;
+    color: var(--text-primary);
+    text-align: left;
+    display: block;
+}
+
+.initiator-summary + .markdown-content,
+.initiator-summary + .initiator-files {
+    margin-top: 0.25rem;
+}
+
+.initiator-files {
+    margin: 0;
+    padding-left: 1.25rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
+.initiator-files li {
+    margin: 0.125rem 0;
+}

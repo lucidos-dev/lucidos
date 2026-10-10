@@ -1,0 +1,789 @@
+//! E2E for POST /api/v1/internal/ask-user-question — the long-poll endpoint
+//! invoked by the lucidos-cli ask-user-question-hook subcommand from inside
+//! CC subprocesses. Drives the endpoint with HTTP only — no real CC needed.
+
+use crate::support::{base_url, count_events_of_type, db_url, seed_cc_thread_summary, user_client};
+use serde_json::json;
+use sqlx::PgPool;
+use std::time::Duration;
+use tokio::time::sleep;
+use uuid::Uuid;
+
+/// Poll until the hook endpoint has persisted `UserQuestionAsked` for
+/// `tool_use_id`.
+///
+/// Every answering task below waits on this first: answering before the emit
+/// lands makes the handler's pending-question lookup 409. A query error
+/// panics rather than reading as "not yet", which would surface as the
+/// deadline panic and name the wrong cause.
+async fn wait_for_question_asked(pool: &PgPool, thread_id: Uuid, tool_use_id: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE thread_id = $1 \
+             AND event_type = 'UserQuestionAsked' AND payload->>'tool_use_id' = $2)",
+        )
+        .bind(thread_id)
+        .bind(tool_use_id)
+        .fetch_one(pool)
+        .await
+        .expect("polling for UserQuestionAsked failed");
+        if exists {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "UserQuestionAsked never persisted by the hook endpoint"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn long_poll_returns_answer_when_user_responds() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!("toolu_e2e_{}", thread_id.simple());
+    // The hook emits UserQuestionAsked / accepts the answer keyed on a
+    // synthetic per-question id `{outer}#q{i}`. Even with one question we
+    // address `#q0`. See `synth_question_id` in `api/internal.rs`.
+    let q0_id = format!("{tool_use_id}#q0");
+
+    // Seed a SessionStarted so the lifecycle classifier treats this as a CC
+    // thread (UserQuestionAsked is CC-only and would otherwise be rejected).
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+
+    // Background: wait for the hook endpoint to emit UserQuestionAsked, then
+    // simulate the user answering. Polling the events table avoids a race
+    // between the hook's emit and the answer-question handler's pending-question
+    // lookup (which would otherwise 409).
+    let client_bg = client.clone();
+    let q0_id_bg = q0_id.clone();
+    let pool_bg = pool.clone();
+    let answerer = tokio::spawn(async move {
+        wait_for_question_asked(&pool_bg, thread_id, &q0_id_bg).await;
+        let resp = client_bg
+            .post(format!(
+                "{}/api/v1/threads/{}/answer-question",
+                base_url(),
+                thread_id
+            ))
+            .json(&json!({
+                "tool_use_id": q0_id_bg,
+                "answer": { "kind": "Selected", "option_id": "opt-0" }
+            }))
+            .send()
+            .await
+            .expect("answer post");
+        assert_eq!(resp.status().as_u16(), 200, "answer-question should accept");
+    });
+
+    // Hook side — blocks until the answer arrives (or test timeout).
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+            .json(&json!({
+                "thread_id": thread_id.to_string(),
+                "tool_use_id": tool_use_id,
+                "session_id": "sid-1",
+                "questions": [{
+                    "question": "Fav color?",
+                    "header": "color",
+                    "multiSelect": false,
+                    "options": [
+                        {"label": "Red", "description": ""},
+                        {"label": "Blue", "description": ""}
+                    ]
+                }]
+            }))
+            .send(),
+    )
+    .await
+    .expect("did not time out")
+    .expect("hook post");
+
+    answerer.await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "hook should get 200");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["answers"],
+        json!({"Fav color?": "Red"}),
+        "hook output should contain {{question: label}}"
+    );
+
+    // Cleanup
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+/// Upload the suite's PNG to `thread_id` and return its blob hash.
+async fn upload_png(client: &reqwest::Client, thread_id: Uuid) -> String {
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(crate::support::png_bytes())
+            .file_name("answer.png")
+            .mime_str("image/png")
+            .unwrap(),
+    );
+    let resp = client
+        .post(format!("{}/api/v1/threads/{}/blobs", base_url(), thread_id))
+        .multipart(form)
+        .send()
+        .await
+        .expect("blob upload");
+    assert!(resp.status().is_success(), "upload: {}", resp.status());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    body["hash"].as_str().expect("hash").to_string()
+}
+
+/// A typed answer's image reaches the coding agent as its blob path, which a
+/// Claude Code session may open because it is granted `data/`. An answer
+/// naming an image the workspace never received is refused outright.
+#[tokio::test]
+async fn an_answer_image_reaches_the_hook_as_its_blob_path() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!("toolu_e2e_{}", thread_id.simple());
+    let q0_id = format!("{tool_use_id}#q0");
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+    let hash = upload_png(&client, thread_id).await;
+
+    let client_bg = client.clone();
+    let pool_bg = pool.clone();
+    let hash_bg = hash.clone();
+    let answerer = tokio::spawn(async move {
+        wait_for_question_asked(&pool_bg, thread_id, &q0_id).await;
+        let url = format!(
+            "{}/api/v1/threads/{}/answer-question",
+            base_url(),
+            thread_id
+        );
+        let unknown = client_bg
+            .post(&url)
+            .json(&json!({
+                "tool_use_id": q0_id,
+                "answer": { "kind": "FreeText", "text": "this", "image_hashes": ["f".repeat(64)] }
+            }))
+            .send()
+            .await
+            .expect("answer post");
+        assert_eq!(
+            unknown.status().as_u16(),
+            409,
+            "an unknown image is refused"
+        );
+        let resp = client_bg
+            .post(&url)
+            .json(&json!({
+                "tool_use_id": q0_id,
+                "answer": { "kind": "FreeText", "text": "this", "image_hashes": [hash_bg] }
+            }))
+            .send()
+            .await
+            .expect("answer post");
+        assert_eq!(resp.status().as_u16(), 200, "answer-question should accept");
+    });
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+            .json(&json!({
+                "thread_id": thread_id.to_string(),
+                "tool_use_id": tool_use_id,
+                "session_id": "sid-1",
+                "questions": [{
+                    "question": "Which screen?",
+                    "header": "screen",
+                    "multiSelect": false,
+                    "options": [{"label": "A", "description": ""}, {"label": "B", "description": ""}]
+                }]
+            }))
+            .send(),
+    )
+    .await
+    .expect("did not time out")
+    .expect("hook post");
+    answerer.await.unwrap();
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let value = body["answers"]["Which screen?"]
+        .as_str()
+        .expect("string answer");
+    assert!(
+        value.starts_with("this\n\n"),
+        "typed text first, got {value:?}"
+    );
+    assert!(
+        value.contains(&format!("data/blobs/{}/{hash}.png", &hash[..2])),
+        "the blob path must be named, got {value:?}"
+    );
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+/// An answer-less resolution releases the agent parked inside this endpoint,
+/// and ends the whole batch rather than just its own card.
+///
+/// That release is the whole point of the supersede path: a coding agent asking
+/// a question blocks here, so only a resolution lets it read anything else.
+/// `Canceled` and `Superseded` share the code that does it
+/// (`batch_ending_answer`, `answer_resolves_without_resume`), and `Canceled` is
+/// the one a client may post, so it drives the test. The Superseded-specific
+/// half (the string the agent reads) is unit-covered in `agent_question.rs`.
+///
+/// Two questions, because the untouched card is resolved by a padding row
+/// alone. Without it a restart would re-fire the walk and re-ask it.
+#[tokio::test]
+async fn answer_less_resolution_releases_the_parked_hook_and_ends_the_batch() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!("toolu_batch_end_{}", thread_id.simple());
+    let q0_id = format!("{tool_use_id}#q0");
+    let q1_id = format!("{tool_use_id}#q1");
+
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+
+    let client_bg = client.clone();
+    let q0_id_bg = q0_id.clone();
+    let pool_bg = pool.clone();
+    let resolver = tokio::spawn(async move {
+        wait_for_question_asked(&pool_bg, thread_id, &q0_id_bg).await;
+        let resp = client_bg
+            .post(format!(
+                "{}/api/v1/threads/{}/answer-question",
+                base_url(),
+                thread_id
+            ))
+            .json(&json!({
+                "tool_use_id": q0_id_bg,
+                "answer": { "kind": "Canceled" }
+            }))
+            .send()
+            .await
+            .expect("resolution post");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "an answer-less resolution must resolve the pending question"
+        );
+    });
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+            .json(&json!({
+                "thread_id": thread_id.to_string(),
+                "tool_use_id": tool_use_id,
+                "session_id": "sid-batch-end",
+                "questions": [
+                    {
+                        "question": "Fav color?",
+                        "header": "color",
+                        "multiSelect": false,
+                        "options": [{"label": "Red", "description": ""}]
+                    },
+                    {
+                        "question": "Fav animal?",
+                        "header": "animal",
+                        "multiSelect": false,
+                        "options": [{"label": "Cat", "description": ""}]
+                    }
+                ]
+            }))
+            .send(),
+    )
+    .await
+    .expect("the parked hook must be released, not left blocked")
+    .expect("hook post");
+
+    resolver.await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["answers"]["Fav color?"], "(canceled)",
+        "the agent must learn the card it was blocked on is resolved"
+    );
+    assert_eq!(
+        body["answers"]["Fav animal?"], "(canceled)",
+        "the untouched card ends the same way, never as unanswered"
+    );
+
+    // The second card was never asked, so only the padding row resolves it.
+    // Without that row a restart would re-fire the walk and re-ask it.
+    let padded_kind: Option<String> = sqlx::query_scalar(
+        "SELECT payload->'answer'->>'kind' FROM events \
+         WHERE thread_id = $1 AND event_type = 'UserQuestionAnswered' \
+           AND payload->>'tool_use_id' = $2 LIMIT 1",
+    )
+    .bind(thread_id)
+    .bind(&q1_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("padding query")
+    .flatten();
+    assert_eq!(
+        padded_kind.as_deref(),
+        Some("Canceled"),
+        "the padding must record the kind that ended the batch"
+    );
+
+    // A supersede leaves the next turn to the follow-up that caused it.
+    for event_type in ["CodingAgentPromptSent", "ContinuationRequested"] {
+        let count = count_events_of_type(&pool, thread_id, event_type).await;
+        assert_eq!(
+            count, 0,
+            "{event_type} must not fire for an answer-less resolution: no turn follows it"
+        );
+    }
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+/// `Superseded` asserts something no client can make true: that a follow-up
+/// arrived and replaced this question. Only the message router knows that, so
+/// the endpoint refuses the kind and leaves the question pending.
+///
+/// It is on the public enum because it rides the same persisted
+/// `UserQuestionAnswered` as every other answer. That is exactly why the
+/// refusal has to be tested rather than assumed from the type.
+#[tokio::test]
+async fn answer_question_refuses_a_client_supplied_superseded() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    let q0_id = format!("toolu_client_superseded_{}#q0", thread_id.simple());
+
+    seed_cc_thread_summary(&pool, thread_id, "waiting_for_user_answer").await;
+    sqlx::query(
+        "INSERT INTO events (id, thread_id, event_type, payload, created, aggregate, aggregate_id)
+         VALUES ($1, $2, 'UserQuestionAsked', $3, NOW(), 'thread', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(thread_id)
+    .bind(json!({
+        "tool_use_id": q0_id,
+        "cc_session_id": "sid-client-superseded",
+        "question": "Pick one",
+        "options": [{"id": "opt-0", "label": "Red"}],
+        "channel": "claude_code",
+    }))
+    .bind(thread_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert UserQuestionAsked");
+
+    let resp = client
+        .post(format!(
+            "{}/api/v1/threads/{}/answer-question",
+            base_url(),
+            thread_id
+        ))
+        .json(&json!({
+            "tool_use_id": q0_id,
+            "answer": { "kind": "Superseded" }
+        }))
+        .send()
+        .await
+        .expect("answer post");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "an engine-internal kind must be refused, not persisted"
+    );
+    let body: serde_json::Value = resp.json().await.expect("standard error body");
+    let msg = body["error"].as_str().expect("error is a string");
+    assert!(
+        msg.contains("engine-internal"),
+        "the refusal must say why, got: {msg}"
+    );
+
+    let answered: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE thread_id = $1 \
+         AND event_type = 'UserQuestionAnswered'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .expect("counting UserQuestionAnswered failed");
+    assert_eq!(
+        answered, 0,
+        "a refused answer must leave the question pending and answerable"
+    );
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn multi_select_question_returns_joined_answer() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!("toolu_multi_{}", thread_id.simple());
+    let q0_id = format!("{tool_use_id}#q0");
+
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+
+    let client_bg = client.clone();
+    let q0_id_bg = q0_id.clone();
+    let pool_bg = pool.clone();
+    let answerer = tokio::spawn(async move {
+        wait_for_question_asked(&pool_bg, thread_id, &q0_id_bg).await;
+        let resp = client_bg
+            .post(format!(
+                "{}/api/v1/threads/{}/answer-question",
+                base_url(),
+                thread_id
+            ))
+            .json(&json!({
+                "tool_use_id": q0_id_bg,
+                "answer": { "kind": "MultiSelected", "option_ids": ["opt-0", "opt-1"] }
+            }))
+            .send()
+            .await
+            .expect("answer post");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "MultiSelected answer should accept"
+        );
+    });
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+            .json(&json!({
+                "thread_id": thread_id.to_string(),
+                "tool_use_id": tool_use_id,
+                "session_id": "sid-multi",
+                "questions": [{
+                    "question": "Pick all that apply",
+                    "header": "multi",
+                    "multiSelect": true,
+                    "options": [
+                        {"label": "Red", "description": ""},
+                        {"label": "Blue", "description": ""}
+                    ]
+                }]
+            }))
+            .send(),
+    )
+    .await
+    .expect("did not time out")
+    .expect("hook post");
+
+    answerer.await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["answers"],
+        json!({"Pick all that apply": "Red, Blue"}),
+        "joined labels should round-trip to the hook output"
+    );
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn multi_select_empty_answer_is_rejected() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!("toolu_multi_empty_{}", thread_id.simple());
+    let q0_id = format!("{tool_use_id}#q0");
+
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+
+    // Pre-seed the question so answer-question can find it (we don't want to
+    // race the long-poll endpoint here — this is purely a validation test).
+    // Use the synthetic per-question id `#q0` because that's what the hook
+    // endpoint emits and what the answer endpoint matches against.
+    sqlx::query(
+        "INSERT INTO events (id, thread_id, event_type, payload, created, aggregate, aggregate_id)
+         VALUES ($1, $2, 'UserQuestionAsked', $3, NOW(), 'thread', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(thread_id)
+    .bind(json!({
+        "tool_use_id": q0_id,
+        "cc_session_id": "sid-multi-empty",
+        "question": "Pick all that apply",
+        "options": [
+            {"id": "opt-0", "label": "Red"},
+            {"id": "opt-1", "label": "Blue"}
+        ],
+        "multi_select": true
+    }))
+    .bind(thread_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert UserQuestionAsked");
+
+    let resp = client
+        .post(format!(
+            "{}/api/v1/threads/{}/answer-question",
+            base_url(),
+            thread_id
+        ))
+        .json(&json!({
+            "tool_use_id": q0_id,
+            "answer": { "kind": "MultiSelected", "option_ids": [] }
+        }))
+        .send()
+        .await
+        .expect("answer post");
+    assert_eq!(
+        resp.status().as_u16(),
+        409,
+        "empty MultiSelected option_ids must reject as conflict"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .map(|s| s.contains("at least one"))
+            .unwrap_or(false),
+        "error must explain the requirement; got {body:?}"
+    );
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn returns_immediately_when_answer_already_persisted() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!("toolu_recovery_{}", thread_id.simple());
+    // Crash-recovery answer is keyed on the synthetic `#q0` id — the hook
+    // re-POSTs the same outer tool_use_id on restart, the handler re-derives
+    // `#q0` and finds the persisted UserQuestionAnswered.
+    let q0_id = format!("{tool_use_id}#q0");
+
+    // Pre-insert a UserQuestionAnswered event directly to simulate "engine
+    // restarted; the user already answered before crash".
+    sqlx::query(
+        "INSERT INTO events (id, thread_id, event_type, payload, created, aggregate, aggregate_id)
+         VALUES ($1, $2, 'UserQuestionAnswered', $3, NOW(), 'thread', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(thread_id)
+    .bind(json!({
+        "tool_use_id": q0_id,
+        "answer": { "kind": "Selected", "option_id": "opt-1" }
+    }))
+    .bind(thread_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert event");
+
+    let start = std::time::Instant::now();
+    let resp = client
+        .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+        .json(&json!({
+            "thread_id": thread_id.to_string(),
+            "tool_use_id": tool_use_id,
+            "session_id": "sid-recovery",
+            "questions": [{
+                "question": "Fav color?",
+                "header": "color",
+                "multiSelect": false,
+                "options": [
+                    {"label": "Red", "description": ""},
+                    {"label": "Blue", "description": ""}
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .expect("hook post");
+
+    // Fast path = "no long-poll", not "sub-1s round-trip" — under parallel
+    // test load HTTPS handshake + DB lookup can take ~1s. Long-poll timeout
+    // is much higher; 5s leaves headroom while still catching regressions.
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "should not block when answer already exists; took {:?}",
+        start.elapsed()
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["answers"], json!({"Fav color?": "Blue"}));
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// ADR 0415 on the hook path: a bad option widget refuses the batch before any
+/// card is written, and a good one is lifted into the option's `widget`.
+#[tokio::test]
+async fn an_option_widget_is_checked_and_lifted_on_the_hook_path() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+    let ask = |tool_use_id: String, description: &str| {
+        json!({
+            "thread_id": thread_id.to_string(),
+            "tool_use_id": tool_use_id,
+            "session_id": "sid-1",
+            "questions": [{
+                "question": "Which voice?",
+                "options": [
+                    {"label": "Marin", "description": description},
+                    {"label": "Ash", "description": ""}
+                ]
+            }]
+        })
+    };
+
+    let refused = client
+        .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+        .json(&ask(
+            format!("toolu_bad_{}", thread_id.simple()),
+            "Warm. ![Marin](app:lucidos-sound-player)",
+        ))
+        .send()
+        .await
+        .expect("hook post");
+    assert_eq!(
+        refused.status().as_u16(),
+        500,
+        "a missing required param refuses"
+    );
+    let reason = refused.text().await.unwrap_or_default();
+    assert!(reason.contains("needs the param 'clip'"), "{reason}");
+    assert_eq!(
+        count_events_of_type(&pool, thread_id, "UserQuestionAsked").await,
+        0,
+        "no card before the refusal"
+    );
+
+    let tool_use_id = format!("toolu_good_{}", thread_id.simple());
+    let q0 = format!("{tool_use_id}#q0");
+    let pool_bg = pool.clone();
+    let client_bg = client.clone();
+    let q0_bg = q0.clone();
+    let answerer = tokio::spawn(async move {
+        wait_for_question_asked(&pool_bg, thread_id, &q0_bg).await;
+        client_bg
+            .post(format!(
+                "{}/api/v1/threads/{}/answer-question",
+                base_url(),
+                thread_id
+            ))
+            .json(&json!({
+                "tool_use_id": q0_bg,
+                "answer": { "kind": "Selected", "option_id": "opt-0" }
+            }))
+            .send()
+            .await
+            .expect("answer post");
+    });
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+            .json(&ask(
+                tool_use_id.clone(),
+                r#"Warm. ![Marin](app:lucidos-sound-player?params={"clip": "artifacts/voices/marin.mp3"})"#,
+            ))
+            .send(),
+    )
+    .await
+    .expect("did not time out")
+    .expect("hook post");
+    answerer.await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let option: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload->'options'->0 FROM events WHERE thread_id = $1 \
+         AND event_type = 'UserQuestionAsked'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the card was asked");
+    assert_eq!(option["description"], "Warm.");
+    assert_eq!(option["widget"]["app_id"], "lucidos-sound-player");
+    assert_eq!(option["widget"]["label"], "Marin");
+    assert_eq!(
+        option["widget"]["params"]["clip"],
+        "artifacts/voices/marin.mp3"
+    );
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
