@@ -1,0 +1,1597 @@
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 0.5rem;
+    height: 0.5rem;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.5);
+}
+
+::-webkit-scrollbar-corner {
+    background: var(--bg-primary);
+}
+
+@media (hover: hover) {
+    ::-webkit-scrollbar-thumb:hover {
+        background: var(--text-muted);
+    }
+}
+
+/* Crossfade out of a loading skeleton (LoadingFade.tsx). Two grid children — the
+   `.loading-fade-content` wrapper and the skeleton — share one grid cell
+   (stacked); while loading the skeleton sizes the cell, once loaded the content
+   sizes it and the skeleton goes absolute + fades out over the now-visible
+   content — a smooth exit with no blank frame and no withheld content. The
+   content is wrapped in a single element so a caller passing a fragment of N
+   siblings doesn't flatten into N direct grid children (which would all stack in
+   the one cell via the rule below — the Changes-panel double-text bug). */
+.loading-fade {
+    display: grid;
+    position: relative;
+}
+
+.loading-fade > * {
+    grid-area: 1 / 1;
+    min-width: 0;
+}
+
+.loading-fade-skeleton {
+    transition: opacity var(--duration-normal) ease;
+}
+
+.loading-fade-skeleton.loading-fade-out {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+
+:root[data-motion="reduce"] .loading-fade-skeleton {
+    transition: none;
+}
+
+/* Self-skeletonizing primitives (components/shared/Skeleton.tsx). The Sk* leaves
+   render a `.sk-bar` shimmer placeholder when inside a SkeletonProvider, so a row
+   draws itself as its own loading placeholder (mirrors the real layout by
+   construction). Reuses the global `shimmer` keyframes (drawer.css). Host-only —
+   these classes live in the host bundle and are never served to apps. */
+/* Both stops are translucent, so a bar shows on whatever it sits on, including
+   the many surfaces painted --bg-tertiary. The body tints the text colour, so a
+   muted line shimmers fainter, like its text. A surface with a brand background
+   overrides the two variables. */
+.sk-bar {
+    --sk-base: color-mix(in srgb, currentColor 13%, transparent);
+    --sk-shine: color-mix(in srgb, var(--accent) 30%, transparent);
+    display: inline-block;
+    width: 100%;
+    height: 0.85em;
+    border-radius: calc(var(--radius-control) * 0.75);
+    background: linear-gradient(90deg, var(--sk-base) 25%, var(--sk-shine) 50%, var(--sk-base) 75%);
+    background-size: 200% 100%;
+    /* The sweep repaints every frame, so the bar owns its layer
+       (an-endless-repaint-owns-its-layer.test.ts). */
+    will-change: transform;
+    animation: shimmer 1.5s infinite;
+    vertical-align: middle;
+}
+
+.sk-circle {
+    border-radius: var(--radius-round);
+}
+
+.sk-round {
+    border-radius: var(--radius-control);
+}
+
+/* Full-pane self-skeletonizing run (ListSkeletonOf fill): the component pins an
+   inline pixel height to the available content-pane height and renders one extra
+   row, clipped here so the run fills the pane exactly with no void below. The
+   row spacing/inset comes from the real list's `containerClass`, so no padding
+   is added here (unlike `.list-skeleton--fill`, which had no real container). */
+.sk-fill {
+    overflow: hidden;
+}
+
+:root[data-motion="reduce"] .sk-bar {
+    animation: none;
+}
+
+/* These boxes can hold focus without being something the user presses, and
+   none of them paints a ring for it. Same call .thread-content
+   (chat/input-messages.css) and .content-pane-body (panels/shell.css) make, and
+   their comments carry the longer form.
+
+   The progress dialog's body takes focus on purpose, so a modal with no Cancel
+   cannot leave the keyboard behind it (ProgressDialog.tsx). The others carry
+   tabIndex={-1} at their render site, because Chrome promotes an
+   overflowing scroller with no focusable child to a Tab stop and each sits
+   inside a surface whose own Tab cycle cannot name it. A click can still land
+   focus on one, which is what this rule covers there.
+
+   Controls inside these boxes keep their own rings, the toast's buttons
+   included. */
+.confirm-details:focus,
+.confirm-details:focus-visible,
+.dialog-body:focus,
+.dialog-body:focus-visible,
+.step-detail-body:focus,
+.step-detail-body:focus-visible,
+.explainer-body:focus,
+.explainer-body:focus-visible,
+.event-condition-popover-body:focus,
+.event-condition-popover-body:focus-visible,
+.progress-dialog-body:focus,
+.progress-dialog-body:focus-visible,
+.toast-heading:focus,
+.toast-heading:focus-visible,
+.toast-text:focus,
+.toast-text:focus-visible {
+    outline: none;
+}
+
+/* The file preview's body is the exception, and it earns a ring. Nothing traps
+   Tab in that modal, so a keyboard user reaches the body deliberately and
+   scrolls the file with it (FilePreviewModal.tsx). A stop a sighted keyboard
+   user cannot see is worse than the browser's default ring, so it wears ours.
+
+   Drawn INSET, for the reason .list-row-add-card:focus-visible is: the body is
+   full-bleed and .file-preview-modal clips, so an outward band would lose its
+   sides. :focus-visible only, so a click on the preview paints nothing. The
+   transparent outline is the forced-colors fallback, where box-shadow is
+   stripped, and takes the matching negative offset. */
+.file-preview-modal-body:focus-visible {
+    outline: 0.125rem solid transparent;
+    outline-offset: -0.125rem;
+    box-shadow: inset var(--focus-ring);
+}
+
+/* The centred dialog: Confirm, Prompt, Progress and the release notice. Its
+   box is `.surface` (styles/global/surface.css); this rule only sizes it and
+   lets the body scroll inside the cap. */
+.confirm-dialog {
+    max-width: 27.5rem;
+    width: 90%;
+    /* Cap height so the dialog never spills past the viewport;
+       the details list scrolls inside. `--app-height` is set by
+       MobileSwipeContainer so iOS Safari shrinks correctly when the
+       keyboard opens (raw `100vh` does not). */
+    max-height: calc(var(--app-height, 100dvh) - 4rem - var(--safe-area-top) - var(--safe-area-bottom));
+    display: flex;
+    flex-direction: column;
+}
+
+/* A dialog with no title opens straight on its message. */
+.dialog-body:first-child {
+    padding-top: var(--surface-inset);
+}
+
+/* The body is the part that scrolls, so the head and the buttons stay put.
+   It stays a block: a message can mix text with inline code, which a flex
+   column would break onto one line per fragment. */
+.dialog-body {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+/* An untitled message is the whole dialog, so it reads at full strength. Under
+   a title it is the explanation, and steps back. */
+.confirm-message {
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+    margin: 0 0 var(--space-md);
+}
+
+.surface-head + .surface-body .confirm-message {
+    color: var(--text-secondary);
+}
+
+/* A multi-paragraph message (DialogMessage splits on a blank line) sits tighter
+   between its own paragraphs than the gap down to the input or the buttons,
+   which the LAST paragraph keeps. Written as "followed by another paragraph"
+   rather than `:not(:last-of-type)` so it can only ever fire when a second
+   paragraph exists: every single-paragraph dialog keeps the rule above
+   untouched, including markup where the message is not the last element of its
+   type (showcase.html renders it as a div among divs). */
+.confirm-message:has(+ .confirm-message) {
+    margin-bottom: var(--space-md);
+}
+
+/* Text input for the prompt dialog (PromptDialog). Box and focus:
+   global/text-input.css. */
+.prompt-input {
+    width: 100%;
+    box-sizing: border-box;
+    margin-bottom: var(--space-md);
+    padding: 0.5rem 0.625rem;
+    font-family: inherit;
+    font-size: var(--font-size-md);
+}
+
+.prompt-textarea {
+    resize: vertical;
+    min-height: 4.5rem;
+    line-height: 1.5;
+}
+
+.confirm-details {
+    margin: 0 0 var(--space-md);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+    color: var(--text-secondary);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    min-height: 0;
+}
+
+.confirm-details-intro {
+    margin: 0 0 0.75rem;
+}
+
+.confirm-details-group {
+    margin-bottom: 0.75rem;
+}
+
+.confirm-details-group:last-child {
+    margin-bottom: 0;
+}
+
+.confirm-details-header {
+    color: var(--text-primary);
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+}
+
+.confirm-details-list {
+    list-style: disc;
+    padding-left: 1.25rem;
+    margin: 0;
+}
+
+.confirm-details-list li {
+    margin-bottom: 0.125rem;
+}
+
+/* The extra action (Discard beside Keep draft) sits apart from the answer pair. */
+.confirm-extra {
+    margin-right: auto;
+}
+
+/* The progress dialog reuses .confirm-dialog's box, so only its own parts are
+   declared here. It narrates an operation that takes the workspace away, so
+   there is nothing to lay out beside the message except the readout. */
+.progress-dialog-body {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.progress-dialog-readout {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+}
+
+.progress-dialog-readout .confirm-message {
+    margin-bottom: 0;
+}
+
+.progress-dialog-bar {
+    /* Full width of the dialog: the bar IS the readout, unlike the toast's,
+       which shares its row with a message and a close button. */
+    width: 100%;
+}
+
+/* The release-notice modal reuses .confirm-dialog's box too, so only its own
+   parts are here. It is wider than a confirm, because its body is authored
+   markdown rather than one sentence. */
+.release-notice {
+    max-width: 34rem;
+}
+
+/* Which release this came from, and where the reader is in the queue. Under the
+   title and quieter than it: the instruction is the subject, its provenance is
+   not. */
+.release-notice-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-md);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    margin-bottom: var(--space-xs);
+}
+
+.release-notice-step {
+    font-variant-numeric: tabular-nums;
+}
+
+/* Scrolls inside the capped box, the same way the confirm dialog's details list
+   does, so a long notice cannot push its buttons off screen. */
+/* Shared by the modal and the What's New rows, so one notice reads the same in
+   both. Its font-size is named here because `.markdown-content` deliberately
+   sets none: that rule is also served to app iframes, so the size belongs to
+   whatever surface wears it. */
+.release-notice-body {
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+}
+
+/* Says why this notice draws no action button: a later one carries it. */
+.release-notice-deferred {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    margin: var(--space-sm) 0 0;
+}
+
+
+/* File preview modal (components/files/FilePreviewModal.tsx): a read-only
+   glance at a cited file, over whatever the content pane is showing, opened by
+   an app through `lucidos.ui.previewFile`. Bigger than the confirm dialog
+   because it holds a real file preview, and a fixed height rather than a
+   max-height so the line-numbered source (`.repo-file-content` /
+   `.file-preview-inline`, both `height: 100%`) has a definite box to scroll
+   inside. `--app-height` is set by MobileSwipeContainer so iOS Safari shrinks
+   correctly when the keyboard opens (raw `100vh` does not). */
+.file-preview-modal {
+    width: min(60rem, 92vw);
+    height: min(45rem, calc(var(--app-height, 100dvh) - 4rem - var(--safe-area-top) - var(--safe-area-bottom)));
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+}
+
+.file-preview-modal > .surface-head {
+    /* The body below is full-bleed, so the head needs a rule to stand on. */
+    border-bottom: 1px solid var(--border-color);
+}
+
+/* The name over the path. min-width: 0 (from .surface-title) lets the path
+   ellipsize instead of widening the modal. */
+.file-preview-modal .surface-title {
+    display: flex;
+    flex-direction: column;
+}
+
+.file-preview-modal-detail {
+    font-size: var(--font-size-xs);
+    font-weight: 400;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The escalation is a secondary affordance beside the file name, not a second
+   heading. `.accent-link` is `font: inherit`, which took the panel's base size
+   and left "Open in Files" competing with the name it sits next to. One step
+   down reads as a link and still gives a comfortable tap target (the detail
+   line's --font-size-xs would not). */
+.file-preview-modal .surface-actions .accent-link {
+    font-size: var(--font-size-sm);
+}
+
+/* The preview components render full-bleed (no gutter), the same way they do in
+   the content pane. `min-height: 0` is what lets a flex child actually scroll
+   rather than pushing the modal taller than its box. */
+.file-preview-modal-body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+}
+
+/* `flex-basis: auto` so a rendered document (`.repo-file-rendered`, which has no
+   height of its own) grows and scrolls the body, while a line-numbered source
+   view keeps its `height: 100%` and scrolls inside itself. */
+.file-preview-modal-body > * {
+    flex: 1 0 auto;
+    min-height: 0;
+}
+
+/* The source view's pinned gutter paints the surface it sits on, and in here
+   that is the modal panel rather than the content pane. Declared on the same
+   element `.line-numbered` sets its default on (panels/content.css), one step
+   more specific, so the override cannot be lost to source order. */
+.file-preview-modal .line-numbered {
+    --code-surface: var(--surface-bg);
+}
+
+/* Toast notifications — positioned below header. The container spans the full
+   width and holds one .toast-column per VISIBLE pane, each centered over its own
+   pane (desktop block below). Mobile shows one pane at a time, so it gets a
+   single full-width column. --z-toast sits above .ui-blocking-overlay so the
+   restart toast stays visible when the dim overlay covers the header. */
+.toast-container {
+    /* The widest a toast gets, read by the toast and by the corner placement,
+       which sizes the container rather than the toast. */
+    --toast-max-width: 36rem;
+    position: fixed;
+    /* Start at the header's BOTTOM edge (--app-header-bottom, global/base.css)
+       plus the stack's gap. The container is position:fixed, so its top is
+       measured from the viewport: restating the header's own height here is what
+       put the stack inside the header on the packaged macOS build, where the
+       reclaimed title-bar band pushes the header ~28px down. The anchor carries
+       that band; mobile redefines it as its own fixed header's height.
+       The max() floor keeps the stack clear of the notch on mobile while the
+       keyboard is open and the header has slid off. It is inert on desktop and
+       on any device without a top inset, where env() resolves to 0. */
+    top: max(
+        calc(var(--safe-area-top) + 0.5rem),
+        calc(var(--app-header-bottom) + 0.5rem)
+    );
+    left: 0;
+    right: 0;
+    z-index: var(--z-toast);
+    pointer-events: none;
+}
+
+/* An open modal outranks the toast layer, unless the stack has something that
+   cannot wait. A standing offer ("Switch to new version") is still there when
+   the modal closes, so covering what the reader is reading buys nothing. An
+   error or a warning is the exception: a failure raised by a button INSIDE a
+   modal has to be seen while that modal is up, or the button reads as having
+   done nothing (.claude/rules/frontend.md, No Hidden Errors). Which case this
+   is comes from toastUrgency.ts, per stack, because the container carries the
+   z-index and is one stacking context.
+
+   Below the FLOOR of the modal band, so one value clears every stacked modal.
+
+   The UI blocker is excluded. It is not an <Overlay> and raises no
+   data-overlay-open of its own, but a modal left open when a client refresh
+   starts would otherwise take the "Refreshing…" toast down with it, and that
+   toast is the only thing the reader may still act on. */
+:root[data-overlay-open]:not([data-ui-blocked]) .toast-container[data-toast-urgency="standing"] {
+    z-index: calc(var(--z-modal) - 1);
+}
+
+/* One stack per visible pane. A toast is pinned to the pane that was focused
+   WHEN IT APPEARED (ToastItem.pane, frozen in showToast) and lands in that
+   pane's column, so it displaces only that pane's other toasts. Which columns
+   exist is decided in JS (toastColumns.ts): a collapsed pane leaves ONE column
+   for the survivor, and mobile has a single full-width one, which is why there
+   is no collapse handling here. Newest-first inside a column, matching the
+   newest-first array showToast prepends to. */
+.toast-column {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+/* Desktop: each column spans its own pane, so `align-items: center` above
+   centers its toasts over that pane and the toast's own `width: calc(100% - 2rem)`
+   measures against the pane rather than the viewport. The geometry is the shared
+   header vars from shell.css (--co drawer width, --ddo drawer-divider offset,
+   --divider-x split position, --divider-width), i.e. the same segmentation the
+   header focus wash uses, so a column tracks its pane through a divider drag.
+   The percentages inside those vars resolve against .toast-container, which
+   spans the viewport exactly as the header does. */
+@media (--desktop-layout) {
+    .toast-column {
+        position: absolute;
+        top: 0;
+        /* Geometry easing matched to the panes so a collapse/expand slides the
+           column with its pane instead of teleporting it. Switched off during a
+           divider drag by the data-pane-resizing kill rule in shell.css, for the
+           same 1:1 tracking the header regions get. */
+        transition: left var(--duration-slow) ease, width var(--duration-slow) ease;
+    }
+
+    .toast-column[data-toast-pane="thread"] {
+        left: calc(var(--co) + var(--ddo));
+        width: calc(var(--divider-x) - var(--co) - var(--ddo));
+    }
+
+    .toast-column[data-toast-pane="content"] {
+        left: calc(var(--divider-x) + var(--divider-width));
+        width: calc(100% - var(--divider-x) - var(--divider-width));
+    }
+}
+
+.toast {
+    /* The card's own padding, named because the out-of-flow icon and close X
+       are both placed ON it. A literal restated in those two rules is a value
+       that silently stops matching the day this padding is retuned. */
+    --toast-pad-y: 0.625rem;
+    --toast-pad-x: var(--surface-inset);
+    /* The close X's box: an .icon-btn, so a 0.875rem glyph in 0.25rem of
+       padding. .toast-heading reserves this much on the right AND is at least
+       this tall, which is what keeps the scroll box under it clear of the
+       button. */
+    --toast-close-size: 1.375rem;
+    /* The category icon's box. It is out of flow, so .toast-heading pays for it
+       as left padding rather than as a flex sibling. */
+    --toast-icon-size: 1.125rem;
+    /* The message's line height, named because .toast-heading's cap is a whole
+       multiple of it. A literal restated there is a value that silently stops
+       dividing the day this is retuned, and the whole point of that cap is
+       that it divides. */
+    --toast-line-height: 1.4;
+    /* The box (fill, hairline, radius, shadow) is `.surface`, which every toast
+       also wears. Tone lives in the icon alone, never in the frame. */
+    padding: var(--toast-pad-y) var(--toast-pad-x);
+    min-height: 2.5rem;
+    /* Cap height; the message scrolls inside (see .toast-text) and the
+       actions row + close X are outside every scroll box, so they stay
+       reachable without scrolling to find them.
+
+       A toast is a SUMMARY with somewhere to go, never the place a long body is
+       read: for a notification the full text is one tap away in the content
+       pane, and for everything else the toast is the whole message and is short.
+       So the absolute 14rem leads (roughly six lines of body plus the actions
+       row), and the viewport term is only a ceiling under it, for a short screen
+       or an open keyboard. The viewport term ALONE is what shipped the bug: at
+       `100dvh - 6rem` a single Mac-memory-watchdog notification (which embeds a
+       `ps` command and a full metrics dump) rendered ~87% tall on a 390pt phone,
+       from under the header down to the composer. Desktop had the identical rule
+       and the identical unbounded growth; the cap is deliberately shared rather
+       than made a mobile override, because "a toast is a summary" is not a
+       phone-specific claim.
+
+       `--app-height` keeps iOS Safari honest when the keyboard pushes the visual
+       viewport up. Same min(absolute, viewport) shape as the prompt-bar popover
+       in global/anchored-popover.css. */
+    max-height: min(
+        14rem,
+        calc(var(--app-height, 100dvh) - 6rem - var(--safe-area-top) - var(--safe-area-bottom))
+    );
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    width: calc(100% - 2rem);
+    max-width: var(--toast-max-width);
+    pointer-events: auto;
+    /* Entry animation. Kept in lockstep with the JS reflow (FLIP) that slides
+       the toasts BELOW a newly-inserted one down to make room — see
+       REFLOW_DURATION_MS / REFLOW_EASING in Toast.tsx. Same duration + easing so
+       the incoming toast and the push-down it causes move together instead of
+       one snapping while the other glides. The 0.26s here is the 1x default;
+       Toast.tsx overrides `animation-duration` inline so both halves also scale
+       together with the diagnostic animation-speed slider (speedMultiplier). */
+    animation: toast-in calc(0.26s * var(--duration-scale)) cubic-bezier(0.22, 0, 0, 1);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    position: relative;
+    overflow: hidden;
+}
+
+/* The message column: the heading that stays, and the text that scrolls
+   under it. NOT a scroll container itself, and not an ancestor of the icon.
+   The two boxes inside it own every scroll the toast has, so no rule here has
+   to be switched off for the spinner.
+
+   `min-height: 0` lets the column shrink under .toast's cap. That shrink is
+   what gives the boxes inside it a bounded height to scroll in; without it they
+   grow to their content and the cap just clips them.
+
+   `overflow-wrap` makes a long path or URL wrap instead of running off the
+   card. The default is not enough. Chrome and WebKit break a long word only at
+   its hyphens, and a leading `/Users/.../crates/lucidos-` is still wider than
+   the toast. Without the wrap, .toast-heading draws a horizontal scrollbar
+   under the message and clips the middle of the path. A box that scrolls
+   vertically scrolls on BOTH axes.
+
+   `anywhere` rather than `break-word`, since it is what the app already uses
+   for a path. The toast has a definite width, so the min-content difference
+   between the two cannot reach it.
+
+   `pre-line` keeps the caller's line breaks: a newline in a title or message
+   is a line break, and nothing reads structure out of it. */
+.toast-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    min-height: 0;
+    overflow-wrap: anywhere;
+    white-space: pre-line;
+}
+
+/* Out of the flow, so no scroll container can ever contain it. A scroll
+   container clips its own painted overflow on both axes, and the mini-spinner
+   rotates via CSS transform: at 45° it reports a box ~41% wider than its layout
+   box, so a scrolling ancestor sheared its corners. That was patched once with
+   a `:has(.mini-spinner)` rule that switched the scroll off instead, which then
+   clipped every spinning toast that grew a body
+   (docs/plans/2026-08-11-build-toast-scrolls-and-describes-the-build.md).
+   Absolute, the question cannot come back.
+
+   It sits on the toast's own padding, so it lines up with the first line the
+   way the old flex row's `flex-start` did. Click-through, so the gutter it
+   occupies is not a dead spot on a clickable toast. */
+.toast-icon {
+    position: absolute;
+    top: var(--toast-pad-y);
+    left: var(--toast-pad-x);
+    width: var(--toast-icon-size);
+    height: var(--toast-icon-size);
+    pointer-events: none;
+    /* Per-type category colour, set as --toast-accent on the .toast-{type}
+       ancestor below. The icon is the only part of a toast that shows tone. */
+    color: var(--toast-accent);
+}
+
+/* The title, or an untitled message, and the one part that does NOT scroll: it
+   names what the toast is about, so it has to survive a scroll to the end.
+
+   It is the one box beside the out-of-flow icon, so it alone pads out the
+   icon's gutter. The text under it runs the toast's full width.
+
+   Two jobs beyond that, both carried by --toast-close-size. Reserving that much
+   on the right keeps the text clear of the close X. Being at least that TALL is
+   what puts .toast-text BELOW the button rather than beside it, and a scroll
+   box reaching up beside the X would draw its scrollbar under the glyph.
+
+   It is a scroll box itself for the one case with nothing under it: an
+   untitled message is all heading, and a long one has to scroll rather than be
+   clipped at the cap. A one-line heading is already at its floor, so it cannot
+   shrink and never shows a bar.
+
+   WHOLE LINES ONLY, which is the third job and the reason for the two rules
+   below. Flex has no reason to stop shrinking on a line boundary, so a heading
+   squeezed to make room for the text box was sheared through the middle of its
+   last line: the reported 503 card showed the top halves of the glyphs that
+   carried the actual error. `flex-shrink: 0` hands the squeeze to the text
+   box, which is what `flex: 1 1 auto; min-height: 0` there is for, and the cap
+   is a whole multiple of the line height so the box always ends on a boundary.
+
+   Six lines, and the number matters in one direction only: it must leave room
+   under .toast's 14rem cap for the actions row and the close X, which are the
+   heading's siblings rather than its content.
+
+   `em`, not the `rem` the rest of the app sizes in, and this one is not a slip.
+   A line here is the HEADING's own font-size times the ratio, so only an
+   em-relative cap tracks it. A rem value is a fixed length that stops dividing
+   the moment the message font moves. */
+.toast-heading {
+    flex: 0 0 auto;
+    line-height: var(--toast-line-height);
+    max-height: calc(6em * var(--toast-line-height));
+    min-height: var(--toast-close-size);
+    padding-left: calc(var(--toast-icon-size) + 0.5rem);
+    margin-right: var(--toast-close-size);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+/* The message under a title, and the toast's main scroll box: a message taller
+   than the 14rem cap is read to its last line here instead of being clipped by
+   .toast's `overflow: hidden`.
+
+   It reserves NOTHING on the right, which is the point. The box runs to the
+   toast's content edge, so its scrollbar sits in the card's right rail level
+   with the close glyph, rather than inside the text column with the X beyond
+   it. The heading above is what makes that safe: it clears the button, and this
+   box starts below it.
+
+   Under a title the message is the explanation, and steps back, as a titled
+   dialog's message does (.confirm-message). */
+.toast-text {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    line-height: var(--toast-line-height);
+    color: var(--text-secondary);
+}
+
+/* The bold line over the message. Nothing else in a toast is bold. */
+.toast-title {
+    font-weight: 600;
+}
+
+/* How many times a plain toast was raised while it was up (`showToast`). */
+.toast-count {
+    margin-left: var(--space-sm);
+}
+
+/* The whole card takes the tap (`toastTap`). Only a card that ACTS shows the
+   pointer and underlines its message on hover. The underline sits on the
+   message: set on the card, it would also reach the text of its buttons. */
+.toast[data-toast-tap="click"],
+.toast[data-toast-tap="action"] {
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .toast[data-toast-tap="click"]:hover .toast-body,
+    .toast[data-toast-tap="action"]:hover .toast-body {
+        text-decoration: underline;
+        text-decoration-color: currentColor;
+        text-underline-offset: 0.125rem;
+    }
+}
+
+/* Linkified URLs inside a toast (heading and text). A long URL takes its wrap
+   from .toast-body above, which both of these live inside. */
+.toast-heading a,
+.toast-text a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    text-underline-offset: 0.125rem;
+}
+
+@media (hover: hover) {
+    .toast-heading a:hover,
+    .toast-text a:hover {
+        text-decoration-color: var(--accent);
+    }
+}
+
+/* Determinate progress for a long operation the toast is narrating (a packaged
+   update's download). Uses the shared .progress-bar track and sits between the
+   message and the actions in the toast's flex column. `flex-shrink: 0` keeps the
+   thin track from being squeezed away when a long message fills the capped
+   height. It runs the full content width, level with the scrolling message
+   above and the actions row below: only the heading reserves the close-X
+   gutter, because only the heading is beside the button. */
+.toast-progress {
+    flex-shrink: 0;
+}
+
+/* Layout comes from `.button-group` (shared-components.css), which wraps the
+   buttons onto a second row rather than letting them overflow the toast and be
+   clipped by its `overflow: hidden`. Only the alignment is the toast's own. */
+.toast-actions {
+    justify-content: flex-end;
+}
+
+/* Sized from --toast-close-size rather than left to .icon-btn's padding, so the
+   token the heading reserves and floors against IS this button's box, not a
+   guess at it.
+
+   Inset by the toast's padding less the .icon-btn padding the glyph sits in, so
+   the GLYPH's right edge lands on the toast's content edge. That is the card's
+   right rail: .toast-text ends there too, which is where its scrollbar is
+   drawn. The button's own box overhangs into the padding, where nothing else
+   is. */
+.toast-close {
+    position: absolute;
+    top: var(--toast-pad-y);
+    right: calc(var(--toast-pad-x) - 0.25rem);
+    width: var(--toast-close-size);
+    height: var(--toast-close-size);
+    justify-content: center;
+    margin: 0;
+}
+
+/* A card that is the action holds a hidden button (`.toast-tap-control`), so
+   its keyboard ring goes on the card it stands for, beside the card's shadow. */
+.toast:has(.toast-tap-control:focus-visible) {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring), var(--shadow-md);
+}
+
+.toast-close svg {
+    width: 0.875rem;
+    height: 0.875rem;
+}
+
+/* The toast's CATEGORY colour (success green, info blue, warning sand, error
+   red). Only the icon reads it: the frame stays the neutral surface hairline. */
+.toast-success { --toast-accent: var(--accent-green); }
+.toast-info    { --toast-accent: var(--accent); }
+.toast-warning { --toast-accent: var(--accent-yellow); }
+.toast-error   { --toast-accent: var(--accent-red); }
+
+.toast-icon svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+/* The one-line toast: icon, words, one text action, and the X when it stays.
+   Every part is in flow, so nothing needs the gutter and the reserve the
+   multi-line layout keeps for its out-of-flow icon and X.
+
+   The parts sit on the FIRST line, not on the middle of the block: each gets a
+   row of the X's height, and the words are padded to centre in that row. A
+   headline that still wraps on a narrow phone keeps its icon and action beside
+   its opening words. */
+.toast-inline {
+    flex-direction: row;
+    align-items: flex-start;
+    gap: var(--space-sm);
+}
+
+.toast-inline .toast-icon,
+.toast-inline .toast-close,
+.toast-inline .toast-actions {
+    position: static;
+    flex: none;
+    height: var(--toast-close-size);
+    display: flex;
+    align-items: center;
+}
+
+.toast-inline .toast-icon svg {
+    width: var(--toast-icon-size);
+    height: var(--toast-icon-size);
+}
+
+.toast-inline .toast-close {
+    margin-right: -0.25rem;
+}
+
+.toast-inline .toast-body {
+    flex: 1;
+}
+
+.toast-inline .toast-heading {
+    min-height: 0;
+    padding-left: 0;
+    margin-right: 0;
+    padding-top: calc((var(--toast-close-size) - 1em * var(--toast-line-height)) / 2);
+}
+
+.toast-inline .toast-actions {
+    flex-wrap: nowrap;
+    /* The growing body already places these at the toast's right end. */
+    justify-content: flex-end;
+}
+
+/* The spinner keeps the app's standard ring size and centres in the icon's box.
+   A ring fills its box edge to edge, so at the icon's size it reads larger than
+   a glyph. */
+.mini-spinner.toast-icon {
+    --toast-spinner-size: 0.75rem;
+    width: var(--toast-spinner-size);
+    height: var(--toast-spinner-size);
+    margin: calc((var(--toast-icon-size) - var(--toast-spinner-size)) / 2);
+    --spinner-color: var(--toast-accent);
+}
+
+.toast-inline .mini-spinner.toast-icon {
+    margin-top: calc((var(--toast-close-size) - var(--toast-spinner-size)) / 2);
+}
+
+/* ─── Toast placement shapes (TEMPORARY: a comparison, see
+   docs/temporary-measures.md) ───
+
+   Four shapes, one of which survives. The pane columns above are the
+   `data-toast-placement="pane"` case and need no rule of their own, since they
+   are what the base CSS already draws. The other three are all ONE column, so
+   `toastLayout` answers `single` for them and only geometry differs here.
+
+   The problem the bleed shapes solve: a card narrower than the viewport sits ON
+   the pane divider, with the seam visible above and below it. A bar that runs
+   edge to edge COVERS the divider for its whole width instead, so the seam
+   emerges below the stack and reads as layering. */
+
+/* All three cross-pane shapes share one column spanning the container, so they
+   opt OUT of the desktop rule that absolutely positions a column over its pane.
+   Without this the lone column would shrink-wrap at the viewport's left edge
+   there, since it carries no [data-toast-pane] and so picks up no left/width.
+   Stated outside the media query because static is already the mobile value. */
+.toast-container[data-toast-placement="bottom-right"] .toast-column,
+.toast-container[data-toast-placement="top-bleed"] .toast-column,
+.toast-container[data-toast-placement="bottom-bleed"] .toast-column,
+.toast-container[data-toast-placement="card"] .toast-column {
+    position: static;
+}
+
+/* Both bleed shapes: the bar IS the full width, so the side insets, the width
+   cap, the side borders and the corner radius all go. The bars butt against
+   each other with no gap, so a burst reads as one band rather than a scatter of
+   cards. Safe-area insets stay on the container, since a notch or a rounded
+   corner still eats the edge a full-bleed bar runs to. */
+.toast-container[data-toast-placement="top-bleed"],
+.toast-container[data-toast-placement="bottom-bleed"] {
+    left: var(--safe-area-left);
+    right: var(--safe-area-right);
+}
+
+.toast-container[data-toast-placement="top-bleed"] .toast-column,
+.toast-container[data-toast-placement="bottom-bleed"] .toast-column {
+    gap: 0;
+}
+
+.toast-container[data-toast-placement="top-bleed"] .toast,
+.toast-container[data-toast-placement="bottom-bleed"] .toast {
+    width: 100%;
+    max-width: none;
+    border-radius: 0;
+    border-left-width: 0;
+    border-right-width: 0;
+}
+
+/* Bottom: anchored to the bottom edge instead of below the header, with the
+   column reversed so the newest bar is nearest the edge it enters from. The
+   thread pane's composer is bottom-docked on both layouts, so this shape sits
+   over the prompt input, which is exactly what the comparison is for. */
+.toast-container[data-toast-placement="bottom-bleed"] {
+    top: auto;
+    bottom: var(--safe-area-bottom);
+}
+
+.toast-container[data-toast-placement="bottom-bleed"] .toast-column {
+    flex-direction: column-reverse;
+}
+
+/* Card needs nothing beyond the static column above: the base .toast-column
+   already centres, and .toast keeps its --toast-max-width cap. That IS the shape the
+   per-pane columns replaced, kept here so the comparison has its baseline. */
+
+/* Bottom-right corner, the spot VS Code and IntelliJ both default to. Anchored
+   to the WINDOW, not to a pane, so it holds still through a divider drag and
+   never meets the seam, because it never goes near the middle.
+
+   DESKTOP ONLY. On a phone the corner IS the full width and would land on the
+   composer, with the keyboard over it the moment the user types. So mobile
+   keeps the base top placement. That breakpoint split is what Material and
+   Carbon both call for, rather than an inconsistency between the two. */
+@media (--desktop-layout) {
+    .toast-container[data-toast-placement="bottom-right"] {
+        top: auto;
+        left: auto;
+        bottom: max(1rem, var(--safe-area-bottom));
+        right: max(1rem, var(--safe-area-right));
+        /* The container IS the toast's width here, so .toast fills it below.
+           Sizing the box rather than the toast is what puts the toast's right
+           edge exactly on the inset above. */
+        width: min(var(--toast-max-width), calc(100vw - 2rem));
+    }
+
+    /* Newest nearest the corner it enters from, so the stack grows upward and
+       the toast the user just caused is the one under their eye. */
+    .toast-container[data-toast-placement="bottom-right"] .toast-column {
+        flex-direction: column-reverse;
+    }
+
+    .toast-container[data-toast-placement="bottom-right"] .toast {
+        width: 100%;
+    }
+}
+
+/* A bottom-anchored stack has to rise INTO place: the shared `toast-in` drops
+   from above, which reads as the toast falling out of the stack it is joining.
+   Only the direction changes, so the duration and easing stay shared, and the
+   inline duration Toast.tsx sets for the animation-speed slider still lands. */
+@keyframes toast-in-up {
+    from { opacity: 0; transform: translateY(0.5rem); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.toast-container[data-toast-placement="bottom-right"] .toast,
+.toast-container[data-toast-placement="bottom-bleed"] .toast {
+    animation-name: toast-in-up;
+}
+
+@keyframes toast-in {
+    from { opacity: 0; transform: translateY(-0.5rem); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes modal-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes modal-out {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+/* Contextual drop highlights — applied to the element with data-drop-zone
+ * by the document-level dispatcher (DropZone.tsx). The matched element gets
+ * either drag-over-attach (composer/thread) or drag-over-import (files panel),
+ * and an inset dashed overlay fills it. The "attach" zone uses green to echo
+ * the send action; "import" uses the standard accent blue. */
+[data-drop-zone].drag-over-attach,
+[data-drop-zone].drag-over-import {
+    position: relative;
+}
+
+[data-drop-zone].drag-over-attach::after,
+[data-drop-zone].drag-over-import::after {
+    content: '';
+    position: absolute;
+    inset: 0.5rem;
+    border-radius: calc(var(--radius-surface) * 2 / 3);
+    pointer-events: none;
+    z-index: 1000;
+}
+
+[data-drop-zone].drag-over-attach::after {
+    background: color-mix(in srgb, var(--accent-green) 8%, transparent);
+    border: 0.1875rem dashed var(--accent-green);
+}
+
+[data-drop-zone].drag-over-import::after {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    border: 0.1875rem dashed var(--accent);
+}
+
+[data-drop-zone].drag-over-attach::before,
+[data-drop-zone].drag-over-import::before {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    padding: 1rem 1.75rem;
+    border-radius: calc(var(--radius-surface) * 2 / 3);
+    box-shadow: var(--shadow-lg);
+    font-size: var(--font-size-xl);
+    font-weight: 500;
+    pointer-events: none;
+    z-index: 1001;
+    white-space: nowrap;
+}
+
+[data-drop-zone].drag-over-attach::before {
+    content: 'Attach to message';
+}
+
+[data-drop-zone].drag-over-import::before {
+    content: 'Drop files to import';
+}
+
+/* Folder tree navigation */
+.folder-tree {
+    font-size: var(--font-size-md);
+    margin-top: 0;
+}
+
+.folder-item {
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.folder-header {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.375rem 0.5rem;
+    cursor: pointer;
+    border-radius: calc(var(--radius-control) * 0.5);
+    transition: background-color var(--duration-fast);
+}
+
+@media (hover: hover) {
+    .folder-header:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.folder-chevron {
+    flex: 0 0 auto;
+    display: inline-flex;
+    width: 0.75rem;
+    height: 0.75rem;
+    color: var(--text-muted);
+    transition: transform var(--duration-fast) ease;
+}
+
+.folder-chevron svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.folder-chevron[data-open="true"] {
+    transform: rotate(90deg);
+}
+
+.folder-icon {
+    width: 1.25rem;
+    height: 1.25rem;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+.folder-name {
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.folder-count {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+/* The ONE source of tree indentation. A folder's children are nested inside its
+ * `.folder-contents`, so the DOM nesting already accumulates — the offset here is
+ * one constant unit per level, never a running total. (A per-row offset applied
+ * on top of this nesting compounds into 1, 3, 6, 10 … rem.) */
+.folder-contents {
+    margin-left: 1rem;
+}
+
+.file-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3125rem 0.5rem;
+    cursor: pointer;
+    border-radius: calc(var(--radius-control) * 0.5);
+    transition: background-color var(--duration-fast);
+}
+
+/* A file row inside the tree sits further right than a sibling folder row, to
+ * clear that row's disclosure arrow. Scoped to the tree so the flat changed-files
+ * list (`.file-item.repo-changed-file`) keeps the base 0.5rem gutter. */
+.tree-file-item {
+    padding-left: 1.25rem;
+}
+
+@media (hover: hover) {
+    .file-item:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.file-icon {
+    width: 1.25rem;
+    height: 1.25rem;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+@media (hover: hover) {
+    .folder-header:hover .folder-icon,
+    .file-item:hover .file-icon {
+        color: var(--text-primary);
+    }
+}
+
+.file-name {
+    color: var(--text-secondary);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The changed-files list (ChangesFileList) renders each file's whole PATH where
+   the tree renders a bare name, and a path is what an ellipsis destroys:
+   `system-knowhow/thread-even…` and `system-knowhow/workspace-aud…` are the same
+   string right up to the cut, so the list stops telling its rows apart at
+   exactly the width a phone gives it. It wraps onto as many lines as it needs
+   instead. Modifies `.file-name` rather than replacing it, so the row keeps one
+   name box; it must therefore stay BELOW that rule, which it overrides at equal
+   specificity.
+
+   `anywhere` rather than `break-word`, deliberately: only `anywhere` also
+   shrinks the box's min-content width, which is what lets flexbox take the
+   width out of the path instead of squeezing the diffstat and the change badge
+   beside it. */
+.file-path {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+/* A wrapped path makes the row tall, so its icon, diffstat and badge hold the
+   top rather than floating to the middle. The line height equals the icon's box
+   (`.file-icon`), so each of them shares a line with the path's first line. */
+.file-item.repo-changed-file {
+    position: relative;
+    align-items: flex-start;
+    line-height: 1.25rem;
+    padding-block: 0.5rem;
+}
+
+/* A hairline between rows, so a path wrapped onto several lines still reads as
+   one file. It starts at the path's column (padding, icon, gap) like the
+   drawer's row divider. A filled row (active or hovered) drops the lines on
+   both its edges, so no line runs along a fill. */
+.file-item.repo-changed-file + .file-item.repo-changed-file::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: calc(0.5rem + 1.25rem + 0.5rem);
+    right: 0.5rem;
+    border-top: 1px solid var(--border-color);
+    pointer-events: none;
+}
+
+.file-item.repo-changed-file + .file-item.repo-changed-file.active::before,
+.file-item.repo-changed-file.active + .file-item.repo-changed-file::before {
+    content: none;
+}
+
+@media (hover: hover) {
+    .file-item.repo-changed-file + .file-item.repo-changed-file:hover::before,
+    .file-item.repo-changed-file:hover + .file-item.repo-changed-file::before {
+        content: none;
+    }
+}
+
+/* Image thumbnails - clickable to show full size */
+.image-thumbnail {
+    max-width: 18.75rem;
+    max-height: 12.5rem;
+    border-radius: calc(var(--radius-surface) * 2 / 3);
+    border: 1px solid var(--border-color);
+    cursor: pointer;
+    transition: all var(--duration-normal);
+    object-fit: cover;
+}
+
+@media (hover: hover) {
+    .image-thumbnail:hover {
+        border-color: var(--accent);
+        box-shadow: var(--shadow-sm);
+        transform: scale(1.02);
+    }
+}
+
+/* Image popup for full-size viewing */
+/* Extends .modal-overlay: a darker backdrop for image viewing, and nothing
+   else. It states no z-index. <Overlay> writes an INLINE one on this same
+   element, its place in the modal band (store/overlayStack.ts), and an inline
+   declaration beats a class rule. So a level named here would be dead, and
+   dead in a way nothing reports: it resolved to the band floor, so it looked
+   like it was working right up until a token moved. The band already clears
+   the header chrome at 2200, which is what the level here was for. */
+.image-popup {
+    background: rgba(0, 0, 0, 0.9);
+    padding: 1.25rem;
+    overflow: hidden;
+    overscroll-behavior: contain;
+    /* Width of the white ring on every control below. A hairline needs two
+       DEVICE pixels to hold an even weight around a curve. At one, its straight
+       runs land on a whole row and paint solid, while its arcs spread over two
+       rows and paint at part coverage. The ring visibly thins and brightens as
+       it turns, which is the "uneven, rasterized" look, and a higher alpha only
+       makes it a brighter uneven ring. So 2px on a 1x screen, and back to 1px
+       from 2x up, where a hairline already gets its two device pixels. The
+       chrome inherits this: it is fixed-positioned, yet still nested in the
+       overlay. It stays a px literal because the browser snaps a border width
+       to a whole unit before layout (.claude/rules/frontend-css.md), and the
+       pill's radius below derives from it. */
+    --image-popup-ring: 2px;
+}
+
+@media (min-resolution: 2dppx), (-webkit-min-device-pixel-ratio: 2) {
+    .image-popup {
+        --image-popup-ring: 1px;
+    }
+}
+
+.image-popup-content {
+    position: relative;
+    width: 95vw;
+    height: 95vh;
+    overflow: hidden;
+}
+
+/* The strip holds every image. Each slide's `left` is set inline to its
+   shortest signed delta from the current index (so wrap-around neighbours
+   sit adjacent on screen). The strip rests at translateX(0); a swipe commit
+   animates it by ±W in the swipe direction, then snaps back to 0 as the
+   signal updates and slides reposition. Every <img> is mounted from the
+   start, so swiping just moves the strip — no src swaps, no decode race. */
+.image-popup-strip {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    will-change: transform;
+}
+
+.image-popup-slide {
+    position: absolute;
+    top: 0;
+    /* left set inline per slide */
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* No `border-radius` here, and that is a contract rather than an omission.
+   A viewer shows the image, so it may not reshape it. No CSS can tell whether
+   an edge belongs to the picture, and rounding cuts the ones that do. The
+   lucidos.dev og-card draws its own two-pixel rim, and a 0.5rem radius takes
+   each corner off it. A browser tab rounds nothing, and the reader compares the
+   two. The shadow stays, because it paints outside the box and touches no pixel
+   of the image. Pinned by
+   styles/__tests__/image-popup-image-unshaped-guard.test.ts.
+
+   That shadow is a literal rather than `--shadow-lg`, which is the one place
+   the token rule gives way. The backdrop over it is `rgba(0, 0, 0, 0.9)` in
+   both themes, so the surface here is near-black whatever the theme is. The
+   light-theme token rests at alpha 0.1 and would vanish against it. */
+.image-popup-slide img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    user-select: none;
+    -webkit-user-select: none;
+    transform-origin: center;
+    touch-action: none;
+    /* Pin to its own compositor layer so pinch-zoom transforms don't
+       repaint at native resolution every frame. iOS Safari is especially
+       sensitive — without this, pinch updates feel jerky because the
+       browser re-rasterizes the image bitmap on each scale change. The
+       JS path also uses translate3d() to force the GPU code path. */
+    will-change: transform;
+    -webkit-transform: translateZ(0);
+    transform: translateZ(0);
+    -webkit-backface-visibility: hidden;
+    backface-visibility: hidden;
+}
+
+/* Every piece of popup chrome is pinned to the VIEWPORT, for the reason spelled
+   out over .image-popup-nav below: .image-popup-content clips its children, so
+   an absolutely-positioned control outside the box is simply not drawn. This
+   button used to sit at `top: -2.5rem` above a box that grew to a fixed 95vh,
+   which put it off the top of the screen as well as outside the clip.
+
+   Every bordered control below takes a size in WHOLE CSS PIXELS on purpose,
+   and that is what the odd-looking 0.5rem steps buy. The browser snaps a
+   rounded box to the pixel grid before painting its ring, so a box whose edges
+   land on a fraction gets a ring that paints bright on one arc and washes out
+   on the opposite one. It reads as a jagged, uneven circle. The UI scale runs
+   75% to 200% in 12.5% steps (packages/lucidos-sdk/src/appearance.ts), so the
+   root font size is always an even whole number of px and every 0.5rem
+   multiple lands on the grid. Keep each box's total a 0.5rem multiple plus its
+   borders. A padding or gap may be fractional alone, as long as the pair sums
+   to one. */
+.image-popup-close {
+    position: fixed;
+    top: 1.5rem;
+    right: 1.5rem;
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.7);
+    border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
+    color: #fff;
+    border-radius: var(--radius-round);
+    z-index: 1;
+}
+
+/* .icon-btn's own hover is a THEME fill (--bg-hover plus --text-primary), which
+   on this dark overlay reads as a blue tile in the dark theme and as a
+   near-white one in the light theme, where it swallows the glyph. The chrome
+   here is theme-independent, so it darkens like the nav buttons instead. */
+@media (hover: hover) {
+    .image-popup-close:hover {
+        background: rgba(0, 0, 0, 0.85);
+        color: #fff;
+    }
+}
+
+.floating-mobile-close {
+    display: none;
+}
+
+/* Prev/Next navigation buttons in the popup. Pinned to the viewport so
+   .image-popup-content's `overflow: hidden` (needed to clip pinch-zoomed
+   images) doesn't hide them. */
+.image-popup-nav {
+    position: fixed;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 3rem;
+    height: 3rem;
+    border-radius: var(--radius-round);
+    background: rgba(0, 0, 0, 0.6);
+    border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
+    color: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1;
+}
+
+.image-popup-nav-prev {
+    left: 1.5rem;
+}
+
+.image-popup-nav-next {
+    right: 1.5rem;
+}
+
+@media (hover: hover) {
+    .image-popup-nav:hover {
+        background: rgba(0, 0, 0, 0.85);
+    }
+}
+
+.image-popup-counter {
+    position: fixed;
+    bottom: 1.5rem;
+    left: 50%;
+    transform: translateX(-50%);
+    color: var(--text-on-accent);
+    font-size: var(--font-size-sm);
+    background: rgba(0, 0, 0, 0.6);
+    padding: 0.1875rem 0.5rem;
+    border-radius: calc(var(--radius-control) * 1.25);
+    pointer-events: none;
+}
+
+/* Zoom controls: out, the level readout, and in. Pinned to the viewport like
+   the rest of the chrome. Each button is wide enough for a word, so the cluster
+   is a pill rather than three circles. */
+.image-popup-zoom {
+    position: fixed;
+    right: 1.5rem;
+    bottom: 1.5rem;
+    display: flex;
+    align-items: center;
+    /* The paddings and the gaps each sum to 0.25rem, which is what carries the
+       2.25rem buttons to a pill 2.5rem + its borders tall and 9rem + its
+       borders wide: whole pixels at every UI scale, per the note over
+       .image-popup-close. The buttons keep their own size, so the inset gives
+       way rather than the tap target. */
+    gap: 0.125rem;
+    padding: 0.125rem;
+    /* Exactly half the outer height, so the ends are true semicircles. A larger
+       radius is clamped instead, and the clamp is what made the two ends
+       disagree once the height carried a fraction. `--radius-round` only caps
+       it, so a theme that squares pills squares this one. */
+    border-radius: min(calc(1.25rem + var(--image-popup-ring)), var(--radius-round));
+    background: rgba(0, 0, 0, 0.6);
+    border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
+    z-index: 1;
+}
+
+.image-popup-zoom-btn {
+    min-width: 2.25rem;
+    height: 2.25rem;
+    padding: 0 0.5rem;
+    border: none;
+    border-radius: min(1.125rem, var(--radius-round));
+    background: transparent;
+    color: #fff;
+    font-size: var(--font-size-md);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background var(--duration-fast);
+}
+
+/* The readout changes on every step, so it holds room for four digits and
+   lines them up: a proportional font would shuffle the cluster under the
+   pointer each time a digit changed width. A whole rem rather than 3.75, so
+   the pill stays 9rem plus its borders wide at every UI scale, per the note
+   over .image-popup-close. */
+.image-popup-zoom-level {
+    min-width: 4rem;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Zoomed all the way out or all the way in. */
+.image-popup-zoom-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+@media (hover: hover) {
+    .image-popup-zoom-btn:not(:disabled):hover {
+        background: rgba(255, 255, 255, 0.15);
+    }
+}
+
+/* The chrome fades on its way in and on its way out, and each direction takes
+   the curve that suits it. A rule governs the change TOWARD its own state, so
+   this one is the arrival and the .chrome-hidden one below is the departure.
+   An ease-out departure is down to a tenth of its opacity inside 70ms, which
+   reads as a snap rather than a fade.
+
+   Opacity alone, with no drift toward the screen edge. Every control here is a
+   bordered circle or pill whose ring needs whole-pixel edges (see the note over
+   .image-popup-close), and a transform holds them on fractions for the length
+   of the animation.
+
+   `background` rides along because this shorthand replaces whatever the
+   individual rules set. The close button and the nav chevrons darken on hover,
+   and without it here they snap. */
+.image-popup-close,
+.floating-mobile-close,
+.image-popup-nav,
+.image-popup-counter,
+.image-popup-zoom {
+    transition: opacity var(--duration-slow) ease-out, background var(--duration-fast);
+}
+
+/* pointer-events:none keeps the invisible buttons from eating the next tap. It
+   lands at once rather than with the fade, so a control on its way out is dead
+   from the first frame. */
+.image-popup-content.chrome-hidden .image-popup-close,
+.image-popup-content.chrome-hidden .floating-mobile-close,
+.image-popup-content.chrome-hidden .image-popup-nav,
+.image-popup-content.chrome-hidden .image-popup-counter,
+.image-popup-content.chrome-hidden .image-popup-zoom {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--duration-slow) ease-in;
+}
+
+@media (max-width: 600px) {
+    .image-popup {
+        padding: 0;
+        background: #000;
+    }
+
+    .image-popup-content {
+        width: 100vw;
+        height: 100vh;
+    }
+
+    /* A phone fills the screen with the image, so no backdrop is left for a
+       shadow to lift it off. */
+    .image-popup-slide img {
+        box-shadow: none;
+    }
+
+    .image-popup-close {
+        display: none;
+    }
+
+    /* 1rem rather than the 0.75rem the rest of the phone chrome pads by: a
+       quarter-rem is a fraction of a pixel at the 112.5% mobile root, and this
+       is a bordered circle, so it owes the whole-pixel rule over
+       .image-popup-close. The env() term is the platform's and stays as it is. */
+    .floating-mobile-close {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: fixed;
+        top: max(3.5rem, calc(1rem + var(--safe-area-top)));
+        right: calc(1rem + var(--safe-area-right));
+        width: 3rem;
+        height: 3rem;
+        border-radius: var(--radius-round);
+        background: rgba(0, 0, 0, 0.7);
+        border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
+        color: #fff;
+        cursor: pointer;
+        z-index: 1;
+    }
+
+    .floating-mobile-close svg {
+        width: 1.25rem;
+        height: 1.25rem;
+    }
+
+    /* Mobile relies on swipe for navigation — chevrons would steal thumb
+       real estate without adding anything. */
+    .image-popup-nav {
+        display: none;
+    }
+
+    .image-popup-counter {
+        bottom: max(1rem, calc(0.5rem + var(--safe-area-bottom)));
+    }
+
+    /* Same bottom line as the counter, clear of the home indicator. Pinch is
+       the natural gesture here, but the controls stay: they are the only way
+       to reach full size in one move. */
+    .image-popup-zoom {
+        right: calc(1rem + var(--safe-area-right));
+        bottom: max(1rem, calc(0.5rem + var(--safe-area-bottom)));
+    }
+}
+
+/* ── Lucidos mark (brand glyph) ─────────────────────────────────────────────
+   The reusable inline-SVG mark (components/shared/LucidosMark.tsx). Sized via
+   the inline `width/height` the component sets from its `size` prop; these rules
+   only own layout alignment. (The boot splash no longer uses this component — it
+   is inlined in index.html so it paints before the bundle loads; see
+   utils/bootSplash.ts.) */
+.lucidos-mark {
+    display: inline-block;
+    vertical-align: middle;
+    flex-shrink: 0;
+}

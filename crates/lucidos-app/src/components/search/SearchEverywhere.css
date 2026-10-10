@@ -1,0 +1,254 @@
+/* Extends .modal-overlay — top-aligned for search dropdown.
+   Compound selector beats .modal-overlay's align-items:center. */
+.modal-overlay.search-everywhere-overlay {
+    /* Hung from the header's bottom edge on the SAME anchor and gap the Lucidos
+       menu uses (`.brand-menu` in styles/header-mark.css), so the two surfaces
+       the header opens start on one line instead of at two eyeballed offsets.
+       `--app-header-bottom` is redefined per breakpoint (global/base.css for
+       desktop, mobile.css for the fixed mobile header), so this one expression
+       follows whichever header is on screen and the mobile block below no
+       longer restates it. Declared as a var because the mobile max-height has
+       to subtract exactly this.
+       Focusing the palette's own field never moves this anchor: a field inside
+       an overlay does not slide the header off for the keyboard
+       (useHideOnScroll). */
+    --search-everywhere-top: calc(var(--app-header-bottom) + var(--header-surface-gap));
+    align-items: flex-start;
+    padding-top: var(--search-everywhere-top);
+    /* Own GPU compositing layer — same rationale as file-search-overlay. */
+    will-change: opacity;
+    /* Click-through: clicks outside the modal pass to underlying elements
+       (e.g. compose button). Outside-click dismiss is owned by the central
+       <Overlay> component (useDismissOnOutside + overlayStack). */
+    pointer-events: none;
+    /* A palette dims nothing: only a surface that blocks takes the scrim. */
+    background: none;
+}
+
+.search-everywhere-overlay.search-everywhere-hidden {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+.search-everywhere-modal {
+    pointer-events: auto;
+    display: flex;
+    flex-direction: column;
+    /* Wider than the Lucidos menu on desktop, because result titles and paths
+       need the room. Narrowed to its pane, so it never straddles the divider
+       (usePaneCentre). */
+    max-width: min(36rem, var(--pane-fit, 100%));
+    width: 100%;
+    max-height: min(32rem, 80vh);
+    overflow: hidden;
+}
+
+/* Must stay BELOW the base rule: it has the same specificity, so source order
+   is the only thing that lets it win. */
+@media (--phone-layout) {
+    /* A phone has no room to spare, so here it takes the shared header width. */
+    .search-everywhere-modal {
+        max-width: min(var(--header-surface-width), var(--pane-fit, 100%));
+        max-height: calc(var(--app-height, 100dvh) - var(--search-everywhere-top));
+    }
+}
+
+/* The row is a `.surface-head`, so it takes the surface inset from there. The
+   rule under it separates the input from the results. */
+.search-everywhere-header {
+    border-bottom: 1px solid var(--border-color);
+}
+
+.search-everywhere-field {
+    flex: 1;
+}
+
+.search-everywhere-close {
+    color: var(--text-muted);
+}
+
+/* The categories are chips that WRAP, so every one is on screen at any width
+   and none needs a gesture to reach. Never make this strip scroll sideways. */
+.search-everywhere-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-xs);
+    border-bottom: 1px solid var(--border-color);
+    /* A chip's side padding, read by the chip below. Taking it off the pill's
+       glyph inset puts the first label under the search glyph. The 1px is the
+       pill's border. */
+    --search-tab-pad-x: 0.625rem;
+    padding: var(--space-sm) calc(var(--surface-inset) - var(--search-tab-pad-x));
+    padding-left: calc(var(--surface-inset) + var(--search-field-pad-x) + 1px - var(--search-tab-pad-x));
+    /* The results list takes the column's slack, never the chips. */
+    flex-shrink: 0;
+}
+
+.search-everywhere-tab {
+    padding: var(--space-xs) var(--search-tab-pad-x);
+    font-size: var(--font-size-sm);
+    font-family: var(--font-ui);
+    line-height: 1.4;
+    background: none;
+    border: none;
+    border-radius: var(--radius-control);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: color var(--duration-fast), background-color var(--duration-fast);
+    white-space: nowrap;
+}
+
+.search-everywhere-tab.active {
+    background: var(--picked-surface);
+    color: var(--accent);
+}
+
+/* A category with no hits for the query. Still a button: its tab lists
+   nothing, but the reader may want to see that. */
+.search-everywhere-tab[data-empty] {
+    color: var(--text-muted);
+    opacity: 0.5;
+}
+
+/* Keeps the width of the widest label it can show, so no chip moves as the
+   query starts. That widest label lies invisibly under the real one in the
+   same grid cell. */
+.search-everywhere-widest {
+    display: inline-grid;
+}
+
+.search-everywhere-widest::before {
+    content: attr(data-widest);
+    visibility: hidden;
+}
+
+.search-everywhere-widest::before,
+.search-everywhere-widest > * {
+    grid-area: 1 / 1;
+}
+
+/* The transparent outline is the forced-colors fallback, same as
+   .icon-btn:focus-visible. */
+.search-everywhere-tab:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+@media (hover: hover) {
+    .search-everywhere-tab:not(.active):hover {
+        background: var(--bg-hover);
+        color: var(--text-primary);
+    }
+}
+
+.search-everywhere-results {
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    flex: 1;
+    min-height: 0;
+}
+
+.search-everywhere-section-header {
+    padding: 0.375rem var(--surface-inset);
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-family: var(--font-ui);
+}
+
+.search-everywhere-result {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.375rem var(--surface-inset);
+    background: none;
+    border: none;
+    color: inherit;
+    /* base.css already gives a button the family, size and ligature setting;
+       the line height is the one thing its UA font leaves at `normal`. */
+    line-height: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color var(--duration-fast);
+}
+
+/* `.selected` is the keyboard cursor, which a tap also sets through
+   `mouseenter`. A phone has no keyboard to move it, so it paints nothing there. */
+@media (hover: hover) {
+    .search-everywhere-result.selected,
+    .search-everywhere-result:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.search-everywhere-result-icon {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+    flex-shrink: 0;
+    color: var(--text-muted);
+}
+
+.search-everywhere-result-info {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.search-everywhere-result-title {
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.search-everywhere-result-subtitle {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+}
+
+/* The Text tab's totals, above its lines. */
+.search-everywhere-summary {
+    padding: 0.375rem var(--surface-inset);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-family: var(--font-ui);
+}
+
+/* Laid out like a result row, so the spinner sits in the icon column. */
+.search-everywhere-pending,
+.search-everywhere-note {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.375rem var(--surface-inset);
+    font-size: var(--font-size-xs);
+    font-family: var(--font-ui);
+}
+
+/* The note takes its colour from `.error-text`. */
+.search-everywhere-pending {
+    color: var(--text-muted);
+}
+
+.search-everywhere-pending .mini-spinner {
+    margin-inline: calc((var(--icon-size-md) - 0.75rem) / 2);
+}
+
+.search-everywhere-empty {
+    padding: 1.5rem;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    font-family: var(--font-ui);
+}

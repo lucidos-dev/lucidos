@@ -1,0 +1,7 @@
+[
+  { "id": 1, "started": "2026-01-05T07:40:00+01:00", "branch": "main", "result": "pass", "seconds": 205 },
+  { "id": 2, "started": "2026-01-05T09:15:00+01:00", "branch": "main", "result": "pass", "seconds": 198 },
+  { "id": 3, "started": "2026-01-05T11:02:00+01:00", "branch": "fix/retry", "result": "fail", "seconds": 64 },
+  { "id": 4, "started": "2026-01-05T12:38:00+01:00", "branch": "main", "result": "pass", "seconds": 211 },
+  { "id": 5, "started": "2026-01-05T16:20:00+01:00", "branch": "main", "result": "pass", "seconds": 202 }
+]

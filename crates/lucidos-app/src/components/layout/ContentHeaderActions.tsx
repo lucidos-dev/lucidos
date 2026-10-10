@@ -1,0 +1,465 @@
+import { useState, useEffect, useRef } from 'preact/hooks';
+import { NotificationsBell } from '../notifications/NotificationsBell';
+import { lucidos } from '@lucidos/sdk';
+import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, filePreviewWrap, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen, repositories, workspacePath, type PanelOverlay } from '../../store/store';
+import { loadedOr } from '../../store/types';
+import { sideBySideDiffAvailable } from '../../store/diffBody';
+import { wrapToggleAvailable } from '../../store/previewWrap';
+import { closeUrl, openLocalFile, openUrlOutsideApp } from '../../store/actions/artifacts';
+import { previewCopyPath, previewDiskPath } from '../../utils/previewPath';
+import { copyToClipboard } from '../../utils/clipboard';
+import { getAppFrameSrc, exitPseudoFullscreen, toggleAppSearch, popOutApp, toggleAppFullscreen } from '../../store/actions/apps';
+import { findAvailable, findSurface, toggleFind } from '../../store/actions/find-bar';
+import { panelRefreshAvailable, runPanelRefresh } from '../../store/panelRefresh';
+import { DIFF_REFRESH_PINNED, panelRefreshLive } from './RefreshIndicator';
+import { nativeFullscreenElement } from '../../store/appFullscreenHost';
+import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon, SideBySideColumnsIcon, WrapTextIcon, CopyIcon } from '../shared/icons';
+import { RENDERABLE_EXTS, REPO_RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
+import { isTauri, isIOSPwa, clipboardAbilities } from '../../utils/platform';
+import { webviewReload } from '../../utils/tauri';
+import { openFileSearch } from '../files/fileSearchActions';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
+import { withPreviewCapability } from '../files/previewFrameBridge';
+import { currentArtifactPreviewCapability } from '../../store/actions/frame-capability';
+import { pushOverlay, removeOverlay } from '../../store/overlayStack';
+import { CollapsingActions, type HeaderActionSpec } from './headerActions';
+import { useHeaderActionCollapse, type HeaderCollapseTargets } from '../../hooks/useHeaderActionCollapse';
+
+/** The boxes the content row's collapse is measured against: the row, and the
+ *  title cluster centred on it. No leading entry: there is nothing to measure
+ *  there. The cluster is centred, so these actions get half of what it leaves,
+ *  not the row's leftover. The hamburger and Refresh fit inside the other half.
+ *  Stable identity so the collapse effect's deps do not re-fire every render. */
+const COLLAPSE_TARGETS: HeaderCollapseTargets = {
+  container: '.content-header-elements',
+  centre: '.pane-header-content-title',
+  anchor: '.notifications-bell',
+};
+
+/** One control that takes something out of the shell, given the sink this
+ *  platform can actually reach.
+ *
+ *  Shared by the two of them (the open app, the previewed file) because the
+ *  platform question is one question. An installed iOS PWA gets nothing: it
+ *  cannot open a same-origin link anywhere but its own inescapable in-app web
+ *  view, a limitation every WebKit-based iOS browser shares.
+ *
+ *  A browser gets a real anchor, so cmd-click, middle-click and "copy link
+ *  address" all work. The packaged desktop client gets a button, because its
+ *  WKWebView silently drops a `target="_blank"` navigation and there are no tabs
+ *  there to open one in. The caller hands it the OS opener instead. */
+function popoutSpec(
+  extraClass: string,
+  label: string,
+  sink: { href: string | null } | { onClick: () => void },
+): HeaderActionSpec | null {
+  if (isIOSPwa()) return null;
+  return { key: 'open-in-tab', icon: () => <PopOutIcon />, extraClass, label, ...sink };
+}
+
+/** The control that takes the open app out of the shell and into a top-level
+ *  page of its own, or null where the platform cannot offer one.
+ *
+ *  Exported so the platform decision is testable without standing the header up:
+ *  which of the two shapes is returned is the whole bug fix, and neither shape
+ *  is observable from the rendered markup alone (a dead anchor and a live one
+ *  look identical). */
+export function appPopoutAction(): HeaderActionSpec | null {
+  return isTauri()
+    ? popoutSpec('app-open-in-tab', 'Open in browser', { onClick: () => popOutApp() })
+    : popoutSpec('app-open-in-tab', 'Open in new tab', { href: getAppFrameSrc() });
+}
+
+/** What the packaged desktop client's control says. Not "browser", because the
+ *  OS picks the handler: a report opens in the browser, a `.png` in the image
+ *  viewer, a `.rs` in the editor. */
+const OPEN_ON_DESKTOP = 'Open in default app';
+
+/** Resolved against this document, so the gateway origin, its port and the
+ *  workspace slug prefix all survive the hop out to the OS.
+ *
+ *  `lucidos.data.url` returns a ROOT-RELATIVE path, which an anchor resolves for
+ *  free and the OS opener does not: `open /dev/data/x.html` reads it as a
+ *  filesystem path and finds nothing there. Same reason `popOutApp` does it. */
+function absoluteUrl(url: string): string {
+  try {
+    return new URL(url, location.href).href;
+  } catch {
+    return url;
+  }
+}
+
+/** A file the engine serves as a sandboxed document (`file_response.rs`). */
+const OPENS_SANDBOXED = /\.(html?|svg|xhtml|xml)$/i;
+
+/** The control that takes the previewed file out of the shell, or null where
+ *  this platform cannot open this locator anywhere.
+ *
+ *  The desktop client hands the REAL FILE to the OS opener, which is what the
+ *  user asked for. It is also the only route a repo file has, being read at a
+ *  git ref with no `/data/` URL of its own. What it opens is the working tree,
+ *  so a repo preview at a ref can differ from it.
+ *
+ *  Everywhere else it is the engine's `/data/` URL in a new tab, since no page
+ *  may navigate to `file://`. That leaves a repo file with no control in a
+ *  browser, which is the honest answer rather than a dead button. An HTML or
+ *  SVG artifact opens sandboxed at an opaque origin (ADR 0322), so its tab
+ *  sends no cookie with its images. Its URL carries the preview pass instead.
+ *
+ *  An artifact that TALKS to the workspace, rather than just showing something,
+ *  belongs in an app: opened from disk it is a `file://` document and the API is
+ *  another origin from there. Apps have their own popout, right above. */
+export function filePreviewPopoutAction(encoded: string): HeaderActionSpec | null {
+  // A repo file has no `/data/` URL at all; `previewDiskPath` covers the data
+  // paths that have no file under the workspace either.
+  const url = parseRepoPath(encoded) ? null : lucidos.data.url(encoded);
+  if (!isTauri()) {
+    if (url === null) return null;
+    const href = OPENS_SANDBOXED.test(encoded) ? withPreviewCapability(url, currentArtifactPreviewCapability()) : url;
+    return popoutSpec('file-open-in-tab', 'Open in new tab', { href });
+  }
+  const disk = previewDiskPath(encoded, workspacePath.value, loadedOr(repositories.value, []));
+  if (disk) return popoutSpec('file-open-in-tab', OPEN_ON_DESKTOP, { onClick: () => openLocalFile(disk) });
+  // No file of our own to hand over (`system-knowhow/`, or a clone we have not
+  // loaded yet). The OS opener takes the URL just as well, and resolves it to
+  // the same default browser. Absolute, or it reads as a path.
+  if (url) {
+    return popoutSpec('file-open-in-tab', OPEN_ON_DESKTOP, { onClick: () => openUrlOutsideApp(absoluteUrl(url)) });
+  }
+  return null;
+}
+
+/** The control that copies the previewed file's real location: the absolute
+ *  disk path the user pastes into Finder, a terminal or another app (the
+ *  Obsidian case this shipped for). Falls back to the repo- or
+ *  workspace-relative path where `previewCopyPath` cannot resolve the
+ *  absolute one yet, and the confirmation says which one landed.
+ *
+ *  Null off a non-secure origin (a plain-HTTP LAN address), the one case
+ *  `navigator.clipboard` is absent: nothing here shows the path as selectable
+ *  text, so a tap could only ever open the "no clipboard" toast. Same
+ *  `clipboardAbilities().copy` gate `CopyButton` (`AddDeviceSection.tsx`) and
+ *  `PairingGate` use. */
+export function filePreviewCopyPathAction(encoded: string): HeaderActionSpec | null {
+  if (!clipboardAbilities().copy) return null;
+  return {
+    key: 'copy-path',
+    label: 'Copy path',
+    icon: () => <CopyIcon />,
+    onClick: () => {
+      const { path, absolute } = previewCopyPath(encoded, workspacePath.value, loadedOr(repositories.value, []));
+      copyToClipboard(path, absolute ? 'Path copied' : 'Relative path copied (the full path is not known yet)');
+    },
+  };
+}
+
+/** Whether a phone's actions carry the open panel's Refresh.
+ *
+ *  A phone refreshes by pulling. So Refresh shows only where it predates the
+ *  pull (an app, a file preview). Its spinner is not an action at all, see
+ *  `MobileRefreshIndicator`. A diff draws a disabled Refresh instead, and
+ *  claiming both would throw on the duplicate key. Desktop leads the row with
+ *  `ContentRefreshButton` and carries no Refresh here. */
+export function mobileRefreshActionShown(overlay: PanelOverlay, available: boolean): boolean {
+  const predatesPull = overlay?.type === 'app-ui' || overlay?.type === 'file-preview';
+  return predatesPull && panelRefreshLive(overlay, available);
+}
+
+/** What a file preview's header offers, decided once for the header and the
+ *  shortcuts. Editing hides the view toggles, since they would fight the draft. */
+function filePreviewOffers(path: string) {
+  const ext = path.split('.').pop()?.toLowerCase() || '';
+  const repo = parseRepoPath(path);
+  // Repo HTML has no rendered view (it shows as source — see REPO_RENDERABLE_EXTS),
+  // so the source/rendered toggle is suppressed for it.
+  const hasRendered = (repo ? REPO_RENDERABLE_EXTS : RENDERABLE_EXTS).includes(ext);
+  // Repo files are read at a git ref (not the live workspace), so they're not
+  // inline-editable; only data files under a mutable prefix are.
+  const editable = !repo && isEditableDataFile(path);
+  const editing = filePreviewEditing.value && editable;
+  return { isDiff: repo?.mode === 'diff', hasRendered, editable, editing };
+}
+
+/** The open file preview's offers, or null when the pane shows no preview. */
+function openFilePreviewOffers(): ReturnType<typeof filePreviewOffers> | null {
+  const overlay = panelOverlay.value;
+  return overlay?.type === 'file-preview' ? filePreviewOffers(overlay.path) : null;
+}
+
+/** One row that spins while a refresh is in flight: the panel's own pull, or
+ *  a diff's pinned, disabled stand-in. Pure, hoisted out of the header
+ *  component so `filePreviewContentActions` can build the same row. */
+function reloadSpec(key: string, onClick: () => void, label: 'Refresh' | 'Reload' = 'Refresh', disabledTooltip?: string): HeaderActionSpec {
+  return { key, label, icon: () => <ReloadIcon />, onClick, disabledTooltip };
+}
+
+/** The Find action, over any content view the find bar can search. The
+ *  header and a preview's right-click menu both carry it. */
+function findSpec(): HeaderActionSpec {
+  return {
+    key: 'find',
+    label: 'Find',
+    tooltip: tooltipWithShortcut('Find', 'findInView'),
+    icon: () => <SearchIcon />,
+    onClick: () => toggleFind('content'),
+    extraClass: 'find-btn',
+    active: findSurface.value === 'content',
+  };
+}
+
+/** The file-preview header's actions, in order. The single source of truth
+ *  for "what can I do to this file": the header toolbar and the preview's
+ *  own right-click menu both render this list, so neither can offer
+ *  something the other doesn't.
+ *
+ *  Editing hides every one of them, since Save/Cancel live in the editor
+ *  body and refresh/source-toggle would fight the draft. That is why it
+ *  returns early rather than guarding each push. */
+export function filePreviewContentActions(path: string, mobile: boolean): HeaderActionSpec[] {
+  const { isDiff, hasRendered, editable, editing } = filePreviewOffers(path);
+  const actions: HeaderActionSpec[] = [];
+  if (editing) return actions;
+
+  if (isDiff && mobile) actions.push(reloadSpec('refresh', () => {}, 'Refresh', DIFF_REFRESH_PINNED));
+  // Second, mirroring where the app header puts its own popout, so the two
+  // content views agree about where "take this out of the shell" lives.
+  const popout = filePreviewPopoutAction(path);
+  if (popout) actions.push(popout);
+  const copyPath = filePreviewCopyPathAction(path);
+  if (copyPath) actions.push(copyPath);
+  if (findAvailable('content')) actions.push(findSpec());
+  // Diff-only: toggle between the unified hunks and the whole file in its
+  // merged end state. Orthogonal to the source/rendered toggle below. Read
+  // the effective state (which carries the added-file default) so the icon
+  // matches what's shown, and write the inverse as an explicit override.
+  if (isDiff) {
+    const wholeFile = diffWholeFileEffective.value;
+    actions.push({
+      key: 'diff-whole-file',
+      label: wholeFile ? 'Show diff' : 'Show full file',
+      icon: () => (wholeFile ? <DiffIcon /> : <FileIcon />),
+      onClick: () => { diffWholeFile.value = !wholeFile; },
+      extraClass: 'diff-whole-file-toggle',
+    });
+  }
+  // Side-by-side is a rendering of the HUNKS: offered only when the hunks are
+  // what's showing (not the whole merged file, not the rendered markdown
+  // diff), and only where two columns fit. Both conditions are the body's
+  // own (`diffBodyKind`, `diffFitsSideBySide`), so the control cannot appear
+  // over a view it would do nothing to.
+  if (sideBySideDiffAvailable.value) {
+    const sideBySideOn = diffSideBySide.value;
+    actions.push({
+      key: 'diff-side-by-side',
+      label: sideBySideOn ? 'Show unified' : 'Show side by side',
+      icon: () => (sideBySideOn ? <DiffIcon /> : <SideBySideColumnsIcon />),
+      onClick: () => { diffSideBySide.value = !sideBySideOn; },
+      extraClass: 'diff-side-by-side-toggle',
+    });
+  }
+  if (hasRendered) {
+    const isSource = filePreviewSource.value;
+    const label = isSource ? 'Show rendered' : 'Show source';
+    actions.push({
+      key: 'source-toggle',
+      label,
+      tooltip: tooltipWithShortcut(label, 'toggleSourceView'),
+      icon: () => (isSource ? <EyeIcon /> : <CodeIcon />),
+      onClick: toggleSourceView,
+    });
+  }
+  // Only over the line-numbered source view, the one body wrapping acts on
+  // (`wrapToggleAvailable`). The control STAYS while wrapping is on, and
+  // reads as pressed: it is how the reader turns it back off, and the
+  // pinned-gutter pan is the other half of the same choice.
+  if (wrapToggleAvailable.value) {
+    const wrapOn = filePreviewWrap.value;
+    const label = wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines';
+    actions.push({
+      key: 'wrap-toggle',
+      label,
+      tooltip: tooltipWithShortcut(label, 'toggleLineWrap'),
+      icon: () => <WrapTextIcon />,
+      onClick: toggleLineWrap,
+      active: wrapOn,
+      extraClass: 'file-preview-wrap-toggle',
+    });
+  }
+  if (editable) {
+    actions.push({
+      key: 'edit',
+      label: 'Edit file',
+      icon: () => <EditIcon />,
+      onClick: () => { filePreviewEditing.value = true; },
+      extraClass: 'file-edit-btn',
+    });
+  }
+  return actions;
+}
+
+/** Flips source and rendered, where the header offers it. The header button
+ *  and the shortcut both run this. */
+export function toggleSourceView(): void {
+  const offers = openFilePreviewOffers();
+  if (offers && !offers.editing && offers.hasRendered) filePreviewSource.value = !filePreviewSource.value;
+}
+
+/** Flips line wrapping, where the header offers it. The header button and
+ *  the shortcut both run this. */
+export function toggleLineWrap(): void {
+  const offers = openFilePreviewOffers();
+  if (offers && !offers.editing && wrapToggleAvailable.value) filePreviewWrap.value = !filePreviewWrap.value;
+}
+
+/** The fullscreen shortcut: the header's own toggle, offered over an app. */
+export function toggleAppFullscreenIfShown(): void {
+  if (panelOverlay.value?.type === 'app-ui') toggleAppFullscreen();
+}
+
+interface Props {
+  /** Which header this copy belongs to. Both are mounted at once and only one
+   *  is visible, and the two collapse completely differently (see the render
+   *  below), so the copy has to say which it is rather than sniff the DOM for
+   *  an enclosing mobile row. Same shape as `ContentPane`. */
+  layout: 'desktop' | 'mobile';
+}
+
+/** Shared action buttons for the content side of the header (used by both mobile and desktop). */
+export function ContentHeaderActions({ layout }: Props) {
+  // Track native fullscreen state. `nativeFullscreenElement` is the one reader
+  // of both spellings (store/appFullscreenHost.ts), shared with the overlay
+  // layer so the header and the layer can never disagree about what is
+  // fullscreen.
+  const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
+  useEffect(() => {
+    const handler = () => setIsNativeFullscreen(nativeFullscreenElement() !== null);
+    document.addEventListener('fullscreenchange', handler);
+    document.addEventListener('webkitfullscreenchange', handler);
+    return () => {
+      document.removeEventListener('fullscreenchange', handler);
+      document.removeEventListener('webkitfullscreenchange', handler);
+    };
+  }, []);
+
+  // Exit pseudo-fullscreen when navigating away from app view or on Escape key
+  const overlay = panelOverlay.value;
+  const isPseudo = appPseudoFullscreen.value;
+  useEffect(() => {
+    if (overlay?.type !== 'app-ui' && isPseudo) exitPseudoFullscreen();
+  }, [overlay?.type, isPseudo]);
+
+  // Pseudo-fullscreen is dismissable via the central Escape dispatcher: register
+  // it on the overlay stack while active instead of hand-rolling a `document`
+  // Escape listener (which would race the dispatcher).
+  useEffect(() => {
+    if (!isPseudo) return;
+    pushOverlay({ id: 'pseudo-fullscreen', dismiss: exitPseudoFullscreen, hasPanel: false });
+    return () => removeOverlay('pseudo-fullscreen');
+  }, [isPseudo]);
+
+  const isFullscreen = isNativeFullscreen || isPseudo;
+
+  // ── Build ordered action list — each key claimed exactly once ──
+  const actions: HeaderActionSpec[] = [];
+  const claimed = new Set<string>();
+
+  function addAction(spec: HeaderActionSpec) {
+    if (claimed.has(spec.key)) throw new Error(`Header action "${spec.key}" already claimed`);
+    claimed.add(spec.key);
+    actions.push(spec);
+  }
+
+  // The open panel's refresh (the panel refresh contract), first so it folds
+  // first. A phone spins the leading slot instead, which no action can fold.
+  const mobile = layout === 'mobile';
+  if (mobile && mobileRefreshActionShown(overlay, panelRefreshAvailable.value)) {
+    addAction(reloadSpec('refresh', () => void runPanelRefresh()));
+  }
+
+  // Context-specific actions — mutually exclusive via if/else
+  if (overlay?.type === 'app-ui') {
+    const popout = appPopoutAction();
+    if (popout) addAction(popout);
+    addAction(findSpec());
+    const label = isFullscreen ? 'Exit fullscreen' : 'Fullscreen';
+    addAction({
+      key: 'fullscreen',
+      label,
+      tooltip: tooltipWithShortcut(label, 'toggleAppFullscreen'),
+      icon: () => (isFullscreen ? <ExitFullscreenIcon /> : <FullscreenIcon />),
+      onClick: toggleAppFullscreen,
+      extraClass: 'app-fullscreen',
+    });
+  } else if (overlay?.type === 'url-preview') {
+    addAction(reloadSpec('reload', () => {
+      if (isTauri()) { const url = panelUrl.value; if (url) webviewReload(url); }
+    }, 'Reload'));
+    addAction({
+      key: 'close',
+      label: 'Close browser',
+      icon: () => <CloseIcon />,
+      onClick: closeUrl,
+    });
+  } else if (overlay?.type === 'file-preview') {
+    for (const a of filePreviewContentActions(overlay.path, mobile)) addAction(a);
+  } else if (!overlay && activeMenuItem.value === 'files') {
+    addAction({
+      key: 'search',
+      label: 'Search files',
+      tooltip: tooltipWithShortcut('Search files', 'searchFiles'),
+      icon: () => <SearchIcon />,
+      onClick: (e) => openFileSearch(e.currentTarget as HTMLElement),
+      extraClass: 'file-search-btn',
+    });
+  } else if (!overlay && (activeMenuItem.value === 'apps' || activeMenuItem.value === 'plugins')) {
+    addAction({
+      key: 'search',
+      label: activeMenuItem.value === 'plugins' ? 'Search plugins' : 'Search apps',
+      icon: () => <SearchIcon />,
+      onClick: toggleAppSearch,
+      extraClass: 'apps-search-btn',
+      active: appSearchOpen.value,
+    });
+  }
+
+  // ── Collapse ──
+  // Desktop collapses PROGRESSIVELY: as the pane narrows the leading context
+  // actions (nearest the title) move into a ⋯ overflow menu, two first and then
+  // one more per step, until only ⋯ + the bell remain.
+  //
+  // What it is giving way TO changed on 2026-08-13, even though the steps did
+  // not. The title used to be the flex middle of the row, so folding an icon
+  // handed it that width; it is a box centred on the row now, clearing a
+  // constant reserve at each end (--content-side-reserve in panels/shell.css),
+  // so folding frees the cluster's own room and nothing else. Which means the
+  // fold only has to fire where that reserve stops holding: the clamp's
+  // min-span arm, a Canvas pane at or near its floor, where the box's ends do
+  // reach the clusters. Above it the reserve is sized for the widest cluster
+  // this row can carry and the measurement finds everything fits.
+  //
+  // Mobile collapses EVERYTHING, at every width, bar the exception below. The
+  // trailing cluster is therefore ⋯ + the bell, or the bell alone for a view
+  // with no context actions. It predates the desktop row being centred and
+  // answers the same
+  // question differently. A phone's row cannot afford a reserve wide enough for
+  // a cluster that grows with the action count. So it bounds the cluster
+  // instead, which pins the chevrons to a fixed span agreeing with the thread
+  // pane's.
+  //
+  // One exception, and it agrees with the desktop rule rather than departing
+  // from it: a view carrying exactly ONE action keeps that action's own icon.
+  // The ⋯ trigger would stand in the same box, so the cluster is two boxes
+  // either way and the menu buys only a tap. See `mobileCollapseCount`.
+  const hostRef = useRef<HTMLDivElement>(null);
+  // Room alone decides: every action rides while it fits, then the two
+  // nearest the title fold first and one more follows per step.
+  const collapsedCount = useHeaderActionCollapse(hostRef, actions.length, layout, COLLAPSE_TARGETS);
+
+  return (
+    <div class="content-header-actions" ref={hostRef}>
+      <CollapsingActions actions={actions} collapsed={collapsedCount} moreClass="content-header-more">
+        <NotificationsBell />
+      </CollapsingActions>
+    </div>
+  );
+}

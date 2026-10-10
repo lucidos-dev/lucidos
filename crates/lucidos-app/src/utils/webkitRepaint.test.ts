@@ -1,0 +1,1085 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// platform.ts touches navigator/window at import time (no jsdom here), so mock
+// it outright. The helper only consumes isWebKit().
+//
+// isIOS is pinned FALSE, so the whole suite runs as a Mac: a WebKit client that
+// is not iOS. That is the packaged desktop app, which the gate used to lock out
+// of the recovery entirely. Re-gate the module on isIOS and every case here
+// fails rather than silently passing on the phone alone.
+let webKitValue = true;
+vi.mock('./platform', () => ({ isWebKit: () => webKitValue, isIOS: () => false }));
+
+// scrollState owns the notification deep-link scroll claim. The repaint skips
+// its scrollTop nudge while a held claim has not yet resolved, so it cannot race
+// the landing. Mock both flags as controllable booleans, which avoids pulling in
+// @preact/signals. `deepLinkResolved` defaults false, so a bare
+// `pendingEventScroll = true` is a link still looking for its target. (The real
+// claim can't be set here: scrollToEventAndPulse bails before setting it when
+// `document` is undefined, which is the case in this DOM-less suite.)
+let pendingEventScroll = false;
+let deepLinkResolved = false;
+vi.mock('../components/chat/scrollState', () => ({
+  hasPendingEventScroll: () => pendingEventScroll,
+  deepLinkHasResolved: () => pendingEventScroll && deepLinkResolved,
+}));
+
+// scrollActivity tracks whether a user touch-drag / momentum scroll is in flight.
+// The repaint gates its scrollTop nudge on it so a nudge can't cancel an in-flight
+// iOS momentum scroll (the "scrolling randomly stops when you let go" bug).
+// Mock to a controllable boolean, mirroring the isIOS / scrollState mocks.
+let userScrolling = false;
+vi.mock('./scrollActivity', () => ({ isUserScrolling: () => userScrolling }));
+
+import { forceWebKitRepaint, forceWebKitRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS, isRepaintNudging, NUDGE_EVENT_WINDOW_MS, PINNED_SHIFT_PROP, SCROLLER_PINNED_ATTR, repaintNudgeShift, settledScrollTop } from './webkitRepaint';
+
+describe('OPEN_REPAINT_BURST_DELAYS_MS', () => {
+  it('starts with an immediate (0ms) attempt', () => {
+    expect(OPEN_REPAINT_BURST_DELAYS_MS[0]).toBe(0);
+  });
+
+  it('is strictly ascending (no duplicate / out-of-order setTimeout slots)', () => {
+    for (let i = 1; i < OPEN_REPAINT_BURST_DELAYS_MS.length; i++) {
+      expect(OPEN_REPAINT_BURST_DELAYS_MS[i]).toBeGreaterThan(OPEN_REPAINT_BURST_DELAYS_MS[i - 1]);
+    }
+  });
+
+  it('extends past 300ms to cover a layer that blanks later under prolonged use', () => {
+    // Regression: the old [0,100,300] tail fired its last attempt before a
+    // late blank landed on a degraded WKWebView, leaving the body black.
+    expect(Math.max(...OPEN_REPAINT_BURST_DELAYS_MS)).toBeGreaterThanOrEqual(1000);
+  });
+});
+
+// Minimal rAF stub: queue callbacks, run them on demand so the two-frame
+// transform toggle is deterministic.
+let rafQueue: Array<() => void>;
+let rafIdSeq: number;
+let canceled: Set<number>;
+const origRaf = (globalThis as any).requestAnimationFrame;
+const origCancelRaf = (globalThis as any).cancelAnimationFrame;
+
+function flushFrame() {
+  // Snapshot then clear, so callbacks that schedule the next frame land in the
+  // fresh queue rather than running within this flush.
+  const batch = rafQueue;
+  rafQueue = [];
+  for (const cb of batch) cb();
+}
+
+beforeEach(() => {
+  webKitValue = true;
+  pendingEventScroll = false;
+  deepLinkResolved = false;
+  userScrolling = false;
+  rafQueue = [];
+  rafIdSeq = 0;
+  canceled = new Set();
+  (globalThis as any).requestAnimationFrame = (cb: () => void) => {
+    const id = ++rafIdSeq;
+    rafQueue.push(() => { if (!canceled.has(id)) cb(); });
+    return id;
+  };
+  (globalThis as any).cancelAnimationFrame = (id: number) => { canceled.add(id); };
+});
+
+afterEach(() => {
+  // Restore the originals rather than deleting — leaving these undefined would
+  // break any other module that calls rAF in the shared worker context.
+  (globalThis as any).requestAnimationFrame = origRaf;
+  (globalThis as any).cancelAnimationFrame = origCancelRaf;
+});
+
+/** A `style` stub that records custom-property writes, so a test can tell WHICH
+ *  element a published value landed on. `transform` stays a plain field, since
+ *  the code sets it by assignment. */
+function styleStub(transform = ''): any {
+  const props = new Map<string, string>();
+  return {
+    transform,
+    props,
+    setProperty(name: string, value: string) { props.set(name, value); },
+    removeProperty(name: string) { props.delete(name); },
+  };
+}
+
+/** A scrollport-pinned child: a direct child carrying the marker, and what the
+ *  compensation counter is published onto. */
+function fakePinnedChild(): any {
+  return { style: styleStub(), hasAttribute: (name: string) => name === SCROLLER_PINNED_ATTR };
+}
+
+/** An ordinary direct child of the scroller, carrying no marker. */
+function fakePlainChild(): any {
+  return { style: styleStub(), hasAttribute: () => false };
+}
+
+/** The pixels a pinned child was told to undo, or `null` when it holds no
+ *  counter at all. */
+function pinnedShiftPx(child: any): number | null {
+  const raw = child.style.props.get(PINNED_SHIFT_PROP);
+  return raw === undefined ? null : Number(raw.replace('px', ''));
+}
+
+/** A fake element. Pass `scroll` to make it scrollable (the scroll-nudge path);
+ *  omit it for the transform-only cases (a non-scrollable element). Pass
+ *  `pinned` to give it a scrollport-pinned child. `offsetHeight` is a counting
+ *  getter so a test can assert the forced synchronous layout read actually
+ *  happens. */
+function fakeEl(
+  transform = '',
+  scroll?: { scrollTop: number; scrollHeight: number; clientHeight: number },
+  ...pinned: any[]
+): any {
+  const el: any = { isConnected: true, style: styleStub(transform), offsetReads: 0 };
+  // The publish scans the scroller's own children for the marker, so the fake
+  // hands back a `children` list and each child answers `hasAttribute`.
+  el.children = pinned;
+  if (scroll) {
+    el.scrollTop = scroll.scrollTop;
+    el.scrollHeight = scroll.scrollHeight;
+    el.clientHeight = scroll.clientHeight;
+  }
+  Object.defineProperty(el, 'offsetHeight', {
+    get() { el.offsetReads++; return 0; },
+    configurable: true,
+  });
+  return el;
+}
+
+/** The `translateY` pixels a transform carries, 0 when it carries none. */
+function translateYPx(transform: string): number {
+  const m = /translateY\((-?\d+(?:\.\d+)?)px\)/.exec(transform);
+  return m ? Number(m[1]) : 0;
+}
+
+/** How far the painted content moved since it sat at `from`. The container's
+ *  `translateY` pushes it down, and a larger `scrollTop` pulls it up by the same
+ *  measure. It reads arithmetic rather than a transform string, so it pins the
+ *  rule and not the format. */
+function paintedShiftPx(el: any, from: number): number {
+  return translateYPx(el.style.transform) - (el.scrollTop - from);
+}
+
+describe('forceWebKitRepaint', () => {
+  it('toggles a translateZ across two frames then restores the prior transform', () => {
+    const el = fakeEl();
+    forceWebKitRepaint(el);
+    expect(el.style.transform).toBe(''); // nothing yet — deferred to rAF
+
+    flushFrame(); // frame 1: set the nudge
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+
+    flushFrame(); // frame 2: restore
+    expect(el.style.transform).toBe('');
+  });
+
+  it('preserves an existing inline transform', () => {
+    const el = fakeEl('rotate(2deg)');
+    forceWebKitRepaint(el);
+    flushFrame();
+    expect(el.style.transform).toBe('rotate(2deg) translateZ(0.1px)');
+    flushFrame();
+    expect(el.style.transform).toBe('rotate(2deg)');
+  });
+
+  it('is a no-op off WebKit', () => {
+    webKitValue = false;
+    const el = fakeEl();
+    const cleanup = forceWebKitRepaint(el);
+    expect(cleanup).toBeUndefined();
+    flushFrame();
+    flushFrame();
+    expect(el.style.transform).toBe('');
+  });
+
+  it('is a no-op for a detached node', () => {
+    const el = fakeEl();
+    el.isConnected = false;
+    const cleanup = forceWebKitRepaint(el);
+    expect(cleanup).toBeUndefined();
+  });
+
+  it('skips the restore if the element detaches mid-toggle', () => {
+    const el = fakeEl();
+    forceWebKitRepaint(el);
+    flushFrame(); // frame 1: applies the nudge
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+    el.isConnected = false;
+    flushFrame(); // frame 2: bails, leaves transform as-is (element is gone)
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+  });
+
+  it('coalesces overlapping calls so no stale transform accumulates', () => {
+    // A single iOS resume can fire visibilitychange + pageshow + focus in one
+    // tick. Each calls forceWebKitRepaint; a superseding call reuses the first
+    // call's captured baseline, so the net effect stays one repaint per burst
+    // without a growing `translateZ(0.1px) translateZ(0.1px) …` cruft.
+    const el = fakeEl();
+    forceWebKitRepaint(el);
+    forceWebKitRepaint(el); // in-flight → supersedes, same baseline
+    forceWebKitRepaint(el); // in-flight → supersedes, same baseline
+    flushFrame();
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+    flushFrame();
+    expect(el.style.transform).toBe(''); // restored to the true baseline
+
+    // Once the toggle finishes the element is repaintable again.
+    forceWebKitRepaint(el);
+    flushFrame();
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+    flushFrame();
+    expect(el.style.transform).toBe('');
+  });
+
+  it('recovers when a prior toggle never completes (iOS drops queued frames)', () => {
+    // iOS suspends a backgrounded PWA and can DROP its queued rAF callbacks
+    // rather than deferring them. If the page froze between scheduling the
+    // toggle and its second frame, the old "skip while pending" guard left the
+    // element permanently locked out: every later repaint — including the
+    // resume / open-thread repaint meant to un-blank the layer — no-op'd, so
+    // the thread content stayed black until the element was recreated. The
+    // up-chevron-but-blank screenshot is this state.
+    const el = fakeEl();
+    forceWebKitRepaint(el); // schedules frame 1, which never runs (page frozen)
+    // Simulate the OS dropping the queued frame: clear without running it.
+    rafQueue = [];
+
+    // Resume fires another repaint on the SAME element — it must supersede the
+    // dropped toggle and actually paint, not skip.
+    forceWebKitRepaint(el);
+    flushFrame();
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+    flushFrame();
+    expect(el.style.transform).toBe(''); // back to the true baseline
+  });
+
+  it('supersedes a toggle frozen after its first frame without polluting the baseline', () => {
+    // Frame 1 ran (nudge applied) but frame 2 (the restore) was dropped by the
+    // suspend. A superseding call must restore the TRUE baseline and toggle
+    // again — not read the nudged value as the new baseline and accumulate.
+    const el = fakeEl('rotate(1deg)');
+    forceWebKitRepaint(el);
+    flushFrame();
+    expect(el.style.transform).toBe('rotate(1deg) translateZ(0.1px)');
+    rafQueue = []; // page freezes — the restore frame is dropped
+
+    forceWebKitRepaint(el);
+    flushFrame();
+    expect(el.style.transform).toBe('rotate(1deg) translateZ(0.1px)');
+    flushFrame();
+    expect(el.style.transform).toBe('rotate(1deg)'); // true baseline, no cruft
+  });
+
+  it('cleanup cancels pending frames so no transform is applied', () => {
+    const el = fakeEl();
+    const cleanup = forceWebKitRepaint(el)!;
+    cleanup();
+    flushFrame();
+    flushFrame();
+    expect(el.style.transform).toBe('');
+  });
+
+  // --- scroll-nudge escalation (the WKCompositingView-removal recovery) -----
+
+  it('nudges scrollTop by 1px then restores it across two frames (scrollable)', () => {
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    expect(el.scrollTop).toBe(500); // deferred to rAF — nothing yet
+
+    flushFrame(); // frame 1: nudge up by 1 (re-tiles the frozen layer)
+    expect(el.scrollTop).toBe(499);
+
+    flushFrame(); // frame 2: restore (not at bottom → exact prior position)
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('forces a synchronous layout read (offsetHeight) on the nudge frame', () => {
+    // The documented reliable repaint trigger — a layout read flushes the nudged
+    // state so it actually paints instead of being coalesced with the restore.
+    const el = fakeEl('', { scrollTop: 100, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    expect(el.offsetReads).toBe(0); // deferred to rAF
+    flushFrame(); // frame 1 applies the nudge AND reads offsetHeight
+    expect(el.offsetReads).toBeGreaterThanOrEqual(1);
+  });
+
+  it('yields the restore to a concurrent scroll write (never clobbers useScrollMemory / the chevron)', () => {
+    // The open-path race: useScrollMemory restores a thread to its saved
+    // position, or the reader taps the down chevron, BETWEEN the nudge and its
+    // restore. The restore must yield, only undoing OUR nudge if scrollTop is
+    // still the value we left, so it can't snap them back to a stale position.
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame(); // frame 1: nudge to 499
+    expect(el.scrollTop).toBe(499);
+    el.scrollTop = 2000; // a concurrent writer (useScrollMemory restore) moves it
+    flushFrame(); // frame 2: 2000 !== 499 → yield, leave it alone
+    expect(el.scrollTop).toBe(2000);
+  });
+
+  it('nudges from the LIVE position, not a stale call-time baseline (streaming growth)', () => {
+    // On iOS the streaming-repaint throttle calls forceWebKitRepaint while the
+    // reader is at the bottom, and they can move between the call and the rAF
+    // nudge (a chevron tap landing them on the grown bottom). A call-time
+    // baseline would then write (oldBottom - 1), dragging them back up by
+    // however far they got. The nudge must be ±1 from the CURRENT position so
+    // it stays inside the 2px chevron slack and moves nobody.
+    const el = fakeEl('', { scrollTop: 1200, scrollHeight: 2000, clientHeight: 800 }); // at bottom (2000-800)
+    forceWebKitRepaint(el); // call-time baseline would capture 1200
+    // Streaming grows the transcript and the reader chevrons to the new bottom:
+    el.scrollHeight = 3000;
+    el.scrollTop = 2200; // new bottom (3000-800)
+    flushFrame(); // frame 1: nudge — must be ±1 from the LIVE 2200, not the stale 1200
+    expect(el.scrollTop).toBe(2199);
+    flushFrame(); // frame 2: restore to the live baseline it nudged from
+    expect(el.scrollTop).toBe(2200);
+  });
+
+  it('nudges DOWN then restores when at the very top (direction-safe, scrollTop 0)', () => {
+    const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame(); // frame 1: can't go below 0, so nudge +1
+    expect(el.scrollTop).toBe(1);
+    flushFrame(); // frame 2: restore to 0 (not at bottom)
+    expect(el.scrollTop).toBe(0);
+  });
+
+  it('does not touch scrollTop on a non-scrollable element (transform-only fallback)', () => {
+    const el = fakeEl('', { scrollTop: 0, scrollHeight: 800, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame();
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform still fires
+    expect(el.scrollTop).toBe(0); // scroll untouched
+    flushFrame();
+    expect(el.style.transform).toBe('');
+    expect(el.scrollTop).toBe(0);
+  });
+
+  it('supersedes a dropped scroll restore without drifting the position', () => {
+    // iOS dropped the restore frame; a superseding call must undo the partial
+    // nudge to the TRUE baseline (not read the nudged 499 as the new baseline)
+    // and round-trip again — no 1px-per-burst drift.
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame(); // nudge to 499
+    expect(el.scrollTop).toBe(499);
+    rafQueue = []; // page freezes — the restore frame is dropped
+
+    forceWebKitRepaint(el); // supersede: immediately restores the true baseline
+    expect(el.scrollTop).toBe(500);
+    flushFrame(); // fresh nudge
+    expect(el.scrollTop).toBe(499);
+    flushFrame(); // fresh restore
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('is a no-op off WebKit for a scrollable element (no scrollTop write, no layout read)', () => {
+    webKitValue = false;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    const cleanup = forceWebKitRepaint(el);
+    expect(cleanup).toBeUndefined();
+    flushFrame();
+    flushFrame();
+    expect(el.scrollTop).toBe(500);
+    expect(el.offsetReads).toBe(0);
+  });
+
+  // --- the nudge is invisible: a matching translateY cancels its displacement ---
+
+  it('cancels the nudge with a matching translateY, so the painted content never moves', () => {
+    // The nudge's mechanism is a PAINTED offset change, and every caller fires
+    // it: the open burst, the resume, the settle probe, and the streaming
+    // throttle at five a second. Uncompensated that is a 1px flick per toggle,
+    // which the reader saw on the iOS PWA as a rapid small shake. The layer
+    // still gets its offset change; the reader must not see it.
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame(); // frame 1: nudged to 499, compensated by translateY(-1px)
+    expect(el.scrollTop).toBe(499); // the offset change the re-tile needs
+    expect(paintedShiftPx(el, 500)).toBe(0); // and nothing the reader can see
+    expect(el.style.transform).toContain('translateZ(0.1px)'); // the other lever survives
+
+    flushFrame(); // frame 2: the compensation leaves with the nudge it cancelled
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('cancels a downward nudge too (at scrollTop 0, where the direction flips)', () => {
+    const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame(); // frame 1: can't go below 0, so nudge +1 and compensate +1
+    expect(el.scrollTop).toBe(1);
+    expect(paintedShiftPx(el, 0)).toBe(0);
+
+    flushFrame();
+    expect(el.scrollTop).toBe(0);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('leads with the compensation, so a scaling baseline cannot magnify it', () => {
+    // Transform functions apply left to right, each in the coordinate system the
+    // ones before it established. Behind this `scale(2)` the compensation would
+    // move two viewport pixels and over-cancel a one-pixel scroll. Leading keeps
+    // it the pixel the scroll took, and leaves the caller's own transform alone.
+    const el = fakeEl('scale(2)', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame();
+    expect(el.style.transform).toBe('translateY(-1px) scale(2) translateZ(0.1px)');
+    expect(paintedShiftPx(el, 500)).toBe(0);
+
+    flushFrame();
+    expect(el.style.transform).toBe('scale(2)');
+  });
+
+  it('drops the compensation when the restore YIELDS to a concurrent scroll write', () => {
+    // The restore declines when something else moved the container, so the
+    // position it was compensating is gone. Leaving the translateY behind would
+    // offset the pane by a pixel for as long as the element lives.
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame();
+    el.scrollTop = 2000; // a concurrent writer (useScrollMemory restore)
+    flushFrame(); // frame 2: the scroll restore yields, the transform still resets
+    expect(el.scrollTop).toBe(2000);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('leaves no compensation stranded when a supersede undoes a dropped restore', () => {
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame(); // nudged and compensated
+    expect(translateYPx(el.style.transform)).toBe(-1);
+    rafQueue = []; // the page freezes, so the restore frame is dropped
+
+    forceWebKitRepaint(el); // a supersede restores the true baseline of BOTH
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+    flushFrame();
+    expect(paintedShiftPx(el, 500)).toBe(0); // the fresh toggle is invisible too
+  });
+
+  it('leaves no compensation stranded when the cleanup runs mid-toggle', () => {
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    const cleanup = forceWebKitRepaint(el)!;
+    flushFrame(); // nudged and compensated
+    cleanup();
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  // --- a scrollport-pinned child undoes that compensation ----------------------
+  //
+  // The compensation is exact for content the SCROLL moved. A position:sticky
+  // child paints at its own `top` whatever scrollTop says. So the scroll leg
+  // passes it by, and the transform leg displaces it by the full delta. That was
+  // the mobile thread title flicking a pixel five times on every thread open.
+
+  it('hands a pinned child exactly the shift the container moved it by', () => {
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    forceWebKitRepaint(el);
+
+    flushFrame(); // frame 1
+    expect(pinnedShiftPx(pinned)).toBe(translateYPx(el.style.transform));
+    expect(pinnedShiftPx(pinned)).toBe(-1);
+
+    flushFrame(); // frame 2: it leaves with the compensation it undoes
+    expect(pinnedShiftPx(pinned)).toBeNull();
+  });
+
+  it('hands the shift to EVERY marked child, and to no unmarked one', () => {
+    // The marker is a role, not a name, so a second pinned row is a thing the
+    // design invites. Serving one and displacing the rest would say nothing.
+    // The turns between them scroll normally and are already compensated.
+    const first = fakePinnedChild();
+    const turn = fakePlainChild();
+    const second = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, first, turn, second);
+    forceWebKitRepaint(el);
+
+    flushFrame();
+    expect(pinnedShiftPx(first)).toBe(-1);
+    expect(pinnedShiftPx(second)).toBe(-1);
+    expect(pinnedShiftPx(turn)).toBeNull();
+
+    flushFrame();
+    expect(pinnedShiftPx(first)).toBeNull();
+    expect(pinnedShiftPx(second)).toBeNull();
+  });
+
+  it('hands over a downward shift too (at scrollTop 0, where the direction flips)', () => {
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    forceWebKitRepaint(el);
+
+    flushFrame();
+    expect(pinnedShiftPx(pinned)).toBe(translateYPx(el.style.transform));
+    expect(pinnedShiftPx(pinned)).toBe(1);
+  });
+
+  it('writes the counter on the CHILD, never on the scroller', () => {
+    // A custom property inherits. A write one level up would invalidate style
+    // for the whole transcript per nudge, five a second while streaming.
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    forceWebKitRepaint(el);
+    flushFrame();
+    expect(el.style.props.has(PINNED_SHIFT_PROP)).toBe(false);
+    expect(pinnedShiftPx(pinned)).toBe(-1);
+  });
+
+  it('hands over nothing wherever the nudge is skipped', () => {
+    // No scroll leg means no compensation, so a counter here would displace the
+    // row by exactly the pixel nothing moved it.
+    const unscrollable = fakePinnedChild();
+    forceWebKitRepaint(fakeEl('', { scrollTop: 0, scrollHeight: 800, clientHeight: 800 }, unscrollable));
+    flushFrame();
+    expect(pinnedShiftPx(unscrollable)).toBeNull();
+
+    pendingEventScroll = true;
+    const claimed = fakePinnedChild();
+    forceWebKitRepaint(fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, claimed));
+    flushFrame();
+    expect(pinnedShiftPx(claimed)).toBeNull();
+    pendingEventScroll = false;
+
+    userScrolling = true;
+    const dragging = fakePinnedChild();
+    forceWebKitRepaint(fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, dragging));
+    flushFrame();
+    expect(pinnedShiftPx(dragging)).toBeNull();
+    userScrolling = false;
+  });
+
+  it('retires the counter when the restore YIELDS to a concurrent scroll write', () => {
+    // The transform still resets, so the displacement it caused is gone and the
+    // counter has nothing left to undo.
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    forceWebKitRepaint(el);
+    flushFrame();
+    el.scrollTop = 2000; // a concurrent writer (useScrollMemory restore)
+    flushFrame();
+    expect(el.style.transform).toBe('');
+    expect(pinnedShiftPx(pinned)).toBeNull();
+  });
+
+  it('retires the counter when a supersede undoes a dropped restore', () => {
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    forceWebKitRepaint(el);
+    flushFrame();
+    expect(pinnedShiftPx(pinned)).toBe(-1);
+    rafQueue = []; // the page freezes, so the restore frame is dropped
+
+    forceWebKitRepaint(el); // the supersede restores the baseline of all three
+    expect(el.style.transform).toBe('');
+    expect(pinnedShiftPx(pinned)).toBeNull();
+    flushFrame();
+    expect(pinnedShiftPx(pinned)).toBe(-1); // and the fresh toggle publishes again
+  });
+
+  it('retires the counter when the cleanup runs mid-toggle', () => {
+    const pinned = fakePinnedChild();
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
+    const cleanup = forceWebKitRepaint(el)!;
+    flushFrame();
+    cleanup();
+    expect(pinnedShiftPx(pinned)).toBeNull();
+  });
+
+  // --- deep-link claim gate (don't fight a notification deep-link's scroll) -----
+
+  it('skips the scrollTop nudge while a deep-link claim is held, but still repaints (transform + layout read)', () => {
+    // The residual iOS-PWA flakiness: a notification-tap foreground fires the
+    // resume repaint (visibilitychange/pageshow/focus) at the SAME instant
+    // scrollToEventAndPulse is smooth-scrolling to the target event. The ±1px
+    // nudge captures the PRE-deep-link baseline (the bottom) and fights the
+    // landing — middle/top/bottom nondeterministically. With a claim held the
+    // nudge must be skipped entirely (no off-baseline strand), while the cheaper
+    // compositor re-commit (transform round-trip + forced layout read) still runs.
+    pendingEventScroll = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+
+    flushFrame(); // frame 1: NO scroll nudge — defer to the deep-link
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform repaint still fires
+    expect(el.offsetReads).toBeGreaterThanOrEqual(1); // forced layout read still happens
+
+    flushFrame(); // frame 2: scroll still untouched (not stranded), transform restored
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('nudges once the deep link has LANDED, though its claim is still held', () => {
+    // The claim outlives the landing by the resolve deadline. A landing onto
+    // the clamped bottom moves nothing, so it re-commits nothing. Skipping the
+    // nudge for that whole window left the transcript blank until the reader
+    // scrolled. Reported from an in-app toast tap.
+    pendingEventScroll = true;
+    deepLinkResolved = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+
+    flushFrame();
+    expect(el.scrollTop).toBe(499);
+    flushFrame();
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('still nudges + restores scrollTop when NO claim is held (repaint not regressed)', () => {
+    // The paired case: with no deep-link in flight the ±1px nudge is the
+    // user-confirmed compositor recovery and must keep working exactly as before.
+    pendingEventScroll = false;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+
+    flushFrame(); // frame 1: nudge
+    expect(el.scrollTop).toBe(499);
+    flushFrame(); // frame 2: restore
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('keeps a consistent nudge decision when the claim ARRIVES mid-burst (no off-baseline strand)', () => {
+    // hasPendingEventScroll() can flip between rAF1 and rAF2. The decision is
+    // captured ONCE at burst start (no claim → nudge ON), so a claim arriving
+    // before the restore frame must NOT skip the restore and strand scrollTop at
+    // the nudged value.
+    pendingEventScroll = false; // burst starts with no claim → nudge decided ON
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+
+    flushFrame(); // frame 1: nudge applied
+    expect(el.scrollTop).toBe(499);
+    pendingEventScroll = true; // a deep-link claim arrives mid-burst
+    flushFrame(); // frame 2: restore STILL runs (decision reused) — no strand
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('keeps a consistent skip decision when the claim RELEASES mid-burst (never nudges)', () => {
+    // The mirror case: a claim held at burst start decides nudge OFF; releasing it
+    // before the restore frame must NOT cause a spurious restore write — scrollTop
+    // was never moved, so neither frame may touch it.
+    pendingEventScroll = true; // burst starts with a claim → nudge decided OFF
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+
+    flushFrame(); // frame 1: no nudge
+    expect(el.scrollTop).toBe(500);
+    pendingEventScroll = false; // claim releases mid-burst
+    flushFrame(); // frame 2: restore is a no-op (decision was OFF) — scrollTop untouched
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('reuses the burst nudge decision across a superseding call (claim held → no nudge)', () => {
+    // A single iOS resume fires visibilitychange + pageshow + focus → three
+    // forceWebKitRepaint calls in one tick. The first captures the decision; the
+    // supersedes reuse it. With a claim held the whole burst must skip the nudge.
+    pendingEventScroll = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    forceWebKitRepaint(el); // supersede: reuses the captured (skip) decision
+    forceWebKitRepaint(el); // supersede
+
+    flushFrame();
+    expect(el.scrollTop).toBe(500); // still no nudge
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform still repaints
+    flushFrame();
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  // --- active-scroll gate (don't cancel an in-flight iOS momentum scroll) -----
+
+  it('skips the scrollTop nudge while the user is actively scrolling, but still repaints (transform + layout read)', () => {
+    // iOS cancels a momentum scroll the instant scrollTop is written. The repaint
+    // nudge fires on timers (streaming throttle, thread-open burst, settle probe,
+    // page-resume) independent of the gesture, so mid-fling it stops the scroll
+    // dead — the "scrolling randomly stops instead of going further when you let
+    // go" report. While a touch-drag / its momentum tail is in flight the nudge
+    // must stand down (the scroll itself is already keeping the compositor
+    // committed), while the cheaper transform round-trip + forced layout read run.
+    userScrolling = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+
+    flushFrame(); // frame 1: NO scroll nudge — don't cancel momentum
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform repaint still fires
+    expect(el.offsetReads).toBeGreaterThanOrEqual(1); // forced layout read still happens
+
+    flushFrame(); // frame 2: scroll still untouched (not stranded), transform restored
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('re-checks live scrolling at the write frame — a drag that starts after the (idle) call but before rAF1 still skips the nudge', () => {
+    // The repaint callers are timer/data-driven and the scrollTop write is deferred
+    // one frame. If the user starts a fling in the ~16ms between an idle call and
+    // rAF1, a decision frozen at call time would still write scrollTop and cancel
+    // the just-started momentum. The nudge must re-check the LIVE scroll state at
+    // the write point; the restore stays gated on whether a nudge was applied, so
+    // skipping here leaves scrollTop untouched on BOTH frames.
+    userScrolling = false; // idle at call → burst decision would allow the nudge
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    userScrolling = true; // a drag begins before the deferred write frame runs
+
+    flushFrame(); // rAF1: re-check sees the drag → NO scrollTop write
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform repaint still fires
+    expect(el.offsetReads).toBeGreaterThanOrEqual(1); // forced layout read still happens
+
+    flushFrame(); // rAF2: nothing was nudged → restore is a no-op
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('still nudges + restores scrollTop when the user is NOT scrolling (recovery not regressed)', () => {
+    // The paired case: idle (no touch in flight), the ±1px nudge is the
+    // user-confirmed compositor recovery and must keep working exactly as before.
+    userScrolling = false;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame(); // frame 1: nudge
+    expect(el.scrollTop).toBe(499);
+    flushFrame(); // frame 2: restore
+    expect(el.scrollTop).toBe(500);
+  });
+
+  it('reuses the burst skip decision across a superseding call (scrolling → never nudges)', () => {
+    // A single iOS resume fires visibilitychange + pageshow + focus → three calls
+    // in one tick; the supersedes reuse the first call's decision. While a scroll
+    // is in flight the whole burst must skip the nudge (and never strand scrollTop).
+    userScrolling = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    forceWebKitRepaint(el); // supersede: reuses the captured (skip) decision
+    forceWebKitRepaint(el); // supersede
+    flushFrame();
+    expect(el.scrollTop).toBe(500); // still no nudge
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // transform still repaints
+    flushFrame();
+    expect(el.scrollTop).toBe(500);
+    expect(el.style.transform).toBe('');
+  });
+
+  it('keeps a consistent skip decision when scrolling ends mid-burst (never nudges)', () => {
+    // The gesture window can lapse between rAF1 and rAF2. The decision is captured
+    // ONCE at burst start; a burst begun mid-scroll has the nudge OFF for the whole
+    // burst, so momentum ending before the restore frame can't trigger a spurious
+    // scrollTop write — scrollTop was never moved, so neither frame may touch it.
+    userScrolling = true; // burst starts mid-drag → nudge decided OFF
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame(); // frame 1: no nudge
+    expect(el.scrollTop).toBe(500);
+    userScrolling = false; // momentum ends before the restore frame
+    flushFrame(); // frame 2: restore is a no-op (decision was OFF) — untouched
+    expect(el.scrollTop).toBe(500);
+  });
+});
+
+describe('isRepaintNudging', () => {
+  // `lastNudgeAt` is module state that outlives a test, and the window is a
+  // recency check against the real clock, so a bare `isRepaintNudging()` could
+  // read a nudge left behind by an earlier test. Ask the order-independent
+  // question instead: evaluating the window at `since + NUDGE_EVENT_WINDOW_MS`
+  // is true exactly when a nudge write landed at or after `since`.
+  function nudgedSince(since: number): boolean {
+    return isRepaintNudging(since + NUDGE_EVENT_WINDOW_MS);
+  }
+
+  it('reports nudging from the nudge write until after the restore', () => {
+    // The header hook skips scroll events inside this window. It has to stay open
+    // across BOTH legs: the -1px write in frame 1 and the +1px restore in frame 2
+    // each dispatch their own scroll event a frame later, and letting either
+    // through moves the header (the iOS PWA "header shakes at rest" report).
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    const t0 = performance.now();
+    forceWebKitRepaint(el);
+
+    // Scheduling alone writes nothing, so nothing to hide from the hook yet.
+    expect(nudgedSince(t0)).toBe(false);
+
+    flushFrame(); // frame 1: the -1px nudge
+    expect(el.scrollTop).toBe(499);
+    const afterNudge = performance.now();
+    expect(nudgedSince(t0)).toBe(true);
+
+    flushFrame(); // frame 2: the restore, itself a scrollTop write
+    expect(el.scrollTop).toBe(500);
+    expect(nudgedSince(afterNudge)).toBe(true);
+  });
+
+  it('closes the window once it has elapsed, so a real scroll is never swallowed', () => {
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame();
+    const atNudge = performance.now();
+    // A finger scroll one window later must reach the header untouched.
+    expect(isRepaintNudging(atNudge + NUDGE_EVENT_WINDOW_MS)).toBe(false);
+  });
+
+  it('stays closed for the transform-only repaint (no scrollTop write)', () => {
+    // A non-scrollable element takes the transform + forced-layout path and never
+    // touches scrollTop, so there is no synthetic scroll event to hide. Reporting
+    // a nudge here would blind the header to real scrolls for no reason.
+    const el = fakeEl();
+    const t0 = performance.now();
+    forceWebKitRepaint(el);
+    flushFrame();
+    flushFrame();
+    expect(nudgedSince(t0)).toBe(false);
+  });
+
+  it('stays closed when the nudge is skipped for an in-flight user scroll', () => {
+    // Same reason, the other skip gate: nothing was written, so nothing to hide.
+    // This is the case where swallowing events would be worst, because the user
+    // is actively scrolling and every event is theirs.
+    userScrolling = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    const t0 = performance.now();
+    forceWebKitRepaint(el);
+    flushFrame();
+    flushFrame();
+    expect(nudgedSince(t0)).toBe(false);
+  });
+});
+
+describe('settledScrollTop', () => {
+  // A capture taken inside the nudged frame and applied in a later one keeps
+  // the nudge's pixel for good: the restore yields to the write built from it.
+
+  it('reads through the nudge while it is in its nudged frame', () => {
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    expect(settledScrollTop(el)).toBe(500); // scheduled, nothing written yet
+
+    flushFrame(); // frame 1: the -1px nudge
+    expect(el.scrollTop).toBe(499);
+    expect(repaintNudgeShift(el)).toBe(-1);
+    expect(settledScrollTop(el)).toBe(500);
+
+    flushFrame(); // frame 2: the restore
+    expect(repaintNudgeShift(el)).toBe(0);
+    expect(settledScrollTop(el)).toBe(500);
+  });
+
+  it('reads through the +1px nudge at the very top too', () => {
+    const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame();
+    expect(el.scrollTop).toBe(1);
+    expect(settledScrollTop(el)).toBe(0);
+  });
+
+  it('believes another writer that moved the container mid-nudge', () => {
+    // A restore or a correction landing inside the nudged frame is where the
+    // reader IS now. The nudge yields to it, so nothing is discounted.
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+    flushFrame();
+    el.scrollTop = 1337;
+    expect(settledScrollTop(el)).toBe(1337);
+    flushFrame(); // the restore yields
+    expect(el.scrollTop).toBe(1337);
+  });
+
+  it('is the plain scrollTop for an element nobody is nudging', () => {
+    const el = fakeEl('', { scrollTop: 420, scrollHeight: 2000, clientHeight: 800 });
+    expect(settledScrollTop(el)).toBe(420);
+  });
+});
+
+describe('forceWebKitRepaintBurst', () => {
+  // The file-level beforeEach already installs the manual rAF stub and the WebKit flag.
+  // Add ONLY setTimeout/clearTimeout fakes so the burst's spaced retries are
+  // driven deterministically while rAF stays the manual queue.
+  beforeEach(() => { vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('fires an immediate toggle then setTimeout-spaced retries', () => {
+    const el = fakeEl();
+    forceWebKitRepaintBurst(el);
+
+    // Immediate attempt: deferred to rAF, nothing applied yet.
+    expect(el.style.transform).toBe('');
+    flushFrame(); // immediate frame 1: nudge
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+    flushFrame(); // immediate frame 2: restore
+    expect(el.style.transform).toBe('');
+
+    // First retry at 100ms fires a fresh, independent toggle.
+    vi.advanceTimersByTime(100);
+    flushFrame();
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+    flushFrame();
+    expect(el.style.transform).toBe('');
+
+    // Second retry at 300ms (200ms more) fires another.
+    vi.advanceTimersByTime(200);
+    flushFrame();
+    expect(el.style.transform).toBe('translateZ(0.1px)');
+    flushFrame();
+    expect(el.style.transform).toBe('');
+  });
+
+  it('recovers when the immediate toggle frames are dropped (iOS coalesces) via a later retry', () => {
+    // The blank-on-open repro: the open path fires ONE toggle and iOS drops its
+    // queued rAF callbacks (cold open / suspended frame queue). With no retry the
+    // thread stays black (up-chevron visible, content in the DOM) until a manual
+    // scroll. The burst's spaced setTimeout retry lands a fresh toggle that
+    // actually paints.
+    const el = fakeEl();
+    forceWebKitRepaintBurst(el);
+    rafQueue = []; // OS drops the immediate toggle's frames without running them
+    expect(el.style.transform).toBe(''); // immediate attempt never painted
+
+    vi.advanceTimersByTime(100); // first retry
+    flushFrame();
+    expect(el.style.transform).toBe('translateZ(0.1px)'); // recovered
+    flushFrame();
+    expect(el.style.transform).toBe('');
+  });
+
+  it('preserves an existing inline transform across the burst', () => {
+    const el = fakeEl('rotate(2deg)');
+    forceWebKitRepaintBurst(el);
+    flushFrame();
+    expect(el.style.transform).toBe('rotate(2deg) translateZ(0.1px)');
+    flushFrame();
+    expect(el.style.transform).toBe('rotate(2deg)');
+
+    vi.advanceTimersByTime(300); // run all remaining retries
+    flushFrame();
+    flushFrame();
+    expect(el.style.transform).toBe('rotate(2deg)'); // no cruft accumulates
+  });
+
+  it('is a no-op off WebKit', () => {
+    webKitValue = false;
+    const el = fakeEl();
+    const cleanup = forceWebKitRepaintBurst(el);
+    expect(cleanup).toBeUndefined();
+    vi.advanceTimersByTime(1000);
+    flushFrame();
+    flushFrame();
+    expect(el.style.transform).toBe('');
+  });
+
+  it('is a no-op for a detached node', () => {
+    const el = fakeEl();
+    el.isConnected = false;
+    const cleanup = forceWebKitRepaintBurst(el);
+    expect(cleanup).toBeUndefined();
+  });
+
+  it('cleanup cancels the immediate frames and all pending retries', () => {
+    const el = fakeEl();
+    const cleanup = forceWebKitRepaintBurst(el)!;
+    cleanup();
+    // Immediate frames canceled — no nudge applied.
+    flushFrame();
+    flushFrame();
+    expect(el.style.transform).toBe('');
+    // Pending retries canceled — advancing past every delay fires nothing.
+    vi.advanceTimersByTime(1000);
+    flushFrame();
+    flushFrame();
+    expect(el.style.transform).toBe('');
+  });
+});
+
+describe('createRepaintThrottle', () => {
+  // Fake only the timers the throttle uses — leaving the file-level rAF stubs
+  // (set by the root beforeEach for the forceWebKitRepaint suite) untouched.
+  beforeEach(() => { vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('fires immediately on the leading edge', () => {
+    const fire = vi.fn();
+    const gate = createRepaintThrottle(200);
+    gate.request(0, fire);
+    expect(fire).toHaveBeenCalledTimes(1);
+  });
+
+  it('throttles a leading repaint but fires the request on the trailing edge', () => {
+    const fire = vi.fn();
+    const gate = createRepaintThrottle(200);
+    gate.request(1000, fire); // leading
+    expect(fire).toHaveBeenCalledTimes(1);
+    gate.request(1100, fire); // +100ms — throttled, arms trailing for the window end
+    gate.request(1199, fire); // +199ms — re-arms trailing, still not fired inline
+    expect(fire).toHaveBeenCalledTimes(1);
+    // Trailing for the last request (at 1199, window ends 1ms later) fires.
+    vi.advanceTimersByTime(1);
+    expect(fire).toHaveBeenCalledTimes(2);
+    // After the trailing fired, the next request inside the new window throttles.
+    gate.request(1250, fire);
+    expect(fire).toHaveBeenCalledTimes(2);
+  });
+
+  it('a single request throttled right after a leading repaint still paints once activity stops', () => {
+    // The stuck-blank repro: a streamed mutation (or a turn control's shrink)
+    // re-blanks the iOS layer a beat after a leading repaint, then the stream
+    // pauses (a CC tool call runs for many seconds) so no further request comes.
+    // Leading-only throttling dropped it and left the pane black; the trailing
+    // edge recovers it within one window.
+    const fire = vi.fn();
+    const gate = createRepaintThrottle(200);
+    gate.request(0, fire);   // leading repaint
+    expect(fire).toHaveBeenCalledTimes(1);
+    gate.request(40, fire);  // re-blanking mutation — throttled
+    expect(fire).toHaveBeenCalledTimes(1);
+    // ...stream pauses; no more requests...
+    vi.advanceTimersByTime(200);
+    expect(fire).toHaveBeenCalledTimes(2); // trailing repaint clears the blank
+  });
+
+  it('coalesces a burst of throttled requests into one trailing fire', () => {
+    const fire = vi.fn();
+    const gate = createRepaintThrottle(200);
+    gate.request(0, fire);   // leading
+    gate.request(50, fire);  // throttled
+    gate.request(100, fire); // throttled — re-arms
+    gate.request(150, fire); // throttled — re-arms (window ends at 200)
+    expect(fire).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(50); // window end reached for the last request
+    expect(fire).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(1000); // no further fires
+    expect(fire).toHaveBeenCalledTimes(2);
+  });
+
+  it('measures the window from the last ALLOWED fire, not the last attempt', () => {
+    const fire = vi.fn();
+    const gate = createRepaintThrottle(200);
+    gate.request(0, fire);   // leading fire, window from 0
+    expect(fire).toHaveBeenCalledTimes(1);
+    gate.request(150, fire); // throttled (150 < 200), arms trailing
+    gate.request(199, fire); // throttled, re-arms
+    gate.request(200, fire); // 200ms since the allowed fire at 0 → leading fires
+    expect(fire).toHaveBeenCalledTimes(2);
+  });
+
+  it('fires the leading edge at the interval cadence under a dense stream', () => {
+    const fire = vi.fn();
+    const gate = createRepaintThrottle(100);
+    // Issue requests every 25ms without advancing timers — only leading fires
+    // are counted (trailing timers stay armed-and-superseded, never run).
+    for (let t = 0; t <= 350; t += 25) gate.request(t, fire);
+    expect(fire).toHaveBeenCalledTimes(4); // 0, 100, 200, 300
+  });
+
+  it('cancel() clears a pending trailing fire', () => {
+    const fire = vi.fn();
+    const gate = createRepaintThrottle(200);
+    gate.request(0, fire);  // leading
+    gate.request(40, fire); // throttled — arms trailing
+    gate.cancel();
+    vi.advanceTimersByTime(1000);
+    expect(fire).toHaveBeenCalledTimes(1); // trailing never ran
+  });
+});

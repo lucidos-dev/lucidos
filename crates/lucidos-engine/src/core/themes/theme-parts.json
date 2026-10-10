@@ -1,0 +1,536 @@
+{
+  "properties": {
+    "color": {
+      "grammar": "colour",
+      "inherits": true,
+      "minAlpha": 0.6,
+      "protectedValue": "var(--text-primary)"
+    },
+    "caret-color": {
+      "grammar": "colour",
+      "inherits": true,
+      "minAlpha": 0.6,
+      "protectedValue": "auto"
+    },
+    "background-color": {
+      "grammar": "colour",
+      "inherits": false
+    },
+    "border-color": {
+      "grammar": "colour",
+      "inherits": false
+    },
+    "text-decoration-color": {
+      "grammar": "colour",
+      "inherits": false
+    },
+    "text-shadow": {
+      "grammar": "shadow",
+      "inherits": true,
+      "effect": true,
+      "unit": "em",
+      "maxLayers": 2,
+      "maxOffset": 0.1,
+      "maxBlur": 0.6,
+      "protectedValue": "none"
+    },
+    "box-shadow": {
+      "grammar": "shadow",
+      "inherits": false,
+      "effect": true,
+      "unit": "px",
+      "maxLayers": 2,
+      "maxOffset": 4,
+      "maxBlur": 16,
+      "maxSpread": 2
+    },
+    "filter": {
+      "grammar": "drop-shadow",
+      "inherits": false,
+      "effect": true,
+      "unit": "px",
+      "maxOffset": 2,
+      "maxBlur": 6
+    },
+    "letter-spacing": {
+      "grammar": "spacing",
+      "inherits": true,
+      "unit": "em",
+      "min": -0.02,
+      "max": 0.12,
+      "protectedValue": "normal"
+    },
+    "caret-shape": {
+      "grammar": "keyword",
+      "values": [
+        "auto",
+        "bar",
+        "block",
+        "underscore"
+      ],
+      "inherits": true,
+      "protectedValue": "auto"
+    },
+    "border-style": {
+      "grammar": "keyword",
+      "values": [
+        "solid",
+        "double"
+      ],
+      "inherits": false
+    },
+    "border-width": {
+      "grammar": "length",
+      "inherits": false,
+      "unit": "px",
+      "min": 1,
+      "max": 4
+    },
+    "background-image": {
+      "grammar": "scanlines",
+      "inherits": false,
+      "effect": true,
+      "maxAlpha": 0.25,
+      "maxPeriod": 8,
+      "maxStops": 4
+    }
+  },
+  "groups": [
+    {
+      "id": "chat",
+      "label": "Chat",
+      "description": "Messages in a thread: prose, headings, links and code."
+    },
+    {
+      "id": "chrome",
+      "label": "Chrome",
+      "description": "The frame around the work: header titles, header icons and the actor icons."
+    },
+    {
+      "id": "composer",
+      "label": "Composer",
+      "description": "The box you type a message in."
+    },
+    {
+      "id": "app",
+      "label": "App frames",
+      "description": "Apps that load the Lucidos SDK stylesheet. An app can opt out with data-theme-parts=\"off\" on its <html>."
+    }
+  ],
+  "protected": [
+    {
+      "id": "permission-card",
+      "label": "Permission and approval cards"
+    },
+    {
+      "id": "question-card",
+      "label": "Question cards"
+    },
+    {
+      "id": "credential-modal",
+      "label": "The credential form"
+    },
+    {
+      "id": "apply-card",
+      "label": "The Apply controls and change list"
+    },
+    {
+      "id": "plugin-install-review",
+      "label": "Plugin install and uninstall panels"
+    },
+    {
+      "id": "confirm-dialog",
+      "label": "Confirm dialogs"
+    }
+  ],
+  "aliases": [
+    {
+      "token": "--text-glow",
+      "property": "text-shadow",
+      "parts": [
+        "chat-text",
+        "actor-label",
+        "header-title",
+        "composer-text"
+      ]
+    }
+  ],
+  "parts": [
+    {
+      "id": "chat-text",
+      "label": "Chat text",
+      "group": "chat",
+      "description": "Prose in chat messages, yours and the agent's.",
+      "selector": ".response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content",
+      "frames": false,
+      "properties": [
+        {
+          "name": "color",
+          "token": "--part-chat-text-color",
+          "default": "currentcolor"
+        },
+        {
+          "name": "text-shadow",
+          "token": "--part-chat-text-text-shadow",
+          "default": "none"
+        },
+        {
+          "name": "letter-spacing",
+          "token": "--part-chat-text-letter-spacing",
+          "default": "normal"
+        }
+      ]
+    },
+    {
+      "id": "chat-heading",
+      "label": "Chat headings",
+      "group": "chat",
+      "description": "Headings inside chat messages. Unset properties follow chat text.",
+      "selector": ":is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) :is(h1, h2, h3, h4, h5, h6)",
+      "parent": "chat-text",
+      "frames": false,
+      "properties": [
+        {
+          "name": "color",
+          "token": "--part-chat-heading-color",
+          "default": "var(--part-chat-text-color, var(--text-primary))"
+        },
+        {
+          "name": "text-shadow",
+          "token": "--part-chat-heading-text-shadow",
+          "default": "var(--part-chat-text-text-shadow, none)"
+        },
+        {
+          "name": "letter-spacing",
+          "token": "--part-chat-heading-letter-spacing",
+          "default": "var(--part-chat-text-letter-spacing, normal)"
+        }
+      ]
+    },
+    {
+      "id": "chat-link",
+      "label": "Chat links",
+      "group": "chat",
+      "description": "Links inside chat messages. An unset glow follows chat text.",
+      "selector": ":is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) a",
+      "parent": "chat-text",
+      "frames": false,
+      "properties": [
+        {
+          "name": "color",
+          "token": "--part-chat-link-color",
+          "default": "var(--accent)"
+        },
+        {
+          "name": "text-shadow",
+          "token": "--part-chat-link-text-shadow",
+          "default": "var(--part-chat-text-text-shadow, none)"
+        }
+      ]
+    },
+    {
+      "id": "inline-code",
+      "label": "Inline code",
+      "group": "chat",
+      "description": "Inline code spans inside chat messages.",
+      "selector": ":is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) code:not(pre > code)",
+      "parent": "chat-text",
+      "frames": false,
+      "properties": [
+        {
+          "name": "color",
+          "token": "--part-inline-code-color",
+          "default": "var(--accent)"
+        },
+        {
+          "name": "background-color",
+          "token": "--part-inline-code-background-color",
+          "default": "var(--bg-tertiary)"
+        }
+      ]
+    },
+    {
+      "id": "code-block",
+      "label": "Code blocks",
+      "group": "chat",
+      "description": "Fenced code blocks inside chat messages. An unset glow follows chat text.",
+      "selector": ":is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) pre",
+      "parent": "chat-text",
+      "frames": false,
+      "properties": [
+        {
+          "name": "background-color",
+          "token": "--part-code-block-background-color",
+          "default": "var(--bg-tertiary)"
+        },
+        {
+          "name": "box-shadow",
+          "token": "--part-code-block-box-shadow",
+          "default": "none"
+        },
+        {
+          "name": "text-shadow",
+          "token": "--part-code-block-text-shadow",
+          "default": "var(--part-chat-text-text-shadow, none)"
+        }
+      ]
+    },
+    {
+      "id": "actor-label",
+      "label": "Actor labels",
+      "group": "chat",
+      "description": "The name beside each actor icon on a message.",
+      "selector": ".initiator-label, .response-executor-label",
+      "frames": false,
+      "properties": [
+        {
+          "name": "text-shadow",
+          "token": "--part-actor-label-text-shadow",
+          "default": "none"
+        },
+        {
+          "name": "letter-spacing",
+          "token": "--part-actor-label-letter-spacing",
+          "default": "normal"
+        }
+      ]
+    },
+    {
+      "id": "actor-icon",
+      "label": "Actor icons",
+      "group": "chrome",
+      "description": "The Lucidos, Claude and Codex marks beside a message. The Brand marks tokens colour them; this part adds a glow.",
+      "selector": ".initiator-icon svg, .response-executor-icon svg",
+      "frames": false,
+      "properties": [
+        {
+          "name": "filter",
+          "token": "--part-actor-icon-filter",
+          "default": "none"
+        }
+      ]
+    },
+    {
+      "id": "header-icon",
+      "label": "Header icons",
+      "group": "chrome",
+      "description": "The glyphs on the icon buttons in a pane's header. Their colour follows --header-fg-muted.",
+      "selector": ".app-header .icon-btn svg",
+      "frames": false,
+      "properties": [
+        {
+          "name": "filter",
+          "token": "--part-header-icon-filter",
+          "default": "none"
+        }
+      ]
+    },
+    {
+      "id": "header-title",
+      "label": "Header titles",
+      "group": "chrome",
+      "description": "Pane, thread and workspace titles in the header. Their colour follows --header-fg.",
+      "selector": ".threads-header-title, .mobile-header-title, .mobile-content-title, .workspace-name-label, .pane-header-title-text, .panel-url-title, .thread-title",
+      "frames": false,
+      "properties": [
+        {
+          "name": "text-shadow",
+          "token": "--part-header-title-text-shadow",
+          "default": "none"
+        },
+        {
+          "name": "letter-spacing",
+          "token": "--part-header-title-letter-spacing",
+          "default": "normal"
+        }
+      ]
+    },
+    {
+      "id": "composer",
+      "label": "Composer box",
+      "group": "composer",
+      "description": "The box around the message you type in chat. It can overlap scrolled messages, so it takes inset shadows only.",
+      "selector": ".prompt-area .prompt-box",
+      "frames": false,
+      "properties": [
+        {
+          "name": "background-color",
+          "token": "--part-composer-background-color",
+          "default": "var(--bg-secondary)"
+        },
+        {
+          "name": "border-color",
+          "token": "--part-composer-border-color",
+          "default": "color-mix(in srgb, var(--border-color) 50%, transparent)"
+        },
+        {
+          "name": "box-shadow",
+          "token": "--part-composer-box-shadow",
+          "default": "none",
+          "insetOnly": true
+        }
+      ]
+    },
+    {
+      "id": "composer-text",
+      "label": "Composer text",
+      "group": "composer",
+      "description": "The text you type in the composer.",
+      "selector": ".prompt-area .prompt-row .prompt-textarea",
+      "frames": false,
+      "properties": [
+        {
+          "name": "color",
+          "token": "--part-composer-text-color",
+          "default": "var(--text-primary)"
+        },
+        {
+          "name": "caret-color",
+          "token": "--part-composer-text-caret-color",
+          "default": "auto"
+        },
+        {
+          "name": "caret-shape",
+          "token": "--part-composer-text-caret-shape",
+          "default": "auto"
+        },
+        {
+          "name": "text-shadow",
+          "token": "--part-composer-text-text-shadow",
+          "default": "none"
+        },
+        {
+          "name": "letter-spacing",
+          "token": "--part-composer-text-letter-spacing",
+          "default": "normal"
+        }
+      ]
+    },
+    {
+      "id": "card",
+      "label": "Step cards",
+      "group": "chat",
+      "description": "The bordered blocks a step shows: tool output, its result and its reasoning.",
+      "selector": ".copyable-block, .step-detail-full, .step-detail-reasoning, .step-detail-result",
+      "frames": false,
+      "properties": [
+        {
+          "name": "border-style",
+          "token": "--part-card-border-style",
+          "default": "solid"
+        },
+        {
+          "name": "border-width",
+          "token": "--part-card-border-width",
+          "default": "1px"
+        },
+        {
+          "name": "border-color",
+          "token": "--part-card-border-color",
+          "default": "var(--border-color)"
+        }
+      ]
+    },
+    {
+      "id": "surface",
+      "label": "Floating surfaces",
+      "group": "chrome",
+      "description": "Every toast, popover, menu and dialog. Protected dialogs keep their own frame.",
+      "selector": ".surface:where(:not(.protected-surface)), .surface-box:where(:not(.protected-surface))",
+      "frames": false,
+      "properties": [
+        {
+          "name": "border-style",
+          "token": "--part-surface-border-style",
+          "default": "solid"
+        },
+        {
+          "name": "border-width",
+          "token": "--part-surface-border-width",
+          "default": "1px"
+        },
+        {
+          "name": "border-color",
+          "token": "--part-surface-border-color",
+          "default": "var(--border-color)"
+        }
+      ]
+    },
+    {
+      "id": "screen",
+      "label": "Screen",
+      "group": "chrome",
+      "description": "The base fill behind every pane. Scanlines paint here, under all content.",
+      "selector": ".app-shell, .mobile-swipe-pane",
+      "frames": false,
+      "properties": [
+        {
+          "name": "background-image",
+          "token": "--part-screen-background-image",
+          "default": "none"
+        }
+      ]
+    },
+    {
+      "id": "app-text",
+      "label": "App text",
+      "group": "app",
+      "description": "Body text in an app frame.",
+      "selector": "body",
+      "frames": true,
+      "properties": [
+        {
+          "name": "text-shadow",
+          "token": "--part-app-text-text-shadow",
+          "default": "none"
+        },
+        {
+          "name": "letter-spacing",
+          "token": "--part-app-text-letter-spacing",
+          "default": "normal"
+        }
+      ]
+    },
+    {
+      "id": "app-link",
+      "label": "App links",
+      "group": "app",
+      "description": "Links in an app frame. An unset glow follows app text.",
+      "selector": "a",
+      "parent": "app-text",
+      "frames": true,
+      "properties": [
+        {
+          "name": "text-decoration-color",
+          "token": "--part-app-link-text-decoration-color",
+          "default": "currentcolor"
+        },
+        {
+          "name": "text-shadow",
+          "token": "--part-app-link-text-shadow",
+          "default": "var(--part-app-text-text-shadow, none)"
+        }
+      ]
+    },
+    {
+      "id": "app-control",
+      "label": "App controls",
+      "group": "app",
+      "description": "Buttons, inputs and the SDK select in an app frame.",
+      "selector": "input, textarea, select, button, .lucidos-select-trigger, .text-input",
+      "frames": true,
+      "properties": [
+        {
+          "name": "border-color",
+          "token": "--part-app-control-border-color",
+          "default": "var(--border-color)"
+        },
+        {
+          "name": "box-shadow",
+          "token": "--part-app-control-box-shadow",
+          "default": "none"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1497 @@
+use super::*;
+use serde_json::json;
+
+#[test]
+fn from_created_event_prompt() {
+    let payload = json!({
+        "trigger_id": "sleep-reminder",
+            "name": "Sleep Reminder",
+            "schedule": ["0 0 22 * * 1-5"],
+        "timezone": "Europe/Oslo",
+        "run": { "type": "prompt", "text": "Send a push notification reminding me to go to sleep.", "knowhow": [] }
+    });
+
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.id, "sleep-reminder");
+    assert_eq!(config.name, "Sleep Reminder");
+    assert_eq!(config.schedule, vec!["0 0 22 * * 1-5"]);
+    assert_eq!(config.timezone, "Europe/Oslo");
+    assert!(matches!(config.run, TriggerRun::Intent { .. }));
+    assert!(!config.paused);
+}
+
+#[test]
+fn plugin_id_provenance_round_trips_and_defaults_none() {
+    // User trigger: no plugin_id → None.
+    let user = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t1", "name": "User", "schedule": [], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "hi" },
+        "on": [{ "event_type": "X" }],
+    }))
+    .unwrap();
+    assert_eq!(user.plugin_id, None);
+
+    // Plugin trigger: plugin_id carried through.
+    let plug = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t2", "name": "Plug", "schedule": [], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "hi" },
+        "on": [{ "event_type": "X" }],
+        "plugin_id": "browser-learning",
+    }))
+    .unwrap();
+    assert_eq!(plug.plugin_id.as_deref(), Some("browser-learning"));
+}
+
+#[test]
+fn apply_update_sets_plugin_id_but_a_user_edit_never_strips_it() {
+    let mut config = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t", "name": "T", "schedule": [], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "hi" }, "on": [{ "event_type": "X" }],
+        "plugin_id": "my-plugin",
+    }))
+    .unwrap();
+
+    // A user edit (no plugin_id in payload) must preserve provenance, else
+    // uninstall could no longer reclaim the trigger.
+    config.apply_update(&json!({ "name": "Renamed" }));
+    assert_eq!(config.plugin_id.as_deref(), Some("my-plugin"));
+
+    // A re-sync update can (re-)stamp it.
+    config.apply_update(&json!({ "plugin_id": "my-plugin" }));
+    assert_eq!(config.plugin_id.as_deref(), Some("my-plugin"));
+}
+
+#[test]
+fn from_created_event_script() {
+    let payload = json!({
+        "trigger_id": "oura-import",
+        "name": "Oura Import",
+        "schedule": ["0 0 * * * *"],
+        "timezone": "Europe/Oslo",
+        "run": { "type": "script", "path": "oura/run.py" }
+    });
+
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert!(matches!(config.run, TriggerRun::Script { .. }));
+    if let TriggerRun::Script { path } = &config.run {
+        assert_eq!(path, "oura/run.py");
+    }
+}
+
+#[test]
+fn prompt_with_legacy_knowhow_field_is_ignored() {
+    // Phase 1 dropped run.knowhow; serde drops unknown fields silently
+    // (the default), so on-disk events still carry the field but it must
+    // not affect the parsed config.
+    let payload = json!({
+        "trigger_id": "heatpump-logging",
+        "name": "Heatpump Logging",
+        "schedule": ["0 */30 * * * *"],
+        "timezone": "Europe/Oslo",
+        "run": { "type": "prompt", "text": "Log heat pump status", "knowhow": ["heatpump"] }
+    });
+
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert!(matches!(config.run, TriggerRun::Intent { .. }));
+    if let TriggerRun::Intent { intent } = &config.run {
+        assert_eq!(intent, "Log heat pump status");
+    }
+}
+
+#[test]
+fn apply_update_partial() {
+    let payload = json!({
+        "trigger_id": "sleep-reminder",
+            "name": "Sleep Reminder",
+            "schedule": ["0 0 22 * * 1-5"],
+        "timezone": "Europe/Oslo",
+        "run": { "type": "prompt", "text": "Go to sleep.", "knowhow": [] }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+
+    let update = json!({
+        "trigger_id": "sleep-reminder",
+            "schedule": ["0 0 23 * * *"]
+    });
+    config.apply_update(&update);
+    assert_eq!(config.schedule, vec!["0 0 23 * * *"]);
+    assert_eq!(config.name, "Sleep Reminder"); // unchanged
+}
+
+#[test]
+fn apply_update_name_only() {
+    let payload = json!({
+            "trigger_id": "test",
+        "name": "Old Name",
+        "schedule": ["0 0 8 * * *"],
+        "timezone": "UTC",
+        "run": { "type": "prompt", "text": "test", "knowhow": [] }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+
+    config.apply_update(&json!({ "trigger_id": "test", "name": "New Name" }));
+    assert_eq!(config.name, "New Name");
+    assert_eq!(config.schedule, vec!["0 0 8 * * *"]); // unchanged
+}
+
+#[test]
+fn apply_update_run_field() {
+    let payload = json!({
+        "trigger_id": "test",
+        "name": "Test",
+        "schedule": ["0 0 8 * * *"],
+        "timezone": "UTC",
+        "run": { "type": "prompt", "text": "old prompt", "knowhow": [] }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+
+    config.apply_update(&json!({
+        "trigger_id": "test",
+        "run": { "type": "script", "path": "test/run.py" }
+    }));
+    assert!(matches!(config.run, TriggerRun::Script { .. }));
+}
+
+#[test]
+fn intent_variant_deserializes_legacy_text_alias() {
+    // On-disk TriggerCreated events from before the rename carry `text:`.
+    let val = json!({"type": "intent", "text": "legacy payload"});
+    let run: TriggerRun = serde_json::from_value(val).unwrap();
+    if let TriggerRun::Intent { intent } = run {
+        assert_eq!(intent, "legacy payload");
+    } else {
+        panic!("Expected Intent variant");
+    }
+}
+
+#[test]
+fn trigger_run_serde_roundtrip() {
+    let prompt = TriggerRun::Intent {
+        intent: "Do something".into(),
+    };
+    let json = serde_json::to_value(&prompt).unwrap();
+    assert_eq!(json["type"], "intent");
+    assert_eq!(json["intent"], "Do something");
+    assert!(
+        json.get("text").is_none(),
+        "serialized output must not contain the legacy `text` key"
+    );
+    assert!(
+        json.get("knowhow").is_none(),
+        "serialized output must not contain the deleted `knowhow` field"
+    );
+
+    let back: TriggerRun = serde_json::from_value(json).unwrap();
+    assert!(matches!(back, TriggerRun::Intent { .. }));
+
+    let script = TriggerRun::Script {
+        path: "test/run.py".into(),
+    };
+    let json = serde_json::to_value(&script).unwrap();
+    assert_eq!(json["type"], "script");
+    let back: TriggerRun = serde_json::from_value(json).unwrap();
+    assert!(matches!(back, TriggerRun::Script { .. }));
+
+    let shell = TriggerRun::Script {
+        path: "backup/run.sh".into(),
+    };
+    let json = serde_json::to_value(&shell).unwrap();
+    assert_eq!(json["type"], "script");
+    assert_eq!(json["path"], "backup/run.sh");
+    let back: TriggerRun = serde_json::from_value(json).unwrap();
+    if let TriggerRun::Script { path } = &back {
+        assert_eq!(path, "backup/run.sh");
+    } else {
+        panic!("Expected Script variant");
+    }
+}
+
+#[test]
+fn from_created_event_shell_script() {
+    let payload = json!({
+        "trigger_id": "backup-job",
+        "name": "Daily Backup",
+        "schedule": ["0 0 2 * * *"],
+        "timezone": "Europe/Oslo",
+        "run": { "type": "script", "path": "triggers/backup/scripts/run.sh" }
+    });
+
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert!(matches!(config.run, TriggerRun::Script { .. }));
+    if let TriggerRun::Script { path } = &config.run {
+        assert_eq!(path, "triggers/backup/scripts/run.sh");
+    }
+}
+
+#[test]
+fn missing_trigger_id_errors() {
+    let payload = json!({
+        "name": "Test",
+        "schedule": ["0 0 8 * * *"],
+        "timezone": "UTC",
+        "run": { "type": "prompt", "text": "test", "knowhow": [] }
+    });
+    assert!(TriggerConfig::from_created_payload(&payload).is_err());
+}
+
+#[test]
+fn missing_name_errors() {
+    let payload = json!({
+        "trigger_id": "test",
+        "schedule": ["0 0 8 * * *"],
+        "timezone": "UTC",
+        "run": { "type": "prompt", "text": "test", "knowhow": [] }
+    });
+    assert!(TriggerConfig::from_created_payload(&payload).is_err());
+}
+
+#[test]
+fn defaults_timezone_to_utc() {
+    let payload = json!({
+        "trigger_id": "test",
+        "name": "Test",
+        "schedule": ["0 0 8 * * *"],
+        "run": { "type": "prompt", "text": "test", "knowhow": [] }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.timezone, "UTC");
+}
+
+#[test]
+fn legacy_on_string_payload_no_longer_yields_a_subscription() {
+    // Migration 20260516195912 rewrites this shape before replay, so the
+    // reader treating it as malformed is correct, not a regression.
+    let payload = json!({
+        "trigger_id": "test",
+        "name": "Test",
+        "schedule": [],
+        "timezone": "UTC",
+        "run": { "type": "prompt", "text": "react", "knowhow": [] },
+        "on": "OuraSleepImported",
+        "condition": { "sleep_score": { "$lt": 70 } }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert!(config.on.is_empty());
+}
+
+#[test]
+fn new_on_array_with_per_entry_conditions_parsed() {
+    let payload = json!({
+        "trigger_id": "test",
+        "name": "Test",
+        "schedule": [],
+        "timezone": "UTC",
+        "run": { "type": "intent", "intent": "react" },
+        "on": [
+            {
+                "event_type": "OuraSleepImported",
+                "condition": { "sleep_score": { "$lt": 70 } }
+            },
+            { "event_type": "EmailReceived" }
+        ]
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.on.len(), 2);
+    assert_eq!(config.on[0].event_type, "OuraSleepImported");
+    assert!(config.on[0].condition.is_some());
+    assert_eq!(config.on[1].event_type, "EmailReceived");
+    assert!(config.on[1].condition.is_none());
+}
+
+#[test]
+fn array_of_bare_strings_parsed_as_no_condition_entries() {
+    // `["X", "Y"]` is a shorthand the LLM tool / SDK callers can use when
+    // none of the events need a condition.
+    let on = parse_event_subscriptions(Some(&json!(["A", "B"])));
+    assert_eq!(on.len(), 2);
+    assert_eq!(on[0].event_type, "A");
+    assert_eq!(on[1].event_type, "B");
+    assert!(on[0].condition.is_none());
+    assert!(on[1].condition.is_none());
+}
+
+#[test]
+fn malformed_subscription_entries_are_dropped() {
+    // One bad entry must not wedge the whole list.
+    let on = parse_event_subscriptions(Some(&json!([
+        { "event_type": "Good" },
+        { "not_event_type": "Bad" },
+        "",
+        { "event_type": "   " },
+        "StringOk"
+    ])));
+    let names: Vec<&str> = on.iter().map(|s| s.event_type.as_str()).collect();
+    assert_eq!(names, vec!["Good", "StringOk"]);
+}
+
+#[test]
+fn trigger_run_deserialize_prompt_legacy_alias() {
+    let val = json!({"type": "prompt", "text": "do something"});
+    let run: Result<TriggerRun, _> = serde_json::from_value(val);
+    assert!(
+        run.is_ok(),
+        "TriggerRun should deserialize the legacy 'prompt' variant"
+    );
+    if let TriggerRun::Intent { intent } = run.unwrap() {
+        assert_eq!(intent, "do something");
+    } else {
+        panic!("Expected Intent variant");
+    }
+}
+
+#[test]
+fn trigger_run_deserialize_intent_minimal() {
+    let val = json!({"type": "intent", "text": "do something"});
+    let run: Result<TriggerRun, _> = serde_json::from_value(val);
+    assert!(
+        run.is_ok(),
+        "TriggerRun should deserialize from minimal {{type, text}} shape"
+    );
+}
+
+#[test]
+fn apply_update_run_carries_intent() {
+    let payload = json!({
+        "trigger_id": "test",
+        "name": "Test",
+        "schedule": ["0 0 8 * * *"],
+        "timezone": "UTC",
+        "run": { "type": "prompt", "text": "old prompt" }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+
+    config.apply_update(&json!({
+        "trigger_id": "test",
+        "run": { "type": "prompt", "text": "new prompt" }
+    }));
+
+    if let TriggerRun::Intent { intent } = &config.run {
+        assert_eq!(intent, "new prompt");
+    } else {
+        panic!("Expected Intent variant");
+    }
+}
+
+#[test]
+fn null_on_and_condition_yield_empty_subscriptions() {
+    let payload = json!({
+        "trigger_id": "test",
+        "name": "Test",
+        "schedule": ["0 0 8 * * *"],
+        "timezone": "UTC",
+        "run": { "type": "prompt", "text": "test", "knowhow": [] },
+        "on": null,
+        "condition": null
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert!(config.on.is_empty());
+}
+
+#[test]
+fn apply_update_clear_schedule() {
+    let payload = json!({
+        "trigger_id": "test",
+        "name": "Hybrid Trigger",
+            "schedule": ["0 0 8 * * *"],
+        "timezone": "UTC",
+        "run": { "type": "prompt", "text": "test", "knowhow": [] },
+        "on": [{ "event_type": "SomeEvent" }]
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.schedule, vec!["0 0 8 * * *"]);
+
+    // Clear schedule by setting to empty array (from cron: null in LLM tool)
+    config.apply_update(&json!({ "trigger_id": "test", "schedule": [] }));
+    assert!(config.schedule.is_empty());
+    assert_eq!(config.on.len(), 1); // unchanged
+    assert_eq!(config.on[0].event_type, "SomeEvent");
+}
+
+#[test]
+fn apply_update_clear_on_event() {
+    let payload = json!({
+        "trigger_id": "test",
+        "name": "Hybrid Trigger",
+            "schedule": ["0 0 8 * * *"],
+        "timezone": "UTC",
+        "run": { "type": "prompt", "text": "test", "knowhow": [] },
+        "on": [{
+            "event_type": "SomeEvent",
+            "condition": { "score": { "$lt": 70 } }
+        }]
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.on.len(), 1);
+
+    config.apply_update(&json!({ "trigger_id": "test", "on": null }));
+    assert!(config.on.is_empty());
+}
+
+#[test]
+fn apply_update_orphan_condition_key_is_ignored_post_migration() {
+    // Migration 20260516195912 folds legacy condition-only updates into
+    // the prior subscription at startup, so an orphan key at runtime has
+    // nowhere to land.
+    let mut config = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "test",
+        "name": "Test",
+        "schedule": [],
+        "timezone": "UTC",
+        "run": { "type": "prompt", "text": "test", "knowhow": [] },
+        "on": [{
+            "event_type": "SomeEvent",
+            "condition": { "score": { "$lt": 70 } }
+        }]
+    }))
+    .unwrap();
+    assert!(config.on[0].condition.is_some());
+
+    config.apply_update(&json!({ "trigger_id": "test", "condition": null }));
+    assert_eq!(config.on.len(), 1);
+    assert!(config.on[0].condition.is_some());
+}
+
+#[test]
+fn apply_update_replaces_subscriptions_with_new_array() {
+    let mut config = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "test",
+        "name": "Test",
+        "schedule": [],
+        "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+        "on": [{ "event_type": "OldEvent" }]
+    }))
+    .unwrap();
+
+    config.apply_update(&json!({
+        "trigger_id": "test",
+        "on": [
+            { "event_type": "NewA", "condition": { "x": 1 } },
+            { "event_type": "NewB" }
+        ]
+    }));
+
+    assert_eq!(config.on.len(), 2);
+    assert_eq!(config.on[0].event_type, "NewA");
+    assert!(config.on[0].condition.is_some());
+    assert_eq!(config.on[1].event_type, "NewB");
+    assert!(config.on[1].condition.is_none());
+}
+
+#[test]
+fn apply_update_absent_fields_unchanged() {
+    let payload = json!({
+        "trigger_id": "test",
+        "name": "Original",
+        "schedule": ["0 0 8 * * *"],
+        "timezone": "Europe/Oslo",
+        "run": { "type": "prompt", "text": "original prompt", "knowhow": ["domain"] },
+        "on": [{
+            "event_type": "SomeEvent",
+            "condition": { "key": "val" }
+        }]
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+
+    config.apply_update(&json!({ "trigger_id": "test", "name": "Renamed" }));
+    assert_eq!(config.name, "Renamed");
+    assert_eq!(config.schedule, vec!["0 0 8 * * *"]);
+    assert_eq!(config.timezone, "Europe/Oslo");
+    assert_eq!(config.on.len(), 1);
+    assert_eq!(config.on[0].event_type, "SomeEvent");
+    assert!(config.on[0].condition.is_some());
+    if let TriggerRun::Intent { intent } = &config.run {
+        assert_eq!(intent, "original prompt");
+    } else {
+        panic!("Expected Intent variant");
+    }
+}
+
+#[test]
+fn apply_update_switch_run_type() {
+    let payload = json!({
+        "trigger_id": "test",
+        "name": "Test",
+        "schedule": ["0 0 8 * * *"],
+        "timezone": "UTC",
+        "run": { "type": "prompt", "text": "old prompt", "knowhow": [] }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+
+    // Switch from intent to script
+    config.apply_update(&json!({
+        "trigger_id": "test",
+        "run": { "type": "script", "path": "test/run.py" }
+    }));
+    if let TriggerRun::Script { path } = &config.run {
+        assert_eq!(path, "test/run.py");
+    } else {
+        panic!("Expected Script variant");
+    }
+
+    // Switch back to intent
+    config.apply_update(&json!({
+        "trigger_id": "test",
+        "run": { "type": "intent", "text": "new prompt" }
+    }));
+    if let TriggerRun::Intent { intent } = &config.run {
+        assert_eq!(intent, "new prompt");
+    } else {
+        panic!("Expected Intent variant");
+    }
+}
+
+#[test]
+fn validate_script_extension_py() {
+    assert!(validate_script_extension("triggers/oura/scripts/run.py").is_ok());
+}
+
+#[test]
+fn validate_script_extension_sh() {
+    assert!(validate_script_extension("triggers/backup/scripts/run.sh").is_ok());
+}
+
+#[test]
+fn validate_script_extension_unsupported() {
+    let err = validate_script_extension("scripts/run.rb").unwrap_err();
+    assert!(err.contains(".rb"));
+    assert!(err.contains("Unsupported"));
+}
+
+#[test]
+fn validate_script_extension_missing() {
+    let err = validate_script_extension("scripts/run").unwrap_err();
+    assert!(err.contains("must have a file extension"));
+}
+
+#[test]
+fn paused_defaults_to_false_for_new_trigger() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x", "knowhow": [] }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert!(!config.paused);
+}
+
+#[test]
+fn from_created_payload_reads_explicit_paused_true() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x", "knowhow": [] },
+        "paused": true
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert!(config.paused);
+}
+
+#[test]
+fn from_created_payload_legacy_enabled_false_becomes_paused_true() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x", "knowhow": [] },
+        "enabled": false
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert!(config.paused);
+}
+
+#[test]
+fn apply_update_paused_field() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x", "knowhow": [] }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert!(!config.paused);
+    config.apply_update(&json!({ "trigger_id": "t1", "paused": true }));
+    assert!(config.paused);
+    config.apply_update(&json!({ "trigger_id": "t1", "paused": false }));
+    assert!(!config.paused);
+}
+
+#[test]
+fn apply_update_legacy_enabled_field_inverts_to_paused() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x", "knowhow": [] }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    config.apply_update(&json!({ "trigger_id": "t1", "enabled": false }));
+    assert!(config.paused);
+    config.apply_update(&json!({ "trigger_id": "t1", "enabled": true }));
+    assert!(!config.paused);
+}
+
+#[test]
+fn from_created_payload_reads_explicit_app_id() {
+    // Regression: notification popover's "open the app" button compares
+    // notification.app_id against app directory names. Triggers must be able
+    // to declare which app dir they belong to so the comparison can match.
+    let payload = json!({
+        "trigger_id": "uuid-abc-123", "name": "Smart CI Nightly",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x", "knowhow": [] },
+        "app_id": "trigger-workflow"
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.app_id, Some("trigger-workflow".to_string()));
+    assert_eq!(config.owning_app_id(), Some("trigger-workflow".to_string()));
+}
+
+#[test]
+fn from_created_payload_app_id_defaults_to_none() {
+    // Existing triggers (and standalone ones) have no app_id — must round-trip as None,
+    // never silently fall back to the trigger UUID.
+    let payload = json!({
+        "trigger_id": "uuid-abc-123", "name": "Standalone",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x", "knowhow": [] }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.app_id, None);
+    assert_eq!(
+        config.owning_app_id(),
+        None,
+        "intent trigger without explicit app_id must not invent one"
+    );
+}
+
+#[test]
+fn owning_app_id_derives_from_apps_script_path() {
+    // Legacy app-scoped script triggers have no explicit app_id field but their
+    // path lives under `apps/<X>/...` — derive the app dir from there so the
+    // notification popover's link still resolves.
+    let payload = json!({
+        "trigger_id": "uuid-1", "name": "Some script",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "script", "path": "apps/trigger-workflow/triggers/scripts/nightly.py" }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.owning_app_id(), Some("trigger-workflow".to_string()));
+}
+
+#[test]
+fn owning_app_id_none_for_standalone_script_path() {
+    // Scripts under `data/triggers/<dir>/...` are standalone — must not be
+    // misattributed to any app.
+    let payload = json!({
+        "trigger_id": "uuid-1", "name": "Oura import",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "script", "path": "triggers/oura-import/scripts/run.py" }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.owning_app_id(), None);
+}
+
+#[test]
+fn explicit_app_id_overrides_derivation() {
+    // If a script trigger lives under apps/<X>/ but explicitly declares a
+    // different owning app (e.g. moved/legacy), the explicit field wins.
+    let payload = json!({
+        "trigger_id": "uuid-1", "name": "Cross-app",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "script", "path": "apps/old-app/triggers/scripts/run.py" },
+        "app_id": "new-app"
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.owning_app_id(), Some("new-app".to_string()));
+}
+
+#[test]
+fn apply_update_sets_app_id() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x", "knowhow": [] }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.app_id, None);
+    config.apply_update(&json!({ "trigger_id": "t1", "app_id": "trigger-workflow" }));
+    assert_eq!(config.app_id, Some("trigger-workflow".to_string()));
+}
+
+#[test]
+fn apply_update_clears_app_id_with_null() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x", "knowhow": [] },
+        "app_id": "trigger-workflow"
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.app_id, Some("trigger-workflow".to_string()));
+    config.apply_update(&json!({ "trigger_id": "t1", "app_id": null }));
+    assert_eq!(config.app_id, None);
+}
+
+#[test]
+fn apply_update_absent_app_id_leaves_unchanged() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x", "knowhow": [] },
+        "app_id": "trigger-workflow"
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    config.apply_update(&json!({ "trigger_id": "t1", "name": "Renamed" }));
+    assert_eq!(config.name, "Renamed");
+    assert_eq!(
+        config.app_id,
+        Some("trigger-workflow".to_string()),
+        "absent app_id field must not clobber existing"
+    );
+}
+
+#[test]
+fn derive_app_id_from_apps_path() {
+    assert_eq!(
+        derive_app_id_from_script_path("apps/trigger-workflow/triggers/scripts/x.py"),
+        Some("trigger-workflow".to_string())
+    );
+    assert_eq!(
+        derive_app_id_from_script_path("apps/foo/scripts/y.sh"),
+        Some("foo".to_string())
+    );
+}
+
+#[test]
+fn derive_app_id_returns_none_for_non_apps_paths() {
+    assert_eq!(
+        derive_app_id_from_script_path("triggers/oura/scripts/run.py"),
+        None
+    );
+    assert_eq!(derive_app_id_from_script_path("scripts/legacy.py"), None);
+    assert_eq!(derive_app_id_from_script_path("apps/"), None);
+    assert_eq!(derive_app_id_from_script_path(""), None);
+}
+
+#[test]
+fn derive_app_id_rejects_traversal_and_dotfile_dirs() {
+    // A malformed `apps/..` or `apps/.git` path must not become a fake app
+    // id on the frontend popover.
+    assert_eq!(derive_app_id_from_script_path("apps/../foo/bar"), None);
+    assert_eq!(derive_app_id_from_script_path("apps/./foo"), None);
+    assert_eq!(derive_app_id_from_script_path("apps/.git/x/y"), None);
+    assert_eq!(derive_app_id_from_script_path("apps//foo"), None);
+}
+
+#[test]
+fn trigger_config_carries_slug_field() {
+    let payload = json!({
+        "trigger_id": "uuid-1", "name": "Send Daily Summary",
+        "slug": "send-daily-summary",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.slug, "send-daily-summary");
+}
+
+#[test]
+fn trigger_config_derives_slug_from_name_when_missing() {
+    // Legacy events lack the `slug` field — must derive from `name` so
+    // existing workspaces resolve trigger knowhow without a backfill.
+    let payload = json!({
+        "trigger_id": "uuid-1", "name": "Nightly CI Build",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.slug, "nightly-ci-build");
+}
+
+// Kebab-case slugification itself is covered by `core::slug`, which owns the
+// shared function; only the trigger-specific fallback is tested here.
+#[test]
+fn slug_kebab_falls_back_to_uuid_short_when_empty() {
+    let s = slugify_trigger_name_with_fallback("!!!", "abcdef-1234-5678");
+    assert_eq!(s, "trigger-abcdef12");
+}
+
+fn taken(slugs: &[&str]) -> std::collections::HashSet<String> {
+    slugs.iter().map(|s| s.to_string()).collect()
+}
+
+/// Two triggers named "Daily Summary" must not share one slug directory.
+///
+/// The slug is the `data/triggers/<slug>/` segment for the `trigger.toml`
+/// projection and the per-trigger knowhow. Sharing it means each boot's
+/// rebuild overwrites one definition with the other's.
+#[test]
+fn minting_suffixes_a_slug_another_trigger_already_owns() {
+    assert_eq!(
+        mint_unique_trigger_slug("Daily Summary", "uuid-1", &taken(&[])),
+        "daily-summary",
+        "an unclaimed name keeps the plain slug"
+    );
+    assert_eq!(
+        mint_unique_trigger_slug("Daily Summary", "uuid-2", &taken(&["daily-summary"])),
+        "daily-summary-2"
+    );
+    assert_eq!(
+        mint_unique_trigger_slug(
+            "Daily Summary",
+            "uuid-3",
+            &taken(&["daily-summary", "daily-summary-2"])
+        ),
+        "daily-summary-3"
+    );
+}
+
+#[test]
+fn every_minted_slug_is_a_valid_trigger_slug() {
+    // A suffixed slug still has to pass the boundary validator, including the
+    // 64-char cap, or the API would reject the trigger it just minted for.
+    let long = "Nightly ".repeat(20);
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..5 {
+        let slug = mint_unique_trigger_slug(&long, &format!("uuid-{i}"), &seen);
+        assert!(is_valid_trigger_slug(&slug), "minted {slug}");
+        assert!(seen.insert(slug), "each mint is distinct");
+    }
+}
+
+#[test]
+fn minting_falls_back_to_the_trigger_id_when_the_numbered_variants_run_out() {
+    let mut all = taken(&["busy"]);
+    for n in 2..=99 {
+        all.insert(format!("busy-{n}"));
+    }
+    assert_eq!(
+        mint_unique_trigger_slug("Busy", "abcdef-1234-5678", &all),
+        "trigger-abcdef12"
+    );
+}
+
+#[test]
+fn apply_update_accepts_slug_edit() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "Old Name",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.slug, "old-name");
+
+    config.apply_update(&json!({ "trigger_id": "t1", "slug": "renamed" }));
+    assert_eq!(config.slug, "renamed");
+}
+
+#[test]
+fn apply_update_ignores_invalid_slug() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "Original",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    let before = config.slug.clone();
+
+    config.apply_update(&json!({ "trigger_id": "t1", "slug": "Has Spaces" }));
+    assert_eq!(
+        config.slug, before,
+        "invalid slug must not clobber existing"
+    );
+}
+
+#[test]
+fn is_valid_trigger_slug_accepts_well_formed() {
+    assert!(is_valid_trigger_slug("a"));
+    assert!(is_valid_trigger_slug("9"));
+    assert!(is_valid_trigger_slug("send-daily-summary"));
+    assert!(is_valid_trigger_slug("trigger-abc12345"));
+}
+
+#[test]
+fn is_valid_trigger_slug_rejects_malformed() {
+    assert!(!is_valid_trigger_slug(""));
+    assert!(!is_valid_trigger_slug("-leading-dash"));
+    assert!(!is_valid_trigger_slug("trailing-dash-"));
+    assert!(!is_valid_trigger_slug("Has Capitals"));
+    assert!(!is_valid_trigger_slug("under_score"));
+    assert!(!is_valid_trigger_slug(&"a".repeat(65)));
+}
+
+#[test]
+fn is_path_safe_trigger_slug_accepts_any_plain_segment() {
+    // A plugin trigger's slug is its installed directory name, so shapes
+    // `is_valid_trigger_slug` rejects still have to pass here.
+    assert!(is_path_safe_trigger_slug("daily_reflect"));
+    assert!(is_path_safe_trigger_slug("Has Capitals"));
+    assert!(is_path_safe_trigger_slug("-leading-dash"));
+    assert!(is_path_safe_trigger_slug(&"a".repeat(255)));
+}
+
+#[test]
+fn is_path_safe_trigger_slug_rejects_escapes() {
+    assert!(!is_path_safe_trigger_slug(""));
+    assert!(!is_path_safe_trigger_slug("."));
+    assert!(!is_path_safe_trigger_slug(".."));
+    assert!(!is_path_safe_trigger_slug("../../etc"));
+    assert!(!is_path_safe_trigger_slug("a/b"));
+    assert!(!is_path_safe_trigger_slug("a\\b"));
+    assert!(!is_path_safe_trigger_slug("a\0b"));
+    assert!(!is_path_safe_trigger_slug(&"a".repeat(256)));
+}
+
+#[test]
+fn from_created_payload_keeps_a_plugin_directory_slug() {
+    // The installed directory segment is authoritative for a plugin trigger
+    // (ADR 0019). Substituting a name-derived slug here would desync the
+    // install record, the knowhow dir and the projection key.
+    let payload = json!({
+        "trigger_id": "t1", "name": "Daily Reflect",
+        "slug": "daily_reflect",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.slug, "daily_reflect");
+}
+
+#[test]
+fn from_created_payload_drops_a_traversing_slug() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "Escape Me",
+        "slug": "../../etc",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(
+        config.slug, "escape-me",
+        "a slug that escapes data/triggers/ falls back to the name"
+    );
+}
+
+#[test]
+fn from_created_payload_reads_explicit_group_id() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" },
+        "group_id": "group-uuid-1"
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.group_id, Some("group-uuid-1".to_string()));
+}
+
+#[test]
+fn from_created_payload_group_id_defaults_to_none() {
+    // Legacy events lack group_id — must round-trip as None so existing
+    // triggers render under the "Ungrouped" section.
+    let payload = json!({
+        "trigger_id": "t1", "name": "T",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.group_id, None);
+}
+
+#[test]
+fn apply_update_sets_group_id() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.group_id, None);
+    config.apply_update(&json!({ "trigger_id": "t1", "group_id": "group-uuid-1" }));
+    assert_eq!(config.group_id, Some("group-uuid-1".to_string()));
+}
+
+#[test]
+fn apply_update_clears_group_id_with_null() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" },
+        "group_id": "group-uuid-1"
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.group_id, Some("group-uuid-1".to_string()));
+    config.apply_update(&json!({ "trigger_id": "t1", "group_id": null }));
+    assert_eq!(config.group_id, None);
+}
+
+#[test]
+fn apply_update_absent_group_id_leaves_unchanged() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" },
+        "group_id": "group-uuid-1"
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    config.apply_update(&json!({ "trigger_id": "t1", "name": "Renamed" }));
+    assert_eq!(config.name, "Renamed");
+    assert_eq!(
+        config.group_id,
+        Some("group-uuid-1".to_string()),
+        "absent group_id field must not clobber existing"
+    );
+}
+
+#[test]
+fn next_runs_returns_nothing_when_paused() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x", "knowhow": [] }
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert!(!config.next_runs(1).is_empty());
+    config.paused = true;
+    assert!(config.next_runs(1).is_empty());
+}
+
+// --- Side-effect grant (ADR 0002, Phase 5) ---
+
+#[test]
+fn from_created_payload_parses_side_effect_grant() {
+    use crate::engine::command_guard::SideEffectCategory;
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+        "side_effect_grant": ["email", "external_api"],
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(
+        config.side_effect_grant,
+        vec![SideEffectCategory::Email, SideEffectCategory::ExternalApi]
+    );
+}
+
+#[test]
+fn from_created_payload_side_effect_grant_defaults_empty_and_skips_unknown() {
+    use crate::engine::command_guard::SideEffectCategory;
+    // Absent → empty (no grant).
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+    });
+    assert!(TriggerConfig::from_created_payload(&payload)
+        .unwrap()
+        .side_effect_grant
+        .is_empty());
+
+    // Unknown / forward-compat entries are skipped, duplicates deduped.
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+        "side_effect_grant": ["email", "email", "future_category", "cloud_cli"],
+    });
+    assert_eq!(
+        TriggerConfig::from_created_payload(&payload)
+            .unwrap()
+            .side_effect_grant,
+        vec![SideEffectCategory::Email, SideEffectCategory::CloudCli]
+    );
+}
+
+#[test]
+fn apply_update_replaces_and_clears_side_effect_grant() {
+    use crate::engine::command_guard::SideEffectCategory;
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+        "side_effect_grant": ["email"],
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+
+    // Replacement.
+    config.apply_update(&json!({ "trigger_id": "t1", "side_effect_grant": ["cloud_cli"] }));
+    assert_eq!(config.side_effect_grant, vec![SideEffectCategory::CloudCli]);
+
+    // Absent field leaves it as-is.
+    config.apply_update(&json!({ "trigger_id": "t1", "name": "T2" }));
+    assert_eq!(config.side_effect_grant, vec![SideEffectCategory::CloudCli]);
+
+    // Empty array clears it.
+    config.apply_update(&json!({ "trigger_id": "t1", "side_effect_grant": [] }));
+    assert!(config.side_effect_grant.is_empty());
+}
+
+// -- schedule_error / next_runs --
+
+/// Build a schedule-only config from a `TriggerCreated` payload.
+fn scheduled(schedule: serde_json::Value, paused: bool) -> TriggerConfig {
+    let mut config = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t1",
+        "name": "T",
+        "schedule": schedule,
+        "timezone": "Europe/Oslo",
+        "run": { "type": "intent", "intent": "do the thing" },
+    }))
+    .unwrap();
+    config.paused = paused;
+    config
+}
+
+#[test]
+fn schedule_error_names_the_impossible_date() {
+    let problem = scheduled(json!(["0 0 9 31 2 *"]), false)
+        .schedule_error()
+        .expect("Feb 31 can never fire");
+    assert!(problem.contains("0 0 9 31 2 *"), "got: {problem}");
+    assert!(
+        problem.contains("day-of-month 31 never occurs in month 2 (February)"),
+        "got: {problem}"
+    );
+}
+
+#[test]
+fn schedule_error_ignores_paused() {
+    // A paused trigger with a dead schedule is exactly as misconfigured as an
+    // active one: resuming it would still do nothing.
+    assert!(scheduled(json!(["0 0 9 31 2 *"]), true)
+        .schedule_error()
+        .is_some());
+}
+
+#[test]
+fn schedule_error_is_none_when_any_expression_can_fire() {
+    // One live expression means the trigger genuinely fires, so the row must not
+    // wear an error chip because a sibling entry is dead.
+    assert_eq!(
+        scheduled(json!(["0 0 9 31 2 *", "0 0 8 * * *"]), false).schedule_error(),
+        None
+    );
+}
+
+#[test]
+fn schedule_error_is_none_for_healthy_and_event_only_triggers() {
+    assert_eq!(
+        scheduled(json!(["0 0 8 * * *"]), false).schedule_error(),
+        None
+    );
+    // No cron at all: nothing to be wrong about.
+    assert_eq!(scheduled(json!([]), false).schedule_error(), None);
+}
+
+#[test]
+fn schedule_error_reports_an_unparseable_expression() {
+    let problem = scheduled(json!(["0 0 99 * * *"]), false)
+        .schedule_error()
+        .expect("an unparseable expression is also a dead schedule");
+    assert!(
+        problem.contains("not a valid cron expression"),
+        "got: {problem}"
+    );
+}
+
+#[test]
+fn next_runs_merges_the_whole_schedule_in_order() {
+    // OR semantics across the array, so the 8am and 8pm streams interleave
+    // rather than the first expression owning all three slots.
+    let config = scheduled(json!(["0 0 8 * * *", "0 0 20 * * *"]), false);
+    let runs = config.next_runs(3);
+    assert_eq!(runs.len(), 3);
+    assert!(runs.windows(2).all(|w| w[0] < w[1]), "got: {runs:?}");
+    let hours: std::collections::BTreeSet<u32> = runs.iter().map(chrono::Timelike::hour).collect();
+    assert_eq!(
+        hours.len(),
+        2,
+        "both expressions must be represented: {runs:?}"
+    );
+}
+
+#[test]
+fn next_runs_is_empty_when_paused_or_dead() {
+    assert!(scheduled(json!(["0 0 8 * * *"]), true)
+        .next_runs(3)
+        .is_empty());
+    assert!(scheduled(json!(["0 0 9 31 2 *"]), false)
+        .next_runs(3)
+        .is_empty());
+}
+
+// --- Per-trigger model + reasoning effort -----------------------------------
+
+/// Minimal event-driven trigger payload with the given extra fields merged in,
+/// so each model/effort case states only what it is about.
+fn created_with(extra: serde_json::Value) -> TriggerConfig {
+    let mut payload = json!({
+        "trigger_id": "t-model", "name": "Model Trigger", "schedule": [], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "summarize my day" },
+        "on": [{ "event_type": "DayEnded" }],
+    });
+    for (k, v) in extra.as_object().expect("extra must be an object") {
+        payload[k] = v.clone();
+    }
+    TriggerConfig::from_created_payload(&payload).unwrap()
+}
+
+/// The no-change case for every trigger that predates the field: absent reads
+/// back as None, which the fire path turns into "use the account chat default".
+#[test]
+fn created_without_model_or_effort_defaults_to_none() {
+    let config = created_with(json!({}));
+    assert_eq!(config.model, None);
+    assert_eq!(config.reasoning_effort, None);
+}
+
+#[test]
+fn created_with_model_and_effort_carries_both() {
+    let config = created_with(json!({ "model": "claude-sonnet-5", "reasoning_effort": "low" }));
+    assert_eq!(config.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
+}
+
+/// The two fields are independent: pinning one must not pin the other, or a
+/// trigger that only wanted a cheaper model would also freeze its effort.
+#[test]
+fn created_with_only_one_of_the_pair_leaves_the_other_none() {
+    let model_only = created_with(json!({ "model": "gemini-3.5-flash" }));
+    assert_eq!(model_only.model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(model_only.reasoning_effort, None);
+
+    let effort_only = created_with(json!({ "reasoning_effort": "max" }));
+    assert_eq!(effort_only.model, None);
+    assert_eq!(effort_only.reasoning_effort.as_deref(), Some("max"));
+}
+
+/// A blank or whitespace-only value is Default, never a stored empty string:
+/// `Some("")` would read as a genuine override and send an empty model id to
+/// the provider.
+#[test]
+fn blank_model_or_effort_reads_as_default() {
+    let config = created_with(json!({ "model": "   ", "reasoning_effort": "" }));
+    assert_eq!(config.model, None);
+    assert_eq!(config.reasoning_effort, None);
+}
+
+/// Only a hand-edited event row can carry an out-of-set tier (the API and the
+/// LLM tool both reject one), and it is dropped rather than honored.
+#[test]
+fn out_of_set_reasoning_effort_is_dropped_on_read() {
+    let config = created_with(json!({ "reasoning_effort": "maximum" }));
+    assert_eq!(config.reasoning_effort, None);
+}
+
+#[test]
+fn valid_reasoning_efforts_are_exactly_the_preference_set() {
+    for tier in ["none", "low", "medium", "high", "xhigh", "max"] {
+        assert!(is_valid_reasoning_effort(tier), "{tier} should be valid");
+    }
+    for bad in ["maximum", "HIGH", "off", "", " high"] {
+        assert!(!is_valid_reasoning_effort(bad), "{bad:?} should be invalid");
+    }
+}
+
+/// Absent leaves as-is, explicit null clears back to Default, a string sets.
+/// The absent case is the load-bearing one: a rename-only update must not wipe
+/// the trigger's model.
+#[test]
+fn apply_update_model_and_effort_triple_state() {
+    let mut config = created_with(json!({ "model": "claude-sonnet-5", "reasoning_effort": "low" }));
+
+    // Absent: unchanged.
+    config.apply_update(&json!({ "trigger_id": "t-model", "name": "Renamed" }));
+    assert_eq!(config.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
+
+    // String: set.
+    config.apply_update(&json!({ "model": "gemini-3.5-flash", "reasoning_effort": "high" }));
+    assert_eq!(config.model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
+
+    // Null: cleared back to the account default.
+    config.apply_update(&json!({ "model": null, "reasoning_effort": null }));
+    assert_eq!(config.model, None);
+    assert_eq!(config.reasoning_effort, None);
+}
+
+/// A blank string on update means the user chose Default in the form, so it
+/// clears rather than storing "".
+#[test]
+fn apply_update_blank_model_clears_it() {
+    let mut config = created_with(json!({ "model": "claude-sonnet-5" }));
+    config.apply_update(&json!({ "model": "  " }));
+    assert_eq!(config.model, None);
+}
+
+#[test]
+fn apply_update_ignores_an_out_of_set_effort() {
+    let mut config = created_with(json!({ "reasoning_effort": "high" }));
+    config.apply_update(&json!({ "reasoning_effort": "maximum" }));
+    assert_eq!(
+        config.reasoning_effort.as_deref(),
+        Some("high"),
+        "a bad tier must be dropped, not applied and not silently cleared"
+    );
+}
+
+/// Blank is how the form's "Default" option travels, so it must normalize to
+/// None at the write boundary rather than round-tripping as a stored "".
+#[test]
+fn normalize_route_setting_reads_blank_as_default() {
+    assert_eq!(normalize_route_setting(None), None);
+    assert_eq!(normalize_route_setting(Some("")), None);
+    assert_eq!(normalize_route_setting(Some("   ")), None);
+    assert_eq!(
+        normalize_route_setting(Some("  claude-sonnet-5  ")).as_deref(),
+        Some("claude-sonnet-5")
+    );
+}
+
+/// The model id space is open (any provider string is allowed), so this helper
+/// must not reject an id it does not recognise.
+#[test]
+fn normalize_route_setting_does_not_judge_the_model_id() {
+    assert_eq!(
+        normalize_route_setting(Some("some-future-model")).as_deref(),
+        Some("some-future-model")
+    );
+}
+
+#[test]
+fn validate_trigger_reasoning_effort_accepts_the_tiers_and_default() {
+    assert_eq!(validate_trigger_reasoning_effort(None), Ok(None));
+    assert_eq!(validate_trigger_reasoning_effort(Some("  ")), Ok(None));
+    for tier in ["none", "low", "medium", "high", "xhigh", "max"] {
+        assert_eq!(
+            validate_trigger_reasoning_effort(Some(tier)),
+            Ok(Some(tier.to_string()))
+        );
+    }
+}
+
+#[test]
+fn validate_trigger_reasoning_effort_rejects_an_unknown_tier() {
+    let err = validate_trigger_reasoning_effort(Some("maximum")).unwrap_err();
+    assert!(err.contains("maximum"), "error names the bad value: {err}");
+    assert!(
+        err.contains("none, low, medium, high, xhigh, max"),
+        "error lists the accepted tiers: {err}"
+    );
+}
+
+// --- Per-trigger provider pin -----------------------------------------------
+
+/// A registry holding one model served by `vertex` then `anthropic`.
+fn two_route_registry() -> crate::llm::ModelRegistry {
+    use crate::llm::model_registry::{ModelRouting, RouteEntry};
+    use crate::llm::ProviderKind;
+    let registry = crate::llm::model_registry::empty();
+    registry.write().unwrap().insert(
+        "claude-opus-5".to_string(),
+        ModelRouting {
+            routes: vec![
+                RouteEntry::new(ProviderKind::Vertex, "claude-opus-5"),
+                RouteEntry::new(ProviderKind::Anthropic, "claude-opus-5"),
+            ],
+            preferred: None,
+            vision: false,
+            default_effort: None,
+        },
+    );
+    registry
+}
+
+#[test]
+fn validate_trigger_provider_accepts_a_route_of_the_model() {
+    let registry = two_route_registry();
+    assert_eq!(
+        validate_trigger_provider(&registry, Some("claude-opus-5"), Some(" anthropic ")),
+        Ok(Some("anthropic".to_string()))
+    );
+}
+
+#[test]
+fn validate_trigger_provider_reads_blank_as_no_pin() {
+    let registry = two_route_registry();
+    assert_eq!(validate_trigger_provider(&registry, None, None), Ok(None));
+    assert_eq!(
+        validate_trigger_provider(&registry, None, Some("  ")),
+        Ok(None)
+    );
+}
+
+/// A typo must be refused, never stored and never read as Vertex.
+#[test]
+fn validate_trigger_provider_refuses_an_unknown_provider() {
+    let registry = two_route_registry();
+    let err =
+        validate_trigger_provider(&registry, Some("claude-opus-5"), Some("antropic")).unwrap_err();
+    assert!(err.contains("Unknown provider 'antropic'"), "{err}");
+}
+
+/// A provider says which backend serves the model, so it means nothing alone.
+#[test]
+fn validate_trigger_provider_refuses_a_pin_without_a_model() {
+    let registry = two_route_registry();
+    let err = validate_trigger_provider(&registry, None, Some("anthropic")).unwrap_err();
+    assert!(err.contains("needs a model pin"), "{err}");
+}
+
+#[test]
+fn validate_trigger_provider_refuses_a_provider_the_model_has_no_route_on() {
+    let registry = two_route_registry();
+    let err = validate_trigger_provider(&registry, Some("claude-opus-5"), Some("openrouter"))
+        .unwrap_err();
+    assert!(err.contains("'claude-opus-5'"), "names the model: {err}");
+    assert!(err.contains("'openrouter'"), "names the provider: {err}");
+}
+
+fn pinned_trigger() -> TriggerConfig {
+    created_with(json!({ "model": "claude-opus-5", "provider": "anthropic" }))
+}
+
+#[test]
+fn provider_update_leaves_the_pin_alone_when_neither_field_moves() {
+    let registry = two_route_registry();
+    let existing = pinned_trigger();
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, None, None),
+        Ok(None)
+    );
+    // Re-sending the same model is not a model change.
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, Some(Some("claude-opus-5")), None),
+        Ok(None)
+    );
+}
+
+#[test]
+fn provider_update_null_clears_the_pin() {
+    let registry = two_route_registry();
+    let existing = pinned_trigger();
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, None, Some(None)),
+        Ok(Some(None))
+    );
+}
+
+/// Clearing the model drops the provider with it, since a pin belongs to its
+/// model.
+#[test]
+fn provider_update_clearing_the_model_clears_the_pin() {
+    let registry = two_route_registry();
+    let existing = pinned_trigger();
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, Some(None), None),
+        Ok(Some(None))
+    );
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, Some(Some("gpt-5.5")), None),
+        Ok(Some(None))
+    );
+}
+
+/// A provider-only update validates against the model the trigger already has.
+#[test]
+fn provider_update_validates_against_the_existing_model() {
+    let registry = two_route_registry();
+    let existing = created_with(json!({ "model": "claude-opus-5" }));
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, None, Some(Some("vertex"))),
+        Ok(Some(Some("vertex".to_string())))
+    );
+    let unpinned = created_with(json!({}));
+    let err = resolve_trigger_provider_update(&registry, &unpinned, None, Some(Some("vertex")))
+        .unwrap_err();
+    assert!(err.contains("needs a model pin"), "{err}");
+}

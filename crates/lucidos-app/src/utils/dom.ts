@@ -1,0 +1,121 @@
+/** Focus an element only if it isn't already the active element, avoiding flicker.
+ *  Uses preventScroll to avoid iOS Safari auto-scrolling overflow:hidden
+ *  containers (e.g. the mobile swipe container) when the target is offscreen. */
+export function focusIfNeeded(el: HTMLElement | null | undefined): void {
+  if (el && document.activeElement !== el) {
+    el.focus({ preventScroll: true });
+  }
+}
+
+/** The `onMouseDown` of a menu trigger or menu row: the press leaves focus
+ *  where it is. On iOS a mousedown on a button blurs the focused field, and a
+ *  keyboard sliding away under an open menu moves it under the reader. */
+export function keepFocusOnPress(e: Event): void {
+  e.preventDefault();
+}
+
+/** Returns true if the element is a text input (input, textarea, select, or contentEditable). */
+export function isTextInput(el: EventTarget | Element | null): boolean {
+  if (!(el instanceof HTMLElement)) return false;
+  if (el.isContentEditable) return true;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
+/** True if the element, or any ancestor, is an interactive control that owns its
+ *  own tap/drag (button, link, form field, [role="button"], contentEditable).
+ *  Exempts edge controls from the iOS navigation-swipe guard, whose touchstart
+ *  preventDefault swallows the emulated click. Also keeps a control's click
+ *  from opening the clickable row it sits in. */
+export function isInteractiveTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof Element)) return false;
+  return !!el.closest('button, a, input, textarea, select, label, [role="button"], [contenteditable]');
+}
+
+/** True if the element is, or sits within, the focusable conversation transcript
+ *  scroll region (`.thread-content`). Used so a Space keypress while that region
+ *  has focus pages it down instead of being captured by type-to-focus-prompt. */
+export function isThreadTranscript(el: EventTarget | null): boolean {
+  return el instanceof HTMLElement && el.closest('.thread-content') !== null;
+}
+
+const KEYBOARD_INPUT_TYPES = new Set([
+  'text', 'search', 'email', 'password', 'tel', 'url', 'number',
+]);
+
+/** True only for elements that bring up the on-screen keyboard when focused.
+ *  Excludes range, checkbox, button, color, file, date, select, etc.: these
+ *  focus without opening a keyboard. Use this for "is the user typing", such
+ *  as keyboard-related layout or holding off a pane swipe. Use `isTextInput`
+ *  where a focused checkbox or select must also count, as for keyboard
+ *  shortcuts. */
+export function opensSoftwareKeyboard(el: EventTarget | Element | null): boolean {
+  if (!(el instanceof HTMLElement)) return false;
+  if (el.isContentEditable) return true;
+  if (el.tagName === 'TEXTAREA') return true;
+  if (el.tagName !== 'INPUT') return false;
+  // HTMLInputElement.type is a reflecting getter — normalizes to 'text' for
+  // unset/unknown values, never returns ''.
+  return KEYBOARD_INPUT_TYPES.has((el as HTMLInputElement).type);
+}
+
+/** How much shorter the VISUAL viewport must be than the LAYOUT one before the
+ *  software keyboard is the only plausible explanation. iOS never shrinks the
+ *  layout viewport for it, and browser chrome moves by far less than this. */
+const KEYBOARD_SHRINK_MIN_PX = 100;
+
+/** Is the software keyboard taking room off the foot of the screen?
+ *
+ *  Says nothing about focus, so a caller that needs both asks
+ *  `opensSoftwareKeyboard` separately. Takes both heights as arguments rather
+ *  than reading `window`, so the decision is testable without a viewport. */
+export function viewportIsKeyboardShrunk(vvHeight: number, innerHeight: number): boolean {
+  return vvHeight < innerHeight - KEYBOARD_SHRINK_MIN_PX;
+}
+
+/** Pixels per CSS rem at the document root. Mobile uses 112.5% (18px) base;
+ *  the 16 fallback covers SSR/JSDOM where getComputedStyle returns ''. */
+export function getRemPx(): number {
+  return parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+}
+
+let safeAreaProbe: HTMLElement | null = null;
+
+/** The top safe area in px: the band the status bar and the Dynamic Island
+ *  draw over. Script cannot read the inset, so a hidden probe resolves it as
+ *  padding. 0 where there is no inset, or no DOM. */
+export function safeAreaTopPx(): number {
+  if (typeof document === 'undefined' || !document.body) return 0;
+  if (!safeAreaProbe?.isConnected) {
+    safeAreaProbe = document.createElement('div');
+    safeAreaProbe.setAttribute('aria-hidden', 'true');
+    safeAreaProbe.style.cssText =
+      'position:fixed;top:0;left:0;visibility:hidden;pointer-events:none;padding-top:var(--safe-area-top)';
+    document.body.appendChild(safeAreaProbe);
+  }
+  return parseFloat(getComputedStyle(safeAreaProbe).paddingTop) || 0;
+}
+
+/** The viewport clamps live in `@lucidos/geometry`, because the shared tooltip
+ *  runs in an app iframe and needs them too. Re-exported here so the host's own
+ *  callers keep one import site, and there is still one definition. */
+export { clampWithin } from '@lucidos/geometry';
+
+/** Resize a textarea to fit its content. Setting height to 'auto' first lets
+ *  scrollHeight shrink when text is removed; without it the textarea would
+ *  only ever grow.
+ *
+ *  scrollHeight is content + padding (no border). With the project's global
+ *  box-sizing: border-box, CSS height includes the border, so the content area
+ *  shrinks by border-height and clips the bottom of descenders (g, p, y, j, q).
+ *  Add the border back so the content area exactly fits scrollHeight. */
+export function autoResizeTextarea(el: HTMLTextAreaElement | null) {
+  if (!el) return;
+  el.style.height = 'auto';
+  const cs = getComputedStyle(el);
+  // `|| 0` for the same reason `getRemPx` carries `|| 16`: getComputedStyle
+  // answers '' under SSR/JSDOM, and a NaN height is a silently dropped
+  // declaration that leaves the textarea stuck at `auto`.
+  const borderY = (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+  el.style.height = `${el.scrollHeight + borderY}px`;
+}

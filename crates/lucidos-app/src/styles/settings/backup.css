@@ -1,0 +1,148 @@
+/* Backup health card — surfaces running / last-run / staleness at the top of
+   the Backup section so the page answers "is my data backed up?" at a glance. */
+.backup-health-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 0.75rem;
+    padding: 0.5rem 0.625rem;
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-surface) * 0.5);
+    background: var(--bg-primary);
+    font-size: var(--font-size-sm);
+}
+
+.backup-health-line {
+    color: var(--text-primary);
+}
+
+.backup-health-ok {
+    color: var(--text-muted);
+}
+
+.backup-health-success {
+    color: var(--accent-green);
+}
+
+.backup-health-error {
+    color: var(--accent-red);
+}
+
+.backup-health-muted {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+/* Severity tints — a subtle accent wash over the card surface, with the neutral
+   border kept (matches the rest of Lucidos's inline notices). No heavy colored
+   border. */
+
+/* No recent good backup, but the last run didn't fail — a soft warning. */
+.backup-health-card[data-state="stale"] {
+    background: color-mix(in srgb, var(--accent-yellow) 8%, var(--bg-primary));
+}
+
+/* Last run failed — escalate the whole card to the error hue so a failure never
+   sits inside a cheerful yellow box. */
+.backup-health-card[data-state="error"] {
+    background: color-mix(in srgb, var(--accent-red) 8%, var(--bg-primary));
+}
+
+.backup-health-warn {
+    color: var(--accent-yellow);
+    font-weight: 600;
+}
+
+/* "View backups folder" deep link under the provider row. */
+.backup-folder-link-row {
+    margin-bottom: 0.75rem;
+    font-size: var(--font-size-xs);
+}
+
+/* A provider that cannot upload, plus the button that fixes it. ONE class for
+   both blocked states (no account connected, and connected without the
+   permissions a backup needs): they sit in the same slot, say the same kind of
+   thing and offer the same kind of button, so they must not be spaced or sized
+   differently. They were, because the not-granted half was an inline
+   `style="display: flex; …"` copy of this rule that had lost its bottom margin,
+   which is why the red line, its button and the row below all collided in the
+   reported screenshot.
+
+   A button rather than a sentence because the fix is a place to go rather than
+   a path to walk, and it sits on its own line under the message at every pane
+   width: side by side, the red line and a green button read as one strip of
+   competing colour, and the button's position drifted with the length of the
+   provider name until the pane got narrow enough to wrap it.
+
+   One step up the type scale from the --font-size-xs the not-connected half
+   used, deliberately: it now sits alongside a permission name the user has to
+   read and act on, and it matches the health card and the section description
+   directly above it, which is the rest of what this page says in prose. */
+.backup-blocked-state {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-sm);
+    font-size: var(--font-size-sm);
+    color: var(--accent-red);
+}
+
+/* Back up now + the schedule and retention pickers. The section's rows carried
+   no shared rhythm at all before (five of them were inline styles with their
+   own eyeballed margins, and this one had none), so this row sat flush against
+   whichever state line preceded it. The gap above is what separates "what is
+   wrong with the destination" from "what you can do now". */
+.backup-actions-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    flex-wrap: wrap;
+    margin-top: var(--space-md);
+}
+
+/* What the picked provider can reach. Read before connecting, so it sits
+   directly under the Provider row. */
+.backup-provider-access {
+    margin: 0 0 var(--space-sm);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* Explains when a non-manual schedule actually fires. Sits tight under the row
+   it qualifies. */
+.backup-schedule-hint {
+    margin-top: var(--space-xs);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* The encryption key is a separate concern from where and when backups run, so
+   it opens a full gutter below the controls rather than continuing their
+   rhythm. */
+.backup-key-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    flex-wrap: wrap;
+    margin-top: var(--space-lg);
+}
+
+/* The revealed key. Monospace and fully selectable: the user is here to copy it
+   somewhere safe, and the Copy button next to it is not the only way people do
+   that. */
+.backup-key-value {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    user-select: all;
+    overflow-wrap: anywhere;
+}
+
+/* Shown only while the key is revealed: this is the one irreversible obligation
+   on the page. */
+.backup-key-warning {
+    margin-top: var(--space-xs);
+    font-size: var(--font-size-xs);
+    color: var(--accent-red);
+}
