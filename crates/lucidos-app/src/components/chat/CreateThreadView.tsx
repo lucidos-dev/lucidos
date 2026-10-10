@@ -1,0 +1,815 @@
+import type { VNode } from 'preact';
+import { useRef, useEffect, useLayoutEffect, useState } from 'preact/hooks';
+import {
+  activeExchanges,
+  activeStreamingBuffer,
+  threadsLoaded,
+  focusedThreadId,
+  threadMap,
+  isRenderedThreadIdle,
+  cancelingThreadIds,
+  removingQueuedMessageIds,
+  queuedMessageRemovalKey,
+  promptAnimating,
+} from '../../store/store';
+import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
+import { homeThreadId } from '../../store/actions/homeThread';
+import { anchorSpacer, setAnchorSpacer, splitAnchorCorrection } from './anchorCorrection';
+import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, readerGestureSince } from './scrollState';
+import { ChatExchange } from './ChatExchange';
+import type { ProposedChangeSeed } from './ChatExchange';
+import { NO_SIDE_QUESTIONS, placeSideQuestions, sideQuestionOwners } from './SideQuestionCard';
+import type { SideQuestion } from '../../store/sideQuestions';
+import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
+import { WelcomeMessage } from './WelcomeMessage';
+import type { Exchange, StoredEvent } from '../../store/thread-events';
+import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, continuableAbortIndex, queuedFollowupRun, readMarkers, isChangeLifecycleEvent, restartPauseFoldsInto, opensAwaitingAnswer, agentWorkedSince } from '../../store/thread-events';
+import { isActive as isStatusActive } from '../../store/exchange-status';
+import { forceWebKitRepaint, settledScrollTop } from '../../utils/webkitRepaint';
+import { opensSoftwareKeyboard } from '../../utils/dom';
+import { nowMs } from '../../utils/scrollActivity';
+import { scaledDurationMs } from '../../utils/motion';
+import { DISCLOSURE_MAX_MS } from '../../utils/disclosureMotion';
+
+/** A change's description, file count and summary, keyed by change_id.
+ *  Harvested from the `ChangeProposed` and `ChangeSummarized` events riding a
+ *  thread's coding-agent turns as non-rendered steps. A later lifecycle card
+ *  for the same change_id is a SEPARATE exchange carrying none of them. It
+ *  would otherwise fetch the `Change` row on open and pop the body in late.
+ *  Seeding from this in-thread data paints the body at full height at once.
+ *
+ *  The LATEST proposal wins, since that is the commit list the card resolves.
+ *  A summary counts only while it summarized that list, the same guard the
+ *  engine's projection applies. */
+export function buildProposedChangeInfo(exchanges: Exchange[]): Map<string, ProposedChangeSeed> {
+  const map = new Map<string, ProposedChangeSeed>();
+  // change_id → description summarized → summary. A later event overwrites.
+  const summaries = new Map<string, Map<string, string>>();
+  for (const ex of exchanges) {
+    for (const { event } of ex.steps) {
+      // Per-commit ChangeProposed emits carry an empty change_id, which the
+      // truthiness check skips. The aggregate proposal carries the real id and
+      // the full file list.
+      if (event.type === 'ChangeProposed' && event.change_id) {
+        map.set(event.change_id, { description: event.description, fileCount: event.files?.length });
+      } else if (event.type === 'ChangeSummarized' && event.change_id && event.summary) {
+        const byDescription = summaries.get(event.change_id) ?? new Map<string, string>();
+        byDescription.set(event.description ?? '', event.summary);
+        summaries.set(event.change_id, byDescription);
+      }
+    }
+  }
+  for (const [changeId, seed] of map) {
+    seed.summary = summaries.get(changeId)?.get(seed.description ?? '');
+  }
+  return map;
+}
+
+const NO_PROPOSED_CHANGE_INFO = new Map<string, ProposedChangeSeed>();
+
+/** The matched event of a delivery, keyed by the `EventWaitDelivered`'s own
+ *  event id, which is what the anchor's `PromptInjected.delivered_event_id`
+ *  names.
+ *
+ *  Resolved at thread level because the two events land in DIFFERENT exchanges.
+ *  The delivery is not an exchange-start type, so it attaches to whatever
+ *  exchange was open, and the injection after it starts a new one. A
+ *  `ChatExchange` therefore cannot see its own delivery's payload. Reading
+ *  `threadMap` to find one would resubscribe every exchange to the store and
+ *  undo the memo (see `chatExchangePropsEqual`).
+ *
+ *  The payload is stringified HERE, once per grouping pass, for two reasons. A
+ *  string is a primitive the memo compares without a deep walk, and the
+ *  formatting is a pure function of the value. */
+type DeliveredEventInfo = { eventType: string; eventId?: string; payloadJson?: string };
+
+function buildDeliveredEventInfo(exchanges: Exchange[]): Map<string, DeliveredEventInfo> {
+  const map = new Map<string, DeliveredEventInfo>();
+  for (const ex of exchanges) {
+    for (const { event } of ex.steps) {
+      if (event.type !== 'EventWaitDelivered' || !event._eventId) continue;
+      map.set(event._eventId, {
+        eventType: event.event_type,
+        // The event that MATCHED, not this delivery's own id: it is what the
+        // delivery card's jump navigates to. Absent on a delivery the engine wrote
+        // without one.
+        eventId: event.event_id,
+        payloadJson: formatDeliveredPayload(event.payload),
+      });
+    }
+  }
+  return map;
+}
+
+/** Pretty-print a delivered payload for the disclosure, or return undefined
+ *  when there is nothing worth expanding. An empty object is the common shape
+ *  for a marker event, and a disclosure opening onto `{}` is a worse affordance
+ *  than none. */
+export function formatDeliveredPayload(payload: unknown): string | undefined {
+  if (payload === null || payload === undefined) return undefined;
+  if (typeof payload === 'object' && Object.keys(payload as object).length === 0) return undefined;
+  try {
+    return JSON.stringify(payload, null, 2);
+  } catch {
+    // Cyclic or otherwise unserializable: the event NAME is still the answer to
+    // "why is this thread talking again", so drop only the payload rather than
+    // the row.
+    return undefined;
+  }
+}
+
+const NO_DELIVERED_EVENT_INFO = new Map<string, DeliveredEventInfo>();
+
+/** The `EventWaitDelivered` id this exchange is the delivery for, if it is one
+ *  at all. The one "is this a delivery" test, so the cheap has-any check and
+ *  the per-exchange lookup can't drift apart. */
+function deliveryEventId(ex: Exchange): string | undefined {
+  const ev = ex.userEvent;
+  return ev.type === 'PromptInjected' ? ev.delivered_event_id : undefined;
+}
+
+/** Threads the last model/effort across exchanges so each child sees its predecessors' state. */
+export function renderExchanges(
+  exchanges: Exchange[],
+  threadId: string,
+  streamingBuffer: string,
+  /** Windowing: emit DOM only for exchanges at this index or later. The loop
+   *  iterates the FULL array, so every index-based decision and the prior
+   *  model/effort accumulator stay correct. Only `nodes.push` is gated. A large
+   *  thread therefore renders and markdown-parses just its visible tail, and
+   *  older exchanges materialize as the user scrolls up (see ThreadView's
+   *  `renderCount`). Default 0 renders all, which is what the tests and the
+   *  deep-link path use. */
+  renderFromIndex = 0,
+  /** Windowing, one grain finer: how many of the FLOOR exchange's leading rows
+   *  to leave out. A coding-agent turn can outweigh a whole transcript, so
+   *  gating whole exchanges is not enough on its own. Zero for every other
+   *  exchange, which is what keeps the window a contiguous tail. */
+  floorRowsHidden = 0,
+  /** The thread's side questions. Each is drawn inside the turn it was asked
+   *  in, or in the feed when no turn owns it (`sideQuestionOwners`). */
+  sideQuestions: readonly SideQuestion[] = NO_SIDE_QUESTIONS,
+): VNode[] {
+  // Compute once which abort exchange (if any) gets the Continue button: the
+  // most recent ResponseAborted the user may actually resume from. See
+  // `continuableAbortIndex` for the three ways that comes back empty, the
+  // sharpest being a switch teardown the engine is already auto-resuming.
+  const continuableIdx = continuableAbortIndex(exchanges);
+  // Lifted once for the whole list and passed as props to every ChatExchange.
+  // These reads subscribe the PARENT to `threadMap` and `cancelingThreadIds`
+  // instead of the 29+ child ChatExchanges. ChatExchange is `memo`d, so a
+  // meta-shape change wakes only this render pass and the memo skips every
+  // exchange whose prop fingerprint is unchanged. On a 29-exchange thread that
+  // is 28 times fewer markdown re-parses per SSE event.
+  const thread = threadMap.value.get(threadId);
+  const threadMeta = thread?.meta;
+  const threadIsCC = threadMeta?.channel === 'claude_code';
+  const threadCodingAgent = threadMeta?.codingAgent ?? 'claude-code';
+  // Quiescent by raw status, but false while an optimistic resume is in flight
+  // (just-answered question / un-ingested follow-up) — see isRenderedThreadIdle.
+  const threadIdle = isRenderedThreadIdle(thread);
+  // Backend says the thread is parked on / resuming from a question or
+  // permission card. A just-answered divider whose resume `running` aggregate
+  // hasn't reached the client yet keeps reading "Working". See exchangeStatus.
+  const threadAwaitingAnswer = threadMeta?.status === 'waiting_for_user_answer';
+  const threadCanceling = cancelingThreadIds.value.has(threadId);
+  // When the agent is busy (running, or paused on a question), chat follow-ups
+  // typed meanwhile are queued. The queue window includes optimistic messages
+  // AND persisted-but-not-yet-injected MessageReceived events, so derive the
+  // active exchange and queued set once at the thread level. Queued exchanges
+  // then render immediately after the active turn as user bubbles only instead
+  // of stealing the live stream or the active 'last' role.
+  const threadBusy = threadMeta?.status === 'running' || threadMeta?.status === 'waiting_for_user_answer';
+  const queuedRun = queuedFollowupRun(exchanges, threadBusy, threadIsCC);
+  const activeIdx = queuedRun.activeIndex;
+  const removingQueued = removingQueuedMessageIds.value;
+  const removedQueuedIndices = new Set(queuedRun.queuedOrder.filter((i) => {
+    const messageId = exchanges[i]?.userEvent._eventId;
+    return !!messageId && removingQueued.has(queuedMessageRemovalKey(threadId, messageId));
+  }));
+  const queuedOrder = queuedRun.queuedOrder.filter(i => !removedQueuedIndices.has(i));
+  const queuedIndices = new Set<number>(queuedOrder);
+  const queuedCount = queuedOrder.length;
+  const sideQuestionPlaces = sideQuestionOwners(
+    exchanges,
+    sideQuestions,
+    (i) => queuedRun.queuedIndices.has(i) || restartPauseFoldsInto(exchanges[i], exchanges[i + 1]),
+  );
+  const markers = readMarkers(exchanges, threadIsCC);
+  const nodes: VNode[] = [];
+  let lastModel: string | undefined;
+  let lastEffort: string | undefined;
+
+  // Only scan for ChangeProposed seeds when the thread actually has a
+  // change-lifecycle card to seed — the common (chat) thread pays nothing.
+  const hasChangePanel = exchanges.some(ex => isChangeLifecycleEvent(ex.userEvent));
+  const proposedChangeInfo = hasChangePanel ? buildProposedChangeInfo(exchanges) : NO_PROPOSED_CHANGE_INFO;
+  // Same shape, same reason: only a thread that actually holds an event
+  // delivery pays for the scan, so an ordinary thread pays nothing.
+  const hasEventDelivery = exchanges.some(ex => deliveryEventId(ex) !== undefined);
+  const deliveredEventInfo = hasEventDelivery ? buildDeliveredEventInfo(exchanges) : NO_DELIVERED_EVENT_INFO;
+
+  // For non-queued exchanges only. `queuedRun` drives the queued display, so a
+  // persisted follow-up never leans on exchangeStatus' single-last queued arm.
+  const priorActiveAt = (i: number): boolean =>
+    i > 0 && isStatusActive(getExchangeStatus(exchanges[i - 1], '', /* isLast */ false, /* hasPriorActive */ false, threadIsCC, threadIdle, threadAwaitingAnswer));
+
+  // **A card that reads "Needs your answer" draws last**, above only the
+  // queued group (ADR 0284). Its props still come from its fold index, so no
+  // status moves with it. Two tests keep a stale card from pinning: a thread
+  // that settled with no park owes no answer, and a card the agent worked past
+  // was left behind.
+  const pinnedOrder: number[] = [];
+  if (threadAwaitingAnswer || !threadIdle) {
+    exchanges.forEach((ex, i) => {
+      if (queuedRun.queuedIndices.has(i) || !opensAwaitingAnswer(ex)) return;
+      const isLast = i === activeIdx;
+      const status = getExchangeStatus(ex, isLast ? streamingBuffer : '', isLast, priorActiveAt(i), threadIsCC, threadIdle, threadAwaitingAnswer);
+      // The tail scan last: only a card still awaiting an answer pays for it.
+      if (status === 'awaiting-answer' && !agentWorkedSince(exchanges, i)) pinnedOrder.push(i);
+    });
+  }
+  const pinnedIndices = new Set(pinnedOrder);
+  const openCardIdx = pinnedOrder.length > 0 ? pinnedOrder[pinnedOrder.length - 1] : -1;
+
+  const renderOne = (ex: Exchange, i: number, pausedBy?: StoredEvent): VNode => {
+    // The active exchange plays the 'last' role (gets the stream, reads
+    // 'streaming'/'working'); queued follow-ups after it are explicitly flagged.
+    const isLast = i === activeIdx;
+    const isQueued = queuedIndices.has(i);
+    const priorActive = priorActiveAt(i);
+    // Seed the change-lifecycle card's body from the in-thread ChangeProposed
+    // so it paints at final height on first open (see buildProposedChangeInfo).
+    const seedChangeId = isChangeLifecycleEvent(ex.userEvent)
+      ? (ex.userEvent as { change_id?: string }).change_id
+      : undefined;
+    const proposedSeed = seedChangeId ? proposedChangeInfo.get(seedChangeId) : undefined;
+    // Undefined when this is not a delivery, and ALSO when the delivery it
+    // names is outside the loaded window. Both fall back to the injected prose,
+    // which is the honest thing to show when the structured half is not in hand.
+    const matchedEvent = deliveredEventInfo.get(deliveryEventId(ex) ?? '');
+    return (
+      <ChatExchange
+        // Key by the stable event id, not userSeq, so an optimistic pending
+        // message reconciles IN PLACE when its persisted event arrives. A
+        // userSeq key changes on that swap, remounting the node and making the
+        // just-sent follow-up flicker away and reappear. See `exchangeKey`.
+        key={exchangeKey(ex)}
+        exchange={ex}
+        // Captured as a primitive at render time: the incremental grouping
+        // cache mutates Exchange objects in place, so the memo can't see a
+        // change through the identity-stable object — see Exchange.revision.
+        revision={ex.revision ?? 0}
+        streamingBuffer={isLast ? streamingBuffer : ''}
+        isLast={isLast}
+        isQueued={isQueued}
+        readMarker={markers?.get(i)}
+        threadId={threadId}
+        hasPriorActive={priorActive}
+        priorModel={lastModel}
+        priorEffort={lastEffort}
+        isContinuableAbort={i === continuableIdx}
+        threadIsCC={threadIsCC}
+        threadCodingAgent={threadCodingAgent}
+        threadIdle={threadIdle}
+        threadAwaitingAnswer={threadAwaitingAnswer}
+        behindOpenQuestion={openCardIdx >= 0 && i > openCardIdx && !isQueued}
+        threadCanceling={threadCanceling}
+        rowsHidden={i === renderFromIndex && !pinnedIndices.has(i) ? floorRowsHidden : 0}
+        proposedChangeDesc={proposedSeed?.description}
+        proposedChangeFileCount={proposedSeed?.fileCount}
+        proposedChangeSummary={proposedSeed?.summary}
+        matchedEventType={matchedEvent?.eventType}
+        matchedEventId={matchedEvent?.eventId}
+        matchedPayloadJson={matchedEvent?.payloadJson}
+        pausedBy={pausedBy}
+        sideQuestions={sideQuestionPlaces.owned.get(i) ?? NO_SIDE_QUESTIONS}
+      />
+    );
+  };
+
+  const advance = (ex: Exchange): void => {
+    lastModel = exchangeResponseModel(ex) ?? lastModel;
+    lastEffort = exchangeReasoningEffort(ex) ?? lastEffort;
+  };
+
+  // **Queued follow-ups are NOT windowed.** They render at the bottom of the
+  // transcript, whatever their index. Gating them on that index hides a
+  // message the reader is still waiting on. A call is what makes the two
+  // disagree: every utterance said after they typed is an exchange, so enough
+  // of them push the index above the window floor. There are only ever a
+  // handful, each stepless, so drawing them all costs nothing.
+  const renderQueued = (): void => {
+    if (queuedCount === 0) return;
+    if (queuedCount === 1) {
+      const i = queuedOrder[0];
+      const ex = exchanges[i];
+      nodes.push(renderOne(ex, i));
+      advance(ex);
+      return;
+    }
+
+    const queuedNodes: VNode[] = [];
+    for (const j of queuedOrder) {
+      const ex = exchanges[j];
+      queuedNodes.push(renderOne(ex, j));
+      advance(ex);
+    }
+    nodes.push(
+      <details
+        class="queued-message-group"
+        key={`queued-${queuedOrder.join('-')}`}
+        /* Expanding the group unfolds the queued bubbles below the active turn,
+           at the bottom of the thread. It used to snap the transcript down to
+           them; it no longer does. A disclosure is not the "take me to the live
+           edge" gesture, and growing content under the reader is exactly what
+           must not move them (see scrollState's header). The chevron rises on
+           the growth, which is the way down. */
+      >
+        <summary class="queued-message-group-summary">
+          <span class="queued-message-group-label">{`Queued (${queuedCount})`}</span>
+        </summary>
+        <div class="queued-message-group-body">
+          {queuedNodes}
+        </div>
+      </details>
+    );
+  };
+
+  // The queued group rides the BOTTOM of the transcript, which is where the
+  // reader left their unsent messages. On a typed thread that IS the active
+  // turn, since everything after it is queued by construction. On a call it is
+  // not: a caller can speak after typing, and those utterances belong below the
+  // turn and above the messages still waiting. So anchor on the last exchange
+  // that is not itself queued, which the active one never is.
+  let queuedAnchor = activeIdx;
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    if (!queuedRun.queuedIndices.has(i)) {
+      queuedAnchor = i;
+      break;
+    }
+  }
+
+  // The window floor is NOT widened to reach the active turn, however far up a
+  // call has pushed it. The edge is seeded once and only ever moves up
+  // (`threadWindow.ts`). Deriving it from the active index would let it fall
+  // back down the moment a turn ended, unmounting turns the reader had already
+  // been shown. Reaching an out-of-view live turn means moving the STORED edge,
+  // which is that module's own mechanism.
+  //
+  // A pinned card is rendered at its fold index, so it reads the prior model
+  // it would there, and is emitted at the anchor. Like the queue, it is not
+  // windowed: it is what the reader has to act on.
+  const pinnedNodes: VNode[] = [];
+  for (let i = 0; i < exchanges.length;) {
+    if (queuedRun.queuedIndices.has(i)) {
+      i++;
+      continue;
+    }
+
+    const ex = exchanges[i];
+    // See `restartPauseFoldsInto`. The index-based decisions above still see
+    // the pause, so only its panel goes.
+    const folds = restartPauseFoldsInto(ex, exchanges[i + 1]);
+    const pausedBy = i > 0 && restartPauseFoldsInto(exchanges[i - 1], ex)
+      ? exchanges[i - 1].userEvent
+      : undefined;
+    if (pinnedIndices.has(i)) pinnedNodes.push(renderOne(ex, i, pausedBy));
+    else if (i >= renderFromIndex && !folds) nodes.push(renderOne(ex, i, pausedBy));
+    advance(ex);
+
+    if (i === queuedAnchor) {
+      nodes.push(...pinnedNodes);
+      renderQueued();
+    }
+
+    i++;
+  }
+
+  return placeSideQuestions(nodes, exchanges, sideQuestionPlaces.unowned, renderFromIndex > 0);
+}
+
+// --- Scroll anchoring for turn-control changes (full response, steps) ---
+//
+// When toggling global signals (stepsExpanded, detailsExpanded), ALL ChatExchange
+// components re-render, changing content height. Without compensation, the scroll
+// position stays at the same absolute offset but the viewport shows different
+// content — the classic "scroll jump."
+//
+// iOS Safari PWA: WKWebView's compositor adjusts scroll position asynchronously
+// when DOM nodes change, and `overflow-anchor` is unsupported (WebKit #171099).
+// We freeze the container (`overflow:hidden`) during DOM changes so the browser
+// can't touch scrollTop, then compensate and unfreeze.
+//
+// The scroll container is found via `anchor.closest('.thread-content')` rather
+// than by id. Ids are banned on pane chrome (.claude/rules/frontend-css.md),
+// and walking up from the anchor cannot pick the wrong element even while a
+// layout swap is committing.
+
+/** Where `el`'s top sits inside the transcript's scrollable content, measured to
+ *  the SUBPIXEL. This is `offsetTop`, in doubles.
+ *
+ *  `offsetTop` itself cannot be used for the correction, and the two rects are
+ *  taken in one call against the CONTAINER rather than the offset parent. Both
+ *  are load-bearing: ADR 0078. Nothing between a `.chat-exchange` and the
+ *  transcript is transformed. */
+function contentOffsetTop(container: HTMLElement, el: HTMLElement): number {
+  return el.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+}
+
+/* --- What the correction holds still ---------------------------------------
+ *
+ * THE ELEMENT THE READER CLICKED, and nothing else. A turn control changes
+ * heights and nothing else, and the reader asked for that by pressing one named
+ * thing. So that thing is what must not move. `ChatExchange`'s `heldOnThePress`
+ * hands it over, as the click's own `currentTarget`.
+ *
+ * The anchor used to be a RANKING, preferring the reader's topmost visible line
+ * and taking the pressed turn last. It is what left a reader at the top of the
+ * thread for pressing the second turn's control. The sweep that produced the
+ * ranking presses through `btn.click()` on controls it never scrolls into view,
+ * and no finger can reach those: the controls live in a header that is not
+ * sticky. Full account, and what the ranking cost:
+ * docs/plans/2026-08-28-a-turn-control-holds-what-you-pressed.md
+ */
+/** How many frames the correction may re-assert while the transcript settles.
+ *
+ *  WebKit does not settle a large reveal inside the frame its mutation commits,
+ *  and one next-frame re-assert is not enough. Unfolding a turn of 80 tool
+ *  steps left the reader 911px off, on a control at the foot of the pane.
+ *  Chromium held the same control exactly.
+ *
+ *  The mechanism is a CLAMP, not slow arithmetic. The old rows leave before the
+ *  new ones arrive, so the offset is clamped against a container that is
+ *  briefly tiny. The correction cannot reach its target, which becomes
+ *  reachable a frame or two later, by which time nothing was asking.
+ *
+ *  IT RUNS THE WHOLE BUDGET rather than converging. Two convergence rules were
+ *  tried and both stopped on a frame that was quiet only because the change had
+ *  not begun: a target that had not moved yet, then a height that had not moved
+ *  yet. A frame costs two rect reads, and writes only when the container is off
+ *  target. The budget is cheaper than another rule to get wrong.
+ *
+ *  12 frames is about 200ms. A press that rolls rows runs on until the longest
+ *  roll has landed (`ROLL_SETTLE_SLACK_MS`). What ends it early is the reader,
+ *  never a guess about the layout. */
+const ANCHOR_SETTLE_FRAMES = 12;
+
+/** A turn toggle rolls rows ABOVE the control too, since it spans the whole
+ *  transcript. So the correction also runs until the longest roll has landed. */
+const ROLL_SETTLE_SLACK_MS = 50;
+
+/** Hold `anchor` exactly where it is while `fn` mutates the DOM around it.
+ *  `anchor` is THE ELEMENT THE READER CLICKED, per the block above.
+ *
+ *  ONE PRESS READS ONLY ITS OWN TWO MEASUREMENTS. A press that shrinks the
+ *  content below its control cannot hold it, so the browser clamps and the
+ *  control slides. Nothing carries that deficit to the next press. Repaying it
+ *  there would move the control the reader just pressed, which is the one
+ *  thing this function exists to prevent. See ADR 0147. */
+export function withScrollAnchor(anchor: Element | null | undefined, fn: () => void) {
+  const container = anchor?.closest('.thread-content') as HTMLElement | null;
+  if (!container || !anchor) { fn(); return; }
+
+  // Blur a focused KEYBOARD FIELD inside the container: iOS scrolls one into
+  // view to clear the soft keyboard, and that scroll fights the correction.
+  //
+  // A field, not any focused element. Every turn control is a button, and the
+  // reader reaches one by Tab. Blurring it drops them out of the transcript, so
+  // the press that folds a turn takes away the control that unfolds it.
+  //
+  // `opensSoftwareKeyboard` is the question exactly, and `utils/dom.ts` already
+  // owns it. A checkbox, a range or a file input is an `INPUT` that opens no
+  // keyboard, so a tag test would blur one for nothing.
+  const focused = document.activeElement;
+  if (focused instanceof HTMLElement && container.contains(focused) && opensSoftwareKeyboard(focused)) {
+    focused.blur();
+  }
+
+  // Half of the pair the correction subtracts, taken while the old layout still
+  // stands. The other half is read after the mutation, in `targetNow`.
+  const held = anchor as HTMLElement;
+  const offsetBefore = contentOffsetTop(container, held);
+  // Settled, because a press can land inside a repaint nudge's frame. The nudge
+  // moves `offsetBefore`'s two readings together, so only this one needs it.
+  const scrollBefore = settledScrollTop(container);
+  const overflowBefore = container.style.overflow;
+  const pressedAt = nowMs();
+  let restored = false;
+
+  // Freeze: prevent browser from adjusting scroll during DOM changes.
+  container.style.overflow = 'hidden';
+  // The freeze can move the anchor by itself. WebKit drops the scrollbar gutter
+  // under `overflow: hidden`, which rewraps every line. So the synchronous
+  // check below compares against this frozen reading, never `offsetBefore`.
+  const offsetFrozen = contentOffsetTop(container, held);
+
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    observer.disconnect();
+    // Unfrozen BEFORE anything is measured, so `targetNow` reads the layout
+    // `offsetBefore` was taken in. Measured frozen, the gutter reflow lands in
+    // the correction as a jump of several pixels.
+    container.style.overflow = overflowBefore;
+
+    // Did the anchor survive the mutation? A detached element does not say so by
+    // measuring nothing: it answers an all-zero rect, which reads as content
+    // that moved to the top of the thread and would send the reader there.
+    //
+    // A press whose mutation detaches its own control has nothing to hold, so
+    // the freeze has already left the reader where they were.
+    const anchored = held.isConnected;
+    // Where the correction wants the container, read from the layout the
+    // mutation left. One definition, because the next-frame re-check has to ask
+    // the same question a frame later.
+    //
+    // The spacer is subtracted because it sits above the anchor and is ours to
+    // rewrite: the correction carries its sub-pixel rest there (ADR 0286).
+    const targetNow = (): { scrollTop: number; spacer: number } => {
+      const offset = contentOffsetTop(container, held);
+      return splitAnchorCorrection(scrollBefore + (offset - anchorSpacer(container) - offsetBefore));
+    };
+    // What the write carries. A press whose anchor left the DOM writes the
+    // offset the container already holds, so the MARK is the whole of it and
+    // nobody moves. The mark is owed anyway, see below.
+    const wanted = anchored ? targetNow() : { scrollTop: container.scrollTop, spacer: anchorSpacer(container) };
+    // Every press gets the mark, whether or not it moves the reader. The mark is
+    // what stands the growth round's own edge write down (`keepTheLiveEdge`)
+    // and what re-bases the mobile header. Declining to correct is still the app
+    // deciding the reader stays put.
+    setAnchorSpacer(container, wanted.spacer);
+    markAnchorScroll(container, wanted.scrollTop);
+
+    // The overflow freeze plus a large DOM shrink can leave iOS WKWebView
+    // showing a blanked layer texture. The whole `.thread-content` renders
+    // black until a scroll forces a repaint, so trigger it proactively.
+    forceWebKitRepaint(container);
+
+    // Tell the transcript that THIS correction was ours, so its scroll event
+    // cannot cancel a pending landing. And retire a standing follow the hold
+    // left off the live edge: the press moved the reader there, so the toggle
+    // must not stay lit (ADR 0064).
+    honourAnchoredMutation(container);
+
+    // iOS may adjust after unfreeze, so re-check on the frames that follow.
+    // Skipped while the app is driving this container's scroll: a tween may be
+    // in flight, and re-asserting a pre-tween offset against it is a frame of
+    // jitter for a correction the tween makes moot.
+    //
+    // NOT skipped for a correction that asked for no movement, which it used to
+    // be. That is the press whose turn is the last one, and a mid-mutation
+    // clamp moves the reader there as readily as anywhere else.
+    if (anchored) {
+      let framesLeft = ANCHOR_SETTLE_FRAMES;
+      // Timed from now, not from the press: the rolls start once the render
+      // has committed, and a slow render lands well after the press.
+      const rollsLandAt = nowMs() + scaledDurationMs(DISCLOSURE_MAX_MS) + ROLL_SETTLE_SLACK_MS;
+      let lastFrameAt = -Infinity;
+      const reassert = (frameAt: number) => {
+        if (!held.isConnected || isOtherNavigationScroll(container)) return;
+        // THE READER ENDS IT, and only a gesture made since the press says so.
+        // A press must never fight a flick made a moment after it.
+        //
+        // Not "the container moved since our write". A render landing after
+        // the correction clamps the offset against the shrunk content, which
+        // moves it with nobody scrolling. Read as the reader, that clamp left
+        // them at the bottom of the thread (WebKit, which has no scroll anchoring).
+        if (readerGestureSince(container, pressedAt)) return;
+        const target = targetNow();
+        setAnchorSpacer(container, target.spacer);
+        // Discounts the WebKit repaint nudge. It lands in the same frame as the
+        // first re-assert, 1px off under a compensating transform. Writing that
+        // pixel back mid-nudge showed the transcript 1px off.
+        if (settledScrollTop(container) !== target.scrollTop) {
+          markAnchorScroll(container, target.scrollTop);
+          honourAnchoredMutation(container);
+        }
+        // The frame's own timestamp is on `nowMs`'s clock. A frame whose clock
+        // did not advance cannot be waiting on a roll, so the loop always ends.
+        const rolling = frameAt > lastFrameAt && frameAt < rollsLandAt;
+        lastFrameAt = frameAt;
+        if (--framesLeft <= 0 && !rolling) return;
+        requestAnimationFrame(reassert);
+      };
+      requestAnimationFrame(reassert);
+    }
+  };
+
+  const observer = new MutationObserver(() => restore());
+  observer.observe(container, { childList: true, subtree: true });
+
+  fn();
+
+  // Synchronous check, for a `fn` that changed the DOM before returning.
+  if (!restored && contentOffsetTop(container, held) !== offsetFrozen) restore();
+
+  // After Preact's Promise microtask render
+  queueMicrotask(() => queueMicrotask(restore));
+
+  // Final safety net — ensure overflow is always restored
+  requestAnimationFrame(restore);
+}
+
+/** Wire a transcript element to the shared scroll signals. Attaches the scroll
+ *  and resize observers (`makeScrollObservers`). Registers it as the active
+ *  scroll target, so the chevrons and deep links know which transcript to move.
+ *  Nothing here reacts to content: no layout effect snaps the container to the
+ *  bottom on arrival (ADR 0064).
+ *
+ *  Listener setup tracks the actual DOM element via a ref, not just the `ready`
+ *  boolean. When the element changes, listeners are detached from the old one
+ *  and reattached to the new one on the next render. That prevents dead
+ *  listeners feeding scroll events to a detached node. */
+export function useScrollObservers(ref: preact.RefObject<HTMLDivElement>, ready: boolean) {
+  const listenerRef = useRef<{ el: HTMLDivElement; cleanup: () => void } | null>(null);
+
+  // Check on every render whether the target element has changed.
+  // Runs after commit (ref.current is set), so we always see the current element.
+  useEffect(() => {
+    const el = ready ? ref.current : null;
+    const prev = listenerRef.current;
+
+    // Same element (or both null) — nothing to do
+    if (el === (prev?.el ?? null)) return;
+
+    // Cleanup old listeners
+    prev?.cleanup();
+    listenerRef.current = null;
+
+    if (!el) return;
+
+    // `detachGestures` unwires the reader-gesture listeners the observers came
+    // with, which is what tells `onScroll` a scroll was the READER's rather
+    // than the platform's. Removed with the `scroll` listener below, so a
+    // recycled transcript never leaves a detached element feeding the signal.
+    const { onScroll, onResize, detachGestures } = makeScrollObservers(el);
+
+    el.addEventListener('scroll', onScroll, { passive: true });
+    const ro = new ResizeObserver(onResize);
+    ro.observe(el);
+    // The container is `position: absolute; inset: 0` (chat.css), so its own
+    // box never resizes when children grow. Observing it alone would miss every
+    // in-thread size change. Observe each child too, and re-observe on
+    // childList changes so new exchanges join in.
+    function observeChildren() {
+      for (const child of Array.from(el!.children)) {
+        ro.observe(child);
+      }
+    }
+    const mo = new MutationObserver(observeChildren);
+    mo.observe(el, { childList: true });
+    observeChildren();
+
+    // Register as the active scroll target so scrollToBottom() moves the
+    // transcript the user can actually see, never one laid out at zero size.
+    if (isElementVisible(el)) {
+      setActiveScrollElement(el);
+    }
+
+    listenerRef.current = {
+      el,
+      cleanup: () => {
+        el.removeEventListener('scroll', onScroll);
+        detachGestures();
+        ro.disconnect();
+        mo.disconnect();
+        // Only clear if we're still the active element (another instance
+        // may have already registered itself during component transitions).
+        if (getActiveScrollElement() === el) {
+          setActiveScrollElement(null);
+        }
+      },
+    };
+  });
+
+  // Cleanup on unmount
+  useEffect(() => () => {
+    listenerRef.current?.cleanup();
+    listenerRef.current = null;
+    notAtTop.value = false;
+    awayFromBottom.value = false;
+  }, []);
+}
+
+/** Where the welcome surface (`WelcomeMessage`) belongs: in the home thread,
+ *  on the empty compose view, or nowhere (ADR 0411).
+ *
+ *  Home holds it whenever Home exists, which is every workspace once boot ran.
+ *  The compose view holds it only when there is no Home, if creating it
+ *  failed. Nothing holds it while the thread list loads, since only then is it
+ *  known whether Home exists, nor once it is dismissed. The dismissal lives in
+ *  the DB-backed `welcome_suggestions_dismissed` preference, so it sticks
+ *  across reloads and devices. A surface also shows the welcome only while it
+ *  is empty. Pure, so the rule is unit-testable without the hook-heavy view. */
+export function welcomePlacement(opts: {
+  threadsLoaded: boolean;
+  homeId: string | null;
+  welcomeDismissed: boolean;
+}): 'home' | 'compose' | 'none' {
+  if (!opts.threadsLoaded || opts.welcomeDismissed) return 'none';
+  return opts.homeId ? 'home' : 'compose';
+}
+
+export function CreateThreadView() {
+  const exchanges = activeExchanges.value;
+  const streamingBuffer = activeStreamingBuffer.value;
+  const threadId = focusedThreadId.value || '';
+  const loaded = threadsLoaded.value;
+  const areaRef = useRef<HTMLDivElement>(null);
+  const isUp = awayFromBottom.value;
+  const isNotAtTop = notAtTop.value;
+
+  // Subscribe to the prompt's FLIP move (ThreadPane): the welcome's entrance is
+  // sequenced AFTER this move finishes — see the reveal effect below.
+  const animating = promptAnimating.value;
+
+  const isEmpty = exchanges.length === 0;
+  // This view is the compose view, or an empty Home in its compose layout.
+  // Either way it shows the welcome only if the welcome belongs here.
+  const here = threadId && threadId === homeThreadId.value ? 'home' : 'compose';
+  const showWelcome = isEmpty && welcomePlacement({
+    threadsLoaded: loaded,
+    homeId: homeThreadId.value,
+    welcomeDismissed: welcomeSuggestionsDismissed(),
+  }) === here;
+
+  // Sequenced welcome entrance. The surface stays hidden on its CSS
+  // `opacity: 0` base until the prompt textarea finishes sliding up, then
+  // `.welcome-revealing` plays the enter animation. `promptAnimating` is the
+  // authoritative end-of-move signal: ThreadPane flips it true for the FLIP
+  // move and false on the transform `transitionend`.
+  //
+  // The rAF defer wins the race against a move about to START. Entering
+  // compose-empty runs this layout effect BEFORE ThreadPane sets
+  // `promptAnimating`, so re-checking the live signal a frame later lets a
+  // just-started move re-gate the reveal. With no move at all, the welcome
+  // reveals on the next frame.
+  const [welcomeRevealed, setWelcomeRevealed] = useState(false);
+  useLayoutEffect(() => {
+    if (!showWelcome) { setWelcomeRevealed(false); return; }
+    if (welcomeRevealed || animating) return;
+    const raf = requestAnimationFrame(() => {
+      if (promptAnimating.value) return; // a move just started — wait for it
+      setWelcomeRevealed(true);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [animating, showWelcome, welcomeRevealed]);
+
+  // hasContent: true exactly when the thread-content div will be in the DOM.
+  // useScrollObservers depends on this. If we only pass `loaded`, the effect
+  // runs when threadsLoaded becomes true but the div might not exist yet (no
+  // exchanges, no welcome). Later when exchanges arrive, the effect never
+  // re-runs → no scroll listener → button broken.
+  const hasContent = loaded && (showWelcome || !isEmpty);
+
+  useScrollObservers(areaRef, hasContent);
+
+  return (
+    <div class="thread-content-wrap">
+      {hasContent && (
+        <>
+          <div class={`thread-content visible${welcomeRevealed ? ' welcome-revealing' : ''}`} ref={areaRef}>
+
+            {showWelcome ? (
+              <WelcomeMessage />
+            ) : (
+              renderExchanges(exchanges, threadId, streamingBuffer)
+            )}
+          </div>
+          {!isEmpty && (
+            <ScrollControls
+              showUp={isNotAtTop}
+              showDown={isUp}
+              // `scrollToTop`, not a raw `scrollTo` on the ref. The up chevron
+              // is a navigation. The module owning navigations is what ends the
+              // ride, supersedes a deep-link claim and settles the chevron
+              // signal (ADR 0064).
+              onScrollUp={scrollToTop}
+              onScrollDown={scrollToBottom}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// Buttons stay mounted so the CSS `.visible` class can drive the fade transition.
+export function ScrollControls({ showUp, showDown, onScrollUp, onScrollDown }: {
+  showUp: boolean;
+  showDown: boolean;
+  onScrollUp: () => void;
+  onScrollDown: () => void;
+}) {
+  return (
+    <>
+      <button class={`scroll-to-top${showUp ? ' visible' : ''}`} onClick={onScrollUp} aria-label="Scroll to top">
+        <ChevronUpIcon />
+      </button>
+      <button class={`scroll-to-bottom${showDown ? ' visible' : ''}`} onClick={onScrollDown} aria-label="Scroll to bottom">
+        <ChevronDownIcon />
+      </button>
+    </>
+  );
+}

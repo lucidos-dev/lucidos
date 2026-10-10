@@ -1,0 +1,204 @@
+/* ─── Shared modal overlay base ───
+
+   Bounded to the VISUAL viewport, so a modal centres in what is on screen.
+   iOS never shrinks the layout viewport for the keyboard
+   (`interactive-widget=resizes-visual` in index.html), so `inset: 0` alone
+   centred the panel with its buttons under the keys. MobileSwipeContainer
+   publishes `--app-height`; desktop takes the 100dvh fallback. */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    bottom: auto;
+    height: var(--app-height, 100dvh);
+    background: var(--scrim);
+    z-index: var(--z-modal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: modal-in var(--duration-fast) ease;
+}
+
+/* The drawing a backdrop <Overlay> leaves as it closes (overlayExitDrawing.ts):
+   its entrance, played backwards. Click-through, so the UI behind is live at
+   once. Nothing inside moves, or a copied panel would replay its own entrance. */
+.modal-overlay.modal-overlay-leaving {
+    animation: modal-out var(--duration-fast) ease forwards;
+    pointer-events: none;
+}
+.modal-overlay.modal-overlay-leaving * {
+    animation: none;
+    transition: none;
+}
+
+/* UI-blocking overlay — blocks interaction while the client refreshes (swaps
+   the service worker and reloads). Engine restart no longer blocks here: the
+   gateway boot splash + GET-gate + SSE reconnect make it a recoverable
+   non-event, so the tab stays interactive and shows only a light dismissible
+   "Restarting engine…" toast.
+   z-index above the WHOLE modal band, which is --z-modal plus a stack depth of
+   at most MAX_MODAL_STACK_DEPTH (store/overlayStack.ts). Stated against the
+   band rather than against --z-control-panel, because the band is the tallest
+   thing the blocker has to cover; the header (.pane-header-brand,
+   .thread-toggle-slot, .message-route-panel, all at 2200) is below it anyway.
+   .toast-container sits a step higher so the "Refreshing…" toast stays visible. */
+.ui-blocking-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-modal) + 50);
+    background: var(--scrim);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: not-allowed;
+    -webkit-user-select: none;
+    user-select: none;
+    animation: modal-in var(--duration-normal) ease-out;
+}
+
+/* While the UI is blocked, nothing may float above the dim blocker except the
+   toast container (--z-toast). One element outranks the overlay in normal use:
+   the JS tooltip, at --z-tooltip = 10000, kept that high so a modal never clips
+   it. UiBlockingOverlay flags :root[data-ui-blocked] so it steps aside while
+   blocked. (A pseudo-fullscreen app panel used to be the second one and needed
+   the same treatment; it now sits at --z-app-fullscreen, below the blocker and
+   below every modal, so it needs no override.) */
+
+/* Tooltip is transient — hide it outright (a ghost behind the 50% scrim would
+   look broken). inert already stops new tooltips firing (the hover targets are
+   inert), so this only clears one already on screen when the block began. */
+:root[data-ui-blocked] #tooltip {
+    display: none !important;
+}
+
+/* While any <Overlay> is open, the main UI behind it goes inert — no hover
+   highlight, no activation; a click just lands on `.app-shell` (which the dismiss
+   contract treats as outside → dismiss). The hover analog of the outside-click
+   swallow. `Toast` and the modal scrims render OUTSIDE `.app-shell`, so they stay
+   interactive. The overlay panels themselves (incl. the inline popovers like the
+   control panel / dropdowns, which DO render inside `.app-shell`) are re-enabled
+   via `[data-overlay-panel]`, and the toggle that opened the overlay via
+   `[data-overlay-anchor]` (set in `Overlay.tsx`) — the anchor MUST stay clickable
+   so re-activating it closes via its OWN handler (the documented anchor
+   exemption), not by being routed through the outside-dismiss path.
+   `pointer-events` is used (not `inert`) precisely because a descendant can
+   override an inert ancestor, which `inert` can't.
+
+   The inert is applied to `.app-shell`'s CHILDREN (`.app-shell > *`), not
+   `.app-shell` itself: `.app-shell` must remain a real hit target so an outside
+   click LANDS ON IT (a backdrop-less popover has no scrim of its own — the click
+   would otherwise fall through to `#app` and the dismiss-via-outside-click path
+   couldn't resolve a target inside the app). `pointer-events` inherits, so every
+   descendant of an inert child is inert too; panels/anchors re-set it to `auto`.
+   Driven by `data-overlay-open` on <html>, ref-counted in `Overlay.tsx`.
+
+   `[data-overlay-layer]` is the third exemption, and it exists because the
+   overlay layer does NOT always render outside `.app-shell`: while an app is
+   natively fullscreen, `OverlayLayer` portals the whole group into the
+   fullscreen app panel (the only place the browser will paint it), which is
+   deep inside `.app-shell` and therefore inherits the inert. The exemption puts
+   the layer back where it started, and no further: everything under it is host
+   chrome. */
+:root[data-overlay-open] .app-shell > * {
+    pointer-events: none;
+}
+:root[data-overlay-open] [data-overlay-panel],
+:root[data-overlay-open] [data-overlay-anchor],
+:root[data-overlay-open] [data-overlay-layer] {
+    pointer-events: auto;
+}
+
+/* The overlay layer's mount inside a natively fullscreen app panel (rendered by
+   AppUiInline, filled by OverlayLayer). It generates no box of its own: its
+   children are the same position:fixed scrims and toast container that sit at
+   the app root when nothing is fullscreen, so the mount must not become a flex
+   item of the app panel or a hit target over the app. */
+.app-overlay-layer {
+    display: contents;
+}
+
+/* AI running-text shimmer — the standard "actively working" affordance: a
+ * highlight band sweeps across the text itself (clipped to the glyphs) instead
+ * of a separate spinner. Applied to text that should read as "live" — the
+ * in-progress step description and a drawer section header that contains a
+ * running thread. Reuses the same 200%→-200% sweep direction as the skeleton
+ * `shimmer` keyframe. `color` is the no-clip fallback (and the reduced-motion
+ * resting color).
+ *
+ * The sweep repaints every frame, so the text owns its compositing layer.
+ * Without one, each frame re-rasterizes the transcript's layer around it, and
+ * WebKit's GPU process can grow without bound under a streaming turn.
+ * `inline-block` lets a span take the layer
+ * (an-endless-repaint-owns-its-layer.test.ts). */
+@keyframes running-shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+.running-shimmer {
+    background: linear-gradient(
+        90deg,
+        var(--text-muted) 0%,
+        var(--text-muted) 35%,
+        var(--text-primary) 50%,
+        var(--text-muted) 65%,
+        var(--text-muted) 100%
+    );
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: var(--text-secondary);
+    display: inline-block;
+    will-change: transform;
+    animation: running-shimmer 2.6s linear infinite;
+}
+
+/* Inverted running-text shimmer — the section-header variant. The resting text
+ * stays full-strength (`--text-primary`, so the bold section label reads
+ * normally) and a MUTED band sweeps across instead of a bright one. Used on the
+ * drawer section header that holds a running thread, where the standard
+ * dim-base + bright-sweep competed with the bold label and read as "dimmed"
+ * rather than "live". The in-thread step/status shimmer keeps the standard
+ * direction. Overrides only the gradient + resting color; the text-clip,
+ * `background-size`, and animation are inherited from `.running-shimmer` (apply
+ * both). Must use `background-image` (not the `background` shorthand) — the
+ * shorthand would reset `background-size` to `auto`, collapsing the 200%-wide
+ * gradient the sweep animation needs and freezing it static. */
+.running-shimmer-invert {
+    background-image: linear-gradient(
+        90deg,
+        var(--text-primary) 0%,
+        var(--text-primary) 35%,
+        var(--text-muted) 50%,
+        var(--text-primary) 65%,
+        var(--text-primary) 100%
+    );
+    color: var(--text-primary);
+}
+
+:root[data-motion="reduce"] .list-row,
+:root[data-motion="reduce"] .list-row-add-card,
+:root[data-motion="reduce"] .action-btn,
+:root[data-motion="reduce"] .dropdown-trigger,
+:root[data-motion="reduce"] .dropdown-option,
+:root[data-motion="reduce"] .icon-btn {
+    transition: none;
+}
+
+:root[data-motion="reduce"] .progress-bar-fill {
+    transition: none;
+}
+
+/* Drop the sweep AND the text-clip so the glyphs fall back to a solid,
+ * visible color (a clipped-but-unanimated gradient would freeze mid-sweep). */
+:root[data-motion="reduce"] .running-shimmer {
+    animation: none;
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--text-secondary);
+}
+
+/* The inverted variant rests at the full-strength label color, not the
+ * dimmed `--text-secondary` the standard shimmer falls back to. */
+:root[data-motion="reduce"] .running-shimmer-invert {
+    color: var(--text-primary);
+}

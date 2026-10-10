@@ -1,0 +1,1739 @@
+import { Fragment } from 'preact';
+import { useRef, useEffect, useLayoutEffect, useState, useMemo } from 'preact/hooks';
+import { Overlay } from '../shared/Overlay';
+import { Disclosure } from '../shared/Disclosure';
+import { useLongPress } from '../../hooks/useLongPress';
+import { signal, untracked, useSignalEffect } from '@preact/signals';
+import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, currentApp, wipPreviewThreadId, promptSendCollapsing, composeViewActive, scaledDurationMs } from '../../store/store';
+import { resolveCodingAgent } from '../../store/composeSelections';
+import { discardUnsentAnswers, sendMessage, handleCancelExchange } from '../../store/actions/chat';
+import { currentChatContext, type ChatContext } from '../../store/actions/chatContext';
+import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
+import { type AnswerKind, type ThreadState } from '../../store/thread-events';
+import {
+  multiSelectedByToolUse,
+  getMultiSelectedIds,
+  setMultiSelectedIds,
+} from './QuestionCard';
+import { pendingAnswers } from '../../store/pendingDecisions';
+import { updateCompose, updateComposeSelection, sendCompose, sendFollowup, ensureFocusedComposeThread } from '../../store/actions/compose';
+import { focusPane } from '../../store/actions/pane';
+import { openAppById } from '../../store/actions/apps';
+import { pushNavState } from '../../store/actions/navigation';
+import { tooltipWithShortcut, matchShortcut } from '../../store/actions/keybindings';
+import { getDraft } from '../../store/composeDrafts';
+import { askSideQuestion, routeSideQuestion, sideQuestionModeOn } from '../../store/sideQuestions';
+import { ComposeDestinationRow } from './ComposeDestinationRow';
+import { followAnsweredQuestion, followCanceledTurn, followSentMessage, followSideQuestion } from './scrollState';
+import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon, WarningIcon } from '../shared/icons';
+import { BlobImage } from '../shared/BlobImage';
+import { codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
+import { isComposeContext, PromptRowControls, promptRowToggles } from './PromptRowControls';
+import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
+import { OverflowMenu } from '../shared/OverflowMenu';
+import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup } from '../../hooks/usePromptActionCollapse';
+import { TodoPanelSlot, closeTodoPanel, todoIndicatorAction } from './todoIndicator';
+import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
+import { composerBannerState, getBannerActions, getWaitingState, getStandaloneActions } from './WaitingBanner';
+import { composeHasContent, sideQuestionModeActive, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, queuedUploadSends, queueUploadSend, clearQueuedUploadSend, uploadBlockedSends, markUploadBlockedSend, settleQueuedUploadSends, uploadSendNotice, uploadSendNoticeText, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionBlocker, type UploadSendIntent } from './prompt-input-helpers';
+import { canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting } from '../../store/canceledQuestions';
+import { SplitButton } from '../shared/SplitButton';
+import { NotReadyStrip } from './NotReadyStrip';
+export * from './prompt-input-helpers';
+import { composeHandlers } from './composeHandlers';
+import { focusIfNeeded } from '../../utils/dom';
+import { threadEntryFocusTarget } from './choiceCardNav';
+import { focusIntoPane } from '../layout/paneFocus';
+import { syncTextareaValue, shouldSkipSyncWhileEditing, resolveEmptyDraftSync, promptOverrideSyncSeq, promptOverrideReplacesDraft } from './promptValueSync';
+import { reportDraftClobbered } from './deadKeystrokeProbe';
+import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
+import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, useWidthRemeasure, animateTextareaHeightFrom, easeEmptiedTextarea, remeasureTextareaForPlaceholder } from './promptResize';
+import { isMobile } from '../../utils/viewport';
+import { cameraIsAvailable } from '../../utils/platform';
+import { isReducedMotion } from '../../utils/motion';
+import { createTapGate } from '../../utils/tapGesture';
+import { useTouchActivated } from '../../hooks/useTouchActivated';
+import { errorDetail } from '../../utils/errorDetail';
+import { extractPasteUrl, escapeMarkdownLinkText } from '../../utils/extractPasteUrl';
+import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
+import { attachDrawnCaret } from '../../utils/drawnCaret';
+import { attachedImagesForCurrentThread, getAttachedImages, markHashesAsSent, removeAttachedImage, type AttachedImage } from './pastedImages';
+import { getPendingUploads, hasInFlightUploads, uploadsGate, pendingUploads } from '../../store/pendingUploads';
+import { cancelPendingUpload, retryPendingUpload } from '../../store/actions/imageUploads';
+import { attachImageToActiveDraft } from './attachToDraft';
+import { PendingUploadChip } from './PendingUploadChip';
+import { computeCaptureGeometry, readDeviceAngle } from './cameraGeometry';
+import { isImeComposingKey } from '../../utils/ime';
+
+const attachMenuOpen = signal(false);
+const cameraOpen = signal(false);
+/** The ⋯ trigger's row attributes. It is measured like a member, and its EMPTY
+ *  fold key is what tells the measurement it stands in for members rather than
+ *  being one. Module-level, so its identity is stable across renders. */
+const MORE_TRIGGER_ATTRS = { 'data-row-item': 'fold', [FOLD_KEY_ATTR]: '' };
+
+/** Retire every popover a foldable member owns.
+ *
+ *  Two callers, and a hazard each. A fold step moves controls between the row
+ *  and the ⋯ menu, so an open panel's anchor can leave the DOM under it.
+ *
+ *  And the ⋯ trigger is itself the anchor of any panel a menu row opened. An
+ *  anchor is exempt from its own panel's outside-click dismiss, so re-pressing
+ *  the trigger would stack a menu over a panel that will not go. */
+function closeFoldedPanels(): void {
+  attachMenuOpen.value = false;
+  closeTodoPanel();
+  closeWaitingPanel();
+}
+/** 1x length of the compose-destination row's fade-out, mirroring
+ *  `.input-toggles-wrapper`'s `transition: opacity var(--duration-slow)` in
+ *  chat/input-messages.css. The literal is `--duration-slow` before the
+ *  Animation speed slider scales it, so a timer on it goes through
+ *  `scaledDurationMs`. */
+const TOGGLES_FADE_MS = 300;
+/** Fixed margin so the unmount lands AFTER the fade rather than on its last
+ *  frame. Slack is a safety margin, not animation, so it stays outside the
+ *  scaled call. */
+const TOGGLES_FADE_SLACK_MS = 50;
+/** Said when a multi-select answer is submitted while an image uploads. */
+const UPLOAD_BLOCKS_ANSWER_TOAST = 'An image is still uploading. Submit again once it finishes.';
+/** Tooltip on the prompt row's Cancel while a question card is pending. Nothing
+ *  else on screen spells out what the red button does to a pending question: it
+ *  stamps the card `Canceled`, so the user can steer the agent elsewhere. The
+ *  placeholder keeps the typing half (`PLACEHOLDER_ANSWERING`), and between the
+ *  two nothing on the card needs an "Other, I'll type it" option.
+ *
+ *  Only while a question card is pending. The same button serves coding-agent
+ *  permission cards, which are not `UserQuestionAsked` and absorb no typed
+ *  text, so there it stays the plain "Stop". */
+export const ANSWER_CANCEL_TOOLTIP = 'Cancel this question and ask something else';
+
+
+/** Whether an input event opens the Claude Code slash-command menu. Opening it
+ *  clears the box, so only a box holding a lone `/` qualifies. A value that
+ *  merely starts with `/` is the user's text: a pasted path or log line, or a
+ *  slash typed in front of a draft. Pure, and exported for testing. */
+export function opensSlashMenu(value: string, claudeCodeMode: boolean): boolean {
+  return claudeCodeMode && value === '/';
+}
+
+function addImageFile(file: File) {
+  attachImageToActiveDraft(file).catch((err) => {
+    showToast('Failed to attach image: ' + errorDetail(err), 'error');
+  });
+}
+
+
+/** Said when this page has no camera API at all, as over plain http on a LAN. */
+export const NO_CAMERA_API = 'This page cannot open a camera. The camera needs a secure connection.';
+
+/** Open the rear camera. Rejects, and never throws, where this page has no
+ *  camera API: `navigator.mediaDevices` is undefined outside a secure context,
+ *  and a synchronous throw would escape the caller's `.catch`. */
+export function openRearCamera(): Promise<MediaStream> {
+  if (!cameraIsAvailable()) return Promise.reject(new Error(NO_CAMERA_API));
+  return navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+}
+
+function CameraCapture() {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+
+  useEffect(() => {
+    let canceled = false;
+    openRearCamera()
+      .then((stream) => {
+        if (canceled) { stream.getTracks().forEach((t) => t.stop()); return; }
+        streamRef.current = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+        }
+      })
+      .catch((err: unknown) => {
+        showToast(`Could not access camera: ${errorDetail(err)}`, 'error');
+        cameraOpen.value = false;
+      });
+    return () => {
+      canceled = true;
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, []);
+
+  function capture() {
+    const video = videoRef.current;
+    if (!video) return;
+    const geom = computeCaptureGeometry(video.videoWidth, video.videoHeight, readDeviceAngle());
+    const canvas = document.createElement('canvas');
+    canvas.width = geom.canvasWidth;
+    canvas.height = geom.canvasHeight;
+    // Both failure paths below are real on iOS Safari. It refuses a new 2D
+    // context, and can hand back a null blob, once its per-tab canvas memory
+    // budget is spent. Neither may stay silent: the user pressed the shutter,
+    // so an unhandled null leaves the button dead with the camera still open.
+    // Both paths end in `close()`, as the success path does, since the shutter
+    // is a one-shot. An early return that only toasts would strand the live
+    // MediaStream and leave the overlay up.
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      showToast('Could not capture photo: the browser refused a drawing surface', 'error');
+      close();
+      return;
+    }
+    ctx.translate(geom.translateX, geom.translateY);
+    ctx.rotate(geom.rotateRadians);
+    ctx.drawImage(video, 0, 0);
+    canvas.toBlob((blob) => {
+      if (blob) addImageFile(new File([blob], 'camera.jpg', { type: 'image/jpeg' }));
+      else showToast('Could not capture photo: the browser produced no image', 'error');
+      close();
+    }, 'image/jpeg', 0.9);
+  }
+
+  function close() {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    cameraOpen.value = false;
+  }
+
+  // Backdrop-only modal (the attach menu that opened it is gone by now, so
+  // there is no anchor toggle) — <Overlay> owns dismiss/swallow/Escape/inert.
+  return (
+    <Overlay open onClose={close} overlayClass="camera-overlay" panelClass="surface surface-raised camera-container" panelRole="dialog">
+      <video ref={videoRef} autoPlay playsInline muted class="camera-video" />
+      <div class="camera-controls">
+        <button class="camera-capture-btn" onClick={capture} aria-label="Take photo" data-tooltip="Take photo">
+          <CaptureIcon />
+        </button>
+        <button class="action-btn action-btn-secondary" onClick={close}>Cancel</button>
+      </div>
+    </Overlay>
+  );
+}
+
+/** The camera dialog, for App's overlay layer. Rendered inside the prompt it
+ *  would take the prompt's box for its full-screen backdrop, since the
+ *  prompt's `will-change: translate` contains `position: fixed` descendants. */
+export function CameraCaptureSlot() {
+  return cameraOpen.value ? <CameraCapture /> : null;
+}
+
+/** The WIP app preview toggle, or null on a thread that has nothing to preview.
+ *
+ *  It stands whenever the focused thread is an app coding-agent thread whose
+ *  branch holds work, proposed or not (`codingAgentChangeState`). The state
+ *  falls to `none` when the worktree is removed, so the toggle can never point
+ *  at a gone worktree.
+ *
+ *  NOT gated on the app already being open. The preview swaps the app's
+ *  panel-overlay iframe, so gating it would strand a user reviewing the change
+ *  with the app closed. Clicking ON opens the target app if needed, then flips
+ *  that iframe to the worktree-served WIP through the engine's
+ *  `?thread_id=<id>` route (`api/apps.rs::serve_app_ui`).
+ *
+ *  Clicking OFF reverts to live, as does navigating away
+ *  (`actions/wipPreview.ts`) and an Apply or Discard removing the worktree (the
+ *  SSE handlers call `clearWipIfMatches`). */
+function wipPreviewAction(ft: ThreadState | undefined): HeaderActionSpec | null {
+  if (!ft || ft.meta.codingAgentKind !== 'app') return null;
+  if (ft.meta.codingAgentChangeState.kind === 'none') return null;
+  const folder = ft.meta.codingAgentFolder;
+  const appId = folder ? folder.split('/').filter(Boolean).pop() : undefined;
+  if (!appId) return null;
+  const wipOn = wipPreviewThreadId.value === ft.meta.id;
+  return {
+    key: 'wip-preview-toggle',
+    dataRole: 'wip-preview-toggle',
+    label: wipOn ? 'Stop WIP app preview' : 'Show WIP app preview',
+    tooltip: wipOn
+      ? 'Showing the WIP app preview from this thread’s worktree. Click to return to the live app.'
+      : 'Preview the in-flight changes from this app coding-agent thread in the panel.',
+    // A filled eye, distinct from the outlined `EyeIcon` in shared/icons.tsx.
+    // No inline width/height: `.icon-btn.header-icon` sizes the glyph from
+    // `--icon-glyph`, so an attribute here would be overridden.
+    icon: () => (
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+        <path d="M8 3C4.5 3 1.7 5.3 0.5 8c1.2 2.7 4 5 7.5 5s6.3-2.3 7.5-5c-1.2-2.7-4-5-7.5-5zm0 8a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-1.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z"/>
+      </svg>
+    ),
+    active: wipOn,
+    activeClass: 'active',
+    onClick: () => {
+      if (wipOn) {
+        // Revert to live. pushNavState captures wipPreviewThreadId into the new
+        // entry, so flip the signal first.
+        wipPreviewThreadId.value = null;
+        pushNavState();
+        return;
+      }
+      // Turning WIP on. The preview swaps the target app's panel-overlay
+      // iframe, so open that app first if it isn't the one currently shown. Set
+      // the WIP signal only AFTER the app is in place, or the wipPreview effect
+      // would see a currentApp/wipApp mismatch and clear it at once.
+      void (async () => {
+        if (currentApp.value?.id !== appId) {
+          await openAppById(appId);
+          if (currentApp.value?.id !== appId) return; // open failed, toast already shown
+        }
+        wipPreviewThreadId.value = ft.meta.id;
+        pushNavState();
+      })();
+    },
+  };
+}
+
+// Pending uploads count as content. While a pasted or picked image is still
+// uploading, the prompt is actively composing, so the waiting banner yields to
+// the Send button. `computeMorphMode` reads `composeHasContent`, which includes
+// pending uploads. Without this the banner's actions briefly show in place of
+// Send during the upload window, for any thread in the review section.
+
+export function PromptInput() {
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const promptActionsAreaRef = useRef<HTMLDivElement>(null);
+  // Measure-driven stacking. The hook sums every `[data-row-item]`'s width and
+  // compares against the row's content width. User font scaling, browser zoom
+  // and per-thread label changes therefore feed in directly, with no
+  // viewport-width heuristic to miss the squeeze on a dense row. When false,
+  // the secondary candidate lifts to a row above the icons.
+  //
+  // Scroll-vs-tap gate for the one-tap prompt buttons: the morph Send→Cancel
+  // and the answer control's Submit / Cancel. An iOS PWA touch can stay under
+  // iOS's ~10 px native cancel threshold during a scroll. It then lands a
+  // `click` on whatever sits under the finger. Worst case that is the
+  // destructive Cancel, which aborts the turn and stamps a pending question
+  // `Canceled`.
+  //
+  // It therefore guards the CLICK path, which is where that stray click
+  // arrives. `touchActivated` takes the gate and asks it there.
+  //
+  // The morph and the answer control are mutually exclusive, so they share one
+  // gate instance. The multi-select split-button Submit needs no gate: its
+  // caret menu makes the action deliberate. So it takes `ungatedHoldHandlers`,
+  // and each gated button takes `holdHandlers`, which feeds this gate.
+  const morphGate = useMemo(() => createTapGate(), []);
+  /** A discarded tap is the user's press thrown away, so it must never be
+   *  silent: the button reads as dead and nothing says why.
+   *
+   *  Only the composer's own actions report it. A question-card option sits
+   *  inside the transcript scroller. There, discarding a moving touch IS the
+   *  gate doing its job, and a toast on every scroll starting on an option
+   *  would be noise. */
+  function morphTapPassed(): boolean {
+    const moved = morphGate.tapRejection();
+    if (moved === null) return true;
+    showToast(`Tap ignored: it moved ${moved}px and read as a swipe. Try again.`, 'info');
+    return false;
+  }
+  /** The gate as `touchActivated` takes it. A press the touch path served is
+   *  spent, not ruled on: left unspent it would rule on the next activation
+   *  with no press behind it.
+   *
+   *  `spend` is NOT `cancel`. Cancel means the system took the gesture, which
+   *  `aborted` then reports, and a served press must not raise that flag. */
+  const morphActivationGate = {
+    pass: morphTapPassed,
+    spend: morphGate.spend,
+    aborted: morphGate.wasAborted,
+  };
+  // Watch for pending messages from other modules (e.g. new app modal)
+  useSignalEffect(() => {
+    const msg = pendingChatMessage.value;
+    if (!msg) return;
+    pendingChatMessage.value = null;
+    sendMessage(msg, undefined, { context: currentChatContext() }).catch((error) => {
+      showToast('Failed to send message: ' + errorDetail(error), 'error');
+    });
+  });
+
+  const tid = focusedThreadId.value;
+  // Subscribe via composeDrafts, NOT threadMap: ChatExchange subscribes to
+  // threadMap and runs marked.parse per render, so per-keystroke writes there
+  // would re-parse every exchange in the thread.
+  const composeText = getDraft(tid).text;
+  const hasText = composeText.length > 0;
+
+  // Preserve cursor on same-thread re-syncs; let it end-snap on thread switch.
+  // shouldSkipSyncWhileEditing protects in-flight keystrokes — see its docstring.
+  const prevTidRef = useRef<string | null | undefined>(undefined);
+  // Whether the box holds characters the COMPOSER did not put there. Set by the
+  // user's own `onInput`, cleared by every write the composer makes through
+  // `writeComposerValue`. `resolveEmptyDraftSync` reads it to tell a keystroke
+  // the store is missing from a synced draft a peer is entitled to clear.
+  const typedSinceComposerWroteRef = useRef(false);
+  // Whether the PREVIOUS render was the centered compose view. Drives the
+  // compose-to-compose height animation, which must NOT fire on a
+  // compose-to-active switch, where the ThreadPane FLIP owns the transition.
+  const wasComposeViewRef = useRef(false);
+  // A deliberate programmatic override (welcome starter suggestion) bumps this
+  // counter to force the very next sync past the skip-while-editing guard. Track
+  // the last value we acted on so a bump forces exactly one sync.
+  const overrideSyncSeq = promptOverrideSyncSeq.value;
+  const lastOverrideSyncSeqRef = useRef(overrideSyncSeq);
+  // A layout effect, so the box holds the new thread's text before ThreadPane's
+  // FLIP measures where the prompt docks. A child's layout effects run first.
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    const sameThread = prevTidRef.current === tid;
+    const isComposeView = composeViewActive.value;
+    const thisElementActive = document.activeElement === el;
+    // A one-shot override, a suggestion replacing an in-progress draft, must
+    // land in the textarea whatever the focus and content are.
+    // `requestPromptOverrideSync` bumps the counter after the draft write, so
+    // this render sees both.
+    const forceOverride = overrideSyncSeq !== lastOverrideSyncSeqRef.current;
+    lastOverrideSyncSeqRef.current = overrideSyncSeq;
+    // An empty canonical draft must still reach the textarea, or a cleared
+    // draft leaves stale text in a focused box. What it may NEVER do is erase
+    // characters the user typed. `resolveEmptyDraftSync` rules on that, and
+    // rules the same way `resolveComposerText` does at send time. An override
+    // outranks it: that write is deliberate and programmatic.
+    const adopting = !forceOverride && composeText === '' && resolveEmptyDraftSync({
+      domText: el.value,
+      typedSinceComposerWrote: typedSinceComposerWroteRef.current,
+      thisElementActive,
+      sameThread,
+    }) === 'adopt';
+    const forceEmptySync = composeText === '';
+    // An override that REPLACED the draft end-snaps the caret, the same as a
+    // thread switch: the old offset indexes text that is gone. An appending
+    // override keeps it, since the prefix it points into is untouched.
+    const preserveCursor = sameThread
+      && !(forceOverride && promptOverrideReplacesDraft.value);
+    if (adopting) adoptComposerText(el);
+    if (!adopting
+        && (forceEmptySync || forceOverride || !shouldSkipSyncWhileEditing(el, sameThread, thisElementActive))) {
+      // The composer is claiming the box's value, so nothing standing in it is
+      // unaccounted-for typing any more. Set before the write, and whether or
+      // not the write changes anything: a box that already matches the draft
+      // holds no keystroke the store is missing either.
+      typedSinceComposerWroteRef.current = false;
+      if (syncTextareaValue(el, composeText, preserveCursor)) {
+        // A compose-view to compose-view switch keeps the centered layout put, so
+        // the ThreadPane FLIP never fires and the textarea would insta-resize.
+        // Ease its height from the previous view's to the new one instead.
+        //
+        // Gated on `composeViewActive`, NOT on both being composing threads: the
+        // blank view has no thread id. A compose-to-active switch flips
+        // `composeViewActive`, so this is false there and the FLIP owns it.
+        // Capture the old inline height BEFORE `autoResize` overwrites it.
+        // Desktop-only and motion-respecting, mirroring the ThreadPane FLIP.
+        const animateSwitch = !sameThread && wasComposeViewRef.current && isComposeView
+          && !isMobile() && !isReducedMotion();
+        const fromHeight = animateSwitch ? el.style.height : '';
+        autoResize();
+        if (animateSwitch && fromHeight) {
+          animateTextareaHeightFrom(el, fromHeight);
+        } else {
+          requestAnimationFrame(() => requestAnimationFrame(() => autoResize()));
+        }
+      }
+    }
+    if (!sameThread && !isMobile()) {
+      // A thread parked on a live choice card wants that card's default choice
+      // focused, not the prompt, so Enter answers straight away.
+      // `threadEntryFocusTarget` is the SINGLE place deciding between the two.
+      // The card's own mount seed also fires on a switch, and letting both
+      // decide independently would race on mount order. The switch may come from
+      // a drawer row, so the focused-pane marker follows focus and Tab stays here.
+      requestAnimationFrame(() => focusIntoPane(threadEntryFocusTarget(el)));
+    }
+    prevTidRef.current = tid;
+    wasComposeViewRef.current = isComposeView;
+  }, [tid, composeText, overrideSyncSeq]);
+
+  // A font change moves the height the SAME value needs. `resizeTextarea` reads
+  // only the value, so it would keep a box too tall after a smaller UI scale.
+  useFontMetricsResize(() => {
+    const el = inputRef.current;
+    if (el && !isTextareaHeightAnimating(el)) remeasureTextarea(el);
+  });
+  useWidthRemeasure(inputRef);
+
+  useEffect(() => {
+    const el = inputRef.current;
+    return el ? attachDrawnCaret(el) : undefined;
+  }, []);
+
+  function autoResize() {
+    const el = inputRef.current;
+    if (el) resizeTextarea(el);
+  }
+
+  /** Write the composer's OWN value into the box. The only way to set it.
+   *
+   *  Every such write also says the box no longer holds anything the user
+   *  typed, and keeping the two in one call is the point: a bare `el.value =`
+   *  would leave the flag set, and the next empty-draft sync would then adopt
+   *  text the composer itself put there. Pinned by `promptValueSync.test.ts`. */
+  function writeComposerValue(el: HTMLTextAreaElement, text: string): void {
+    el.value = text;
+    typedSinceComposerWroteRef.current = false;
+  }
+
+  /** Take the characters standing in the box into the draft, because a clear
+   *  ran under the user's fingers. The box is left exactly as it is.
+   *
+   *  This is the send path's verdict, applied at sync time: see
+   *  `resolveEmptyDraftSync`. It goes through the store write a keystroke
+   *  takes, so the draft, the Send face and the debounced PUT agree afterwards.
+   *  The next render then takes the ordinary skip branch. */
+  function adoptComposerText(el: HTMLTextAreaElement): void {
+    const text = el.value;
+    const thread = tid ? threadMap.value.get(tid) : undefined;
+    reportDraftClobbered({
+      charCount: text.length,
+      threadStatus: thread ? effectiveThreadStatus(thread) : 'none',
+    });
+    updateCompose(ensureFocusedComposeThread(), { text });
+  }
+
+  function handleKeyDown(e: KeyboardEvent) {
+    // Nothing here acts on a keystroke the IME owns. Ahead of the Escape branch
+    // as well as the Enter one. Escape mid-composition cancels the candidate,
+    // and taking it here would abort the running turn instead.
+    if (isImeComposingKey(e)) return;
+    if (e.key === 'Escape') {
+      // Escape reaches the textarea only when no overlay is open: the central
+      // overlay stack handles it first, in the capture phase, and stops
+      // propagation (see .claude/rules/frontend.md). So here it belongs to the
+      // composer, and means the same thing as the row's red button.
+      const action = computePromptEscapeAction(cancelTargetId !== null, isCancelSettling(), sideQuestionMode);
+      if (action === 'leave-side-question') {
+        e.preventDefault();
+        setSideQuestionMode(false);
+      } else if (action === 'cancel') {
+        e.preventDefault();
+        cancelExchangeForTarget();
+      } else if (action === 'blur') {
+        inputRef.current?.blur();
+      }
+      return;
+    }
+    // A modified Enter a shortcut claims (⌥↵ toggles side-question mode) is
+    // the shortcut's, so it must not also send.
+    if (e.key === 'Enter' && !e.shiftKey && !isMobile() && matchShortcut(e) === null) {
+      e.preventDefault();
+      if (hasPendingMultiQ) void submitMultiAnswer();
+      else void submit();
+    }
+  }
+
+  function beginSend(
+    threadId: string | null,
+    thread: ThreadState | undefined,
+    msg: string,
+    currentImages: AttachedImage[],
+    intent: UploadSendIntent<ChatContext>,
+  ): Promise<void> {
+    const imageHashes = currentImages.length > 0 ? currentImages.map((i) => i.hash) : undefined;
+    const shouldFocus = threadId === null || focusedThreadId.value === threadId;
+
+    const { promise: sendPromise, submittedId } = dispatchSend(threadId, () => {
+      if (threadId && thread?.meta.state === 'composing') {
+        // Composing thread: send through compose so server transitions
+        // state→active and clears compose fields atomically.
+        return sendCompose(threadId, { useCodingAgent: intent.useCodingAgent, context: intent.context, focus: shouldFocus });
+      } else if (threadId) {
+        return sendFollowup(threadId, msg, imageHashes, { useCodingAgent: intent.useCodingAgent || undefined, context: intent.context, focus: shouldFocus });
+      } else {
+        return sendMessage(msg, imageHashes, { useCodingAgent: intent.useCodingAgent || undefined, context: intent.context, focus: shouldFocus });
+      }
+    });
+
+    return sendPromise.catch((error) => {
+      if (submittedId) {
+        clearSubmittingThread(submittedId);
+      }
+      showToast('Failed to send message: ' + errorDetail(error), 'error');
+    });
+  }
+
+  function sendQueuedAfterUpload(
+    threadId: string,
+    intent: UploadSendIntent<ChatContext>,
+  ): Promise<void> {
+    const thread = threadMap.value.get(threadId);
+    if (!thread) {
+      clearSubmittingThread(threadId);
+      return Promise.resolve();
+    }
+    const draft = getDraft(threadId);
+    const msg = thread.meta.state === 'composing' ? draft.text : draft.text.trim();
+    const currentImages = getAttachedImages(threadId);
+    if (!composeHasContent(msg, currentImages.length, false)) {
+      // The user pressed Send and was told the send was waiting on the upload.
+      // Emptying the box in the meantime cancels it, so say so rather than let
+      // the promised send never arrive.
+      showToast('The queued send was dropped: the composer is empty now.', 'info');
+      clearSubmittingThread(threadId);
+      return Promise.resolve();
+    }
+    const sideQuestion = routeSideQuestion(msg, {
+      started: thread.meta.state !== 'composing',
+      codex: effectiveCodingAgentBackend(thread, resolveCodingAgent(threadId)) === 'codex',
+    }, intent.asSideQuestion === true);
+    if (sideQuestion.kind !== 'message') {
+      clearSubmittingThread(threadId);
+      if (sideQuestion.kind === 'refuse') showToast(sideQuestion.toast, 'info');
+      else askComposerSideQuestion(threadId, sideQuestion.question, currentImages);
+      return Promise.resolve();
+    }
+    // Empty the box HERE, where this send actually dispatches. `submit` cleared
+    // it at its own dispatch point and returned before that one, the send being
+    // owed to an upload. Left alone, the box would still claim to hold unsent
+    // typing. The next empty-draft sync would then adopt the message just sent
+    // straight back as a draft. Past the three returns above, each of which
+    // cancels the send and must leave what the user typed alone.
+    //
+    // Only when the box on screen is THIS thread's. A queued send is retried
+    // per thread, so it can fire after the reader has moved to another one.
+    // There the composer is showing somebody else's draft. An unfocused thread
+    // needs no clear anyway: its box is not mounted, and arriving at it later is
+    // a thread switch, which syncs from the draft this send just emptied.
+    const el = inputRef.current;
+    if (el && el.dataset.threadId === threadId) {
+      writeComposerValue(el, '');
+      easeEmptiedTextarea(el);
+    }
+    return beginSend(threadId, thread, msg, currentImages, intent);
+  }
+
+  /** Send the composer's contents, or ask them as a side question in
+   *  side-question mode. */
+  async function submit() {
+    const el = inputRef.current;
+    const threadId = focusedThreadId.value;
+    // ONE source for "is there anything to send": the draft the Send face was
+    // rendered from, and the value `sendCompose` goes on to send. The textarea
+    // only fills a gap the store has. See `resolveComposerText`.
+    //
+    // The node itself is no longer required. It is needed to clear the box and
+    // to reset its height, and both sit under a null check below. A missing node
+    // used to return here, which is a dead button that says nothing.
+    const draftText = getDraft(threadId).text;
+    const resolved = resolveComposerText(draftText, el ? el.value : null);
+    const msg = resolved.text;
+    const currentImages = threadId ? getAttachedImages(threadId) : [];
+    const uploadInFlight = threadId ? hasInFlightUploads(threadId) : false;
+    // The same reading the Send face was lit from, so a press on a LIT face can
+    // never land here. What still reaches it is Enter on an empty desktop
+    // composer, and there is nothing to say about that.
+    //
+    // A box holding characters is a different thing. Nothing sendable and
+    // something on screen is the shape the user reports as a dead button, so it
+    // says which it is. Every other return below dispatches or speaks.
+    if (!composeHasContent(msg, currentImages.length, uploadInFlight)) {
+      const onScreen = (el?.value.length ?? 0) > 0 || draftText.length > 0;
+      if (onScreen) showToast('Nothing to send: the message is only spaces.', 'info');
+      return;
+    }
+    // Only with a thread to hold a draft. Without one there is no stored copy,
+    // so the box is the only source and there is nothing to disagree with.
+    const disagreement = threadId ? composerTextDisagreementToast(resolved) : null;
+    if (disagreement) showToast(disagreement, 'warning');
+    // Before every return below, and before the dispatch: a queued upload send
+    // re-reads the draft later, and `sendCompose` re-reads it now. Either would
+    // otherwise carry the empty copy the recovery just repaired.
+    if (threadId && resolved.storeWrite !== null) {
+      updateCompose(threadId, { text: resolved.storeWrite });
+    }
+    const thread = threadId ? threadMap.value.get(threadId) : undefined;
+    const useCodingAgent = effectiveSendMode(thread) === 'claude_code';
+    const sideQuestion = routeSideQuestion(msg, {
+      started: threadId !== null && thread !== undefined && thread.meta.state !== 'composing',
+      codex: effectiveCodingAgentBackend(thread, resolveCodingAgent(threadId)) === 'codex',
+    }, sideQuestionMode);
+    if (sideQuestion.kind === 'refuse') {
+      showToast(sideQuestion.toast, 'info');
+      return;
+    }
+    // An image that failed to upload would be left out of the message without
+    // a word. Refuse, and let the composer's upload line say why.
+    if (threadId && uploadsGate(threadId) === 'failed') {
+      markUploadBlockedSend(threadId);
+      return;
+    }
+    const context = currentChatContext();
+    // A queued send keeps the draft and fires later, which would read as a
+    // dead button. The composer's upload line says it is waiting, for as long
+    // as it waits (`uploadSendNotice`).
+    if (sideQuestion.kind === 'ask' && threadId) {
+      if (uploadInFlight) {
+        queueUploadSend(threadId, { useCodingAgent, context, asSideQuestion: true });
+        return;
+      }
+      askComposerSideQuestion(threadId, sideQuestion.question, currentImages);
+      return;
+    }
+    if (threadId && uploadInFlight) {
+      // A queued send still flips the button to the optimistic Cancel — settle.
+      armCancelSettle();
+      queueUploadSend(threadId, { useCodingAgent, context });
+      return;
+    }
+    if (el) writeComposerValue(el, '');
+    // In the centered compose layout the prompt re-docks on send. The height
+    // collapse defers to the ThreadPane FLIP, so a tall draft shrinks *and*
+    // slides into the docked state together rather than snapping short first.
+    // The FLIP consumes this flag and owns the reset in every path, so it
+    // cannot stick tall. A docked follow-up send eases down on its own.
+    const inComposeLayout = !threadId || thread?.meta.state === 'composing';
+    if (inComposeLayout) {
+      promptSendCollapsing.value = true;
+    } else if (el) {
+      easeEmptiedTextarea(el);
+    }
+    // Show the reader what they just wrote being picked up. That rests them on
+    // the live edge, armed or not (ADR 0080). It covers a typed ANSWER too,
+    // landing that on the card the text goes to. Here as well as in
+    // `addPendingMessage`, because this is the composer's own tap and must not
+    // wait on the awaited send below. Both calls describe the same submit, so
+    // the second either keeps the first's request or restates it. A reader
+    // already at the live edge is not scrolled, and a send into a thread
+    // entirely on screen writes nothing.
+    followSentMessage();
+    if (isMobile()) el?.blur();
+
+    // This constructive tap is about to morph the same button into the
+    // destructive Cancel or Stop. Arm the settle window NOW, so a laggy repeat
+    // tap cannot land on it. See `armCancelSettle`.
+    armCancelSettle();
+    await beginSend(threadId, thread, msg, currentImages, { useCodingAgent, context });
+    restoreComposerFocus();
+  }
+
+  /** Put the caret back in the composer after a send. Sending is not leaving
+   *  the composer: the next follow-up usually comes straight after, and on the
+   *  compose→docked path the prompt is re-parented by the FLIP, which drops
+   *  focus on its own. Mobile is excluded because it deliberately blurred on
+   *  submit to drop the keyboard.
+   *
+   *  Only when nobody else has claimed focus meanwhile. The send is awaited, so
+   *  by the time this runs the user may have clicked into another field. A
+   *  question card that arrived seeds focus onto its own options. Neither
+   *  should be yanked back. */
+  function restoreComposerFocus() {
+    if (isMobile()) return;
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    focusIfNeeded(inputRef.current);
+  }
+
+  /** Ask a side question from the composer: the question and every image
+   *  already uploaded. The box and the draft empty, as a send's do. Only the
+   *  box on screen is this thread's, so another thread's box is left alone. */
+  function askComposerSideQuestion(threadId: string, question: string, images: AttachedImage[]): void {
+    // The emptied box turns the button into Stop or a card's Cancel, so a
+    // laggy repeat tap must not land on it. See `armCancelSettle`.
+    armCancelSettle();
+    const el = inputRef.current;
+    if (el && el.dataset.threadId === threadId) {
+      writeComposerValue(el, '');
+      easeEmptiedTextarea(el);
+    }
+    const hashes = images.map((image) => image.hash);
+    // Before the draft clear, so the thumbnails keep their session blob URLs.
+    if (hashes.length > 0) markHashesAsSent(hashes);
+    updateCompose(threadId, { text: '', image_hashes: [] });
+    if (sideQuestionModeOn(threadId)) updateComposeSelection(threadId, { sideQuestionMode: false });
+    followSideQuestion();
+    void askSideQuestion(threadId, question, hashes);
+    restoreComposerFocus();
+  }
+
+  /** Turn side-question mode on or off for the focused thread. The text in the
+   *  box stays. Turning it on focuses the box inside the gesture, so a touch
+   *  can raise the iOS keyboard. */
+  function setSideQuestionMode(on: boolean): void {
+    const threadId = focusedThreadId.value;
+    if (!threadId) return;
+    updateComposeSelection(threadId, { sideQuestionMode: on });
+    if (on) focusIfNeeded(inputRef.current);
+  }
+
+  useSignalEffect(() => {
+    void pendingUploads.value;
+    settleQueuedUploadSends((threadId, intent) => {
+      void sendQueuedAfterUpload(threadId, intent as UploadSendIntent<ChatContext>);
+    });
+  });
+
+  function handleInput() {
+    autoResize();
+    const el = inputRef.current;
+    if (!el) return;
+    // The box now holds the user's characters rather than the composer's. Set
+    // before every early return below, so a keystroke the rest of this function
+    // declines to store is still protected from the next empty-draft sync. See
+    // `resolveEmptyDraftSync`.
+    typedSinceComposerWroteRef.current = true;
+    const val = el.value;
+    // Codex shares the legacy claude_code channel but has no slash-command
+    // surface, so Codex prompts keep the slash as normal message text.
+    const tid = focusedThreadId.value;
+    const thread = tid ? threadMap.value.get(tid) : undefined;
+    const isClaudeCodeMode = effectiveCodingAgentBackend(thread, resolveCodingAgent(tid)) === 'claude-code';
+    if (opensSlashMenu(val, isClaudeCodeMode)) {
+      writeComposerValue(el, '');
+      autoResize();
+      codingAgentMenuOpenRequest.value = '';
+      if (tid) updateCompose(tid, { text: '' });
+      return;
+    }
+    const threadId = ensureFocusedComposeThread();
+    updateCompose(threadId, { text: val });
+  }
+
+  function handlePaste(e: ClipboardEvent) {
+    // Image paste needs `clipboardData.items`. The URL-on-selection
+    // substitution below needs only `getData('text/plain')` and a selection.
+    // Do NOT gate the whole handler on `items`: WebKit can deliver a paste with
+    // usable `getData` but no items list, which would skip link substitution.
+    const items = e.clipboardData?.items;
+    if (items) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type.startsWith('image/')) {
+          e.preventDefault();
+          const file = item.getAsFile();
+          if (!file) continue;
+          addImageFile(file);
+          return; // Only process first image item
+        }
+      }
+    }
+
+    const el = inputRef.current;
+    if (!el) return;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    if (start === end) return;
+    const text = e.clipboardData?.getData('text/plain') ?? '';
+    const url = extractPasteUrl(text);
+    if (!url) return;
+    e.preventDefault();
+    const selection = escapeMarkdownLinkText(el.value.slice(start, end));
+    // setRangeText keeps the change in the textarea's native undo stack.
+    el.setRangeText(`[${selection}](${url})`, start, end, 'end');
+    handleInput();
+  }
+
+  function handleFileSelect(e: Event) {
+    const input = e.target as HTMLInputElement;
+    if (!input.files) return;
+    for (let i = 0; i < input.files.length; i++) {
+      addImageFile(input.files[i]);
+    }
+    input.value = ''; // Reset so same file can be selected again
+  }
+
+  function removeImage(index: number): void {
+    const id = focusedThreadId.value;
+    if (!id) return;
+    removeAttachedImage(id, index);
+  }
+
+  const focusedThread = focusedThreadId.value ? threadMap.value.get(focusedThreadId.value) : undefined;
+  const promptCodingAgent = effectiveCodingAgentBackend(
+    focusedThread,
+    resolveCodingAgent(focusedThreadId.value),
+  );
+
+  // Toggle visibility: visible whenever the channel choice is mutable — the
+  // compose view (no focused thread) AND a focused composing draft (state
+  // hasn't locked to active yet). Derived inline so toggles mount immediately
+  // on a state change — no useEffect sync needed.
+  const showToggles = !focusedThreadId.value || focusedThread?.meta.state === 'composing';
+  const [fading, setFading] = useState(false);
+
+  useEffect(() => {
+    if (!showToggles) {
+      setFading(true);
+      // Keep the row mounted for the length of its own opacity transition
+      // (`.input-toggles-wrapper`, `var(--duration-slow)`). Scaled by the
+      // animation-speed slider, as that transition is. An unscaled timer
+      // unmounts the row partway through a slowed fade, so the toggles pop
+      // out instead of dissolving.
+      const t = setTimeout(
+        () => setFading(false),
+        scaledDurationMs(TOGGLES_FADE_MS) + TOGGLES_FADE_SLACK_MS,
+      );
+      return () => { clearTimeout(t); setFading(false); };
+    }
+  }, [showToggles]);
+
+  const togglesMounted = showToggles || fading;
+  const togglesFading = !showToggles && fading;
+
+  const isNarrow = typeof window !== 'undefined' && window.innerWidth <= 600;
+  const images = attachedImagesForCurrentThread.value;
+  // Subscribe so the strip re-renders when uploads settle.
+  void pendingUploads.value;
+  const focusedTid = focusedThreadId.value;
+  const pending = focusedTid ? getPendingUploads(focusedTid) : [];
+  const uploadsBlocking = focusedTid ? hasInFlightUploads(focusedTid) : false;
+  const uploadSendQueued = focusedTid ? queuedUploadSends.value.has(focusedTid) : false;
+  const uploadNotice = focusedTid
+    ? uploadSendNotice(queuedUploadSends.value.get(focusedTid), uploadBlockedSends.value.has(focusedTid), pending)
+    : null;
+  // The same reading `submit()` dispatches on. See `composeHasContent`: two
+  // readings is what an enabled Send whose press does nothing is made of.
+  const hasContent = composeHasContent(composeText, images.length, uploadsBlocking);
+  void multiSelectedByToolUse.value;
+  const pendingPicks = pendingAnswers.map.value;
+  // Gate the exchange walk by status — without it, every keystroke would
+  // sort + group all events. Suppress once optimistically answered so Submit
+  // hides instead of flashing back as disabled.
+  const focusedStatus = focusedThread ? effectiveThreadStatus(focusedThread) : 'idle';
+  // While the thread waits for an answer, ANY text or image in the prompt
+  // becomes a UserQuestion answer. Multi-select goes through
+  // `submitMultiAnswer` here. Single-select and freetext are rerouted in
+  // chat/process/run.rs as `AnswerKind::FreeText`, images included, since the
+  // engine's fast path asks only whether the user typed instead of clicking.
+  const isAnsweringQuestion = focusedStatus === 'waiting_for_user_answer';
+  // One exchange walk serves both consumers: the multi-select Submit control
+  // and the placeholder. `waiting_for_user_answer` also covers coding-agent
+  // permission cards. Those are NOT `UserQuestionAsked` and never absorb typed
+  // text, so the placeholder keys off an actual pending question rather than
+  // the status alone.
+  const rawPendingQ = isAnsweringQuestion ? findLatestPendingQuestion(focusedThread) : null;
+  // Drop an optimistically-answered question here, once, so every consumer
+  // agrees the user is done with it: Submit hides AND the placeholder stops
+  // inviting an answer during the click-to-SSE gap.
+  const pendingQ = rawPendingQ && !pendingPicks.has(rawPendingQ.toolUseId) ? rawPendingQ : null;
+  const answeringQuestionCard = pendingQ !== null;
+  const sideQuestionMode = sideQuestionModeActive({
+    stored: sideQuestionModeOn(focusedThreadId.value),
+    threadStarted: focusedThread !== undefined && focusedThread.meta.state !== 'composing',
+    isCodex: promptCodingAgent === 'codex',
+  });
+  // A placeholder swap changes what the empty box has to fit without touching
+  // its value, which is all `resizeTextarea` reacts to. So each swap forces a
+  // fresh measurement. The answering placeholder is the reason: it is the
+  // longest of the three. A narrowed pane or a large UI scale wraps it where
+  // the follow-up one does not, so the box grows to it and back.
+  //
+  // A height ease in flight is re-aimed rather than overwritten, so it never
+  // ends in a snap. See `remeasureTextareaForPlaceholder`.
+  const placeholder = promptPlaceholder(!!focusedThreadId.value, answeringQuestionCard, sideQuestionMode);
+  useEffect(() => {
+    const el = inputRef.current;
+    if (el) remeasureTextareaForPlaceholder(el);
+  }, [placeholder]);
+  const pendingMultiQ = pendingQ?.multiSelect ? pendingQ : null;
+  const multiSelectedIds = pendingMultiQ ? getMultiSelectedIds(pendingMultiQ.toolUseId) : [];
+  // In side-question mode the box asks, so a multi-select card waits for the ×
+  // rather than taking the box's text as its custom answer.
+  const hasPendingMultiQ = pendingMultiQ !== null && !sideQuestionMode;
+  // Submit consumes the typed text; queued upload sends also count as already
+  // submitted so the normal Send→Cancel morph takes over while the hash lands.
+  const morphHasContent = hasContent && !hasPendingMultiQ && !uploadSendQueued;
+  // Coding agents don't use browser context — hide the pill when it won't be sent.
+  const toggleMode = effectiveSendMode(focusedThread);
+  const willUseCodingAgent = toggleMode === 'claude_code';
+  const hasUrlContext = !!panelUrl.value && !willUseCodingAgent;
+  // Per-draft coding-agent backend. Resolve the focused draft's override,
+  // falling back to the global default. The control button and the slash
+  // routing then follow the draft the user is editing.
+  const isComposingFocused = focusedThread?.meta.state === 'composing';
+  // Compose context = a focused composing draft OR the fresh no-draft compose
+  // view (no focused thread). NOT an active thread. Drives the control menus'
+  // per-draft/pending routing so a fresh-compose pick lands in the pending slot,
+  // never a global that every override-less draft reads.
+  const inComposeContext = isComposeContext(focusedThread);
+  // A focused composing draft has no backend session yet. Load controls as a
+  // compose-view menu so Codex/Claude and repo scope come from the picker,
+  // not from the server's legacy thread default. `codingAgentControlThreadId` is
+  // the active-session id; `composeControlThreadId` is the composing draft id —
+  // mutually exclusive, and the compose one keys the per-draft model/effort/scope.
+  const codingAgentControlThreadId = focusedThread?.meta.state === 'active'
+    ? focusedThreadId.value ?? undefined
+    : undefined;
+  const composeControlThreadId = isComposingFocused ? focusedThreadId.value ?? undefined : undefined;
+
+  const waitingState = getWaitingState();
+
+  // Send, Cancel and the placeholder share ONE always-rendered <button> at the
+  // same JSX position, so Preact never remounts it. The existing color
+  // transition on `.action-btn` then animates the morph instead of a hard swap.
+  // Cancel takes over when the thread has a cancel target: either the real
+  // cancellable status from `getWaitingState`, or the optimistic submitting
+  // flag bridging the click-to-SSE gap. Other `waitingState` types flow through
+  // WaitingBanner.
+  const cancelTargetId =
+    waitingState?.type === 'canceling' ? waitingState.threadId
+    : (focusedTid && submittingThreadIds.value.has(focusedTid)) ? focusedTid
+    : null;
+  const isCanceling = cancelTargetId !== null && cancelingThreadIds.value.has(cancelTargetId);
+  const bannerState = composerBannerState(waitingState, hasContent);
+
+  const morphMode = computeMorphMode({
+    hasContent: morphHasContent,
+    cancelTargetId,
+    isCanceling,
+    hasBannerOrSectionButtons: !!bannerState,
+  });
+
+  // Post-submit settle: while true, the destructive Cancel/Stop morph renders
+  // disabled so a laggy repeat tap can't abort the just-started turn. Read once
+  // here so the render subscribes to the arm/expire signal transitions; used by
+  // both the answer-control Cancel and the morph button below.
+  const cancelSettling = isCancelSettling();
+
+  // While the thread is `waiting_for_user_answer` the prompt row swaps the
+  // morph Send/Stop for a Submit-default control (`computeAnswerActionMode`).
+  // Multi-select is the only state needing the split button: its Submit is
+  // always present, so Cancel lives behind the caret. Every other state is a
+  // lone Submit, while a custom answer is typed, or a lone red Cancel. In the
+  // second the forward action lives in the card above.
+  // In side-question mode a typed box asks rather than answers. So the round
+  // morph button takes over from Submit, as during a running turn.
+  const answersCard = isAnsweringQuestion && !(sideQuestionMode && morphHasContent);
+  const answerMode = answersCard
+    ? computeAnswerActionMode({
+        pendingMultiQ: hasPendingMultiQ,
+        hasContent: morphHasContent,
+        isCanceling,
+      })
+    : null;
+
+  // TOUCH ACTIVATION for the row's actions. The user presses these with the
+  // mobile keyboard up. A tap then blurs the textarea, the keyboard starts
+  // dismissing, and the button moves out from under the finger. WebKit drops
+  // the synthetic click, so the press reads as dead with nothing on screen to
+  // say why. `touchActivated` runs the action inside the gesture instead.
+  //
+  // The morph button is ONE node that turns destructive. It keeps the touch
+  // path in both live modes. While it reads Cancel it passes `destructive`,
+  // which makes that path rule on the tap gate rather than spend it. Withheld
+  // entirely, the path left Cancel dead whenever the keyboard was up. See
+  // `docs/plans/2026-08-28-cancel-survives-the-ios-keyboard.md`.
+  //
+  // The settle window is the other half of the guard, and `disabled` alone is
+  // not it: a disabled element still receives touch events. So the destructive
+  // faces stand the touch path down while `cancelSettling`.
+  //
+  // The constructive actions blur on their own (`submit`, `submitMultiAnswer`):
+  // the suppressed click never reaches `installActionBtnBlurListener`, which
+  // listens on `click`.
+  // A hold on whichever button ends the row turns on side-question mode, and
+  // the draft stays in the box to be asked. The release that ends the hold
+  // must not also send, submit or cancel, so the hold marks itself. That
+  // release or the next press spends the mark, so it never swallows a later
+  // tap.
+  const heldSendRef = useRef(false);
+  // A mouse press moves focus off the composer, so a mouse hold hands it back
+  // for the side question to be typed. A touch hold keeps the keyboard up on
+  // its own, and focusing outside a tap cannot raise it.
+  const holdRefocusesComposerRef = useRef(false);
+  const sideQuestionRefusal = sideQuestionBlocker({
+    threadStarted: focusedThread !== undefined && focusedThread.meta.state !== 'composing',
+    isCodex: promptCodingAgent === 'codex',
+  });
+  const holdOffersSideQuestion = sideQuestionRefusal === null;
+  const sendHold = useLongPress(() => {
+    if (sideQuestionRefusal !== null) return;
+    heldSendRef.current = true;
+    // The hold took the press, so the gate must not rule on its lift. Stop
+    // asks the gate before the mark, so drift during the hold would toast.
+    morphGate.spend();
+    setSideQuestionMode(true);
+  }, () => {});
+  useSignalEffect(() => {
+    if (!promptSideQuestionRequested.value) return;
+    promptSideQuestionRequested.value = false;
+    if (sideQuestionRefusal !== null) {
+      showToast(sideQuestionRefusal, 'info');
+      return;
+    }
+    // The shortcut toggles, as the pill's × and Escape turn the mode off.
+    setSideQuestionMode(!sideQuestionMode);
+    if (!sideQuestionMode) requestAnimationFrame(() => focusIfNeeded(inputRef.current));
+  });
+  /** Whether this release ends a hold, spending the hold's mark if so. */
+  function releaseEndsHold(): boolean {
+    if (!heldSendRef.current) return false;
+    heldSendRef.current = false;
+    // This click still reaches the `.action-btn` blur listener, so the
+    // composer takes focus back a frame later.
+    if (holdRefocusesComposerRef.current) requestAnimationFrame(() => focusIfNeeded(inputRef.current));
+    return true;
+  }
+  /** The hold gesture alone. A multi-select card's Submit takes it as is,
+   *  since that button sits outside the tap gate. */
+  const ungatedHoldHandlers = {
+    onPointerDown: (e: PointerEvent) => {
+      heldSendRef.current = false;
+      holdRefocusesComposerRef.current = e.pointerType === 'mouse';
+      sendHold.onPointerDown(e);
+    },
+    onPointerMove: sendHold.onPointerMove,
+    onPointerUp: sendHold.onPointerUp,
+    onPointerLeave: sendHold.onPointerLeave,
+    onPointerCancel: sendHold.onPointerCancel,
+    onContextMenu: holdOffersSideQuestion ? sendHold.onContextMenu : undefined,
+    // A key press is never a hold's release. A right-click leaves the mark
+    // with no click to spend it.
+    onKeyDown: (e: KeyboardEvent) => {
+      if (e.key === 'Enter' || e.key === ' ') heldSendRef.current = false;
+    },
+  };
+  /** The hold gesture, feeding the tap gate, on the gated buttons that end
+   *  the row: Send, Stop, Submit, or a waiting card's lone Cancel. */
+  const holdHandlers = {
+    ...ungatedHoldHandlers,
+    onPointerDown: (e: PointerEvent) => {
+      ungatedHoldHandlers.onPointerDown(e);
+      morphGate.down(e);
+    },
+    onPointerMove: (e: PointerEvent) => {
+      sendHold.onPointerMove(e);
+      morphGate.move(e);
+    },
+    onPointerCancel: (e: PointerEvent) => {
+      sendHold.onPointerCancel(e);
+      morphGate.cancel();
+    },
+  };
+  const morphActivate = useTouchActivated(
+    () => {
+      if (releaseEndsHold()) return;
+      if (morphMode === 'send') void submit();
+      else if (morphMode === 'cancel') cancelExchangeForTarget();
+    },
+    morphMode === 'send' || (morphMode === 'cancel' && !cancelSettling),
+    morphActivationGate,
+    morphMode === 'cancel',
+  );
+  const answerSubmitActivate = useTouchActivated(() => {
+    if (releaseEndsHold()) return;
+    void submit();
+  }, true, morphActivationGate);
+  // The lone answer Cancel is its own node, so it needs its own activation.
+  // Always destructive, and stood down for the same settle window.
+  const answerCancelActivate = useTouchActivated(
+    () => {
+      if (releaseEndsHold()) return;
+      cancelExchangeForTarget();
+    },
+    !cancelSettling,
+    morphActivationGate,
+    true,
+  );
+
+  // Release the optimistic canceling flag once the cancel has landed. The set
+  // survives component re-renders by design, since the button lives in the
+  // always-visible prompt area. Without an explicit release the flag sticks
+  // across the next stream and disables the button before it is pressed.
+  //
+  // `shouldClearCanceling` releases on EITHER the thread leaving every mid-turn
+  // state OR the canceled question being replaced. The latter is the re-ask
+  // case. An agent answering a cancel by re-asking keeps the thread mid-turn
+  // throughout, so a not-mid-turn-only check would stick the button in a
+  // disabled "Cancel..." until reload.
+  useEffect(() => {
+    const focused = focusedThreadId.value;
+    if (!focused || !cancelingThreadIds.value.has(focused)) return;
+    const thread = threadMap.value.get(focused);
+    if (!thread) return;
+    const canceledQid = canceledQuestionByThread.value.get(focused);
+    const latestPendingQid = findLatestPendingQuestion(thread)?.toolUseId;
+    const canceledWhileAwaiting = canceledWhileAwaitingByThread.value.has(focused);
+    if (shouldClearCanceling(effectiveThreadStatus(thread), canceledQid, latestPendingQid, canceledWhileAwaiting)) {
+      const next = new Set(cancelingThreadIds.value);
+      next.delete(focused);
+      cancelingThreadIds.value = next;
+      setCanceledQuestion(focused, undefined);
+      setCanceledWhileAwaiting(focused, false);
+    }
+    // cancelingThreadIds.value intentionally omitted from deps — the effect
+    // writes to it, and it only needs to fire when status changes (carried by
+    // threadMap). Including it would cause an extra no-op run after each clear.
+  }, [focusedThreadId.value, threadMap.value]);
+
+  // Mirror effect for the optimistic submitting flag, which covers the
+  // click-to-SSE gap. Release it the moment either the real status takes over
+  // OR nothing is in flight behind it. A Stop is then never offered on a thread
+  // with no turn to stop. See `shouldClearSubmitting` for both arms.
+  useEffect(() => {
+    const focused = focusedThreadId.value;
+    if (!focused || !submittingThreadIds.value.has(focused)) return;
+    const thread = threadMap.value.get(focused);
+    if (!thread) return;
+    if (shouldClearSubmitting(
+      effectiveThreadStatus(thread),
+      queuedUploadSends.value.has(focused),
+    )) {
+      const next = new Set(submittingThreadIds.value);
+      next.delete(focused);
+      submittingThreadIds.value = next;
+    }
+    // See cancelingThreadIds effect above for why submittingThreadIds.value
+    // is intentionally omitted from deps.
+  }, [focusedThreadId.value, threadMap.value, queuedUploadSends.value]);
+
+  // Release the optimistic answering flag once the real projection status
+  // leaves `waiting_for_user_answer`. The resume is confirmed, or the turn
+  // finished, so the real status can drive `isRenderedThreadIdle` from here.
+  //
+  // Read RAW `meta.status`, NOT `effectiveThreadStatus`. The flag itself is
+  // what suppresses the false "Done", through `isRenderedThreadIdle`, so
+  // gating on raw status keeps the release honest against the projection.
+  useEffect(() => {
+    const focused = focusedThreadId.value;
+    if (!focused || !answeringThreadIds.value.has(focused)) return;
+    const thread = threadMap.value.get(focused);
+    if (!thread) return;
+    if (thread.meta.status !== 'waiting_for_user_answer') {
+      clearThreadAnswering(focused);
+    }
+    // See cancelingThreadIds effect above for why answeringThreadIds.value is
+    // intentionally omitted from deps.
+  }, [focusedThreadId.value, threadMap.value]);
+
+  // Bundles toggled option_ids + textarea text into one MultiSelected answer.
+  // Backend joins them with `, ` for CC.
+  async function submitMultiAnswer() {
+    if (!pendingMultiQ) return;
+    const focused = focusedThreadId.value;
+    if (!focused) return;
+    const el = inputRef.current;
+    // The same one source as `submit`. This button's own count comes from
+    // `computeSubmitMultiCount(..., composeText)`, which is the draft, so
+    // reading the textarea here enabled it from one value and answered from
+    // another. See `resolveComposerText`.
+    const resolved = resolveComposerText(getDraft(focused).text, el ? el.value : null);
+    const text = resolved.text;
+    const disagreement = composerTextDisagreementToast(resolved);
+    if (disagreement) showToast(disagreement, 'warning');
+    const ids = getMultiSelectedIds(pendingMultiQ.toolUseId);
+    const gate = uploadsGate(focused);
+    if (gate === 'failed') {
+      markUploadBlockedSend(focused);
+      return;
+    }
+    if (gate === 'in-flight') {
+      showToast(UPLOAD_BLOCKS_ANSWER_TOAST, 'info');
+      return;
+    }
+    const imageHashes = getAttachedImages(focused).map((image) => image.hash);
+    if (ids.length === 0 && text.length === 0 && imageHashes.length === 0) return;
+    // Once answered, pendingMultiQ clears and the row falls to the lone Cancel —
+    // settle so a repeat tap can't abort the resuming turn. See armCancelSettle.
+    armCancelSettle();
+    const answer: AnswerKind = {
+      kind: 'MultiSelected',
+      option_ids: ids,
+      ...(text.length > 0 ? { text } : {}),
+      ...(imageHashes.length > 0 ? { image_hashes: imageHashes } : {}),
+    };
+    pendingAnswers.set(pendingMultiQ.toolUseId, answer);
+    // Same ask as a picked option: the reader lands on the live edge once the
+    // engine confirms the answer. Called before the awaited answer below, so
+    // the reader's scroll during the round trip can still cancel it.
+    followAnsweredQuestion(pendingMultiQ.toolUseId);
+    if (el) {
+      writeComposerValue(el, '');
+      easeEmptiedTextarea(el);
+    }
+    // Before the draft clear, so the thumbnails keep their session blob URLs.
+    if (imageHashes.length > 0) markHashesAsSent(imageHashes);
+    updateCompose(focused, { text: '', image_hashes: [] });
+    setMultiSelectedIds(pendingMultiQ.toolUseId, []);
+    if (isMobile()) el?.blur();
+    const outcome = await answerThreadQuestion(focused, pendingMultiQ.toolUseId, answer);
+    // The answer replaces a typed answer to this card that was not sent.
+    if (outcome === 'sent') discardUnsentAnswers(focused, pendingMultiQ.toolUseId);
+    // Drop optimistic so the question card un-resolves and the row re-shows
+    // Submit. The action owns the only failure message.
+    else pendingAnswers.clear(pendingMultiQ.toolUseId);
+    // An unsent answer stays whole on its card, ticks and text, behind its own
+    // Retry. Handing any of it back would let Submit send part of it.
+    if (outcome === 'refused') {
+      // Hand the answer back so a retry is one tap. See
+      // `recoverableAnswerDraft` for what a fresh pick or keystroke protects.
+      const box = inputRef.current;
+      const recovered = recoverableAnswerDraft({
+        sentIds: ids,
+        sentText: text,
+        currentIds: getMultiSelectedIds(pendingMultiQ.toolUseId),
+        currentDraft: getDraft(focused).text,
+        domText: box ? box.value : null,
+      });
+      if (recovered.ids) setMultiSelectedIds(pendingMultiQ.toolUseId, recovered.ids);
+      // Through the draft, never the box: the sync effect above writes the
+      // textarea from it and resizes, so the two cannot end up disagreeing.
+      if (recovered.text !== null) updateCompose(focused, { text: recovered.text });
+      // The images come back too, unless the user attached new ones meanwhile.
+      if (imageHashes.length > 0 && getAttachedImages(focused).length === 0) {
+        updateCompose(focused, { image_hashes: imageHashes });
+      }
+    }
+    restoreComposerFocus();
+  }
+
+  const submitMultiCount = computeSubmitMultiCount(multiSelectedIds.length, composeText);
+  const submitMultiDisabled = submitMultiCount === 0 && images.length === 0;
+
+  // The Stop shortcut. It cancels exactly what the red button would, and does
+  // nothing while there is no running turn to cancel.
+  useSignalEffect(() => {
+    if (!promptStopRequested.value) return;
+    promptStopRequested.value = false;
+    untracked(cancelExchangeForTarget);
+  });
+
+  // Cancel the current exchange: abort the turn, or stamp the pending question
+  // Canceled. Shared by the morph button and the answer control's Cancel. It
+  // snapshots the targeted question id, so the cleanup effect can release the
+  // optimistic `cancelingThreadIds` flag even when the agent answers by
+  // re-asking. A queued upload-send is dropped instead, having no live turn.
+  function cancelExchangeForTarget() {
+    // Within the post-submit settle window the destructive morph is held
+    // disabled. This is the belt to the disabled prop's suspenders: a tap that
+    // slips through, fired in the same frame before disabled applied, still
+    // cannot abort the turn the user just started. See `armCancelSettle`.
+    if (isCancelSettling()) return;
+    const targetId = cancelTargetId;
+    if (!targetId) return;
+    const targetQuestionId = findLatestPendingQuestion(focusedThread)?.toolUseId;
+    // Whether a card was on screen at click time. A permission card sets no
+    // `canceledQuestionId`, not being an `UserQuestionAsked`. This bit is what
+    // keeps such a cancel bridged through `waiting_for_user_answer` instead of
+    // falling to the running-turn release. See `shouldClearCanceling`.
+    const canceledWhileAwaiting = focusedThread
+      ? effectiveThreadStatus(focusedThread) === 'waiting_for_user_answer'
+      : false;
+    if (queuedUploadSends.value.has(targetId)) {
+      clearQueuedUploadSend(targetId);
+      setCanceledQuestion(targetId, undefined);
+      setCanceledWhileAwaiting(targetId, false);
+      return;
+    }
+    setCanceledQuestion(targetId, targetQuestionId);
+    setCanceledWhileAwaiting(targetId, canceledWhileAwaiting);
+    // A submit like the other four, and taken BEFORE the awaited POST because
+    // it is the button's own tap. Past the queued-upload return above, so a
+    // cancel that sent the agent nothing moves nobody.
+    //
+    // The id is passed only while the thread is ACTUALLY awaiting an answer.
+    // `findLatestPendingQuestion` has no liveness term, so it still answers with
+    // a card the agent raced past or an abort stranded. Handed that, the landing
+    // would hold on a turn that will never draw again. See `followCanceledTurn`.
+    followCanceledTurn(canceledWhileAwaiting ? targetQuestionId : undefined);
+    void handleCancelExchange(targetId);
+  }
+
+  // The three lone-button states share ONE key ("answer-lone"), so crossing the
+  // empty-to-typed boundary morphs Cancel and Submit in place rather than
+  // remounting the node. That is the no-mobile-blink contract the morph button
+  // keeps. Multi-select uses the SplitButton, its own node.
+  const answerControl = answerMode === 'multi' ? (
+    <SplitButton
+      primaryLabel={submitMultiCount > 0 ? `Submit (${submitMultiCount})` : 'Submit'}
+      primaryClassName="action-btn action-btn-confirm"
+      primaryAriaLabel="Submit answer"
+      primaryDisabled={submitMultiDisabled}
+      primaryTouchActivate
+      primaryPressHandlers={ungatedHoldHandlers}
+      onPrimary={() => {
+        if (releaseEndsHold()) return;
+        void submitMultiAnswer();
+      }}
+      caretClassName="action-btn action-btn-confirm"
+      caretAriaLabel="Cancel this question"
+      menuItems={[{
+        key: 'cancel',
+        label: 'Cancel',
+        className: 'action-btn action-btn-danger',
+        // This path exists only while a multi-select question is pending, so the
+        // question-specific wording always applies here.
+        tooltip: ANSWER_CANCEL_TOOLTIP,
+        onClick: cancelExchangeForTarget,
+      }]}
+    />
+  ) : answerMode === 'canceling' ? (
+    <button key="answer-lone" type="button" class="action-btn action-btn-danger" disabled aria-label="Canceling" data-row-item>
+      Canceling…
+    </button>
+  ) : answerMode === 'submit' ? (
+    <button
+      key="answer-lone"
+      type="button"
+      class="action-btn action-btn-confirm"
+      {...holdHandlers}
+      onTouchStart={answerSubmitActivate.onTouchStart}
+      onTouchMove={answerSubmitActivate.onTouchMove}
+      onTouchCancel={answerSubmitActivate.onTouchCancel}
+      onTouchEnd={answerSubmitActivate.onTouchEnd}
+      onClick={answerSubmitActivate.onClick}
+      aria-label="Submit answer"
+      data-tooltip={
+        uploadsBlocking ? 'Send after image upload'
+        : holdOffersSideQuestion ? tooltipWithShortcut('Send answer. Hold for a side question', 'askSideQuestion')
+        : 'Send answer'
+      }
+      data-row-item
+    >
+      Submit
+    </button>
+  ) : answerMode === 'cancel' ? (
+    // Lone destructive Cancel — keep the scroll-vs-tap gate so an iOS PWA scroll
+    // can't land a one-tap abort (the concern that drove the morph gate).
+    <button
+      key="answer-lone"
+      type="button"
+      class="action-btn action-btn-danger"
+      // Held disabled for the post-submit settle window. The Submit the user
+      // just pressed morphed into this Cancel, so a laggy repeat tap must not
+      // abort the resuming turn. `cancelExchangeForTarget` belts the same check.
+      disabled={cancelSettling}
+      // The scroll-vs-tap gate rides inside the hold handlers.
+      {...holdHandlers}
+      // The touch path runs the abort inside the gesture, because iOS drops
+      // the click when the keyboard dismisses under the finger. Being
+      // destructive, it rules on the gate: a press that travelled is refused
+      // on both paths. It must never cancel `mousedown` to hold that click.
+      // On iOS a cancelled event stops the rest of the synthesized sequence.
+      onTouchEnd={answerCancelActivate.onTouchEnd}
+      onClick={answerCancelActivate.onClick}
+      aria-label="Cancel"
+      // A pending question card gets the wording that says what Cancel does to
+      // it; a permission card (same button, no typed-text escape) keeps "Stop".
+      data-tooltip={answeringQuestionCard ? ANSWER_CANCEL_TOOLTIP : tooltipWithShortcut('Stop', 'stopThread')}
+      data-row-item
+    >
+      Cancel
+    </button>
+  ) : null;
+
+  // The row's right-hand members. With the banner suppressed the standalone
+  // pair stands in. So a branch with commits always shows a Diff whatever the
+  // coding agent's run-state, and a still-working thread can still arm an apply
+  // (ADR 0168). Both FOLD, like everything between the menu and the send.
+  const bannerActions = bannerState ? getBannerActions(bannerState) : getStandaloneActions();
+  const sendButton = morphMode !== 'hidden' ? (
+    <button
+      key="send-cancel-morph"
+      class={
+        'action-btn send-cancel-morph send-cancel-round'
+        + (morphMode === 'placeholder' ? ' morph-placeholder' : '')
+        + (morphMode === 'cancel' && cancelSettling ? ' morph-settling' : '')
+      }
+      {...holdHandlers}
+      onTouchStart={morphActivate.onTouchStart}
+      onTouchMove={morphActivate.onTouchMove}
+      onTouchCancel={morphActivate.onTouchCancel}
+      onTouchEnd={morphActivate.onTouchEnd}
+      onClick={morphActivate.onClick}
+      aria-label={morphMode === 'cancel' || morphMode === 'canceling' ? 'Cancel'
+        : sideQuestionMode ? 'Ask side question' : 'Send message'}
+      aria-hidden={morphMode === 'placeholder' ? 'true' : undefined}
+      tabIndex={morphMode === 'send' || morphMode === 'cancel' ? undefined : -1}
+      disabled={
+        morphMode === 'send' ? false
+        // Hold the just-morphed Stop disabled for the post-submit settle window
+        // so a laggy repeat tap of Send can't immediately cancel the turn.
+        : morphMode === 'cancel' ? cancelSettling
+        : true
+      }
+      data-tooltip={
+        morphMode === 'cancel' && holdOffersSideQuestion ? tooltipWithShortcut('Stop. Hold for a side question', 'stopThread')
+        : morphMode === 'cancel' ? tooltipWithShortcut('Stop', 'stopThread')
+        : morphMode === 'canceling' ? 'Stopping…'
+        : morphMode === 'send' && uploadsBlocking ? 'Send after image upload'
+        : morphMode === 'send' && sideQuestionMode ? 'Ask side question'
+        : morphMode === 'send' && holdOffersSideQuestion ? tooltipWithShortcut('Send. Hold for a side question', 'askSideQuestion')
+        : morphMode === 'send' ? 'Send'
+        : undefined
+      }
+      data-row-item
+    >
+      {/* Icon-only: an up-arrow for send, a stop-square while a turn is
+          running/canceling. One stable element swaps only its glyph +
+          aria-label/tooltip between states: no unmount, so no mobile blink. */}
+      {morphMode === 'cancel' || morphMode === 'canceling'
+        ? <StopIcon />
+        : <SendArrowIcon />}
+    </button>
+  ) : null;
+  // `.thread-action-buttons` is the e2e hook for a visible banner with action
+  // buttons. Keep it bound to `bannerState`, so the selector flips with the
+  // banner. The row wrapper itself always renders.
+  const rowClass = bannerState
+    ? 'prompt-actions-row thread-action-buttons'
+    : 'prompt-actions-row';
+  // ── The row's FOLDABLE members, in FOLD ORDER ──
+  //
+  // One list, and the fold takes a PREFIX of it. So the head goes into the ⋯
+  // menu first, and the last member standing is the one nearest the thumb. The
+  // order is also the row's own, so a row with room to spare is unchanged.
+  //
+  // The two STATUS readouts head it: an action the thumb reaches for outranks a
+  // readout, and a folded readout still says its state in words on its menu
+  // row. The follow and call toggles are LAST, so their fixed slots hold at
+  // every width that can show them.
+  //
+  // Only the control menu and the send button never fold, and those two fit at
+  // any width the app supports. So a row too narrow for its members is not a
+  // state this can settle in.
+  const foldActions: HeaderActionSpec[] = [];
+  const todoAction = promptCodingAgent === null ? todoIndicatorAction() : null;
+  if (todoAction) foldActions.push(todoAction);
+  const waitingAction = waitingIndicatorAction();
+  if (waitingAction) foldActions.push(waitingAction);
+  const wipAction = wipPreviewAction(focusedThread);
+  if (wipAction) foldActions.push(wipAction);
+  foldActions.push({
+    key: 'attach-image',
+    dataRole: 'attach-image',
+    label: 'Attach image',
+    tooltip: 'Attach image',
+    icon: () => <ImageIcon />,
+    // Folded, and on a narrow row, this IS the file picker. The `.click()` is
+    // dispatched inside the menu item's own click, which <Overlay> treats as
+    // inside and therefore does not swallow.
+    onClick: () => fileInputRef.current?.click(),
+    // Both full-size buttons run on touchend through composeHandlers, so a tap
+    // leaves focus on the prompt and the iOS keyboard stays up.
+    //
+    // The narrow one passes no focus nudge: a closed keyboard stays closed, and
+    // no focus moves inside the gesture that opens the picker.
+    render: isNarrow ? (attrs) => (
+      <button
+        {...attrs}
+        class="icon-btn header-icon"
+        {...composeHandlers(() => fileInputRef.current?.click(), () => {})}
+        data-tooltip="Attach image"
+        aria-label="Attach image"
+      >
+        <ImageIcon />
+      </button>
+    ) : (attrs) => (
+      // The wide row keeps the Camera / File popover, which the default button
+      // cannot express: it is an anchor hosting an <Overlay> of its own.
+      <div class="image-attach-anchor" ref={menuRef} {...attrs}>
+        <button
+          class="icon-btn header-icon"
+          {...composeHandlers(() => { attachMenuOpen.value = !attachMenuOpen.value; })}
+          data-tooltip="Attach image"
+          aria-label="Attach image"
+        >
+          <ImageIcon />
+        </button>
+        <Overlay
+          open={attachMenuOpen.value}
+          onClose={() => { attachMenuOpen.value = false; }}
+          anchor={menuRef.current}
+          backdrop={false}
+          panelClass="surface-box image-attach-menu"
+        >
+          <button onClick={() => { attachMenuOpen.value = false; cameraOpen.value = true; }}>
+            <CameraIcon />
+            Camera
+          </button>
+          <button onClick={() => { attachMenuOpen.value = false; fileInputRef.current?.click(); }}>
+            <FileIcon />
+            File
+          </button>
+        </Overlay>
+      </div>
+    ),
+  });
+  // CLEAR THE DRAFT, deliberately not a second control on the right edge. What
+  // the corner placement cost the field, and why this one carries no rule of
+  // its own, is in `__tests__/composer-single-right-anchor.test.ts`.
+  //
+  // It joins the list only while there is a draft to clear, so the row reserves
+  // no box for it.
+  if (hasText) {
+    foldActions.push({
+      key: 'prompt-clear',
+      extraClass: 'prompt-clear',
+      label: 'Clear draft',
+      icon: () => <ClearIcon />,
+      onClick: () => {
+        const el = inputRef.current;
+        if (!el) return;
+        writeComposerValue(el, '');
+        const id = focusedThreadId.value;
+        if (id) updateCompose(id, { text: '' });
+        autoResize();
+        el.focus();
+      },
+    });
+  }
+  // Everything pushed so far renders at the ⋯'s own position, between the fixed
+  // toggles and the right-hand cluster.
+  const middleActions = foldActions.slice();
+  // The right-hand members, then the two fixed toggles. Those fold LAST, which
+  // is what keeps their slots stable at every width that can hold them.
+  foldActions.push(...bannerActions);
+  const toggles = promptRowToggles(promptCodingAgent, inComposeContext, focusedThread);
+  foldActions.push(...toggles.fold);
+
+  // Where each member renders. The cluster declares a gap and the rest of the
+  // row does not. So a member folding out of the cluster takes a gap with it.
+  const clusterKeys = new Set(bannerActions.map((a) => a.key));
+  const foldSignature = foldActions.map((a) => a.key).join(' ');
+  const foldKeys = useMemo(() => foldActions.map((a) => a.key), [foldSignature]);
+  const foldGroups = useMemo<FoldGroup[]>(
+    () => foldActions.map((a) => (clusterKeys.has(a.key) ? 'cluster' : 'row')),
+    [foldSignature],
+  );
+  const collapsedActions = usePromptActionCollapse(promptActionsAreaRef, foldKeys, foldGroups);
+  const foldedKeys = new Set(foldActions.slice(0, collapsedActions).map((a) => a.key));
+  const hidden = foldActions.slice(0, collapsedActions);
+  /** Is this member still wearing its own box, rather than sitting in the ⋯? */
+  const standing = (a: HeaderActionSpec) => !foldedKeys.has(a.key);
+  /** The row attributes a member carries: the measurement marker, and the name
+   *  the width cache remembers it by once it folds. */
+  const foldAttrs = (key: string) => ({ 'data-row-item': 'fold', [FOLD_KEY_ATTR]: key });
+  // A fold moves controls between the row and the ⋯ menu, so an open popover's
+  // anchor can leave the DOM under it. A panel pinned to a detached box is
+  // positioned against nothing. Close them all on a step rather than pick.
+  useEffect(closeFoldedPanels, [collapsedActions]);
+
+  return (
+    <div class="prompt-input-container">
+      {(images.length > 0 || pending.length > 0) && (
+        <div key="images" class="image-preview-strip">
+          {images.map((img, i) => (
+            <div class="image-preview-item" key={`hash-${img.hash}`}>
+              <BlobImage
+                src={img.previewUrl}
+                class="image-preview-thumb"
+                onClick={(e) => openImagePopupFromGroup(e.currentTarget.src, e.currentTarget)}
+              />
+              <button class="icon-btn image-preview-remove" onClick={() => removeImage(i)} aria-label="Remove" data-tooltip="Remove"><CloseIcon /></button>
+            </div>
+          ))}
+          {pending.map((p) => (
+            <PendingUploadChip
+              key={`pending-${p.localId}`}
+              upload={p}
+              onOpen={(img) => openImagePopupFromGroup(img.src, img)}
+              onRetry={() => void retryPendingUpload(p.threadId, p.localId)}
+              onRemove={() => cancelPendingUpload(p.threadId, p.localId)}
+            />
+          ))}
+        </div>
+      )}
+      {uploadNotice && (
+        <div
+          key="upload-notice"
+          class={`upload-send-notice upload-send-notice-${uploadNotice.kind}`}
+          data-role="upload-send-notice"
+          role="status"
+        >
+          {uploadNotice.kind === 'queued' ? <span class="mini-spinner" aria-hidden="true" /> : <WarningIcon />}
+          <span>{uploadSendNoticeText(uploadNotice)}</span>
+        </div>
+      )}
+      {togglesMounted && <div key="toggles" class={`input-toggles-wrapper${togglesFading ? ' fading-out' : ''}`}>
+        <ComposeDestinationRow
+          threadId={focusedThreadId.value}
+          toggleMode={toggleMode}
+          fading={togglesFading}
+        />
+      </div>}
+      {hasUrlContext && (
+        <div class="url-context-pill" data-tooltip={panelUrl.value ?? undefined}>
+          <GlobeIcon />
+          <span class="url-context-label">{panelTitle.value || 'Page content'}</span>
+        </div>
+      )}
+      <Disclosure key="side-question-mode" open={sideQuestionMode}>
+        <div class="side-question-mode-pill" data-role="side-question-mode">
+          <span>Side question</span>
+          <button
+            type="button"
+            class="icon-btn side-question-mode-leave"
+            aria-label="Back to a normal message"
+            data-tooltip="Back to a normal message"
+            onClick={() => setSideQuestionMode(false)}
+          >
+            <CloseIcon />
+          </button>
+        </div>
+      </Disclosure>
+      <NotReadyStrip key="not-ready" />
+      <div key="prompt-box" class="prompt-box">
+        <div class="prompt-row">
+          <textarea
+            ref={inputRef}
+            class="prompt-textarea"
+            data-role="prompt-input"
+            data-thread-id={tid ?? ''}
+            {...PROSE_TEXT_ATTRS}
+            placeholder={placeholder}
+            rows={1}
+            onInput={handleInput}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            // Writing in the prompt means working in the chat — keep the focused
+            // pane in sync however focus arrived (click, type-to-focus, Tab,
+            // programmatic). focusPane is signal-only + no-op on mobile, so this
+            // can't loop with the pane-focus DOM-focus logic.
+            onFocus={() => focusPane('thread')}
+          />
+        </div>
+        {/* Single hidden file input lives at the top of prompt-box so the menu
+            open/close re-render never unmounts it mid-tap. Photo buttons below
+            trigger via `.click()` (the proven pattern from 0.7.2). Hidden via
+            `.visually-hidden` (off-screen, in layout) — `display:none` is what
+            HiddenFileInput's docs blame for dropping the iOS PWA change event,
+            so we match that even though .click() is a synthetic dispatch. */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          multiple
+          class="visually-hidden"
+          tabIndex={-1}
+          aria-hidden="true"
+          onChange={handleFileSelect}
+        />
+        <div class={rowClass} ref={promptActionsAreaRef}>
+          <PromptRowControls
+            codingAgent={promptCodingAgent}
+            codingAgentThreadId={codingAgentControlThreadId}
+            composeThreadId={composeControlThreadId}
+            lucidosThreadId={focusedThreadId.value ?? undefined}
+            composeContext={inComposeContext}
+            toggles={toggles.row.filter(standing)}
+            attrsFor={foldAttrs}
+          />
+          {/* The ⋯ holds every folded member, from BOTH ends of the row, and it
+              sits here so a surviving right-hand button still renders on the
+              right. Folding never moves a button across the row. */}
+          {hidden.length > 0 && (
+            <OverflowMenu
+              ariaLabel="More actions"
+              extraClass="prompt-actions-more"
+              triggerAttrs={MORE_TRIGGER_ATTRS}
+              onOpen={closeFoldedPanels}
+              items={(ctx) => hidden.map((a) => renderMenuAction(a, ctx))}
+            />
+          )}
+          {middleActions.filter(standing).map((a) => (
+            <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment>
+          ))}
+          <div class="prompt-actions-right">
+            {bannerActions.filter(standing).map((a) => (
+              <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment>
+            ))}
+            {answersCard ? answerControl : sendButton}
+          </div>
+        </div>
+      </div>
+      {/* The two indicator panels, mounted here rather than by their controls:
+          a control that folds into the ⋯ menu unmounts its button, and the
+          panel has to outlive that. Both portal, so this is placement only. */}
+      <TodoPanelSlot />
+      <WaitingPanelHost />
+    </div>
+  );
+}

@@ -1,0 +1,253 @@
+/* AUTO-GENERATED. Do not edit by hand.
+   Regenerate: cargo test -p lucidos-engine --lib generate_theme_parts_files -- --ignored
+
+   Source of truth: crates/lucidos-engine/src/core/themes/theme-parts.json
+   and the colour tokens of theme-tokens.json.
+*/
+
+/* Every colour token this realm defines is a <color>, so a var() in a part
+   value substitutes a computed colour, never text that could add a shadow
+   layer. */
+@property --bg-primary {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #07172e;
+}
+
+@property --bg-secondary {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #0d2244;
+}
+
+@property --bg-tertiary {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #163052;
+}
+
+@property --bg-quaternary {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #21406c;
+}
+
+@property --bg-hover {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #122a4a;
+}
+
+@property --bg-selected {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #163356;
+}
+
+@property --border-color {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #2c456a;
+}
+
+@property --surface-bg {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #0d2244;
+}
+
+@property --text-primary {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #e6edf3;
+}
+
+@property --text-secondary {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #8b949e;
+}
+
+@property --text-muted {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #6e7681;
+}
+
+@property --text-on-accent {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #ffffff;
+}
+
+@property --text-strong {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #f0f4f8;
+}
+
+@property --accent {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #58a6ff;
+}
+
+@property --accent-light {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #7ab8ff;
+}
+
+@property --accent-action {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #2579d8;
+}
+
+@property --brand-blue {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #1a6fd0;
+}
+
+@property --brand-blue-deep {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #0a4ea8;
+}
+
+@property --accent-green {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #3fb950;
+}
+
+@property --accent-yellow {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #d9c48f;
+}
+
+@property --accent-red {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #f85149;
+}
+
+/* A protected surface: no part token reaches inside, and no inherited
+   part paint flows in from a container. */
+.protected-surface {
+    --part-chat-text-color: initial;
+    --part-chat-text-text-shadow: initial;
+    --part-chat-text-letter-spacing: initial;
+    --part-chat-heading-color: initial;
+    --part-chat-heading-text-shadow: initial;
+    --part-chat-heading-letter-spacing: initial;
+    --part-chat-link-color: initial;
+    --part-chat-link-text-shadow: initial;
+    --part-inline-code-color: initial;
+    --part-inline-code-background-color: initial;
+    --part-code-block-background-color: initial;
+    --part-code-block-box-shadow: initial;
+    --part-code-block-text-shadow: initial;
+    --part-actor-label-text-shadow: initial;
+    --part-actor-label-letter-spacing: initial;
+    --part-actor-icon-filter: initial;
+    --part-header-icon-filter: initial;
+    --part-header-title-text-shadow: initial;
+    --part-header-title-letter-spacing: initial;
+    --part-composer-background-color: initial;
+    --part-composer-border-color: initial;
+    --part-composer-box-shadow: initial;
+    --part-composer-text-color: initial;
+    --part-composer-text-caret-color: initial;
+    --part-composer-text-caret-shape: initial;
+    --part-composer-text-text-shadow: initial;
+    --part-composer-text-letter-spacing: initial;
+    --part-card-border-style: initial;
+    --part-card-border-width: initial;
+    --part-card-border-color: initial;
+    --part-surface-border-style: initial;
+    --part-surface-border-width: initial;
+    --part-surface-border-color: initial;
+    --part-screen-background-image: initial;
+    --part-app-text-text-shadow: initial;
+    --part-app-text-letter-spacing: initial;
+    --part-app-link-text-decoration-color: initial;
+    --part-app-link-text-shadow: initial;
+    --part-app-control-border-color: initial;
+    --part-app-control-box-shadow: initial;
+}
+
+:where(.protected-surface) {
+    caret-color: auto;
+    caret-shape: auto;
+    color: var(--text-primary);
+    letter-spacing: normal;
+    text-shadow: none;
+}
+
+/* theme-effects: reduce drops every part effect: shadows, filters and
+   scanlines. On body, because the tokens sit inline on <html>, where no
+   rule can beat them. */
+html[data-theme-effects="reduce"] body {
+    --part-chat-text-text-shadow: initial;
+    --part-chat-heading-text-shadow: initial;
+    --part-chat-link-text-shadow: initial;
+    --part-code-block-box-shadow: initial;
+    --part-code-block-text-shadow: initial;
+    --part-actor-label-text-shadow: initial;
+    --part-actor-icon-filter: initial;
+    --part-header-icon-filter: initial;
+    --part-header-title-text-shadow: initial;
+    --part-composer-box-shadow: initial;
+    --part-composer-text-text-shadow: initial;
+    --part-screen-background-image: initial;
+    --part-app-text-text-shadow: initial;
+    --part-app-link-text-shadow: initial;
+    --part-app-control-box-shadow: initial;
+}
+
+/* An app frame that opts out paints no part. */
+html[data-theme-parts="off"] body {
+    --part-chat-text-color: initial;
+    --part-chat-text-text-shadow: initial;
+    --part-chat-text-letter-spacing: initial;
+    --part-chat-heading-color: initial;
+    --part-chat-heading-text-shadow: initial;
+    --part-chat-heading-letter-spacing: initial;
+    --part-chat-link-color: initial;
+    --part-chat-link-text-shadow: initial;
+    --part-inline-code-color: initial;
+    --part-inline-code-background-color: initial;
+    --part-code-block-background-color: initial;
+    --part-code-block-box-shadow: initial;
+    --part-code-block-text-shadow: initial;
+    --part-actor-label-text-shadow: initial;
+    --part-actor-label-letter-spacing: initial;
+    --part-actor-icon-filter: initial;
+    --part-header-icon-filter: initial;
+    --part-header-title-text-shadow: initial;
+    --part-header-title-letter-spacing: initial;
+    --part-composer-background-color: initial;
+    --part-composer-border-color: initial;
+    --part-composer-box-shadow: initial;
+    --part-composer-text-color: initial;
+    --part-composer-text-caret-color: initial;
+    --part-composer-text-caret-shape: initial;
+    --part-composer-text-text-shadow: initial;
+    --part-composer-text-letter-spacing: initial;
+    --part-card-border-style: initial;
+    --part-card-border-width: initial;
+    --part-card-border-color: initial;
+    --part-surface-border-style: initial;
+    --part-surface-border-width: initial;
+    --part-surface-border-color: initial;
+    --part-screen-background-image: initial;
+    --part-app-text-text-shadow: initial;
+    --part-app-text-letter-spacing: initial;
+    --part-app-link-text-decoration-color: initial;
+    --part-app-link-text-shadow: initial;
+    --part-app-control-border-color: initial;
+    --part-app-control-box-shadow: initial;
+}

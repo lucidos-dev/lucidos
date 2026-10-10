@@ -1,0 +1,847 @@
+import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, awaitedThreadId, drawerGrouping, selectedOngoingGroup, threadSearchQuery, threadSearchResults } from '../store';
+import { appliedThreadFilter } from '../appliedThreadFilter';
+import { revealThreadPane } from './pane';
+import type { ThreadMeta, ThreadSection, ThreadState } from '../thread-events';
+import { deepLinkAnchorInThread, describeWaitSubscription, NO_CHANGE } from '../thread-events';
+import type { ConfirmDetailGroup, ConfirmDetails } from '../types';
+import { threadPassesChannelFilter } from '../threadFilter';
+import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, ongoingGroupLists } from '../../components/drawer/family-graph';
+import type { FamilyGraph } from '../../components/drawer/family-graph';
+import { saveThread, unsaveThread, archiveThread, unarchiveThreads, type ArchiveSkippedMember } from '../../api/threads';
+import { ApiError, putComposeOnThread } from '../../api/client';
+import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, sectionMutatedAt, threadEventsStillArriving } from './thread-loading';
+import { refreshThreadList } from './thread-list-refresh';
+import { clearDraft, draftPresentThreadIds, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll, stopFollowingBottom } from '../../components/chat/scrollState';
+import { pushThreadNavState } from './thread-navigation';
+import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
+import { markThreadOpenStart } from '../../utils/threadOpenMarks';
+import { errorDetail } from '../../utils/errorDetail';
+import { pruneRecents } from './entityReferences';
+import { BLOCKER_REASON, blockedRefusal, type BlockedRefusal } from './blockerCopy';
+import { collectThreadFamily } from './threadFamily';
+
+// ---------------------------------------------------------------------------
+// Thread CRUD
+// ---------------------------------------------------------------------------
+
+export interface FocusThreadOptions {
+  /** When set, after the thread loads, scroll the matching event card into
+   *  view and briefly pulse it. Used by notification deep-links so a push
+   *  for a `UserQuestionAsked` lands on that exact question, not the bottom
+   *  of the thread or the user's last saved scroll. Overrides the default
+   *  scroll-to-bottom / restore-saved-scroll behavior. */
+  targetEventId?: string | null;
+  /** When set, after the thread loads, scroll to the turn that produced this
+   *  change (stamped with `data-change-id` by `ChatExchange`) and pulse it.
+   *  Used by the Changes panel so a row lands on its own diff event rather than
+   *  the bottom of the thread — the change isn't necessarily the last turn.
+   *  Same scroll/suppression contract as `targetEventId`; ignored when
+   *  `targetEventId` is also set. */
+  targetChangeId?: string | null;
+  /** Default true: focusing a thread is navigation, so it surfaces the thread
+   *  pane (`revealThreadPane`: mobile swipes, desktop re-activates the Threads
+   *  pane group). Pass `false` for a focus change that is BOOKKEEPING rather
+   *  than navigation, i.e. the post-archive hand-off in `handleArchiveThread`.
+   *  There the focus moves to the next row so the thread pane isn't left
+   *  pointing at an archived thread, but the user never asked to go there, and
+   *  on mobile the thread drawer IS a pane, so revealing would swipe them off
+   *  the list they're triaging. Mirrors `unfocusThread({ revealPane: false })`. */
+  revealPane?: boolean;
+  /** Where the navigate came from, when it was not a direct click: a sibling
+   *  thread's `NavigationRequested`, an app iframe, a notification. Named in the
+   *  miss toast so a failure says who asked, the way the `app` and `trigger`
+   *  branches of `handleNavigationRequest` already do. */
+  source?: string;
+}
+
+export function focusThread(threadId: string, options?: FocusThreadOptions): void {
+  const wasFocused = focusedThreadId.value === threadId;
+  // A standing follow belongs to the thread it was armed in, so opening a
+  // DIFFERENT one retires it. The position this open restores to may BE that
+  // thread's bottom, which writes no scroll for the reader-moved disarm to see.
+  //
+  // BEFORE the focus moves. A signal assignment runs its subscribers
+  // synchronously, and none of them may find the outgoing ride still armed.
+  //
+  // The thread being LEFT loses nothing. Its request was recorded as the
+  // live-edge form of its reading position. Only a ride starting reaches the
+  // recording side, so a retire writes nothing (see `onFollowRideStarted`).
+  // Re-entry resumes it.
+  //
+  // Re-focusing the thread already open is not an open, and retires nothing.
+  // `useScrollMemory` does not re-run on an unchanged key, so a retire would end
+  // a follow with nothing left to resume it. The one caller arriving with the
+  // focus already moved is `focusThreadOrBootstrapResult`'s miss path, which
+  // retires at its own optimistic focus instead.
+  if (!wasFocused) stopFollowingBottom();
+  setFocusedThread(threadId);
+  rememberOpenedViewRows(threadId);
+  resetCodingAgentPendingPreferences();
+  // Focusing a thread does NOT position its transcript. `useScrollMemory` owns
+  // that: a saved position is restored, and a thread with none opens at the top
+  // of what is rendered (see ThreadView's `resetOnEmpty`). A deep-link target
+  // (event or change) overrides both, via the matching scrollTo*AndPulse below.
+  const targetEventId = options?.targetEventId ?? null;
+  // targetEventId wins when both are set (notification deep-link is more
+  // specific than a Changes-row landing on the originating turn).
+  const targetChangeId = targetEventId ? null : (options?.targetChangeId ?? null);
+  const hasTarget = !!targetEventId || !!targetChangeId;
+  // A plain focus (no deep-link target) cancels any in-flight deep-link scroll
+  // claim from a prior focus, so its suppression can't leak onto this thread's
+  // load. A deep-link focus re-claims below via scrollTo*AndPulse.
+  if (!hasTarget) clearPendingEventScroll();
+  // notAtTop is NOT reset here — syncNotAtTop() in the scroll listener owns
+  // it exclusively. Manual resets cause the chevron to vanish when no scroll
+  // event fires (e.g. re-focusing the same thread where scrollTop is unchanged).
+
+  // Perf: stamp the open-start for the `thread-render` mark. This is the WARM
+  // half; `loadThreadEvents` owns the cold half, under its `eventsLoaded`
+  // return. A warm thread fetches nothing. So without this, a thread visited
+  // once this session was never measured again, and back / forward between
+  // visited threads left no sample at all.
+  //
+  // `!wasFocused` is what makes it an OPEN rather than any call that happens
+  // to name the focused thread. A re-tap of the thread already on screen
+  // renders nothing. The next streamed event would take the mark instead, and
+  // report a render lasting as long as the reader sat still.
+  // Fire-and-forget telemetry; see utils/threadOpenMarks.ts.
+  if (!wasFocused) {
+    markThreadOpenStart(threadId, {
+      ...currentPerfBaseline(),
+      warm: threadMap.value.get(threadId)?.eventsLoaded ?? false,
+    });
+  }
+
+  // Lazy-load events for this thread if not already loaded
+  loadThreadEvents(threadId);
+  // And catch it up if it IS loaded but a sync point (an iOS PWA wake, an SSE
+  // reopen, a `Lagged`) marked it as possibly behind. Those no longer fetch every
+  // loaded thread; they mark, and this is where the mark is paid, on the one
+  // thread the user is actually opening. No-op for a thread with no mark.
+  refreshStaleThreadEvents(threadId);
+
+  pushThreadNavState({ type: 'thread', id: threadId });
+
+  // Surface the focused thread on the pane the user is actually working in:
+  // mobile swipes to the thread pane, desktop re-activates the Threads pane
+  // group from the cross-group case. Without this, callers like toast onClick
+  // and search would set the focused thread but leave the user on whichever
+  // pane they were on. See `revealThreadPane` (the mirror of revealContentPane).
+  // `revealPane: false` opts out for a bookkeeping focus change (see the option).
+  if (options?.revealPane !== false) revealThreadPane();
+
+  // A deep-link whose target never renders used to end in silence, so the tap
+  // just looked broken. Either the event is not in this thread, or it renders
+  // nothing. scrollState calls back here for the words, staying free of the
+  // `store` import that `showToast` would drag in.
+  //
+  // The message deliberately does NOT claim where the user was taken, because
+  // they are not taken anywhere: the transcript stays exactly where it was, and
+  // the toast is the whole recovery. It does not name the SOURCE either: a notification tap is no longer the only way in, since the event-wait
+  // card's "show it" (`showEventWhereItLives`) lands here too, and telling that
+  // user about a notification they never received would be a plain lie.
+  //
+  // A THIRD case is not a failure and no longer reports: this thread's events
+  // were still arriving. The message is a VERDICT about what the thread holds.
+  // The calls above started that load, so the deadline used to race a fetch
+  // this function had just issued. See `DeepLinkOptions.stillArriving`.
+  if (targetEventId) {
+    landOnEvent(threadId, targetEventId);
+  } else if (targetChangeId) {
+    scrollToChangeAndPulse(targetChangeId, {
+      stillArriving: () => threadEventsStillArriving(threadId),
+      onUnresolved: () => showToast(
+        'That change is not shown in this thread.',
+        'warning',
+      ),
+    });
+  }
+
+  // No auto-read — user must explicitly click Archive, Apply, or Discard.
+}
+
+/** Scroll the open thread to `eventId` and pulse it, or say why it can't.
+ *  `focusThread`'s event deep link, and the late landing of a Blocked
+ *  open whose target was only known once the events arrived. An event drawn as
+ *  a step lands on the turn holding it. */
+export function landOnEvent(threadId: string, eventId: string): void {
+  scrollToEventAndPulse(eventId, {
+    anchorFor: () => deepLinkAnchorInThread(threadMap.value.get(threadId), eventId),
+    stillArriving: () => threadEventsStillArriving(threadId),
+    onUnresolved: () => showToast(
+      'That event is not shown in this thread.',
+      'warning',
+    ),
+  });
+}
+
+/** Focus a thread the engine has just spawned for us, naming the id it returned.
+ *
+ *  Plain `focusThread` is wrong here and silently lands the user on the compose
+ *  view. It sets the focused id and nothing else. `loadThreadEvents` bails on a
+ *  thread that is not in `threadMap`, so `ThreadView` reads the focused id as a
+ *  stale pointer and unfocuses it. The row reaches this client over SSE, which
+ *  can land after the response that named the thread. So the thread is
+ *  legitimately absent for a moment.
+ *
+ *  Claiming the await says so. ThreadView holds its delay-gated skeleton
+ *  instead, and the transcript appears the moment the row arrives.
+ *
+ *  Not `focusThreadOrBootstrap` either. A merely QUEUED spawn owns no
+ *  `thread_summaries` row, so the fetch 404s and the miss path drops the focus
+ *  back where it came from. */
+export function focusSpawnedThread(threadId: string, options?: FocusThreadOptions): void {
+  // Before the focus, so `setFocusedThread`'s move-away clear sees its own id.
+  awaitedThreadId.value = threadId;
+  focusThread(threadId, options);
+}
+
+/** Why a bootstrap-and-focus attempt ended. The distinction is load-bearing for
+ *  the cross-workspace `#thread=` landing (see `hash-deeplink-router`): a
+ *  `not-found` is a verdict from the engine and must not be retried, while a
+ *  `failed` is a transport / server error that a peer engine still lazy-starting
+ *  behind the gateway routinely produces on the first request. */
+export type FocusBootstrapOutcome =
+  | { kind: 'focused' }
+  | { kind: 'not-found' }
+  | { kind: 'failed'; error: unknown };
+
+/** Focus a thread by id, fetching its metadata first if it's not already in
+ *  the loaded list (e.g. an old archived thread beyond the Archive per-source
+ *  window, or a thread reached via cross-workspace deep link), and report how it
+ *  went. Toast-free by design: the caller owns the user-facing message, because
+ *  a caller holding durable navigation state (the landing hash) wants to retry a
+ *  `failed` before saying anything.
+ *
+ *  Focuses SYNCHRONOUSLY when the thread is already in the map (that branch runs
+ *  before the first `await`), so a caller that only cares about the common case
+ *  can ignore the promise without a behavior change. */
+export async function focusThreadOrBootstrapResult(
+  threadId: string,
+  options?: FocusThreadOptions,
+): Promise<FocusBootstrapOutcome> {
+  if (threadMap.value.has(threadId)) {
+    focusThread(threadId, options);
+    return { kind: 'focused' };
+  }
+  // Miss path: a round-trip stands between the tap and anything on screen, and
+  // this is where a notification navigating to a thread outside the loaded
+  // window lands (always, on a cold push tap: the deep link dispatches while
+  // `loadAllThreads` is still in flight, so the map is empty). Acknowledge the
+  // tap NOW rather than after the fetch. Focusing optimistically moves the pane
+  // and hands `ThreadView` a focused-but-absent thread, which it already renders
+  // as its delay-gated skeleton with the 8s "tap to reload" escape hatch. The
+  // `awaitedThreadId` signal is what stops ThreadView's stale-pointer
+  // cleanup from immediately unfocusing it again.
+  const previousFocus = focusedThreadId.value;
+  awaitedThreadId.value = threadId;
+  setFocusedThread(threadId);
+  // This optimistic focus IS the navigation away from the previous thread, so
+  // the standing follow retires HERE. The `focusThread` at the end cannot do it:
+  // by then this thread is already the focused one, so its same-thread gate
+  // reads "nothing was left" and would keep the PREVIOUS thread's follow armed
+  // over the one being opened, which would then ride a live edge nobody asked
+  // for and record that borrowed request as its own reading position.
+  if (previousFocus !== threadId) stopFollowingBottom();
+  // Same opt-out as the hit path above, so `revealPane: false` means the same
+  // thing whichever branch a caller lands on.
+  if (options?.revealPane !== false) revealThreadPane();
+  let found: boolean;
+  try {
+    found = await ensureThreadByIdInMap(threadId);
+  } catch (error) {
+    releaseAwait(threadId, previousFocus);
+    return { kind: 'failed', error };
+  }
+  if (!found) {
+    releaseAwait(threadId, previousFocus);
+    // The engine's answer, so unlike a `threadMap` miss it proves the thread
+    // is gone. It covers a delete whose `ThreadsDeleted` frame this page missed.
+    pruneRecents(threadId, 'threads');
+    return { kind: 'not-found' };
+  }
+  // Clear BEFORE focusing: the thread is in the map now, so ThreadView needs no
+  // exemption, and leaving it set would exempt a genuinely stale pointer later.
+  if (awaitedThreadId.value === threadId) awaitedThreadId.value = null;
+  focusThread(threadId, options);
+  return { kind: 'focused' };
+}
+
+/** Undo an optimistic bootstrap focus that didn't land, so the user isn't left
+ *  staring at a skeleton for a thread that will never arrive.
+ *
+ *  A no-op when a NEWER await has claimed the slot (the user tapped a second
+ *  notification mid-flight): that one owns the focus now, and restoring this
+ *  call's `previousFocus` would yank them off it.
+ *
+ *  Each call releases, including the ones inside `landThreadHash`'s retry ladder
+ *  (`hash-deeplink-router.ts`), so a cross-workspace landing that loses the race
+ *  against a lazy-starting peer engine shows the target's skeleton, drops back to
+ *  the prior thread for the backoff, then re-focuses on the next attempt. That
+ *  blip is deliberate: holding the focus across attempts instead would mean this
+ *  function could no longer release unconditionally, and a caller that forgot to
+ *  would leave a thread permanently exempt from ThreadView's stale-pointer
+ *  cleanup. Re-capturing `previousFocus` per attempt keeps the restore correct
+ *  either way. */
+function releaseAwait(threadId: string, previousFocus: string | null): void {
+  if (awaitedThreadId.value !== threadId) return;
+  awaitedThreadId.value = null;
+  if (focusedThreadId.value === threadId) setFocusedThread(previousFocus);
+}
+
+/** Fire-and-forget {@link focusThreadOrBootstrapResult} that surfaces the
+ *  failure itself. The entry point for every caller with no retry state of its
+ *  own (thread-link clicks, notification taps, search results). */
+export function focusThreadOrBootstrap(threadId: string, options?: FocusThreadOptions): void {
+  // Name the thread and, when the navigate was not a direct click, who asked.
+  // A bare "Thread not found" is a swallowed error under
+  // `.claude/rules/frontend.md`. This runs for a sibling thread's
+  // `NavigationRequested` and a notification tap, not only a link click.
+  const from = options?.source ? ` (requested by ${options.source})` : '';
+  void focusThreadOrBootstrapResult(threadId, options).then(outcome => {
+    if (outcome.kind === 'not-found') {
+      showToast(`Thread "${threadId}" no longer exists${from}`, 'error');
+    } else if (outcome.kind === 'failed') {
+      showToast(`Couldn't open thread "${threadId}"${from}: ${errorDetail(outcome.error)}`, 'error');
+    }
+  }).catch(err => {
+    // `focusThreadOrBootstrapResult` converts a fetch failure into a `failed`
+    // outcome, so reaching here means `focusThread` itself threw. Surface it
+    // rather than leave an unhandled rejection (frontend.md, no hidden errors).
+    showToast(`Couldn't open thread "${threadId}"${from}: ${errorDetail(err)}`, 'error');
+  });
+}
+
+/** Drop the focused thread → the thread pane shows the compose view.
+ *
+ *  `revealPane` (default true): also surface the thread pane, so the user-intent
+ *  callers (the New-thread buttons, the new-chat shortcut, a new-chat
+ *  NavigationRequested) land the compose view on the pane the user is looking
+ *  at: mobile swipes to it, desktop re-activates the Threads pane group from the
+ *  content group. Mirrors focusThread; the callers that used to hand-pair
+ *  `navigateToPane('thread')` no longer need to.
+ *
+ *  Two callers pass `{ revealPane: false }`, both because the unfocus is not
+ *  navigation and must not move the visible pane:
+ *
+ *  - Stale-pointer CLEANUP: ThreadView clears a focusedThreadId whose thread
+ *    isn't in the map. ThreadView is mounted in the background on mobile
+ *    (MobileSwipeContainer mounts all three panes), so a reveal there would yank
+ *    a user on the content pane to the thread pane during render.
+ *  - The post-archive hand-off when the last review is dismissed
+ *    (`handleArchiveThread`), which must leave a user archiving from the thread
+ *    drawer there. See `FocusThreadOptions.revealPane`. */
+export function unfocusThread(opts?: { revealPane?: boolean }): void {
+  setFocusedThread(null);
+  openedViewRows = null;
+  revealOnFocus.value = false;
+  resetCodingAgentPendingPreferences();
+  // Same rule as `focusThread`'s retire, for the surface it forgot: the compose
+  // view has its own scroll container and registers itself as the active one
+  // (`CreateThreadView`'s `useScrollObservers`), so a follow armed in a thread
+  // would ride the compose view's growth instead. Nothing is lost by retiring,
+  // since the thread's own request is recorded under its reading position.
+  stopFollowingBottom();
+  if (opts?.revealPane !== false) revealThreadPane();
+}
+
+// ---------------------------------------------------------------------------
+// Save / Unsave
+// ---------------------------------------------------------------------------
+// Save is offered on Review/Archive sections at idle. Unsave is offered on
+// the Saved section mid-turn — the only way to drop a running thread out of
+// Saved without canceling it. Confirm before unsave so a stray click doesn't
+// cost the parking spot.
+
+/** Why the engine refused an exit, in the thread menu's words (ADR 0378). The
+ *  action opens the sub-thread that holds it back. */
+export function showBlockedToast(title: string, refusal: BlockedRefusal): void {
+  const subThreadId = refusal.subThreadId;
+  showToast(BLOCKER_REASON[refusal.blocker], 'error', {
+    title,
+    action: subThreadId ? { label: 'Show sub-thread', onClick: () => focusThread(subThreadId) } : undefined,
+  });
+}
+
+/** Tell the user why `archiveThread` failed. A cascade refusal names its
+ *  blocker; anything else needs its own words, or a bare "409" would tell the
+ *  user nothing. */
+export function showArchiveError(err: unknown, threadId: string): void {
+  const refusal = blockedRefusal(err, threadId);
+  if (refusal) {
+    showBlockedToast("Can't archive yet", refusal);
+    return;
+  }
+  showToast(formatArchiveErrorToast(err), 'error');
+}
+
+function formatArchiveErrorToast(err: unknown): string {
+  if (err instanceof ApiError && err.httpCode === 409 && err.body && typeof err.body === 'object') {
+    const body = err.body as Record<string, unknown>;
+    // An apply or Discard holds the thread's session. The engine's message
+    // names which, and says when to try again.
+    if (CHANGE_CLAIM_REFUSALS.has(String(body.reason)) && typeof body.message === 'string') {
+      return `Can't archive yet: ${body.message}`;
+    }
+  }
+  return `Failed to archive thread: ${errorDetail(err)}`;
+}
+
+/** The archive refusals a change claim gives (see `claim_refusal_slug`). */
+const CHANGE_CLAIM_REFUSALS = new Set(['apply_in_progress', 'discard_in_progress']);
+
+/** The warning for members an archive left behind: each by title, with the
+ *  engine's reason, and that the user can archive again once it is done. */
+export function formatArchiveSkippedToast(skipped: ArchiveSkippedMember[]): string {
+  const lines = skipped.map((m) => {
+    const title = threadMap.value.get(m.thread_id)?.meta.title || 'Untitled thread';
+    return `${title}: ${m.message}`;
+  });
+  const head = skipped.length === 1
+    ? 'One thread was not archived.'
+    : `${skipped.length} threads were not archived.`;
+  return `${head} ${lines.join(' ')} Archive again once that is done.`;
+}
+
+function updateThreadMeta(threadId: string, patch: Partial<{ saved: boolean; section: ThreadSection }>): void {
+  const map = new Map(threadMap.value);
+  const thread = map.get(threadId);
+  if (thread) {
+    map.set(threadId, { ...thread, meta: { ...thread.meta, ...patch } });
+    threadMap.value = map;
+  }
+}
+
+export async function handleSaveThread(threadId: string): Promise<void> {
+  const thread = threadMap.value.get(threadId);
+  if (!thread || thread.meta.saved) return;
+
+  // A pinned thread is never archived (ADR 0312): the engine moves it to the
+  // inbox in the same event, so the optimistic flip does too.
+  const priorSection = thread.meta.section;
+  sectionMutatedAt.set(threadId, Date.now());
+  updateThreadMeta(threadId, { saved: true, section: 'inbox' });
+  try {
+    await saveThread(threadId);
+  } catch (e) {
+    // A 409 means the thread is already saved — the desired end-state already
+    // holds (a racing/duplicate submit, or a stale client hitting an older
+    // engine). Keep the optimistic pin and stay quiet; only real failures
+    // (network, 5xx) revert + toast. The server is idempotent now, so a fresh
+    // engine won't even 409 here — this is defense in depth.
+    if (e instanceof ApiError && e.httpCode === 409) return;
+    updateThreadMeta(threadId, { saved: false, section: priorSection });
+    showToast(`Failed to pin thread: ${errorDetail(e)}`, 'error');
+  }
+}
+
+export async function handleUnsaveThread(threadId: string): Promise<void> {
+  const thread = threadMap.value.get(threadId);
+  if (!thread || !thread.meta.saved) return;
+
+  if (!await showConfirm('Remove this thread from the Pinned section?', 'Remove', { variant: 'default' })) {
+    return;
+  }
+
+  updateThreadMeta(threadId, { saved: false });
+  try {
+    await unsaveThread(threadId);
+  } catch (e) {
+    // Mirror of the save path: a 409 means the thread is already unsaved, so
+    // the desired end-state holds — keep the optimistic unpin and stay quiet.
+    if (e instanceof ApiError && e.httpCode === 409) return;
+    updateThreadMeta(threadId, { saved: true });
+    showToast(`Failed to unpin thread: ${errorDetail(e)}`, 'error');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Archive (move waiting thread to archive)
+// ---------------------------------------------------------------------------
+
+/** Threads the user can actually see, given the active channel/trigger/repo/app
+ *  filter — the SAME family-scoped predicate the drawer uses (`ThreadDrawer`'s
+ *  ThreadList). The post-archive focus must land on a thread the user can click
+ *  on in the list, so a thread hidden by the active filter is never offered as
+ *  the next focus. Returns the filtered set plus the family graph (built over
+ *  the full thread map so parent walks resolve) for the caller to order. */
+function visibleThreadsAndGraph(): { visible: ThreadState[]; graph: FamilyGraph } {
+  const all = Array.from(threadMap.value.values());
+  const graph = computeFamilyGraph(all);
+  // The *applied* selection, which is what the drawer is showing: while the
+  // thread filter panel is up it holds still, and the row the focus lands on
+  // has to be one the user can actually click (see `appliedThreadFilter`).
+  const { channels: filter, triggerIds: triggerSelection, repoIds: repoSelection, appIds: appSelection } = appliedThreadFilter.value;
+  // A trigger/repo/app sub-selection flips the gate to any-member matching,
+  // mirroring the drawer so a coding-agent thread in the selected repo/app surfaces with
+  // its family even when the root's channel is filtered out.
+  const subSelectionActive =
+    triggerSelection.size > 0 || repoSelection.size > 0 || appSelection.size > 0;
+  const visible = filterByTopThread(all, graph,
+    t => threadPassesChannelFilter(t, filter, triggerSelection, repoSelection, appSelection),
+    subSelectionActive,
+  );
+  return { visible, graph };
+}
+
+/** The visible thread ids of the drawer list the user is *currently looking
+ *  at*, in the same order the drawer renders them. The post-archive focus
+ *  walks this, so "next" is the next visible row of the list on screen: the
+ *  selected ongoing group's rows under Ongoing, the filtered Current rows under
+ *  Folders. Mirrors `ThreadDrawer`'s `activeView` resolution: a live search
+ *  query overrides the grouping.
+ *
+ *  The Ongoing grouping deliberately bypasses the channel/trigger/repo/app
+ *  filter, exactly as the drawer renders it. Only Folders is filter-aware,
+ *  walking the visible Current section (`orderedCurrentForReview`) the same way
+ *  the drawer does. */
+function orderedVisibleThreadIds(): string[] {
+  // Search overrides the grouping (mirrors ThreadDrawer's activeView).
+  if (threadSearchQuery.value.trim().length > 0) {
+    const results = threadSearchResults.value;
+    return results.status === 'loaded' ? results.data.map(r => r.thread_id) : [];
+  }
+  if (drawerGrouping.value === 'ongoing') {
+    const selected = selectedOngoingGroup.value;
+    return ongoingGroupLists.value.find(g => g.group === selected)?.rows.map(n => n.thread.meta.id) ?? [];
+  }
+  const { visible, graph } = visibleThreadsAndGraph();
+  return orderedCurrentForReview(visible, graph).map(t => t.meta.id);
+}
+
+/** Which drawer list `orderedVisibleThreadIds` walks: a live search, the selected
+ *  ongoing group, or Folders. */
+function activeViewKey(): string {
+  const query = threadSearchQuery.value.trim();
+  if (query.length > 0) return `search:${query}`;
+  return drawerGrouping.value === 'ongoing' ? `ongoing:${selectedOngoingGroup.value}` : 'folders';
+}
+
+/** The active view's rows as they stood when the focused thread was opened.
+ *  A thread often leaves its view before it is archived: stopping a question
+ *  leaves Blocked, applying a change leaves Review. Its row in this
+ *  snapshot is the position the archive hand-off falls back on. */
+let openedViewRows: { threadId: string; view: string; ids: string[] } | null = null;
+
+function rememberOpenedViewRows(threadId: string): void {
+  const ids = orderedVisibleThreadIds();
+  // Re-focusing a thread that already left its view keeps its last position.
+  if (!ids.includes(threadId) && openedViewRows?.threadId === threadId) return;
+  openedViewRows = { threadId, view: activeViewKey(), ids };
+}
+
+/** The rows below `idx`, nearest first, then the rows above it, nearest first. */
+function neighboursOf(ids: readonly string[], idx: number): string[] {
+  return [...ids.slice(idx + 1), ...ids.slice(0, idx).reverse()];
+}
+
+/** Ordered list of visible thread ids to consider as the next focus when the
+ *  user archives `aroundId` — closest below first, then closest above — within
+ *  the drawer list on screen (`orderedVisibleThreadIds`). Snapshotted
+ *  BEFORE the optimistic flip so the position anchor survives the cascade
+ *  dropping `aroundId` (and its descendants) out of the view.
+ *
+ *  A thread that already left the view takes its position from when it was
+ *  opened (`openedViewRows`), keeping only rows still visible. With no
+ *  position at all, the view's own rows are the candidates, top first. */
+export function visibleCandidatesAround(aroundId: string): string[] {
+  const ordered = orderedVisibleThreadIds();
+  const idx = ordered.indexOf(aroundId);
+  if (idx >= 0) return neighboursOf(ordered, idx);
+  const opened = openedViewRows;
+  const openedIdx = opened?.threadId === aroundId && opened.view === activeViewKey()
+    ? opened.ids.indexOf(aroundId)
+    : -1;
+  if (!opened || openedIdx < 0) return ordered;
+  const visible = new Set(ordered);
+  const nearest = neighboursOf(opened.ids, openedIdx).filter(id => visible.has(id));
+  const placed = new Set(nearest);
+  return [...nearest, ...ordered.filter(id => !placed.has(id))];
+}
+
+
+/** What archiving this cascade would stop, for the confirm to name.
+ *
+ *  Archiving cancels every live *thread subscription* in the cascade, which is
+ *  correct and stays: leaving one live behind the archive curtain would wake a
+ *  thread the user considers closed. The bug was that it happened in silence,
+ *  so an ordinary unsaved thread with three live subscriptions archived on the
+ *  first tap and the event-wait dispatcher cancelled all three.
+ *
+ *  **Two sources, because a row can be counted before it is named.** Both now
+ *  come from the same projection: `meta.liveEventWaitCount` and
+ *  `meta.liveEventWaits` arrive together on every thread summary, so a row in
+ *  the map normally names every subscription it holds. They can still differ
+ *  for a row assembled from another path, an optimistic SSE skeleton or a
+ *  fixture that carries the count alone. So the named ones come from the list,
+ *  and any remainder is counted from the column. The dialog never waits on a
+ *  fetch before it can open.
+ *
+ *  Returns `null` when the cascade holds none, which is what keeps an ordinary
+ *  archive a single tap.
+ *
+ *  Exported for its own tests: the naming and the remainder line are worth
+ *  pinning without driving a whole archive. */
+export function subscriptionsStoppedByArchive(
+  cascade: Set<string>,
+  rootId: string,
+): { message: string; details: ConfirmDetails } | null {
+  const groups: ConfirmDetailGroup[] = [];
+  let named = 0;
+  let unnamed = 0;
+  for (const id of cascade) {
+    const t = threadMap.value.get(id);
+    if (t === undefined || t.meta.liveEventWaitCount === 0) continue;
+    const waits = t.meta.liveEventWaits;
+    if (waits.length > 0) {
+      named += waits.length;
+      groups.push({
+        header: id === rootId ? 'This thread' : t.meta.title || 'Sub-thread',
+        items: waits.map((w) => `${w.reason} (${describeWaitSubscription(w.on)})`),
+      });
+    }
+    // The shortfall is counted whether the thread named NONE of its
+    // subscriptions or only some. Handling only the all-or-nothing case would
+    // name one and drop the other, under-reporting the total in the one dialog
+    // whose whole job is not to.
+    unnamed += Math.max(0, t.meta.liveEventWaitCount - waits.length);
+  }
+  const count = named + unnamed;
+  if (count === 0) return null;
+  // A count-only group: the dialog renders a header with no list, which is the
+  // honest shape for subscriptions we can count but not name.
+  if (unnamed > 0) {
+    groups.push({
+      header: `${unnamed} more on sub-threads`,
+      items: [],
+    });
+  }
+  return {
+    message:
+      count === 1
+        ? 'Archiving stops what this thread is waiting for. It will not fire.'
+        : `Archiving stops waiting for ${count} events. They will not fire.`,
+    details: { groups },
+  };
+}
+
+/** Clear a thread's unsent reply draft — local signal plus the server compose
+ *  row. Snapshots the draft so a failed PUT restores it: local and server must
+ *  not diverge, or the discarded draft silently reappears on the next load.
+ *  Deliberately uses the leaf `composeDrafts` helpers + `putComposeOnThread`
+ *  rather than compose.ts's `updateCompose`, so core thread CRUD doesn't pull
+ *  the chat-send graph (compose.ts → chat.ts) into its imports. */
+function discardThreadDraft(threadId: string): void {
+  const prior = getDraft(threadId);
+  const restore: ComposeDraft = { ...prior, image_hashes: [...prior.image_hashes] };
+  clearDraft(threadId);
+  void putComposeOnThread(threadId, '', [], null).catch((e) => {
+    setDraft(threadId, restore);
+    showToast(`Couldn't discard draft: ${errorDetail(e)}`, 'error');
+  });
+}
+
+/** Move an archived thread, and the sub-threads Archive took with it, back to
+ *  Current. The `ThreadUnarchived` frames move the rows. */
+export async function handleUnarchiveThread(threadId: string): Promise<void> {
+  try {
+    await unarchiveThreads([threadId], { withSubThreads: true });
+  } catch (e) {
+    showToast(`Could not move the thread to Current: ${errorDetail(e)}`, 'error');
+  }
+}
+
+/** The confirm before archiving a pinned thread, which unpins it. */
+export const ARCHIVE_PINNED_CONFIRM = 'Archiving unpins this thread. Move it to the archive?';
+
+export async function handleArchiveThread(threadId: string): Promise<void> {
+  if (archivingThreadIds.value.has(threadId)) return;
+  if (discardingCCThreadIds.value.has(threadId)) return; // Can't archive while discarding
+
+  // Archiving a pinned thread unpins it: a pinned thread is never archived
+  // (ADR 0312). Confirm before it leaves the Pinned section.
+  const thread = threadMap.value.get(threadId);
+  if (thread?.meta.saved) {
+    if (!await showConfirm(
+      ARCHIVE_PINNED_CONFIRM,
+      'Archive',
+      { variant: 'default' },
+    )) {
+      return;
+    }
+  }
+
+  // The archive cascades to the target + every transitive descendant; collect
+  // the family up front so we can both check it for unsent drafts here and (just
+  // below) flip the whole family out of review in one stroke.
+  const cascade = collectThreadFamily(threadId);
+
+  // If any family member carries an unsent reply draft, ask whether to discard
+  // it too. Archiving doesn't clear the draft server-side, so the focused OK
+  // button ("Keep draft") is the conservative default — it leaves the draft to
+  // resume after un-archiving. "Discard draft" (the left extraAction) clears it
+  // on every drafted member once the archive succeeds; Cancel/Escape aborts the
+  // archive entirely. Mirrors the Apply/Discard/Cancel shape in threadActions.ts
+  // (destructive = extraAction, safe = the focused OK button).
+  const draftedIds = [...cascade].filter((id) => draftPresentThreadIds.value.has(id));
+  let discardDrafts = false;
+  if (draftedIds.length > 0) {
+    const many = draftedIds.length > 1;
+    let discardChosen = false;
+    const keep = await showConfirm(
+      many
+        ? 'These threads have unsent drafts. Discard them too?'
+        : 'This thread has an unsent draft. Discard it too?',
+      many ? 'Keep drafts' : 'Keep draft',
+      {
+        variant: 'default',
+        cancelLabel: 'Cancel',
+        extraAction: {
+          label: many ? 'Discard drafts' : 'Discard draft',
+          onClick: () => { discardChosen = true; },
+        },
+      },
+    );
+    // keep === true → OK ("Keep draft(s)"): archive, leave the draft.
+    // discardChosen → extraAction ("Discard draft(s)"): archive + clear below.
+    // neither → Cancel/Escape/outside-click: abort the archive.
+    if (!keep && !discardChosen) return;
+    discardDrafts = discardChosen;
+  }
+
+  // Archiving cancels every live thread subscription in the same cascade, so
+  // say which ones before it happens. Unlike the draft confirm there is no
+  // third outcome to offer: keeping a subscription alive behind the archive
+  // curtain is not on the table, so this is Cancel (abort) versus Archive
+  // (proceed), and a cascade holding none never asks at all.
+  const stopping = subscriptionsStoppedByArchive(cascade, threadId);
+  if (stopping) {
+    const proceed = await showConfirm(stopping.message, 'Archive', {
+      variant: 'default',
+      cancelLabel: 'Cancel',
+      details: stopping.details,
+    });
+    if (!proceed) return;
+  }
+
+  // Clear stale apply state — applying and archiving are mutually exclusive.
+  // If the user is archiving, any in-progress or stale apply is abandoned.
+  if (applyingNowThreadIds.value.has(threadId)) {
+    const next = new Map(applyingNowThreadIds.value);
+    next.delete(threadId);
+    applyingNowThreadIds.value = next;
+  }
+
+  // Snapshot the position anchor BEFORE the optimistic flip — once the
+  // cascade leaves the active view, visibleCandidatesAround() can't compute it.
+  const candidates = visibleCandidatesAround(threadId);
+
+  // Snapshot section, pin and change state on every family member so we can
+  // roll back if the API rejects (409 blocking, 500 mid-cascade). All three are
+  // required to leave Current and Pinned: `displaySection` keeps a pinned
+  // thread in Pinned and one with a pending change in Current, whatever
+  // `section` says. An archive leaves the branch's work at `none`: the archive
+  // net sets a pending change aside, and `ThreadArchived` clears what remains.
+  // `cascade` was collected up front (above the draft confirm).
+  type Snap = Pick<ThreadMeta, 'section' | 'saved' | 'codingAgentChangeState'>;
+  const snapshot = new Map<string, Snap>();
+  const optimistic = new Map(threadMap.value);
+  // Stamp BEFORE the flip so any in-flight GET issued before this moment is
+  // considered stale wrt section/change state. See `sectionMutatedAt`
+  // in thread-loading.ts for the iOS-PWA-resume race this prevents.
+  const flippedAt = Date.now();
+  for (const tid of cascade) {
+    const t = optimistic.get(tid);
+    if (!t) continue;
+    sectionMutatedAt.set(tid, flippedAt);
+    snapshot.set(tid, {
+      section: t.meta.section,
+      saved: t.meta.saved,
+      codingAgentChangeState: t.meta.codingAgentChangeState,
+    });
+    optimistic.set(tid, {
+      ...t,
+      meta: { ...t.meta, section: 'archived', saved: false, codingAgentChangeState: NO_CHANGE },
+    });
+  }
+  threadMap.value = optimistic;
+
+  // Every cascade member gets the in-flight flag, not just the root: the
+  // backend's stop_agent emits CodingAgentIdled for each descendant with the
+  // PRE-archive aggregate (section='inbox'), so the SSE archive-race guard
+  // in thread-sync.ts needs to recognise descendants as in-flight too.
+  archivingThreadIds.value = new Set([...archivingThreadIds.value, ...cascade]);
+
+  // The SSE `ThreadArchived` cascade arriving later just confirms what we
+  // already did.
+  //
+  // Both branches move the focus WITHOUT revealing the thread pane: archiving
+  // is not navigation. The hand-off exists so the thread pane isn't left
+  // pointing at a thread that just left the list, not because the user asked to
+  // go there. On mobile the thread drawer is its own pane, so revealing swiped a
+  // user archiving row after row out of the list on every tap.
+  const nextId = candidates.find(id => !cascade.has(id)) ?? null;
+  if (nextId) {
+    revealOnFocus.value = true;
+    focusThread(nextId, { revealPane: false });
+  } else {
+    // Last review dismissed → the thread pane falls back to the compose view.
+    unfocusThread({ revealPane: false });
+  }
+
+  let skipped: ArchiveSkippedMember[] = [];
+  try {
+    skipped = (await archiveThread(threadId)).skipped ?? [];
+    // A member the engine left unarchived goes back where it was, and the user
+    // is told which and why. The optimistic flip hid it.
+    const skippedIds = new Set(skipped.map((m) => m.thread_id));
+    if (skipped.length > 0) {
+      const restored = new Map(threadMap.value);
+      for (const tid of skippedIds) {
+        const t = restored.get(tid);
+        const snap = snapshot.get(tid);
+        if (t && snap) restored.set(tid, { ...t, meta: { ...t.meta, ...snap } });
+      }
+      threadMap.value = restored;
+      // The target itself stayed open: give it its focus back, as a rejected
+      // archive does, unless the user has moved on meanwhile.
+      if (skippedIds.has(threadId) && focusedThreadId.value === nextId) {
+        focusThread(threadId, { revealPane: false });
+      }
+      showToast(formatArchiveSkippedToast(skipped), 'warning');
+    }
+    // Archive landed — now honor a "Discard draft(s)" choice. Deferred until
+    // here so a rejected archive (rolled back below) leaves the draft intact,
+    // and a skipped member keeps its draft too.
+    if (discardDrafts) {
+      for (const id of draftedIds) {
+        if (!skippedIds.has(id)) discardThreadDraft(id);
+      }
+    }
+  } catch (e) {
+    const restored = new Map(threadMap.value);
+    for (const [tid, snap] of snapshot) {
+      const t = restored.get(tid);
+      if (!t) continue;
+      restored.set(tid, { ...t, meta: { ...t.meta, ...snap } });
+    }
+    threadMap.value = restored;
+    // Re-focus the rejected thread only if the user hasn't actively navigated
+    // away during the in-flight API call — a user who picked a different
+    // thread made a deliberate choice we shouldn't yank them out of.
+    const stillOnAutoFocus = focusedThreadId.value === nextId;
+    if (stillOnAutoFocus && restored.has(threadId)) {
+      focusThread(threadId, { revealPane: false });
+    }
+    showArchiveError(e, threadId);
+  } finally {
+    const next = new Set(archivingThreadIds.value);
+    for (const tid of cascade) next.delete(tid);
+    archivingThreadIds.value = next;
+  }
+  // The snapshot is from before the archive. The in-flight guard dropped any
+  // update a skipped member had meanwhile, and its apply or Discard often ends
+  // first. So re-read the list now the guard is off.
+  if (skipped.length > 0) void refreshThreadList();
+}

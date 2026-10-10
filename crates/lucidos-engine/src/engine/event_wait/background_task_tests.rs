@@ -1,0 +1,527 @@
+//! The pure decisions behind the engine-armed background-task wait: whether to
+//! arm at all, over which tasks, and for how long.
+//!
+//! Both are the parts that can be wrong silently. A coverage test that is too
+//! loose delivers one completion to the thread twice; one that is too strict
+//! never arms at all and the stall comes straight back. A timeout shorter than
+//! the task is a subscription that expires before the thing it watches.
+//!
+//! `plan_wait` exists as a pure function precisely so all of that is reachable
+//! without standing up an engine and a database. What is left in the engine
+//! method is three reads, this call, and the arming itself.
+
+use super::*;
+use serde_json::json;
+
+fn sub(event_type: &str, condition: Option<serde_json::Value>) -> EventSubscription {
+    EventSubscription {
+        event_type: event_type.to_string(),
+        condition,
+    }
+}
+
+/// The thread the tasks and the waits belong to. Fixed rather than fresh per
+/// call, because the coverage probe now runs against the *matchable payload*
+/// the completion will carry, and that view names the owning thread.
+fn owner() -> Uuid {
+    Uuid::from_u128(0x0BACC0DE)
+}
+
+fn handle(task_id: &str, deadline: DateTime<Utc>) -> RunningTaskHandle {
+    RunningTaskHandle {
+        task_id: task_id.to_string(),
+        description: None,
+        command: "cargo build".to_string(),
+        watchdog_deadline: deadline,
+        stop_requested: false,
+    }
+}
+
+// ── coverage ─────────────────────────────────────────────────────────
+
+/// The case that matters: the model armed its own wait for exactly this task,
+/// so the engine must not arm a second one. Two waits over one completion is
+/// two deliveries, and the second finds the work already reported.
+#[test]
+fn a_wait_the_model_armed_for_this_task_covers_it() {
+    let on = vec![sub(
+        "BackgroundBashCompleted",
+        Some(json!({"task_id": "abc"})),
+    )];
+    assert!(wait_covers_task(&on, "abc", Some(owner())));
+}
+
+/// The mirror case, and the reason coverage is not just "does a
+/// `BackgroundBashCompleted` entry exist": a wait for a DIFFERENT task will
+/// never fire for this one, so this task is still unwatched.
+#[test]
+fn a_wait_for_a_different_task_does_not_cover_this_one() {
+    let on = vec![sub(
+        "BackgroundBashCompleted",
+        Some(json!({"task_id": "other"})),
+    )];
+    assert!(!wait_covers_task(&on, "abc", Some(owner())));
+}
+
+/// An unconditioned subscription fires on the first background task to finish
+/// anywhere, including this one, so it genuinely covers it. Arming beside it
+/// would deliver it twice.
+#[test]
+fn an_unconditioned_subscription_covers_every_task() {
+    let on = vec![sub("BackgroundBashCompleted", None)];
+    assert!(wait_covers_task(&on, "abc", Some(owner())));
+    assert!(wait_covers_task(&on, "anything-else", Some(owner())));
+}
+
+/// A thread waiting on something else entirely is not watching its background
+/// work, however many live subscriptions it holds.
+#[test]
+fn a_wait_on_another_event_type_covers_nothing() {
+    let on = vec![
+        sub("ChangeProposed", None),
+        sub("CodingAgentIdled", Some(json!({"task_id": "abc"}))),
+    ];
+    assert!(!wait_covers_task(&on, "abc", Some(owner())));
+}
+
+/// The `on:` list is an OR, so one matching entry among several is coverage.
+#[test]
+fn one_matching_entry_among_several_is_coverage() {
+    let on = vec![
+        sub("ChangeProposed", None),
+        sub("BackgroundBashCompleted", Some(json!({"task_id": "abc"}))),
+    ];
+    assert!(wait_covers_task(&on, "abc", Some(owner())));
+}
+
+// ── timeout ──────────────────────────────────────────────────────────
+
+/// The invariant the deadline exists for: the wait outlives the task. A task
+/// killed by its watchdog at T emits its completion at or after T, so a wait
+/// expiring at T could lose that race.
+#[test]
+fn the_wait_outlives_the_task_it_watches() {
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("valid");
+    let task_secs = 3600;
+    let tasks = [handle("a", now + Duration::seconds(task_secs))];
+    let refs: Vec<&RunningTaskHandle> = tasks.iter().collect();
+
+    let timeout = timeout_for(&refs, now);
+
+    assert!(
+        timeout > task_secs,
+        "wait of {timeout}s must outlive a task with {task_secs}s left"
+    );
+    assert_eq!(timeout, task_secs + DEADLINE_MARGIN.num_seconds());
+}
+
+/// One wait covers several tasks, so it has to last past the LAST of them.
+/// Sizing on the first would strand every longer task in the same list.
+#[test]
+fn several_tasks_size_the_wait_on_the_latest_deadline() {
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("valid");
+    let tasks = [
+        handle("short", now + Duration::seconds(60)),
+        handle("long", now + Duration::seconds(7200)),
+        handle("middling", now + Duration::seconds(900)),
+    ];
+    let refs: Vec<&RunningTaskHandle> = tasks.iter().collect();
+
+    assert_eq!(
+        timeout_for(&refs, now),
+        7200 + DEADLINE_MARGIN.num_seconds()
+    );
+}
+
+/// A watchdog that is late (a child ignoring SIGTERM, a saturated host) leaves
+/// a deadline in the past. The answer is a wait that gives up almost at once,
+/// never a negative timeout, which `Duration::seconds` would turn into an
+/// `expires_at` BEFORE `armed_at` and so a subscription that can never fire.
+#[test]
+fn a_deadline_already_past_yields_the_floor_not_a_negative() {
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("valid");
+    let tasks = [handle("overdue", now - Duration::hours(24))];
+    let refs: Vec<&RunningTaskHandle> = tasks.iter().collect();
+
+    assert_eq!(timeout_for(&refs, now), 1);
+}
+
+/// The ceiling is the same one `await_event` enforces. A task spawned with a
+/// multi-day watchdog must not produce a wait that outlives the ordinary
+/// maximum, which exists because a wait outliving every reason for it is
+/// indistinguishable from a stalled thread.
+#[test]
+fn the_ordinary_ceiling_still_applies() {
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("valid");
+    let tasks = [handle("marathon", now + Duration::days(7))];
+    let refs: Vec<&RunningTaskHandle> = tasks.iter().collect();
+
+    assert_eq!(
+        timeout_for(&refs, now),
+        super::super::register::MAX_TIMEOUT_SECS
+    );
+}
+
+// ── the reason the user reads ────────────────────────────────────────
+
+fn named(description: Option<&str>, command: &str) -> RunningTaskHandle {
+    RunningTaskHandle {
+        description: description.map(String::from),
+        command: command.to_string(),
+        ..task("t")
+    }
+}
+
+/// The row reads `Waiting for <reason>`, so the agent's own name for
+/// the work is the whole answer to "what is it waiting for".
+#[test]
+fn one_described_task_is_named_in_the_agents_words() {
+    let t = named(Some("the five-project e2e sweep"), "./scripts/sweep.sh");
+    assert_eq!(armed_reason(&[&t]), "the five-project e2e sweep to finish");
+}
+
+/// No description still names the work, by its command. A generic sentence
+/// about "background work" is what this replaced.
+#[test]
+fn an_undescribed_task_is_named_by_its_command() {
+    let t = named(None, "cargo test --lib");
+    assert_eq!(
+        armed_reason(&[&t]),
+        "the background command \"cargo test --lib\" to finish"
+    );
+}
+
+/// The wait fires on the first completion, so the reason says so, and names
+/// every task up to the cap.
+#[test]
+fn several_tasks_are_all_named_and_the_first_to_finish_is_what_counts() {
+    let a = named(Some("the build"), "make");
+    let b = named(None, "npm test");
+    assert_eq!(
+        armed_reason(&[&a, &b]),
+        "the first of 2 background jobs to finish: the build; \
+         the background command \"npm test\""
+    );
+}
+
+/// Past the cap the rest are counted, not listed, so a thread with many tasks
+/// still gets one readable line.
+#[test]
+fn tasks_past_the_cap_are_counted() {
+    let tasks: Vec<RunningTaskHandle> = (0..5)
+        .map(|i| named(Some(&format!("job {i}")), "x"))
+        .collect();
+    let refs: Vec<&RunningTaskHandle> = tasks.iter().collect();
+    assert_eq!(
+        armed_reason(&refs),
+        "the first of 5 background jobs to finish: job 0; job 1; job 2; 2 more"
+    );
+}
+
+/// The transcript row is one line. A multi-line, oversized command must not
+/// break it or flood it.
+#[test]
+fn a_long_multi_line_command_becomes_one_bounded_line() {
+    let command = format!("set -e\ncd /tmp\n{}", "echo lots; ".repeat(50));
+    let t = named(None, &command);
+    let reason = armed_reason(&[&t]);
+
+    assert!(!reason.contains('\n'), "{reason}");
+    assert!(reason.contains("\"set -e cd /tmp echo lots;"), "{reason}");
+    assert!(
+        reason.contains('…'),
+        "a cut label says it was cut: {reason}"
+    );
+    assert!(one_short_line(&command).chars().count() <= LABEL_MAX_CHARS);
+}
+
+// ── the synthetic id ─────────────────────────────────────────────────
+
+/// The id is namespaced so an engine-armed wait is recognisable in the event
+/// log and cannot collide with a provider-issued `tool_use_id`.
+#[test]
+fn the_synthetic_tool_use_id_is_namespaced() {
+    assert!(
+        ENGINE_TOOL_USE_PREFIX.starts_with("engine:"),
+        "an engine-armed wait must be distinguishable from a model-armed one"
+    );
+}
+
+// ── the arming decision ──────────────────────────────────────────────
+
+fn wait_over(on: Vec<EventSubscription>) -> super::super::LiveWait {
+    let now = DateTime::from_timestamp(1_800_000_000, 0).expect("valid");
+    super::super::LiveWait {
+        wait_id: uuid::Uuid::new_v4(),
+        thread_id: uuid::Uuid::new_v4(),
+        tool_use_id: "toolu_test".to_string(),
+        on,
+        reason: "test".to_string(),
+        armed_at: now,
+        expires_at: now + Duration::hours(1),
+        watermark: 0,
+    }
+}
+
+fn task(id: &str) -> RunningTaskHandle {
+    handle(
+        id,
+        DateTime::from_timestamp(1_800_003_600, 0).expect("valid"),
+    )
+}
+
+/// The ordinary case: a turn ends with a build running and nothing watching,
+/// which is the five-hour stall this whole module exists to prevent.
+#[test]
+fn an_unwatched_task_is_armed() {
+    let running = [task("build")];
+    match plan_wait(&running, &[], Some(0), owner()) {
+        ArmingPlan::Arm(tasks) => assert_eq!(tasks.len(), 1),
+        other => panic!("expected Arm, got {other:?}"),
+    }
+}
+
+/// The model armed its own wait, so the engine must stand down. Two waits over
+/// one completion is delivered twice.
+#[test]
+fn a_task_the_model_is_already_watching_is_not_armed_again() {
+    let running = [task("build")];
+    let live = [wait_over(vec![sub(
+        "BackgroundBashCompleted",
+        Some(json!({"task_id": "build"})),
+    )])];
+    assert_eq!(
+        plan_wait(&running, &live, Some(0), owner()),
+        ArmingPlan::NothingUncovered
+    );
+}
+
+/// Partial coverage still arms, over the remainder only. Arming over the
+/// covered one too would deliver it twice.
+#[test]
+fn only_the_uncovered_tasks_are_armed() {
+    let running = [task("watched"), task("unwatched")];
+    let live = [wait_over(vec![sub(
+        "BackgroundBashCompleted",
+        Some(json!({"task_id": "watched"})),
+    )])];
+    match plan_wait(&running, &live, Some(0), owner()) {
+        ArmingPlan::Arm(tasks) => {
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].task_id, "unwatched");
+        }
+        other => panic!("expected Arm, got {other:?}"),
+    }
+}
+
+/// One wait covers every uncovered task rather than one wait each, so three
+/// builds spend one live-wait slot instead of three.
+#[test]
+fn several_uncovered_tasks_go_into_one_wait() {
+    let running = [task("a"), task("b"), task("c")];
+    match plan_wait(&running, &[], Some(0), owner()) {
+        ArmingPlan::Arm(tasks) => assert_eq!(tasks.len(), 3),
+        other => panic!("expected Arm, got {other:?}"),
+    }
+}
+
+/// The live-wait cap. At the limit the thread goes quiet with work running,
+/// which is a real regression, so the plan says why rather than returning a
+/// bare no.
+#[test]
+fn the_live_wait_cap_refuses_and_says_why() {
+    let running = [task("build")];
+    let live: Vec<super::super::LiveWait> = (0..MAX_LIVE_WAITS_PER_THREAD)
+        .map(|_| wait_over(vec![sub("ChangeProposed", None)]))
+        .collect();
+    match plan_wait(&running, &live, Some(0), owner()) {
+        ArmingPlan::Refused(why) => assert!(why.contains("live subscriptions"), "{why}"),
+        other => panic!("expected Refused, got {other:?}"),
+    }
+}
+
+/// The recent-subscription cap is what bounds the loop this mechanism could
+/// otherwise create: a turn re-entered by an engine-armed wait spawns another
+/// task and ends again, forever. Counting engine-armed waits stops it at the
+/// same rate the model gets.
+#[test]
+fn the_recent_subscription_cap_refuses_at_the_same_limit_the_model_gets() {
+    let running = [task("build")];
+    assert!(matches!(
+        plan_wait(
+            &running,
+            &[],
+            Some(super::super::MAX_RECENT_SUBSCRIPTIONS),
+            owner()
+        ),
+        ArmingPlan::Refused(_)
+    ));
+    assert!(matches!(
+        plan_wait(
+            &running,
+            &[],
+            Some(super::super::MAX_RECENT_SUBSCRIPTIONS - 1),
+            owner()
+        ),
+        ArmingPlan::Arm(_)
+    ));
+}
+
+/// A cap that cannot be evaluated must not silently become no cap: an
+/// unreadable event store is exactly when a runaway loop does the most damage.
+/// `None` is UNKNOWN, never zero.
+#[test]
+fn an_unreadable_subscription_count_refuses_rather_than_assuming_zero() {
+    let running = [task("build")];
+    match plan_wait(&running, &[], None, owner()) {
+        ArmingPlan::Refused(why) => assert!(why.contains("could not be read"), "{why}"),
+        other => panic!("an unknown count must refuse, got {other:?}"),
+    }
+}
+
+/// A task whose stop is already on its way is no longer news to anyone. Else
+/// `stop X; run Y` re-arms a wait on X inside the stop's grace. X's killed
+/// completion would then wake the thread that stopped it.
+#[test]
+fn a_task_being_stopped_is_never_armed_for() {
+    let mut stopping = task("lint");
+    stopping.stop_requested = true;
+    let running = [stopping, task("e2e")];
+    match plan_wait(&running, &[], Some(0), owner()) {
+        ArmingPlan::Arm(tasks) => {
+            assert_eq!(
+                tasks.iter().map(|h| h.task_id.as_str()).collect::<Vec<_>>(),
+                ["e2e"]
+            )
+        }
+        other => panic!("expected Arm, got {other:?}"),
+    }
+    assert_eq!(
+        plan_wait(&running[..1], &[], Some(0), owner()),
+        ArmingPlan::NothingUncovered
+    );
+}
+
+// ── standing a wait down when its thread stops a task ───────────────
+
+fn wait_armed_by(tool_use_id: &str, on: Vec<EventSubscription>) -> super::super::LiveWait {
+    super::super::LiveWait {
+        tool_use_id: tool_use_id.to_string(),
+        ..wait_over(on)
+    }
+}
+
+fn completed(task_id: &str) -> EventSubscription {
+    sub(
+        "BackgroundBashCompleted",
+        Some(json!({ "task_id": task_id })),
+    )
+}
+
+#[test]
+fn only_the_engines_own_prefix_counts_as_engine_armed() {
+    assert!(is_engine_armed(&wait_armed_by(
+        &engine_tool_use_id(),
+        vec![]
+    )));
+    assert!(!is_engine_armed(&wait_armed_by(
+        "engine:bg-task-waiting",
+        vec![]
+    )));
+    assert!(!is_engine_armed(&wait_armed_by("toolu_x", vec![])));
+}
+
+/// The evidence case: one task, one engine wait. Nothing is left to watch.
+#[test]
+fn a_wait_over_only_the_stopped_task_ends() {
+    let wait = wait_armed_by(&engine_tool_use_id(), vec![completed("lint")]);
+    assert_eq!(
+        plan_stand_down(&wait, "lint", Some(owner())),
+        Some(StandDown::End)
+    );
+}
+
+#[test]
+fn a_wait_that_never_fires_on_the_task_is_left_alone() {
+    let wait = wait_armed_by(&engine_tool_use_id(), vec![completed("e2e")]);
+    assert_eq!(plan_stand_down(&wait, "lint", Some(owner())), None);
+    let other = wait_armed_by("toolu_x", vec![sub("ChangeProposed", None)]);
+    assert_eq!(plan_stand_down(&other, "lint", Some(owner())), None);
+}
+
+/// The engine wrote this wait, so it may narrow it to the tasks still running.
+#[test]
+fn the_engines_wait_over_more_tasks_narrows_to_the_rest() {
+    let wait = wait_armed_by(
+        &engine_tool_use_id(),
+        vec![completed("lint"), completed("e2e")],
+    );
+    assert_eq!(
+        plan_stand_down(&wait, "lint", Some(owner())),
+        Some(StandDown::Narrow(vec![completed("e2e")]))
+    );
+}
+
+/// ADR 0059: never replace a model's wait with one it never armed. It ends
+/// whole, and the caller names it.
+#[test]
+fn a_model_wait_watching_more_ends_whole() {
+    let wait = wait_armed_by(
+        "toolu_x",
+        vec![completed("lint"), sub("ChangeProposed", None)],
+    );
+    assert_eq!(
+        plan_stand_down(&wait, "lint", Some(owner())),
+        Some(StandDown::EndWithOthers)
+    );
+    let only = wait_armed_by("toolu_x", vec![completed("lint")]);
+    assert_eq!(
+        plan_stand_down(&only, "lint", Some(owner())),
+        Some(StandDown::End)
+    );
+}
+
+/// The owner is part of the payload the dispatcher matches, so a wait that
+/// names another thread's task by thread never fires on this one.
+#[test]
+fn the_owner_decides_whether_a_thread_conditioned_entry_fires() {
+    let elsewhere = Uuid::from_u128(0xE15E);
+    let wait = wait_armed_by(
+        "toolu_x",
+        vec![sub(
+            "BackgroundBashCompleted",
+            Some(json!({ "task_id": "lint", "thread_id": elsewhere.to_string() })),
+        )],
+    );
+    assert_eq!(plan_stand_down(&wait, "lint", Some(owner())), None);
+    assert_eq!(
+        plan_stand_down(&wait, "lint", Some(elsewhere)),
+        Some(StandDown::End)
+    );
+}
+
+/// A model wait may condition on how the task ended. One that watches for a
+/// kill fires on the thread's own stop, so it must stand down. One that only
+/// wants a natural exit never fires on a stop, so it is left alone.
+#[test]
+fn a_condition_on_how_the_task_ended_is_judged_against_a_stop() {
+    let killed = wait_armed_by(
+        "toolu_x",
+        vec![sub(
+            "BackgroundBashCompleted",
+            Some(json!({ "task_id": "lint", "killed": true })),
+        )],
+    );
+    assert_eq!(
+        plan_stand_down(&killed, "lint", Some(owner())),
+        Some(StandDown::End)
+    );
+    let natural = wait_armed_by(
+        "toolu_x",
+        vec![sub(
+            "BackgroundBashCompleted",
+            Some(json!({ "task_id": "lint", "killed": false })),
+        )],
+    );
+    assert_eq!(plan_stand_down(&natural, "lint", Some(owner())), None);
+}
