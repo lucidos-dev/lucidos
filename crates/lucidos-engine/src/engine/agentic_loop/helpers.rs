@@ -1,0 +1,2532 @@
+//! Free helper functions and small types extracted from the agentic-loop
+//! driver. Re-exported from `agentic_loop`'s mod.rs so existing
+//! `agentic_loop::X` and `super::X` paths keep resolving.
+
+use crate::core::store::with_event_address;
+use crate::engine::{InjectedPrompt, InjectedPromptKind};
+use crate::llm::provider::ToolDefinition;
+use crate::llm::tool_names as tn;
+use crate::llm::{get_default_tools, get_notification_tool, ToolCapabilities};
+use crate::llm::{ContentBlock, Message, MessageContent};
+use std::collections::HashSet;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use super::super::chat::process::working_understanding as wu;
+use super::super::LucidosEngine;
+
+/// Build a fresh `EventMeta` for a `ResponseCanceled` emit by copying the
+/// request meta and stamping the actor that the chat-cancel handler
+/// recorded on the per-thread handle. Drains the actor slot via
+/// `take_cancel_actor` so a follow-up request on the same thread can't
+/// inherit a stale device. When no actor was stamped (engine-internal
+/// cancels — shutdown, restart), the request meta passes through unchanged
+/// and `meta.actor` stays `None`.
+///
+/// Defensive: only fills `actor` if `base.actor` is `None`. Today the
+/// request meta is always built from `EventMeta::NONE` so `base.actor` is
+/// `None` at every call site, but if a future refactor starts propagating
+/// the originating message's actor into the request meta, this guard
+/// prevents the cancel-clicker from silently overwriting the legitimate
+/// message author.
+pub(crate) fn meta_with_cancel_actor(
+    engine: &LucidosEngine,
+    thread_id: Uuid,
+    base: &crate::engine::thread_events::EventMeta,
+) -> crate::engine::thread_events::EventMeta {
+    let mut out = base.clone();
+    if out.actor.is_none() {
+        if let Some(actor) = engine.take_cancel_actor(thread_id) {
+            out.actor = Some(actor);
+        }
+    }
+    out
+}
+
+/// Why this turn's `ResponseCanceled` ended it: a Stop click, or an urgent
+/// child follow-up superseding it.
+///
+/// The two are not interchangeable and the difference reaches the user twice
+/// over. `UserStop` renders "Canceled x" and reports to a parent as a terminal
+/// child outcome; `SupersededByFollowup` renders neutrally and is excluded
+/// from the parent-callback terminal set, because the work is not abandoned,
+/// it continues in the very next turn (`event_bus/parent_callback.rs`). Mislabel
+/// it and the parent is re-entered with a false "child canceled" card and may spawn a
+/// replacement for a child that is still working.
+///
+/// Drains the flag on read, like `meta_with_cancel_actor` drains the actor and
+/// for the same reason: a stale flag must not relabel the next turn on this
+/// thread. Call it exactly once per terminated turn. The Lucidos Agent analog
+/// of `take_session_redirect_followup`.
+pub(crate) fn cancel_cause_for_turn(
+    engine: &LucidosEngine,
+    thread_id: Uuid,
+) -> crate::engine::thread_events::CancelCause {
+    if engine.take_redirect_followup(thread_id) {
+        crate::engine::thread_events::CancelCause::SupersededByFollowup
+    } else {
+        crate::engine::thread_events::CancelCause::UserStop
+    }
+}
+
+/// Race a tool execution future against the per-thread cancel token. On
+/// cancel, returns `Err("Error: canceled by user")` so the agent loop's
+/// `tool_use → tool_result` pairing invariant survives — every emitted
+/// `ToolCalled` gets a matching `ToolResult` (with `success: false`)
+/// even when the work is aborted mid-await. The outer loop's pre-iter
+/// `is_cancelled()` then emits `ResponseCanceled` on the next iteration.
+///
+/// `biased` poll order means cancel ALWAYS wins when the token is already
+/// cancelled — without it, an instantly-ready tool result could race with
+/// a pending cancel and leak one extra iteration past the user's Stop.
+///
+/// For subprocess-spawning tools (`run_python`, `run_bash`, MCP), this is
+/// only half the fix: the inner future being dropped here must also tear
+/// down the OS child, which requires `kill_on_drop(true)` on the
+/// `tokio::process::Command`. Without that, dropping the future leaks the
+/// child process even though the agent loop unblocks.
+pub(crate) async fn run_tool_with_cancel<F>(
+    fut: F,
+    cancel_token: &CancellationToken,
+) -> super::super::tools::ToolOutcome
+where
+    F: std::future::Future<Output = super::super::tools::ToolOutcome>,
+{
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => Err("Error: canceled by user".to_string()),
+        r = fut => r,
+    }
+}
+
+/// Tools that may run at the same time as their neighbours in one batch.
+///
+/// Every entry is a pure read. None has a command guard lane, none routes
+/// through `handle_special_tool`, none emits a thread event while it runs, and
+/// none writes. Adding a tool here means checking all four (ADR 0246).
+pub(crate) const PARALLEL_SAFE_TOOLS: &[&str] = &[
+    tn::READ_FILE,
+    tn::LIST_FILES,
+    tn::GLOB_FILES,
+    tn::GREP_FILES,
+    tn::WEB_SEARCH,
+    tn::FETCH_NEWS,
+    tn::QUERY_EVENTS,
+    tn::COUNT_EVENTS,
+    tn::LIST_EVENT_TYPES,
+];
+
+/// The most calls of one parallel run in flight at once. It bounds the
+/// pressure a batch of web searches puts on the search provider.
+pub(crate) const MAX_PARALLEL_TOOL_CALLS: usize = 4;
+
+/// Whether this call may run beside its neighbours. It judges the name
+/// `execute_tool` will dispatch on, so a grouped tool counts only when its
+/// `action` resolves to an allowlisted flat name.
+pub(crate) fn is_parallel_safe(name: &str, args: &serde_json::Value) -> bool {
+    super::super::tools::dispatch_name(name, args)
+        .is_ok_and(|dispatched| PARALLEL_SAFE_TOOLS.contains(&dispatched))
+}
+
+/// The exclusive end of the parallel run that starts at `start`: the block of
+/// consecutive parallel-safe calls. A run never crosses another call, so a
+/// read that follows a write in the same batch still sees the write.
+pub(crate) fn parallel_run_end(calls: &[crate::llm::provider::ToolCall], start: usize) -> usize {
+    start
+        + calls[start..]
+            .iter()
+            .take_while(|call| is_parallel_safe(&call.name, &call.arguments))
+            .count()
+}
+
+/// Run futures `MAX_PARALLEL_TOOL_CALLS` at a time and return their outputs in
+/// input order. Each one's own side effects land when it finishes.
+///
+/// Unordered underneath on purpose. An ordered buffer holds a finished call's
+/// slot until every earlier call is done. One slow call would then delay the
+/// start of every call queued behind it.
+pub(crate) async fn run_concurrently<F: std::future::Future>(calls: Vec<F>) -> Vec<F::Output> {
+    use futures::StreamExt;
+    let mut finished: Vec<(usize, F::Output)> = futures::stream::iter(
+        calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| async move { (index, call.await) }),
+    )
+    .buffer_unordered(MAX_PARALLEL_TOOL_CALLS)
+    .collect()
+    .await;
+    finished.sort_by_key(|(index, _)| *index);
+    finished.into_iter().map(|(_, output)| output).collect()
+}
+
+/// What one call of a parallel run leaves for the loop's bookkeeping. Its
+/// `ToolCalled` and `ToolResult` were emitted when it started and finished.
+pub(super) struct ParallelRead {
+    pub(super) tool_called_event_id: Option<Uuid>,
+    /// The raw outcome text, as the ordinary path's `result`.
+    pub(super) result: String,
+    /// What the model sees, as the ordinary path's `split.llm_text`.
+    pub(super) llm_text: String,
+    pub(super) is_error: bool,
+}
+
+impl LucidosEngine {
+    /// Persist and broadcast `ToolCalled` for one call, and log it as step
+    /// `step` of `max`. Returns the event id, which pairs the result and
+    /// becomes a spawned thread's `spawning_event_id`.
+    pub(super) async fn emit_tool_called(
+        &self,
+        thread_id: Uuid,
+        meta: &crate::engine::thread_events::EventMeta,
+        tool_call: &crate::llm::provider::ToolCall,
+        step: usize,
+        max: usize,
+    ) -> Option<Uuid> {
+        // Mask any postgres password the LLM hardcoded into a command BEFORE
+        // it reaches the log, the description or the args. The description
+        // renders in the steps UI just like the args, so both come from the
+        // redacted copy; see `core::redact_postgres_secrets_in_json`.
+        let mut redacted_args = tool_call.arguments.clone();
+        crate::core::redact_postgres_secrets_in_json(&mut redacted_args);
+        let description = self.describe_tool(&tool_call.name, &redacted_args);
+        log!("[AgentLoop] Step {}/{}: {}", step, max, description);
+        self.event_bus
+            .emit_for_id(crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::ToolCalled {
+                    name: tool_call.name.clone(),
+                    description,
+                    args: redacted_args,
+                },
+                meta: meta.clone(),
+            })
+            .await
+    }
+
+    /// Persist and broadcast one call's `ToolResult`, taking the split's images.
+    ///
+    /// It always stamps the originating `ToolCalled`'s id. A parallel run
+    /// answers in completion order, so every reader pairs a result by that id.
+    /// The frontend also routes the result to its exchange through it
+    /// (`chatToolCallOwners`).
+    pub(super) async fn emit_tool_result(
+        &self,
+        thread_id: Uuid,
+        meta: &crate::engine::thread_events::EventMeta,
+        name: &str,
+        split: &mut ToolResultSplit,
+        success: bool,
+        tool_called_event_id: Option<Uuid>,
+    ) {
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event: crate::engine::thread_events::ThreadEvent::ToolResult {
+                        name: name.to_string(),
+                        result: crate::core::sanitize_for_jsonb(split.event_text()),
+                        images: std::mem::take(&mut split.images),
+                        success,
+                        tool_called_event_id,
+                    },
+                    meta: meta.clone(),
+                },
+                "[AgenticLoop] ToolResult",
+            )
+            .await;
+    }
+
+    /// Run a block of parallel-safe calls at once, each reporting as it goes.
+    ///
+    /// Every call emits `ToolCalled` when it starts and `ToolResult` the moment
+    /// it finishes, so each step row shows what really happened (ADR 0246).
+    /// The cancel race wraps only the work, never the emits: a dropped future
+    /// must not leave a call without its result. Outputs come back in call
+    /// order, which is the order the model receives them in.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_parallel_reads(
+        &self,
+        calls: &[crate::llm::provider::ToolCall],
+        first_step: usize,
+        max_steps: usize,
+        thread_id: Uuid,
+        meta: &crate::engine::thread_events::EventMeta,
+        extraction_ctx: &str,
+        request_id: Uuid,
+        device_id: Option<&str>,
+        cancel_token: &CancellationToken,
+    ) -> Vec<ParallelRead> {
+        let reads = calls.iter().enumerate().map(|(offset, call)| async move {
+            let tool_called_event_id = self
+                .emit_tool_called(thread_id, meta, call, first_step + offset, max_steps)
+                .await;
+            let work = self.execute_tool(
+                &call.name,
+                &call.arguments,
+                extraction_ctx,
+                request_id,
+                device_id,
+                cancel_token,
+                thread_id,
+            );
+            let (result, is_error) = match run_tool_with_cancel(work, cancel_token).await {
+                Ok(text) => (text, false),
+                Err(text) => (text, true),
+            };
+            let mut split = split_tool_result(&result);
+            self.emit_tool_result(
+                thread_id,
+                meta,
+                &call.name,
+                &mut split,
+                !is_error,
+                tool_called_event_id,
+            )
+            .await;
+            ParallelRead {
+                tool_called_event_id,
+                result,
+                llm_text: split.llm_text,
+                is_error,
+            }
+        });
+        run_concurrently(reads.collect()).await
+    }
+}
+
+/// Race a **read-only** future against the per-thread cancel token, yielding
+/// `None` when the token wins. The turn's setup phase (history load, query
+/// classification, memory retrieval, system-prompt and context assembly) uses
+/// this so a user Stop ends the turn from wherever it is, instead of only at
+/// the agentic loop's pre-iteration check. On a large thread that setup is tens
+/// of seconds, and every one of them was spent with the UI stuck on
+/// "Canceling…" (see
+/// `docs/plans/2026-08-04-chat-stop-honored-during-turn-setup.md`).
+///
+/// **Only wrap a pure read.** Losing the race DROPS the inner future, so a call
+/// that emits an event, writes the DB, or touches the filesystem must never go
+/// through here: it would be torn down half-done with no record. That is the
+/// difference from `run_tool_with_cancel` above, which deliberately returns an
+/// `Err` outcome rather than nothing precisely so its caller can still emit the
+/// paired `ToolResult`.
+///
+/// `biased` for the same reason `run_tool_with_cancel` needs it: an
+/// instantly-ready future must not win against an already-cancelled token, or a
+/// Stop leaks one more phase of work.
+pub(crate) async fn until_canceled<F>(cancel_token: &CancellationToken, fut: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => None,
+        v = fut => Some(v),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum InjectedPromptGroup {
+    UserText(Vec<InjectedPrompt>),
+    /// One engine re-entry, kept out of any batch. Named for the LAYOUT rather
+    /// than the source, because every engine re-entry gets the same one: its
+    /// exchange-starter is already on the wire, so the text is projected inline
+    /// and no `PromptInjected` is emitted. Which re-entry it is stays on
+    /// [`InjectedPromptKind`], which is what the log line reads.
+    Standalone(InjectedPrompt),
+}
+
+/// Keep each engine re-entry as a standalone user-channel block, but batch
+/// contiguous user/agent/engine text prompts so one injection window becomes
+/// one LLM user message. Each original prompt still emits its own
+/// PromptInjected audit event at append time.
+pub(crate) fn group_injected_prompts(prompts: Vec<InjectedPrompt>) -> Vec<InjectedPromptGroup> {
+    let mut groups = Vec::new();
+    let mut user_batch = Vec::new();
+
+    for prompt in prompts {
+        if prompt.kind.is_engine_reentry() {
+            if !user_batch.is_empty() {
+                groups.push(InjectedPromptGroup::UserText(std::mem::take(
+                    &mut user_batch,
+                )));
+            }
+            groups.push(InjectedPromptGroup::Standalone(prompt));
+        } else {
+            user_batch.push(prompt);
+        }
+    }
+
+    if !user_batch.is_empty() {
+        groups.push(InjectedPromptGroup::UserText(user_batch));
+    }
+
+    groups
+}
+
+/// Whether a drained injection set is worth reopening a finished answer for.
+///
+/// The final-answer path is the last chance to ingest a follow-up that landed
+/// mid-call. Taking it costs a whole extra round, so a set carrying no
+/// follow-up must not buy one.
+///
+/// A set of spoken asides alone carries no follow-up, per
+/// [`InjectedPromptKind::can_carry_a_turn`]. `drain_turn_orphans` drops one a
+/// moment later for the same reason, so the two windows agree rather than a
+/// race deciding.
+///
+/// Mixed with a real follow-up the set still reopens, and the aside rides
+/// along in the appended message. That is the case
+/// `TurnStarter::overheard` exists for.
+pub(crate) fn injections_reopen_a_finished_answer(prompts: &[InjectedPrompt]) -> bool {
+    prompts.iter().any(|p| p.kind.can_carry_a_turn())
+}
+
+/// Where a framed injection is being delivered — the half of the framing the
+/// prompt itself can't carry.
+///
+/// Load-bearing, not cosmetic: "carry on with the work you had in progress" is
+/// true mid-turn and false for a re-processed orphan, whose turn already
+/// terminated. Framing the two the same way tells the model to resume work
+/// that no longer exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InjectionDelivery {
+    /// Appended to the message list of a turn that is still running.
+    MidTurn,
+    /// Re-processed as a turn of its own because the previous turn ended
+    /// before draining it (`api::chat::process_orphan_chain`).
+    NewTurn,
+}
+
+/// Wrap an injected message so the model knows when it arrived relative to the
+/// turn it lands in.
+///
+/// The mid-turn human framing deliberately does NOT call the message a
+/// *correction*. It used to ("prioritize this over your current plan and
+/// adjust accordingly"), which made every interjection read as a course
+/// change: a bare "status?" sent while the agent was mid-work got answered and
+/// then ended the turn, abandoning the work in progress. Only the user knows
+/// whether they meant "instead" or "also" — so state both paths and let the
+/// model classify, with resuming as the default.
+///
+/// A `NewTurn` delivery gets no resume directive at all: there is no work in
+/// progress to carry on with, and no response in flight to fold an update
+/// into. It only reports *when* the message was sent, since the turn it
+/// arrived during has since finished and its result is already in history.
+pub(crate) fn framed_injected_prompt(
+    prompt: &InjectedPrompt,
+    delivery: InjectionDelivery,
+) -> String {
+    use super::super::thread_events::ActorMode;
+    match (prompt.mode, delivery) {
+        (ActorMode::Human, InjectionDelivery::MidTurn) => format!(
+            "[USER INTERJECTION — the user sent this while you were working. \
+             Answer it, then carry on with the work you had in progress, in this \
+             same turn; answering is not a reason to end your turn. If it \
+             redirects you, drop the old plan and follow the new direction \
+             instead.]\n\n{}",
+            prompt.text
+        ),
+        (ActorMode::Human, InjectionDelivery::NewTurn) => format!(
+            "[USER MESSAGE — sent while the previous turn was still finishing, \
+             so it is being handled now as its own turn.]\n\n{}",
+            prompt.text
+        ),
+        (ActorMode::Agent | ActorMode::Engine, InjectionDelivery::MidTurn) => format!(
+            "[SYSTEM UPDATE — new information arrived while you were working. \
+             Incorporate this into your current response.]\n\n{}",
+            prompt.text
+        ),
+        (ActorMode::Agent | ActorMode::Engine, InjectionDelivery::NewTurn) => format!(
+            "[SYSTEM UPDATE — this arrived while the previous turn was still \
+             finishing, so it is being handled now as its own turn.]\n\n{}",
+            prompt.text
+        ),
+    }
+}
+
+/// Whether any prompt in the batch carries image bytes. Drives both the
+/// blocks-vs-text shape of the coalesced message and the caller's decision to
+/// pin that message against trim pass 0 — the two must agree, so they read the
+/// same predicate.
+pub(crate) fn prompts_have_images(prompts: &[InjectedPrompt]) -> bool {
+    prompts
+        .iter()
+        .any(|prompt| prompt.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
+}
+
+/// Build the one user message a mid-turn injection batch is appended to. The
+/// delivery is intrinsic to this builder — it exists only for the live-turn
+/// path; the orphan path uses [`coalesced_user_text_for_reprocess`].
+/// `workspace` is where the images' blobs live, which their handles need.
+pub(crate) fn coalesced_user_text_message(
+    workspace: &std::path::Path,
+    prompts: &[InjectedPrompt],
+) -> Message {
+    let has_images = prompts_have_images(prompts);
+
+    let content = if prompts.len() == 1 && !has_images {
+        MessageContent::Text(framed_injected_prompt(
+            &prompts[0],
+            InjectionDelivery::MidTurn,
+        ))
+    } else {
+        let mut blocks = Vec::new();
+        for prompt in prompts {
+            let mut text = framed_injected_prompt(prompt, InjectionDelivery::MidTurn);
+            // Same label a turn-opening image gets, so the agent copies the
+            // handle instead of guessing a `thread:N`.
+            if let Some(imgs) = prompt.images.as_deref().filter(|imgs| !imgs.is_empty()) {
+                let noun = if imgs.len() == 1 { "image" } else { "images" };
+                let handles: Vec<String> =
+                    crate::engine::chat::current_image_handles(workspace, imgs)
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                let note = crate::engine::chat::handles_note(&handles);
+                text.push_str(&format!("\n\n[{noun} attached to this message{note}]"));
+            }
+            blocks.push(ContentBlock::Text { text });
+            if let Some(imgs) = &prompt.images {
+                for img in imgs {
+                    let fitted = img.clone().fit_for_llm();
+                    blocks.push(ContentBlock::Image {
+                        source_type: "base64".to_string(),
+                        media_type: fitted.mime_type,
+                        data: fitted.base64,
+                    });
+                }
+            }
+        }
+        MessageContent::Blocks(blocks)
+    };
+
+    Message {
+        role: "user".to_string(),
+        content,
+    }
+}
+
+/// Build the opening text of the turn that re-processes orphaned injections —
+/// messages the previous turn ended before draining. That turn is over, so
+/// these are framed as `NewTurn`, never with a resume directive.
+pub(crate) fn coalesced_user_text_for_reprocess(prompts: &[InjectedPrompt]) -> String {
+    prompts
+        .iter()
+        .map(|prompt| framed_injected_prompt(prompt, InjectionDelivery::NewTurn))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n")
+}
+
+pub(crate) fn coalesced_images_for_reprocess(
+    prompts: &[InjectedPrompt],
+) -> Option<Vec<crate::api::ChatImage>> {
+    let images: Vec<_> = prompts
+        .iter()
+        .filter_map(|prompt| prompt.images.as_ref())
+        .flat_map(|imgs| imgs.iter().cloned())
+        .collect();
+    (!images.is_empty()).then_some(images)
+}
+
+pub(crate) async fn filter_removed_queued_prompts(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    prompts: Vec<InjectedPrompt>,
+) -> Vec<InjectedPrompt> {
+    let ids: Vec<String> = prompts
+        .iter()
+        .filter(|prompt| matches!(prompt.kind, InjectedPromptKind::UserText))
+        .filter_map(|prompt| prompt.event_id.map(|id| id.to_string()))
+        .collect();
+    if ids.is_empty() {
+        return prompts;
+    }
+
+    let removed = match sqlx::query_scalar::<_, String>(
+        "SELECT payload->>'removed_message_id'
+           FROM events
+          WHERE aggregate = 'thread'
+            AND aggregate_id = $1
+            AND event_type = 'QueuedMessageRemoved'
+            AND payload->>'removed_message_id' = ANY($2::text[])",
+    )
+    .bind(thread_id.to_string())
+    .bind(&ids)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows.into_iter().collect::<HashSet<_>>(),
+        Err(e) => {
+            crate::log!(
+                "[Inject] queued-message removal lookup failed for thread {}: {}",
+                thread_id,
+                e
+            );
+            HashSet::new()
+        }
+    };
+    if removed.is_empty() {
+        return prompts;
+    }
+
+    let before = prompts.len();
+    let filtered: Vec<_> = prompts
+        .into_iter()
+        .filter(|prompt| {
+            if !matches!(prompt.kind, InjectedPromptKind::UserText) {
+                return true;
+            }
+            prompt
+                .event_id
+                .map(|id| !removed.contains(&id.to_string()))
+                .unwrap_or(true)
+        })
+        .collect();
+    let skipped = before.saturating_sub(filtered.len());
+    if skipped > 0 {
+        crate::log!(
+            "[Inject] Skipped {} removed queued prompt(s) for thread {}",
+            skipped,
+            thread_id
+        );
+    }
+    filtered
+}
+
+/// What [`append_injected_prompts_to_messages`] added to the message list.
+#[derive(Debug, Default)]
+pub(crate) struct AppendedInjections {
+    /// At least one message was appended, so the caller re-points
+    /// `user_message_idx` at the new last message.
+    pub appended: bool,
+    /// Indices of appended messages that carry image bytes. The caller pins
+    /// these against trim pass 0: an image the user attached mid-turn is every
+    /// bit as explicit as one attached to the message that opened the turn, and
+    /// without a pin it went blind on the model's very next tool call.
+    pub image_message_idxs: Vec<usize>,
+}
+
+pub(crate) async fn append_injected_prompts_to_messages(
+    workspace: &std::path::Path,
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    meta: &crate::engine::thread_events::EventMeta,
+    messages: &mut Vec<Message>,
+    prompts: Vec<InjectedPrompt>,
+) -> AppendedInjections {
+    let mut result = AppendedInjections::default();
+    for group in group_injected_prompts(prompts) {
+        match group {
+            InjectedPromptGroup::Standalone(prompt) => {
+                // An empty block is a provider 400 ("all messages must have
+                // non-empty content"), and it would carry nothing anyway. The
+                // callers are supposed to keep an empty re-entry off this path
+                // entirely (see `is_attached_event_wake` in `chat/process`);
+                // this is the backstop that turns a future slip into a dropped
+                // no-op rather than a failed turn.
+                if prompt.text.trim().is_empty() {
+                    crate::log!(
+                        "[Inject] Dropped an empty engine re-entry {:?} on thread {}",
+                        prompt.kind,
+                        thread_id
+                    );
+                    continue;
+                }
+                crate::log!(
+                    "[Inject] Engine re-entry {:?} (spawning_event {:?}) into active thread {}",
+                    prompt.kind,
+                    prompt.spawning_event_id,
+                    thread_id
+                );
+                // Engine re-entries are text-only, so there is nothing to pin.
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: MessageContent::Text(prompt.text),
+                });
+                result.appended = true;
+            }
+            InjectedPromptGroup::UserText(batch) => {
+                for prompt in &batch {
+                    crate::log!(
+                        "[Inject] Mid-flight {:?} prompt injected into thread {}: {}",
+                        prompt.mode,
+                        thread_id,
+                        &prompt.text[..prompt.text.floor_char_boundary(80)]
+                    );
+                    emit_prompt_injected_event(bus, thread_id, meta, prompt).await;
+                }
+                let has_images = prompts_have_images(&batch);
+                messages.push(coalesced_user_text_message(workspace, &batch));
+                result.appended = true;
+                if has_images {
+                    result.image_message_idxs.push(messages.len() - 1);
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Cross-provider classification of a completion's finish reason. Providers
+/// report the raw reason verbatim and use *different vocabularies* — Anthropic
+/// lowercases (`end_turn`, `max_tokens`, `refusal`), Gemini uppercases (`STOP`,
+/// `MAX_TOKENS`, `SAFETY`, `RECITATION`), OpenAI mixes (`completed`, `stop`,
+/// `length`, `max_output_tokens`, `content_filter`). Classifying on a single
+/// provider's strings would silently mis-file every other provider's
+/// truncation / safety stop as a clean stop — the exact trap that made an empty
+/// Gemini `STOP` look the same as a Gemini `MAX_TOKENS` cutoff. Normalize once,
+/// here, so the empty-completion decision is provider-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinishClass {
+    /// The model finished its turn on its own terms (`end_turn` / `STOP` /
+    /// `stop` / `completed`). An empty turn here is intentional silence, not a
+    /// failure.
+    Clean,
+    /// Output was cut off by a length / token budget (`max_tokens` /
+    /// `MAX_TOKENS` / `length` / `max_output_tokens`). Content was lost.
+    Truncated,
+    /// A provider safety / policy classifier withheld the content
+    /// (`refusal` / `SAFETY` / `RECITATION` / `content_filter` / …).
+    Blocked,
+    /// Anything unrecognised — `null`/absent, `stop_sequence`, `other`,
+    /// `malformed_function_call`, a future reason we haven't mapped. Treated as
+    /// a failure (fail-safe): we don't know why the turn was empty, so surface
+    /// it rather than silently pass.
+    Unknown,
+}
+
+/// Map a raw provider finish reason onto [`FinishClass`]. Case-insensitive so
+/// Gemini's uppercase enum collapses onto the same buckets as Anthropic's
+/// lowercase one.
+pub(crate) fn normalize_finish_reason(stop_reason: &str) -> FinishClass {
+    match stop_reason.to_ascii_lowercase().as_str() {
+        // Model-decided end of turn across providers.
+        "end_turn" | "stop" | "completed" | "end_of_turn" | "eos" => FinishClass::Clean,
+        // Length / token-budget cutoff across providers.
+        "max_tokens" | "max_output_tokens" | "length" | "model_length" => FinishClass::Truncated,
+        // Safety / policy block or explicit refusal across providers.
+        "refusal" | "safety" | "recitation" | "content_filter" | "blocklist"
+        | "prohibited_content" | "spii" | "image_safety" => FinishClass::Blocked,
+        // null/absent ("unknown" sentinel), stop_sequence, other, etc.
+        _ => FinishClass::Unknown,
+    }
+}
+
+/// Why a final turn that DID produce text must still end as a failure, or
+/// `None` when its text is a finished answer.
+///
+/// A safety classifier can stop a response partway. The text before the cut
+/// has already streamed and stays on screen. It is not an answer, though, so
+/// the turn fails with this message rather than completing as if it were whole.
+pub(crate) fn declined_partway_error(stop_reason: Option<&str>) -> Option<&'static str> {
+    (stop_reason.map(normalize_finish_reason) == Some(FinishClass::Blocked)).then_some(
+        "The model stopped partway: the provider's safety classifier withheld the rest of the \
+         response. The text above is incomplete. Rephrase the request or start a new thread; \
+         retrying the same prompt will be refused again.",
+    )
+}
+
+/// Verdict for a completion that returned no text and no tool calls.
+pub(crate) struct EmptyCompletionClass {
+    /// `true` → emit `ResponseFailed` (genuine failure: truncation, safety
+    /// block, dropped output, or an unrecognised stop). `false` → benign: the
+    /// model finished cleanly and just produced no text, so the thread
+    /// completes normally and the UI renders a neutral "empty response" note.
+    pub is_error: bool,
+    /// Human-readable suffix. For the error case it's appended to the
+    /// `ResponseFailed` diagnostic; for the benign case it's logged so an
+    /// operator can still see *why* the turn was empty.
+    pub hint: &'static str,
+}
+
+/// Decide whether an empty completion (no text, no tool calls) is a genuine
+/// failure or benign intentional silence — uniformly across providers and
+/// thread types. The classification keys off the *cause* of the emptiness, not
+/// what launched the thread:
+///
+/// - **Truncated / Blocked** (normalized finish reason): content was lost or
+///   withheld → error.
+/// - **Dropped output**: `output_tokens > 16` while the model did not think
+///   (`model_thought` false), or `unknown_sse_dropped > 0`. The provider billed
+///   real output but nothing reached the engine: a known block carried an
+///   unrecognised shape, or an unknown SSE block slipped past the parser.
+///   `model_thought` must count thinking BLOCKS, not only thinking text:
+///   Claude returns empty thinking text unless asked to show it. → error.
+/// - **Unknown** finish reason with nothing salvageable (`null`,
+///   `stop_sequence`, a future reason): fail-safe → error.
+/// - **Clean** stop with nothing dropped: the model ended its turn and chose to
+///   emit no text → benign.
+///
+/// Threshold `16` is well above any realistic structural-overhead floor for
+/// `usage.output_tokens` on a no-op clean stop — keeps true silence out of the
+/// parser-miss branch.
+pub(crate) fn classify_empty_completion(
+    stop_reason: &str,
+    output_tokens: u32,
+    model_thought: bool,
+    unknown_sse_dropped: u32,
+) -> EmptyCompletionClass {
+    let error = |hint: &'static str| EmptyCompletionClass {
+        is_error: true,
+        hint,
+    };
+    let class = normalize_finish_reason(stop_reason);
+    match class {
+        // Truncation wins regardless of what was captured — the user needs to
+        // know the budget was hit before they wonder about parser drift.
+        FinishClass::Truncated => return error(" — output truncated by token budget"),
+        // A safety / policy block withheld already-generated content, so
+        // output_tokens can be non-zero while nothing reaches the engine.
+        FinishClass::Blocked => {
+            return error(" — the model declined to respond (provider safety classifier withheld the output). Rephrase the request or start a new thread; retrying the same prompt will be refused again")
+        }
+        FinishClass::Clean | FinishClass::Unknown => {}
+    }
+    // Dropped output: tokens billed but nothing surfaced. Either a known block
+    // carried an unexpected payload shape (couldn't classify) or an unknown
+    // SSE block was dropped (`unknown_sse_dropped`, incremented in
+    // `vertex::process_sse_data`). Surfacing this prevents the misleading
+    // "model decided no action was needed" that masked real Vertex SSE drift.
+    if output_tokens > 16 && !model_thought {
+        if unknown_sse_dropped > 0 {
+            return error(" — engine dropped unknown SSE shapes; provider stream may have changed (see [Vertex] WARNING logs for the exact types)");
+        }
+        return error(" — model generated output the engine couldn't classify (likely a stream-shape change in the provider)");
+    }
+    if unknown_sse_dropped > 0 {
+        return error(" — engine dropped unknown SSE shapes; provider stream may have changed (see [Vertex] WARNING logs for the exact types)");
+    }
+    // Unrecognised stop with nothing salvageable — we can't vouch that the
+    // turn ended cleanly, so surface it rather than silently passing.
+    if class == FinishClass::Unknown {
+        return error("");
+    }
+    // Clean stop, nothing dropped: intentional silence. Not an error.
+    let hint = if model_thought {
+        " — model thought but produced no text or tool call"
+    } else {
+        " — model ended its turn without producing text"
+    };
+    EmptyCompletionClass {
+        is_error: false,
+        hint,
+    }
+}
+
+/// Choose the assistant text to flush at the end of a turn.
+///
+/// Streamed providers (Claude) fill `raw` via the token callback as tokens
+/// arrive. A non-streaming provider (Gemini) emits its whole text through the
+/// callback once, which also lands in `raw`; `content` is the defensive
+/// fallback for a provider that left `raw` empty but carried prose in the
+/// response body. `cleaned` (inline-question-repair, tag-stripped) wins when
+/// present. This flushes the assistant's preamble on a tool-call turn too — the
+/// agent explains along the way, not just in its final answer.
+pub(crate) fn effective_flush_text<'a>(
+    cleaned: Option<&'a str>,
+    raw: &'a str,
+    content: Option<&'a str>,
+) -> &'a str {
+    if let Some(c) = cleaned {
+        return c;
+    }
+    if !raw.is_empty() {
+        return raw;
+    }
+    content.unwrap_or("")
+}
+
+/// Build the tool list for intent sub-loops.
+/// Notification tools must be included explicitly — they're not in get_default_tools().
+///
+/// `caps` is the caller's workspace gates, so a sub-loop is offered the same
+/// families the chat turn above it was (ADR 0088).
+pub(crate) fn build_intent_tools(caps: &ToolCapabilities) -> Vec<ToolDefinition> {
+    // `await_event` is dropped alongside `execute_intent`, and for a sharper
+    // reason than recursion: an intent sub-loop runs INSIDE the caller's turn
+    // and returns a string, so a subscription registered here outlives the only
+    // thing that wanted it. It would be recorded against the OUTER thread and
+    // re-open it, hours later, with an event nobody on that thread ever asked
+    // to wait for. (Before subscriptions became non-blocking this was refused for
+    // a different reason, a park with no turn to end; that one is gone, this
+    // one is not.)
+    let mut tools: Vec<_> = get_default_tools(caps)
+        .into_iter()
+        .filter(|t| t.name != tn::EXECUTE_INTENT && t.name != tn::AWAIT_EVENT)
+        .collect();
+    tools.push(get_notification_tool());
+    // Grouped notification-inbox tool (list / mark_read / mark_all_read) +
+    // any other manifest-declared LLM tools — single source of truth.
+    tools.extend(crate::capability_manifest::llm_tools_for(caps));
+    tools
+}
+
+/// Derive the "target" key for the consecutive-tool-call circuit breaker.
+///
+/// Most tools have a meaningful target argument (`path`, `url`, `query`).
+/// `run_bash` is special: its argument is `command`, and bucketing by the
+/// bare tool name would mean three unrelated shell calls (e.g. `git status`
+/// → `git add` → `git commit`) trip the guard. Bucketing by the first
+/// whitespace-delimited token of `command` keeps the original "stop the LLM
+/// from spamming the exact same call" intent (same prefix still counts) while
+/// letting unrelated commands run in sequence.
+///
+/// `run_python` and `run_python_background` mirror that idea: bucket by the
+/// first non-blank, non-comment, non-import line of `code` (truncated to 80
+/// chars). Different scripts have different first actionable lines; identical
+/// retry-storms (most famously `time.sleep(N)` polling) share theirs, so the
+/// generic 3-strike guard fires. Falls back to the tool name when the code
+/// has no actionable line so the guard still fires on three pure-import or
+/// pure-comment calls in a row.
+///
+/// `read_file` is similarly special: its window args (`start_line`,
+/// `line_count`, `offset`) are how an LLM legitimately pages through one big
+/// file. Bucketing the page-1, page-2, page-3 reads under the same `path`
+/// key would trip the read_file breaker on the third page even though each
+/// call returns new content. When any window arg is present, suffix the key
+/// so each (path, window) combination is its own bucket.
+pub(crate) fn derive_call_key(tool_name: &str, args: &serde_json::Value) -> String {
+    if tool_name == tn::RUN_BASH {
+        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+            if let Some(first_token) = cmd.split_whitespace().next() {
+                return first_token.to_string();
+            }
+        }
+        return tn::RUN_BASH.to_string();
+    }
+
+    if tool_name == tn::RUN_PYTHON || tool_name == tn::RUN_PYTHON_BACKGROUND {
+        if let Some(code) = args.get("code").and_then(|v| v.as_str()) {
+            if let Some(key) = python_call_key(code) {
+                return key;
+            }
+        }
+        return tool_name.to_string();
+    }
+
+    let base = args
+        .get("path")
+        .or_else(|| args.get("url"))
+        .or_else(|| args.get("query"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if tool_name == tn::READ_FILE {
+        let start = args.get("start_line").and_then(|v| v.as_u64());
+        let count = args.get("line_count").and_then(|v| v.as_u64());
+        let offset = args.get("offset").and_then(|v| v.as_u64());
+        if start.is_some() || count.is_some() || offset.is_some() {
+            let fmt_opt = |n: Option<u64>| n.map(|v| v.to_string()).unwrap_or_default();
+            return format!(
+                "{}|s={}|c={}|o={}",
+                base,
+                fmt_opt(start),
+                fmt_opt(count),
+                fmt_opt(offset),
+            );
+        }
+    }
+
+    base.to_string()
+}
+
+/// First non-blank, non-comment, non-import line of a Python script —
+/// the bucket key the consecutive-call circuit breaker uses for
+/// `run_python` / `run_python_background`. Returns `None` when the code
+/// is empty / pure-import / pure-comment so the caller falls back to
+/// the bare tool name (three pure-import calls in a row still trip the
+/// guard under the tool name, which is fine — they're a retry storm).
+///
+/// Truncated to 80 chars for readability in logs / STOP messages, with
+/// an 8-hex-char hash suffix of the FULL line so two long scripts
+/// diverging past char 80 (e.g. `df = pd.read_csv('/long/path/.../foo_A.csv')`
+/// vs `..._B.csv`) bucket separately. Case-preserved because Python is
+/// case-sensitive (`time.sleep` vs `Time.sleep` mean different things).
+pub(crate) fn python_call_key(code: &str) -> Option<String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    const MAX_KEY_CHARS: usize = 80;
+    for raw in code.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Skip imports — different scripts share these but their
+        // actionable lines diverge. Catches `import x`, `from x import y`,
+        // and the rare `import x as y` form.
+        if line.starts_with("import ") || line.starts_with("from ") {
+            continue;
+        }
+        let take = line
+            .char_indices()
+            .nth(MAX_KEY_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+        if take == line.len() {
+            // Line fits — no hash suffix needed.
+            return Some(line.to_string());
+        }
+        // Line longer than 80 chars — append a hash of the full line so
+        // two retries that share the same prefix but diverge past
+        // char 80 don't collide.
+        let mut hasher = DefaultHasher::new();
+        line.hash(&mut hasher);
+        let h = hasher.finish();
+        return Some(format!(
+            "{}#{:08x}",
+            &line[..take],
+            (h & 0xFFFF_FFFF) as u32
+        ));
+    }
+    None
+}
+
+/// One sentinel-prefixed tool result, parsed: which *form request* to emit.
+///
+/// `redacted_text` replaces the LLM-visible tool result, so the model cannot
+/// read the raw JSON and act as if the call returned synchronously. `None`
+/// leaves the result alone: the EmailConfirm tool's description already
+/// explains the confirm flow, so its raw payload is harmless to the model.
+pub(crate) struct SentinelMatch {
+    pub label: &'static str,
+    pub event: super::super::thread_events::ThreadEvent,
+    pub redacted_text: Option<String>,
+}
+
+/// The `request_id` a plugin preview already carries under `key`. The confirm
+/// and cancel routes take that id, so the form request reuses it.
+fn preview_id(payload: &str, key: &str) -> Option<uuid::Uuid> {
+    serde_json::from_str::<serde_json::Value>(payload).ok()?[key]
+        .as_str()?
+        .parse()
+        .ok()
+}
+
+/// Inspect a tool result for a form-request sentinel. On a match, return the
+/// request event to emit and the LLM-facing replacement text, if any.
+///
+/// Only the tool that produces a sentinel may open its form. `run_bash`, an MCP
+/// tool or a fetched page passes outside text through verbatim. A prefix match
+/// alone would let that text open a trusted credential form scoped to any host.
+/// `tool_name` and `args` are the call as the model made it. A grouped tool
+/// resolves to its legacy name first.
+///
+/// The wording says the form was SENT, never shown. The engine knows it
+/// recorded the request; whether a screen drew it is the client's to know.
+pub(crate) fn match_sentinel(
+    tool_name: &str,
+    args: &serde_json::Value,
+    text: &str,
+) -> Option<SentinelMatch> {
+    use super::super::thread_events::ThreadEvent;
+    use super::super::tools::credentials::CREDENTIAL_REQUEST_PREFIX;
+    use super::super::tools::plugins::{
+        PLUGIN_INSTALL_REQUEST_PREFIX, PLUGIN_UNINSTALL_REQUEST_PREFIX,
+    };
+    use crate::llm::tool_names as tn;
+
+    let tool = super::super::tools::dispatch_name(tool_name, args).ok()?;
+
+    type SentinelEntry = (
+        &'static str,
+        &'static [&'static str],
+        &'static str,
+        fn(String) -> Option<ThreadEvent>,
+        Option<&'static str>,
+    );
+    let entries: &[SentinelEntry] = &[
+        (
+            CREDENTIAL_REQUEST_PREFIX,
+            &[
+                tn::REQUEST_CREDENTIAL,
+                tn::CONNECT_OAUTH_ACCOUNT,
+                tn::CONFIGURE_EMAIL,
+            ],
+            "[AgenticLoop] CredentialRequested",
+            |payload| {
+                Some(ThreadEvent::CredentialRequested {
+                    request_id: uuid::Uuid::new_v4(),
+                    payload,
+                })
+            },
+            Some("Credential form sent to the user. It stays open in this thread until they save or cancel it, so wait for that. Do not chat-ask for the same value: the form resolves the request."),
+        ),
+        (
+            PLUGIN_INSTALL_REQUEST_PREFIX,
+            &[tn::INSTALL_PLUGIN, tn::UPDATE_PLUGIN],
+            "[AgenticLoop] PluginInstallRequested",
+            |payload| {
+                Some(ThreadEvent::PluginInstallRequested {
+                    request_id: preview_id(&payload, "install_id")?,
+                    payload,
+                })
+            },
+            Some("Install panel sent to the user. It stays open in this thread until they click Confirm or Cancel. Do not chat-ask about overwrites and do not claim the install succeeded: the panel resolves it and the next user message will tell you the outcome."),
+        ),
+        (
+            PLUGIN_UNINSTALL_REQUEST_PREFIX,
+            &[tn::UNINSTALL_PLUGIN],
+            "[AgenticLoop] PluginUninstallRequested",
+            |payload| {
+                Some(ThreadEvent::PluginUninstallRequested {
+                    request_id: preview_id(&payload, "uninstall_id")?,
+                    payload,
+                })
+            },
+            Some("Uninstall panel sent to the user. It stays open in this thread until they click Confirm or Cancel. Do not chat-ask which files to delete and do not claim files were removed: the panel resolves it and the next user message will tell you the outcome."),
+        ),
+        (
+            "[EMAIL_CONFIRM]",
+            &[tn::SEND_EMAIL],
+            "[AgenticLoop] EmailConfirmRequested",
+            |payload| {
+                Some(ThreadEvent::EmailConfirmRequested {
+                    request_id: uuid::Uuid::new_v4(),
+                    payload,
+                })
+            },
+            None,
+        ),
+    ];
+
+    for &(prefix, producers, label, ctor, redacted) in entries {
+        if !producers.contains(&tool) || !text.starts_with(prefix) {
+            continue;
+        }
+        let after = &text[prefix.len()..];
+        let rel_start = after.find('{')?;
+        let payload = after[rel_start..].to_string();
+        let mut redacted_text = redacted.map(str::to_string);
+        // Name the credential the modal is collecting. The redaction hides the
+        // payload, so without this the model knows a modal opened but not what
+        // it stores, and has to guess: on 2026-08-05 `connect_oauth_account`
+        // reopened a modal because the client had been saved under `dropbox`
+        // instead of `oauth:dropbox`, and the agent narrated a theory rather
+        // than the fact. The service name is engine-authored (see
+        // `oauth::client_service_name`), not user text.
+        //
+        // A widening says so instead. The modal reopened a credential that
+        // already holds its secret. "It saves the credential as X" would send
+        // the agent off narrating a token the user does not have to type.
+        if prefix == CREDENTIAL_REQUEST_PREFIX {
+            let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
+            if let Some(service) = parsed
+                .as_ref()
+                .and_then(|v| v["service"].as_str())
+                .filter(|s| !s.is_empty())
+            {
+                let widening = parsed
+                    .as_ref()
+                    .and_then(|v| v["adding_base_urls"].as_array())
+                    .is_some_and(|hosts| !hosts.is_empty());
+                if let Some(t) = redacted_text.as_mut() {
+                    t.push_str(&if widening {
+                        format!(
+                            " It widens the existing \"{service}\" credential to reach another \
+                             host. The stored secret is unchanged, so the user only presses Save."
+                        )
+                    } else {
+                        format!(" It saves the credential as \"{service}\".")
+                    });
+                }
+            }
+        }
+        return Some(SentinelMatch {
+            label,
+            event: ctor(payload)?,
+            redacted_text,
+        });
+    }
+    None
+}
+
+/// Check if buffered text has reached a renderable boundary.
+pub(crate) fn should_flush(text: &str) -> bool {
+    // Paragraph break
+    if text.ends_with("\n\n") {
+        return true;
+    }
+    // Code fence close
+    if text.ends_with("```\n") {
+        return true;
+    }
+    // Heading completed (ends with newline after a heading line)
+    if text.ends_with('\n') {
+        if let Some(last_line) = text.lines().last() {
+            if last_line.starts_with('#') {
+                return true;
+            }
+        }
+    }
+    // Horizontal rule
+    if text.ends_with("\n---\n") || text.ends_with("\n***\n") {
+        return true;
+    }
+    false
+}
+
+/// Parse a `[APP_CAPTURE:<screenshot_b64>]\n<dom>` sentinel produced by the SDK
+/// frontend `capture_app` tool. Returns `(screenshot_b64, dom_text)` if matched.
+pub(crate) fn parse_app_capture_marker(s: &str) -> Option<(&str, &str)> {
+    let rest = s.strip_prefix("[APP_CAPTURE:")?;
+    let end_bracket = rest.find("]\n")?;
+    Some((&rest[..end_bracket], &rest[end_bracket + 2..]))
+}
+
+/// Inverse of [`parse_app_capture_marker`]: format a tool-result string for
+/// the agentic loop to feed back to Claude.
+///
+/// When the SDK couldn't take a screenshot (the rasterizer failed, for one),
+/// it returns `screenshot = ""` and stuffs the failure into `dom`. Wrapping that in `[APP_CAPTURE:]`
+/// (empty marker) makes the parser hand the loop an empty base64, which
+/// becomes a `ContentBlock::Image { data: "" }` and gets a 400
+/// `image cannot be empty` from Anthropic. Drop the marker entirely in that
+/// case so the result falls through to the plain-text path; the LLM still
+/// reads the `dom` (which carries the error) and can decide how to proceed.
+pub(crate) fn format_capture_result(screenshot_b64: &str, dom: &str) -> String {
+    if screenshot_b64.is_empty() {
+        dom.to_string()
+    } else {
+        format!("[APP_CAPTURE:{}]\nDOM snapshot:\n{}", screenshot_b64, dom)
+    }
+}
+
+/// If `s` is an `[APP_CAPTURE:<b64>]\n<dom>` sentinel, return a stub that names
+/// the screenshot's media type and approximate decoded size, followed by the
+/// DOM text unchanged. Returns `None` for non-matching input.
+///
+/// The mirror of [`crate::engine::tools::files::strip_image_content_marker`],
+/// and it exists for the same reason: the block builder lifts the screenshot
+/// into a proper image block before the model call, so persisting the base64
+/// too is dead weight. It is dead weight at a scale that matters, since a
+/// single retina capture reached 1.5 MB in one event row. The DOM survives
+/// because it is the part a human reading the step-detail modal wants, and it
+/// is already what the model gets as the tool-result body.
+pub(crate) fn strip_app_capture_marker(s: &str) -> Option<String> {
+    let (screenshot_b64, dom) = parse_app_capture_marker(s)?;
+    let approx_bytes = (screenshot_b64.len() * 3) / 4;
+    Some(format!(
+        "[screenshot {}, {} omitted, not embedded in event]\n{}",
+        sniff_image_media_type(screenshot_b64),
+        crate::core::format_byte_size(approx_bytes),
+        dom,
+    ))
+}
+
+/// Sniff a recognized image mime from a base64-encoded image. Decodes only the
+/// leading bytes (enough for any magic header in `core::blobs::sniff_image_mime`)
+/// so the multi-MB capture body isn't decoded twice. Falls back to PNG when the
+/// header doesn't match the allowlist — keeps prior behaviour for unrecognised
+/// inputs; the Anthropic API rejects the message either way.
+pub(crate) fn sniff_image_media_type(b64: &str) -> &'static str {
+    use base64::Engine;
+    // 16 base64 chars decode to exactly 12 bytes — enough for HEIC's `ftyp` brand
+    // at offset 8-11, the longest header `sniff_image_mime` inspects. Round down
+    // to a multiple of 4 so the strict decoder accepts the partial slice.
+    let prefix_len = 16.min(b64.len() & !3);
+    base64::engine::general_purpose::STANDARD
+        .decode(&b64.as_bytes()[..prefix_len])
+        .ok()
+        .as_deref()
+        .and_then(crate::core::blobs::sniff_image_mime)
+        .unwrap_or("image/png")
+}
+
+/// One raw tool result, split into the two texts that want different things.
+///
+/// The model needs the raw sentinel, because [`build_tool_result_blocks`] is
+/// what lifts its base64 into a real `ContentBlock::Image`. The event wants a
+/// small stub, because a megabyte of base64 in the events table is dead weight
+/// the frontend never reads. Collapsing both onto one value is what broke both
+/// directions at once; see [`split_tool_result`].
+pub(crate) struct ToolResultSplit {
+    /// Text handed to the LLM message builder.
+    pub llm_text: String,
+    /// The event's text when it must differ from `llm_text`, which is only ever
+    /// for the two image sentinels. `None` means the event records exactly what
+    /// the model saw, which is every other tool result. Modelling the override
+    /// rather than a second copy keeps the common path to a single allocation:
+    /// a `run_bash` result is routinely 150 kB and this runs per tool call.
+    event_stub: Option<String>,
+    /// Base64 images persisted alongside the event, for the frontend to render.
+    pub images: Vec<String>,
+}
+
+impl ToolResultSplit {
+    /// The model and the event see the same thing. The common case: any result
+    /// carrying no image sentinel at all.
+    fn shared(text: String) -> Self {
+        Self {
+            llm_text: text,
+            event_stub: None,
+            images: Vec::new(),
+        }
+    }
+
+    /// What gets persisted in the `ToolResult` event payload.
+    pub(crate) fn event_text(&self) -> &str {
+        self.event_stub.as_deref().unwrap_or(&self.llm_text)
+    }
+
+    /// Apply a confirm-flow sentinel redaction to both sides. The redaction
+    /// exists so the model sees a one-line wait notice instead of parseable
+    /// JSON it would act on, and the event should record what the model saw.
+    /// Clearing the stub is what makes both sides agree: a redacted result is
+    /// one short sentence, so there is nothing left worth stubbing.
+    pub(crate) fn redact(&mut self, redacted: String) {
+        self.llm_text = redacted;
+        self.event_stub = None;
+    }
+}
+
+/// Split a raw tool result into its model-facing and event-facing halves.
+///
+/// Four cases:
+/// - `[GENERATED_IMAGE:<b64>]`: the bytes go to the event's `images` array for
+///   the frontend to render, and both texts get the remainder. The model is not
+///   shown its own synthesised image back.
+/// - `[IMAGE_CONTENT:<type>]`: an image the model explicitly asked to see
+///   (`read_file` on an image file, `view_image`). The sentinel survives to the
+///   model so the block builder can lift it; the event gets a stub.
+/// - `[APP_CAPTURE:<b64>]`: an ambient capture (`capture_app`,
+///   `browser_screenshot`). Same treatment, and the event keeps the DOM text,
+///   which is the part worth persisting.
+/// - anything else: both sides get the result verbatim.
+///
+/// The two sentinel cases are the whole reason this function exists. Persisting
+/// the base64 bloats the events table (one 46 MB thread froze iOS PWAs, hence
+/// the stubs); stripping it before the block builder runs blinds the model.
+/// Both were true at once until this split existed, in opposite directions.
+pub(crate) fn split_tool_result(result: &str) -> ToolResultSplit {
+    if let Some(rest) = result.strip_prefix("[GENERATED_IMAGE:") {
+        let Some(end_bracket) = rest.find("]\n") else {
+            return ToolResultSplit::shared(result.to_string());
+        };
+        return ToolResultSplit {
+            llm_text: rest[end_bracket + 2..].to_string(),
+            event_stub: None,
+            images: vec![rest[..end_bracket].to_string()],
+        };
+    }
+    if let Some(stub) = crate::engine::tools::files::strip_image_content_marker(result) {
+        return ToolResultSplit {
+            event_stub: Some(stub),
+            ..ToolResultSplit::shared(result.to_string())
+        };
+    }
+    if let Some(stub) = strip_app_capture_marker(result) {
+        return ToolResultSplit {
+            event_stub: Some(stub),
+            ..ToolResultSplit::shared(result.to_string())
+        };
+    }
+    ToolResultSplit::shared(result.to_string())
+}
+
+/// Take the answer-image marker off an `ask_user_question` result, returning
+/// the result and the blobs it names. Only that tool writes the marker. Any
+/// other tool may pass outside text through, so its result is left alone.
+pub(crate) fn take_answer_images(tool_name: &str, result: String) -> (String, Vec<String>) {
+    if tool_name != crate::llm::tool_names::ASK_USER_QUESTION {
+        return (result, Vec::new());
+    }
+    match crate::engine::agent_question::parse_answer_images(&result) {
+        Some((hashes, text)) => (text.to_string(), hashes),
+        None => (result, Vec::new()),
+    }
+}
+
+/// Load a result's attached blobs as images fit for the model.
+///
+/// The answer that named them was checked against the blob store moments
+/// ago, so a miss means the file was deleted in between. It is logged, and
+/// the model sees one image fewer than the result's text announced.
+pub(crate) fn load_attached_images(
+    workspace: &std::path::Path,
+    hashes: &[String],
+) -> Vec<crate::api::ChatImage> {
+    hashes
+        .iter()
+        .filter_map(|hash| {
+            let loaded = crate::core::blobs::read_blob_as_base64(workspace, hash);
+            if loaded.is_none() {
+                log!("[AgentLoop] Attached image {hash} is no longer in the blob store");
+            }
+            loaded
+        })
+        .map(|(base64, mime_type)| crate::api::ChatImage { base64, mime_type }.fit_for_llm())
+        .collect()
+}
+
+/// One finished tool call, as the wire-block builder needs it.
+pub(crate) struct ToolOutput {
+    /// The provider's own id for the call, which pairs result to `tool_use`.
+    /// Meaningful only inside this turn, and the reason `event_id` exists.
+    pub tool_use_id: String,
+    /// What the model sees.
+    pub text: String,
+    /// The originating `ToolCalled` event id, or `None` when its emit failed.
+    pub event_id: Option<uuid::Uuid>,
+    /// Images shown to the model after every result, already fit for it.
+    pub images: Vec<crate::api::ChatImage>,
+}
+
+/// Build the user message's content blocks from this iteration's tool outputs.
+///
+/// CRITICAL: every `ToolResult` block must come before any `Image` or `Text`
+/// block. The Claude API validates that tool_result blocks immediately follow
+/// the assistant's tool_use blocks; interleaving makes it miss the later
+/// results and return `tool_use ids were found without tool_result blocks`.
+/// Images are therefore collected separately and appended after the loop.
+///
+/// Extracted from the loop body so the sentinel-to-vision chain is testable
+/// end to end. It was inline and unreachable from any test for three months,
+/// which is precisely how the image lift below came to be dead code.
+pub(crate) fn build_tool_result_blocks(
+    tool_outputs: &[ToolOutput],
+    instruction: &str,
+) -> Vec<ContentBlock> {
+    let mut result_blocks: Vec<ContentBlock> = Vec::new();
+    let mut trailing_blocks: Vec<ContentBlock> = Vec::new();
+    for ToolOutput {
+        tool_use_id,
+        text: result,
+        event_id,
+        images,
+    } in tool_outputs
+    {
+        trailing_blocks.extend(images.iter().map(|image| ContentBlock::Image {
+            source_type: "base64".to_string(),
+            media_type: image.mime_type.clone(),
+            data: image.base64.clone(),
+        }));
+        if let Some((screenshot_b64, dom_text)) = parse_app_capture_marker(result) {
+            result_blocks.push(ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: with_event_address(dom_text.to_string(), event_id.as_ref()),
+            });
+            // Fit the screenshot to the model size target (compress only if
+            // over) so a large retina capture can't trip the provider's
+            // per-image limit. fit_for_llm is the single gate for every
+            // chat-to-model image.
+            let fitted = crate::api::ChatImage {
+                base64: screenshot_b64.to_string(),
+                mime_type: sniff_image_media_type(screenshot_b64).to_string(),
+            }
+            .fit_for_llm();
+            trailing_blocks.push(ContentBlock::Image {
+                source_type: "base64".to_string(),
+                media_type: fitted.mime_type,
+                data: fitted.base64,
+            });
+            continue;
+        }
+        if let Some((media_type, image_b64)) =
+            crate::engine::tools::files::parse_image_content_marker(result)
+        {
+            result_blocks.push(ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: with_event_address(
+                    crate::engine::tools::files::EXPLICIT_IMAGE_RESULT_TEXT.to_string(),
+                    event_id.as_ref(),
+                ),
+            });
+            // No fit_for_llm here: read_file's encode_image_for_read already
+            // fit the image before emitting the IMAGE_CONTENT marker, so this
+            // payload is guaranteed within the model size target.
+            trailing_blocks.push(ContentBlock::Image {
+                source_type: "base64".to_string(),
+                media_type: media_type.to_string(),
+                data: image_b64.to_string(),
+            });
+            continue;
+        }
+        result_blocks.push(ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: with_event_address(result.clone(), event_id.as_ref()),
+        });
+    }
+    // Append images and instruction text AFTER all ToolResult blocks.
+    result_blocks.append(&mut trailing_blocks);
+    result_blocks.push(ContentBlock::Text {
+        text: instruction.to_string(),
+    });
+    result_blocks
+}
+
+/// Detect image descriptions that indicate the model couldn't see the image.
+/// These are error responses, not actual descriptions — using them would poison
+/// the LLM context with false information (e.g. "the image shows an error message").
+pub(crate) fn is_bad_image_description(desc: &str) -> bool {
+    let lower = desc.to_lowercase();
+    lower.contains("i do not see any image")
+        || lower.contains("i don't see any image")
+        || lower.contains("no image attached")
+        || lower.contains("no images attached")
+        || lower.contains("please provide the image")
+        || lower.contains("i cannot see")
+        || lower.contains("no image was provided")
+        || lower.contains("no image provided")
+}
+
+/// How many times a single response may reject a prose answer and force the
+/// model to re-call `ask_user_question` after a failed ask. Bounds the re-ask
+/// guard so a persistently-broken question path (e.g. the DB is down and every
+/// `walk_question_batch` errors) or a model that refuses to comply can never
+/// trap the loop — after this many forces the turn finalizes normally with
+/// prose. Far below the default tool-call cap, which remains the outer
+/// backstop. (A user who configures a cap this low has deliberately chosen for
+/// the backstop to fire first; see [`crate::core::prefs::MAX_TOOL_CALLS`].)
+pub(crate) const MAX_QUESTION_REASK: usize = 2;
+
+/// Why the loop is pushing the model to re-ask. Each cause carries its own
+/// forcing instruction. Telling the model a call was rejected when it never
+/// made one sends it looking for a mistake that isn't there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuestionReaskCause {
+    /// The model called `ask_user_question`, the engine rejected the call, and
+    /// the model answered in prose instead of re-calling.
+    CallRejected,
+    /// The model typed `<ask_user_question>` as text and its body was not a
+    /// dispatchable payload, so no call was ever made. Detected by
+    /// [`crate::engine::inline_question_repair`].
+    LeakedAsText,
+    /// The model never reached for the tool at all: it just ended its reply on
+    /// a question. Detected by [`reply_ends_in_a_question`].
+    AskedInProse,
+}
+
+impl QuestionReaskCause {
+    /// The forcing instruction appended as a user message. Pushes the model
+    /// back to the tool with the full question text: the interactive card is
+    /// the whole point of the call, and a prose fallback degrades it into a
+    /// typed-reply menu the user can't click.
+    pub(crate) fn instruction(self) -> &'static str {
+        match self {
+            Self::CallRejected => {
+                "Your previous `ask_user_question` call was rejected because a question object \
+                 had no `question` text. Do NOT \
+                 answer in prose or inline the options as a typed-reply menu: the user needs \
+                 the clickable question card. Re-call `ask_user_question` now with the full \
+                 question text filled in on every question object."
+            }
+            Self::LeakedAsText => {
+                "You typed an `<ask_user_question>` tag as ordinary text, so no tool call was \
+                 made and the user got no clickable card. The tag is not parsed out of your \
+                 response. Do NOT type it again, and do NOT inline the options as a typed-reply \
+                 menu. INVOKE `ask_user_question` AS A TOOL CALL now, with the full question \
+                 text and 2-4 options."
+            }
+            Self::AskedInProse => {
+                "You ended your turn with a question typed as prose, so the user got no \
+                 clickable card. Prose does not park the thread: it reads as finished, nothing \
+                 lights the Blocked badge, and nobody is told you are waiting. Re-issue \
+                 the question now as an `ask_user_question` TOOL CALL with 2-4 options, and do \
+                 NOT inline them as a typed-reply menu. Reserve plaintext for a genuinely \
+                 open-ended question (e.g. \"what should I name this?\") where pre-baked options \
+                 would be guesses. If yours is one, say in one line why options would be \
+                 guesses, and call no tool. The user never sees that line: your draft above \
+                 already reached them and stays as your answer. You are not asked a second time."
+            }
+        }
+    }
+
+    /// What the `LlmCallRetried` this force emits says it was for. Lives beside
+    /// the instruction so a new cause cannot ship observable in the transcript
+    /// but anonymous in the event log.
+    pub(crate) fn retry_reason(self) -> &'static str {
+        match self {
+            Self::CallRejected => "ask_user_question had no question text, forcing re-ask",
+            Self::LeakedAsText => "ask_user_question was typed as text, forcing re-ask",
+            Self::AskedInProse => "the reply ended on a question with no card, forcing re-ask",
+        }
+    }
+}
+
+/// How many times one turn may be sent back for ending on a question typed as
+/// prose. One, on its own counter rather than the budget above.
+///
+/// The bound matters more here than for [`MAX_QUESTION_REASK`], for the reason
+/// [`MAX_TODO_WAKE_NUDGE`] also caps at one. A model that reads this nudge and
+/// still wants prose has made a choice. Asking twice would only spend a round
+/// to hear it again.
+pub(crate) const MAX_PROSE_QUESTION_NUDGE: usize = 1;
+
+/// Whether a finished reply hands the turn back on a question.
+///
+/// The test is the trailing `?` alone. It mirrors `detect_plaintext_question`
+/// in `lucidos-cli`'s Claude Code Stop hook. That hook has redirected
+/// coding-agent sessions on this exact signal since long before the chat side
+/// had a gate.
+///
+/// Only the END of the reply counts. A question mid-paragraph is usually
+/// rhetorical or quoted, while a reply whose last character is `?` is asking
+/// the user something and then going silent.
+pub(crate) fn reply_ends_in_a_question(text: &str) -> bool {
+    text.trim_end().ends_with('?')
+}
+
+/// Everything the re-ask decision reads. A struct rather than six positional
+/// arguments, four of them booleans: `(true, false, true, …)` at the call site
+/// says nothing about which is which.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QuestionReaskInputs {
+    /// The previous iteration's `ask_user_question` call was rejected.
+    pub(crate) ask_failed_last_iter: bool,
+    /// The model typed an `<ask_user_question>` tag as ordinary text.
+    pub(crate) leaked_as_text: bool,
+    /// The prose the model just finished ends on a question.
+    pub(crate) ends_in_a_question: bool,
+    /// Somebody is at the other end of this turn who could tap a card.
+    /// Resolved by the caller, never re-derived here: see the parameter of the
+    /// same name on `run_agentic_loop`.
+    pub(crate) human_can_answer: bool,
+    /// Forces already spent this turn on a broken `ask_user_question` call.
+    pub(crate) reask_forced: usize,
+    /// Nudges already spent this turn on a question typed as prose.
+    pub(crate) prose_nudges_forced: usize,
+}
+
+/// Why the no-tool-calls termination branch must force a re-ask instead of
+/// finalizing the turn, or `None` to finalize normally.
+///
+/// The two broken-call causes share one `MAX_QUESTION_REASK` budget, so they
+/// cannot alternate past the cap. A rejected call wins when both hold: it is
+/// the more specific diagnosis, since the model did reach the tool. Pure, so
+/// every bound is unit-testable without driving the whole loop.
+///
+/// [`QuestionReaskCause::AskedInProse`] sits last and carries its own budget.
+/// It is the widest of the three, and the only one that fires when the model
+/// never reached the tool. Anything more specific outranks it.
+pub(crate) fn question_reask_cause(inputs: QuestionReaskInputs) -> Option<QuestionReaskCause> {
+    if inputs.reask_forced < MAX_QUESTION_REASK {
+        if inputs.ask_failed_last_iter {
+            return Some(QuestionReaskCause::CallRejected);
+        }
+        if inputs.leaked_as_text {
+            return Some(QuestionReaskCause::LeakedAsText);
+        }
+    }
+    asked_in_prose(inputs).then_some(QuestionReaskCause::AskedInProse)
+}
+
+/// Whether to nudge a turn that ended on a question nobody can tap.
+///
+/// Three guards beyond the question itself. `reask_forced == 0` keeps it to
+/// one diagnosis per turn: a turn already corrected for a broken call is not
+/// also corrected for prose. `human_can_answer` spares the runs where a card
+/// is the wrong answer, and the caller decides which those are.
+fn asked_in_prose(inputs: QuestionReaskInputs) -> bool {
+    inputs.ends_in_a_question
+        && inputs.human_can_answer
+        && inputs.reask_forced == 0
+        && inputs.prose_nudges_forced < MAX_PROSE_QUESTION_NUDGE
+}
+
+/// What follows every successful tool round. The user sees only the agent's
+/// text and cards, so this must never suggest they read the results.
+pub(crate) const TOOL_RESULTS_INSTRUCTION: &str = "Results above. The user never sees tool \
+     results, only what you write, so what they need from these must reach them in your words \
+     before you ask them anything or finish. Do not repeat what you already told them. Proceed \
+     to your next action or final answer.";
+
+/// `instruction`, led by what the user read of the round's progress notes.
+/// The agent believes they read its whole text, so without this it skips the
+/// steps or draft it "already told them". A round with a card gets nothing
+/// here: the card gate's refusal says it instead.
+pub(crate) fn instruction_after_round(
+    instruction: &str,
+    progress_notes: &[String],
+    raised_a_card: bool,
+) -> String {
+    if progress_notes.is_empty() || raised_a_card {
+        return instruction.to_string();
+    }
+    let seen = progress_notes
+        .iter()
+        .map(|note| format!("\"{note}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Part of what you wrote before these tool calls reached the user only as this summary: \
+         {seen}. The full text behind it never reached them. If it held anything they need, \
+         such as steps, a draft, a link or a picture, write it out in full in your reply, or in \
+         a card's `message`.\n\n{instruction}"
+    )
+}
+
+/// How many times one turn may be sent back for leaving work open with nothing
+/// to re-open the thread. One, and the bound matters more here than for the
+/// re-ask above. A model that answers the nudge and still leaves the list open
+/// has made a choice. Asking twice would only spend a round to hear it again.
+/// After this the turn finalizes and `settle_open_todos` records the items as
+/// `Abandoned`, exactly as it did before this gate existed.
+pub(crate) const MAX_TODO_WAKE_NUDGE: usize = 1;
+
+/// The forcing instruction for a turn that would end with open todo work and no
+/// wake. `open_items` is stated because it is the fact the model is about to
+/// contradict, and a count is cheaper to act on than "some".
+///
+/// The three options are deliberately equal in weight. Arming, settling and
+/// handing back are each correct in their own case. A nudge leaning on one
+/// would teach the model to reach for it reflexively. Leaning on `todo_write`
+/// in particular would buy silence by clearing the evidence.
+///
+/// It supplies no sentence for the model to repeat at the user. That is the
+/// mistake `APPLY_VERIFY_DEV_ADDENDUM` made, whose ready-made negative sentence
+/// got quoted back as a finding with the check behind it never run. See
+/// `docs/plans/2026-08-10-the-agent-checks-state-instead-of-assuming-it.md`.
+/// `curated` is true under *self-curated context mode*, which withdraws
+/// `todo_write` whole. Naming a tool the model was never shown offers it an
+/// action it cannot take, so option two names the heading it writes instead.
+pub(crate) fn todo_wake_nudge_instruction(open_items: usize, curated: bool) -> String {
+    let update_the_list = if curated {
+        "rewrite the `[TODO]` heading of your working understanding, marking what is done as \
+         `- [x]` and dropping what you are no longer doing"
+    } else {
+        "call `todo_write` to mark what is done as completed, and to drop what you are no longer \
+         doing"
+    };
+    format!(
+        "STOP, do not finish this turn yet. Your todo list still has {open_items} unfinished \
+         item(s), and NOTHING will re-open this thread: you hold no event-wait subscription and \
+         no background task is running. No wake is scheduled, whatever your answer says. Do one \
+         of these three now, then finish: (1) call `await_event` if that work is waiting on \
+         something happening in Lucidos, so the thread re-opens when it does; (2) \
+         {update_the_list}; (3) hand back to the user, deciding for yourself how to say that you \
+         are not watching for anything. Whichever you choose, do not tell the user you are \
+         watching, monitoring, or will report back, unless you armed a subscription in this turn."
+    )
+}
+
+/// Decide whether the no-tool-calls termination branch must send the turn back
+/// for leaving work open that nothing will wake it to finish.
+///
+/// `open_items` is `None` when the probe could not run. That is UNKNOWN rather
+/// than a count of zero, and unknown does not nudge (`.claude/rules/rust.md`).
+/// The direction is the one that rule asks for. A database blip must not add a
+/// round to every chat turn, and the settle asks again at the terminator.
+///
+/// `covered` is true when a live *event wait* or an unfinished background task
+/// will re-open the thread. Either means the agent parked rather than walked
+/// away, the same split `settle_open_todos` makes between `Waiting` and
+/// `Abandoned`.
+///
+/// Pure so every arm is testable without an engine behind it.
+pub(crate) fn should_nudge_unwatched_turn(
+    open_items: Option<usize>,
+    covered: bool,
+    nudges_forced: usize,
+) -> bool {
+    matches!(open_items, Some(n) if n > 0) && !covered && nudges_forced < MAX_TODO_WAKE_NUDGE
+}
+
+/// What the generic consecutive-call circuit breaker should do given the
+/// current consecutive-*failure* streak length for one `(tool, call_key)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BreakerAction {
+    /// Streak below threshold — execute the proposed call normally.
+    None,
+    /// 3-4 consecutive failures of the same call: feed a STOP message back
+    /// to the model and skip executing the proposed (repeat) call.
+    Warn,
+    /// 5+ consecutive failures: terminate the turn with a force-break.
+    Break,
+}
+
+/// Update the consecutive-*failure* streak for the generic circuit breaker.
+///
+/// Unlike the raw repeat counter (`consecutive_same_call`, which the
+/// content-deterministic `read_file` / `list_files` breakers still use), this
+/// streak only grows when the model repeats the SAME `(tool, call_key)` AND the
+/// previous identical call actually FAILED. A successful call mid-streak, or a
+/// switch to a different call, resets the streak to 1 — because successful
+/// repetition is by definition not a stuck loop, and only a run of failures is
+/// the genuine "stuck" signal worth breaking.
+///
+/// `is_repeat` — the current call matches the previous `(tool, call_key)`.
+/// `prev_call_failed` — the previous identical call returned an error.
+/// `prev_streak` — the streak value carried from the last iteration.
+pub(crate) fn next_failure_streak(
+    is_repeat: bool,
+    prev_call_failed: bool,
+    prev_streak: usize,
+) -> usize {
+    if is_repeat && prev_call_failed {
+        prev_streak + 1
+    } else {
+        1
+    }
+}
+
+/// Map a consecutive-failure streak length onto the breaker action. Warn at
+/// 3-4 (give the model a STOP nudge with the results it already has), hard
+/// break at 5+ (it ignored the warnings). Both thresholds stay far below the
+/// default tool-call cap, the outer backstop.
+pub(crate) fn generic_breaker_action(failure_streak: usize) -> BreakerAction {
+    if failure_streak >= 5 {
+        BreakerAction::Break
+    } else if failure_streak >= 3 {
+        BreakerAction::Warn
+    } else {
+        BreakerAction::None
+    }
+}
+
+/// Build the `ProcessResult` every terminal path in `run_agentic_loop`
+/// returns. All eight return sites — pre-iter cancel, iteration cap, mid-LLM
+/// cancel, success, empty completion, and the three circuit-breaker
+/// force-breaks — construct the same shape: only `response` and `images`
+/// vary, while `steps`, `auto_apply`, and `orphaned_injections` are always
+/// empty/`false` on a terminal turn. Centralising the construction keeps
+/// those constant fields from drifting across the return sites.
+///
+/// This is a pure value constructor with no side effects: each caller still
+/// sets `*terminator_settled = true` and settles the turn's ending its own way
+/// before returning, so the circuit-breaker branches keep their individual
+/// thresholds and messages — nothing is unified beyond the result literal.
+pub(crate) fn terminal_result(
+    response: String,
+    images: Vec<String>,
+    request_id: Uuid,
+    thread_id: Uuid,
+    proposed_change: bool,
+) -> super::super::types::ProcessResult {
+    super::super::types::ProcessResult {
+        response,
+        steps: vec![],
+        images,
+        request_id,
+        thread_id,
+        proposed_change,
+        auto_apply: false,
+        orphaned_injections: vec![],
+    }
+}
+
+/// How many rounds past the tool-call cap the loop may spend before the
+/// unconditional backstop fires.
+///
+/// A handful of paths `continue` the loop WITHOUT executing a tool call, so
+/// they do not advance `tool_calls_made`: a forced `ask_user_question` re-ask,
+/// the three circuit-breaker warnings, and a mid-turn user injection. Each is
+/// individually bounded today, but "every path happens to be bounded" is a
+/// property that decays silently as paths are added, and the guarantee worth
+/// keeping is the unconditional one: a turn ALWAYS ends. (A turn that did not
+/// end is the zombie-thread bug in `agentic_loop_tests.rs`.)
+///
+/// Sized so it can never bind before the user's own cap: 100 non-tool rounds is
+/// an order of magnitude more than every bounded path can produce together,
+/// while still ending a turn that is genuinely spinning.
+pub(crate) const NON_TOOL_ROUND_SLACK: usize = 100;
+
+/// What the engine says back when a reply carried only the working
+/// understanding.
+///
+/// A user message is required rather than optional: the next round appends the
+/// panel and the document to whatever is last, and a trailing assistant message
+/// would take them as a prefill.
+pub(crate) const NOTED_CARRY_ON: &str =
+    "Your working understanding is updated. Carry on with the work.";
+
+/// Whether a reply that made no tool call was bookkeeping rather than an
+/// answer.
+///
+/// The model writes its document beside its next action, but the design record
+/// measured 82% of notes written alone in a round. A lone write would otherwise
+/// end the turn with an empty answer, abandoning the task.
+///
+/// So the span is spliced out first, and what is left decides. Nothing left is
+/// bookkeeping and the turn continues. Something left is the answer.
+pub(crate) fn reply_was_bookkeeping_alone(wrote_document: bool, visible: Option<&str>) -> bool {
+    wrote_document && visible.is_none_or(str::is_empty)
+}
+
+/// The `[ENGINE-LIMIT]` message for the user's tool-call cap.
+///
+/// The prefix is load-bearing: the chat agent cannot observe its own tool-call
+/// count, so any "tool-call cap" claim WITHOUT it is a hallucination. The chat
+/// system prompt tells the model the same, quoting the same cap.
+///
+/// Names the cap that actually fired (not the default) and says where to change
+/// it. Hitting the cap is the one moment the user has a reason to raise it, and
+/// on a packaged install the Settings row is the only way they can: there is no
+/// constant to edit and no rebuild. `[Settings](settings)` is a real clickable
+/// panel link in rendered message text (see `utils/linkifyPaths.ts`), so this is
+/// one tap plus the named path.
+pub(crate) fn tool_call_cap_message(max_tool_calls: usize) -> String {
+    format!(
+        "[ENGINE-LIMIT] Per-turn limit of {} tool calls reached. Send any message to continue \
+         from here, or raise the limit in [Settings](settings) under Models, Chat & triggers, \
+         Max tool calls.",
+        max_tool_calls
+    )
+}
+
+/// The `[ENGINE-LIMIT]` message for the unconditional round backstop.
+///
+/// Deliberately NOT the tool-call message: the user has not reached their cap,
+/// and saying they did would be a false statement carrying the one prefix the
+/// system prompt tells the model to trust. Raising the setting would not help
+/// here, so this one does not suggest it.
+pub(crate) fn round_backstop_message(rounds: usize) -> String {
+    format!(
+        "[ENGINE-LIMIT] Turn ended after {} steps without reaching the tool-call limit, which \
+         means it was looping without getting anywhere. Send any message to continue from here.",
+        rounds
+    )
+}
+
+/// Without this emit the frontend would never see a terminator and the
+/// thread would show "running" forever after hitting a cap. Takes the built
+/// message so both backstops share one emit path.
+pub(crate) async fn emit_iteration_cap_response_generated(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    meta: &crate::engine::thread_events::EventMeta,
+    images: Vec<String>,
+    effective_model: Option<String>,
+    effective_effort: Option<String>,
+    msg: String,
+) -> String {
+    bus.emit_or_log(
+        crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: crate::engine::thread_events::ThreadEvent::ResponseGenerated {
+                text: msg.clone(),
+                images,
+                model: effective_model,
+                reasoning_effort: effective_effort,
+            },
+            meta: meta.authored_by(crate::engine::thread_events::AgentParticipant::LucidosAgent),
+        },
+        "[AgenticLoop] ResponseGenerated (iteration cap)",
+    )
+    .await;
+    msg
+}
+
+/// Critical invariant: the persisted event MUST get a fresh primary key,
+/// NOT `prompt.event_id`. The chat fast-path (`chat::process`) emits
+/// `MessageReceived` with the client-provided UUID before injecting,
+/// so reusing that UUID here causes an `events_pkey` duplicate-key
+/// error and the event is silently dropped under `emit_or_log`. The
+/// frontend correlates pending messages via `MessageReceived.id`;
+/// `PromptInjected` is a separate engine-side acknowledgment whose
+/// link back to the request is carried by `meta.request_event_id`.
+pub(crate) async fn emit_prompt_injected_event(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    base_meta: &crate::engine::thread_events::EventMeta,
+    prompt: &super::super::InjectedPrompt,
+) {
+    let mut inject_meta = base_meta.clone();
+    inject_meta.event_id = None;
+    bus.emit_or_log(
+        crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: crate::engine::thread_events::ThreadEvent::PromptInjected {
+                text: prompt.text.clone(),
+                mode: prompt.mode,
+                origin: prompt.origin.clone(),
+                injected_message_id: prompt.event_id,
+                delivered_event_id: None,
+            },
+            meta: inject_meta,
+        },
+        "[AgenticLoop] PromptInjected",
+    )
+    .await;
+}
+
+/// How many tool-result images the model explicitly asked to see stay pinned in
+/// vision at once. Beyond this the oldest pin is released and that image reverts
+/// to the usual "strip once it is no longer last" rule; the model can call
+/// `view_image` again to bring it back.
+///
+/// A cap is needed because pinned images are exempt from trim pass 0 by
+/// construction and the model may issue as many image reads in a single turn as
+/// its tool-call cap allows. A "describe every photo in this folder" turn would otherwise
+/// accumulate hundreds of un-strippable images (~1600 tokens each, see
+/// `context::IMAGE_BUDGET_TOKEN_ESTIMATE`) and blow the context window.
+///
+/// Eight is chosen to cover the realistic reason to hold several at once —
+/// comparing a handful of images — at a worst case near 13k tokens, which is
+/// small against any supported context window and is honestly counted by
+/// `estimate_message_chars`, so the other trim passes compensate for it.
+pub(crate) const MAX_PINNED_EXPLICIT_IMAGES: usize = 8;
+
+/// Record `idx` as holding an explicitly-requested image, releasing the oldest
+/// pin once [`MAX_PINNED_EXPLICIT_IMAGES`] is exceeded.
+pub(crate) fn push_explicit_image_pin(pins: &mut Vec<usize>, idx: usize) {
+    pins.push(idx);
+    if pins.len() > MAX_PINNED_EXPLICIT_IMAGES {
+        pins.remove(0);
+    }
+}
+
+/// Whether a freshly-built tool-result message holds an image the model
+/// explicitly asked to see (`view_image`, or `read_file` on an image file).
+/// Those messages get pinned so trim pass 0 keeps the bytes for the rest of the
+/// turn — otherwise the model's very next tool call blinds it again, which is
+/// what made `view_image` unable to do its one job.
+///
+/// Detected via the `EXPLICIT_IMAGE_RESULT_TEXT` block the loop substitutes for
+/// the `[IMAGE_CONTENT:…]` sentinel, which is the only marker distinguishing an
+/// explicit request from an ambient capture (`capture_app` writes the page's DOM
+/// text as its result instead, and stays unpinned so it can age out).
+///
+/// A message can carry both when the model batches an explicit view alongside a
+/// capture; pinning is per-message, so the capture rides along. Rare, bounded,
+/// and preferable to dropping the image the model actually asked for.
+///
+/// Matched as a PREFIX, not for equality. [`with_event_address`] appends the
+/// result's `[evt-…]` address after this text, so an equality test silently
+/// stopped recognising the marker and unpinned every explicitly viewed image.
+pub(crate) fn holds_explicitly_requested_image(blocks: &[ContentBlock]) -> bool {
+    blocks.iter().any(|b| {
+        matches!(
+            b,
+            ContentBlock::ToolResult { content, .. }
+                if content.starts_with(crate::engine::tools::files::EXPLICIT_IMAGE_RESULT_TEXT)
+        )
+    })
+}
+
+/// Await a pending Flash image-description task and emit one `ImageDescribed`
+/// per hash attached to `origin_id`'s message.
+///
+/// A free function taking cloned handles rather than a `&LucidosEngine` method,
+/// because it has two callers with different lifetimes: the agentic loop awaits
+/// it inline after the first LLM call, while the chat injection fast-path — which
+/// returns to the HTTP caller immediately and never reaches the loop — spawns it
+/// as a detached task. Before that second caller existed, an image attached to a
+/// message that arrived mid-turn produced no `ImageDescribed` at all, so once its
+/// bytes aged out of context the thread held no record of what had been shown.
+///
+/// Hashes come from the persisted `MessageReceived` row so images whose decode
+/// failed at emit time are not re-included. Emitting nothing when the
+/// description is missing, empty, or judged bad is the intended no-op.
+pub(crate) async fn emit_image_descriptions(
+    event_store: &crate::core::EventStore,
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    origin_id: Uuid,
+    channel: Option<crate::engine::thread_events::EventChannel>,
+    handle: Option<tokio::task::JoinHandle<Option<(String, String)>>>,
+) {
+    // Resolve the Flash description (should be done by now — Flash is much
+    // faster than the main model's first response). The handle yields
+    // `(description, model)` so we can stamp the producing model on the
+    // emitted `ImageDescribed` event.
+    let Some((desc, model)) = (match handle {
+        Some(h) => match h.await {
+            Ok(opt) => opt.filter(|(d, _)| !is_bad_image_description(d)),
+            Err(_) => None,
+        },
+        None => None,
+    }) else {
+        return;
+    };
+
+    let hashes = match event_store.get_event_by_id(origin_id).await {
+        Ok(Some(row)) => row
+            .payload
+            .get("user_image_hashes")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|h| h.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        Ok(None) => {
+            crate::log!(
+                "[AgentLoop] ImageDescribed: origin event {} not found, skipping emit",
+                origin_id
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            crate::log!(
+                "[AgentLoop] ImageDescribed: failed to load origin event {}: {}",
+                origin_id,
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    for hash in hashes {
+        bus.emit_or_log(
+            crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::ImageDescribed {
+                    source_event_id: origin_id,
+                    hash,
+                    description: desc.clone(),
+                    model: model.clone(),
+                },
+                // Engine-internal enrichment; inherit the turn's channel but
+                // drop request_event_id (this isn't a response to the user's
+                // request, it's a derived fact about the request itself).
+                meta: crate::engine::thread_events::EventMeta {
+                    channel,
+                    ..crate::engine::thread_events::EventMeta::NONE
+                },
+            },
+            "[AgentLoop] ImageDescribed",
+        )
+        .await;
+    }
+}
+
+/// Defensive post-loop guard: emits `ResponseAborted` if no terminator
+/// landed for `request_event_id`. Catches future regressions in the
+/// loop's many return paths — every existing path emits explicitly, but
+/// the SQL check is the safety net. Scoped to `request_event_id` so a
+/// previous exchange's terminator doesn't mask a current zombie one.
+///
+/// Skip the SQL when callers can prove the turn's ending is already settled
+/// (the success path): `chat::process` does this via the `terminator_settled`
+/// flag threaded through `run_agentic_loop`. Without that fast path this
+/// query runs on every chat turn against a `payload->>'request_event_id'`
+/// expression that has no functional index, walking every event in the
+/// thread on long-lived conversations.
+///
+pub(crate) async fn ensure_terminator_emitted(
+    bus: &crate::engine::event_bus::EventBus,
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    request_event_id: Uuid,
+    channel: Option<crate::engine::thread_events::EventChannel>,
+) {
+    if crate::engine::thread_events::has_terminator_for(pool, thread_id, request_event_id).await {
+        return;
+    }
+
+    crate::log!(
+        "[AgenticLoop] WARNING: loop exited without emitting a terminator for request {} on thread {} — emitting defensive ResponseAborted",
+        request_event_id,
+        thread_id
+    );
+    crate::engine::thread_events::emit_response_aborted(
+        bus,
+        thread_id,
+        crate::engine::thread_events::AbortCause::ProcessKilled,
+        String::new(),
+        vec![],
+        None,
+        None,
+        crate::engine::thread_events::EventMeta {
+            request_event_id: Some(request_event_id),
+            channel,
+            ..crate::engine::thread_events::EventMeta::NONE
+        },
+        "[AgenticLoop] ResponseAborted (defensive — no terminator emitted)",
+    )
+    .await;
+}
+
+/// The failure sibling of [`ensure_terminator_emitted`], sharing its gate.
+/// Emits an ANCHORED `ResponseFailed` unless a terminator already landed for
+/// `request_event_id`.
+///
+/// Every error exit that happens once an exchange exists funnels through
+/// here, which is what makes `process_message_with_steps` the single owner of
+/// a turn's terminator. Its callers used to each bolt on their own
+/// `ResponseFailed` with `EventMeta::NONE`, because the pre-loop exits emitted
+/// nothing. Anchorless, those copies walked straight past the gate. So every
+/// in-loop failure wrote the event twice and fired every subscribed trigger
+/// twice. Anchor the emit and the gate does its job.
+pub(crate) async fn ensure_failure_terminator_emitted(
+    bus: &crate::engine::event_bus::EventBus,
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    request_event_id: Uuid,
+    channel: Option<crate::engine::thread_events::EventChannel>,
+    error: &str,
+) {
+    if crate::engine::thread_events::has_terminator_for(pool, thread_id, request_event_id).await {
+        return;
+    }
+
+    bus.emit_or_log(
+        crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                error: error.to_string(),
+            },
+            meta: crate::engine::thread_events::EventMeta {
+                request_event_id: Some(request_event_id),
+                channel,
+                ..crate::engine::thread_events::EventMeta::NONE
+            },
+        },
+        "[AgenticLoop] ResponseFailed (turn failed outside the loop)",
+    )
+    .await;
+}
+
+/// Static parts of a ContextCaptured event built once by `chat::process`
+/// before the loop starts: section list (system + memory + history + …)
+/// and the model id. The loop appends a dynamic `Conversation` section per
+/// iteration sized from the current `messages`, and reads the tool array off
+/// [`TurnTools`], which can move mid-turn.
+///
+/// `sections` always carry their bodies. [`round_capture_sections`] decides
+/// per round whether a capture keeps them.
+pub(crate) struct ContextCaptureSeed<'a> {
+    pub sections: &'a [crate::engine::ContextSection],
+    pub model: &'a str,
+}
+
+/// The rows one round's `ContextCaptured` persists.
+///
+/// `capture_body` is the `capture_context` preference as read for THIS round,
+/// never for the turn: a question card can hold a turn open for hours.
+pub(crate) fn round_capture_sections(
+    seed: &[crate::engine::ContextSection],
+    tail: impl IntoIterator<Item = crate::engine::ContextSection>,
+    capture_body: bool,
+) -> Vec<crate::engine::ContextSection> {
+    seed.iter()
+        .cloned()
+        .chain(tail)
+        .map(|mut section| {
+            if !capture_body {
+                section.content = None;
+            }
+            section
+        })
+        .collect()
+}
+
+/// The tool array this turn sends, and what it costs.
+///
+/// Almost all of it is fixed for the turn: a family is offered on workspace
+/// capability, never on the thread (ADR 0088). The MCP slice is the exception.
+/// The model can start, stop or remove a server with the `mcp` tool, and so
+/// can the user from Settings, while the turn runs. The array used to be
+/// frozen at setup, so a server started mid-turn stayed uncallable until the
+/// next user message.
+///
+/// `mcp_generation` is what the loop compares against
+/// `McpManager::tool_surface_generation()` each round. See
+/// `docs/plans/2026-09-16-mcp-tools-register-mid-turn.md`.
+pub(crate) struct TurnTools {
+    defs: Vec<ToolDefinition>,
+    names: Vec<String>,
+    defs_chars: usize,
+    mcp_generation: u64,
+    /// The ceiling the MCP slice was fitted under. Fixed for the turn, so a
+    /// mid-turn refresh fits the same window the setup did.
+    mcp_char_ceiling: usize,
+    /// What the MCP slice left out, as the line the model is told.
+    mcp_dropped_notice: Option<String>,
+}
+
+impl TurnTools {
+    /// `engine_defs` are the engine-authored families, and `surface` is the MCP
+    /// slice fitted under `mcp_char_ceiling`. It lands at the tail.
+    pub(crate) fn new(
+        engine_defs: Vec<ToolDefinition>,
+        surface: crate::mcp::McpToolSurface,
+        mcp_char_ceiling: usize,
+    ) -> Self {
+        let mut tools = Self {
+            defs: engine_defs,
+            names: Vec::new(),
+            defs_chars: 0,
+            mcp_generation: 0,
+            mcp_char_ceiling,
+            mcp_dropped_notice: None,
+        };
+        tools.refresh_mcp(surface);
+        tools
+    }
+
+    /// The schemas the next request carries.
+    pub(crate) fn defs(&self) -> &[ToolDefinition] {
+        &self.defs
+    }
+
+    /// Their names, for the `ContextCaptured` row and the inline-tool-call
+    /// repair's list of what the model is allowed to have meant.
+    pub(crate) fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Total chars of the schemas. Counted into the capture's
+    /// `estimated_total_tokens` and subtracted from the message budget,
+    /// because the schemas ride every request.
+    pub(crate) fn defs_chars(&self) -> usize {
+        self.defs_chars
+    }
+
+    /// The MCP surface stamp this array was built against.
+    pub(crate) fn mcp_generation(&self) -> u64 {
+        self.mcp_generation
+    }
+
+    /// The ceiling to fit the next MCP surface under.
+    pub(crate) fn mcp_char_ceiling(&self) -> usize {
+        self.mcp_char_ceiling
+    }
+
+    /// The line telling the model which MCP tools were left out, if any were.
+    pub(crate) fn mcp_dropped_notice(&self) -> Option<&str> {
+        self.mcp_dropped_notice.as_deref()
+    }
+
+    /// Every MCP server the array currently offers a tool for.
+    ///
+    /// Read either side of a refresh to see which servers came up and which
+    /// went away. Sorted, so the line built from it reads the same each time.
+    pub(crate) fn mcp_server_ids(&self) -> std::collections::BTreeSet<String> {
+        self.defs
+            .iter()
+            .filter_map(|t| crate::mcp::McpManager::parse_mcp_tool_name(&t.name))
+            .map(|(server_id, _)| server_id)
+            .collect()
+    }
+
+    /// Swap the MCP slice for what the servers offer now.
+    ///
+    /// Only that slice: re-deriving the engine-authored families would change
+    /// nothing and cost a read, and their order is what keeps the cacheable
+    /// head of the array stable. The new tools land at the tail, where the
+    /// turn's setup put them.
+    pub(crate) fn refresh_mcp(&mut self, surface: crate::mcp::McpToolSurface) {
+        self.defs
+            .retain(|t| crate::mcp::McpManager::parse_mcp_tool_name(&t.name).is_none());
+        self.mcp_dropped_notice = surface.dropped_notice();
+        self.defs.extend(surface.tools);
+        self.mcp_generation = surface.generation;
+        self.remeasure();
+    }
+
+    fn remeasure(&mut self) {
+        self.names = self.defs.iter().map(|t| t.name.clone()).collect();
+        self.defs_chars = crate::engine::context::tool_definitions_chars(&self.defs);
+    }
+}
+
+/// Which MCP servers came up or went away since the request was assembled.
+/// `None` when the same servers are offered.
+///
+/// `[STOPPED MCP SERVERS]` is built once at turn setup and sits in the first
+/// message. That message is fixed for the turn, which is what keeps the prefix
+/// cache. The array moves per round (ADR 0195), so the two disagree the moment
+/// a server starts. The model then reads a server it just started as stopped,
+/// and either starts it again or tells the user it is not running.
+pub(crate) fn mcp_surface_correction(
+    before: &std::collections::BTreeSet<String>,
+    after: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let came_up: Vec<&str> = after.difference(before).map(String::as_str).collect();
+    let went_away: Vec<&str> = before.difference(after).map(String::as_str).collect();
+
+    let mut parts: Vec<String> = Vec::new();
+    if !came_up.is_empty() {
+        parts.push(format!("running and callable now: {}", came_up.join(", ")));
+    }
+    if !went_away.is_empty() {
+        parts.push(format!("no longer running: {}", went_away.join(", ")));
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "[MCP UPDATE] {}. This corrects the stopped-server list above.",
+            parts.join("; ")
+        )
+    })
+}
+
+/// What the round owes the model when the set of MCP tools left out moved.
+/// `None` when it did not.
+///
+/// The turn's first message carries the setup's notice and is never
+/// rewritten, so a refresh that cuts different tools, or none, has to say so.
+pub(crate) fn mcp_dropped_correction(before: Option<&str>, after: Option<&str>) -> Option<String> {
+    match (before, after) {
+        (before, Some(after)) if before != Some(after) => Some(after.to_string()),
+        (Some(_), None) => Some(
+            "[MCP UPDATE] Every MCP tool is sent now. This corrects the tools-not-sent line above."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Cap on the `Conversation` body, matching what `chat::process` applies to
+/// every other section body. The eval lifts it (ADR 0110): this section IS the
+/// message array, the largest addressable region a context benchmark exists to
+/// look at, and 8 KB of it says nothing.
+const CONVERSATION_PERSIST_MAX: usize = 8_000;
+
+/// The `Conversation` capture row, and the one row where a section's two sizes
+/// disagree by construction.
+///
+/// `budget_delta_chars` is what the tool loop ADDED. Every static section is
+/// already concatenated into `messages[0]`, so counting the array whole would
+/// bill the bundle twice against `estimated_total_tokens`. `bundled_total` is
+/// what those sections already declare, and `context_chars` is what the budget
+/// measured over the trimmed array.
+///
+/// `content_chars` is the array's real size, which is the region an eval sizes.
+/// [`round_capture_sections`] may drop the body, never this size.
+pub(crate) fn conversation_section(
+    messages: &[Message],
+    bundled_total: usize,
+    context_chars: usize,
+) -> crate::engine::ContextSection {
+    let serialized = serialize_messages_for_capture(messages);
+    let content_chars = serialized.chars().count();
+    let cap = crate::engine::eval_capture::body_cap(CONVERSATION_PERSIST_MAX);
+    let content = Some(match cap {
+        Some(cap) if serialized.len() > cap => {
+            crate::engine::context::truncate_head_tail(&serialized, cap)
+        }
+        _ => serialized,
+    });
+    crate::engine::ContextSection {
+        name: "Conversation".to_string(),
+        content,
+        budget_delta_chars: context_chars.saturating_sub(bundled_total),
+        content_chars: Some(content_chars),
+        role: crate::engine::ContextRole::User,
+        group: None,
+    }
+}
+
+/// Render the in-flight `messages` array as a compact text body for the
+/// `Conversation` section's persisted content. Each message is prefixed with
+/// its role; tool calls/results are summarized inline so the dump stays
+/// readable rather than dumping raw JSON. Caller truncates with
+/// `truncate_head_tail` when over the persistence cap.
+pub(crate) fn serialize_messages_for_capture(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for msg in messages {
+        out.push_str(&format!("[{}]\n", msg.role));
+        match &msg.content {
+            MessageContent::Text(s) => out.push_str(s),
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text }
+                        | ContentBlock::EngineTail { text }
+                        | ContentBlock::MemoryView { text } => out.push_str(text),
+                        ContentBlock::ToolUse {
+                            name, input, id, ..
+                        } => {
+                            out.push_str(&format!(
+                                "\n[tool_use {} id={} input={}]",
+                                name, id, input
+                            ));
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
+                            out.push_str(&format!(
+                                "\n[tool_result id={} content={}]",
+                                tool_use_id, content
+                            ));
+                        }
+                        ContentBlock::Image { .. } => out.push_str("\n[image]"),
+                    }
+                }
+            }
+        }
+        out.push_str("\n\n");
+    }
+    out
+}
+
+/// Record a failed action so no round rule lets it go (ADR 0109).
+///
+/// Manus found that leaving mistakes in context is what stops a model repeating
+/// them. Three paths in the loop end a tool call as failed, and two of them
+/// `continue` before reaching the third. So the marking lives here rather than
+/// at whichever site happens to be biggest.
+pub(super) fn note_failure(
+    failed: &mut std::collections::HashSet<String>,
+    tool_called_event_id: Option<uuid::Uuid>,
+    mode: crate::engine::chat::process::context_mode::ContextMode,
+) {
+    if let Some(handle) = tool_called_event_id.filter(|_| mode.is_on()) {
+        failed.insert(crate::engine::chat::process::context_mode::event_address(
+            handle,
+        ));
+    }
+}
+
+/// Read the working understanding out of a reply and persist what it wrote.
+///
+/// Both terminal paths run this. A cancelled round wrote its document before
+/// the user pressed stop, and the document is the one thing the mode promises
+/// outlives a turn. Losing it there also flushed the raw markup to the
+/// transcript, because a splice needs the spans this parse produces.
+///
+/// **A keep is deliberately not applied here.** It needs `panel_first_seen` and
+/// the live message array, neither of which a cancelled round goes on to use.
+/// The emitted `ContextKeptOpen` is what the eval counts as held, so recording
+/// one for a request that never carried it would be a durable lie. The live
+/// path applies keeps itself, from the returned `keep_open`.
+///
+/// `end` says who stopped the text. A cut reply keeps only the blocks the model
+/// closed, so pressing Stop mid-write cannot replace the document with the
+/// fragment: see [`wu::ParsedReply::drop_unclosed`].
+pub(crate) async fn read_working_understanding(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: uuid::Uuid,
+    raw_text: &str,
+    end: wu::ReplyEnd,
+    live_document: &mut wu::WorkingUnderstanding,
+    live_todo: &mut Vec<crate::engine::thread_events::TodoItem>,
+    live_todo_notes: &Option<String>,
+) -> (wu::ParsedReply, wu::Applied) {
+    let mut parsed = wu::parse_message(wu::ASSISTANT_ROLE, raw_text);
+    if end == wu::ReplyEnd::Truncated {
+        parsed.drop_unclosed();
+    }
+    let (next_document, applied) = wu::apply_spans(live_document, &parsed);
+    if parsed.wrote_something() {
+        *live_document = next_document;
+        bus.emit_or_log(
+            crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::WorkingUnderstandingWritten {
+                    document: live_document.to_document(),
+                },
+                meta: crate::engine::thread_events::EventMeta::NONE,
+            },
+            "[AgenticLoop] WorkingUnderstandingWritten",
+        )
+        .await;
+    }
+    // The checklist is CONSUMED, never stored. It goes to the projection, and
+    // the render regenerates the section from there, so the two engine-written
+    // statuses reach the model.
+    if let Some(items) = applied.todo.clone().filter(|items| items != live_todo) {
+        live_todo.clone_from(&items);
+        bus.emit_or_log(
+            crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::TodoListWritten {
+                    items,
+                    // Carried through, never cleared. The settle path follows
+                    // the same rule: a re-emit without it erases what the agent
+                    // wrote before the mode was turned on.
+                    notes: live_todo_notes.clone(),
+                },
+                meta: crate::engine::thread_events::EventMeta::NONE,
+            },
+            "[AgenticLoop] TodoListWritten (working understanding)",
+        )
+        .await;
+    }
+    (parsed, applied)
+}

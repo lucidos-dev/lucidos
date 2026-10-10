@@ -1,0 +1,1485 @@
+/*
+ * Lucidos shared component layer — SINGLE SOURCE OF TRUTH.
+ *
+ * The REUSABLE component classes shared by the host shell and app iframes:
+ * .action-btn family, .icon-btn, .label and its tones, .title,
+ * .segmented-control, .pill-bar, .toggle-switch, .mini-spinner, .list-row*,
+ * .markdown-content, .progress-bar, .empty-state, .accent-link, headings. This
+ * file is consumed by BOTH:
+ *   1. the host shell — imported by `src/styles/global.css` (`@import './global/shared-components.css'`).
+ *   2. app iframes — `include_str!`'d by the engine and appended to the served
+ *      `/api/v1/sdk-iframe.css` (see crates/lucidos-engine/src/api/sdk.rs). The
+ *      engine prepends the iframe's own tokens/theme/element-defaults from
+ *      `sdk_iframe.css`; the component rules below run against those.
+ *
+ * So an app that opts into Lucidos styling renders these classes IDENTICALLY to
+ * the host — there is no copy to keep in sync.
+ *
+ * Placement rules (keep them honest):
+ *   - REUSABLE component → here (host + apps).
+ *   - HOST-CHROME component (the custom <Dropdown>/nav-history, the send→cancel
+ *     morph, header/filter icon-button variants, list-row FLIP helper) →
+ *     `host-components.css` (host bundle only, NOT served to apps).
+ *   - IFRAME-ONLY (e.g. the `lucidos.ui.Select` `.lucidos-select` styles)
+ *     → the engine's `sdk_iframe.css` (avoids dead code in the host bundle).
+ *
+ * Rules here reference design tokens defined in `base.css` (`:root` + theme
+ * blocks) for the host and in `sdk_iframe.css` for the iframe; every token used
+ * below is defined in BOTH, or carries a `var()` fallback for the iframe.
+ */
+
+/* Global heading styles — matches chat message heading appearance */
+h1, h2, h3, h4, h5, h6 {
+    margin: 1rem 0 0.5rem 0;
+    color: var(--text-primary);
+    white-space: normal;
+}
+
+h1 { font-size: var(--font-size-2xl); }
+h2 { font-size: var(--font-size-xl); }
+h3 { font-size: var(--font-size-lg); }
+h4, h5, h6 { font-size: var(--font-size-md); }
+
+/* One checkbox for every engine. The native control is a fixed pixel size, so
+   it ignores the ui-scale, and each engine draws its own. This one is sized in
+   `em` so it tracks the text of the row it sits in. Ticked, it takes a soft
+   accent tint rather than a solid fill. The box itself never moves: the tint
+   fades in, the mark wipes on left to right like a pen stroke, and unticking
+   fades the mark out rather than rewinding it. */
+input[type="checkbox"] {
+    --checkbox-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3 3 6-6.5' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    appearance: none;
+    display: inline-grid;
+    place-content: center;
+    flex-shrink: 0;
+    width: 1.0625em;
+    height: 1.0625em;
+    margin: 0;
+    padding: 0;
+    vertical-align: middle;
+    border: 1px solid var(--text-muted);
+    /* In em, with the box. The corner keeps its size and squares only when the
+       theme zeroes the token. */
+    border-radius: min(0.25em, var(--radius-control) * 99);
+    background: transparent;
+    cursor: pointer;
+    transition:
+        background-color var(--duration-normal) ease-out,
+        border-color var(--duration-normal) ease-out;
+}
+
+/* The clip resets only after the fade, so an untick never shows the wipe run
+   backwards. */
+input[type="checkbox"]::before {
+    content: "";
+    width: 0.9em;
+    height: 0.9em;
+    background: var(--accent-light);
+    -webkit-mask: var(--checkbox-mark) center / contain no-repeat;
+    mask: var(--checkbox-mark) center / contain no-repeat;
+    clip-path: inset(0 100% 0 0);
+    opacity: 0;
+    transition:
+        opacity var(--duration-fast) ease-out,
+        clip-path 0s var(--duration-fast);
+}
+
+@media (hover: hover) {
+    input[type="checkbox"]:hover:not(:disabled, :checked, :indeterminate) {
+        border-color: var(--text-secondary);
+    }
+}
+
+input[type="checkbox"]:checked,
+input[type="checkbox"]:indeterminate {
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+input[type="checkbox"]:checked::before,
+input[type="checkbox"]:indeterminate::before {
+    clip-path: inset(0);
+    opacity: 1;
+    transition:
+        clip-path var(--duration-normal) cubic-bezier(0.25, 0.8, 0.25, 1),
+        opacity 0s;
+}
+
+input[type="checkbox"]:indeterminate {
+    --checkbox-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 8h7' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
+/* Transparent outline is the forced-colors fallback (box-shadow is stripped). */
+input[type="checkbox"]:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+input[type="checkbox"]:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Forced colors repaint every background with Canvas, which would hide both
+   the fill and the tick. System colours keep a ticked box readable. */
+@media (forced-colors: active) {
+    input[type="checkbox"]::before {
+        background: CanvasText;
+    }
+
+    input[type="checkbox"]:checked,
+    input[type="checkbox"]:indeterminate {
+        border-color: Highlight;
+    }
+}
+
+/* Shared segmented control: a few mutually exclusive options, one of them
+   picked. Every host caller is two or three segments wide.
+
+   Do NOT reach for it as page navigation. The strip has no room to say where a
+   link goes, and past a handful of segments it wraps into a slab that reads as
+   options to weigh. Settings > System is the worked example of both: it drilled
+   down to a nav list instead (`components/settings/SystemSubmenu.tsx`).
+
+   It still wraps, as a safety net for an app author whose segments pass their
+   container: without it the flex line squeezes instead, and every segment's own
+   LABEL breaks into two lines. No-op at the sizes the host uses. */
+.segmented-control {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 0.125rem;
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-control) * 0.5);
+    padding: 0.1875rem;
+}
+
+.segmented-btn {
+    background: none;
+    border: none;
+    /* One step up from --text-muted, which sits at about 2.9:1 on the control's
+       own --bg-tertiary and reads as disabled. An unpicked segment is still a
+       live choice, so it must not. The active one stays distinct on weight and
+       on its lifted surface, which leaves the extra dimming no work to do. */
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: var(--font-size-xs);
+    font-family: var(--font-ui);
+    font-weight: 400;
+    padding: 0.3125rem 0.75rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+    transition: background-color var(--duration-fast), color var(--duration-fast);
+}
+
+/* The clear background restated, because an app frame's `button:hover`
+   (sdk_iframe.css) outranks the base rule and would fill the segment grey. */
+@media (hover: hover) {
+    .segmented-btn:hover {
+        color: var(--text-primary);
+    }
+
+    .segmented-btn:hover:not(.active) {
+        background: none;
+    }
+}
+
+.segmented-btn.active {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.segmented-btn:focus-visible {
+    /* Our shared accent ring — replaces the browser's default thin outline.
+       Transparent outline is the forced-colors fallback (box-shadow is stripped). */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+    position: relative;
+}
+
+/* Pill bar: a row of filled pills with one picked, which inverts. Settings >
+   Theme and the app store filter with it, and an app switches views with it as
+   tabs. The markup carries the role: `role="group"` with `aria-pressed` for a
+   filter, and `role="tablist"` with `role="tab"` + `aria-selected` for tabs.
+   The host marks the picked pill with `.active` as well. It stays on one line
+   and scrolls sideways when it does not fit. */
+.pill-bar {
+    display: flex;
+    gap: 0.375rem;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+}
+
+/* The scroll box clips, so it pads out ring room on every side, plus the touch
+   reach above and below (below). A negative margin hands back only the room
+   above and below: handed back at the sides, a bar flush with an app page's
+   edge would overflow it sideways. Zero specificity, so an app's own padding
+   wins wherever its stylesheet sits. A bar that sets its own keeps both. */
+:where(.pill-bar) {
+    padding: calc(var(--focus-ring-width) + var(--pill-bar-hit-slop, 0rem)) var(--focus-ring-width);
+    margin-block: calc(-1 * (var(--focus-ring-width) + var(--pill-bar-hit-slop, 0rem)));
+}
+
+.pill-bar::-webkit-scrollbar {
+    display: none;
+}
+
+.pill-bar-btn {
+    flex-shrink: 0;
+    padding: 0.3125rem 0.75rem;
+    border: none;
+    border-radius: var(--radius-round);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color var(--duration-fast), color var(--duration-fast);
+}
+
+.pill-bar-btn.active,
+.pill-bar-btn[aria-pressed="true"],
+.pill-bar-btn[aria-selected="true"] {
+    background: var(--text-primary);
+    color: var(--bg-primary);
+}
+
+/* The fill restated, for the same reason as the segmented control: an app
+   frame's `button:hover` would repaint an unpicked pill. */
+@media (hover: hover) {
+    .pill-bar-btn:hover:not(.active, [aria-pressed="true"], [aria-selected="true"]) {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+}
+
+/* A finger needs a taller target than a pointer does, but the pill keeps its
+   size: an invisible layer takes the taps past it, above and below. The scroll
+   box clips taps too, so the bar's padding and margin above carry that reach.
+   A bar that sets its own padding adds var(--pill-bar-hit-slop, 0rem) to it. */
+@media (pointer: coarse) {
+    .pill-bar {
+        --pill-bar-hit-slop: 0.5rem;
+    }
+
+    .pill-bar-btn {
+        position: relative;
+    }
+
+    .pill-bar-btn::before {
+        content: '';
+        position: absolute;
+        inset: calc(-1 * var(--pill-bar-hit-slop)) 0;
+    }
+}
+
+/* Forced colors repaint every background, which would erase the only thing
+   marking the picked pill. System colours keep it marked. */
+@media (forced-colors: active) {
+    .pill-bar-btn.active,
+    .pill-bar-btn[aria-pressed="true"],
+    .pill-bar-btn[aria-selected="true"] {
+        forced-color-adjust: none;
+        background: SelectedItem;
+        color: SelectedItemText;
+    }
+}
+
+.pill-bar-btn:focus-visible {
+    /* Transparent outline is the forced-colors fallback (box-shadow is stripped). */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+/* Toggle switch: a real checkbox, hidden, with the pill drawn beside it.
+
+   The three geometry values are named here because everything else derives from
+   them: the pill's height, and the knob's travel when checked. Write those two
+   as literals and they go wrong silently. A later change to any of the three
+   leaves the knob off centre, short of the far end, or over it.
+
+   `flex-shrink: 0` is what keeps the pill the width it declares. A settings row
+   is a flex box, and a flex item shrinks on its UNWRAPPED width. So a label long
+   enough to wrap squeezes the control beside it instead. Three toggles in one
+   column came out three different widths. The narrowest one had its knob
+   hanging past the end of its own pill. */
+.toggle-switch {
+    --toggle-width: 2.25rem;
+    --toggle-knob: 0.875rem;
+    --toggle-inset: 0.1875rem;
+    position: relative;
+    display: inline-block;
+    flex-shrink: 0;
+    width: var(--toggle-width);
+    height: calc(var(--toggle-knob) + 2 * var(--toggle-inset));
+    cursor: pointer;
+}
+
+/* The attribute matches the checkbox rule's `:disabled` specificity above, and
+   this rule comes after it, so a disabled switch keeps its input hidden too. */
+.toggle-switch input[type="checkbox"] {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: var(--bg-tertiary);
+    border-radius: calc(var(--radius-control) * 2.5);
+    transition: background-color var(--duration-normal);
+}
+
+.toggle-slider::before {
+    content: '';
+    position: absolute;
+    height: var(--toggle-knob);
+    width: var(--toggle-knob);
+    left: var(--toggle-inset);
+    bottom: var(--toggle-inset);
+    background-color: var(--text-muted);
+    border-radius: var(--radius-round);
+    transition: transform var(--duration-normal), background-color var(--duration-normal);
+}
+
+.toggle-switch input:checked + .toggle-slider {
+    background-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+/* The knob lands on the far inset, mirroring where it rests when off. */
+.toggle-switch input:checked + .toggle-slider::before {
+    transform: translateX(calc(var(--toggle-width) - var(--toggle-knob) - 2 * var(--toggle-inset)));
+    background-color: var(--accent);
+}
+
+/* Keyboard focus shows the shared accent ring on the visible pill. The real
+   <input> is 0×0 and transparent, so a default outline would land on nothing. */
+.toggle-switch input:focus-visible + .toggle-slider {
+    /* Transparent outline is the forced-colors fallback (box-shadow is stripped). */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+/* Disabled: dimmed and not interactive, but still showing on or off. */
+.toggle-switch-disabled {
+    cursor: not-allowed;
+}
+
+.toggle-switch input:disabled + .toggle-slider {
+    opacity: 0.4;
+}
+
+/* The spinning ring for a working state: a running step, a save in flight.
+   Data loading draws a skeleton instead. An indefinite animation keeps a
+   literal duration, so it ignores the animation-speed slider. */
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.mini-spinner {
+    --spinner-color: var(--text-secondary);
+    display: inline-block;
+    width: 0.75rem;
+    height: 0.75rem;
+    animation: spin 1.2s linear infinite;
+    vertical-align: middle;
+    flex-shrink: 0;
+    border: var(--spinner-weight) solid var(--spinner-color);
+    border-top-color: transparent;
+    border-radius: 50%;
+    box-sizing: border-box;
+}
+
+/* Reduced motion stops the ring. It stays drawn, so the working state still
+   shows. */
+:root[data-motion="reduce"] .mini-spinner {
+    animation: none;
+}
+
+/* Utility classes */
+
+/* Hidden but preserves layout — use when removing the element would
+   reflow neighbours (e.g. icon buttons in a flex row). */
+.invisible {
+    visibility: hidden;
+    pointer-events: none;
+}
+
+/* Off-screen but still rendered — for inputs we trigger programmatically.
+   iOS WebKit (especially in standalone PWA mode) drops the `change` event
+   on `display:none` / `visibility:hidden` file inputs after the picker
+   dismisses; keeping the element in the layout makes events deliver.
+
+   IT MUST CLIP ITS OWN TEXT. A zero-width box still LAYS ITS TEXT OUT, and
+   with no room the line breaks after every character. That column of line
+   boxes is scrollable overflow, `overflow: visible` carries it up to the
+   nearest scroll container, and no element's rect shows it. A ten-character
+   label under the transcript's newest voice row therefore let the reader
+   scroll 135px past where the conversation ended, which reads as a hole above
+   the composer. `nowrap` stops the column forming and `hidden` clips whatever
+   still spills. See docs/plans/2026-09-17-a-hidden-label-stops-inflating-the-transcript.md */
+.visually-hidden {
+    position: absolute;
+    width: 0;
+    height: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* Shared label — small uppercase badge used across the app */
+.label {
+    display: inline-block;
+    font-size: var(--font-size-3xs);
+    text-transform: uppercase;
+    letter-spacing: 0.03125rem;
+    padding: 0.0625rem 0.3125rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+    white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: baseline;
+}
+
+/* Status tones, additive: `class="label label-success"`. The bare label is the
+   accent tone. They share the toast's words, so a status reads the same in a
+   chip and in a toast. Neutral takes --text-secondary, since --text-muted on
+   --bg-tertiary reads as disabled. */
+.label-success {
+    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
+    color: var(--accent-green);
+}
+
+.label-warning {
+    background: color-mix(in srgb, var(--accent-yellow) 15%, transparent);
+    color: var(--accent-yellow);
+}
+
+.label-error {
+    background: color-mix(in srgb, var(--accent-red) 15%, transparent);
+    color: var(--accent-red);
+}
+
+.label-neutral {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+/* Shared title — used across modals, list rows, panels */
+.title {
+    font-size: var(--font-size-lg);
+    font-weight: 500;
+    color: var(--text-primary);
+    font-family: inherit;
+    letter-spacing: normal;
+}
+
+/* Shared action buttons — used for all small action buttons across the app */
+.icon-btn {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 0.25rem;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    border-radius: calc(var(--radius-control) * 0.75);
+    text-decoration: none;
+    transition: color var(--duration-normal), background var(--duration-normal);
+}
+
+.icon-btn svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    flex-shrink: 0;
+}
+
+/* `:where()` keeps the specificity at (0,2,0), so overrides still win. A
+   disabled button that takes the pointer back for its tooltip gets no wash, and
+   neither does an aria-disabled one, which keeps the pointer all along. */
+@media (hover: hover) {
+    .icon-btn:hover:where(:not(:disabled, [aria-disabled="true"])) {
+        background: var(--bg-hover);
+        color: var(--text-primary);
+    }
+}
+
+.icon-btn:focus-visible {
+    /* Shared --focus-ring: one soft accent band (see base.css). The transparent
+       outline is the forced-colors fallback, where box-shadow is stripped. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+.icon-btn:disabled {
+    opacity: 0.25;
+    cursor: default;
+    pointer-events: none;
+}
+
+/* Use background-color longhand: iOS WebKit skips the transition when the
+ * source rule sets `background:` shorthand with a CSS custom property. */
+.action-btn {
+    background-color: var(--accent-action);
+    border: none;
+    color: var(--text-on-accent);
+    cursor: pointer;
+    min-width: 3.5rem;
+    padding: 0.25rem 0.625rem;
+    border-radius: calc(var(--radius-control) * 0.5);
+    font-size: var(--font-size-xs);
+    font-family: var(--font-ui);
+    font-weight: 500;
+    white-space: nowrap;
+    transition: background-color var(--duration-normal), color var(--duration-normal), opacity var(--duration-normal);
+}
+
+@media (hover: hover) {
+    .action-btn:hover {
+        background-color: color-mix(in srgb, var(--accent-action) 80%, #fff);
+    }
+}
+
+.action-btn:focus-visible {
+    /* Shared --focus-ring (see .icon-btn:focus-visible). Replaces the old solid
+       offset outline, which on a filled button read as a clunky same-color
+       double-band against the button's own accent fill. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+.action-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+    pointer-events: none;
+}
+
+.action-btn-confirm {
+    /* Base + hover both derive from --confirm-bg so the two stay in lockstep when
+       a theme overrides it (dark mode below). Defaults to the family --accent-green
+       so diff markers / status dots that use --accent-green are untouched. */
+    --confirm-bg: var(--accent-green);
+    background-color: var(--confirm-bg);
+}
+
+@media (hover: hover) {
+    .action-btn-confirm:hover {
+        background-color: color-mix(in srgb, var(--confirm-bg) 80%, #fff);
+    }
+}
+
+/* Dark mode tones the confirm green down a step — the bright --accent-green reads
+   too vivid as a filled CTA against the near-black app (and darker lifts the white
+   label's contrast). Only the button shifts; other green UI keeps --accent-green.
+   :not([data-theme-mode="light"]) matches the dark default + explicit dark; "system" is
+   always resolved to an explicit data-theme-mode, so light mode never matches. */
+html:not([data-theme-mode="light"]) .action-btn-confirm {
+    --confirm-bg: #2ea043;
+}
+
+.action-btn-danger {
+    background-color: var(--accent-red);
+}
+
+@media (hover: hover) {
+    .action-btn-danger:hover {
+        background-color: color-mix(in srgb, var(--accent-red) 80%, #fff);
+    }
+}
+
+/* The outlined, lower-emphasis sibling beside a primary button: Cancel, Later.
+   Compound, because an app's sdk_iframe.css loads before this file. The padding
+   gives back the border's 1px, so it stands as tall as the borderless primary. */
+.action-btn.action-btn-secondary {
+    background-color: transparent;
+    border: 1px solid var(--border-color);
+    padding: calc(0.25rem - 1px) calc(0.625rem - 1px);
+    color: var(--text-primary);
+}
+
+@media (hover: hover) {
+    .action-btn.action-btn-secondary:hover {
+        background-color: var(--bg-hover);
+        border-color: var(--text-muted);
+    }
+}
+
+/* A row of buttons BOUND BY ITS CONTAINER. Two defects it exists to prevent,
+   both of which shipped on the "New version available" toast at a 320px
+   viewport (an iPhone in Display Zoom), where "Later" + "Switch to new version"
+   were ~30px wider than the toast:
+
+   1. A plain flex row does not wrap, so buttons too wide for it simply overflow
+      and whichever ancestor hides its overflow slices the last one mid-glyph.
+      `flex-wrap` stacks them onto further rows instead.
+   2. `.action-btn` is `white-space: nowrap` with no width bound, so even alone
+      a long label overflows. `max-width: 100%` resolves against the group,
+      which is the widest a single button may ever be, and the ellipsis puts the
+      truncation inside the label instead of at some ancestor's clip edge.
+
+   `min-width: 3.5rem` on `.action-btn` still applies (a min always beats a
+   max), so ordinary short buttons keep their floor and are unaffected.
+
+   Alignment is deliberately NOT set here: it belongs to the consumer (a toast
+   right-aligns its actions, a form may not). Nor do the buttons stretch to fill
+   the row, because `flex: 1 1 auto` would also stretch them in the common
+   single-row case, changing every button row in the host and in every shipped
+   app. */
+.button-group {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.button-group > .action-btn {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Accent link — subtle underline, full on hover. Resets button defaults so
+   it can wrap a <button> for in-app actions (no href hash dance) without an
+   extra reset class. No-op on <a>. */
+.accent-link {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
+    text-align: left;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+@media (hover: hover) {
+    .accent-link:hover {
+        text-decoration-color: var(--accent);
+    }
+}
+
+/* Shared list row layout — used for all list items across the app */
+.list-rows {
+    display: flex;
+    flex-direction: column;
+}
+
+/* The "+ Add <thing>" row closing a list. It is a real <button> (see
+   components/shared/ListRowAddCard.tsx), so the first block below is the UA
+   button reset: without it the card renders on a grey button face, inside a
+   hairline border, in the UA's centered sans-serif.
+   `font-feature-settings` is re-inherited straight after `font: inherit`,
+   which resets it to initial and would hand ligatures back to a Fira Code
+   user (the same trap documented at .accent-link above). `width: 100%` is belt
+   and braces: `display: flex` below already makes the box block-level, so it
+   fills on its own, but a UA button is `inline-block` and that is what it
+   would fall back to.
+
+   `color` IS reset here, unlike .settings-nav-row (which is already coloured by
+   a higher-specificity rule of its own): nothing else states a colour for this
+   card, so without it a bare text node dropped into one lands on the UA's
+   `buttontext` in the host and on the iframe sheet's `button` colour in an app.
+
+   Every declaration here is inert on a non-button, which matters because this
+   file is include_str!'d into /api/v1/sdk-iframe.css and ships to every app
+   iframe: an app author who put the class on a div sees no change. */
+.list-row-add-card {
+    background: none;
+    border: none;
+    width: 100%;
+    font: inherit;
+    font-feature-settings: inherit;
+    text-align: left;
+    color: inherit;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: var(--space-sm) var(--space-lg);
+    cursor: pointer;
+    transition: background var(--duration-fast);
+}
+
+@media (hover: hover) {
+    .list-row-add-card:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.list-row-add-card:focus-visible {
+    /* The shared --focus-ring band (see .icon-btn:focus-visible), drawn INSET
+       rather than around the box. In Apps, Triggers and Accounts the card runs
+       edge to edge (those lists re-establish the 1rem gutter as the row's own
+       padding, so the hover wash reaches the pane edges) and its clip ancestor
+       is .content-pane-body { overflow-x: hidden }, so an outward ring would
+       lose its left and right sides there and render as two stray bars. The
+       card's own 1rem padding keeps the inset band well clear of the label.
+       The transparent outline is the forced-colors fallback, where box-shadow
+       is stripped, and takes a matching negative offset for the same reason. */
+    outline: 0.125rem solid transparent;
+    outline-offset: -0.125rem;
+    box-shadow: inset var(--focus-ring);
+}
+
+.list-row-add-icon {
+    font-size: var(--font-size-2xl);
+    color: var(--text-muted);
+    width: 1.5rem;
+    text-align: center;
+}
+
+.list-row-add-label {
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
+    font-family: var(--font-ui);
+}
+
+.list-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    /* --space-lg (1rem) is the shared content-pane horizontal gutter — every
+       list-family view (apps, plugins, triggers, changes, thread queue, …) lines
+       its rows up here. Also served to app iframes via /api/v1/sdk-iframe.css,
+       which defines the same --space-* scale. */
+    padding: var(--space-sm) var(--space-lg);
+    transition: background var(--duration-fast);
+}
+
+@media (hover: hover) {
+    .list-row:hover {
+        background: var(--bg-hover);
+    }
+}
+
+.list-section-title {
+    position: relative;
+    padding: 0.375rem 1rem;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+}
+
+/* No clip: `min-width: 0` lets the column shrink and the text rules wrap long
+   words, while a clip would cut the focus ring of every field and button
+   that fills the column. */
+.list-row-info {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.list-row-name {
+    margin-bottom: 0.25rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* A name that has become a field (a rename) has no text to ellipsize, and its
+   clip would cut the field's focus ring. */
+.list-row-name:has(> input) {
+    overflow: visible;
+}
+
+.list-row-label {
+    display: block;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    margin-bottom: 0.125rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.list-row-details {
+    display: flex;
+    gap: 0.75rem;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    margin-bottom: 0.25rem;
+    flex-wrap: wrap;
+    min-width: 0;
+}
+
+/* Additive modifier for a details slot holding a SENTENCE rather than a set of
+   fields: class="list-row-details list-row-details-prose".
+   The base class is a flex row whose 0.75rem gap IS the separator between
+   fields, so every inline child of a sentence (a <strong> value, a <code>
+   command) becomes its own flex item: the text breaks around it, the gap opens
+   holes mid-sentence, and a trailing "." lands alone at the start of the next
+   line. Block flow restores normal inline wrapping. */
+.list-row-details-prose {
+    display: block;
+    line-height: 1.5;
+}
+
+.list-row-url {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 18.75rem;
+}
+
+.list-row-type {
+    color: var(--accent);
+    text-transform: uppercase;
+    font-weight: 500;
+}
+
+.list-row-date {
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+.list-row-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+}
+
+.list-row-actions:last-child {
+    margin-left: auto;
+}
+
+/* Shared markdown content — used by .response-content, .notification-detail-body, etc. */
+.markdown-content {
+    overflow-wrap: break-word;
+    word-break: break-word;
+    min-width: 0;
+}
+
+.markdown-content h1:first-child,
+.markdown-content h2:first-child,
+.markdown-content h3:first-child {
+    margin-top: 0;
+}
+
+.markdown-content p {
+    margin: 0 0 0.75rem 0;
+}
+
+.markdown-content strong {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+/* A UI font with no bold face paints bold with its regular outlines, so bold
+   prose steps up in colour instead. `data-font-bold` is set with the font.
+   Prose only: a label's bold word keeps the colour its own rule gives it. */
+html[data-font-bold="none"] .markdown-content :is(strong, b) {
+    color: var(--text-strong);
+}
+
+.markdown-content ul,
+.markdown-content ol {
+    margin: 0.5rem 0;
+    padding-left: 1.25rem;
+}
+
+.markdown-content li {
+    margin: 0.25rem 0;
+}
+
+/* Native list markers (disc / decimal) — no custom ::before bullet. Native
+ * markers make the "number AND bullet" double-marking structurally impossible:
+ * a nested <ol> under a <ul> shows decimal only, because each list level owns
+ * its own marker. `::marker` matches the body text color so bullets and numbers
+ * read as clearly as the list content, not as washed-out muted glyphs. */
+.markdown-content li::marker {
+    color: var(--text-primary);
+}
+
+/* Tables. `renderMarkdown` wraps every table in this scroll container, the
+ * pattern GitHub, Bootstrap's .table-responsive, ChatGPT and Docusaurus all
+ * use. A table never grows past its pane on purpose, so this is a SAFETY NET
+ * rather than the normal path: it catches the one overflow that cannot be
+ * designed away, a single token wider than the pane, and scrolls it here
+ * instead of widening the page. `overscroll-behavior-x: contain` keeps that
+ * pan from chaining into the mobile pane swipe; MobileSwipeContainer already
+ * declines to hijack a touch that starts on a horizontally scrollable child. */
+.markdown-content .table-scroll-wrapper {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    margin: 0.75rem 0;
+}
+
+/* Images. `renderMarkdown` wraps every one in this scroll container, the same
+ * treatment a table gets above. Unlike a table an image cannot be reflowed, so
+ * this is the NORMAL path rather than a safety net: a screenshot is commonly
+ * 2560px wide, and something has to absorb that. The overflow is panned here
+ * with the ordinary scrollbar, the affordance the table wrapper already
+ * established, rather than a bespoke one. `overscroll-behavior-x: contain`
+ * keeps the pan from chaining into the transcript behind it, and into the
+ * mobile pane swipe (MobileSwipeContainer already declines to hijack a touch
+ * that starts on a horizontally scrollable child). Both declarations are the
+ * table wrapper's x-axis form rather than the unsuffixed one, because the
+ * wrapper can never overflow VERTICALLY (its height is the capped image's), so
+ * a y-axis containment would have nothing to contain here and would only risk
+ * swallowing a wheel scroll aimed at the transcript.
+ *
+ * Panning here is NOT a reversal of the decision below that a table must never
+ * pan. That one rests on a table being able to reflow, which makes the
+ * sideways scroll pure cost. An image cannot reflow, so the only alternatives
+ * to panning it are shrinking it or cropping it.
+ *
+ * The image itself is deliberately NOT capped at `max-width: 100%`: capping it
+ * is what shrinks a wide screenshot to an unreadable thumbnail instead of
+ * letting it pan at full size. That is also why `max-width` is reset to `none`
+ * below, which overrides the mobile-only `.response-content img` cap in
+ * mobile.css. Deliberate, and the choice is "the wrapper wins at every width":
+ * one behavior to learn, rather than pan-on-desktop and fit-on-phone diverging
+ * at a breakpoint the reader never sees.
+ *
+ * A `<span>` carries the class (marked puts an image inside a `<p>`, where a
+ * `<div>` would be invalid and split the paragraph), so it needs an explicit
+ * `display: block`, which also drops the baseline descender gap an inline image
+ * leaves under itself. Spacing comes from the containing paragraph, so the
+ * wrapper adds no margin of its own. An image smaller than the pane is
+ * untouched by all of this: the wrapper has no minimum, no padding and no
+ * background, so it shows the image at its natural size with no scrollbar.
+ *
+ * This file is `include_str!`d into /api/v1/sdk-iframe.css, so every rule here
+ * is scoped to the wrapper class. An app's own hand-written <img> has no wrapper
+ * around it and keeps whatever sizing the app gave it. The cap is one custom
+ * property, which the host's size-hint rule in host-components.css reads too. */
+.image-scroll-wrapper {
+    --image-max-height: 24rem;
+}
+
+.markdown-content .image-scroll-wrapper {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+}
+
+.markdown-content .image-scroll-wrapper > img {
+    display: block;
+    max-width: none;
+    /* Half the height of a laptop transcript, so a screenshot is legible at a
+     * glance while the prose under it stays on screen and a second image is
+     * still one short scroll away. In rem so it tracks the user's UI scale, and
+     * paired with `height: auto` so a tall capture narrows proportionally
+     * instead of squashing. */
+    max-height: var(--image-max-height);
+    height: auto;
+}
+
+.markdown-content table {
+    /* A table always fits its pane, at every width. Letting a wrapped table
+     * grow to twice the pane and pan was tried and reverted: measured on a
+     * two-column commit table it cost a FULL PANE of sideways scrolling at
+     * 700/900/1200px alike, which is a bad trade at any size in a transcript
+     * you read vertically. Note this is also the value that was here when the
+     * key column collapsed, and it was never the cause: the cells' min-content
+     * (below) was, and restoring it is what fixed the collapse.
+     *
+     * A second constraint binds any future attempt to let tables grow again:
+     * this file is `include_str!`d into /api/v1/sdk-iframe.css, so an app's
+     * own hand-written table lands here with NO .table-scroll-wrapper and
+     * therefore nothing to absorb an overflow. Growth would widen the iframe
+     * body outright. Pinned by markdown-table-columns.spec.ts. */
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-size-sm);
+}
+
+.markdown-content th,
+.markdown-content td {
+    /* A cell must never break mid-word, because a break opportunity inside a
+     * word lowers the column's MIN-CONTENT width to a single character, and a
+     * column that can be one character wide is one the table layout will make
+     * one character wide. `word-break: break-word` on .markdown-content and
+     * .response-content does exactly that, since despite its name it means
+     * `overflow-wrap: anywhere`, so it is overridden here. The replacement,
+     * `overflow-wrap: break-word`, still breaks a token that genuinely does
+     * not fit, but does not count toward min-content. */
+    word-break: normal;
+    overflow-wrap: break-word;
+    /* No single column may exceed a comfortable line length. Auto table layout
+     * splits the spare width in proportion to each column's max-content, so a
+     * prose column beside a key column takes nearly all of it: on the reported
+     * table in a 900px pane, 671px of prose against 223px of key. That is both
+     * columns wrong at once, since 671px is well past the 45-75 characters
+     * prose is readable at, and the key column is starved to pay for it.
+     * Capping the greedy column hands the remainder back (447/447 there), and
+     * because it is a max the columns that genuinely want less keep their
+     * natural width: a 3-column table's 57px status column stays 57px, which
+     * is what ruled out `table-layout: fixed` (it made that table 60% taller
+     * by forcing every column to an equal third).
+     *
+     * `ch`, not the usual `rem`, and deliberately: this is a LINE LENGTH, so
+     * it has to track the text it measures, and cell font-size drops a step at
+     * 600px (below). A rem value would stay put across that change and stop
+     * meaning 60 characters. It satisfies what the rem rule is for, since `ch`
+     * derives from the cell's font-size, which derives from a --font-size-*
+     * token, so the cap still follows the user's UI scale. */
+    max-width: 60ch;
+    padding: 0.375rem 0.625rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.markdown-content th a,
+.markdown-content td a {
+    word-break: normal;
+    overflow-wrap: break-word;
+}
+
+.markdown-content th {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+/* Narrow viewports: tighter type and padding, so each column fits more text
+ * per line before the cells have to wrap. Lived in settings/toggle.css keyed
+ * on .response-content, which meant chat only, in an unrelated stylesheet. */
+@media (max-width: 600px) {
+    .markdown-content table {
+        font-size: var(--font-size-xs);
+    }
+
+    .markdown-content th,
+    .markdown-content td {
+        padding: 0.25rem 0.375rem;
+    }
+}
+
+@media (hover: hover) {
+    .markdown-content tr:hover {
+        background: var(--bg-hover);
+    }
+}
+
+/* A phone never pans a table sideways. It either FITS (the desktop growth rule
+ * above does not apply here, so the table stays capped at the pane and wraps)
+ * or it STACKS: from four columns up, every column is narrow AND the pan is
+ * long, so each row becomes a card and each cell carries its column header as a
+ * label. `renderMarkdown` decides which tables qualify (STACK_MIN_COLUMNS) and
+ * stamps `data-stack` plus a `data-label` per cell, because an attribute
+ * selector cannot compare a column count and the threshold is unit-testable in
+ * TS. App authors writing their own table markup can stamp the same attributes;
+ * see the component-class table in system-knowhow/js-sdk.md. */
+@media (max-width: 768px) {
+    .markdown-content table[data-stack],
+    .markdown-content table[data-stack] tbody,
+    .markdown-content table[data-stack] tr,
+    .markdown-content table[data-stack] td {
+        display: block;
+    }
+
+    .markdown-content table[data-stack] {
+        /* Undo the bounded-scroll sizing: a stacked table never scrolls. */
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+    }
+
+    /* Redundant once every cell states its own column. */
+    .markdown-content table[data-stack] thead {
+        display: none;
+    }
+
+    /* The row is the card, so it owns the separator the cells used to draw. */
+    .markdown-content table[data-stack] tr {
+        padding: 0.5rem 0;
+        border-bottom: 1px solid var(--border-color);
+    }
+
+    .markdown-content table[data-stack] tr:last-child {
+        border-bottom: none;
+    }
+
+    .markdown-content table[data-stack] td {
+        padding: 0.125rem 0;
+        border-bottom: none;
+    }
+
+    .markdown-content table[data-stack] td::before {
+        content: attr(data-label);
+        display: block;
+        font-size: var(--font-size-xs);
+        color: var(--text-secondary);
+    }
+
+    /* An empty cell would otherwise render as a label with nothing under it. */
+    .markdown-content table[data-stack] td:empty {
+        display: none;
+    }
+}
+
+.markdown-content a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    text-underline-offset: 0.125rem;
+    /* No `word-break` here. A link inherits the container's, which wraps link
+       text at its spaces and breaks a long URL only where it cannot fit. */
+}
+
+@media (hover: hover) {
+    .markdown-content a:hover {
+        text-decoration-color: var(--accent);
+    }
+}
+
+.markdown-content pre {
+    overflow-x: auto;
+    white-space: pre;
+    margin: 0.75rem 0;
+    padding: 0.625rem;
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-control) * 0.5);
+}
+
+.markdown-content code {
+    background: var(--bg-tertiary);
+    padding: 0.125rem 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+    /* Named, because a `<code>` carries a UA `font-family: monospace` of its
+       own and therefore inherits nothing: with no declaration here it painted
+       in the browser's generic mono face rather than the app's declared stack,
+       which is the same class of miss as the body and control defaults in
+       base.css. Covers fenced blocks too, which are `pre > code`. */
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
+    color: var(--accent);
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.markdown-content pre code {
+    padding: 0;
+    background: none;
+    color: inherit;
+}
+
+.markdown-content blockquote {
+    margin: 0.5rem 0;
+    padding: 0.25rem 0.75rem;
+    border-left: 0.1875rem solid var(--accent);
+    color: var(--text-secondary);
+}
+
+.markdown-content hr {
+    border: none;
+    border-top: 1px solid var(--border-color);
+    margin: 1.25rem 0;
+}
+
+/* Shared progress bar — used by backup progress, memory rebuild, etc.
+ * `border` (not just background) makes the empty track visible against panes
+ * that share `--bg-secondary`, so a tiny fill (3%) still reads against a
+ * full-width 100% reference. */
+/* `overflow: hidden` is load-bearing, not tidiness: a caller may set a fill
+   width above 100%, and the clip is what keeps it inside the rounded track.
+   The LLM Context Viewer does exactly that for a capture whose usage exceeds
+   its recorded context window, where the percentage is deliberately unclamped
+   (`utils/formatTokens.ts :: contextPercent`). */
+.progress-bar {
+    height: 0.375rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.375);
+    overflow: hidden;
+}
+
+.progress-bar-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: calc(var(--radius-control) * 0.375);
+    transition: width var(--duration-slow) ease;
+}
+
+.progress-label {
+    display: block;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+}
+
+/* Shared error text — used for inline error messages */
+.error-text {
+    color: var(--accent-red);
+}
+
+/* Shared empty state — used across all list/grid views */
+.empty-state {
+    grid-column: 1 / -1;
+    text-align: center;
+    padding: 2.5rem 1.5rem;
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+}
+
+/* Shared dropdown trigger/chevron/placeholder/option — the host's custom
+   <Dropdown> AND the app SDK's `lucidos.ui.Select` render these exact classes,
+   so the two controls share one look with nothing to keep in sync. See
+   docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md. The menu's own box
+   (background/border/radius/shadow) is `.surface-box`, in `surface.css`.
+
+   The selected value reads as the legible anchor of the control in both
+   themes: the old dim (secondary) + grey glow made it look disabled/fuzzy on
+   light, and washed-out grey on dark. Primary text, no glow — crisp
+   everywhere. Hover keeps the same colour; affordance comes from the
+   border-colour shift alone. */
+.dropdown-trigger {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.75);
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    padding: 0.25rem 0.5rem;
+    cursor: pointer;
+    outline: none;
+    transition: border-color var(--duration-normal), color var(--duration-normal);
+    display: flex;
+    align-items: center;
+    gap: 0.3125rem;
+    white-space: nowrap;
+}
+
+@media (hover: hover) {
+    .dropdown-trigger:hover {
+        border-color: var(--text-muted);
+    }
+}
+
+.dropdown-trigger:focus-visible {
+    color: var(--text-primary);
+    /* Shared --focus-ring — matches .action-btn / .icon-btn. */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+.dropdown-trigger:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.dropdown-placeholder {
+    color: var(--text-muted);
+    opacity: 0.6;
+}
+
+.dropdown-chevron {
+    /* Push the chevron to the trailing edge whenever the trigger is wider than
+     * its content (e.g. a full-width `.form-group` dropdown) — content-width
+     * triggers have no slack, so this is a no-op there. */
+    margin-left: auto;
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+    /* Open flips this glyph rather than drawing `▴`, which can differ in
+       width and resize the trigger. The flip is vertical, so asymmetric
+       horizontal padding cannot move the glyph sideways. */
+    display: inline-block;
+    transition: transform var(--duration-fast);
+}
+
+.dropdown-chevron.open {
+    transform: scaleY(-1);
+}
+
+/* Option label sits at the primary text color so the muted second-line
+ * description and the section headers (both --text-secondary) read as
+ * de-emphasized beneath it — without this contrast every row is one flat
+ * --text-secondary and the hierarchy disappears. */
+.dropdown-option {
+    padding: 0.25rem 0.5rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    color: var(--text-primary);
+    cursor: pointer;
+    white-space: nowrap;
+    /* Below the fast token on purpose: a hover tint that lags the pointer down
+       a long option list reads as sticky. Scaled, so the slider still reaches
+       it. */
+    transition: background-color calc(0.1s * var(--duration-scale));
+}
+
+@media (hover: hover) {
+    .dropdown-option:hover {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+}
+
+.dropdown-option.focused {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+/* Current-selection marker — a small accent dot at the trailing edge, NOT a
+ * full-row color/background treatment. A blue-text (or background) active row
+ * competed with the arrow-key `.focused` row (which owns the bg-tertiary
+ * highlight): traversing showed two "special" rows and you couldn't tell which
+ * one the arrows were on. The dot reads as "this is the current one" without
+ * claiming the row highlight. `padding-right` reserves the dot's gutter so a
+ * long label ellipsizes before it instead of underlapping the dot. Only shown
+ * where the dropdown reflects a persisted current setting; transient "last
+ * used" pickers pass markCurrent={false} (no `.active` class). */
+.dropdown-option.active {
+    position: relative;
+    padding-right: 1.25rem;
+}
+
+.dropdown-option.active::after {
+    content: '';
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    width: 0.3125rem;
+    height: 0.3125rem;
+    border-radius: var(--radius-round);
+    background: var(--accent);
+}
+
+/* Global tooltip: JS-positioned, appended to body, shared rather than host
+ * chrome. One implementation drives it in both hosts, installTooltips() in
+ * packages/lucidos-sdk/src/tooltip.ts. The host calls it through the useTooltip
+ * hook, and the SDK bundle calls it on load inside an app iframe. So these
+ * rules live here rather than in base.css, and there is one copy.
+ * Pinned by styles/__tests__/tooltip-single-source.test.ts. */
+#tooltip {
+    position: fixed;
+    z-index: var(--z-tooltip);
+    max-width: 30rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 1.25);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    font-weight: 400;
+    font-style: normal;
+    line-height: 1.4;
+    text-align: left;
+    text-transform: none;
+    letter-spacing: normal;
+    white-space: normal;
+    word-wrap: break-word;
+    pointer-events: none;
+    opacity: 0;
+    display: none;
+    transition: opacity var(--duration-fast);
+    box-shadow: var(--shadow-sm);
+}
+
+#tooltip-arrow {
+    position: absolute;
+    top: -0.3125rem;
+    width: 0.625rem;
+    height: 0.625rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-right: none;
+    border-bottom: none;
+    transform: translateX(-0.3125rem) rotate(45deg);
+}
+
+#tooltip.above #tooltip-arrow {
+    top: auto;
+    bottom: -0.3125rem;
+    border: 1px solid var(--border-color);
+    border-left: none;
+    border-top: none;
+}
+
+#tooltip-title {
+    font-weight: 600;
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+}
+
+#tooltip-title:empty {
+    display: none;
+}
+
+#tooltip-text {
+    position: relative;
+    white-space: pre-line;
+}
+
+/* Structured two-column label/value tooltip (e.g. thread drawer rows). The dim
+   label sits in the left column, the bright value right-aligned in the right.
+   `display: contents` lets each .tt-row's children join the parent grid, so the
+   columns stay aligned across every row. */
+#tooltip-text.tooltip-rows {
+    display: grid;
+    grid-template-columns: auto auto;
+    column-gap: 1.5rem;
+    row-gap: 0.25rem;
+    white-space: nowrap;
+}
+
+#tooltip-text.tooltip-rows .tt-row {
+    display: contents;
+}
+
+#tooltip-text.tooltip-rows .tt-label {
+    color: var(--text-muted);
+}
+
+#tooltip-text.tooltip-rows .tt-value {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    justify-self: end;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+#tooltip-text.tooltip-rows .tt-dot {
+    flex: none;
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: var(--radius-round);
+    background: var(--text-muted);
+}
+
+#tooltip-text.tooltip-rows .tt-dot-running { background: var(--accent); }
+#tooltip-text.tooltip-rows .tt-dot-changes { background: var(--accent-green); }
+/* Neutral state, not a caution. The fallback
+   carries the app iframe: --accent-notable is host-only on purpose (see the
+   engine's sdk_iframe.css), so an app renders the muted dot instead. */
+#tooltip-text.tooltip-rows .tt-dot-waiting { background: var(--accent-notable, var(--text-muted)); }
+#tooltip-text.tooltip-rows .tt-dot-failed { background: var(--accent-red); }
+
+/* Narrow viewport: keep the box inside the screen. The JS clamp pins the left
+   edge, so a box wider than the viewport still overruns the right one. An app
+   iframe never loads mobile.css, so this cap belongs beside the rule it
+   overrides. */
+@media (max-width: 600px) {
+    #tooltip {
+        max-width: calc(100vw - 2rem);
+    }
+}

@@ -1,0 +1,15 @@
+{
+  "run_id": "20261010-122005-675f",
+  "suites": [
+    "api"
+  ],
+  "api_args": [
+    "-f",
+    "app_icon"
+  ],
+  "browser": {
+    "projects": [],
+    "specs": [],
+    "pw_args": []
+  }
+}

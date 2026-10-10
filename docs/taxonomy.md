@@ -1,0 +1,240 @@
+# Lucidos Workspace Taxonomy
+
+Source of truth for how workspace content is **organized**. Referenced by both the engine system prompt (for the Lucidos LLM) and CLAUDE.md (for CC development sessions).
+
+**Terms** (intent, knowhow, script, app, trigger, artifact, manifest, thread, sub-thread, top-thread, spawning thread, parent thread, event, domain event, workspace, plugin) are defined in [`system-knowhow/glossary.md`](../system-knowhow/glossary.md). This file uses those definitions and adds the structural / placement / ownership story on top.
+
+<!--concepts-content-types-start-->
+## Three Content Types
+
+| Type | Stability | Who maintains | Example |
+|------|-----------|---------------|---------|
+| **Intent** | Stable — changes when the user's needs change | User | "Find relevant jobs, store them, notify me of new ones and deadlines" |
+| **Knowhow** | Evolves — refined every time Lucidos learns something new | Lucidos | "Use `.product-card img` selector, vendor CDN requires base64 conversion" |
+| **Script** | Changes when tools or APIs change | Either | `download_images.py`, `validate_images.py` |
+<!--concepts-content-types-end-->
+
+See [`system-knowhow/glossary.md`](../system-knowhow/glossary.md) for the canonical definitions.
+
+<!--concepts-intent-knowhow-start-->
+### Intent vs Knowhow
+
+The intent describes **what the user wants** — written in user terms, like what you'd tell a competent assistant. The knowhow describes **how to do it well** — technical details that Lucidos accumulates over time.
+
+**Test: "Would a non-technical person understand this file?"**
+- Yes → it's an intent
+- No → it's knowhow
+
+Example: A product-watch intent says "find relevant listings for me, store them, notify me if there are new ones or upcoming deadlines." The knowhow explains how vendor logos are extracted, how prices are normalized, what CORS workarounds are needed. When Lucidos discovers a new quirk, it updates the knowhow — the intent stays the same.
+<!--concepts-intent-knowhow-end-->
+
+### Frontmatter
+
+Both intents and knowhow files use YAML frontmatter:
+
+**Intent frontmatter:**
+```yaml
+---
+name: Daily Weather Check
+knowhow:
+  - weather-api
+---
+```
+- `name` (required): Human-readable name
+- `knowhow` (optional): List of knowhow IDs to load when executing
+
+**Knowhow frontmatter:**
+```yaml
+---
+name: Panasonic Comfort Cloud
+description: Controls and monitors Panasonic heatpumps via Comfort Cloud API
+---
+```
+- `name` (required): Human-readable name
+- `description` (optional): Short description for semantic discovery — the system matches user messages against this to automatically load relevant knowhow. If absent, derived from the name + first paragraph of the body.
+
+### Continuous Learning
+
+When Lucidos discovers something new during execution (a quirk, a better approach, a failure mode), it should update the relevant **knowhow** file. Knowhow is Lucidos's living memory of how to do things well. Intents should only change when the user's goal itself changes — never put technical details in intents.
+
+## Ownership Principle
+
+**Everything lives with its consumer.** Intents, knowhow, and scripts are always scoped to the thing that uses them — an app, a trigger, or a knowhow domain. The exception is a script shared across *several* consumers, which goes in the top-level `data/scripts/` rather than being duplicated into each (see Rules below).
+
+**Survivability test:** "Does this survive if I delete the app?" If yes, it belongs at the top level (e.g., Google Calendar sync). If it only makes sense in the context of the app (e.g., a per-app scoring heuristic), it belongs inside the app.
+
+## Directory Structure
+
+```
+data/
+  artifacts/                ← User files (notes, imported data, projects) — git-tracked, NEVER auto-delete
+    user_profile.md         ← Learned facts about the user
+    imported/<service>/     ← Files imported from APIs (e.g., oura/, weather/)
+    projects/<name>/        ← Major project folders
+    screenshots/            ← Captured screenshots
+
+  apps/<name>/              ← App UIs — render in iframe with scoped chat
+    manifest.json           ← User-facing metadata (name, description, icon) — shown in UI, NOT in LLM context
+    index.html, styles.css  ← App UI files
+    knowhow/                ← App-specific reference docs (evolves)
+      <descriptive>.md      ← A listed doc
+      <descriptive>/        ← That doc's references, not listed
+    intents/                ← App-specific user intents (stable)
+    scripts/                ← App-specific helper scripts
+    triggers/               ← App-specific scheduled triggers
+
+  knowhow/                  ← General domain reference docs (API specs, data formats)
+    <domain>.md             ← Simple knowhow (single file), a listed doc
+    <domain>/               ← Knowhow domain with sub-docs
+      <descriptive>.md      ← A listed doc
+      <descriptive>/        ← That doc's references, not listed
+      scripts/              ← Domain-specific scripts
+      intents/              ← Domain-specific intents
+
+  triggers/                 ← Standalone scheduled triggers (not app-specific)
+    <name>/                 ← Each trigger gets its own directory
+      <descriptive>.md      ← Trigger intent definition
+      knowhow/              ← Trigger-scoped docs, same shape as an app's
+      scripts/              ← Trigger-specific scripts
+
+  scripts/                  ← Shared scripts NOT tied to one consumer
+    <name>/run.py           ← Invoked by intents, knowhow, or proxy auth handshakes across apps/triggers
+
+  themes/                    ← Themes: named sets of design-token values (system-knowhow/themes.md)
+    <id>.json               ← One theme; the device-scoped `theme` preference picks it
+
+  fonts/                    ← Workspace fonts, beside the bundled catalog (system-knowhow/workspace-fonts.md)
+    <slug>/font.json        ← One font's label, group and faces; its id is `ws-<slug>`
+
+  postgres/                 ← Event store — gitignored
+```
+
+## Knowhow: Docs and References
+
+A **knowhow doc** is a file the engine names in a thread's Know-how routing
+list. That list is billed on every turn of every thread, so a root lists docs
+and nothing else. A file below the listing depth is a **knowhow reference**: it
+belongs to the doc above it, and the doc pulls it in.
+
+| Root | Listed as docs | Anything deeper |
+|---|---|---|
+| `data/knowhow/` and the shared `~/.lucidos/knowhow/` | `<name>.md` and `<group>/<name>.md` | a reference |
+| `data/apps/<id>/knowhow/` | `<name>.md` | a reference |
+| `data/triggers/<slug>/knowhow/` | `<name>.md` | a reference |
+
+An app or a trigger is already the group. That is why its root lists one level
+while the top-level root lists two.
+
+**Depth decides listing, never resolution.** A reference keeps its full id and
+stays loadable: `load_knowhow('lucidos-ops/release-process/phase-table')` reads
+it exactly as before. It just takes no row of its own.
+
+Give a doc's supporting files a folder named after the doc:
+
+```
+data/knowhow/
+  lucidos-ops/
+    release-process.md        ← a doc, listed
+    release-process/
+      phase-table.md          ← a reference, the doc loads it
+      rollback-matrix.md      ← a reference, the doc loads it
+```
+
+Name each reference and its id inside the doc that owns them. Nothing else
+routes to a reference, so one no doc names is unreachable in practice.
+
+**A file placed too deep goes quiet.** It stays on disk and stays loadable by
+id, but no thread hears about it. Nothing fails, which is what makes it worth
+checking for: `system-knowhow/workspace-audit.md` § 3 flags it, so an audit is
+how the user learns a reorg is needed.
+
+Engine-shipped `system-knowhow/` is exempt. That corpus is curated in the repo,
+so every file in it is a doc whatever its depth.
+
+## Rules
+
+- **File naming:** Never use generic names like `skill.md`, `knowhow.md`, or `intent.md`. Always name files by what they describe (e.g., `calendar-data-layout.md`, `weather-forecast.md`, `comfort-cloud-api.md`).
+- **Everything under `data/` is git-tracked** — files persist and have version history — **except** the engine-managed gitignored paths `postgres/` (event store), `blobs/` (binary cache), and `.env` (per-workspace env overrides; secret-bearing, loaded on startup).
+- **`.lucidos/`** is ephemeral (runtime cache, temp files). Can be rebuilt. Not under `data/`. It holds nothing large: the embedding model is cached once per user (or per install), never per workspace, so a workspace directory does not carry a multi-hundred-MB copy of it (ADR 0061).
+- **Manifest vs knowhow:** `manifest.json` is for the user (UI display). Knowhow and intents are for the engine (LLM context). Don't put operational knowledge in manifests.
+- **Scripts belong with their consumer.** If only one trigger uses a script, it goes in that trigger's `scripts/`. If only one app uses it, it goes in that app's `scripts/`. A script shared across consumers (apps, triggers, intents) goes in the top-level `data/scripts/<name>/`, and so does one a proxy auth handshake invokes. See `system-knowhow/best-practices.md` § "scripts/: Shared Scripts". Don't duplicate it into each consumer.
+
+## Apps
+
+Apps have two layers of metadata:
+
+- **`manifest.json`** — user-facing: name, description, icon. Displayed in the app list UI. The LLM does NOT see this in its context.
+- **`knowhow/` + `intents/`** — engine-facing: injected into LLM context when the app is active. This is how the LLM knows what the user wants and how to achieve it.
+
+Data storage: pick artifacts (git) OR events (postgres), not both.
+
+## Triggers
+
+Triggers are scheduled tasks that run on cron or in response to events. The **intent** lives in the `TriggerCreated` event payload (`run.intent`) — there is no `intent.md` file. The intent is a single sentence in the user's voice (`{ type: 'intent', intent: '...' }`); there is no per-trigger knowhow allow-list to configure. When the trigger fires, the spawned thread looks up knowhow itself via `load_knowhow` — same as a chat session. Optional **scripts** and trigger-scoped **knowhow files** live alongside the trigger on disk.
+
+### Intent vs Knowhow Split (the rule everyone gets wrong)
+
+Triggers tempt you to dump procedure into the intent — there's one big text field, the API doesn't enforce structure, and the procedure is fresh in your head when you create it. **Resist**, and the way to resist is an ordering, not willpower: **write the knowhow file first, then the intent.** Stated as a prohibition ("don't put procedure in the intent") the rule fails in practice, because whoever holds a procedure and has nowhere to put it writes it where they can. Give it somewhere to live first and the intent comes out clean on its own.
+
+Every imperative verb about *how* (hit, parse, scan, fall back, retry, emit) belongs in that knowhow file, where the LLM discovers it at fire time.
+
+- **Intent**: a sentence the user would say. "Notify me when GPT-5.5 is available via the OpenAI API."
+- **Knowhow**: the recipe. "GET `/v1/models` with `Authorization: Bearer $OPENAI_API_KEY`; scan `data[].id` for ids starting with `gpt-5.5`; on 401/403/network error fall back to one `web_search` for ..."
+
+Two tests, and the second is the sharper one:
+
+1. Would a non-technical person understand the intent? If no, knowhow has leaked.
+2. Sentence by sentence: **would deleting this change HOW the work is done, or WHAT the user wants?** How belongs in the knowhow file. What stays in the intent.
+
+### Worked Example
+
+**Bad** (one step, intent contains the recipe):
+```
+run.intent: "Check whether gpt-5.5 is available. GET https://api.openai.com/v1/models
+with Authorization: Bearer $OPENAI_API_KEY. Scan data[].id for any id starting
+with gpt-5.5. If found, send_notification + update_trigger to disable. If 401/403
+or network error, fall back to web_search for 'gpt-5.5 OpenAI API available'.
+If not yet available, stay silent."
+```
+
+**Good**, two steps in this order. **Step one, the knowhow file**, written before the trigger exists:
+```
+# data/knowhow/openai-api-availability.md
+---
+name: OpenAI API Model Availability
+description: How to check whether a specific model is reachable via the OpenAI API.
+---
+GET `https://api.openai.com/v1/models` with `Authorization: Bearer $OPENAI_API_KEY`.
+On 200, scan `data[].id` for the requested model prefix. On 401/403/network error,
+fall back to one `web_search` distinguishing API availability from ChatGPT-only rollout.
+Stay silent until the model appears.
+```
+**Step two, the trigger**, which now has nothing technical left to carry:
+```
+run.intent: "Notify me when an OpenAI model with id prefix gpt-5.5 becomes available
+via the API. Once notified, disable this trigger."
+```
+
+Skip step one and you reach the tool with procedure in hand and nowhere to put it, so it lands in the intent. That is the failure this ordering prevents, and it is the common one.
+
+When OpenAI changes their endpoint, you update one knowhow file — not every trigger that touches it. When a new model needs watching, you create a new trigger; the same knowhow surfaces via semantic discovery. Skip step one and neither of those holds: the recipe exists in exactly one trigger's config, invisible to discovery and unreachable from any other thread.
+
+### Knowhow discovery at fire time
+
+The trigger thread inherits the chat-thread knowhow surface: the system prompt advertises the intent registry, and the LLM calls `load_knowhow` when it judges a recipe relevant. There is no allow-list to configure on the trigger and no pre-load step. Make the knowhow file's `name` and `description` frontmatter precise so semantic discovery finds it.
+
+### Order of Operations
+
+Knowhow file first, trigger second, as in the worked example above. That works for shared `data/knowhow/`, which is where a recipe belongs unless it is useless to anything else. Trigger-scoped knowhow inverts it: `<slug>` is only authoritative once the trigger exists, so write that file straight after creation. The chat system prompt's `CONTENT TAXONOMY` block states the same ordering. `system-knowhow/triggers.md` § "Write the knowhow file FIRST, then the intent" is what the LLM reads at trigger-creation time.
+
+### Locations
+
+- **Standalone triggers** live in `triggers/<slug>/` (intent is event-sourced; the directory holds scripts and trigger-specific knowhow). `<slug>` is the trigger's kebab-case `slug` field.
+- **App-specific triggers** live in `apps/<id>/triggers/<slug>/`.
+- **Trigger-scoped knowhow** lives at `data/triggers/<slug>/knowhow/<descriptive>.md` (or `data/apps/<id>/triggers/<slug>/knowhow/` for app-specific triggers). Visible only to threads of trigger `<slug>`.
+- **Shared knowhow** lives in `data/knowhow/<id>.md` (or `data/knowhow/<id>/<descriptive>.md` for multi-file domains).
+- **A doc's own reference files** go one folder deeper, per § Knowhow: Docs and References. They are not listed, and the doc loads them by id.
+
+## Thread Vocabulary
+
+Thread terms (*spawning thread*, *child thread*, *sub-thread*, *top-thread*, *parent thread*) are defined in [`system-knowhow/glossary.md`](../system-knowhow/glossary.md). Choose between *child thread* and *top-thread* via the `relation` argument on `run_thread` / `run_claude` (default `"child"`; `"sub"` is a back-compat alias) or the `--relation child|top` flag on `lucidos spawn-thread` (CLI default `top`; `sub` is a back-compat alias). Database columns (`parent_thread_id`, `child_thread_id`) keep their names — child threads still have parents.
