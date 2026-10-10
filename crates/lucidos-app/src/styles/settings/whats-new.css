@@ -1,0 +1,255 @@
+/* Settings > System > What's New: the release list. */
+
+.whats-new-list {
+    display: flex;
+    flex-direction: column;
+}
+
+.whats-new-release {
+    border-top: 1px solid var(--border-color);
+}
+
+/* A release you can act on carries its control BESIDE the toggle. It cannot go
+   inside: the toggle is itself a button, and a nested one is invalid markup.
+
+   The control wraps to a line of its own where the two cannot share one, which
+   is every phone. The header refuses to squeeze (see its min-width), so the
+   wrap is what happens INSTEAD of a squashed row, and every release reads the
+   same on its first line: chevron, version, date, chip. */
+.whats-new-release-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    column-gap: var(--space-sm);
+    /* The header's padding and the action's own margin already space a wrapped
+       line, so a row gap on top of them would double it. */
+    row-gap: 0;
+}
+
+.whats-new-release-action {
+    flex: 0 0 auto;
+    /* The trailing edge on a wrapped line. A no-op inline, where the header's
+       flex-grow has taken the free space an auto margin would otherwise eat. */
+    margin-left: auto;
+    /* Clear of the next release's border, once it sits below the header. */
+    margin-block: var(--space-xs);
+}
+
+/* The whole header is the toggle, so it spans the row and keeps the version and
+   the date on one baseline. Reset of the UA button chrome, since this is a
+   full-width row rather than a control. */
+.whats-new-release-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    /* Both, because this class has two parents. `width` serves the SKELETON
+       row, whose header is a plain block child of `.whats-new-release`.
+       `flex` serves the loaded row, where the header shares
+       `.whats-new-release-row` with the action button.
+
+       `min-width` is what sends the action to its own line rather than
+       squeezing this one. It was `0`, which let the header shrink to nothing:
+       the date broke across two lines mid-value and the row grew a step taller
+       than every other. Nothing here shrinks usefully, so refusing is the
+       honest answer and the wrap absorbs it.
+
+       `auto` and not `min-content`. The two agree at every width where the
+       header fits, and past that they differ badly: a flex item's automatic
+       minimum is the SMALLER of its content and its own `width`, so `auto`
+       gives way where `min-content` overflows the panel. A 200% ui-scale on a
+       phone reaches that. Never back to `0`. */
+    width: 100%;
+    flex: 1;
+    min-width: auto;
+    padding: 0.5rem 0;
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    /* The shorthand above resets font-feature-settings to `normal`, which is not
+       "off" (liga and calt default ON), so without this a Fira Code user gets
+       ligatures back on this row's prose. */
+    font-feature-settings: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .whats-new-release-header:hover .whats-new-version {
+        color: var(--accent);
+    }
+}
+
+/* Sized by its ink rather than its box, so it sits on the text's baseline run
+   instead of pushing the row taller than the line it marks. */
+.whats-new-chevron {
+    display: flex;
+    align-self: center;
+    flex: 0 0 auto;
+    color: var(--text-muted);
+}
+
+.whats-new-version {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* A date is one value, so it breaks at neither of its own hyphens. Left free it
+   wrapped to `2026-` over `09-15` the moment the row ran out of room, which read
+   as two dates. */
+.whats-new-date {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+/* The chip naming what a row IS: the release you are running, or the one being
+   offered. A raised neutral surface, not a left-accent stripe (forbidden, see
+   .claude/rules/frontend-css.md) and not a coloured hue: both are statements of
+   fact, not warnings. */
+.whats-new-mark {
+    margin-left: auto;
+    flex: 0 0 auto;
+    padding: 0.125rem 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.5);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+}
+
+/* The offer is the one thing here you can act on, so it takes the accent while
+   Running stays neutral. */
+.whats-new-mark.is-available {
+    background: var(--accent);
+    color: var(--text-on-accent);
+}
+
+/* The offered release sits above the installed history with a gap, so the list
+   below it reads as a separate run rather than as its continuation. */
+.whats-new-offered {
+    margin-bottom: 1rem;
+}
+
+/* The notes are a card's contents, inset the same step from both edges of the
+   release row, so the prose has room on the right as well as the left.
+
+   The size is here because `.markdown-content` deliberately sets none: it is the
+   shared rule served to app iframes as well as the host, so every surface that
+   wears it names its own size (.response-content, .notification-detail-body,
+   .plugin-install-setup-body, .file-preview-content). This one did not, and an
+   unsized block falls all the way back to the root font size, which is the ui
+   scale rather than a step on the type scale. So the release notes rendered
+   larger than everything around them, including the version heading they sit
+   under. --font-size-sm with 1.5 leading is what the app's other prose surfaces
+   read at. */
+.whats-new-notes {
+    padding: 0 var(--space-md) var(--space-md);
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+}
+
+/* The list is the page's own content, so its first heading should not add a
+   second gap under the section title. */
+.whats-new-notes > :first-child {
+    margin-top: 0;
+}
+
+/* The release notices above the release list. A card each, because a notice is
+   a thing to act on rather than a row to skim, and there are seldom more than
+   one or two. */
+.release-notice-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 0 var(--space-lg);
+}
+
+.release-notice-row {
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-surface) * 2 / 3);
+    padding: 0.75rem;
+}
+
+/* An answered notice is a record of what was asked and what you did. It is not
+   asking any more, so it reads as a struck-through checklist item. */
+.release-notice-row[data-state="resolved"] {
+    background: transparent;
+    border: 1px solid var(--border-color);
+}
+
+.release-notice-row[data-state="resolved"] .release-notice-row-title {
+    color: var(--text-secondary);
+    text-decoration: line-through;
+}
+
+/* Opacity rather than a colour, so the bold and code the markdown may carry
+   recede with the rest instead of staying at full contrast. */
+.release-notice-row[data-state="resolved"] .release-notice-body {
+    opacity: 0.7;
+}
+
+/* Sized by its ink, so it rides the title's line instead of making the head row
+   taller than the text it marks. */
+.release-notice-row-check {
+    display: flex;
+    flex-shrink: 0;
+    color: var(--accent-green);
+}
+
+/* The fold's body, clear of the toggle that opened it. */
+/* Inside the disclosure's box, so the gap rolls in with the list. */
+.release-notice-answered-toggle + .disclosure .release-notice-list {
+    margin-top: var(--space-sm);
+}
+
+.release-notice-row-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.375rem;
+}
+
+.release-notice-row-title {
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+}
+
+/* From which release this applies. Pushed to the end, since it answers a
+   question the reader only asks after reading the instruction. */
+.release-notice-row-since {
+    margin-left: auto;
+    color: var(--text-muted);
+    font-size: var(--font-size-2xs);
+}
+
+.release-notice-row-mark {
+    padding: 0.125rem 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.5);
+    background: var(--accent);
+    color: var(--text-on-accent);
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+}
+
+/* Buttons at the trailing edge, the way every other action in the app sits: a
+   card's controls belong under its far corner, not tucked under its first
+   word. */
+.release-notice-row-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+}
+
+/* Says which notice has to come first, so a disabled button is never a dead end
+   with no explanation. It takes the leading edge back off the buttons, which
+   is why it renders before them. */
+.release-notice-row-hint {
+    margin-right: auto;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}

@@ -1,0 +1,178 @@
+---
+paths:
+  - "crates/lucidos-app/src/**/*.css"
+  - "crates/lucidos-app/src/**/*.tsx"
+  - "crates/lucidos-engine/src/api/sdk_iframe.css"
+---
+
+# Frontend CSS & Component Conventions
+
+Split out of `frontend.md` on 2026-08-06. That file is the TypeScript and state
+contract (`Loadable<T>`, intent-versus-logic, drafts, navigation, modals) and at
+59,374 chars it loaded whole for a one-line CSS edit, which can change none of
+it. This half carries the design tokens, the three-file component split, and the
+class contract.
+
+Scoped to `.css` **and** `.tsx`, on purpose: a component applies these classes
+from TSX, so a TSX edit needs both files and gets both. A plain `.ts` edit (a
+store, an API client, a util) gets only `frontend.md`.
+
+## CSS & Component Rules
+
+### Design tokens: never hardcode a value a token already names
+
+The token families live in `styles/global/` (`:root` in `global.css`, the type
+scale in `base.css`). Read the file for current values rather than trusting a
+copy: a table of hex values duplicated into a rule drifts silently from the CSS,
+which is the same failure `.claude/rules/system-knowhow.md` gates elsewhere.
+
+| Family | Tokens | Rule |
+|---|---|---|
+| Color | `--bg-{primary,secondary,tertiary}`, `--border-color`, `--text-{primary,secondary,muted,on-accent,strong}`, `--accent`, `--accent-{green,yellow,red}` | Never hardcode a color. Two exceptions, both `#fff` / `rgba(255,255,255,*)`: a translucent overlay over image content, and a surface whose colour is functional rather than thematic (the pairing QR's white field, which a camera needs). The second takes a comment at the site saying what breaks if it follows the theme. |
+| Type scale | `--font-size-{3xs,2xs,xs,sm,md,lg,xl,2xl,3xl,display}` | `font-size` takes a token, never a raw `rem`. `em`, percentages, `inherit` and `var(--user-ui-scale)` stay literal on purpose, as does a value deliberately pinned to a computed-px threshold, which must carry a comment saying why. |
+| Z-index | `--z-{float,dropdown,sticky,drawer,widget-window,control-panel,app-fullscreen,modal,toast,tooltip}` | Raw values 1 to 10 are fine inside a component's own stacking context. Anything higher must use a token. `--z-float` (20) is the lowest step, for a popover anchored inside its own pane. |
+| Duration | `--duration-{fast,normal,slow,emphasis}` | `emphasis` is for a deliberate state-change cue the user must register; reach for `normal` or `slow` first. A new one is declared as `calc(<literal> * var(--duration-scale))`, see below. |
+| Icon size | `--icon-size-{sm,md,lg}` | Do not set inline `width`/`height` on an SVG inside `.icon-btn`; the class sizes it. |
+| Shadow | `--shadow-{sm,md,lg,up}` | Never hardcode a `box-shadow`. `up` casts upward, for a surface docked under the content it lifts off. |
+| Surface | `--radius-{control,surface,round}`, `--surface-bg`, `--scrim`, `--surface-inset` | Every corner reads one of the three radius tokens, scaled with `calc()` if it is bigger or smaller; `round` is for circles and pills. `styles/__tests__/radius-token-guard.test.ts` fails on a literal radius. Spinners and badges are exempt: they stay round in every theme, and `styles/badges.css` alone gives every badge its corner. Every toast, popover and dialog is a `.surface` with a `SurfaceHead`, and a menu a `.surface-box` (*surface anatomy*, ADR 0290). Only a surface that blocks paints `--scrim`. Text inside a head, body or foot sits on `--surface-inset`; never restate it. A surface opens at its trigger, as a *header palette*, or as a blocking dialog (ADR 0299). `styles/__tests__/surface-system-guard.test.ts` pins this. |
+| Syntax | `--syntax-{key,string,number,keyword,comment,control}` | Highlighting only. |
+
+### Every duration is scaled by the animation-speed slider
+
+The `--duration-*` tokens are each their 1x literal times `var(--duration-scale)`,
+the *animation speed scale* (`docs/glossary.md`) that `store/effects.ts` publishes
+onto `:root` from the diagnostic slider. That multiplication is the only thing
+carrying the slider into CSS, so **a new duration token declared as a bare
+literal is the one animation in the app that ignores the setting.** Pinned by
+`styles/__tests__/duration-scale-guard.test.ts`.
+
+Two consequences beyond the token block:
+
+- **A TS timer that outlives a CSS transition** (holding an animation class on,
+  keeping content mounted through its own fade) passes its 1x base through
+  `scaledDurationMs` and adds its slack OUTSIDE the call:
+  `scaledDurationMs(PANE_TRANSITION_MS) + 100`. Slack is a fixed safety margin,
+  not animation. An unscaled timer fires partway into the transition it exists to
+  outlive: at 0.1x the drawer body blanks mid-slide and a maximizing pane snaps
+  the rest of the way. Every such timer is listed in
+  `store/__tests__/duration-scale.test.ts`, which fails if one stops scaling.
+- **An indefinite animation does NOT scale**: a spinner, a shimmer, anything
+  `infinite`. It is an activity indicator rather than a transition, so it keeps a
+  literal duration and no token.
+
+- **Every icon-only button needs an `aria-label`.** If a button has no visible text, it has no accessible name.
+- **An icon that belongs to a label never wraps away from it.** A `<button>` or an `<svg>` is an *atomic inline*, and line breaking allows a break in front of one. A label squeezed by the control beside it therefore drops its trailing icon onto a line of its own. Under the text and next to nothing, it reads as a stray glyph. `white-space: nowrap` is not the fix: the break sits in the PARENT's text, so only the parent's own value governs it. Nowrapping the whole label is worse, because a long label must still be free to wrap.
+
+  **Glue it instead.** The icon goes in a plain inline wrapper whose `::before` is a **U+2060 WORD JOINER** (`content: '\2060'`). The joiner forbids a break on both sides. It also raises the label's min-content width to include the icon, so a flex row cannot shrink it off the line either.
+
+  Generated content, never a text node in the markup. A text node lands in `textContent`, in the accessible name of a `<label>` wrapping the control, and in a copied selection. An exact-text assertion on that row then fails on an invisible character. The wrapper must be `display: inline`, since an `inline-flex` or `inline-block` one is an atomic inline itself and hides the joiner. Give it `line-height: 0` and it measures exactly what the bare icon did. `.explainer-slot` is the worked example, so every *explainer* has this already (`components/shared/Explainer.tsx`).
+- **Tab title**: `(count) Lucidos` (count first for narrow tabs)
+- **No system dialogs**: Use `showToast(msg, type)` / `await showConfirm(msg, okLabel, { variant })`. The `variant` is required: `'danger'` paints the OK red and is only for an action that loses something for good; everything else is `'default'` (blue).
+- **A dialog message is ONE string, and a blank line in it is a paragraph**: `showConfirm` / `showPrompt` (and their SDK twins `lucidos.ui.confirm` / `lucidos.ui.prompt`) take `message: string`, so multi-paragraph copy can only be expressed inside it. `ConfirmDialog` and `PromptDialog` render it through **`<DialogMessage message={…} />`** (`components/shared/DialogMessage.tsx`), which emits one `.confirm-message` paragraph per **blank-line**-separated block; a single `\n` collapses to a space, so source-wrapped concatenated copy stays one paragraph. Don't hand-roll a `<p class="confirm-message">{message}</p>` in a new dialog, and don't reach for `white-space: pre-line` to fake breaks (it would turn every incidental newline in an app-supplied message into one). The paragraph rule is part of the app-facing SDK contract, so a change to it updates `system-knowhow/js-sdk.md` § Confirmation dialogs + § Prompts in the same commit.
+- **No native tooltips**: Use `data-tooltip="text"`. It works in the host shell and in an app iframe, from one implementation: the CSS is in `shared-components.css` and the behaviour is `installTooltips()` in `packages/lucidos-sdk/src/tooltip.ts`. The host mounts it through the `useTooltip` hook, and the SDK bundle installs it on load inside an app. Reveal is hover on a pointer and long press on touch.
+- **A tap paints no background.** Hover belongs to a pointer: wrap every `:hover` rule in `@media (hover: hover)`, or scope it under `body:not(.is-touch)` (the JS touch gate), since on touch it latches onto the last element tapped. No `:active` fill; a scale or squeeze is fine. The tap highlight is off once, on `html` in `base.css`, so never restate it. A keyboard cursor class set on `mouseenter` (`.control-item-active`) goes under the same gate, because a tap fires `mouseenter` too. Pinned by `styles/__tests__/touch-paints-no-press.test.ts`.
+- **No left-accent stripe on cards/callouts/notices, strictly forbidden**: Never signal a card, callout, banner, or notice box with a colored vertical `border-left` (or a faux-bar via `::before`/`box-shadow inset`) down its left edge. It's an overused template look the project rejects. Convey emphasis another way: bold/high-contrast text, a raised neutral surface (`--bg-tertiary`), spacing, or an inline icon. (Regression this bans: `.system-notice` "New engine version available" once carried a `border-left: … var(--accent)`.)
+- **Component CSS is split three ways by audience (put each rule in the right file):**
+  - **Reusable (host + apps)** → `styles/global/shared-components.css` (the `.action-btn` family, `.icon-btn`, `.label` and its tones, `.title`, `.list-row*`, `.segmented-control`, `.pill-bar`, `.toggle-switch`, `.mini-spinner`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`, `h1`–`h6`). A component apps also need is the host's own, moved here, never an app-only copy: `styles/__tests__/exported-components-single-source.test.ts` fails on a second definition. SINGLE SOURCE OF TRUTH: the engine `include_str!`s this exact file and appends it to `/api/v1/sdk-iframe.css` (`crates/lucidos-engine/src/api/sdk.rs`). So a class added or changed here ships to the host AND every app iframe at once. **Never copy these rules into `sdk_iframe.css`, edit the shared file.**
+    - The host's dropdown (`.dropdown-trigger`/`.dropdown-chevron`/`.dropdown-placeholder`/`.dropdown-option`) lives here too. `lucidos.ui.Select` renders those exact classes. Two more reusable files join this one the engine-served way: `surface.css` (`.surface-box`, the menu/popover box `lucidos.ui.Select`'s own menu also wears) and `text-input.css` (`.text-input`, the opt-in text-field look). `styles/__tests__/iframe-css-no-shared-component-restyle.test.ts` fails on a restyle of any of the three files' classes. A colour, background, border, radius, padding, font-size or box-shadow in `sdk_iframe.css` is banned on such a class.
+  - **Host-chrome only (host bundle, NEVER served to apps)** → `styles/global/host-components.css` (the custom `<Dropdown>`'s positioning and form-field sizing, `.nav-history-*`, `.send-cancel-*` morph, `.icon-btn.header-icon`/`.filter-active`/`.pinned` variants, `.list-row.flip-animating`). Imported by `global.css` AFTER `shared-components.css` so source-order overrides of a shared base class still win.
+  - **Iframe-only (apps, not the host)** → the engine's `crates/lucidos-engine/src/api/sdk_iframe.css` (e.g. `lucidos.ui.Select`'s own non-portaled menu positioning). Keeps it out of the host bundle as dead code.
+  - Structural host chrome (`#app`, `body`, the `:root`/theme token blocks) stays in `base.css`. `#tooltip` is NOT host chrome and left this file: apps get the same tooltip, so its rules are in `shared-components.css` and `styles/__tests__/tooltip-single-source.test.ts` fails on a second copy anywhere.
+  - When you add an app-facing class to `shared-components.css`, also add it to the component-class table in `system-knowhow/js-sdk.md` (the app-author-facing contract).
+- **List rows**: `.list-row` / `.list-row-info` / `.list-row-actions` (in `shared-components.css`)
+- **`.list-row-details` is a row of FIELDS; a sentence takes `.list-row-details-prose`**: the base class is `display: flex` and its `0.75rem` gap IS the separator between metadata fields, so it blockifies every inline child. Put a sentence in it and each `<strong>`/`<code>` becomes its own flex item: the gap opens holes mid-sentence, the row-gap double-spaces the wrapped lines, and the punctuation right after the element is stranded at the start of the next line (Mobile Access rendered a lone "." under its tailnet address, 2026-08-04). Prose adds the modifier, `class="list-row-details list-row-details-prose"`, which restores block flow. Pinned by `components/shared/__tests__/list-row-prose-guard.test.ts` (source-scan: a details slot containing inline markup must declare itself prose). The same trap applies to explicit `·` glue between fields, which the gap then double-spaces, and to `.list-row-details` on a `<span>` inside a line of text, where the flex box breaks the line.
+- **Action buttons**: `.action-btn` (in `shared-components.css`). Variants are additive: `class="action-btn action-btn-confirm"`.
+  - `.action-btn`: default (blue). Neutral: Edit, Open, Restart, Prev/Next, Retry.
+  - `.action-btn-confirm`: green. Positive: Apply, Accept, Confirm.
+  - `.action-btn-danger`: red. Destructive: Delete, Discard, Remove, Stop.
+  - `.action-btn-secondary`: outlined, neutral. The lower-emphasis choice beside a primary: Cancel, Later, Not now.
+  - A toast never draws a lone neutral action as a button: the whole card is the tap (`docs/glossary.md` § Toast tap).
+- **A row of action buttons packs right, primary last.** Secondary actions (Cancel, Discard) come first and the primary (OK, Retry, Apply) sits rightmost, as in `ConfirmDialog`. Give the row `justify-content: flex-end`. `styles/__tests__/button-rows-pack-right.test.ts` fails on a new left-packed row.
+- **Auto-expanding textareas**: `AutoTextarea` from `components/shared/AutoTextarea.tsx`. Enter submits, Shift+Enter newline.
+- **A prose field spreads `PROSE_TEXT_ATTRS`**: `installNoAutofill` (`utils/noAutofill.ts`) stamps `autocomplete`/`autocorrect`/`autocapitalize` = `off` on **every** `<input>`/`<textarea>`, current and future, to kill WebKit's saved-value dropdown and its white→dark flash. That is right for the ~100 config fields this app is mostly made of, such as paths, ids, model ids and API keys. It is wrong for a **prose field**, one the user writes sentences in, like the chat prompt or a thread title. A prose field spreads `{...PROSE_TEXT_ATTRS}`, a **marker** (`data-prose`) rather than a value. The stamp then leaves `autocapitalize` at the browser default, and `autocorrect` follows the device's switch (next bullet). `autocomplete="off"` is still stamped, since prose fields want the dropdown suppressed too.
+  - **A prose field's autocorrect follows the device's Autocorrect switch.** Unset, it is on, on every client, and a device that keeps hitting the bug below turns it off. While UIKit's autocorrect holds a correction, it keeps the tap on a button below the text. That is what killed the composer's Send for a month ([ADR 0262](../../docs/adr/0262-ios-autocorrect-eats-the-send-tap.md)). The store pushes the value into the stamp through `setProseAutocorrect`, which re-stamps every mounted field when it changes. So the autocorrect-off state the 06-25 autofill fix caused by accident was also keeping that bug away.
+  - `AutoTextarea` is a prose field by definition and carries the marker already; use a bare `<textarea>` for a code or config editor. Adding a new prose field means adding it to `PROSE_FIELDS` in `utils/noAutofill.test.ts`.
+  - **It marks instead of asserting, deliberately.** Spreading `autocorrect="on" autocapitalize="sentences"` also works, but it routes through Preact's property path, and **that path inverts the `off` direction**: `autocorrect` isn't in Preact's exclusion list (`width, height, href, list, form, tabIndex, download, rowSpan, colSpan, role, popover`), so `autocorrect={x}` becomes `el.autocorrect = x`; the IDL attribute is a *boolean*, so the non-empty string `"off"` coerces to `true` and reflects back as `autocorrect="on"`, and the now-present attribute makes `setIfAbsent` skip the field forever. That shipped as a real bug (`AllowlistEditor`, 9 Jun–29 Jul). A `data-*` attribute is never an IDL property, so the marker always lands via `setAttribute`. **Never write `autocorrect="off"` in JSX**: turning it off is the stamp's job, and a source-scan tripwire over every `.tsx` in `noAutofill.test.ts` enforces that.
+  - **`autocapitalize` is mobile-only and iOS reads it at focus time.** Desktop browsers ignore the attribute outright, so verify on a device, not in a desktop browser or the responsive simulator. And iOS computes the keyboard's shift state from editing *deltas*: a programmatic `el.value = ''` bypasses the editing pipeline, so the keyboard can keep a stale lowercase state until a real delta (a backspace) forces recomputation, a WebKit bug ([ionic#23217](https://github.com/ionic-team/ionic-framework/issues/23217), [ionic#22744](https://github.com/ionic-team/ionic-framework/issues/22744)). If a surface clears a focused field programmatically and the keyboard misbehaves after, clear it through a real editing operation instead; do NOT blur-and-refocus (iOS refuses to reopen the keyboard outside a user gesture). (Regression: the 2026-06-25 autofill fix bundled `autocorrect`/`autocapitalize` into a suppression that only needed `autocomplete`, so the chat prompt had no autocorrect at all; `spellcheck` stayed on, which is why typos were still underlined but never fixed.)
+- **All sizes `rem`**: Divide px by 16 (4px→0.25rem, 8px→0.5rem, 16px→1rem). Exceptions: **border widths**, `0px` env(), `@media`, `box-shadow`. Borders are exempt at any width, not just the `1px` hairline, because a border width is snapped to a whole unit before layout (Chromium to a CSS px, WebKit to a device px), so a rem value that lands on a fraction at a scaled root is silently rounded. That is harmless on its own, but it breaks any `calc()` that subtracts the border, since the calc sees the specified value and layout uses the snapped one. A border above `1px` therefore keeps a px literal AND a comment at the site saying what depends on it not rounding (`--prompt-box-border-width` in `base.css`, which the composer's inner padding is derived from, is the worked example).
+- **`1rem` IS A HEADING IN THIS APP, so read this before importing any typography instinct.** `--font-size-xl` is exactly `1rem` and is labelled "section headings"; body text is `--font-size-md` at `0.8125rem` (13px). On the rest of the web `1rem` is body, so the scale's zero point is offset from the platform's by a step and a half, and **every guess calibrated elsewhere lands high**. That single fact explains all three shapes this goes wrong in: a surface that names no size, a mockup that rebuilds "a sensible scale" around a 16px body and comes out one rung high on every step, and an eyeballed literal that lands above the step it wanted. When something reads too big, look for a MISSING declaration before a wrong one. The root font-size is `var(--user-ui-scale)`, deliberately not a scale step: it is the multiplier every `rem` in the app rides, geometry included, so it is not re-anchorable.
+  - That body is the host's. An app or HTML artifact body is `--font-size-sm`, the chat prose step (ADR 0319).
+- **A surface that names no `font-size` gets the body step, because `base.css` supplies defaults. Do not remove them.** Two, and they are separate: `body { font-size: var(--font-size-md) }`, and `input, textarea, select, button { font-family: inherit; font-size: inherit }`. The second exists because a control inherits NOTHING from `body` (the UA stylesheet applies the `font` shorthand to it), which is what the scattered per-component `font: inherit` declarations were each standing in for. Three rules ride on this: **never use the `font` shorthand** to hand a control its font, since it also resets `font-weight` and `font-feature-settings` (`steps.css` and `skills.css` each carry the scar); **never add `html` to that control rule**, since `font-size: inherit` on the root would override the ui-scale; and **the defaults are a net, not a licence** to stop naming sizes. Pinned by `styles/__tests__/text-defaults-guard.test.ts` (source) and `e2e/type-scale.spec.ts` (rendered, the only check that resolves the cascade). History of all three deletions: `docs/code-review-priors.md`.
+- **`font-size` uses a `--font-size-*` token, never a raw `rem`**: the type scale is the closed set `--font-size-{3xs,2xs,xs,sm,md,lg,xl,2xl,3xl,display}` (9px→36px), defined in `styles/global/base.css` and mirrored into the engine's `api/sdk_iframe.css` for app iframes; keep the two in sync. A raw `font-size: N rem` literal is a drift finding: pick the nearest token instead of reintroducing eyeballed values (`0.8`/`0.85`/`0.72rem` …). `em` / percentage / `inherit` / `var(--user-ui-scale)` font-sizes stay literal, being deliberately relative or the root scale, not scale steps. The one other carve-out is a value **deliberately pinned to a computed-px threshold** (e.g. the mobile prompt textarea's `0.9rem` (kept ≥16px on the 18px mobile root so focusing it doesn't trigger iOS Safari input zoom; the nearest token would fall below 16px), which MUST carry a comment at the site saying why it isn't a token. A genuinely new size gets a token in *both* `:root` sources; don't inline it.
+- **A general-purpose design skill does not override this scale.** A generic frontend/design skill will tell you to make the type treatment expressive and memorable; it is calibrated to a 16px body and knows nothing about this app. Take its layout and colour advice if you like, and take the type scale from `base.css`.
+- **Content-pane structural padding uses a `--space-*` token and one 1rem gutter.**
+  - **The scale** is the closed set `--space-{xs,sm,md,lg,xl}` (0.25/0.5/0.75/1/1.5rem). It is defined in `styles/global/base.css` **and mirrored in the engine's `api/sdk_iframe.css`**, since app iframes never load `base.css`.
+  - **Keep the two `:root` blocks' VALUES identical, and never redefine an existing step.** A shared class like `.list-row` renders in both, and shipped apps key off these exact values.
+  - **Every content-pane view shares the `--space-lg` (1rem) horizontal gutter** on its *structural* padding. That means the views `components/layout/ContentPane.tsx` routes into `.content-pane-body`, and it covers the top toolbar or toggle, list rows, empty states, and section or detail headers. Switching views then keeps one clean left edge, with the top-left toggle directly above the row content.
+  - **Snap structural padding to the nearest token.** A raw `padding: N rem` gutter is a drift finding, reviewed by `/harden` like the font-size rule. There is intentionally no source-scan test, since classifying "structural vs. inline" padding precisely is too brittle.
+  - **Carve-outs, each with a comment at the site:**
+    - *Full-bleed views*, edge to edge by design: the app-ui iframe, file/url/repo previews, and the diff or rendered-diff content. They take NO gutter. The gutter is NOT moved onto `.content-pane-body` either, or it would inset list-row hover backgrounds.
+    - *Structurally distinct sub-views*: the Files *tree* (`.file-item`), an indented tree coherent at its own 0.5rem rather than the flat-list gutter.
+    - *Card-like elements*: coloured `bg-tertiary` boxes such as `.thread-queue-policy`, status pills, chips and badges. Their padding is internal, not a gutter.
+    - Inline controls, computed-px-pinned values, `1px` borders, `0` and `env()`.
+  - **A genuinely new step goes in *both* `:root` sources**; don't inline it.
+- **A content-pane column view reserves the scroll gutter while it fits.** `.content-pane-body` is one scroller for every view. Without a reserved gutter, a view that grows past one screen gains a classic scrollbar, and the whole column slides sideways. It uses the same `overflow-y: scroll` plus `scrollbar-gutter: stable` pair as `.thread-content`, for the same engine split (panels/shell.css). A full-bleed view is excluded and keeps its right edge. Pinned by `styles/__tests__/content-pane-scroll-gutter.test.ts` and `e2e/settings-column-holds-still-desktop.spec.ts`.
+- **Every content-pane view gets the *end space* below its last element, and no view sets its own** (`docs/glossary.md` § End space). It is one default-deny spacer in panels/content.css. Never pin a column view to the pane's height, and never style a view root's `::after`. The one exception is the phone's flowing file preview, which re-adds the spacer in mobile.css. A new full-bleed view takes `content-view-full-bleed` and a row in `styles/__tests__/content-pane-end-space.test.ts`.
+- **Thread-pane surfaces share ONE content edge, scroll gutter included.** The transcript (`.thread-content`) and the composer (`.prompt-area` → `.prompt-input-container`) must resolve to the same left and right insets. Otherwise the composer box stops lining up with the message text, question cards and user bubbles it docks under. Four parts, all load-bearing:
+  1. **The shared `--thread-pane-gutter`** on both sides of both surfaces. Never make it asymmetric: that also throws the centered column off the transcript's centre line above the width cap.
+  2. **A `--turn-body-inset` padding** on the composer column and on the compose-empty `.welcome-hero`. It reproduces the inset a turn puts between its box and its visible content, so all three share one edge at any pane width.
+  3. **`--scrollbar-gutter-width` added to the RIGHT inset of every NON-scrolling sibling.** On a classic-scrollbar platform the scrollbar takes its width out of the transcript's content box alone, and nothing in CSS hands that to a sibling.
+     - `.thread-content` reserves it unconditionally via `overflow-y: scroll` **and** `scrollbar-gutter: stable`. Chromium honours the gutter on a container that doesn't overflow, while WebKit reserves only once the scrollbar is drawn. So neither declaration alone is stable across engines.
+     - `utils/scrollbarGutter.ts` measures **the live `.thread-content` element itself** (`offsetWidth - clientWidth`, borders discounted). It runs at boot, on every UI-scale change, and when the transcript mounts.
+     - **It measures the real element, not a detached clone, because on real iOS the clone is wrong.** The probe reports our `::-webkit-scrollbar` width (`0.5rem`, 9px at the 18px mobile root), while the transcript reserves nothing. The composer then subtracted a gutter that wasn't there, and its right edge sat 9px inside the question cards above it.
+     - No emulator reproduces that split: Playwright's WebKit answers 9 for both. So the guard is a unit test over the measurement's element preference, not a browser e2e.
+     - The probe survives only as the boot fallback, before any transcript exists. The compose-empty welcome is deliberately NOT measured. It reuses `.thread-content` with `overflow: visible`, and its answer of 0 would slide the composer sideways on the way into a thread.
+  4. **The two NESTED surfaces share one text column.** They are a question or permission card inside a turn (`.question-body`) and the composer box (`.prompt-box`). Matching their outer edges is not enough, because the eye reads the *text*, not the box. Both put their content on the shared **`--turn-surface-inset`** by subtracting their OWN border from it. Two traps:
+     - The composer's inner padding lives on `.prompt-row .prompt-textarea` (chat/input-messages.css). It is NOT on the `.prompt-box` shell it shares with the trigger form's Intent field.
+     - A border width is snapped to a whole unit before layout (Chromium to CSS px, WebKit to device px). So `--prompt-box-border-width` is a literal `2px`. A rem value would round by an amount the `calc()` cannot see, and put the text off the column at a scaled root.
+
+  Dock a new surface in the thread pane and it joins the first three; a nested one joins the fourth too. Guarded by `e2e/prompt-transcript-alignment.spec.ts`: the outer edges match, and the published var equals what the transcript reserved. A spliced-in `.question-body` probe's content inset also equals the composer's. The probe-vs-rule tripwire in `utils/scrollbarGutter.test.ts` completes the guard.
+- **A fade over a scroll container must exclude the scroll gutter**: the scrollbar is chrome, not content, and must stay at full opacity whatever is dissolving underneath it. Two shapes, each with its own trap. A **mask** on the container applies to the element's WHOLE rendering, scrollbar included, so a full-width one fades the thumb: give it a second, fully opaque layer sized `var(--scrollbar-gutter-width) 100%` and pinned `right top`, and narrow the fade layer to `calc(100% - var(--scrollbar-gutter-width))` (the mask origin is the border box, and the gutter is taken out between the border edge and the padding box, so the strip lands exactly on the scrollbar). An **overlay** painted over the container by a sibling insets its right edge by the same var, which is also why it must be a gradient and not a `box-shadow`: a shadow feathers past the box it is cast from on every side, so no inset gives it a clean edge there. Both are no-ops wherever scrollbars are overlay (the var is `0px`), which is exactly why neither regression reproduces on a default-setting Mac or on a phone, and why the guard is a source scan (`styles/__tests__/transcript-fade-scroll-gutter-guard.test.ts`) rather than a browser e2e. The transcript's two fades are the worked example: the desktop top mask (`.thread-content`, chat/input-messages.css) and the bottom dissolve into the composer (`.prompt-area::before`, panels/content.css).
+- **No `<select>`**: Use `Dropdown` from `components/shared/Dropdown.tsx`
+- **Every search or filter box is a `SearchField`** (`components/shared/SearchField.tsx`). A host on its own backdrop recolours it through `--search-field-{bg,fg,muted}`; never restyle the input.
+- **No `id` on dual-rendered components**: `App.tsx` mounts only the visible layout's pane tree (`SplitLayout` on desktop, `MobileSwipeContainer` on mobile; dual-mounting the panes was removed because every signal write fanned out to both subtrees). But per-layout copies still exist in the header chrome (`ControlPanel` renders in both `AppHeader` and `MobileAppHeader`), and the mounted layout swaps at runtime when the viewport crosses the breakpoint, so `id` attributes remain unsafe. Use `data-role="name"` + `querySelectorAll`. Cross-component: `getVisiblePromptInput()` in `promptFocus.ts`. **Debug hint:** if something works on desktop but fails on mobile (or vice versa), check whether you're hitting the wrong layout's copy: inspect `getBoundingClientRect()` for 0x0 dimensions.
+- **Heavy-mount children that render in both layouts must skip the inactive one**: iframes, video/audio players, big WebGL canvases, anything that fetches on mount. If a component has a copy in each layout, both copies trigger the work, doubling network and resource cost (e.g. before the pane single-mount fix, opening an app fetched `/api/v1/sdk-prefs.js` twice). Pane children mount once now; the rule still binds for chrome with per-layout copies. Pattern: the parent takes `layout: 'desktop' | 'mobile'` and forwards it to the heavy child; the child gates the render with `layout === (viewportIsMobile.value ? 'mobile' : 'desktop')`. `viewportIsMobile` is the reactive signal in `utils/viewport.ts`. Example: `AppUiInline.tsx` (gate retained from the dual-mount era; harmless now that `ContentPane` mounts once).
+- **No `getElementById()`**: Banned except `#app`. Use `querySelector`/`querySelectorAll`
+
+### Focus rings: a box that clips leaves ring room
+
+`--focus-ring` is an outward `box-shadow`, and a shadow adds nothing to
+scrollable overflow. So any ancestor that scrolls or clips cuts the ring where a
+control sits flush with its edge. That is how the Rename dialog's input lost its
+ring's bottom edge.
+
+- **Fix the clipping box, never the control.** Give it *ring room*
+  (`docs/glossary.md`): padding of `--focus-ring-width` on the flush edge,
+  handed back with an equal negative margin or taken from a neighbour, so
+  nothing moves. `.pill-bar` and the surface body are the worked examples.
+- **A clip with no job goes.** `.list-row-info` lost its `overflow: hidden`:
+  `min-width: 0` already lets it shrink.
+- **A header row clips through `clip-path: inset(...)`** with ring room on the
+  axes it does not need, never `overflow: clip`. The packaged macOS webview makes
+  a `clip` box a scroll container.
+- **Inset is the last resort**, for a control with no room outside it, such as a
+  chevron pinned to a clip edge.
+- **The ring stays a literal**, since a theme replaces it whole.
+  `styles/__tests__/focus-ring-width.test.ts` holds every definition's band to
+  `--focus-ring-width`.
+
+`e2e/focus-ring-not-clipped.spec.ts` focuses every control on the settings
+pages, the forms a row opens and each sample dialog, and fails on a cut edge.
+Put a new surface in its visit list.
+
+### Reduced motion keys on `data-motion`, never on the media query
+
+The *Motion* setting and the OS switch resolve to one value, published as
+`data-motion` on `<html>` (`docs/glossary.md` § Reduced motion (resolved)).
+
+- **Write calm rules as `:root[data-motion="reduce"] .x { … }`.** A
+  `@media (prefers-reduced-motion)` block ignores a user who picked Reduce or
+  Full in the app. Script reads `isReducedMotion()` from `utils/motion.ts`.
+- **Reduced motion collapses `--duration-scale`**, so a tokenized one-shot needs
+  no rule of its own. An indefinite or literal-duration animation does: stop it
+  with `animation: none` for its own selector.
+- **An end-event listener needs a way to finish without its event**: a scaled
+  timer, or a bypass that reads `isReducedMotion()`.
+
+`styles/__tests__/reduced-motion-guard.test.ts` and
+`__tests__/animation-end-fallbacks.test.ts` enforce all three.

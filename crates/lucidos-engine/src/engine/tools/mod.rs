@@ -1,0 +1,2018 @@
+pub(crate) mod app_capture;
+mod apps;
+pub(crate) mod bash;
+pub(crate) mod bash_background;
+pub(crate) mod bash_background_recovery;
+pub(crate) mod browser;
+mod bulk_limits;
+mod capabilities;
+pub(crate) mod credentials;
+mod email;
+mod env_vars;
+pub(crate) mod files;
+mod grouped;
+mod http;
+pub(crate) mod image;
+mod import;
+mod judgment;
+mod mcp;
+mod memory;
+mod models;
+pub(crate) mod navigate;
+mod notifications;
+pub(crate) mod plugins;
+mod preferences;
+mod proxy;
+pub(crate) mod python;
+pub(crate) mod recall;
+pub(crate) mod repo_files;
+mod repositories;
+pub(crate) mod scheduler;
+pub(crate) mod search;
+pub(crate) mod todo;
+mod unsent;
+mod web;
+mod widgets;
+
+pub(crate) use capabilities::TurnCapabilities;
+
+/// The name `execute_tool` dispatches a call on.
+///
+/// Phase 5 grouped manifest tools delegate to their flat-alias handlers:
+/// `action` resolves to the legacy flat tool name, validated against the
+/// capability parity manifest. Only these eight names resolve. A flat alias
+/// runs as itself whatever `action` it carries, and domains with bespoke
+/// handling (notifications, preferences, triggers) keep their own arms.
+pub(crate) fn dispatch_name<'a>(
+    name: &'a str,
+    args: &serde_json::Value,
+) -> Result<&'a str, String> {
+    match name {
+        tn::MCP
+        | tn::PLUGINS
+        | tn::EVENTS
+        | tn::CHANGES
+        | tn::THREADS
+        | tn::THREAD_QUEUE
+        | tn::MEMORY
+        | tn::RECALL => grouped::grouped_legacy_name(name, args),
+        other => Ok(other),
+    }
+}
+
+use super::LucidosEngine;
+use crate::api::thread_reach::ThreadReachVerb;
+use crate::engine::thread_lifecycle::ThreadStatus;
+use crate::engine::thread_queue::{CapacityPolicy, OverflowPolicy};
+use crate::llm::tool_names as tn;
+
+/// Result of a tool dispatch: `Ok(text)` = success, `Err(text)` = failure.
+/// In both cases `text` is what the LLM sees as the tool result; the typed
+/// tag is what the agentic loop persists into `ToolResult.success`. Routing
+/// failure through `Err` instead of inferring it from a `result.starts_with(
+/// "Error:")` prefix keeps the success bit honest when a tool's error string
+/// happens to start with `Error reading…` / `Error executing…` / etc. (the
+/// pre-typed dispatch silently stamped those as `success: true`).
+pub(crate) type ToolOutcome = Result<String, String>;
+
+/// Lift a raw `String` tool result into a `ToolOutcome` using the legacy
+/// "starts with `Error:`" convention. Single source for the legacy lift —
+/// `to_outcome`, the plugin-tool branch, and the special-tool / read-cache
+/// sites in the agentic loops all route through here so the convention can
+/// be retired in one place once every tool internally returns typed `Err`.
+///
+/// Temporary measure, registered in `docs/temporary-measures.md` under "The
+/// legacy `Error:`-prefix lift on a tool result", which carries the removal
+/// condition and the live call sites.
+pub(crate) fn lift_legacy_string(s: String) -> ToolOutcome {
+    if s.starts_with("Error:") {
+        Err(s)
+    } else {
+        Ok(s)
+    }
+}
+
+/// Convert a `Result<String, Box<dyn Error + Send + Sync>>`-returning helper
+/// into a `ToolOutcome`. The Err arm is rendered with the canonical
+/// `Error: <e>` prefix so the LLM still sees a familiar failure shape; the
+/// Ok arm goes through `lift_legacy_string` so legacy `Ok("Error: …")`
+/// in-band errors land as typed `Err` until every internal site is migrated.
+fn to_outcome(r: Result<String, Box<dyn std::error::Error + Send + Sync>>) -> ToolOutcome {
+    match r {
+        Ok(s) => lift_legacy_string(s),
+        Err(e) => Err(format!("Error: {}", e)),
+    }
+}
+
+/// The actor to stamp on a `SystemEvent` a tool call mutated state through:
+/// the agent running in THIS thread did it, not the user directly.
+/// `ThreadLink { mode: Agent }` is the in-process analog of the CLI's
+/// `Api { mode: Agent, source_thread_id }`, deep-linking back to the thread
+/// whose agent acted so the route popover never mislabels it as "You".
+/// `direction: Parent` because the dominant flow is a chat thread acting on
+/// behalf of work it spawned.
+///
+/// One definition shared by every agent-tool emit site (repositories, plugins,
+/// change apply, Thread Queue policy) so the attribution can't drift per tool.
+pub(crate) fn agent_tool_actor(
+    thread_id: uuid::Uuid,
+) -> crate::engine::thread_events::MessageOrigin {
+    crate::engine::thread_events::MessageOrigin::ThreadLink {
+        thread_id,
+        title: None,
+        spawning_event_id: None,
+        mode: crate::engine::thread_events::ActorMode::Agent,
+        direction: crate::engine::thread_events::ThreadDirection::Parent,
+    }
+}
+
+/// The clause-4 gate, rendered for a tool's `Result<String, String>`.
+///
+/// Three LLM tools press Apply in-process, so each asks the same rule the HTTP
+/// routes ask. A verb gated on the route somebody remembered and forgotten on
+/// its second is the failure both ADR 0083 and ADR 0168 diagnose.
+///
+/// The refusal text comes from `api::thread_reach`, so a tool and a route tell
+/// an agent the same thing.
+impl LucidosEngine {
+    async fn refuse_tool_without_authority(
+        &self,
+        caller_thread_id: uuid::Uuid,
+        target: Option<uuid::Uuid>,
+        verb: ThreadReachVerb,
+    ) -> Result<(), String> {
+        crate::api::thread_reach::refuse_thread_without_authority(
+            &self.event_bus,
+            caller_thread_id,
+            target,
+            verb,
+        )
+        .await
+        .map_err(|e| format!("Error: {e}"))
+    }
+
+    /// What the gate should aim at for a change id, or `None` to skip it.
+    ///
+    /// A change id naming nothing skips the gate, so the engine answers "Change
+    /// not found" as it does on the HTTP route. Gating it would make a tool and
+    /// a route disagree, and would leak whether the id exists.
+    ///
+    /// Everything else aims: at the proposing thread when there is one, and at
+    /// the workspace when the change names none. That second case is the
+    /// fail-closed answer, since no subtree contains a threadless change.
+    async fn change_target(&self, change_id: uuid::Uuid) -> Option<Option<uuid::Uuid>> {
+        match sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+            "SELECT thread_id FROM changes WHERE id = $1",
+        )
+        .bind(change_id)
+        .fetch_optional(self.pool())
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                log!("[Tools] Could not read the thread of change {change_id}: {e}");
+                // A probe that could not run must not wave the act past, so aim
+                // at the workspace and let the standing instruction decide.
+                Some(None)
+            }
+        }
+    }
+}
+
+impl LucidosEngine {
+    /// Execute a tool call and return its outcome.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_tool(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        extraction_ctx: &str,
+        request_id: uuid::Uuid,
+        device_id: Option<&str>,
+        cancel_token: &tokio_util::sync::CancellationToken,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let name = dispatch_name(name, args)?;
+        match name {
+            tn::READ_FILE
+            | tn::WRITE_FILE
+            | tn::EDIT_FILE
+            | tn::LIST_FILES
+            | tn::GLOB_FILES
+            | tn::GREP_FILES
+            | tn::COPY_FILE
+            | tn::DELETE_FILE => to_outcome(self.execute_file_tool(name, args, thread_id).await),
+            tn::BROWSER_OPEN
+            | tn::BROWSER_EXTRACT
+            | tn::BROWSER_CLICK
+            | tn::BROWSER_TYPE
+            | tn::BROWSER_EVAL
+            | tn::BROWSER_SCREENSHOT
+            | tn::BROWSER_CLOSE
+            | tn::BROWSER_FORGET_LOGIN
+            | tn::BROWSER_CLEAR_DATA => {
+                to_outcome(self.execute_browser_tool(name, args, request_id).await)
+            }
+            tn::SEND_EMAIL
+            | tn::READ_EMAILS
+            | tn::READ_EMAIL
+            | tn::CONFIGURE_EMAIL
+            | tn::SAVE_EMAIL_ATTACHMENT => to_outcome(
+                self.execute_email_tool(name, args, request_id, thread_id)
+                    .await,
+            ),
+            tn::HTTP_REQUEST => to_outcome(self.execute_http_tool(args, thread_id).await),
+            tn::PROXY_REQUEST => to_outcome(self.execute_proxy_tool(args, thread_id).await),
+            // Already an outcome: this handler distinguishes a refusal from a
+            // judgment, so it must not be laundered through `to_outcome`.
+            tn::JUDGE => self.execute_judgment_tool(args, thread_id).await,
+            tn::RELOAD_PROXY_MODULES => to_outcome(self.execute_reload_proxy_modules_tool().await),
+            tn::IMPORT_FILE | tn::GIT_CLONE => to_outcome(
+                self.execute_import_tool(name, args, extraction_ctx, thread_id)
+                    .await,
+            ),
+            // Grouped manifest tools (consolidated surface the model sees).
+            tn::TRIGGERS | tn::TRIGGER_GROUPS => self.execute_scheduler_grouped(name, args).await,
+            tn::PREFERENCES => self.execute_preferences_grouped(args, device_id).await,
+            // Flat per-verb names: back-compat aliases that still dispatch to the
+            // same handlers (consolidated into the grouped tools above, but kept
+            // so cached prompts/in-flight threads don't break).
+            tn::CREATE_TRIGGER
+            | tn::LIST_TRIGGERS
+            | tn::UPDATE_TRIGGER
+            | tn::DELETE_TRIGGER
+            | tn::PAUSE_TRIGGER
+            | tn::RESUME_TRIGGER
+            | tn::RUN_TRIGGER
+            | tn::LIST_TRIGGER_GROUPS
+            | tn::CREATE_TRIGGER_GROUP
+            | tn::RENAME_TRIGGER_GROUP
+            | tn::REORDER_TRIGGER_GROUPS
+            | tn::DELETE_TRIGGER_GROUP => to_outcome(self.execute_scheduler_tool(name, args).await),
+            tn::SET_PREFERENCE | tn::GET_PREFERENCES => {
+                to_outcome(self.execute_preferences_tool(name, args, device_id).await)
+            }
+            tn::GET_BACKUP_STATUS => to_outcome(self.execute_get_backup_status().await),
+            // Grouped env-var tool (list/set/delete). `set_environment_variable`
+            // stays wired as a back-compat alias → dispatched as action "set".
+            tn::ENV_VARS | tn::SET_ENVIRONMENT_VARIABLE => self.execute_env_vars(name, args).await,
+            tn::WIDGETS => to_outcome(self.execute_widgets(args, thread_id).await),
+            tn::MANAGE_MODELS => to_outcome(self.execute_manage_models(args).await),
+            tn::WEB_SEARCH | tn::FETCH_NEWS => {
+                to_outcome(self.execute_web_tool(name, args, thread_id).await)
+            }
+            tn::REQUEST_CREDENTIAL | tn::CONNECT_OAUTH_ACCOUNT => to_outcome(
+                self.execute_credential_tool(name, args, thread_id, device_id)
+                    .await,
+            ),
+            tn::CREATE_APP | tn::LIST_APPS | tn::LOAD_KNOWHOW => {
+                to_outcome(self.execute_app_tool(name, args, thread_id).await)
+            }
+            tn::EXECUTE_INTENT => to_outcome(
+                Box::pin(self.handle_execute_intent(
+                    args,
+                    extraction_ctx,
+                    request_id,
+                    device_id,
+                    cancel_token,
+                    thread_id,
+                ))
+                .await,
+            ),
+            tn::RUN_PYTHON => to_outcome(self.execute_python_tool(args, thread_id).await),
+            tn::RUN_PYTHON_BACKGROUND => self.execute_python_background_tool(args, thread_id).await,
+            tn::RUN_BASH => to_outcome(self.execute_bash_tool(args, thread_id).await),
+            tn::RUN_BASH_BACKGROUND => self.execute_bash_background_tool(args, thread_id).await,
+            tn::BASH_OUTPUT => self.execute_bash_output_tool(args, thread_id).await,
+            tn::BASH_KILL => self.execute_bash_kill_tool(args, thread_id).await,
+            tn::CORRECT_MEMORY => to_outcome(self.execute_memory_tool(args, thread_id).await),
+            tn::CORRECT_MEMORY_BY_ID => to_outcome(self.execute_correct_memory_by_id(args).await),
+            tn::SEARCH_MEMORY => to_outcome(self.execute_search_memory(args).await),
+            tn::MEMORY_SOURCE => to_outcome(self.execute_memory_source(args).await),
+            tn::RECALL_ZOOM => to_outcome(self.execute_recall_zoom(args, thread_id).await),
+            tn::RECALL_FIND => to_outcome(self.execute_recall_find(args, thread_id).await),
+            tn::RECALL_SEARCH => to_outcome(self.execute_recall_search(args).await),
+            tn::RECALL_DATE => to_outcome(self.execute_recall_date(args, thread_id).await),
+            tn::GENERATE_IMAGE => to_outcome(self.execute_generate_image(args, thread_id).await),
+            tn::SAVE_THREAD_IMAGE => {
+                to_outcome(self.execute_save_thread_image(args, thread_id).await)
+            }
+            tn::VIEW_IMAGE => to_outcome(self.execute_view_image(args, thread_id).await),
+            tn::NAVIGATE_UI => self.execute_navigate_ui(args, thread_id, device_id).await,
+            tn::SEND_NOTIFICATION => self.execute_send_notification(args, thread_id).await,
+            tn::NOTIFICATIONS | tn::READ_NOTIFICATIONS => {
+                self.execute_notifications(name, args).await
+            }
+            tn::EMIT_EVENT => self.execute_emit_event(args).await,
+            tn::QUERY_EVENTS => self.execute_query_events(args, thread_id).await,
+            tn::COUNT_EVENTS => self.execute_count_events(args).await,
+            tn::LIST_EVENT_TYPES => self.execute_list_event_types().await,
+            tn::FOLLOW_UP_CHILD_THREAD => {
+                self.execute_follow_up_child_thread(args, thread_id).await
+            }
+            tn::LIST_THREADS => self.execute_list_threads(args, thread_id).await,
+            tn::COUNT_THREADS => self.execute_count_threads(args, thread_id).await,
+            tn::SEARCH_THREADS => to_outcome(self.execute_search_threads(args).await),
+            tn::LIST_DRAFTS => self.execute_list_drafts(args).await,
+            tn::LIST_HELD_MESSAGES => self.execute_list_held_messages(args).await,
+            tn::DETACH_CHILD_THREAD => self.execute_detach_child_thread(args, thread_id).await,
+            tn::ARCHIVE_THREAD => self.execute_archive_thread(args, thread_id).await,
+            tn::REQUEST_READ => self.execute_request_read(args, thread_id).await,
+            tn::TRIAGE_THREADS => self.execute_triage_threads(thread_id).await,
+            tn::APPLY_THREAD_TRIAGE => self.execute_apply_thread_triage(args, thread_id).await,
+            tn::LIST_CHANGES => self.execute_list_changes(args, thread_id).await,
+            tn::APPLY_CHANGE => self.execute_apply_change(args, thread_id).await,
+            tn::APPLY_WHEN_SETTLED => self.execute_apply_when_settled(args, thread_id).await,
+            tn::APPLY_AS_THEY_SETTLE => self.execute_apply_as_they_settle(thread_id).await,
+            tn::CANCEL_STANDING_APPLY => self.execute_cancel_standing_apply(args, thread_id).await,
+            tn::SET_ASIDE_CHANGE => self.execute_set_aside_change(args, thread_id).await,
+            tn::BRING_BACK_CHANGE => self.execute_bring_back_change(args, thread_id).await,
+            tn::LIST_THREAD_QUEUE => self.execute_list_thread_queue().await,
+            tn::UPDATE_THREAD_QUEUE_POLICY => {
+                self.execute_update_thread_queue_policy(args, thread_id)
+                    .await
+            }
+            tn::TODO_WRITE => self.execute_todo_write(args, thread_id).await,
+            tn::MANAGE_REPOSITORIES => self.execute_manage_repositories(args, thread_id).await,
+            tn::INSTALL_PLUGIN
+            | tn::REGISTER_PLUGIN_MARKETPLACE
+            | tn::CHECK_PLUGIN_UPDATES
+            | tn::UPDATE_PLUGIN
+            | tn::UNINSTALL_PLUGIN => self.execute_plugin_tool(name, args, thread_id).await,
+            tn::SETUP_MCP_SERVER
+            | tn::LIST_MCP_SERVERS
+            | tn::START_MCP_SERVER
+            | tn::STOP_MCP_SERVER
+            | tn::REMOVE_MCP_SERVER => {
+                to_outcome(self.execute_mcp_management_tool(name, args).await)
+            }
+            _ if name.starts_with("mcp__") => {
+                // Safety fallback — MCP tools are handled by handle_special_tool() before reaching here
+                Err(format!(
+                    "Error: MCP tool '{}' must be routed through handle_special_tool()",
+                    name
+                ))
+            }
+            _ => Err(format!("Error: Unknown tool: {}", name)),
+        }
+    }
+
+    /// Thin wrapper that delegates to the standalone
+    /// [`todo::todo_tool_impl`] so tests can drive the validation branches
+    /// without booting a full engine.
+    async fn execute_todo_write(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        todo::todo_tool_impl(&self.event_bus, &self.pool, args, thread_id).await
+    }
+
+    /// The turn's *last used device*: the device of the user's newest action
+    /// since the turn began, so a question answered from another device moves
+    /// it there. `device_id` is the device that started the turn.
+    pub(crate) async fn last_used_device(
+        &self,
+        thread_id: uuid::Uuid,
+        device_id: Option<&str>,
+    ) -> Option<String> {
+        let anchor = crate::engine::in_flight_request_event_id(
+            &self.active_threads,
+            &self.pool,
+            thread_id,
+            crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+        )
+        .await;
+        crate::engine::agent_context::last_used_device(&self.pool, thread_id, anchor, device_id)
+            .await
+    }
+
+    async fn execute_navigate_ui(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+        device_id: Option<&str>,
+    ) -> ToolOutcome {
+        let last_used = self.last_used_device(thread_id, device_id).await;
+        navigate::navigate_ui_impl(
+            &self.event_bus,
+            &self.pool,
+            args,
+            thread_id,
+            last_used.as_deref(),
+        )
+        .await
+    }
+
+    async fn execute_send_notification(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let n = parse_send_notification_args(args, thread_id)?;
+        crate::scheduler::notifications::verify_event_anchors(
+            &self.pool,
+            Some(n.link_thread),
+            n.link_event,
+            &n.tap,
+        )
+        .await
+        .map_err(|e| format!("Error: could not check event_id: {e}"))?
+        .map_err(|e| format!("Error: {e}"))?;
+        match self
+            .create_notification(
+                &n.title,
+                &n.message,
+                n.app_id.as_deref(),
+                Some(n.link_thread),
+                n.link_event,
+                n.tap,
+                None,
+            )
+            .await
+        {
+            Ok(_) => Ok("Notification sent.".to_string()),
+            Err(e) => Err(format!("Error: {}", e)),
+        }
+    }
+
+    /// Persist a notification to the inbox AND fan it out as a web push.
+    ///
+    /// Shared between the `send_notification` LLM tool and the
+    /// `POST /api/v1/notifications` HTTP route. Both surfaces produce the
+    /// same `NotificationCreated` event and the same `send_push_to_all_with_app`
+    /// fanout so a script-driven push is indistinguishable from an LLM-driven
+    /// one to the recipient.
+    ///
+    /// `link_thread_id` is the push-payload `thread_id` for tap deep-links.
+    /// The "is the user viewing this thread?" suppression is now made live
+    /// by the page's PresenceCheck pong (see
+    /// `system-knowhow/notifications.md` §3), not by a persisted
+    /// projection. The LLM tool path passes the originating thread (via
+    /// `ORIGIN_THREAD_ID`, falling back to its own thread). The HTTP path
+    /// passes whatever the caller explicitly opted into — typically `None`,
+    /// since scripts rarely have a thread context.
+    ///
+    /// Callers are expected to pre-validate at their boundary (HTTP returns
+    /// 400 for empty title/message; the LLM tool returns the same as a tool
+    /// error). The `trim().is_empty()` guards here are belt-and-braces so a
+    /// future caller can't accidentally publish a blank notification.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_notification(
+        &self,
+        title: &str,
+        message: &str,
+        app_id: Option<&str>,
+        link_thread_id: Option<uuid::Uuid>,
+        link_event_id: Option<uuid::Uuid>,
+        mut tap: crate::scheduler::notifications::Tap,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+    ) -> Result<uuid::Uuid, Box<dyn std::error::Error + Send + Sync>> {
+        if title.trim().is_empty() {
+            return Err("title is required".into());
+        }
+        if message.trim().is_empty() {
+            return Err("message is required".into());
+        }
+        // Belt-and-braces, like the two guards above. The surfaces that take a
+        // caller-written tap already settled it. So this is a no-op for them,
+        // and for every engine-internal producer building one from typed uuids.
+        // What it buys is that a FUTURE producer cannot write a thread tap the
+        // page is unable to resolve. `None`: this is a chokepoint, not a turn,
+        // so there is no ambient thread an alias could mean here.
+        crate::scheduler::notifications::resolve_thread_tap_id(&mut tap, None)?;
+
+        let notification_id = uuid::Uuid::new_v4();
+        self.event_bus
+            .emit(crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::NotificationCreated {
+                    id: notification_id.to_string(),
+                    title: title.to_string(),
+                    message: message.to_string(),
+                    task_id: None,
+                    app_id: app_id.map(str::to_string),
+                    thread_id: link_thread_id.map(|t| t.to_string()),
+                    event_id: link_event_id.map(|e| e.to_string()),
+                    tap: tap.clone(),
+                    actor,
+                },
+            ))
+            .await
+            .map_err(|e| format!("failed to create notification: {}", e))?;
+
+        crate::scheduler::push::send_push_to_all_with_app(
+            &self.clone_arc(),
+            title,
+            message,
+            Some(notification_id),
+            app_id,
+            link_thread_id,
+            link_event_id,
+            tap,
+        );
+
+        Ok(notification_id)
+    }
+
+    async fn execute_emit_event(&self, args: &serde_json::Value) -> ToolOutcome {
+        // The tool call runs on the fire's own task, so the ambient marker is
+        // this fire. Passing it keeps what `EventBus::emit` used to read for
+        // free, now that the emit states its owner (ADR 0137).
+        let emitting_trigger_id = crate::scheduler::user_tasks::current_trigger_id();
+        emit_event_impl(&self.event_bus, args, emitting_trigger_id).await
+    }
+
+    /// Thin wrapper over [`repositories::manage_repositories_impl`], which owns
+    /// the add/list/remove branches plus their `Repository{Added,Removed}`
+    /// emits. Same split as [`query_events_impl`]: the free function takes the
+    /// pool + bus so tests can drive it without booting the engine.
+    async fn execute_manage_repositories(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        repositories::manage_repositories_impl(&self.pool, &self.event_bus, args, thread_id).await
+    }
+
+    /// Thin wrapper over [`query_events_impl`], which owns the arg parsing and
+    /// the dereference branch. The free function takes the store, so tests can
+    /// drive every refusal against a real Postgres without booting the engine.
+    ///
+    /// `thread_id` is the caller's own, ambient from `execute_tool`. It resolves
+    /// the `current` alias, and the model cannot set it.
+    async fn execute_query_events(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        query_events_impl(&self.event_store, args, thread_id).await
+    }
+
+    /// LLM tool: per-`event_type` count + byte total over the same time
+    /// filters as `query_events`. Mirrors `count_threads` shape-wise.
+    /// Without an `event_type` filter, returns the per-type breakdown sorted
+    /// by count desc — the "what's noisy this week" view that a sweep recipe
+    /// (workspace-learning, workspace-audit) should call before drilling.
+    async fn execute_count_events(&self, args: &serde_json::Value) -> ToolOutcome {
+        let event_type = args.get("event_type").and_then(|v| v.as_str());
+        let since = parse_time_filter(args, "since")?;
+        let until = parse_time_filter(args, "until")?;
+
+        if let Some(et) = event_type {
+            match self.event_store.count_events(Some(et), since, until).await {
+                Ok((count, byte_total)) => Ok(serde_json::json!({
+                    "count": count,
+                    "byte_total": byte_total,
+                })
+                .to_string()),
+                Err(e) => Err(format!("Error: failed to count events: {}", e)),
+            }
+        } else {
+            match self.event_store.count_events_by_type(since, until).await {
+                Ok(rows) => {
+                    let total_count: i64 = rows.iter().map(|(_, c, _)| *c).sum();
+                    let total_byte_total: i64 = rows.iter().map(|(_, _, b)| *b).sum();
+                    let by_type: Vec<serde_json::Value> = rows
+                        .into_iter()
+                        .map(|(et, count, byte_total)| {
+                            serde_json::json!({
+                                "event_type": et,
+                                "count": count,
+                                "byte_total": byte_total,
+                            })
+                        })
+                        .collect();
+                    Ok(serde_json::json!({
+                        "by_type": by_type,
+                        "total_count": total_count,
+                        "total_byte_total": total_byte_total,
+                    })
+                    .to_string())
+                }
+                Err(e) => Err(format!("Error: failed to count events: {}", e)),
+            }
+        }
+    }
+
+    /// LLM tool: the event names this workspace can subscribe to.
+    ///
+    /// **The answer the refusals point at.** `engine` is a closed set, checked
+    /// hard: a name that merely resembles one of these is refused with a
+    /// suggestion. `workspace` is open, holding this workspace's own domain
+    /// events. A name in neither list is accepted with a warning.
+    ///
+    /// Drawn from the trigger surface, the wider of the two, so it names the
+    /// one family a wait may not watch.
+    async fn execute_list_event_types(&self) -> ToolOutcome {
+        use crate::core::event_subscription::{event_type_catalog, SubscriptionSurface};
+        let catalog = event_type_catalog(&self.event_store, SubscriptionSurface::Trigger)
+            .await
+            .map_err(|e| format!("Error: {e}"))?;
+        Ok(serde_json::json!({
+            "engine": catalog.engine,
+            "workspace": catalog.workspace,
+            "retired": crate::engine::thread_events::ThreadEvent::LEGACY_TYPE_NAME_ALIASES,
+            "note": "Subscribe by exact name. 'engine' is closed, so a near miss on one \
+                     is refused rather than armed. 'workspace' holds this workspace's own \
+                     domain events; a name in neither list is accepted, with a warning, \
+                     for a domain event you are about to start emitting. 'retired' names \
+                     still read back in history but nothing emits them again. A wait \
+                     cannot watch the EventWait* family, a trigger can.",
+        })
+        .to_string())
+    }
+
+    /// LLM tool: redirect a child thread this thread already spawned.
+    ///
+    /// `caller_thread_id` is `execute_tool`'s ambient thread, never an
+    /// argument. That is what makes the authorization ladder in
+    /// `chat::child_follow_up` a real boundary here rather than an accounting
+    /// one: the model can pick which child to address, but it cannot pick who
+    /// it is.
+    async fn execute_follow_up_child_thread(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::chat::child_follow_up::ChildFollowUpError;
+
+        let raw_id = args
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "Error: follow_up_child_thread needs a thread_id. It is the child's uuid, from \
+                 the run_thread / run_coding_agent result, a completion card, or the threads \
+                 tool's 'list' action with my_children: true."
+                    .to_string()
+            })?;
+        let child_thread_id: uuid::Uuid = raw_id.parse().map_err(|_| {
+            format!(
+                "Error: '{raw_id}' is not a thread id. follow_up_child_thread addresses a child \
+                 by uuid, never by title: titles are not unique, and a fuzzy match would \
+                 silently deliver to the wrong child. List your own children with the threads \
+                 tool's 'list' action and my_children: true."
+            )
+        })?;
+        let message = args
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "Error: follow_up_child_thread needs a non-empty message. It lands in the \
+                 child's conversation as a message from you."
+                    .to_string()
+            })?;
+
+        // Absent means not urgent; a present non-boolean is an error rather
+        // than a silent `false`. See `FollowUpUrgency::from_tool_arg`.
+        let urgency = crate::engine::FollowUpUrgency::from_tool_arg(args.get("urgent"))
+            .map_err(|e| format!("Error: follow_up_child_thread's {e}"))?;
+
+        let Some(engine) = self.try_clone_arc() else {
+            return Err(
+                "Error: follow_up_child_thread is unavailable on this engine instance.".to_string(),
+            );
+        };
+        match engine
+            .follow_up_child_thread(
+                Some(caller_thread_id),
+                child_thread_id,
+                message,
+                None,
+                None,
+                None,
+                urgency,
+            )
+            .await
+        {
+            // Names the child by TITLE, never by uuid, so the model's prose
+            // stays uuid-free by default (a uuid means nothing to the user:
+            // no screen is labelled with one).
+            Ok(ack) => Ok(format!(
+                "Sent to \"{}\". {}{}",
+                ack.child_title,
+                ack.delivered_to.describe(),
+                match ack.reach {
+                    crate::engine::FollowUpReach::OwnChild => "",
+                    crate::engine::FollowUpReach::Home => {
+                        " It is not your child, so no completion card comes back to you. \
+                         Read its reply later with query_events and its thread_id."
+                    }
+                }
+            )),
+            // Each refusal tells the model what to do instead, and none of them
+            // leaks whose child a thread is beyond "not yours".
+            Err(e @ ChildFollowUpError::NotYourChild(_)) => Err(format!(
+                "Error: {e} List your own children with the threads tool's 'list' action and \
+                 my_children: true, then address one of those."
+            )),
+            Err(e @ ChildFollowUpError::UnknownChild(_)) => Err(format!(
+                "Error: {e} Check the id against the threads tool's 'list' action with \
+                 my_children: true."
+            )),
+            Err(e @ ChildFollowUpError::ChildDiscarded(_)) => Err(format!(
+                "Error: {e} Spawn a fresh thread with run_thread or run_coding_agent instead."
+            )),
+            Err(e @ ChildFollowUpError::SelfTarget(_)) => Err(format!("Error: {e}")),
+            Err(e) => Err(format!("Error: {e}")),
+        }
+    }
+
+    /// LLM tool: move a child thread this thread spawned to top level
+    /// (ADR 0278). The caller is `execute_tool`'s ambient thread, as for a
+    /// follow-up, so the model picks which child but never who it is.
+    async fn execute_detach_child_thread(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::{ChildDetachError, DetachCaller};
+
+        let raw_id = args
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "Error: detach_child needs a thread_id: the child's uuid, from the threads \
+                 tool's 'list' action with my_children: true."
+                    .to_string()
+            })?;
+        let child_thread_id: uuid::Uuid = raw_id.parse().map_err(|_| {
+            format!(
+                "Error: '{raw_id}' is not a thread id. detach_child addresses a child by uuid, \
+                 never by title. List your own children with the threads tool's 'list' action \
+                 and my_children: true."
+            )
+        })?;
+
+        match self
+            .detach_child_thread(
+                DetachCaller::Agent(Some(caller_thread_id)),
+                child_thread_id,
+                crate::engine::thread_events::EventMeta::NONE,
+            )
+            .await
+        {
+            Ok(ack) => Ok(format!(
+                "Moved \"{}\" to top level. It keeps running on its own. You will not get \
+                 its result and can no longer follow up on it.",
+                ack.child_title
+            )),
+            Err(e @ (ChildDetachError::NotYourChild(_) | ChildDetachError::UnknownThread(_))) => {
+                Err(format!(
+                    "Error: {e} List your own children with the threads tool's 'list' action \
+                     and my_children: true."
+                ))
+            }
+            Err(e) => Err(format!("Error: {e}")),
+        }
+    }
+
+    /// LLM tool: archive the calling thread or one of its direct children
+    /// (ADR 0310). The caller is `execute_tool`'s ambient thread, as for
+    /// detach, so the model picks the target but never who it is.
+    async fn execute_archive_thread(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::{AgentArchiveAck, AgentArchiveError};
+
+        let raw_id = args
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                "Error: archive needs a thread_id: 'current' for this thread, or a direct \
+                 child's uuid from the threads tool's 'list' action with my_children: true."
+                    .to_string()
+            })?;
+        let target = crate::api::resolve_thread_id_arg(raw_id, Some(caller_thread_id))
+            .map_err(|e| format!("Error: {e}"))?;
+
+        match self.archive_as_agent(Some(caller_thread_id), target).await {
+            Ok(AgentArchiveAck::Requested { .. }) => Ok(
+                "This thread will be archived once this turn ends and it has settled. A new \
+                 message into it before then keeps it open."
+                    .to_string(),
+            ),
+            Ok(AgentArchiveAck::Archived(outcome)) => describe_agent_archive(target, outcome),
+            Err(
+                e @ (AgentArchiveError::NotYourThread(_) | AgentArchiveError::UnknownThread(_)),
+            ) => Err(format!(
+                "Error: {e} List your own children with the threads tool's 'list' action \
+                     and my_children: true."
+            )),
+            Err(e) => Err(format!("Error: {e}")),
+        }
+    }
+
+    /// LLM tool: the turn's *read decision* on this thread's latest reply
+    /// (ADR 0409, ADR 0417). The thread is `execute_tool`'s ambient one, so the
+    /// model cannot name another.
+    async fn execute_request_read(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::read_request::{record_agent_read_decision, ReadDecision};
+        let decision = ReadDecision::from_tool_args(args)?;
+        record_agent_read_decision(&self.event_bus, thread_id, decision)
+            .await
+            .map_err(|e| format!("Error: recording the read decision failed: {e}"))?;
+        Ok(decision.ack().to_string())
+    }
+
+    /// LLM tool: list thread summaries for the workspace. Mirrors
+    /// `GET /api/v1/threads/list` and `lucidos threads list`, except that a
+    /// row carries its draft as the preview reader fields, never in full.
+    ///
+    /// `caller_thread_id` is `execute_tool`'s ambient thread, which the model
+    /// cannot set. It is what `my_children: true` resolves to.
+    async fn execute_list_threads(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let statuses = parse_status_arg(args)?;
+        let status = status_filter_arg(args, &statuses);
+        let sources = parse_source_arg(args.get("source"));
+        let parent = parent_filter_arg(args, caller_thread_id);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(100)
+            .clamp(1, 1000);
+        let mut summaries = self
+            .event_store
+            .list_thread_summaries(crate::core::store::ThreadSummaryFilters {
+                status,
+                sources: sources.as_deref(),
+                parent,
+                has_draft: bool_arg(args, "has_draft")?,
+                change_state: change_state_arg(args)?,
+                limit,
+            })
+            .await
+            .map_err(|e| format!("Error: failed to list thread summaries: {}", e))?;
+        crate::core::store::attach_reader_fields(&mut summaries, &self.workspace_name());
+        unsent::list_rows_for_the_model(&summaries)
+    }
+
+    /// LLM tool: count thread summaries matching the same filters as
+    /// `list_threads`. Returns `{ "count": N }`.
+    async fn execute_count_threads(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let statuses = parse_status_arg(args)?;
+        let status = status_filter_arg(args, &statuses);
+        let sources = parse_source_arg(args.get("source"));
+        let parent = parent_filter_arg(args, caller_thread_id);
+        match self
+            .event_store
+            .count_thread_summaries(crate::core::store::ThreadSummaryFilters {
+                status,
+                sources: sources.as_deref(),
+                parent,
+                has_draft: bool_arg(args, "has_draft")?,
+                change_state: change_state_arg(args)?,
+                limit: 0,
+            })
+            .await
+        {
+            Ok(count) => Ok(serde_json::json!({ "count": count }).to_string()),
+            Err(e) => Err(format!("Error: failed to count thread summaries: {}", e)),
+        }
+    }
+
+    /// LLM tool: list pending + recently-applied *changes* (coding-agent
+    /// branches awaiting Apply). The in-thread mirror of `GET /api/v1/changes`
+    /// and `lucidos changes list` — calls the same projection reads in-process
+    /// rather than shelling out to the CLI. Read-only.
+    async fn execute_list_changes(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let scope = pending_scope_arg(args, thread_id)?;
+        let proj = self.changes();
+        let pending = crate::core::changes::list_pending_for_readers(self.pool(), proj, scope)
+            .await
+            .map_err(|e| format!("Error: failed to list pending changes: {}", e))?;
+        let set_aside = crate::core::changes::list_set_aside_for_readers(self.pool(), proj, scope)
+            .await
+            .map_err(|e| format!("Error: failed to list set-aside changes: {}", e))?;
+        // A small applied window gives the LLM enough recent history to confirm
+        // a just-applied change without flooding the context with the full log.
+        let mut applied = proj
+            .list_recently_applied(10, None)
+            .await
+            .map_err(|e| format!("Error: failed to list applied changes: {}", e))?;
+        crate::core::changes::enrich_thread_titles(self.pool(), &mut applied)
+            .await
+            .map_err(|e| format!("Error: failed to enrich applied change titles: {}", e))?;
+        let total_pending = pending.len();
+        // Compact JSON — same convention as list_threads / query_events.
+        serde_json::to_string(&serde_json::json!({
+            "pending": pending,
+            "set_aside": set_aside,
+            "applied": applied,
+            "total_pending": total_pending,
+        }))
+        .map_err(|e| format!("Error: failed to serialise changes: {}", e))
+    }
+
+    /// LLM tool: set a pending change aside, as the Set aside button does. It
+    /// asks the same per-change gate, because it is the same act.
+    async fn execute_set_aside_change(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let change_id = parse_required_uuid(args, "change_id")?;
+        if let Some(target) = self.change_target(change_id).await {
+            self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::SetAside)
+                .await?;
+        }
+        let refusal = crate::api::changes::change_action_refusal(
+            self.pool(),
+            change_id,
+            crate::engine::thread_lifecycle::Action::SetAside,
+        )
+        .await
+        .map_err(|e| format!("Error: failed to check whether this change can be set aside: {e}"))?;
+        if let Some(refusal) = refusal {
+            return Err(set_aside_refusal_message(refusal));
+        }
+        let actor = agent_tool_actor(thread_id);
+        self.set_aside_change(change_id, Some(actor))
+            .await
+            .map_err(|e| format!("Error: failed to set the change aside: {e}"))?;
+        Ok(format!("Change {change_id} set aside."))
+    }
+
+    /// LLM tool: bring a set-aside change back to pending.
+    async fn execute_bring_back_change(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let change_id = parse_required_uuid(args, "change_id")?;
+        if let Some(target) = self.change_target(change_id).await {
+            self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::BringBack)
+                .await?;
+        }
+        let actor = agent_tool_actor(thread_id);
+        self.bring_back_change(change_id, Some(actor))
+            .await
+            .map_err(|e| format!("Error: failed to bring the change back: {e}"))?;
+        Ok(format!("Change {change_id} brought back to pending."))
+    }
+
+    /// LLM tool: apply a pending *change* — merge the coding-agent branch into
+    /// main, exactly as the Apply button does. Calls the shared
+    /// `LucidosEngine::apply_change` pipeline in-process (which handles the
+    /// /harden gate, restart gating, conflict recovery, `ChangeApplied` emit,
+    /// and projection broadcast) — no apply logic is duplicated here.
+    async fn execute_apply_change(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let change_id = parse_required_uuid(args, "change_id")?;
+        // Applying acts on the thread that proposed the change, so a parent
+        // applying its child's work stays in-subtree and needs nobody. A change
+        // from anywhere else is the owner's button (ADR 0168 clause 4).
+        if let Some(target) = self.change_target(change_id).await {
+            self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::Apply)
+                .await?;
+        }
+        // The same gate the Apply button asks, because this is the same act.
+        // Without it a chat agent merged a branch whose coding agent was
+        // mid-turn. The Tier 1 in-place merge then reset that worktree under
+        // the running session.
+        let refusal = crate::api::changes::change_action_refusal(
+            self.pool(),
+            change_id,
+            crate::engine::thread_lifecycle::Action::Apply,
+        )
+        .await
+        .map_err(|e| format!("Error: failed to check whether this change can apply: {e}"))?;
+        if let Some(refusal) = refusal {
+            return Err(apply_refusal_message(refusal));
+        }
+        // The agent in THIS thread drove the apply, so the `ChangeApplied`
+        // event (emitted on the *proposing* thread's timeline) deep-links back
+        // here. `direction: Parent` fits the dominant flow: a chat thread
+        // applying the change of a coding-agent thread it spawned (the
+        // proposing thread is the child; this thread is its parent).
+        let actor = agent_tool_actor(thread_id);
+        // `apply_change` takes `&Arc<Self>`; the tool handler only has `&self`.
+        let engine = self.clone_arc();
+        match engine.apply_change(change_id, Some(actor)).await {
+            // Echo the typed ApplyResult verbatim so the LLM sees status,
+            // SHAs, restart_required, and any conflict/review thread ids.
+            Ok(result) => serde_json::to_string(&result)
+                .map_err(|e| format!("Error: failed to serialise apply result: {}", e)),
+            Err(e) => Err(format!("Error: failed to apply change: {}", e)),
+        }
+    }
+
+    /// LLM tool: arm a *standing apply* on one thread, so its change applies
+    /// once the thread settles. The prompt-side twin of the Apply control's
+    /// "Apply on settle" face, calling the same engine state (ADR 0168
+    /// clause 5, philosophy rule 2).
+    async fn execute_apply_when_settled(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let target = parse_required_uuid(args, "thread_id")?;
+        let change_id = parse_optional_uuid(args, "change_id")?;
+        // Arming an apply on a thread IS applying it, one settle later, so it
+        // takes the same gate the immediate apply does.
+        self.refuse_tool_without_authority(thread_id, Some(target), ThreadReachVerb::Apply)
+            .await?;
+        let actor = agent_tool_actor(thread_id);
+        let engine = self.clone_arc();
+        engine
+            .arm_standing_apply(crate::engine::standing_apply::StandingApply {
+                thread_id: target,
+                change_id,
+                batch_id: None,
+                actor: Some(actor),
+            })
+            .await
+            .map_err(|e| format!("Error: failed to arm the standing apply: {e}"))?;
+        serde_json::to_string(&serde_json::json!({
+            "armed_thread_id": target,
+            "change_id": change_id,
+        }))
+        .map_err(|e| format!("Error: failed to serialise the arm: {e}"))
+    }
+
+    /// LLM tool: the sweep. Apply everything pending that has settled, then
+    /// keep going as the threads still settling land theirs.
+    ///
+    /// Runs the engine's own Apply All press, so this is the button's rule
+    /// rather than a second copy of it: same filters, same durable batch, same
+    /// driver taking the remainder. Only the first member is applied inline, so
+    /// the turn does not sit through a multi-minute harden.
+    async fn execute_apply_as_they_settle(&self, thread_id: uuid::Uuid) -> ToolOutcome {
+        // The sweep is Apply at workspace scope, so no subtree contains it and
+        // it is the owner's button (ADR 0168 clause 4).
+        self.refuse_tool_without_authority(thread_id, None, ThreadReachVerb::Apply)
+            .await?;
+        let actor = agent_tool_actor(thread_id);
+        let engine = self.clone_arc();
+        let outcome = engine
+            .run_apply_all(Some(actor), true)
+            .await
+            .map_err(|e| format!("Error: failed to start Apply All: {e}"))?;
+        let body = match outcome {
+            crate::engine::apply_all_driver::ApplyAllOutcome::NothingToApply { armed, .. } => {
+                serde_json::json!({ "batch_size": 0, "armed": armed })
+            }
+            crate::engine::apply_all_driver::ApplyAllOutcome::Started {
+                batch_id,
+                batch_size,
+                armed,
+                first_branch,
+                first_result,
+            } => serde_json::json!({
+                "batch_id": batch_id,
+                "batch_size": batch_size,
+                "armed": armed,
+                "first_branch": first_branch,
+                "first_status": first_result.as_ref().map(|r| r.status).ok(),
+                "first_error": first_result.err(),
+            }),
+        };
+        engine.broadcast_changes_updated().await;
+        serde_json::to_string(&body)
+            .map_err(|e| format!("Error: failed to serialise the sweep result: {e}"))
+    }
+
+    /// LLM tool: take a *standing apply* back. The off for the two arms above,
+    /// so the prompt can undo what it armed (philosophy rule 2).
+    ///
+    /// `thread_id` names one thread. Omitted, it cancels every arm here: the
+    /// workspace-wide off.
+    ///
+    /// It asks the gate the arm asks. Taking an apply back acts on the same
+    /// thread's apply, so a caller that could not have armed here may not
+    /// cancel here. The workspace-wide form aims past every subtree, exactly as
+    /// the sweep does.
+    ///
+    /// Nothing armed is not an error. The caller asked for the instruction to
+    /// be gone, and it is.
+    async fn execute_cancel_standing_apply(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let target = parse_optional_uuid(args, "thread_id")?;
+        self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::Apply)
+            .await?;
+        let actor = Some(agent_tool_actor(thread_id));
+        let reason = crate::engine::standing_apply::DISARMED_BY_OWNER;
+        let canceled = match target {
+            Some(target) => self
+                .drop_standing_apply(target, reason, actor)
+                .await
+                .map(usize::from),
+            None => {
+                self.drop_standing_applies(
+                    crate::engine::standing_apply::DisarmScope::All,
+                    reason,
+                    actor,
+                )
+                .await
+            }
+        }
+        .map_err(|e| format!("Error: the standing apply may still be armed: {e}"))?;
+        self.broadcast_changes_updated().await;
+        serde_json::to_string(&serde_json::json!({ "canceled": canceled }))
+            .map_err(|e| format!("Error: failed to serialise the cancel: {e}"))
+    }
+
+    /// LLM tool: list the Thread Queue plus the active capacity policy. Shares
+    /// `ThreadQueue::snapshot` with `GET /api/v1/thread-queue`, so the tool and
+    /// the panel return identical entries — including the in-memory
+    /// user-initiated occupants (`kind: "user-chat"`) the tool previously
+    /// omitted, which is why it reported an empty pool while the panel showed
+    /// running user-chat rows.
+    async fn execute_list_thread_queue(&self) -> ToolOutcome {
+        let snapshot = self
+            .thread_queue
+            .snapshot()
+            .await
+            .map_err(|e| format!("Error: failed to list Thread Queue: {}", e))?;
+        serde_json::to_string(&snapshot)
+            .map_err(|e| format!("Error: failed to serialise Thread Queue: {}", e))
+    }
+
+    /// LLM tool: partially update the Thread Queue capacity policy. Unlike
+    /// the HTTP panel endpoint, omitted fields are merged with the live policy
+    /// rather than with code defaults, which is the safe shape for natural
+    /// requests such as "double capacity".
+    async fn execute_update_thread_queue_policy(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let previous = self.thread_queue.policy().await;
+        let policy = merge_thread_queue_policy_patch(previous.clone(), args)?;
+        let actor = agent_tool_actor(thread_id);
+        let engine = self.clone_arc();
+        engine
+            .thread_queue
+            .set_policy(policy.clone(), Some(actor))
+            .await
+            .map_err(|e| format!("Error: failed to update Thread Queue policy: {}", e))?;
+        serde_json::to_string(&serde_json::json!({
+            "previous_policy": previous,
+            "policy": policy,
+        }))
+        .map_err(|e| format!("Error: failed to serialise Thread Queue policy: {}", e))
+    }
+}
+
+/// Apply a partial Thread Queue policy patch to a starting policy. Missing
+/// fields keep their existing value; present fields must have the same JSON
+/// type as the wire policy. Pure so validation is testable without an engine.
+pub(crate) fn merge_thread_queue_policy_patch(
+    mut policy: CapacityPolicy,
+    args: &serde_json::Value,
+) -> Result<CapacityPolicy, String> {
+    let obj = args
+        .as_object()
+        .ok_or_else(|| "Error: update_thread_queue_policy expects an object".to_string())?;
+    if obj.is_empty() {
+        return Err("Error: at least one Thread Queue policy field is required".to_string());
+    }
+    for field in obj.keys() {
+        if !is_thread_queue_policy_field(field) {
+            return Err(format!(
+                "Error: unknown Thread Queue policy field `{}`",
+                field
+            ));
+        }
+    }
+
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_total",
+        &mut policy.max_concurrent_total,
+    )?;
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_event_trigger",
+        &mut policy.max_concurrent_event_trigger,
+    )?;
+    apply_usize_policy_field(args, "max_concurrent_cron", &mut policy.max_concurrent_cron)?;
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_sub_thread",
+        &mut policy.max_concurrent_sub_thread,
+    )?;
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_coding_agent",
+        &mut policy.max_concurrent_coding_agent,
+    )?;
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_per_trigger",
+        &mut policy.max_concurrent_per_trigger,
+    )?;
+    apply_usize_policy_field(
+        args,
+        "max_queued_per_trigger",
+        &mut policy.max_queued_per_trigger,
+    )?;
+    apply_usize_policy_field(args, "reserved_background", &mut policy.reserved_background)?;
+    apply_usize_policy_field(
+        args,
+        "max_concurrent_children_per_thread",
+        &mut policy.max_concurrent_children_per_thread,
+    )?;
+
+    if let Some(value) = args.get("max_event_trigger_depth") {
+        policy.max_event_trigger_depth =
+            serde_json::from_value::<u32>(value.clone()).map_err(|_| {
+                "Error: max_event_trigger_depth must be an unsigned integer".to_string()
+            })?;
+    }
+
+    if let Some(value) = args.get("overflow") {
+        policy.overflow =
+            serde_json::from_value::<OverflowPolicy>(value.clone()).map_err(|_| {
+                "Error: overflow must be one of `drop-oldest` or `pause-trigger`".to_string()
+            })?;
+    }
+
+    if let Some(reason) = policy.invalid_reason() {
+        return Err(format!("Error: {reason}"));
+    }
+    Ok(policy)
+}
+
+fn apply_usize_policy_field(
+    args: &serde_json::Value,
+    field: &str,
+    target: &mut usize,
+) -> Result<(), String> {
+    let Some(value) = args.get(field) else {
+        return Ok(());
+    };
+    *target = serde_json::from_value::<usize>(value.clone())
+        .map_err(|_| format!("Error: {field} must be an unsigned integer"))?;
+    Ok(())
+}
+
+fn is_thread_queue_policy_field(field: &str) -> bool {
+    matches!(
+        field,
+        "max_concurrent_total"
+            | "max_concurrent_event_trigger"
+            | "max_concurrent_cron"
+            | "max_concurrent_sub_thread"
+            | "max_concurrent_coding_agent"
+            | "max_concurrent_per_trigger"
+            | "max_queued_per_trigger"
+            | "reserved_background"
+            | "max_event_trigger_depth"
+            | "max_concurrent_children_per_thread"
+            | "overflow"
+    )
+}
+
+/// What an agent's archive tells the model. A member the cascade left open is
+/// named, and a pinned sub-thread is one (ADR 0312). Only a target left open
+/// is an error: an already-archived target is not.
+pub(crate) fn describe_agent_archive(
+    target: uuid::Uuid,
+    outcome: crate::api::threads::archive::ArchiveOutcome,
+) -> ToolOutcome {
+    let target_skipped = outcome
+        .skipped
+        .iter()
+        .any(|m| m["thread_id"] == serde_json::json!(target));
+    let left_open = if outcome.skipped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Left open: {}",
+            serde_json::Value::Array(outcome.skipped.clone())
+        )
+    };
+    if target_skipped {
+        return Err(format!("Error: thread {target} was left open.{left_open}"));
+    }
+    if outcome.archived.contains(&target) {
+        let sub_threads = outcome.archived.len() - 1;
+        return Ok(format!(
+            "Archived thread {target} and {sub_threads} of its sub-threads.{left_open}"
+        ));
+    }
+    Ok(format!("Thread {target} was already archived.{left_open}"))
+}
+
+/// Why the `changes` tool's `set_aside` was refused, for the agent to read.
+pub(crate) fn set_aside_refusal_message(
+    refusal: crate::api::changes::ChangeActionRefusal,
+) -> String {
+    use crate::api::changes::ChangeActionRefusal as R;
+    match refusal {
+        R::ThreadSettling | R::ThreadParked => "Error: the thread that proposed this change \
+             is still working or waiting on the user, so it can't be set aside now. Tell \
+             the user."
+            .to_string(),
+        R::ActionUnavailable | R::NoFilesLeft | R::ChangeSetAside => "Error: this change \
+             can't be set aside. Re-read the 'list' action and tell the user what you found."
+            .to_string(),
+    }
+}
+
+/// The `changes` tool's wording for a refused Apply. Pure, so every branch is
+/// asserted without booting an engine.
+///
+/// It names `apply_when_settled` for ONE refusal, the settling thread. A
+/// standing apply drops at once on a parked one. Naming it there would swap
+/// a refusal the caller can act on for one it cannot.
+pub(crate) fn apply_refusal_message(refusal: crate::api::changes::ChangeActionRefusal) -> String {
+    use crate::api::changes::ChangeActionRefusal as R;
+    match refusal {
+        R::NoFilesLeft => "Error: this change has no file changes left, so there is nothing to \
+             merge. Its branch's commits cancelled out. Tell the user to discard it from the \
+             Changes panel."
+            .to_string(),
+        R::ThreadSettling => {
+            "Error: the coding-agent thread that proposed this change has not finished: it is \
+             still working, or waiting on an event it will wake for. So Apply is withheld. It may \
+             commit again on the same branch, and applying now would merge a branch it is still \
+             writing to. Use the 'apply_when_settled' action to apply it the moment that thread \
+             finishes."
+                .to_string()
+        }
+        // Deliberately never spells the standing-apply action, not even to
+        // forbid it. A named tool in a negative instruction is still a named
+        // tool. The test beside this asserts the bare absence, rather than
+        // trusting the model to read the "not".
+        R::ThreadParked => {
+            "Error: the thread that proposed this change is parked: it is waiting on a question, \
+             or its turn failed. It may commit again once it moves on, so Apply is withheld. \
+             Waiting for it will not help either: a standing apply drops at once on a parked \
+             thread. Tell the user, who can answer it or continue it, and then apply."
+                .to_string()
+        }
+        R::ActionUnavailable => "Error: the thread that proposed this change does not offer \
+             Apply, and no wait resolves that. Re-read the 'list' action and tell the user what \
+             you found."
+            .to_string(),
+        R::ChangeSetAside => "Error: this change is set aside. The 'bring_back' action returns \
+             it to pending, and then it can be applied. Do that only if the user asked."
+            .to_string(),
+    }
+}
+
+/// Parse a required UUID arg by name. Pure, so the validation branches are
+/// unit-testable without booting an engine. Missing, null, empty and
+/// whitespace-only all collapse to "required"; a non-UUID string is rejected
+/// before any heavyweight work runs.
+pub(crate) fn parse_required_uuid(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<uuid::Uuid, String> {
+    let raw = match args.get(key).and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => return Err(format!("Error: {key} is required")),
+    };
+    uuid::Uuid::parse_str(raw).map_err(|_| format!("Error: {key} is not a valid UUID: {raw}"))
+}
+
+/// Parse an optional UUID arg by name. Absent reads as `None`. A present but
+/// unparseable value is an error rather than a silent `None`, so a mistyped id
+/// cannot quietly widen what the caller asked for.
+pub(crate) fn parse_optional_uuid(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<Option<uuid::Uuid>, String> {
+    match args.get(key).and_then(|v| v.as_str()).map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(raw) => uuid::Uuid::parse_str(raw)
+            .map(Some)
+            .map_err(|_| format!("Error: {key} is not a valid UUID: {raw}")),
+    }
+}
+
+/// Parse an optional RFC3339 time filter (`since` / `until`) for the event
+/// query tools.
+///
+/// A present-but-unparseable value is a hard error, never a silent `None`:
+/// dropping the bound turns a windowed query into an all-time one, which the
+/// model then reports to the user as the window. `2026-07-01` (no time, no
+/// offset) is a very common model shape and does NOT parse as RFC3339, so this
+/// path is hit routinely rather than exotically.
+pub(crate) fn parse_time_filter(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let Some(raw) = args
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| Some(dt.with_timezone(&chrono::Utc)))
+        .map_err(|e| {
+            format!(
+                "Error: `{}` must be an RFC3339 timestamp (e.g. 2026-07-01T00:00:00Z), got '{}': {}",
+                key, raw, e
+            )
+        })
+}
+
+/// Default + inclusive `[min, max]` bounds for an optional numeric tool
+/// argument. `apply(None)` yields the default; `apply(Some(v))` clamps `v` into
+/// range. Unifies the `query_events` limit/byte-budget pair (and is reusable by
+/// any other tool that wants the same "default-when-absent, then clamp" shape).
+#[derive(Clone, Copy)]
+pub(crate) struct ClampBounds<T> {
+    pub default: T,
+    pub min: T,
+    pub max: T,
+}
+
+impl<T: Ord + Copy> ClampBounds<T> {
+    pub(crate) fn apply(&self, value: Option<T>) -> T {
+        value.unwrap_or(self.default).clamp(self.min, self.max)
+    }
+}
+
+/// Byte-budget bounds for the `query_events` LLM tool. The default cap
+/// (128 KB of compact JSON) keeps a single tool result well under the
+/// model's per-turn token budget — a busy `ToolResult` query in a real
+/// workspace can easily return 2 MB+ (~500k tokens), which blows the
+/// prompt cap on the next turn. Even at the default, a recipe that
+/// chains 8 sweep calls in one turn accumulates ~1 MB of tool-result
+/// content. The MAX (512 KB) is the rare-case ceiling — the LLM may
+/// override via `byte_limit` within these bounds, but should narrow the
+/// query (aggregate_id, tighter `since/until`) before bumping the cap.
+///
+/// History: bounds tightened from {DEFAULT=256K, MAX=1M} after a weekly
+/// workspace-learning trigger sent 1.54M tokens to a 1M-cap Opus API
+/// and crashed with `prompt is too long`. Eight `query_events` calls at
+/// the old 256K default totalled ~2MB of tool results in the LLM
+/// context, and `chars/4` estimation undercounted by ~2.4×.
+pub(crate) const QUERY_EVENTS_BYTE_BUDGET: ClampBounds<i64> = ClampBounds {
+    default: 128 * 1024,
+    min: 1024,
+    max: 512 * 1024,
+};
+
+/// Row-count bounds for the `query_events` LLM tool. The default of 50
+/// matches the `workspace-learning` recipe's "sampling, not enumeration"
+/// rule. The MAX of 200 leaves room for a deliberate full-window pull
+/// on a small event type (e.g. `EngineSupervisorRespawned` over a year)
+/// without enabling the abuse pattern that crashed the May 25 trigger
+/// (single calls at `limit: 300/500` for high-byte-per-row types).
+pub(crate) const QUERY_EVENTS_LIMIT: ClampBounds<i64> = ClampBounds {
+    default: 50,
+    min: 1,
+    max: 200,
+};
+
+/// Serialise events to compact JSON, stopping when the next event would
+/// push the cumulative size over `byte_limit`. Always returns a wrapper
+/// `{events, total_matching, returned, byte_size, truncated, hint?}` so
+/// the LLM can see whether it got the full result and how to narrow if
+/// not.
+///
+/// Guarantee: even on `Vec` size > 0 with `byte_limit < first_event_size`
+/// the response is still valid — `events` will be empty and `truncated`
+/// will be true, telling the LLM to bump `byte_limit` or narrow the
+/// query.
+pub(crate) fn build_query_events_response(
+    events: &[crate::core::EventRow],
+    byte_limit: i64,
+) -> String {
+    let mut included: Vec<serde_json::Value> = Vec::new();
+    let mut running: i64 = 0;
+    for row in events {
+        let Ok(val) = serde_json::to_value(row) else {
+            continue;
+        };
+        let bytes = serde_json::to_string(&val).map(|s| s.len()).unwrap_or(0) as i64;
+        let next = running.saturating_add(bytes);
+        if next > byte_limit {
+            // Stop on the first event that wouldn't fit. If it's the first
+            // event overall, we still return an empty list with truncated=true
+            // so the LLM knows to bump byte_limit or narrow the query.
+            break;
+        }
+        included.push(val);
+        running = next;
+    }
+
+    let total_matching = events.len();
+    let returned = included.len();
+    let truncated = returned < total_matching;
+    let mut wrapper = serde_json::json!({
+        "events": included,
+        "total_matching": total_matching,
+        "returned": returned,
+        "byte_size": running,
+        "truncated": truncated,
+    });
+    if truncated {
+        if let Some(obj) = wrapper.as_object_mut() {
+            obj.insert(
+                "hint".into(),
+                serde_json::Value::String(QUERY_EVENTS_TRUNCATION_HINT.into()),
+            );
+        }
+    }
+    wrapper.to_string()
+}
+
+/// The narrowing arguments [`QUERY_EVENTS_TRUNCATION_HINT`] tells the model to
+/// reach for. Test-only: it is the claim
+/// `truncation_hint_names_only_real_query_arguments` checks in both directions,
+/// that each name really is a property of the `events` domain's `query`
+/// operation, and that the hint really does mention it.
+#[cfg(test)]
+const QUERY_EVENTS_HINT_FILTERS: &[&str] = &["event_type", "since", "until"];
+
+/// What `query_events` says when its result didn't fit `byte_limit`.
+///
+/// It must only ever name arguments the tool accepts. It previously said
+/// "Narrow by aggregate_id", and `aggregate_id` is a real COLUMN on the
+/// `events` table but not an argument of this tool, so the advice sent the
+/// model into a retry with an ignored parameter and an identical truncated
+/// result.
+const QUERY_EVENTS_TRUNCATION_HINT: &str =
+    "result truncated to fit byte_limit. Narrow with event_type, shorten the \
+     time window with since/until, or call count_events first to size the sweep \
+     before drilling. Do not retry with a larger byte_limit unless you have \
+     already narrowed the query.";
+
+/// A three-way boolean filter arg, such as `has_draft`. Absent or null
+/// is no filter, and `"true"` / `"false"` spelled as strings are read as
+/// booleans. Anything else is refused: ignoring it would answer with the whole
+/// workspace, a question the model did not ask.
+fn bool_arg(args: &serde_json::Value, name: &str) -> Result<Option<bool>, String> {
+    match args.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(b)) => Ok(Some(*b)),
+        Some(serde_json::Value::String(s)) if s == "true" || s == "false" => Ok(Some(s == "true")),
+        Some(other) => Err(format!("Error: {name} takes true or false, not {other}.")),
+    }
+}
+
+/// The `change_state` filter: one of [`ChangeStateKind`]'s values, or absent.
+/// The retired `has_diff` filter is refused by name, since ignoring it would
+/// answer with every thread (ADR 0400).
+fn change_state_arg(
+    args: &serde_json::Value,
+) -> Result<Option<crate::engine::thread_lifecycle::ChangeStateKind>, String> {
+    use crate::engine::thread_lifecycle::ChangeStateKind;
+    let allowed = || ChangeStateKind::ALL.map(ChangeStateKind::as_str).join(", ");
+    if args.get("has_diff").is_some() {
+        return Err(format!(
+            "Error: has_diff was replaced by change_state, which takes one of {}.",
+            allowed()
+        ));
+    }
+    match args.get("change_state") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => ChangeStateKind::parse(s)
+            .map(Some)
+            .ok_or_else(|| format!("Error: change_state takes one of {}, not {s:?}.", allowed())),
+        Some(other) => Err(format!("Error: change_state takes a string, not {other}.")),
+    }
+}
+
+/// Resolve the parent filter for `list_threads` / `count_threads`.
+///
+/// The wire shape is a boolean-shaped `my_children`, NOT a `parent` uuid the
+/// model supplies and not a `"self"` sentinel that means something different on
+/// each surface. The caller's own thread id is ambient
+/// (`execute_tool`'s `thread_id`), so a model asking for "my children" cannot
+/// name a thread that is not its own: impossible states made impossible rather
+/// than validated after the fact.
+///
+/// The HTTP surface takes a literal `parent` uuid instead, because it has no
+/// ambient caller to resolve.
+fn parent_filter_arg(args: &serde_json::Value, caller_thread_id: uuid::Uuid) -> Option<uuid::Uuid> {
+    args.get("my_children")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        .then_some(caller_thread_id)
+}
+
+/// Parse the `source` arg accepted by `list_threads` / `count_threads`.
+/// The LLM may emit a comma-separated string (`"chat,trigger"`) or a JSON
+/// array of strings (`["chat", "trigger"]`). Empty results collapse to
+/// `None` so the store helper's "no filter" branch fires. `coding-agent` is
+/// the public filter name; rows are still persisted with the legacy
+/// `claude_code` source.
+fn parse_source_arg(raw: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    let v = raw?;
+    let out: Vec<String> = if let Some(s) = v.as_str() {
+        split_csv(s)
+    } else if let Some(arr) = v.as_array() {
+        arr.iter()
+            .filter_map(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    } else {
+        return None;
+    };
+    let out: Vec<String> = out.into_iter().map(canonical_source_filter_value).collect();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// The `changes` list's `sub_threads_of` argument, settled into a scope. The
+/// `current` alias resolves to the calling thread, and any other non-uuid, or
+/// a non-string, is refused rather than widened to every change.
+fn pending_scope_arg(
+    args: &serde_json::Value,
+    caller: uuid::Uuid,
+) -> Result<crate::core::changes::PendingScope, String> {
+    use crate::core::changes::PendingScope;
+    match args.get("sub_threads_of") {
+        None | Some(serde_json::Value::Null) => Ok(PendingScope::All),
+        Some(serde_json::Value::String(raw)) => {
+            crate::api::resolve_thread_id_arg(raw, Some(caller))
+                .map(PendingScope::SubThreadsOf)
+                .map_err(|e| format!("Error: sub_threads_of: {e}"))
+        }
+        Some(other) => Err(format!(
+            "Error: sub_threads_of must be a thread id string or 'current', got {other}"
+        )),
+    }
+}
+
+/// Parse the `status` arg accepted by `list_threads` / `count_threads`, and
+/// refuse it alongside `active`.
+///
+/// Accepts the array the schema advertises or a comma-separated string, the
+/// same two shapes `parse_source_arg` takes, because a model that has seen one
+/// of these tools will reach for either. Unlike `parse_source_arg` this returns
+/// a `Result`: a status value the model invented must come back as a tool error
+/// it can correct, not as a filter that silently matches nothing.
+fn parse_status_arg(args: &serde_json::Value) -> Result<Vec<ThreadStatus>, String> {
+    let Some(raw) = args.get("status").filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    if args.get("active").and_then(|v| v.as_bool()).is_some() {
+        return Err(format!(
+            "Error: pass either active or status, not both. active is the union \
+             (running, waiting_for_user_answer); status names exactly the statuses \
+             you want, out of {}. For 'is the workspace busy?' use status: \
+             [\"running\"], since a thread awaiting a user answer is blocked on the \
+             human, not working.",
+            crate::core::store::status_value_list()
+        ));
+    }
+    let values: Vec<String> = if let Some(s) = raw.as_str() {
+        s.split(',').map(str::to_string).collect()
+    } else if let Some(arr) = raw.as_array() {
+        arr.iter()
+            .map(|v| match v.as_str() {
+                Some(s) => s.to_string(),
+                // Not silently skipped: a non-string item is a malformed call,
+                // and dropping it would answer a narrower question than asked.
+                None => v.to_string(),
+            })
+            .collect()
+    } else {
+        return Err(format!(
+            "Error: status takes a list of statuses (or a comma-separated string), \
+             one or more of {}.",
+            crate::core::store::status_value_list()
+        ));
+    };
+    crate::core::store::parse_status_filter_values(&values).map_err(|e| format!("Error: {e}"))
+}
+
+/// Resolve the parsed `status` list and the `active` boolean into the single
+/// store filter. Kept separate from [`parse_status_arg`] because
+/// `StatusFilter::OneOf` borrows the parsed vector.
+fn status_filter_arg<'a>(
+    args: &serde_json::Value,
+    statuses: &'a [ThreadStatus],
+) -> crate::core::store::StatusFilter<'a> {
+    if !statuses.is_empty() {
+        crate::core::store::StatusFilter::OneOf(statuses)
+    } else if let Some(want) = args.get("active").and_then(|v| v.as_bool()) {
+        crate::core::store::StatusFilter::Active(want)
+    } else {
+        crate::core::store::StatusFilter::Any
+    }
+}
+
+fn canonical_source_filter_value(value: String) -> String {
+    match value.as_str() {
+        "coding-agent" => "claude_code".to_string(),
+        _ => value,
+    }
+}
+
+/// Everything `send_notification` reads out of the model's args, settled.
+pub(crate) struct SendNotificationArgs {
+    pub title: String,
+    pub message: String,
+    pub app_id: Option<String>,
+    pub link_thread: uuid::Uuid,
+    pub link_event: Option<uuid::Uuid>,
+    pub tap: crate::scheduler::notifications::Tap,
+}
+
+/// Validate the `send_notification` args, so the only work left is the write.
+///
+/// Free function, like [`query_events_impl`] next door, so every refusal is
+/// unit-testable without building a whole `LucidosEngine`.
+///
+/// `thread_id` is the thread the tool call runs in. The DEEP-LINK thread is
+/// `link_thread`, which prefers the `ORIGIN_THREAD_ID` task-local, so a
+/// trigger's notification points at the conversation that fired it. That is
+/// also what the tap's `current` alias resolves to, so the stored tap and the
+/// row's own `thread_id` column name one thread.
+pub(crate) fn parse_send_notification_args(
+    args: &serde_json::Value,
+    thread_id: uuid::Uuid,
+) -> Result<SendNotificationArgs, String> {
+    use crate::scheduler::notifications::{default_tap, resolve_thread_tap_id, Tap};
+
+    let title = match args.get("title").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => return Err("Error: title is required".to_string()),
+    };
+    let message = match args.get("message").and_then(|v| v.as_str()) {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => return Err("Error: message is required".to_string()),
+    };
+
+    // The notification popover compares `notification.app_id` against the
+    // apps list's `id` (the app dir). Only stamp it when the LLM explicitly
+    // passes one. Never auto-stamp from the trigger's owning app. Most
+    // reminders, nudges and summaries should not deep-link, even when their
+    // trigger lives in an app dir for organizational reasons.
+    let app_id: Option<String> = args
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Optional event_id deep-link target. The LLM passes the row id of the
+    // event the user should jump straight to (e.g. the UserQuestionAsked
+    // from the triggering event payload). Validated as a UUID; empty, null
+    // and missing all mean "no event anchor".
+    let link_event: Option<uuid::Uuid> =
+        crate::api::parse_optional_uuid_trimmed(args.get("event_id").and_then(|v| v.as_str()))
+            .map_err(|raw| format!("Error: event_id is not a valid UUID: {}", raw))?;
+
+    // When this trigger fired in response to a thread-scoped event (e.g.
+    // `UserQuestionAsked`), the originating thread lives in a task-local
+    // set by `handle_domain_event`. Prefer it as the deep-link target.
+    // Otherwise the push would point at the trigger LLM's own thread, which
+    // the user has no reason to open.
+    let link_thread = crate::scheduler::user_tasks::ORIGIN_THREAD_ID
+        .try_with(|t| *t)
+        .unwrap_or(thread_id);
+
+    // Missing, null and empty-string all mean the same thing: use
+    // `default_tap`. It navigates to the source event when this
+    // notification names one, and opens the card otherwise. Some LLM
+    // providers emit `"tap": null` or `"tap": ""` for an unset optional, so
+    // both take that default rather than erroring. The structured
+    // `{kind, to?}` object is the only accepted positive shape.
+    // `Tap::Deserialize` strictly rejects the legacy bare-string form
+    // ("modal" / "open_app" / "open_thread" / "none"), and the LLM is
+    // documented against the structured shape.
+    let mut tap: Tap = match args.get("tap") {
+        None | Some(serde_json::Value::Null) => default_tap(Some(link_thread), link_event),
+        Some(serde_json::Value::String(s)) if s.is_empty() => {
+            default_tap(Some(link_thread), link_event)
+        }
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+            format!(
+                "Error: invalid tap {}: expected an object like \
+                 {{\"kind\":\"modal\"}} or \
+                 {{\"kind\":\"navigate\",\"to\":{{\"target\":\"app\",\"app_id\":\"...\"}}}}. \
+                 Parse error: {}",
+                v, e
+            )
+        })?,
+    };
+
+    // The tap's thread id is the only arg here that the page dereferences
+    // LATER, on a device that cannot ask us anything. `link_thread`, not
+    // `thread_id`: `current` means the thread this notification is ABOUT,
+    // which is the one the row's `thread_id` column carries.
+    resolve_thread_tap_id(&mut tap, Some(link_thread)).map_err(|e| format!("Error: {e}"))?;
+
+    Ok(SendNotificationArgs {
+        title,
+        message,
+        app_id,
+        link_thread,
+        link_event,
+        tap,
+    })
+}
+
+/// Split a comma-separated string, trimming each part and dropping
+/// empties. Same semantics as `api::threads::parse_csv` — kept in this
+/// module so the LLM-tool path doesn't pull a `pub(super)` symbol across
+/// crate-internal layers.
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// One refusal for a malformed event address, shared by every tool that takes
+/// one. It names where the agent saw the address, because the commonest cause
+/// is a paraphrase rather than a copy.
+fn bad_event_address(got: impl std::fmt::Display) -> String {
+    format!(
+        "event_id '{got}' is not an event address. Pass the `evt-<32 hex>` \
+         form a tool result states, or a bare uuid."
+    )
+}
+
+/// Write core for the `events` tool's `emit` action, on the bus alone so a test
+/// can drive it without booting the engine.
+///
+/// **The actor is the Lucidos Agent, always.** `execute_tool` runs only on that
+/// agent's own loop (ADR 0150). The model cannot name another actor: an `actor`
+/// in its payload is dropped, and the result says so, so the model never
+/// believes a forged one took.
+pub(crate) async fn emit_event_impl(
+    bus: &crate::engine::event_bus::EventBus,
+    args: &serde_json::Value,
+    emitting_trigger_id: Option<String>,
+) -> ToolOutcome {
+    use crate::engine::event_bus::SystemEvent;
+    use crate::engine::thread_events::{AgentParticipant, MessageOrigin};
+
+    let event_type = match args.get("event_type").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err("Error: event_type is required".to_string()),
+    };
+    let payload = args
+        .get("payload")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let dropped_actor = payload.get(SystemEvent::ACTOR_KEY).is_some();
+    let actor = MessageOrigin::Agent {
+        agent: AgentParticipant::LucidosAgent,
+    };
+    let emitted = bus
+        .emit_domain_event(event_type, payload, false, actor, emitting_trigger_id)
+        .await
+        .map_err(|e| format!("Error: failed to emit event: {}", e))?
+        .expect("a durable domain event always returns its row");
+    let mut text = format!("Event {} emitted (id: {})", event_type, emitted.event_id);
+    if dropped_actor {
+        text.push_str(
+            ". Its payload's `actor` was dropped: the engine records who emitted an event, \
+             and this one reads as you, the Lucidos Agent.",
+        );
+    }
+    Ok(text)
+}
+
+/// Read core for the `events` tool's `query` action. Factored out of the
+/// `LucidosEngine` impl so unit tests can drive every refusal branch against
+/// a real Postgres pool without booting the full engine.
+///
+/// `caller_thread_id` is the thread the tool call runs in, ambient from
+/// `execute_tool`. It is what the `current` alias resolves to, so the model
+/// cannot point the alias at somebody else's conversation.
+pub(crate) async fn query_events_impl(
+    event_store: &crate::core::store::EventStore,
+    args: &serde_json::Value,
+    caller_thread_id: uuid::Uuid,
+) -> ToolOutcome {
+    let event_type = args.get("event_type").and_then(|v| v.as_str());
+    let since = parse_time_filter(args, "since")?;
+    let until = parse_time_filter(args, "until")?;
+    let limit = QUERY_EVENTS_LIMIT.apply(args.get("limit").and_then(|v| v.as_i64()));
+    let byte_limit =
+        QUERY_EVENTS_BYTE_BUDGET.apply(args.get("byte_limit").and_then(|v| v.as_i64()));
+    // Refused rather than ignored. This is the read half of "we talked
+    // about this": the model finds a thread with `threads` 'search', then
+    // asks for its messages here. Silently widening a malformed id to EVERY
+    // thread would hand it another conversation, with no way to tell.
+    // Matched on the VALUE, not on `as_str()`. Filtering to strings first
+    // would send a `thread_id` of `["<uuid>"]` or `{...}` down the absent
+    // arm, which widens the query to every thread.
+    // The alias is the one string that is not an id, and it resolves to the
+    // caller's own thread. Anything else still has to parse as a uuid. Shared
+    // with every other thread-id slot an agent can write, so the vocabulary
+    // cannot drift between them.
+    let thread_id = match args.get("thread_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(raw)) => Some(
+            crate::api::resolve_thread_id_arg(raw, Some(caller_thread_id))
+                .map_err(|e| format!("Error: {e}"))?,
+        ),
+        Some(other) => {
+            return Err(format!(
+                "Error: thread_id must be a uuid string or 'current', got {other}. Pass \
+                 'current' for this thread. For another thread, copy its id from the \
+                 `threads` tool's 'search' or 'list' result."
+            ))
+        }
+    };
+
+    // Dereference half of a noted pointer (ADR 0085). Matched on the VALUE
+    // for the same reason `thread_id` is. A non-string is a malformed
+    // address. Reading it as absent would silently turn a lookup of one
+    // named row into a newest-first window over everything.
+    let event_id = match args.get("event_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(raw)) => {
+            match crate::core::store::parse_event_address(raw) {
+                Some(id) => Some(id),
+                None => return Err(format!("Error: {}", bad_event_address(raw))),
+            }
+        }
+        Some(other) => return Err(format!("Error: {}", bad_event_address(other))),
+    };
+
+    let mut events = event_store
+        .query_events(
+            crate::core::store::EventQueryFilters {
+                event_type,
+                since,
+                until,
+                thread_id,
+                event_id,
+                ..Default::default()
+            },
+            limit,
+        )
+        .await
+        .map_err(|e| format!("Error: failed to query events: {}", e))?;
+
+    // A dereference that resolves to nothing is a failure, not an empty
+    // window. Said plainly, so a mistyped or hallucinated address never
+    // reads to the agent as "that event no longer exists".
+    if let Some(id) = event_id.filter(|_| events.is_empty()) {
+        return Err(format!(
+            "Error: no event has id {id}. Check the address, and drop any \
+             other filter that could exclude it (event_type, thread_id, \
+             since, until)."
+        ));
+    }
+
+    // Dereferencing a tool call returns the PAIR, call then result.
+    //
+    // The address names the call, because that is the form the panel
+    // prints and resumed blocks carry. What the boundary
+    // dropped, though, is the result. The arguments alone resolve the pointer
+    // to the half the agent still remembers. Nothing on this surface gets from
+    // a call id to its result either, since there is no payload filter. That
+    // is a recovery tool that does not recover, which ADR 0085 Decision 5
+    // rules out.
+    if let Some(call) = events.first().filter(|_| event_id.is_some()) {
+        if call.event_type == "ToolCalled" {
+            match event_store
+                .tool_result_for_call(call.id, call.thread_id)
+                .await
+            {
+                // An orphan call has no result to add. Returning the call
+                // alone is the honest answer, not an error.
+                Ok(None) => {}
+                Ok(Some(result)) => events.push(result),
+                Err(e) => return Err(format!("Error: failed to read the tool result: {}", e)),
+            }
+        }
+    }
+    Ok(build_query_events_response(&events, byte_limit))
+}
+
+#[cfg(test)]
+#[path = "tools_tests.rs"]
+mod tests;

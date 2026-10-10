@@ -1,0 +1,1814 @@
+/* The button around each mobile header glyph. It is declared for every width,
+   unlike the mobile tokens below it, because styles/header-mark.css derives
+   --header-nav-edge-reserve from it and declares that at an unscoped :root. A
+   var() with nothing behind it makes the cluster clamp invalid, which drops the
+   nav cluster's width in silence.
+   Three rules have to agree on this box: the buttons themselves, the centred
+   title's reserve, and the nav cluster's edge reserve. */
+:root {
+    --mobile-header-icon-box: 1.75rem;
+}
+
+/* Prevent iOS Safari from scrolling the document when the keyboard opens.
+   overflow:hidden on html reduces (but doesn't fully prevent) the
+   window.scrollY drift that pushes the prompt below the viewport.
+   The JS catch-all in MobileSwipeContainer handles remaining cases.
+   NOTE: Do NOT add height constraints (100%, 100dvh) on html — that
+   causes a black gap at the bottom on iOS Safari PWA (see ba317430). */
+@media (--phone-layout) {
+    html {
+        overflow: hidden;
+    }
+
+    /* Mobile's below-header anchor (see global/base.css for the desktop one).
+       The mobile header is position:fixed at the viewport top, so it OVERLAYS
+       the reclaimed macOS title-bar band rather than sitting below it, and its
+       bottom edge is simply its own height. That height is measured live into
+       --mobile-header-height by useHideOnScroll (it varies with the safe-area
+       inset, and drops to the inset alone while the keyboard pushes the header
+       off); the fallback covers the frames before the first measurement.
+       Redefined at the phone layout line, not the 600px cosmetic one, so the
+       anchor flips exactly when the header layout it describes does. */
+    :root {
+        --app-header-bottom: var(--mobile-header-height, calc(2.75rem + var(--safe-area-top)));
+        /* The one height every mobile header row takes, whichever pane it
+           belongs to (see .mobile-header-row). The value is the tallest control
+           any of them carries, the Lucidos mark's tap target. */
+        --mobile-header-row-height: var(--header-mark-tap);
+        /* What the eye reads as the row's content: the drawn glyph run. The
+           buttons around each glyph are larger, and the mark's tap target is
+           larger still AND tunable, so neither is what the bar's breathing room
+           below the row can be measured from. See .mobile-dot-indicator. */
+        --mobile-header-glyph-box: var(--icon-size-lg);
+        /* The button around each of those glyphs is --mobile-header-icon-box,
+           declared at the top of this file rather than here. Its note there
+           says why it cannot be breakpoint-scoped. */
+        /* The pane dots, and the equal breathing room kept above and below
+           them. */
+        --mobile-dot-size: 0.3125rem;
+        --mobile-dot-gap: 0.375rem;
+        /* What every pane keeps clear at each side: 0 upright, and the Dynamic
+           Island and rounded corners in landscape. The larger of the two
+           insets on both sides, so the column stays centred on a phone whose
+           cutout is on one side only. Backgrounds still run edge to edge. */
+        --phone-side-inset: max(var(--safe-area-left), var(--safe-area-right));
+    }
+
+    /* iOS long-press near container edges auto-selects the nearest block
+       element (rendering as a thin vertical highlight). Suppress globally,
+       then re-enable on content surfaces where selecting text is the point. */
+    body {
+        -webkit-user-select: none;
+        user-select: none;
+    }
+
+    input, textarea, [contenteditable] {
+        -webkit-user-select: text;
+        user-select: text;
+    }
+
+    .markdown-content, .response-content {
+        -webkit-user-select: text;
+        user-select: text;
+    }
+
+    /* The dropdown chevron is tiny by default — bump it on mobile so it reads as
+     * a clear affordance next to the larger touch-target trigger text. */
+    .dropdown-chevron {
+        font-size: var(--font-size-md);
+    }
+}
+
+/* Drawer */
+.drawer-backdrop {
+    position: fixed;
+    /* Lands on the header's bottom edge on BOTH layouts: the anchor already
+       carries the desktop title-bar band and the mobile measured height, so the
+       desktop block below no longer needs its own copy. */
+    top: var(--app-header-bottom);
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: var(--scrim);
+    z-index: 200;
+}
+
+.drawer {
+    position: fixed;
+    /* Same below-header anchor as its backdrop above. Desktop re-anchors the
+       panel to the backdrop instead (position:absolute; top:0), so this is the
+       mobile geometry in practice. */
+    top: var(--app-header-bottom);
+    left: 0;
+    bottom: 0;
+    width: fit-content;
+    min-width: 10rem;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border-color);
+    z-index: 201;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    animation: drawer-slide-in var(--duration-fast) ease-out;
+}
+
+/* Safari ignores padding-bottom on scrollable flex containers — the last item
+   scrolls under the padding instead of stopping before it. Use a flex-child
+   pseudo-element to create reliable bottom space within the scroll flow.
+   The safe-area-inset-bottom covers the home indicator zone on notched iPhones. */
+.drawer::after {
+    content: '';
+    flex-shrink: 0;
+    height: var(--safe-area-bottom);
+    min-height: 0.5rem;
+}
+
+@keyframes drawer-slide-in {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(0); }
+}
+
+/* Tokenized so the panel's exit scales with the animation-speed slider exactly
+   as its entrance above does. A literal here (0.2s, which is what
+   --duration-normal is) left the pair half-scaled the moment the slider moved:
+   the panel slid in over 1.5s at 0.1x and snapped shut in 0.2s. */
+.drawer.closing {
+    animation: drawer-slide-out var(--duration-normal) ease-in forwards;
+}
+
+@keyframes drawer-slide-out {
+    from { transform: translateX(0); }
+    to { transform: translateX(-100%); }
+}
+
+@keyframes drawer-slide-in-right {
+    from { transform: translateX(100%); }
+    to { transform: translateX(0); }
+}
+
+@keyframes drawer-slide-out-right {
+    from { transform: translateX(0); }
+    to { transform: translateX(100%); }
+}
+
+/* Right-edge variant. The drawer emerges from under the hamburger that opened
+   it (drawerSideFor in Drawer.tsx), which on the mobile thread pane header sits
+   at the row's trailing edge. Scoped to the phone layout (isMobile() reads the
+   same definition) so the class can never fight the desktop block below, which
+   positions the panel against the split divider rather than a viewport edge.
+   Only the animation NAME is overridden, so the duration / easing / fill of the
+   base shorthands above still apply. */
+@media (--phone-layout) {
+    .drawer.drawer-right {
+        left: auto;
+        right: 0;
+        border-right: none;
+        border-left: 1px solid var(--border-color);
+        animation-name: drawer-slide-in-right;
+    }
+
+    .drawer.drawer-right.closing {
+        animation-name: drawer-slide-out-right;
+    }
+
+    /* The base row padding puts its wide gutter (and the safe-area inset) on the
+       LEFT, which is the drawer's open edge only in the left variant. Mirror it
+       so a landscape notch can't clip a row against the right edge either. */
+    .drawer.drawer-right .drawer-item {
+        padding-right: max(1.5rem, var(--safe-area-right));
+    }
+}
+
+/* Same token as the panel it dims, for the same reason: the two leave together
+   or the dim outlives the panel by a whole slide at a slow setting. */
+.drawer-backdrop.closing {
+    animation: backdrop-fade-out var(--duration-normal) ease-in forwards;
+}
+
+@keyframes backdrop-fade-out {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+.drawer-item {
+    padding: 0.875rem 1.5rem 0.875rem max(2.5rem, var(--safe-area-left));
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
+    cursor: pointer;
+    min-height: 2.75rem;
+    display: flex;
+    align-items: center;
+}
+
+@media (hover: hover) {
+    .drawer-item:hover {
+        background: var(--bg-hover);
+        color: var(--text-primary);
+    }
+}
+
+.drawer-item.active {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    font-weight: 600;
+}
+
+/* Every row leads with a picture: a pinned app its app icon, a fixed row its
+   glyph. Both take one slot width, so the labels line up. The glyph takes the
+   row's colour, so it follows hover and active. */
+.drawer-item {
+    --app-icon-size: 1.25rem;
+}
+
+.drawer-item > .app-icon {
+    margin-right: 0.75rem;
+}
+
+.drawer-item-glyph {
+    flex: none;
+    display: inline-flex;
+    justify-content: center;
+    width: var(--app-icon-size);
+    margin-right: 0.75rem;
+}
+
+.drawer-item-glyph svg {
+    width: 1.125rem;
+    height: 1.125rem;
+}
+
+/* Sets the pinned apps apart from the fixed rows. */
+.drawer-menu-divider {
+    flex: none;
+    height: 1px;
+    background: var(--border-color);
+}
+
+.drawer-badge {
+    margin-left: auto;
+    /* Blue notification accent, matching the base .badge. */
+    background: var(--accent);
+    color: var(--text-on-accent);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    /* The design height, which styles/badges.css rounds to whole pixels. */
+    --badge-height: 1.25rem;
+    min-width: var(--badge-box, var(--badge-height));
+    height: var(--badge-height);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 0.375rem;
+}
+
+/* Desktop: drawer emerges from the split divider, scoped to panel area */
+@media (--desktop-layout) {
+    .drawer-backdrop {
+        /* `top` comes from the shared --app-header-bottom anchor on the base
+           rule; only the left edge is desktop-specific (the drawer emerges from
+           the split divider rather than the viewport edge). */
+        left: calc(var(--divider-x) + var(--divider-width));
+        overflow: hidden;
+    }
+
+    .drawer {
+        position: absolute;
+        top: 0;
+        left: 0;
+    }
+}
+
+
+/* Mobile responsive overrides */
+@media (max-width: 600px) {
+    html, body {
+        overflow: hidden;
+        width: 100%;
+    }
+
+    html {
+        font-size: var(--user-ui-scale, 112.5%); /* default 18px base on mobile, user-configurable */
+    }
+
+    .drawer-item {
+        padding-left: max(0.75rem, var(--safe-area-left));
+    }
+
+    .prompt-row .prompt-textarea {
+        /* Intentionally a LITERAL, not a --font-size-* token: this must compute
+           to >=16px so focusing it doesn't trigger iOS Safari's input zoom, and
+           the mobile root is 18px (var(--user-ui-scale, 112.5%) above). 0.9rem ×
+           18px = 16.2px clears the threshold; the nearest token (--font-size-lg,
+           0.875rem = 15.75px here) would fall below it. Leave as 0.9rem.
+           Scoped to `.prompt-row`, the CHAT composer, rather than the shared
+           `.prompt-box` shell: the trigger form's Intent field is a .prompt-box
+           too, and there the bump only made one form field a step larger than
+           the ones beside it. */
+        font-size: 0.9rem;
+    }
+
+    .prompt-box .prompt-textarea {
+        /* One empty-box floor for both .prompt-box surfaces, the composer and
+           the Intent field, so they keep one mobile height. It was originally
+           the height of the composer's clear button, which shared this row
+           until that button moved to the prompt row (PromptInput.tsx); the
+           value stays because it is what the mobile composer rests at, and it
+           now answers to nothing but itself. Only the type scale above is
+           composer-specific. */
+        min-height: 2.25rem;
+        -webkit-user-select: text;
+        user-select: text;
+    }
+
+    .files-hint {
+        display: none;
+    }
+
+    /* The content-dissolve fade (opaque background + the .prompt-area::before
+       gradient band above it) now lives in the base .prompt-area rule
+       (panels/content.css) so it renders on desktop too. Mobile keeps only its
+       layout-specific overrides. */
+    .prompt-area {
+        margin-bottom: 0;
+        /* No horizontal override: the base rule's --thread-pane-gutter (plus the
+           scroll gutter, 0px on a touch device) is what keeps the composer
+           aligned with the transcript here too. */
+        padding-bottom: 0.5rem;
+        /* Above edge-swipe-zone (z-index: 1) so prompt buttons are clickable */
+        z-index: 2;
+    }
+
+    /* Rounder textarea corners to match phone screen rounding */
+    .prompt-box {
+        border-radius: calc(var(--radius-surface) * 2);
+    }
+
+    /* List rows — stack vertically so actions don't cramp text. */
+    .list-row {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.5rem;
+    }
+
+    /* Force the info column to the row width so a nowrap label
+       (.list-row-label) ellipsizes instead of growing the column to its
+       intrinsic content width — which would drag .list-row-actions off-screen
+       to the right. flex-shrink alone won't do it: align-items: flex-start
+       sizes children by intrinsic cross-axis content. */
+    .list-row-info {
+        width: 100%;
+    }
+
+    .list-row-name {
+        font-weight: 500;
+    }
+
+    .list-row-actions {
+        align-self: flex-end;
+        justify-content: flex-end;
+    }
+
+    /* Apps and triggers stack like every other mobile row (default column
+       layout above): the name, description, badges, and cron/event lists span
+       the full row width, with the action buttons on their own bottom-right
+       row. They were previously pinned beside the content to save vertical
+       space, but that squeezed long names/descriptions into a narrow column. */
+
+    .thread-row {
+        flex-direction: row;
+        align-items: flex-start;
+    }
+
+    .list-row-url {
+        max-width: calc(100vw - 4.5rem);
+    }
+
+    /* Response content: prevent overflow. Tables are deliberately NOT here.
+       They scroll inside the .table-scroll-wrapper renderMarkdown emits around
+       each one (shared-components.css), and 100vw is not the pane width once
+       the viewport carries a split, so the cap it applied was wrong anyway. */
+    .response-content pre {
+        overflow-x: auto;
+        max-width: calc(100vw - 1.5rem);
+    }
+
+    .response-content img {
+        max-width: 100%;
+        height: auto;
+    }
+
+    /* Break long words in conversation content, turns, and the user bubble */
+    .response-content,
+    .initiator-panel,
+    .initiator-body,
+    .user-bubble {
+        word-break: break-word;
+        overflow-wrap: break-word;
+    }
+
+    .response-content code {
+        overflow-wrap: break-word;
+    }
+
+    .step {
+        word-break: break-word;
+        overflow-wrap: break-word;
+        min-width: 0;
+    }
+
+    /* Invisible extended touch targets — visual size unchanged */
+    .action-btn::before {
+        content: '';
+        position: absolute;
+        inset: -0.375rem -0.25rem;
+    }
+
+    .action-btn {
+        position: relative;
+    }
+
+    /* Notifications — touch-friendly */
+    .notification-item {
+        min-height: 2.75rem;
+    }
+
+    .dropdown-panel-toolbar {
+        flex-shrink: 0;
+        /* Keep the --space-lg (1rem) content-pane gutter on mobile too (so the
+           toggle stays aligned with the .notification-item rows), widened only
+           where the notch's safe-area inset exceeds it. */
+        padding-left: max(var(--space-lg), var(--safe-area-left));
+        padding-right: max(var(--space-lg), var(--safe-area-right));
+    }
+
+    .confirm-dialog {
+        max-width: 90vw;
+    }
+
+    /* A file preview needs the whole phone: the desktop modal's 60rem box would
+       be wider than the viewport, and a glance at code on a 4rem-narrower box is
+       a glance at nothing. Full-bleed, so the frame goes with it. */
+    .file-preview-modal {
+        width: 100%;
+        height: 100%;
+        border: none;
+        border-radius: 0;
+        padding-top: var(--safe-area-top);
+        padding-bottom: var(--safe-area-bottom);
+        box-sizing: border-box;
+    }
+
+    .toast-container {
+        /* `top` (below the fixed header, above the thread title row) comes from
+           the shared --app-header-bottom anchor on the base rule, which the
+           mobile :root above resolves to this header's measured height. Only the
+           side insets are phone-specific. */
+        left: max(0.75rem, var(--safe-area-left));
+        right: max(0.75rem, var(--safe-area-right));
+    }
+
+    .toast {
+        max-width: 100%;
+    }
+
+    /* Two or more buttons share the actions row, so the first starts on the
+       icon's left edge and the last ends under the close X. A wrapped button
+       fills its own row. A lone button keeps its natural width at the right,
+       as on desktop. The one-line toast keeps its action beside the words, so
+       it is excluded. */
+    .toast:not(.toast-inline) .toast-actions > .action-btn:not(:only-child) {
+        flex: 1 1 auto;
+    }
+}
+
+
+/* ─── Mobile split layout override ─── */
+@media (--phone-layout) {
+    /* Use --app-height (set by visualViewport JS) instead of 100dvh.
+       iOS Safari does NOT shrink dvh/vh when the keyboard opens —
+       visualViewport.height is the only reliable signal. */
+    .app-shell {
+        height: var(--app-height, 100dvh);
+    }
+
+    /* ─── Mobile header: fixed, direction-aware hide on scroll ─── */
+
+    /* Dynamic bars glide. hooks/useHideOnScroll.ts writes where each bar
+       belongs, on `translate`, and this transition carries it there on the
+       compositor (ADR 0336). Every bar lists `translate` at this duration,
+       which is 0s while the bars are pinned. */
+    :root[data-mobile-dynamic-bars] {
+        --bars-glide-duration: var(--duration-slow);
+    }
+
+    .app-header {
+        position: fixed !important;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 100;
+        will-change: translate;
+        transition: translate var(--bars-glide-duration, 0s) ease;
+        background: var(--header-gradient);
+        padding-top: var(--safe-area-top);
+        /* The inline inset belongs to the ROWS here, not to this column.
+           `.pane-header` pads the desktop bar, where the header IS one row of
+           controls. This header is a column, and the app-shell banners at its
+           foot span the window. The inherited inset floated each bar a glyph's
+           width inside both screen edges, its border stopping short of each. */
+        padding-inline: 0;
+        flex-direction: column;
+        align-items: stretch;
+        height: auto;
+    }
+
+    /* Content scrolling up dissolves into the page before it reaches the bar.
+       The right inset keeps a classic scrollbar out of the fade. */
+    .app-header::after {
+        content: '';
+        position: absolute;
+        left: 0;
+        right: var(--scrollbar-gutter-width);
+        top: 100%;
+        height: var(--mobile-header-fade);
+        background: linear-gradient(to bottom, var(--bg-primary), transparent);
+        pointer-events: none;
+        transition: opacity var(--duration-normal) ease;
+    }
+
+    /* The app load bar (previews.css) runs along the pane's top edge, which is
+       exactly where this fade hangs, and the header paints above the pane. So
+       the fade stands down while the bar is mounted. Over the load cover it is
+       the cover's own colour, so nothing visible is lost. */
+    :root:has(.app-ui-load-bar) .app-header[data-mobile-view="content"]::after {
+        opacity: 0;
+    }
+
+    /* A thread's sticky title bar sits under the header and carries its own
+       fade (.mobile-thread-title-row::after), so this one would only shade it. */
+    .app-header[data-mobile-view="thread"]::after {
+        display: none;
+    }
+
+    /* Show the right mobile header section based on current view */
+    .app-header[data-mobile-view="threads"] .mobile-threads-header { display: flex; }
+    .app-header[data-mobile-view="thread"] .mobile-thread-header { display: flex; }
+    /* mobile-thread-title-row is no longer in the header — it lives inside
+       .thread-content (scroll container) so it swipes with the pane. */
+    .app-header[data-mobile-view="content"] .mobile-content-header { display: flex; }
+
+    /* Where that inset lives now. It goes on the section rather than on the
+       `.mobile-header-row` inside it, so the row's box is unchanged. The row is
+       what every centred cluster is positioned against, and what its
+       non-overlap reserve is derived from. */
+    .mobile-threads-header,
+    .mobile-thread-header,
+    .mobile-content-header {
+        padding-inline: calc(var(--header-padding-x) + var(--phone-side-inset));
+    }
+
+    /* Row inside each mobile header (icons + title).
+
+       A fixed HEIGHT, not a min-height, so all three rows are the same height
+       by construction rather than by coincidence. Under a min-height each row
+       was as tall as its own tallest IN-FLOW control, and the threads row alone
+       carried the Lucidos mark in flow while the thread pane's sat in the
+       absolutely-positioned .header-nav-cluster and contributed nothing. So the
+       threads row stood 0.1rem taller than the other two, visibly, and the
+       header changed height as the user swiped between panes, taking everything
+       anchored to --mobile-header-height with it. Every row's mark is in a
+       cluster now, which makes the three agree on their own; the fixed height
+       is what stops the next in-flow control from splitting them again.
+       Sized off the tallest control so nothing had to shrink to agree; a taller
+       control added later must raise this token with it. */
+    .mobile-header-row {
+        display: flex;
+        align-items: center;
+        width: 100%;
+        height: var(--mobile-header-row-height);
+        gap: 0.25rem;
+        position: relative;
+    }
+
+    /* The threads row's title, and the only user of this class left:
+       the thread and content rows carry a centred nav CLUSTER instead
+       (styles/header-mark.css), which is centred the same way for the same
+       reason but sized by its own span.
+
+       TRUE-centered on the row's middle (like the pane dots and the desktop
+       header), absolute so it sits on the viewport axis regardless of the
+       leading (grouping, filter) and trailing (search) cluster widths, NOT midway
+       between them: an in-flow title centers between the clusters, so it drifts
+       off the viewport middle whenever the two differ in width, which is the
+       off-center look this replaces. A symmetric `max-width` reserve keeps the
+       centered box clear of what flanks it, so a long title clamps at that
+       edge instead of crossing it. The threads title then hides rather than
+       ellipsizing (`ThreadsPaneTitle`, panels/shell.css).
+
+       The binding neighbour is this row's Lucidos MARK, which no longer rides
+       the trailing icon run: it sits on the nav cluster's trailing edge, the
+       forward chevron's column on the other two panes. So the reserve is
+       derived from that cluster rather than from a constant rem, and it is one
+       subtraction of it: the title may span the cluster less a mark's button
+       and its clearance at each end. A rem constant would only agree with the
+       mark at one ui-scale, since the cluster's own width is measured against
+       the row (at 150% the pair used to kiss). Clearing the mark clears the
+       row's own edges with it, on the reserve arm for free: there the cluster
+       keeps --header-nav-edge-reserve (two icon boxes and a gap) at each end,
+       as wide as the two buttons at each end of the row. On the floor arm
+       the ends keep only (row - min span)/2, which is the same regime where the
+       other two rows' chevrons reach their own edge controls, and it is what
+       --header-nav-min-span's note is about.
+
+       The title pays for the mark being further in: past ~137.5% ui-scale on a
+       375px phone the reserve is narrower than the word, so the title hides
+       where the old constant still fit it. That is honest rather
+       than a miss, the mark really is there, and it is the same thing the
+       content row's title does at those scales.
+
+       pointer-events:none passes taps through to the clusters beneath. The
+       single trailing .pane-header-spacer (flex:1) pins the in-flow clusters to
+       the row edges; search-active hides all non-searchbar children via the
+       .mobile-header-row rule below. */
+    .mobile-header-title {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        max-width: calc(
+            var(--header-nav-cluster-width)
+            - 2 * (var(--mobile-header-icon-box) + var(--header-nav-gap))
+        );
+        text-align: center;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        pointer-events: none;
+    }
+
+    .mobile-header-title > * {
+        pointer-events: auto;
+    }
+
+    /* No `.pane-header-brand` rules here any more. That was the mobile thread
+       row's "Lucidos" label with its wider reserve, and the row carries the
+       Lucidos MARK in the centred nav cluster instead now (see
+       styles/header-mark.css). `.pane-header-brand` still exists, but only as
+       desktop markup (AppHeader.tsx), which no mobile rule should be sizing. */
+
+    /* Mobile header slot — square so hamburger/nav/search line up. Drawer
+     * rows are sized separately in drawer.css. */
+    .mobile-header-row .icon-btn.header-icon {
+        width: var(--mobile-header-icon-box);
+        height: var(--mobile-header-icon-box);
+    }
+
+    /* Each icon takes a tap the full --header-nav-hit-target tall, so a thumb
+       landing short of a glyph at the screen top still hits it. The button box
+       stays put, because the row's reserves place it.
+       The reach stays inside the button's own width. The content row's actions
+       sit flush against the forward chevron and are raised over it, so a
+       sideways reach would cover the chevron's own button. The nav chevrons
+       carry their own wider reach (styles/header-mark.css). */
+    .mobile-header-row .icon-btn.header-icon:not(.nav-chevron)::before {
+        content: '';
+        position: absolute;
+        inset: calc((var(--mobile-header-icon-box) - var(--header-nav-hit-target)) / 2) 0;
+    }
+
+    /* A panel refresh (MobileRefreshIndicator), in the leading slot the edge
+       reserve holds. A status, not a target. The spinner and the check share
+       one cell and crossfade once the spinner's minimum hold has run. Each
+       glyph fades itself: a fade on the slot as well would multiply with the
+       check's and blink it out. */
+    .mobile-refresh-indicator {
+        display: inline-grid;
+        place-items: center;
+        flex-shrink: 0;
+        width: var(--mobile-header-icon-box);
+        height: var(--mobile-header-icon-box);
+        color: var(--header-fg-muted);
+        pointer-events: none;
+    }
+
+    /* The spinner shrinks away as the check grows into its place. `scale`
+       rather than `transform`, which the spin animation owns. */
+    .mobile-refresh-indicator svg {
+        grid-area: 1 / 1;
+        width: var(--icon-size-lg);
+        height: var(--icon-size-lg);
+        transition: opacity var(--duration-slow) ease, scale var(--duration-slow) ease;
+    }
+
+    /* The spin is an activity indicator, so it keeps a literal duration. It
+       runs through the crossfade to the check, since stopping would snap the
+       arrow upright mid-fade. It stops at rest, where a hidden spin still
+       costs frames. */
+    .mobile-refresh-indicator:not([data-state="idle"]) svg:not(.refresh-check) {
+        animation: spin 1s linear infinite;
+    }
+
+    :root[data-motion="reduce"] .mobile-refresh-indicator:not([data-state="idle"]) svg:not(.refresh-check) {
+        animation: none;
+    }
+
+    /* The arrow shows only while refreshing. Keyed on `done` alone, it would
+       fade back in over the check as the indicator leaves. */
+    .mobile-refresh-indicator:not([data-state="refreshing"]) svg:not(.refresh-check) {
+        opacity: 0;
+        scale: 0.6;
+    }
+
+    /* The check grows in, then fades out at full size. Its `scale` resets
+       only once it is invisible, so the exit reads as a fade. */
+    .mobile-refresh-indicator .refresh-check {
+        color: var(--header-fg);
+        opacity: 0;
+        scale: 0.6;
+        transition: opacity var(--duration-slow) ease-in-out, scale 0s var(--duration-slow);
+    }
+
+    .mobile-refresh-indicator[data-state="done"] .refresh-check {
+        opacity: 1;
+        scale: 1;
+        transition: opacity var(--duration-slow) ease, scale var(--duration-slow) ease;
+    }
+
+    /* Above .edge-swipe-zone (z-index: 1), like .prompt-area above, and for the
+       same reason: an action cluster pinned to a row's right edge sits under
+       that transparent strip, which is 1.25rem of the screen and therefore a
+       third of a 2.25rem button. A tap landing on the strip reaches neither the
+       button nor `isInteractiveTarget`, so it is read as an edge gesture and
+       preventDefault()ed, and the control is close to unhittable. The strip
+       exists to beat an app IFRAME to the touch (see EdgeSwipeZones), never a
+       host control, and the swipe container sees an edge touch through a lifted
+       button anyway, because touch events bubble to it either way.
+
+       The thread title bar's menu button needs nothing here either:
+       `.mobile-thread-title-row` already carries
+       its own `z-index: 2` below, and its `transform` makes it a stacking
+       context, so its children are lifted with it and could not be lifted past
+       it. Pinned by e2e/trigger-group-actions-edge-mobile.spec.ts, which
+       hit-tests the button's outer edge rather than tapping its centre. */
+    .list-section-actions {
+        position: relative;
+        z-index: 2;
+    }
+
+    /* Badge position reset for smaller mobile icons.
+
+       The offset parks the badge ON the button's corner, so its ring straddles
+       the edge: roughly half the arc falls outside the control, on the bare
+       bar. No single colour matches both halves, so the veil is dropped and
+       the ring keeps the bar it has always had. Mobile is therefore unchanged,
+       and the dark notch the veil removes on desktop is still there on the
+       half of the arc that crosses a toggled square. Ending that needs the
+       badge back INSIDE the box, which is a layout change this is not.
+
+       The mark's two badges are already inside their host, and header-mark.css
+       has them keep whatever veil the slot carries. See --header-control-veil
+       in panels/shell.css. */
+    .badge {
+        top: -0.125rem;
+        right: -0.125rem;
+        --header-control-veil: 0%;
+    }
+
+    .mobile-header-row .hamburger-panel {
+        padding: 0.375rem;
+    }
+
+    /* The threads Filter button just packs to the left edge; the title is
+       absolutely centered on the row middle (see .mobile-header-title), so the
+       titles line up across panes with no fixed leading-width reservation. */
+
+    /* The absolutely-centered title is pointer-events:none, so lift the content
+       action cluster into its own stacking context: if a long content title
+       reaches under these icons, they still paint over it AND win the tap (the
+       content title below re-enables pointer events for its tap tooltip, so
+       without this a long title could intercept an action). */
+    .mobile-header-row .content-header-actions {
+        position: relative;
+        z-index: 1;
+    }
+
+    .mobile-content-title {
+        /* No width of its own: the title is the one shrinkable member of the
+           fixed-width `.header-title-cluster` (styles/header-mark.css), so the
+           span between the chevrons IS its bound and flexbox applies it.
+
+           This used to be a JS-measured box. The hook read the row, folded
+           trailing actions into the overflow menu until the full title fit, and
+           published `--mobile-content-title-max` plus a `--mobile-content-title-shift`
+           that slid the box into whichever side had slack. All of that existed
+           because a variable-width title faced a variable-width trailing
+           cluster and a constant rem reserve cannot clear one at every
+           ui-scale. Both variables are gone: the cluster always collapses to
+           the overflow menu plus the bell (ContentHeaderActions), and the
+           chevrons are pinned to a clamped span, so the bound is expressible in
+           CSS and the measurement was deleted with the properties it published. */
+        /* Bare text node (no element child for `.mobile-header-title > *` to
+           re-enable), so re-enable pointer events here — the tap tooltip
+           (data-tooltip-tap) reveals the full truncated title. Safe: the action
+           cluster is lifted above it (z-index above), so it can't intercept an
+           action tap even if a long title reaches under the icons. */
+        pointer-events: auto;
+    }
+
+    /* Hide desktop content title on mobile */
+    .pane-header-content-title {
+        display: none;
+    }
+
+    /* Always in DOM so iOS can focus() synchronously within a user gesture.
+       No width/height constraints — composeHandlers focuses before toggling
+       .search-active, so the input needs natural dimensions for correct caret. */
+    .mobile-thread-search-bar {
+        position: absolute;
+        overflow: hidden;
+        clip-path: inset(50%);
+        pointer-events: none;
+    }
+
+    .mobile-threads-header.search-active .mobile-thread-search-bar {
+        position: static;
+        overflow: visible;
+        clip-path: none;
+        pointer-events: auto;
+        flex: 1;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding-left: 0.5rem;
+        min-width: 0;
+    }
+
+    .mobile-threads-header.search-active .mobile-header-row > *:not(.mobile-thread-search-bar) {
+        display: none !important;
+    }
+
+    .mobile-thread-search-bar .search-field {
+        flex: 1;
+    }
+
+    /* ─── Sticky thread title bar inside the scroll container ─── */
+    /* Positioned via CSS vars set by useHideOnScroll so it tracks the header
+       bottom edge and hides proportionally when the header scrolls out. */
+    .mobile-swipe-pane .mobile-thread-title-row {
+        --title-icon-box: 1.25rem;
+        display: flex;
+        align-items: flex-start;
+        gap: 0.25rem 0.75rem;
+        /* Right padding matches `.pane-header`'s `--header-padding-x` so the
+         * action icons land in the same slot as the mobile header above.
+         * Symmetric 0.5rem top/bottom: just the title's own padding, with no
+         * extra gap before the first message. */
+        padding: 0.5rem calc(0.625rem + var(--phone-side-inset)) 0.5rem calc(1rem + var(--phone-side-inset));
+        /* Opaque, so content scrolling under the sticky bar is covered. On the
+         * page colour at the top of the thread; once content slides under it,
+         * the faint --bg-secondary band fades in. Without the band the title
+         * would slide away with the header like loose transcript text. The
+         * ::after fade below dissolves the content, kept out of the box so it
+         * adds no at-rest gap. */
+        background: var(--bg-primary);
+        -webkit-user-select: none;
+        user-select: none;
+        position: sticky;
+        /* Tracks the header's bottom edge via CSS vars from useHideOnScroll.
+           The offset extends past -headerHeight by titleHeight so the title
+           bar leaves the screen together with the header.
+
+           The offset rides `translate`, NOT `top`. A LAYOUT property would make
+           the next scroll event's `scrollTop` read flush style and layout for
+           the whole transcript, the largest DOM in the app. `translate` is
+           composited, and it is what the dynamic bars glide on.
+
+           The row unsticks only near the top, where the header shows and the
+           offset is 0. So the translate never moves a row in normal flow. */
+        top: var(--mobile-header-height, 3rem);
+        z-index: 2;
+    }
+
+    .mobile-swipe-pane .mobile-thread-title-row {
+        flex-shrink: 0;
+        transition: background-color var(--duration-normal) ease,
+            translate var(--bars-glide-duration, 0s) ease;
+        will-change: translate;
+        /* Safe as a transform here because it makes this row the containing
+           block for any `position: fixed` descendant: the only one is the ⋯
+           menu, which already portals to <body> for exactly this reason (see
+           OverflowMenu).
+
+           `transform` undoes the iOS repaint nudge's compensation, which cancels
+           a scroll this sticky row never took. It stays off `translate` so the
+           glide never animates it. utils/webkitRepaint.ts publishes the shift
+           here, on this element alone. Why the two simply add:
+           docs/plans/2026-08-16-the-sticky-title-undoes-the-repaint-nudge-compensation.md */
+        translate: 0 var(--mobile-header-offset, 0rem);
+        transform: translateY(calc(-1 * var(--repaint-nudge-shift, 0px)));
+        /* Stretch to full width, cancelling .thread-content's horizontal padding
+           (the same token the transcript pads with, so the two can't drift).
+           That token carries the side inset, so the band reaches both edges
+           and the padding above adds the inset back for the title. Uncapped,
+           unlike the turns, or a phone in landscape stops the band short. */
+        max-width: none;
+        margin-left: calc(-1 * var(--thread-pane-gutter));
+        margin-right: calc(-1 * var(--thread-pane-gutter));
+        /* No margin-bottom — the title's 0.5rem bottom padding is the only space
+         * before the first message. */
+    }
+
+    /* A row scrolled into view clears the fixed header. */
+    .mobile-swipe-pane .thread-drawer-tree .thread-row {
+        scroll-margin-top: var(--mobile-header-height, 3rem);
+    }
+
+    /* The Ongoing tiles scroll with the rows here. */
+    .mobile-swipe-pane .drawer-ongoing-tiles {
+        position: static;
+    }
+
+    .mobile-swipe-pane .mobile-thread-title-row.scrolled {
+        background: var(--bg-secondary);
+    }
+
+    /* Fade transition below the sticky title: while the transcript is scrolled,
+       content passing up under the bar dissolves into the page background rather
+       than being cut off at the title's edge. It's an absolutely-positioned
+       overlay anchored to the bar's bottom (top: 100%), so it adds NO layout
+       space — the at-rest gap before the first message stays just the title's
+       0.5rem padding. Gated on `.scrolled` (driven by the notAtTop signal) so the
+       first message is crisp at the very top of the thread and the fade only eases
+       in once content is actually sliding under the title. pointer-events: none so
+       taps fall through to the content. */
+    .mobile-swipe-pane .mobile-thread-title-row::after {
+        content: '';
+        position: absolute;
+        top: 100%;
+        left: 0;
+        right: 0;
+        /* --mobile-title-fade (base.css) — shared with the mobile .chat-exchange
+           scroll-margin-top (chat/response.css) so a navigated turn lands clear
+           of this band. */
+        height: var(--mobile-title-fade);
+        background: linear-gradient(to bottom, var(--bg-primary), transparent);
+        opacity: 0;
+        transition: opacity var(--duration-normal) ease;
+        pointer-events: none;
+    }
+
+    .mobile-swipe-pane .mobile-thread-title-row.scrolled::after {
+        opacity: 1;
+    }
+
+}
+
+/* ─── Keyboard-active: disable accidental taps ─── */
+/* When a textarea is focused on mobile, block pointer-events on
+   everything except the prompt area so stray taps can't select threads,
+   tabs, or other UI elements while the keyboard is open. */
+@media (--phone-layout) {
+    :root[data-keyboard-active] .app-header {
+        pointer-events: none;
+    }
+
+    :root[data-keyboard-active] .mobile-thread-title-row {
+        pointer-events: none;
+    }
+
+    /* The title's menu holds in-place actions on the current thread, not a
+       navigation. Keep it tappable while the keyboard is up, since iOS Safari
+       has no fallback click path. */
+    :root[data-keyboard-active] .mobile-thread-title-row .thread-title-menu {
+        pointer-events: auto;
+    }
+
+    /* The DOTS as well as the band: the band is `pointer-events: none` in its
+       own right now (it overlaps the row's buttons), so the dots re-enable
+       theirs, and an ancestor-only rule here would no longer reach them. */
+    :root[data-keyboard-active] .mobile-dot-indicator,
+    :root[data-keyboard-active] .mobile-dot {
+        pointer-events: none;
+    }
+
+    :root[data-keyboard-active] .edge-swipe-zone {
+        pointer-events: none;
+    }
+
+    /* The transcript's CONTENT, never the scroller itself. `pointer-events` is
+       an inherited property, so blocking the children inerts the whole subtree
+       while `.thread-content` stays a hit target, and that difference is the
+       whole point: a touch is hit-tested to the deepest element that answers
+       the pointer, and the browser then pans that element's nearest scrollable
+       ancestor. Blocking the scroller sent the touch to `.thread-content-wrap`,
+       which scrolls nothing, so the transcript FROZE the moment a textarea took
+       focus: no scrolling, and no reaching a live question card's options. The
+       horizontal pane swipe kept working (its handler is on the swipe
+       container, above the wrap), which is exactly how the report read: "swipe
+       up/down did not work, frozen, swipe left/right worked".
+
+       Stray taps are still blocked, which is all this block was ever for: with
+       every child inert the tap lands on the scroller, a non-focusable element,
+       so WebKit blurs the composer and the keyboard drops instead of a message,
+       step, or option being activated behind it. */
+    :root[data-keyboard-active] .thread-content > * {
+        pointer-events: none;
+    }
+
+    /* …but NOT in the compose-empty layout. There `.thread-content` holds the
+       welcome surface — starter suggestions and the "Don't show this again"
+       pill — which is docked directly above the prompt precisely so it can be
+       tapped WHILE composing. The blanket block above is aimed at the
+       transcript (stray taps selecting a message with the keyboard up); applied
+       here it killed the suggestions the moment the user typed anything, so
+       tapping one silently did nothing on iOS. Same carve-out shape as the
+       title row's pin button above and `.prompt-area` below. */
+    :root[data-keyboard-active] .compose-empty .thread-content > * {
+        pointer-events: auto;
+    }
+
+    /* Re-enable pointer events on the prompt area and its children */
+    :root[data-keyboard-active] .prompt-area {
+        pointer-events: auto;
+    }
+}
+
+/* ─── Mobile swipe container ─── */
+
+.mobile-swipe-wrapper {
+    display: none;
+}
+
+@media (--phone-layout) {
+    .mobile-swipe-wrapper {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        position: relative;
+    }
+
+    .mobile-swipe-container {
+        flex: 1;
+        min-height: 0;
+        /* `hidden`, never `clip`: under `clip` iOS stopped opening the
+           prompt box's edit menu (ADR 0420). A scroll into view can slide
+           this strip sideways, and MobileSwipeContainer's scroll reset puts
+           it back. */
+        overflow: hidden;
+        position: relative;
+        /* Let the browser handle vertical pan natively; JS handles horizontal swipe.
+           Without this, Android Chrome may fight for horizontal gestures (back nav). */
+        touch-action: pan-y;
+        /* Force a compositor layer so the overflow clip holds .mobile-swipe-track
+           at composition time. The track has will-change:transform (own layer);
+           without a layer here too, iOS Safari clips at paint time and during
+           rapid back-and-forth swipes the full 300%-wide track can momentarily
+           render outside this container — showing all three panes at once
+           before self-correcting on the next frame. */
+        -webkit-transform: translateZ(0);
+        transform: translateZ(0);
+    }
+
+    .mobile-swipe-track {
+        display: flex;
+        width: 300%;
+        height: 100%;
+        will-change: transform;
+        transition: transform var(--duration-slow) ease;
+    }
+
+    /* Edge swipe zones: transparent strips at screen edges that sit above
+       iframes so touch events reach the parent swipe handler. Without these,
+       iframes capture all touches and pane navigation doesn't work.
+       Left zone is wider (2.5rem) so the "back" swipe gesture is easy to
+       initiate: Apple's HIG recommends 44px minimum touch targets, which
+       2.5rem clears at the mobile root size. The px equivalent moves with the
+       user's UI scale, so `MobileSwipeContainer` mirrors these in rem and
+       multiplies by the live root size. */
+    .edge-swipe-zone {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        z-index: 1;
+        touch-action: pan-y;
+    }
+    .edge-swipe-left  { left: 0; width: 2.5rem; }
+    .edge-swipe-right { right: 0; width: 1.25rem; }
+
+    /* The mobile header is position:fixed over the panes, so EVERY scroll
+       container a pane shows has to reserve its height itself. Use ::before
+       pseudo-elements as flex-child spacers instead of padding-top so the
+       header space is a real element in the layout flow.
+
+       `.thread-filter-cover` is on this list because it COVERS
+       `.thread-drawer-list` (see ThreadFilterPanel) rather than rendering
+       inside it, so it inherits nothing from the list's spacer and its first
+       row lands behind the header without one. The panel is the scroller
+       itself, so its spacer is its first scrolling child, exactly as the
+       list's is. (It briefly was not: it spent a day as a flex column with a
+       pinned Close footer and an inner scrolling body, which is why this
+       paragraph has been rewritten twice. The footer is gone; the header's
+       Filter button is the way out.) Any future view that covers a pane the
+       same way joins this list. */
+    .mobile-swipe-pane .content-pane-body::before,
+    .mobile-swipe-pane .thread-drawer-list::before,
+    .mobile-swipe-pane .thread-view-drawing-list::before,
+    .mobile-swipe-pane .thread-filter-cover::before,
+    .mobile-swipe-pane .thread-content::before {
+        content: '';
+        display: block;
+        flex-shrink: 0;
+        /* The transcript's spacer also carries the scroll anchor's sub-pixel
+           rest, as the desktop padding-top does (ADR 0286). Only
+           `.thread-content` sets the variable, so it is 0 on the rest. */
+        height: calc(var(--app-header-bottom) + var(--anchor-subpixel, 0px));
+    }
+
+    /* A view that fills the pane fills what the spacer leaves. At the full
+       pane height it would overflow by the spacer, and even a short view would
+       scroll its top up behind the header. The URL preview is positioned rather than
+       in flow, so it starts where the spacer ends. The frame's selector must
+       not outrank the flowing repo preview's `height: auto` further down.
+       A column view only starts at that height and grows with its content,
+       for the end space (panels/content.css). */
+    .mobile-swipe-pane .content-pane-body > .content-view-full-bleed.active,
+    .mobile-swipe-pane .content-pane-body > .file-preview-frame {
+        height: calc(100% - var(--app-header-bottom));
+    }
+    .mobile-swipe-pane .content-pane-body > .content-view.active {
+        min-height: calc(100% - var(--app-header-bottom));
+    }
+    .mobile-swipe-pane .content-pane-body > .url-preview-inline {
+        top: var(--app-header-bottom);
+    }
+
+    /* The pull arrow drops from under the overlaid header, where the pane's
+       spacer above ends, not from behind the header. */
+    .mobile-swipe-pane .content-pane {
+        --pull-refresh-top: var(--app-header-bottom);
+    }
+
+    /* The thread pane takes the side inset through --thread-pane-gutter, so its
+       title band can still reach the edges. These two take it whole. */
+    .mobile-swipe-pane .content-pane,
+    .mobile-swipe-pane > .mobile-threads-pane {
+        padding-inline: var(--phone-side-inset);
+    }
+
+    /* The inline form (trigger/credential/app/plugin editors) sits INSIDE the
+       .content-pane-body scroll container, which already carries the ::before
+       header spacer above. Its desktop `height: 100%` + own `overflow-y: auto`
+       made it a SECOND scroller sized to the full pane height — so positioned
+       after the spacer, its box bottom landed a header-height BELOW the viewport
+       and the Cancel/Save actions at the form's end were clipped off-screen and
+       unreachable on mobile. Let the form flow in the pane's own scroller
+       instead. The pane's end space clears the home indicator below it. */
+    .mobile-swipe-pane .inline-form {
+        height: auto;
+        overflow-y: visible;
+    }
+
+    /* The repo preview (a diff, the rendered diff, the whole file) flows in the
+       pane's own scroller too, for the same reason as the form above. As a
+       pane-height box with its own inner scroller, it hid from the header: a
+       drag on the diff never hid the header, and a drag on the path row stuck
+       after one header height. The `:has()` names the text bodies only. A repo
+       PDF or video, whole-file in a diff included, keeps the definite height
+       it sizes itself by. */
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered),
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered) :is(.repo-preview-split, .repo-preview-fade, .repo-file-content, .rendered-diff) {
+        height: auto;
+    }
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered) .repo-preview-fade {
+        grid-template-rows: auto;
+    }
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered) :is(.repo-preview-split-main, .rendered-diff) {
+        overflow: visible;
+    }
+    /* `clip` rather than `hidden`, which would turn the visible y back into a
+       scroller. The wide-line pan of `.repo-file-content` stays: at auto height
+       its own scroller has nothing to scroll vertically. */
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered) .diff-view {
+        overflow-x: clip;
+        overflow-y: visible;
+    }
+
+    /* A data file's text body (a document, a table, source) flows the same way.
+       The HTML frame, the editor and the media keep their definite height,
+       under their skeletons too, which draw the same text classes. The
+       wide-line pan of `.file-preview-content` stays, as the repo's does. */
+    .mobile-swipe-pane .file-preview-frame:has(.file-preview-content .loading-fade-content :is(.markdown-content, .csv-table, .line-numbered)),
+    .mobile-swipe-pane .file-preview-frame:has(.file-preview-content .loading-fade-content :is(.markdown-content, .csv-table, .line-numbered)) :is(.file-preview-inline, .file-preview-fade) {
+        height: auto;
+    }
+    .mobile-swipe-pane .file-preview-frame:has(.file-preview-content .loading-fade-content :is(.markdown-content, .csv-table, .line-numbered)) .file-preview-fade {
+        grid-template-rows: auto;
+    }
+
+    /* A flowing preview scrolls the pane like a column view, so it takes the
+       column's end space (panels/content.css) despite being full-bleed. */
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered)::after,
+    .mobile-swipe-pane .file-preview-frame:has(.file-preview-content .loading-fade-content :is(.markdown-content, .csv-table, .line-numbered))::after {
+        content: '';
+        flex-shrink: 0;
+        height: var(--pane-end-space);
+    }
+
+    /* The ::before spacer replaces padding-top, so zero out the base padding-top
+       on .thread-content. The spacer carries the anchor rest the desktop padding
+       does, and the sticky title covers the top.
+       padding-bottom keeps the base's prompt-fade clearance (below). .thread-content
+       must stay display:block: Safari ignores scrollTo on a flex-column scroll
+       container. */
+    .mobile-swipe-pane .thread-content-wrap {
+        display: flex;
+        flex-direction: column;
+    }
+    /* NO FLOOR ON `.thread-feed` HERE, and none in the base sheet either
+       (ADR 0212). A percentage floor on this scroller has to subtract the
+       chrome above the feed, the header spacer and the sticky title row. Get
+       that by a pixel and every short thread scrolls by a chrome's worth of
+       nothing. */
+
+    .mobile-swipe-pane .thread-content {
+        padding-top: 0;
+        /* Matches the desktop base rule: reserve room past the prompt dissolve
+           (--prompt-fade) plus the focus-marker reach (--nav-focus-reach) so the
+           last turn's .nav-focus-stuck highlight clears the fade. */
+        padding-bottom: calc(var(--prompt-fade) + var(--nav-focus-reach));
+        position: relative;
+        flex: 1;
+        min-height: 0;
+        /* Force a permanent compositor layer so iOS Safari doesn't batch this
+           element's painting into .mobile-swipe-track's cached layer texture.
+           Without this, the compositor can serve a stale (blank) texture after
+           thread switches, PWA resume, or prolonged use — content is in the
+           DOM but invisible. The child layer's texture is updated independently
+           whenever DOM content changes, breaking the caching chain.
+           History: translateZ(0) was tried on the old position:absolute layout
+           (5a66dcb6) but removed (13c460f7) because iOS recycled the layer for
+           abs-positioned overflow:auto inside scroll-snap. With position:relative
+           (normal flow), that recycling pattern doesn't apply. */
+        -webkit-transform: translateZ(0);
+        transform: translateZ(0);
+        /* Above .edge-swipe-zone (z:1) so taps on the sticky title row's
+           pin button (sitting at the left edge, inside the swipe zone's
+           2.5rem strip) reach the button instead of the overlay. The
+           translateZ above creates a stacking context with no explicit
+           z-index — without this, the title row's own z-index:2 is
+           trapped inside .thread-content (effective z:0) and the swipe
+           zone wins hit-testing. iframes that need the swipe-zone bypass
+           live in other panes (content), not here. */
+        z-index: 2;
+    }
+
+
+    /* No reveal animation on mobile — the swipe gesture already provides
+       visual continuity; no animation is safer than a broken one. */
+    .mobile-swipe-pane .thread-view.revealing {
+        animation: none;
+    }
+
+    /* The transcript's find bar docks under the header, over the sticky title
+       row. In flow it sat at viewport y=0, behind the fixed header. An open
+       find bar pins the header (`shouldKeepHeaderVisible`), so the bar never
+       moves while the reader steps through matches. */
+    .mobile-swipe-pane .thread-view {
+        position: relative;
+    }
+
+    .mobile-swipe-pane .thread-view > .find-bar-slot,
+    .mobile-swipe-pane .file-preview-frame > .find-bar-slot {
+        top: var(--mobile-header-height, 3rem);
+        /* Above .thread-content (z-index 2) and its sticky title row. */
+        z-index: 3;
+        background: var(--bg-secondary);
+    }
+
+    .mobile-swipe-pane .thread-view > .find-bar-slot {
+        position: absolute;
+        left: 0;
+        right: 0;
+    }
+
+    .mobile-swipe-pane .thread-view > .find-bar-slot .find-bar {
+        padding-inline: calc(var(--space-lg) + var(--phone-side-inset));
+    }
+
+    /* A file's find bar sticks under the same pinned header. It takes the top
+       slot from the path row, which scrolls away under it, as the transcript's
+       bar covers the title row. First in the column, it rests where it sticks. */
+    .mobile-swipe-pane .file-preview-frame > .find-bar-slot {
+        order: -1;
+        position: sticky;
+    }
+
+    /* The up chevron rests below the title row, which the open bar covers.
+       The bar can be taller than that row, and the chevron then lands on its
+       buttons, so it stands down while the bar is open. The bar's own steps
+       move the reader. */
+    .mobile-swipe-pane .thread-view:has(> .find-bar-slot) .scroll-to-top.visible {
+        opacity: 0;
+        pointer-events: none;
+    }
+
+    /* Position scroll-to-top chevron below the sticky thread title bar.
+       --mobile-thread-title-height is the actual measured height of the
+       title bar (set by useHideOnScroll via ResizeObserver) so the chevron
+       stays anchored to the bar's bottom edge even when the title wraps
+       to multiple lines. The 2.75rem fallback covers the brief mount
+       window before the observer fires. Clamp offset to header height so
+       the chevron tracks the header hide but not the extended title-bar
+       scroll-out. The outer max() floor keeps clearance below the
+       dynamic island when the header+title bar are fully scrolled away.
+       The 0.75rem gap below the bar mirrors .scroll-to-bottom's 0.75rem
+       bottom inset (input-messages.css) — the wrap's bottom edge is flush
+       with the prompt box, so both chevrons keep the same distance to
+       their neighboring chrome.
+
+       Split into a static `top` plus a `translate` for the live offset, for the
+       reason spelled out on .mobile-thread-title-row above: --mobile-header-offset
+       must never reach a layout property. Keeping BOTH of this var's consumers on
+       `translate` makes that a property of the var rather than a habit, and
+       lets the chevron glide with the bars.
+
+       Algebraically identical to the max() nest it replaces, via
+       max(A, B + x) == B + max(A - B, x) with
+         A = safe-area + 0.75rem                       (dynamic-island floor)
+         B = headerHeight + titleHeight + 0.75rem      (resting position)
+         x = max(offset, -headerHeight)                (offset, clamped)
+       so A - B collapses to safe-area - headerHeight - titleHeight (the two
+       0.75rem terms cancel). */
+    .mobile-swipe-pane .scroll-to-top {
+        top: calc(var(--mobile-header-height, 3rem) + var(--mobile-thread-title-height, 2.75rem) + 0.75rem);
+        translate: 0 max(
+            calc(var(--safe-area-top) - var(--mobile-header-height, 3rem) - var(--mobile-thread-title-height, 2.75rem)),
+            max(var(--mobile-header-offset, 0rem), calc(-1 * var(--mobile-header-height, 3rem)))
+        );
+    }
+
+    /* ─── The transcript's own scroll indicator ─── */
+    /* WHY we draw one: `.app-header` is position:fixed and the header space
+       inside the transcript is the ::before spacer above, with the title bar
+       sticky inside the same scroller. Both are load-bearing (content has to
+       scroll UNDER the chrome for hide-on-scroll to reclaim the space), and the
+       consequence is that .thread-content's box starts at viewport y=0. A
+       scrollbar is laid out against its scroller's padding box, so WebKit's
+       overlay indicator spanned the full pane: it painted inside the title band
+       and its thumb sat well above the content it was reporting on. Nothing in
+       CSS insets an overlay indicator (a border-top would shrink the track but
+       is not scrollable, which would kill hide-on-scroll), so the native one is
+       suppressed HERE and replaced below.
+
+       Scoped to the wrap that actually carries a replacement, never to
+       .thread-content at large: suppressing the native indicator on a scroller
+       with nothing drawn in its place would leave that surface with no scroll
+       feedback at all. `scrollbar-width` covers Safari 18.2+ and Android;
+       ::-webkit-scrollbar covers older WebKit.
+
+       TOUCH-PRIMARY ONLY, and the suppression and the replacement share this one
+       gate so they cannot drift apart. The replacement is summoned by
+       `isUserScrolling()` (utils/scrollActivity.ts), which keys off `touchmove`
+       and therefore says nothing about a wheel or an arrow key. Gating the
+       suppression on viewport WIDTH alone would hit a narrow window driven by a
+       mouse, trackpad or keyboard: native indicator gone, replacement never
+       summoned, no scroll feedback at all. `hover: none` + `pointer: coarse` is
+       exactly the input class the replacement serves, so anything else keeps its
+       native scrollbar. */
+    @media (hover: none) and (pointer: coarse) {
+        .mobile-swipe-pane .thread-content-wrap.has-scroll-indicator .thread-content {
+            scrollbar-width: none;
+        }
+
+        .mobile-swipe-pane .thread-content-wrap.has-scroll-indicator .thread-content::-webkit-scrollbar {
+            display: none;
+        }
+
+        /* The track: pinned to the pane's right edge, starting at the chrome's
+           RESTING bottom edge (the same --mobile-header-height +
+           --mobile-thread-title-height pair .scroll-to-top anchors to above, so
+           the two cannot drift). Deliberately static rather than riding
+           --mobile-header-offset like the chevron does: a transform would carry
+           the track's BOTTOM up with its top and open a gap above the prompt,
+           and once the chrome is scrolled away there is nothing left to overlap
+           anyway.
+
+           At the top of a thread the thumb PARKS at the track's top, so this
+           inset is the one the reader sees. It has to clear the title bar's
+           hairline, without dropping so far below that it reads as a gap. Half
+           a rem is that middle. Just above it sits --mobile-title-fade, the
+           band where content dissolves under the bar
+           (.mobile-thread-title-row::after). The bottom has no chrome over it
+           and keeps its hairline inset.
+
+           Outside this gate it stays `display: none` (the base rule in
+           chat/input-messages.css), which also idles the hook for free: a
+           display:none track measures 0, so computeScrollIndicator reports
+           nothing to draw. */
+        .mobile-swipe-pane .thread-scroll-indicator {
+            display: block;
+            position: absolute;
+            right: 0.125rem;
+            top: calc(var(--mobile-header-height, 3rem) + var(--mobile-thread-title-height, 2.75rem) + 0.5rem);
+            bottom: 0.25rem;
+            width: 0.25rem;
+            pointer-events: none;
+            /* Above .thread-content (z:2 in this wrap, and a stacking context via
+               its translateZ) so the thumb is not buried under the transcript. */
+            z-index: 3;
+        }
+
+        /* With dynamic bars the prompt overlays the wrap's bottom, so the track
+           ends above it, as the down chevron does. Otherwise the thumb slides
+           under the prompt just as the reader reaches the end of the thread. */
+        :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .thread-scroll-indicator {
+            bottom: calc(0.25rem + var(--mobile-prompt-height, 0rem));
+        }
+
+        /* The thumb. Its height here is the BASE that useThreadScrollIndicator
+           scales from: the hook writes `translateY(...) scaleY(...)`, never a
+           layout property, so the whole per-scroll path stays composited. Hidden
+           at rest and faded in while the user is dragging.
+
+           The base is the FULL track, so the thumb is only ever scaled DOWN. A
+           short base scaled up instead would rasterize this layer at its small
+           size and stretch it (`will-change: transform` keeps the layer), which
+           smears the rounded caps.
+
+           `border-radius` is authored here only as the fallback before the first
+           paint. The hook overwrites it every frame with a vertical radius
+           divided by the current scale, because a transform scales the painted
+           radius too and a stretched cap on a bar this thin reads as a POINT
+           (see counterScaledRadiusPx). Keep the horizontal value at half the
+           width above so the cap is a true semicircle. */
+        .mobile-swipe-pane .thread-scroll-thumb {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 100%;
+            transform-origin: 0 0;
+            border-radius: calc(var(--radius-control) * 0.25);
+            /* Weight lives in the COLOUR, not in `opacity`, which is reserved as
+               the fade channel the hook drives. A solid --text-muted bar reads
+               loud against the transcript for something the eye should only
+               catch while it is moving, so it is mixed back toward the page. */
+            background: color-mix(in srgb, var(--text-muted) 55%, transparent);
+            opacity: 0;
+            transition: opacity var(--duration-fast) ease;
+            will-change: transform, opacity;
+        }
+    }
+
+    :root[data-motion="reduce"] .mobile-swipe-pane .thread-scroll-thumb {
+        transition: none;
+    }
+
+    /* Hide thread title bar on mobile — app header handles navigation */
+    .mobile-swipe-pane .thread-view-header {
+        display: none;
+    }
+
+    .mobile-swipe-pane {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        /* Anchor the absolute-positioned .edge-swipe-zone children to this pane. */
+        position: relative;
+        /* Opaque background so an adjacent pane (or its iframe) can never
+           show through during a swipe — iOS Safari renders iframes in their
+           own compositor layers that don't always honor an ancestor's
+           overflow:hidden during transforms. */
+        background-color: var(--bg-primary);
+        /* Establish a stacking context per pane so z-indexes inside one
+           pane (sticky title bar, prompt area, edge-swipe zones) cannot
+           paint above a sibling pane during transition. */
+        isolation: isolate;
+        /* Force each pane onto its own compositor layer so the iframe
+           inside the content pane is composited as a child of THIS layer
+           and clips at the pane's bounds. Without this, on iOS Safari
+           the iframe layer is composited as a child of the swipe-track's
+           layer and can paint outside its pane during the swipe — the
+           user sees the iframe's pixels in the wrong place and reads it
+           as "different app". The header refresh button then re-mounts
+           the iframe and the correct pixels return.
+           translateZ(0) chosen over `contain: paint` because Safari's
+           contain support is newer; translateZ has worked reliably on
+           iOS Safari for compositor-layer promotion since iOS 9.
+           History: an unmeasured perf-only version was added (5979772eb)
+           and reverted (a48524016) the same day in 2026-04. This re-add
+           is bug-driven (observed iframe paint corruption), not perf. */
+        -webkit-transform: translateZ(0);
+        transform: translateZ(0);
+    }
+
+    /* Panes inside swipe container need full height */
+    .mobile-swipe-pane > .thread-pane,
+    .mobile-swipe-pane > .content-pane,
+    .mobile-swipe-pane > .mobile-threads-pane {
+        height: 100%;
+    }
+
+    /* Slack for the keyboard's OWN reveal, and the root-cause half of the
+       focused-field reveal (docs/glossary.md).
+
+       iOS brings a focused field above the keyboard by scrolling its nearest
+       scrollable ancestor. When that ancestor cannot scroll far enough it
+       offsets the whole viewport instead, dragging the fixed header off screen
+       and moving the frame our own measurements are taken in. Padding inside
+       the scroller is what removes the reason to do that.
+
+       --keyboard-band is published by MobileSwipeContainer beside --app-height,
+       and is 0px whenever the keys are down, so no view gains a dead scroll
+       zone. Reasoning and sources:
+       docs/plans/2026-09-19-the-keyboard-reveal-stops-fighting-ios.md
+
+       --keyboard-band-hold is the band hold: what a reader scrolled into the
+       band still needs once it drops, so the content never jumps. It drains
+       as they scroll back. docs/plans/2026-09-24-the-keyboard-band-holds-the-scroll-anchor.md
+
+       `.has-app-ui` is excluded below: it does not scroll at all. */
+    .mobile-swipe-pane .content-pane-body {
+        padding-bottom: max(var(--keyboard-band, 0px), var(--keyboard-band-hold, 0px));
+    }
+
+    /* Skill UI iframe: content-pane-body must not scroll — the iframe
+       handles its own scrolling. Without this, the ::before spacer +
+       height:100% skill-ui-inline overflows by the spacer height,
+       making the parent scrollable and causing scroll jitter. */
+    .mobile-swipe-pane .content-pane-body.has-app-ui {
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        padding-bottom: 0;
+    }
+    .mobile-swipe-pane .content-pane-body.has-app-ui .app-ui-inline {
+        flex: 1;
+        min-height: 0;
+        height: auto;
+    }
+
+    /* ─── Mobile threads pane (standalone swipe pane) ─── */
+
+    .mobile-threads-pane {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+    }
+
+    /* Thread drawer rendered as a view inside the mobile threads pane */
+    .mobile-threads-pane > .thread-drawer {
+        display: flex !important;
+        flex-direction: column;
+        position: static;
+        width: 100% !important;
+        border-right: none;
+        flex: 1;
+        min-height: 0;
+        z-index: auto;
+        padding-top: 0;
+    }
+
+    /* thread-pane-body needs to be a real element on mobile (not display:contents) */
+    .thread-pane-body {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+    }
+
+    /* Keep prompt pinned to bottom on mobile — no vertical centering.
+       Centering causes the prompt to jump when the first message is sent. */
+    .compose-empty .thread-pane-body {
+        justify-content: flex-end;
+    }
+
+    /* An empty Home's title sits under the fixed header, where a thread's own
+       title row rests (shell.css places it). The row keeps its own rules: its
+       box is already where its sticky offset would hold it. */
+    .mobile-swipe-pane .home-welcome-title {
+        top: var(--app-header-bottom);
+    }
+
+    /* The row's negative margins cancel the transcript's gutter, and here it
+       sits outside the transcript, with no gutter to cancel. */
+    .mobile-swipe-pane .home-welcome-title .mobile-thread-title-row {
+        margin-left: 0;
+        margin-right: 0;
+    }
+
+    /* Dynamic bars: the prompt overlays the transcript's bottom so it can slide
+       away, the shape the fixed header already has at the top. The transcript
+       reserves the prompt's height as bottom padding. The down chevron sits
+       above the prompt and rides its offset. Both glide on `translate`, never a
+       layout property. hooks/useHideOnScroll.ts sets the attribute and all
+       three vars. Pinned bars and the compose-empty view keep the in-flow
+       prompt. */
+    :root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .thread-pane-body {
+        position: relative;
+    }
+
+    /* One above the transcript's z-index 2 below, so the prompt it overlays
+       paints and takes taps on top without leaning on DOM order. */
+    :root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 3;
+        /* A layer from the start, as the header has: WebKit otherwise builds it
+           as the glide begins and drops that first frame. */
+        will-change: translate;
+        transition: translate var(--bars-glide-duration, 0s) ease;
+        /* Frosted glass: the transcript scrolls on under the box instead of
+           dissolving above it. Only the bottom padding strip stays opaque, so
+           no sharp text shows below the box. The stop is that padding (0.5rem). */
+        background: linear-gradient(to top, var(--bg-primary) 0.5rem, transparent 0.5rem);
+    }
+
+    :root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area::before {
+        display: none;
+    }
+
+    :root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area .prompt-box {
+        background-color: color-mix(in srgb, var(--composer-background-color) 70%, transparent);
+        -webkit-backdrop-filter: blur(0.75rem) saturate(140%);
+        backdrop-filter: blur(0.75rem) saturate(140%);
+    }
+
+    /* Opaque while the keyboard is up: there iOS Safari draws the backdrop
+       above the box with the wrong corners, a second outline behind the focus
+       ring (docs/temporary-measures.md § Composer frost off under the keyboard). */
+    :root[data-mobile-dynamic-bars][data-keyboard-active] .thread-pane:not(.compose-empty) .prompt-area .prompt-box {
+        background-color: var(--composer-background-color);
+        -webkit-backdrop-filter: none;
+        backdrop-filter: none;
+    }
+
+    :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .thread-content {
+        padding-bottom: calc(var(--prompt-fade) + var(--nav-focus-reach) + var(--mobile-prompt-height, 0rem));
+    }
+
+    :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .scroll-to-bottom {
+        bottom: calc(0.75rem + var(--mobile-prompt-height, 0rem));
+        translate: 0 var(--mobile-prompt-offset, 0rem);
+    }
+
+    /* The welcome floats in the middle of the free space instead of docking on
+       the composer: the wrap takes everything between the header and the prompt
+       and centres the surface in it. The PROMPT is untouched and stays pinned to
+       the bottom by the rule above, so the reason that rule exists (a centered
+       prompt jumps when the first message is sent) is not reopened: the welcome
+       is gone entirely the moment a thread has an exchange, and the composer
+       never moves. Scoped to the wrap that actually holds the welcome
+       (`:has(> .thread-content.visible)`), so a dismissed welcome renders no wrap
+       and the bottom dock above is all that applies. Specificity (0,5,0) beats
+       shell.css's content-height `flex: 0 0 auto` on the same wrap, which is what
+       keeps the DESKTOP group (welcome + prompt, centered as a unit) compact.
+
+       `safe center` is the overflow fallback: the wrap is `overflow: hidden`, so
+       a welcome taller than the free space (the keyboard up on a short phone)
+       would otherwise be clipped at BOTH ends, losing the greeting and the
+       action at the top. Safe alignment falls back to `start` there, keeping the
+       top intact. The plain `center` before it is the value an engine without
+       safe-alignment support keeps. */
+    .mobile-swipe-pane .compose-empty .thread-content-wrap:has(> .thread-content.visible) {
+        flex: 1 1 auto;
+        justify-content: center;
+        justify-content: safe center;
+    }
+}
+
+/* ─── Mobile dot indicator (inside header) ─── */
+
+.mobile-dot-indicator {
+    display: none;
+}
+
+@media (--phone-layout) {
+    .mobile-dot-indicator {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: var(--mobile-dot-gap);
+        width: 100%;
+        /* Equal breathing room above and below the dots, DERIVED rather than
+           hand-tuned. The band is pulled up over two things: the header column's
+           own row gap, and the air the row keeps below its glyph run. That air
+           is half the difference between the row's height and the glyphs in it,
+           and the row is as tall as the Lucidos mark's TAP TARGET, which is a
+           style-remote tunable much larger than any glyph. So the old
+           `-0.25rem / 0.375rem` pair was only balanced at the mark's shipped
+           size: retuned to 2.6rem it left 13.5px above the dots against 7.5px
+           below, and made the bar that much taller for nothing.
+
+           The pull puts the band's top edge on the glyph run's bottom edge, so
+           the two gaps below are the whole of what separates the dots from what
+           the user sees above them. */
+        margin-top: calc(
+            -1 * var(--pane-header-gap)
+            - (var(--mobile-header-row-height) - var(--mobile-header-glyph-box)) / 2
+        );
+        padding: var(--mobile-dot-gap) 0;
+        /* The band now overlaps the row's bottom, and the centred nav cluster in
+           that row is absolutely positioned, so it would paint over the middle
+           dot AND take its tap. Its own stacking context puts the dots back on
+           top. Same move .mobile-header-row .content-header-actions makes below,
+           for the same reason.
+
+           It costs the mark the bottom sliver of its own tap target, in the
+           one-dot-wide column the middle dot occupies. That is the right way
+           round: the mark's DRAWN glyph ends well above the dots, since its tap
+           target is deliberately larger than the glyph and is tunable on top of
+           that, and the alternative is a middle dot that cannot be tapped at
+           all. */
+        position: relative;
+        z-index: 1;
+        /* …and the rest of the band, which is full-width and empty, must NOT
+           take anything: raised over the row, its box covers the bottom few
+           pixels of every icon button in it, and a transparent div is a hit
+           target all the same. Measured: a tap on the drawer toggle's bottom
+           edge landed on this element. Only the dots are targets. */
+        pointer-events: none;
+    }
+
+    .mobile-dot {
+        pointer-events: auto;
+        width: var(--mobile-dot-size);
+        height: var(--mobile-dot-size);
+        border-radius: var(--radius-round);
+        border: none;
+        padding: 0;
+        background: var(--header-fg-muted, var(--text-muted));
+        opacity: 0.3;
+        cursor: pointer;
+        /* The active dot "blooms on like a light": on activate the dot ITSELF
+           swaps muted→fill, gains the glow, and brightens, so all three
+           properties transition together (0.33s ease-out) to make the body + soft
+           glow rise together into the steady glow rather than snapping on.
+           Scaled by the animation-speed slider, like its twin on
+           `.header-focus-wash::before` (panels/shell.css). */
+        transition: opacity calc(0.33s * var(--duration-scale)) ease-out,
+                    background calc(0.33s * var(--duration-scale)) ease-out,
+                    box-shadow calc(0.33s * var(--duration-scale)) ease-out;
+    }
+
+    /* Active dot wears the per-theme active-pane fill + neon bloom
+       (--focus-pill-* in base.css) and blooms in over 0.33s ease-out. */
+    .mobile-dot.active {
+        opacity: 1;
+        background: var(--focus-pill-bg);
+        box-shadow: var(--focus-pill-glow);
+    }
+}
+
+/* ─── Pseudo-fullscreen on mobile ─── */
+/* The swipe machinery stacks THREE transformed ancestors between the app iframe
+   and the viewport — .mobile-swipe-container (translateZ(0) compositor layer),
+   .mobile-swipe-track (will-change:transform + inline transform), and
+   .mobile-swipe-pane (translateZ(0) compositor layer). Each one creates a
+   containing block that traps position:fixed descendants, so the app's
+   .app-ui-fullscreen overlay is clipped to the swipe viewport instead of
+   covering the screen — the thread drawer behind it shows through and the page
+   appears frozen. When pseudo-fullscreen is active, drop the transform on all
+   three so the overlay's position:fixed resolves against the real viewport.
+   Also hide the header and dot indicator. */
+@media (--phone-layout) {
+    :root[data-pseudo-fullscreen] .app-header {
+        display: none !important;
+    }
+
+    :root[data-pseudo-fullscreen] .mobile-dot-indicator {
+        display: none !important;
+    }
+
+    :root[data-pseudo-fullscreen] .mobile-swipe-track {
+        will-change: auto !important;
+        transform: none !important;
+        transition: none !important;
+    }
+
+    /* The container's and pane's translateZ(0) (both added for iframe compositor
+       clipping) each form a containing block too. Drop them during
+       pseudo-fullscreen so the app iframe's position:fixed escapes to the real
+       viewport — no swipe is in flight while fullscreen, and the opaque overlay
+       hides any momentary track mis-paint, so losing the compositor layer here
+       is harmless. */
+    :root[data-pseudo-fullscreen] .mobile-swipe-container,
+    :root[data-pseudo-fullscreen] .mobile-swipe-pane {
+        -webkit-transform: none !important;
+        transform: none !important;
+    }
+}
+
+/* Reduced motion: disable slide/fade animations, keep instant state changes */
+:root[data-motion="reduce"] .drawer,
+:root[data-motion="reduce"] .drawer.closing,
+:root[data-motion="reduce"] .drawer-backdrop.closing {
+    animation: none;
+}
+
+:root[data-motion="reduce"] .mobile-swipe-track {
+    transition: none;
+}

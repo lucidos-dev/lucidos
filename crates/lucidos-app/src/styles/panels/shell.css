@@ -1,0 +1,2240 @@
+/* ─── App shell ─── */
+
+.app-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    width: 100vw;
+    overflow: hidden;
+    /* Opaque base surface so the panes (which are transparent and would
+       otherwise show the document background) never reveal the boot-splash brand
+       gradient painted on <html>/<body>. That canvas only fades to
+       var(--bg-primary) alongside the splash veil (bootSplash.ts / index.html),
+       so without this the panels show blue for the ~0.65s the splash spends
+       fading. */
+    background-color: var(--bg-primary);
+}
+
+/* The screen part (ADR 0313). A theme's scanlines paint on the base fills, the
+   shell and each mobile pane, under everything they contain. So no protected
+   surface can ever sit beneath them. Both fills set background-color, never
+   the shorthand, which would reset this image by source order. */
+.app-shell,
+.mobile-swipe-pane {
+    background-image: var(--part-screen-background-image, none);
+}
+
+/* Reclaimed macOS title-bar band. Under the packaged macOS Tauri build
+   (titleBarStyle:"Overlay") the webview spans the full window height and the OS
+   traffic lights float over the top-left. This strip fills that reclaimed band
+   so it reads as our blue chrome (continuous with the header below) instead of
+   the default black bar, and it IS the window drag region (the native bar that
+   used to provide dragging is gone). It sizes to --titlebar-inset, which the
+   macOS Tauri build sets to the title-bar height before first paint (see
+   `titlebar_inset_script` in src-tauri lib.rs); everywhere else (web, PWA,
+   non-macOS) the var is unset, so the strip is 0px tall and the layout is
+   byte-for-byte identical to before. The header and everything below it are
+   untouched — only this band is added on top.
+
+   The focused pane's .header-focus-wash rises out of the header and tints its
+   own segment of this band too (see that rule), so the focused pane reads as
+   painted to the very top of the window.
+
+   This background is the solid base, and the native window colour reads it
+   (applyThemeMode). On desktop the header's fill paints from this strip too: see
+   .titlebar-strip::before. */
+.titlebar-strip {
+    flex: none;
+    height: var(--titlebar-inset, 0px);
+    background: var(--titlebar-strip-bg);
+}
+
+/* ─── App-shell banners (backup reminder, connection, slowness, webhooks) ─── */
+
+/* A persistent bar between the header and the panes, for a condition that stays
+   true until something changes. Deliberately not a toast, which reads as
+   transient status in this app.
+
+   Two mount points each, one per layout (see appBanner.ts): a flow sibling in
+   .app-shell on desktop, and a child of the fixed .app-header on mobile, where a
+   flow sibling would sit behind the header. These rules serve both, since the
+   mobile header is already a stretch column.
+
+   All three wear a soft wash of their state colour over the surface with the
+   neutral border kept, matching the Settings backup health card's warning state.
+   NO colored left stripe on any of them: banned outright by
+   .claude/rules/frontend-css.md. The wash strength is one shared token, so the
+   bars cannot drift apart and the live style remote has one knob for the
+   family. */
+.backup-reminder,
+.connection-banner,
+.slowness-banner,
+.ingress-banner,
+.refusal-banner {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    /* The wash runs edge to edge, and the side inset keeps the text and
+       buttons clear of the Dynamic Island on a phone in landscape. */
+    padding: var(--space-sm) calc(var(--space-lg) + var(--phone-side-inset));
+    border-bottom: 1px solid var(--border-color);
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}
+
+/* A banner's buttons share one size, a step under a surface's, because a bar is
+   a single line of chrome. The tone icon at the start is `.surface-icon`. */
+:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) .action-btn {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.75rem;
+    padding: 0 0.75rem;
+    border-radius: var(--radius-control);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+}
+
+.backup-reminder {
+    background: color-mix(in srgb, var(--accent-yellow) var(--banner-tint-strength), var(--bg-secondary));
+}
+
+/* Takes the slack so the button and the close X sit at the trailing edge. It
+   wraps rather than truncating: a data-loss warning the user can only half-read
+   is worse than a two-line bar, and the desktop instance republishes its
+   measured height either way. */
+.backup-reminder-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.backup-reminder-close {
+    flex: none;
+}
+
+/* The slowness bar. Amber, like the backup reminder: Lucidos still works,
+   only slowly, so this is a condition to act on rather than a live loss. It
+   takes the reminder's shape too: a wrapping sentence and a trailing dismiss. */
+.slowness-banner {
+    background: color-mix(in srgb, var(--accent-yellow) var(--banner-tint-strength), var(--bg-secondary));
+}
+
+.slowness-banner-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.slowness-banner b {
+    font-weight: 600;
+}
+
+.slowness-banner-close {
+    flex: none;
+}
+
+/* The connection bar carries the SAME sentence the Lucidos menu's notice does
+   (utils/connectionNotice.ts), so its wash is keyed on the same two states and
+   takes the same two colours the shared `.status-dot` scale gives the dot beside
+   it: red for the settled disconnect, amber for a connect that has not landed.
+   Stated per state on the bar rather than restated on the dot, which already
+   has its colour from that scale.
+
+   No motion anywhere on this bar, so nothing here needs a reduced-motion
+   rule: the bar's ARRIVAL is the event, and a wash that pulses under a sentence
+   the user is trying to read is noise on top of news. The dot it leads with is
+   deliberately the still one, unlike the Settings row's, which blinks because it
+   is the only thing on that row that changed. */
+.connection-banner {
+    /* Stated rather than inherited, and only on this bar: the dot's offset
+       below is derived from it, so the value the sentence is actually set in
+       has to be one this file can name. The backup reminder is left on the
+       document's own, which is what it has always rendered at. */
+    line-height: var(--banner-line-height);
+}
+
+.connection-banner[data-conn='disconnected'] {
+    background: color-mix(in srgb, var(--accent-red) var(--banner-tint-strength), var(--bg-secondary));
+}
+
+.connection-banner[data-conn='connecting'] {
+    background: color-mix(in srgb, var(--accent-yellow) var(--banner-tint-strength), var(--bg-secondary));
+}
+
+/* Sized here because the shared scale carries colour only, and centred on the
+   line rather than on the box: at a narrow split the sentence wraps to two
+   lines, and a dot centred against the whole bar floats into the middle of them
+   where it reads as a bullet that lost its list. Same derivation, for the same
+   reason, as the menu notice's dot in styles/header-mark.css. */
+.connection-banner .status-dot {
+    width: var(--connection-banner-dot);
+    height: var(--connection-banner-dot);
+    align-self: flex-start;
+    margin-top: calc((1em * var(--banner-line-height) - var(--connection-banner-dot)) / 2);
+}
+
+/* Takes the slack, and wraps rather than truncating: this is the whole message,
+   and a reason the user can only half-read is not a reason. The desktop
+   instance republishes its measured height either way. */
+.connection-banner-text {
+    flex: 1;
+    min-width: 0;
+}
+
+/* The state itself, at full strength, so the sentence around it reads as the
+   explanation rather than as more of the same weight. Matches the menu notice's
+   treatment of the same two halves. */
+.connection-banner b {
+    font-weight: 600;
+}
+
+.connection-banner[data-conn='disconnected'] b {
+    color: var(--accent-red);
+}
+
+/* The webhook ingress bar. Red, on the same wash as a settled disconnect,
+   because the fault is LIVE rather than a risk for later. A delivery sent
+   right now never reaches the workspace. The backup reminder's amber would
+   file it beside a nag, which is how eight hours of silence went unnoticed in
+   the first place.
+
+   No dot. The .status-dot scale is the connection light's vocabulary, and this
+   bar says nothing about whether THIS client can reach the workspace.
+
+   The refusal bar joins it on every rule below, because it reports the same
+   thing one layer in: a delivery that reached the workspace and was thrown
+   away. Two copies of these declarations is how the pair drifts apart. */
+.ingress-banner,
+.refusal-banner {
+    background: color-mix(in srgb, var(--accent-red) var(--banner-tint-strength), var(--bg-secondary));
+    line-height: var(--banner-line-height);
+}
+
+/* Takes the slack so the button sits at the trailing edge, and wraps rather
+   than truncating. The ingress sentence names the address family and the
+   refusal sentence names the hook, and a half-read version drops exactly the
+   thing the reader needs. */
+.ingress-banner-text,
+.refusal-banner-text {
+    flex: 1;
+    min-width: 0;
+}
+
+/* The headline at full strength, so the sentence after it reads as the
+   explanation. Matches the connection bar's treatment of the same two halves. */
+.ingress-banner b,
+.refusal-banner b {
+    font-weight: 600;
+    color: var(--accent-red);
+}
+
+/* The button keeps its width against a wrapping sentence. .action-btn sets
+   white-space: nowrap and a 3.5rem min-width, so a shrinking flex item would
+   clip its own label rather than wrap it. */
+.ingress-banner .action-btn,
+.refusal-banner .action-btn {
+    flex: none;
+}
+
+/* On a phone the buttons' own column is what the sentence loses. The button
+   cannot shrink (the rule above), so the sentence wrapped inside roughly 60%
+   of the bar. The refusal notice ran to ten lines beside a tall empty gap.
+   Wrapping gives the sentence the whole first line and drops the buttons to a
+   second one, at the trailing edge where they already sat.
+
+   Both bars, one rule, for the reason the grouped rules above are grouped.
+   The backup reminder is NOT here: its trailing X is a dismiss. Sent down to
+   a row of actions, a dismiss reads as a third action. The connection bar
+   carries no control at all, so its sentence already spans the bar.
+
+   Stacked, the shared --space-md gap reads as a hole between the sentence and
+   its own button, so the row gap alone is tighter. */
+@media (--phone-layout) {
+    .ingress-banner,
+    .refusal-banner {
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        row-gap: var(--space-sm);
+    }
+
+    .ingress-banner-text,
+    .refusal-banner-text {
+        flex-basis: 100%;
+    }
+}
+
+/* ─── Content row (thread drawer + split layout) ─── */
+
+.content-row {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* ─── Split layout ─── */
+
+.split-layout {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.pane {
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.pane-collapsed {
+    pointer-events: none;
+    visibility: hidden;
+}
+
+/* Same duration/easing as the header regions' left/width transitions — the
+   pane and the header section above it must arrive together or the header
+   reads as disconnected from the panel. flex-grow is transitioned alongside
+   flex-basis: maximizing a pane flips it from basis-driven (flex: 0 0 X%) to
+   grow-driven (flex: 1) sizing, and without easing flex-grow the 0→1 jump
+   snaps the pane to full width instantly while its header still slides. */
+.split-layout.pane-animate .pane {
+    transition: flex-grow var(--duration-slow) ease, flex-basis var(--duration-slow) ease,
+                visibility var(--duration-slow);
+}
+
+.pane-thread {
+    min-width: 0;
+}
+
+.pane-content {
+    min-width: 0;
+}
+
+/* Prevent any text from widening a pane beyond its container */
+.pane-thread,
+.pane-content {
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+/* --- Divider --- */
+
+.split-divider {
+    width: var(--divider-width);
+    cursor: col-resize;
+    background: var(--border-color);
+    flex-shrink: 0;
+    position: relative;
+    z-index: 2;
+    transition: background-color var(--duration-fast);
+    touch-action: none;
+}
+
+@media (hover: hover) {
+    .split-divider.collapsed:hover {
+        background: var(--accent);
+    }
+}
+
+.split-divider.collapsed {
+    cursor: pointer;
+}
+
+/* --- Pane headers --- */
+
+.pane-header {
+    --header-padding-x: 0.625rem;
+    /* The gap between the bar's own children, named because something else has
+       to cancel it: the mobile pane-dot band is a flex item of this column and
+       pulls itself up over this gap (see .mobile-dot-indicator in mobile.css).
+       A literal there would silently stop cancelling the moment this moves. */
+    --pane-header-gap: 0.25rem;
+    /* Every glyph, label and badge in the bar consumes the --header-* tokens,
+       which live in the theme blocks of global/base.css so a theme can retune
+       them. Never redeclare one here: a value on this element beats the theme's
+       value on <html>. A popout anchored in the bar portals to <body>, so it
+       inherits the document's own colours rather than these.
+       The CURRENT veil stays here because it is per-control state: at rest it is
+       0%, and the state rules at the end of this file raise it to one of the
+       theme's veil steps. */
+    --header-control-veil: 0%;
+    /* The gap that stops a badge FUSING with the glyph it rides. The badge is
+       painted white above and the bar's glyphs are white too, so a badge
+       overlapping one merged into a single shape: the Lucidos mark's count and
+       its bottom-right square read as one teardrop.
+       Painted in the bar's own colour, never transparent. What sits behind the
+       badge is the glyph, so a see-through ring would show the glyph and
+       separate nothing. Mixed from the gradient's two stops rather than
+       written out, so it follows every theme and cannot drift from the bar;
+       35% lands it where a header badge actually sits, about two thirds down.
+       See --header-bar-top in global/base.css.
+
+       This is the BARE bar, and `.app-header .badge` adds the veil of the
+       control the badge rides. */
+    --header-badge-ring: color-mix(in srgb, var(--header-bar-top) 35%, var(--header-bar-bottom));
+    --header-badge-ring-width: 1.5px;
+    /* Base bar color: any inherited text / currentColor glyph (e.g. the
+       recovery spinner) reads light by default; explicit muted/active variants
+       and popout resets override below. */
+    color: var(--header-fg);
+    display: flex;
+    align-items: center;
+    gap: var(--pane-header-gap);
+    padding: 0 var(--header-padding-x);
+    background: var(--header-gradient);
+    flex-shrink: 0;
+    height: 2.5rem;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+/* Height is the shared --app-header-height token (global/base.css) so that
+   anything anchored below the header (--app-header-bottom) tracks it instead of
+   restating the geometry. */
+.app-header {
+    padding-top: calc(0.25rem + var(--safe-area-top));
+    height: var(--app-header-height);
+}
+
+.pane-header-brand {
+    display: flex;
+    align-items: center;
+    cursor: default;
+    min-width: 0;
+}
+
+.pane-header-brand-label {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+}
+
+.recovery-indicator {
+    display: inline-flex;
+    align-items: center;
+    opacity: 0.7;
+}
+
+.recovery-spinner {
+    width: 0.875rem;
+    height: 0.875rem;
+    animation: spin 1.2s linear infinite;
+}
+
+/* Reduced motion: the spinner glyph stands still and still reads as busy. */
+:root[data-motion="reduce"] .recovery-spinner {
+    animation: none;
+}
+
+
+
+.pane-header-title {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pane-header-spacer {
+    flex: 1;
+}
+
+.content-header-actions {
+    display: flex;
+    /* The header row already places this cluster at the pane's right end. */
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* Three keyboard-focusable boxes paint no outline of their own. The split
+   panes carry tabindex=-1, focused as a fallback by focusPaneMainControl when a
+   pane has no focusable child. The drawer's tree is a single tab stop
+   (tabindex=0, aria-activedescendant, see ThreadDrawer). A native outline would
+   frame the whole box. The active-pane cue is the header wash, plus the
+   highlighted row inside the drawer. Real controls inside keep their own
+   :focus-visible ring. */
+.pane-thread:focus,
+.pane-content:focus,
+.thread-drawer-tree:focus {
+    outline: none;
+}
+
+/* Focused-pane header wash — desktop-only; positioned + revealed inside the
+   (--desktop-layout) block below. Hidden by default so it never takes a flex slot
+   in the mobile header. */
+.header-focus-wash {
+    display: none;
+}
+
+/* --- Thread pane body --- */
+
+.thread-pane {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    position: relative;
+}
+
+/* Compose-empty: center prompt vertically */
+.thread-pane.compose-empty {
+    justify-content: center;
+}
+
+.compose-empty .thread-content-wrap {
+    flex: 0 0 auto;
+}
+
+/* Compose-empty welcome: a COMPACT surface that flows at its natural height, so
+   the centered group (welcome + prompt) keeps the prompt near the middle on
+   desktop. Mobile keeps the compact surface but gives the wrap the free space
+   and centres the welcome in it, the prompt staying bottom-docked (mobile.css).
+   `.thread-content` is normally a fill +
+   scroll container (desktop `position: absolute; inset: 0`; mobile `flex: 1`);
+   here it flows at content height so the welcome is only as tall as it needs to
+   be. Only the compose-empty welcome is affected — a real transcript keeps its
+   fill + scroll behavior. The wrap therefore sizes to content (not `flex: 1`).
+   `.thread-content` only exists here when `hasContent` is true (CreateThreadView),
+   which in compose-empty mode means the welcome is showing. */
+.compose-empty .thread-content-wrap:has(> .thread-content.visible) {
+    flex: 0 0 auto;
+    min-height: 0;
+}
+
+/* Scoped to `.visible` (0,3,0) so it beats the base/mobile `.thread-content`
+   rules. The dismiss pill anchors to this (`position: relative`). */
+.compose-empty .thread-content.visible {
+    position: relative;   /* was absolute inset:0 (desktop) — flow at natural height */
+    inset: auto;
+    flex: none;           /* mobile sets flex:1 — don't grow in compose-empty */
+    overflow: visible;    /* compact: no inner scroll; the carousel scrolls itself */
+    /* No scrolling transcript to fade here, and the dismiss pill lives in this
+       area — kill the desktop top-fade mask so it isn't ghosted. */
+    -webkit-mask-image: none;
+    mask-image: none;
+    /* The base .thread-content padding reserves room past the prompt fade for a
+       focus marker. That does not apply to the compact welcome (no scroll), so
+       drop back to a tight padding instead of the fade clearance.
+       The horizontal inset still has to match `.prompt-area`'s so the
+       welcome lines up with the composer directly below it, scroll gutter
+       included: `overflow: visible` here means the base rule's
+       `scrollbar-gutter: stable` reserves nothing, so add it explicitly.
+       The bottom is much the larger of the two, on purpose. Nothing docks above
+       this surface (the space over it is the pane's own, and on mobile the wrap
+       centres the surface in it), so the top only has to stop the greeting
+       butting against that space and stays tight. The bottom is the entire gap
+       between the welcome's last line and the composer docked under it, since
+       `.prompt-area` zeroes its own top padding just below, and it has to read
+       as a breath between two surfaces rather than as inner padding. */
+    padding:
+        0.5rem
+        calc(var(--thread-pane-gutter) + var(--scrollbar-gutter-width))
+        3.5rem
+        var(--thread-pane-gutter);
+}
+
+.compose-empty .prompt-area {
+    padding-top: 0;
+    margin-top: 0;
+}
+
+/* An empty Home showing the welcome takes the compose layout above, and keeps
+   its title at the pane's top, outside the centred welcome and prompt
+   (ADR 0411). Out of flow, so the centring is the compose view's exactly. */
+.home-welcome-title {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 1;
+}
+
+/* --- Content pane body --- */
+
+.content-pane {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    position: relative;
+}
+
+.content-pane-body {
+    flex: 1;
+    min-width: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    position: relative;
+    /* The end space every view keeps below its last element (panels/content.css). */
+    --pane-end-space: calc(var(--space-xl) + var(--safe-area-bottom));
+}
+
+/* A column view reserves the scrollbar's gutter even while it fits, as
+   `.thread-content` does. Growing past one screen then never slides the
+   column sideways. Both declarations are needed: WebKit reserves only once a
+   scrollbar is drawn. The idle track paints `--bg-primary`, so an empty gutter
+   is invisible. A full-bleed view keeps its right edge. */
+.content-pane-body:has(> .content-view.active:not(.content-view-full-bleed), > .panel-content) {
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
+}
+
+/* Focusable scroll region (tabindex=0, mirror of .thread-content): pane focus
+   lands DOM focus here so scroll keys work, but the active-pane cue is the header
+   wash — never a ring around the whole pane body. Same rationale as the
+   .pane-*:focus suppression above; controls inside keep their own
+   :focus-visible rings. */
+.content-pane-body:focus,
+.content-pane-body:focus-visible {
+    outline: none;
+}
+
+/* The navigation cover's host (global/host-components.css). Over
+   `.content-pane-body`, and far below `--z-app-fullscreen`: a fullscreen app
+   must not be covered by the pane it escaped. */
+.content-pane > .nav-cover {
+    z-index: 1;
+}
+
+/* The pull-to-refresh arrow (PullRefreshAffordance). It rests just above the
+   pane's top edge and drops with the finger until a release would refresh.
+   `--pull-travel` is a measured touch distance, so it is px rather than a rem
+   length. `--pull-refresh-top` is the pane's visible top: 0 here, below the
+   overlaid header on a phone. */
+.content-pane > .pull-refresh-affordance {
+    position: absolute;
+    top: var(--pull-refresh-top, 0px);
+    left: 50%;
+    z-index: 2;
+    width: 2rem;
+    height: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-round);
+    background: var(--bg-secondary);
+    /* Blends toward the accent with the pull, and is fully the accent at the
+       threshold. The colour says how close a release is to refreshing. */
+    --pull-accent-mix: calc(var(--pull-progress, 0) * 100%);
+    border: 1px solid color-mix(in srgb, var(--accent) var(--pull-accent-mix), var(--border-color));
+    box-shadow: var(--shadow-sm);
+    color: color-mix(in srgb, var(--accent) var(--pull-accent-mix), var(--text-muted));
+    pointer-events: none;
+    opacity: var(--pull-progress, 0);
+    transform: translate(-50%, calc(var(--pull-travel, 0px) - 100%));
+    transition: transform var(--duration-normal) ease, opacity var(--duration-normal) ease;
+}
+
+/* Tracks the finger with no lag. The transition above is the spring-back. */
+.content-pane > .pull-refresh-affordance.is-pulling {
+    transition: none;
+}
+
+/* Turns with the whole pull, so it keeps turning after the arrow stops
+   dropping, more slowly, for as long as the finger keeps pulling. */
+.content-pane > .pull-refresh-affordance svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+    transform: rotate(calc(var(--pull-turn, 0) * 270deg));
+}
+
+
+/* --- Hamburger toggle (panel menu) --- */
+
+.hamburger-panel {
+    padding: 0.5rem;
+    overflow: visible;
+}
+
+/* --- Mobile/Desktop header visibility --- */
+
+/* Mobile header sections: hidden on desktop */
+.mobile-threads-header,
+.mobile-thread-header,
+.mobile-content-header,
+.mobile-thread-title-row {
+    display: none;
+}
+
+/* Desktop header: shown on desktop, hidden on mobile.
+   (`.panel-nav`, the hamburger + chevrons group, is gone: the chevrons moved
+   into the centred title cluster, see ContentNav.) */
+.desktop-header {
+    display: contents; /* pass-through for desktop layout */
+}
+
+/* Transparent wrappers — collapse to display:none hides all children at once */
+.thread-header-elements,
+.content-header-elements {
+    display: contents;
+}
+
+@media (--phone-layout) {
+    .desktop-header {
+        display: none !important;
+    }
+}
+
+/* Threads header — hidden on mobile, only shown via desktop media query */
+.threads-header {
+    display: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+/* The thread drawer toggle and the grouping button: the containing block for
+   their Blocked badge, which hangs past the button's corner. */
+.thread-toggle,
+.grouping-btn {
+    overflow: visible;
+    position: relative;
+}
+
+/* Slot holding the Filter button, which toggles the thread filter panel down
+   in the drawer pane (see ThreadFilterPanel). The filter shapes the Folders
+   grouping only, so under Ongoing the button fades out IN PLACE. The slot keeps
+   its box in both groupings, so no neighbour moves and nothing slides under the
+   fading button (frontend.md, a single control). `visibility` steps at the END
+   of the fade-out, so the button leaves the tab order once it is gone. Fading
+   in, it steps at the start. */
+.filter-slot {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    transition: opacity var(--duration-normal) ease, visibility var(--duration-normal);
+}
+
+.filter-slot:not([data-shown]) {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+/* The threads-pane title is whole or hidden. Once its word outgrows the room
+   between the row's two ends, it fades out rather than ellipsizing
+   (`ThreadsPaneTitle`). Both layouts, on the fade the row's other changes use. */
+.threads-header-title,
+.mobile-threads-header .mobile-header-title {
+    text-overflow: clip;
+    transition: opacity var(--duration-fast) ease, visibility var(--duration-fast);
+}
+
+.threads-header-title[data-cramped],
+.mobile-threads-header .mobile-header-title[data-cramped] {
+    opacity: 0;
+    visibility: hidden;
+}
+
+/* --titlebar-lights-reserve is REGISTERED, because one of its three readers is
+   JavaScript and an unregistered custom property is a token sequence rather than
+   a length.
+
+   `store/paneMinimums.ts` reads the reserve off the root and `parseFloat`s it,
+   which is what keeps the thread drawer's floor from restating a number the CSS
+   owns. That worked while the reserve was the literal `80px`. It stops the
+   moment the reserve becomes arithmetic: `getComputedStyle().getPropertyValue()`
+   returns an UNREGISTERED custom property's value with its vars substituted but
+   its calc NOT evaluated, so the reader would get the string
+   `calc(20px + 60px + 0px)` and `parseFloat` would give NaN. Verified in both
+   engines the app ships on (Chromium and WebKit): the CSS readers resolve
+   the same 80px they always did, and only the JS one goes dark, silently, into
+   its fallback. Registering with a `<length>` syntax is what makes the computed
+   value an actual length again.
+
+   OUTSIDE the media query on purpose, and not by choice: `@property` is not a
+   conditional rule and may not be nested in one. The consequence is that on
+   the phone layout, where the block below does not run, the reserve resolves to this
+   initial value instead of to nothing. That is the same 80px the JS fallback
+   restates for exactly that viewport, so the drawer floor is unchanged; and no
+   CSS rule reads the reserve outside `[data-titlebar-overlay]`, which the suite
+   pins.
+
+   An engine too old for `@property` (WKWebView below Safari 16.4, reachable at
+   the app's macOS 11 floor) ignores this block, and the JS read degrades to the
+   fallback literal, which is the same number again. So the registration
+   improves the mechanism where it is supported and costs nothing where it is
+   not. */
+@property --titlebar-lights-reserve {
+    syntax: '<length>';
+    inherits: true;
+    initial-value: 80px;
+}
+
+/* Desktop: position burger, brand, and panel title to track the split layout */
+@media (--desktop-layout) {
+    /* Compute the divider x-position accounting for thread drawer offset.
+       --content-offset: thread drawer width (0px when closed, 300px when open)
+       --split-ratio: chat fraction of split layout (0–1)
+       --divider-x: actual position in the full-width header */
+    :root {
+        --co: var(--content-offset, 0px);
+        --sr: var(--split-ratio, 0.4);
+        --ddo: 0px; /* drawer-divider offset: 0 when closed */
+        --divider-x: calc(var(--co) + var(--ddo) + var(--sr) * (100% - var(--co) - var(--ddo)));
+        /* `.icon-btn.header-icon`'s box (global/host-components.css), which four
+           rules below reserve room for or measure against. It was written out
+           as a `2.25rem` literal at each of them with a note that there was no
+           token for it; there is one now, so a change to the button's box moves
+           everything sized off it instead of leaving three copies behind. */
+        --header-icon-box: 2.25rem;
+        /* Where the header's leading control rests: the drawer toggle, in the
+           header's corner, whether the drawer is open or shut. ONE declaration
+           for every reader that has to agree on it: .thread-toggle-slot, which
+           sits there; --brand-side-reserve below and the drawer row's
+           --threads-row-lead, which both have to clear it. The overlay build
+           steps it past the traffic lights (see the override below), and a
+           second copy of that 80px is the drift --titlebar-lights-reserve was
+           registered to stop. */
+        --header-lead-inset: 0.5rem;
+        /* Room kept at EACH end of the thread pane's header for the centred
+           brand cluster to clear. Sized to the WIDER of the two ends and paid
+           at both, because the cluster is centred on the PANE. Spending the
+           difference on one side is what would stop it being centred.
+           - leading: the drawer toggle, wherever it rests, and Home while it
+             is shown (the override on .pane-header-brand).
+           - trailing: the actions at their widest, which is setup + compose +
+             search, 3 buttons and 2 gaps, plus the row's padding.
+           The leading term is not decoration. The packaged macOS build starts
+           the toggle 80px in, and below 100% ui-scale that end is the wider one
+           on every build. Reading it as "the drawer toggle alone, so narrower"
+           is what let the back chevron land on the toggle. */
+        --brand-trail-end: calc(0.5rem + 3 * var(--header-icon-box) + 2 * 0.25rem);
+        --brand-side-reserve: max(
+            calc(var(--header-lead-inset) + var(--header-icon-box)),
+            var(--brand-trail-end)
+        );
+        /* The content pane's copy of the reserve above, and the same rule: room
+           kept at EACH end of the row for the centred title cluster to clear,
+           sized to the WIDER of the two ends. The leading end is one hamburger;
+           the trailing one is the actions cluster on the clamp's middle arm,
+           which is three boxes (two context icons riding the row, plus the
+           bell) and the two gaps between them. A third icon rides only where
+           the box sits at its span cap and leaves more room; anywhere tighter,
+           `useHeaderActionCollapse` folds two of them into ⋯ first. The last two gaps are the clearance between that cluster and
+           the title box: two rather than one because that is what the collapse
+           measurement charges (`computeFitsInOneRow` gives the centred box a
+           gap at each of its sides, and the reserve is symmetric, so both land
+           on the wider end). Sizing it to exactly what the measurement wants is
+           what keeps the two from disagreeing, which would show as the ⋯
+           appearing at a width the stylesheet says has room to spare.
+
+           Sized to the trailing end on both sides, deliberately. The leading
+           end (the hamburger and Refresh) is a box and a gap narrower.
+           Spending that difference on the title would stop it being centred on
+           the pane, which is the whole point of the arrangement.
+
+           The gap term is a literal rather than --pane-header-gap because a
+           custom property is substituted on the element that DECLARES it, and
+           that one is declared on .pane-header, not here (same reason
+           --brand-side-reserve above spells it out). It is a copy of this row's
+           own `gap`, so styles/__tests__/content-header-title-centring.test.ts
+           checks the two agree. */
+        --content-side-reserve: calc(3 * var(--header-icon-box) + 4 * 0.25rem);
+        /* The room a wide pane keeps at each end before the Canvas title grows
+           past --desktop-nav-span. Seven boxes: a file preview's six actions,
+           the widest set any content view shows, plus the bell. Eight gaps: the
+           six between them and the two the collapse measurement charges, as
+           above. So the title grows only out of room no cluster needs, and no
+           action folds that the fixed span let ride. */
+        --content-unfolded-reserve: calc(7 * var(--header-icon-box) + 8 * 0.25rem);
+        /* How far the Canvas title may grow on a wide pane. The cap keeps the
+           chevrons from drifting out to the row's ends. */
+        --desktop-content-title-span-max: 36rem;
+        /* How far apart the back/forward chevrons are held, on BOTH panes. The
+           point is that they hold still: a cluster sized to its contents put
+           them wherever the current title or workspace name happened to leave
+           them, so they moved under the pointer on every navigation. A narrow
+           pane squeezes the span rather than the controls in it, down to the
+           floor below. A wide Canvas pane grows its own span past this one
+           (--desktop-content-title-span-max).
+           Mobile deliberately carries no twin of this token. A pane can be far
+           wider than a phone row, so desktop wants a distance to hold; a phone
+           row has no width to spare, and there the chevrons take everything
+           outside the edge reserve. See --header-nav-cluster-width. */
+        --desktop-nav-span: 20rem;
+        /* The floor, and it IS the cluster's natural width: two chevrons and
+           the mark's tap target, touching. This is what "the chevrons hug the
+           mark" resolves to, and it is derived rather than picked. A picked
+           8rem against a natural 6.6rem left 1.4rem of slack, and that slack is
+           what pushed the back chevron onto the drawer toggle at a narrow pane.
+           The Canvas row shares this token and holds a title rather than a
+           mark. It never reaches the floor: its own pane floor keeps it on the
+           clamp's middle arm (store/paneMinimums.ts). */
+        --desktop-nav-min-span: calc(2 * var(--header-icon-box) + var(--header-mark-tap));
+        /* Half the reclaimed macOS title-bar band. A header region centered on
+           the header alone (translateY(-50%)) reads as sitting LOW on the
+           packaged macOS build: .titlebar-strip paints --titlebar-inset of the
+           same blue directly above the header, so the user sees ONE bar rather
+           than a strip plus a header, and the controls hug its bottom edge.
+           Subtracting this from the centering transform centers a region on that
+           whole bar instead. Off the macOS Tauri build --titlebar-inset is unset,
+           so this is 0px and every rule using it is unchanged.
+
+           Still exactly half the band now that the overlay build's header is
+           20px (a 48px bar less the 28px band) rather than the 44px it was when
+           the header WAS the bar, which is worth the arithmetic because it looks
+           like it should have changed: the bar spans -28px to +20px around the
+           header's top edge, putting its center 4px ABOVE that edge, while the
+           header's own center is 10px below it. The correction is the 14px
+           difference, and 14px is --titlebar-inset / 2. The formula is
+           independent of the header's height because BOTH centers move down by
+           half of any change to it.
+
+           EVERY header region uses this, the LEFT-MOST slot included: the two
+           controls that can hold that slot were once raised clear into the band
+           beside the traffic lights instead, and read as sitting higher than
+           their neighbours. They clear the lights sideways now
+           (--titlebar-lights-reserve below) and share this centring.
+
+           So do the LIGHTS, which is newer still and is why this rule finally
+           covers the whole row. We place them ourselves (src/traffic_lights.rs)
+           with the cluster's centre on the bar's centre, which is the same
+           centre this expression resolves to for everything else, so the one
+           control we do not draw is no longer the one control sitting high. The
+           bar height that placement needs is the one thing CSS cannot hand to
+           AppKit, so the frontend measures it and pushes it over IPC. */
+        --header-band-lift: calc(var(--titlebar-inset, 0px) / 2);
+        /* The one desktop bar height (48px at the default UI scale). Web and PWA
+           have no band, so the header IS the bar; the overlay build subtracts
+           its band from this below. Overriding --app-header-height rather than
+           .app-header's height is what keeps --app-header-bottom
+           (global/base.css) in step, since every pane's top offset derives from
+           it.
+
+           The floor is about 40px, and it is the controls rather than taste: a
+           header icon box is 2.25rem (36px at the default scale) and every one
+           of them is centred on the bar, so under 40px they start touching its
+           edges. 48px leaves 6px around them.
+
+           Inside the desktop media query on purpose: the base token carries a
+           var(--safe-area-top) term for the iOS notch, and mobile keeps it
+           untouched. No desktop viewport has a notch, so these drop it. */
+        --desktop-bar-height: 3rem;
+        --app-header-height: var(--desktop-bar-height);
+        /* The macOS traffic lights: where WE put them, and therefore how much
+           horizontal room the header row keeps clear of them. Only ever read
+           under [data-titlebar-overlay], where the lights actually exist.
+
+           DERIVED, not guessed. --titlebar-lights-x is stamped pre-paint by
+           `titlebar_inset_script` (src/lib.rs) from LIGHTS_X_PX, the SAME
+           constant src/traffic_lights.rs places the real cluster with, so the
+           reserve is arithmetic on an x we applied rather than an estimate of
+           where the OS left buttons we did not control. The literal inside the
+           var() is the fallback for a document that somehow was not stamped, so
+           it has to track that constant; the CSS suite checks it by reading the
+           Rust, since nothing else can.
+
+           The cluster's WIDTH is not a choice, it is a measured AppKit fact,
+           which is why it lives here rather than beside the x in Rust (the
+           placement never needs it: it reads AppKit's own pitch off the buttons
+           at apply time). The three buttons carry 14pt frames, each holding a
+           12pt drawn circle, at a 23pt pitch, so the cluster spans
+           2 * 23 + 14 = 60pt from its left edge. The comment this replaces said
+           12px buttons 20px apart ending near 66px, and all three of those
+           numbers were wrong: AppKit's own default put the cluster at x 9 to 69.
+
+           The gap is the slack, and it is EQUAL to the x: 10 + 60 + 10 is the
+           same 80px this has always reserved, with the cluster centred in it
+           rather than shoved against the leading control. What the user sees is
+           symmetric to the pixel, since the 12pt circle sits 1pt inside its
+           14pt frame: 11px of air from the window's edge to the red light, and
+           11px from the green one to where the leading control's box begins.
+           The gap was 0 for one change, with all 20px of the slack in front of
+           the lights, and the row read as cramped against them; that is the
+           report this splits. It stays a named term rather than being folded
+           into the sum because it IS the slack, so a later change to either of
+           the other two spends it here visibly instead of quietly landing a
+           control on a light.
+
+           This is the WHOLE of what the overlay build does to the leading
+           control: it is centered on the bar like every other control in the row
+           (--header-band-lift), and it steps sideways to clear the lights. It
+           used to RISE out of the header and pin itself to the window's top edge
+           beside them, which is the macOS unified-toolbar convention but read as
+           one icon sitting higher than its neighbours; the user rejected it on
+           the packaged build. The reserve survives that removal, and matters
+           MORE now that the lights are centered on the bar too: a 36px box
+           centered on the 48px bar spans window y 6 to 42, and the lights now
+           sit at y 17 to 31 (14pt frames centered on the same 24px), so the two
+           overlap almost completely in y and only this sideways step keeps them
+           apart. That is why NOTHING in this row is left at 0.5rem on this
+           build, the search field included.
+
+           PX, NOT REM, and that is load-bearing rather than an oversight: the
+           lights are OS chrome at a fixed size, so they do not move when the
+           user changes the UI scale, while everything of ours authored in rem
+           does. At UI_SCALE_MIN (75%, preferences.ts) a 5rem reserve computes to
+           60px and puts the control ON the lights, which is the one thing this
+           whole arrangement exists to avoid. That the y is now ours changes
+           nothing here: placing the cluster does not resize it. Same reasoning
+           as --titlebar-inset, which is a px literal from
+           `titlebar_inset_script` for the same reason. */
+        --titlebar-lights-cluster: 60px;
+        --titlebar-lights-gap: 10px;
+        --titlebar-lights-reserve:
+            calc(var(--titlebar-lights-x, 10px) + var(--titlebar-lights-cluster) + var(--titlebar-lights-gap));
+    }
+
+    /* The packaged macOS build (titleBarStyle:"Overlay"), stamped pre-paint by
+       `titlebar_inset_script` in src-tauri lib.rs alongside --titlebar-inset.
+       The header is shorter here because the band above it makes up the
+       difference, so this build's bar is the same one the web build gets from
+       its header alone (20px + 28px at the default scale).
+
+       SUBTRACTED, not the 1.25rem it happens to equal: --titlebar-inset is a
+       fixed px from the OS while --desktop-bar-height is rem, so two literals
+       only agree at one root font size. At 75% (UI_SCALE_MIN) a literal
+       1.25rem would give a 43px macOS bar against a 36px web one. Subtracting
+       keeps the sum equal to the bar by construction, at every scale.
+
+       The remainder stays positive across the supported range: the bar is 36px
+       at UI_SCALE_MIN against a fixed 28px band, and it would take about 58%
+       to reach zero. That floor is the one thing here that does NOT scale with
+       the bar, so a future cut to --desktop-bar-height has to clear it. */
+    :root[data-titlebar-overlay] {
+        --app-header-height: calc(var(--desktop-bar-height) - var(--titlebar-inset, 0px));
+        /* The header's leading control steps past the lights on this build, in
+           both drawer states. NOTHING in the bar is left at 0.5rem here. The
+           toggle's box still reaches up into the reclaimed band. That costs
+           nothing, since nothing clips between .titlebar-strip and .app-header
+           and both paint the same blue. The overlap is exactly why the sideways
+           step is needed.
+
+           Declared on :root, not on .thread-toggle-slot, because every reader
+           that has to clear the toggle reads the value the toggle is placed
+           with: the brand cluster's reserve, and the drawer row's lead. */
+        --header-lead-inset: var(--titlebar-lights-reserve);
+    }
+
+    :root[data-thread-drawer-open] {
+        --ddo: var(--divider-width); /* account for drawer divider element */
+    }
+
+    /* The header's fill, painted as ONE box. At --titlebar-strip-continues 0
+       the box is exactly the header's. At 1 it also covers the band above, so
+       a striped fill lines up across the join: a pattern restarts at each
+       box's top edge, so two boxes never could. The theme's value is used
+       verbatim, its own tile size and colour layers included.
+
+       It hangs off the strip, which sits before the header, so the header's
+       dividers, focus wash and controls all paint above it. */
+    .titlebar-strip {
+        position: relative;
+    }
+
+    .titlebar-strip::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: calc((1 - var(--titlebar-strip-continues)) * var(--titlebar-inset, 0px));
+        height: calc(var(--app-header-height) + var(--titlebar-strip-continues) * var(--titlebar-inset, 0px));
+        background: var(--header-gradient);
+        pointer-events: none;
+    }
+
+    .app-header {
+        position: relative;
+        background: none;
+    }
+
+    /* Divider between chat and panel header areas — centered on the split bar.
+       Full-height + same width as the pane .split-divider below it, so the two
+       would read as one continuous divider. Painted with --header-divider,
+       currently transparent (seam disabled — see the token definition). */
+    .app-header::after {
+        content: '';
+        position: absolute;
+        left: var(--divider-x);
+        top: 0;
+        bottom: 0;
+        width: var(--divider-width);
+        background: var(--header-divider);
+        opacity: 1;
+        pointer-events: none;
+        transition: opacity var(--duration-slow), left var(--duration-slow) ease;
+    }
+
+    /* Divider between thread drawer and chat header — tracks drawer divider */
+    .app-header::before {
+        content: '';
+        position: absolute;
+        left: var(--co);
+        top: 0;
+        bottom: 0;
+        width: var(--divider-width);
+        background: var(--header-divider);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity var(--duration-slow), left var(--duration-slow) ease;
+    }
+
+    :root[data-thread-drawer-open] .app-header::before {
+        opacity: 1;
+    }
+
+    /* Hide header dividers when either pane is collapsed */
+    :root[data-thread-collapsed] .app-header::after,
+    :root[data-content-collapsed] .app-header::after {
+        opacity: 0;
+    }
+
+    :root[data-thread-collapsed] .app-header::before {
+        opacity: 0;
+    }
+
+    /* Content-side header region, pinned between the split divider and the
+       header's right padding. Two in-flow children held apart by
+       space-between, the hamburger leading and the action icons trailing (both
+       flex-shrink:0), with the title cluster absolutely centred OVER them on
+       this row's own middle (see .pane-header-content-title below, which says
+       where that is and is not the pane's). Same shape as .threads-header one
+       region over and .pane-header-brand between them: every header row in the
+       app centres its title on its pane rather than on the gap between the two
+       clusters flanking it.
+
+       It was a 3-zone flex row until 2026-08-13, the title being the flex:1
+       middle. That centres the title on the GAP, and this row's trailing end is
+       1 to 3 icon boxes wide depending on what the current content view offers
+       (the bell alone, an icon and the bell, the overflow ⋯ and the bell), so
+       the title and both chevrons slid by up to a box and a half on every
+       navigation. The user reported it as the ⋯ moving them, which is the
+       sharpest case of it.
+
+       Non-overlap is now the centred box's clamp rather than the flex zone's
+       `min-width: 0` (it clears --content-side-reserve at each end). What is
+       still banned here is a HARDCODED reservation: the arrangement this
+       replaced the first time was a translate(-50%) title with a guessed
+       `max-width: calc(100% - 12rem)`, and the guess is what let the title
+       slide under the icons. Derive the reserve from the controls, as the
+       token does. */
+    .app-header .content-header-elements {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.25rem;
+        position: absolute;
+        left: calc(var(--divider-x) + var(--divider-width));
+        right: var(--header-padding-x);
+        top: 50%;
+        transform: translateY(calc(-50% - var(--header-band-lift)));
+        /* Clips at its own box plus ring room. The row is exactly one icon
+           tall with an icon at each end, so a flush clip cut every ring. A
+           clip-path, not `overflow: clip`: the packaged macOS webview makes a
+           `clip` box a scroll container (see .pane-header-brand). */
+        clip-path: inset(calc(-1 * var(--focus-ring-width)));
+        transition: left var(--duration-slow) ease,
+                    opacity var(--duration-slow) ease, visibility var(--duration-slow);
+    }
+
+    /* Packaged macOS: the row never starts left of the traffic lights, whatever
+       the divider is doing. It steps past the same lights reserve the drawer
+       toggle's --header-lead-inset does, so the header's left-most slot
+       clears the lights in every state that can hold it, and it is needed here
+       for the same reason as there: this row's leading control is the
+       hamburger, and a --header-icon-box centred on the bar reaches up into the
+       reclaimed band, so wherever the row starts is where a control paints.
+
+       Maximizing the Canvas pane is what makes that reachable. Collapsing the
+       Conversation side takes --split-ratio to 0 and hides the drawer with it,
+       so --co, --ddo and --divider-x are all 0 and the base rule lands the
+       hamburger at the window's own left edge, directly on the lights.
+
+       A `max()` rather than a rule gated on [data-thread-collapsed], because
+       the collapse is not the only way under the reserve: --split-ratio is a
+       persisted RATIO and nothing re-clamps it when the window shrinks, so a
+       divider dropped at the Conversation pane's floor on a very wide display
+       (store/paneMinimums.ts clamps the drag in px, against the container it
+       was dragged in) reopens proportionally narrower in a small window. Rare,
+       but a floor written as a floor covers it for free, where an attribute
+       gate would have to enumerate it.
+
+       The inner term is a copy of the base rule's `left`, which CSS cannot hand
+       back as a resolved length; the drift check is in
+       styles/__tests__/header-band-centering.test.ts.
+
+       Horizontal only, like the toggle's step: the row keeps the base
+       rule's bar centring (--header-band-lift), so the hamburger stays on the
+       line every other control in the bar sits on. `left` already transitions
+       there, so the step rides the collapse animation instead of jumping. */
+    :root[data-titlebar-overlay] .app-header .content-header-elements {
+        left: max(calc(var(--divider-x) + var(--divider-width)), var(--titlebar-lights-reserve));
+    }
+
+    .app-header .content-header-elements > .hamburger-panel,
+    .app-header .content-header-actions {
+        flex-shrink: 0;
+    }
+
+    /* Refresh (ContentRefreshButton) joins the hamburger at the leading end.
+       The auto margin takes the free space, so `space-between` still pins the
+       actions to the trailing end. Two boxes and a gap fit inside
+       --content-side-reserve, so the centred title does not move. */
+    .app-header .content-refresh-btn {
+        display: inline-grid;
+        place-items: center;
+        flex-shrink: 0;
+        margin-inline-end: auto;
+    }
+
+    /* The arrow and the check share one cell and crossfade, as on the phone
+       row (.mobile-refresh-indicator). `scale` rather than `transform`, which
+       the spin animation owns. */
+    .app-header .content-refresh-btn svg {
+        grid-area: 1 / 1;
+        transition: opacity var(--duration-normal) ease, scale var(--duration-normal) ease;
+    }
+
+    /* An activity indicator, so a literal duration. It runs through the
+       crossfade to the check, since stopping would snap the arrow upright
+       mid-fade. It stops back at idle, where the arrow is still transparent. */
+    .app-header .content-refresh-btn:not([data-state="idle"]) svg:not(.refresh-check) {
+        animation: spin 1s linear infinite;
+    }
+
+    :root[data-motion="reduce"] .app-header .content-refresh-btn:not([data-state="idle"]) svg:not(.refresh-check) {
+        animation: none;
+    }
+
+    .app-header .content-refresh-btn[data-state="done"] svg:not(.refresh-check),
+    .app-header .content-refresh-btn .refresh-check {
+        opacity: 0;
+        scale: 0.6;
+    }
+
+    /* The check grows in, then fades out at full size, as on the phone row.
+       Its `scale` resets only once it is invisible. */
+    .app-header .content-refresh-btn .refresh-check {
+        color: var(--header-fg);
+        transition: opacity var(--duration-slow) ease-in-out, scale 0s var(--duration-slow);
+    }
+
+    .app-header .content-refresh-btn[data-state="done"] .refresh-check {
+        opacity: 1;
+        scale: 1;
+        transition: opacity var(--duration-normal) ease, scale var(--duration-normal) ease;
+    }
+
+    /* The arrow waits for the check to finish fading. Keyed on `idle` alone,
+       so a new refresh still brings it straight back. */
+    .app-header .content-refresh-btn[data-state="idle"] svg:not(.refresh-check) {
+        transition-delay: var(--duration-slow);
+    }
+
+    /* The chevrons bracketing the title hold their size; only the title gives
+       way. Without this the flex default lets a long title squeeze a chevron,
+       which would move the very controls the user navigates with. Same rule,
+       for the same reason, as `.header-nav-cluster > .icon-btn` on mobile.
+
+       A DIRECT-child selector, and it only started matching again on
+       2026-08-13: the chevrons spent a while as grandchildren, inside a
+       `.header-title-span` that carried the fixed span the box carries now, and
+       for all of it this rule addressed nothing. Absorbing that element back
+       into the box is what makes one element own the span AND its members. */
+    .app-header .pane-header-content-title > .icon-btn {
+        flex: 0 0 auto;
+    }
+
+    /* Both centred boxes clip at their own edges and pin a chevron TO each edge,
+       so the shared --focus-ring (global/shared-components.css) is drawn INSET
+       for these four buttons. It is an outward band, `0 0 0 0.1875rem` with no
+       offset and no blur, so on the chevron the keyboard reaches it would lose
+       exactly its outer side and render as three sides of a box. Same trade
+       `.list-row-add-card` makes against `.content-pane-body`'s clip, including
+       the matching negative `outline-offset` for forced-colors, where the
+       box-shadow is stripped and the transparent outline is the whole ring.
+
+       There is room for it inside the button: the box is --header-icon-box
+       (2.25rem) around an --icon-size-lg (1.25rem) glyph, so the band sits in
+       the 0.5rem of padding either side of the ink rather than over it.
+
+       NOT `overflow-clip-margin`, which is the feature this otherwise wants and
+       would keep the ring identical to every other header icon's: the packaged
+       macOS webview treats a `clip` box as a SCROLL container (the note on
+       .pane-header-brand-label spells this out), so widening the clip region
+       there buys a scrollable strip rather than a visible ring.
+
+       The content row's half is a 2026-08-13 regression and the thread row's is
+       not, but they are one construct now and a fix on one only is the drift
+       this change set out to remove. Before, the content chevrons sat inside a
+       `.header-title-span` well within a much wider clipping zone, so the ring
+       had room; absorbing that wrapper put them on the clip edge. */
+    .app-header .pane-header-content-title > .icon-btn:focus-visible,
+    .app-header .pane-header-brand-label > .icon-btn:focus-visible {
+        outline-offset: -0.125rem;
+        box-shadow: inset var(--focus-ring);
+    }
+
+    /* The thread drawer toggle's ONE host. It rests in the header's corner, at
+       --header-lead-inset, in every state, so there is one place to look for
+       it. With the drawer open it sits over the drawer row's leading end, which
+       the row keeps free for it (--threads-row-lead on .threads-header).
+       NOTHING here transitions opacity: a single control never fades, and this
+       one only shrinks away when its whole pane collapses (below).
+
+       z-index must beat .pane-header-brand (--z-control-panel = 2200), which
+       starts at left:0 when the drawer is closed and would otherwise swallow
+       pointer events. The centred brand-label keeps clear of it via
+       --brand-side-reserve (defined on :root above), whose leading term is this
+       control at --header-lead-inset. That is the same value this rule places it
+       with, so the two cannot disagree about where it is.
+
+       It takes --header-band-lift like the three header regions, so the drawer
+       toggle sits at the same height as every other control in the bar. The
+       overlay build clears the traffic lights SIDEWAYS, via --header-lead-inset
+       on :root above, rather than singling this control out vertically. */
+
+    /* It stays a child of .app-header rather than moving into the strip, and
+       that keeps the window drag correct for free. The strip's own drag handler
+       never sees these pointer events, since the header subtree paints, and
+       hit-tests, above it. The header's own handler already exempts interactive
+       targets via headerCanDragStart. */
+    .thread-toggle-slot {
+        position: absolute;
+        /* Where the toggle rests, in every state. The value is on :root
+           because the brand cluster's reserve and the drawer row's lead read it
+           too, and a private copy here is how such readers came apart on the
+           overlay build. Nothing transitions it: the toggle never travels. */
+        left: var(--header-lead-inset);
+        top: 50%;
+        transform: translateY(calc(-50% - var(--header-band-lift)));
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+        /* The slot is exactly its one control wide, stated rather than left to
+           `auto` because the collapse below animates it to 0 and `auto` is not
+           interpolable. A second control added here has to widen this with it,
+           and a wrong value shows up at once as a clipped icon in the RESTING
+           state rather than only in an animation's tail. */
+        width: var(--header-icon-box);
+        /* What the slot paints: its own box plus room for the button's focus
+           ring, a 0.1875rem band. So the ring is never cut, and a slot shrunk
+           below the button's width paints only the part of it still inside.
+           One value for every state, so no frame of a transition can drop it.
+           A clip-path, not `overflow: clip`, which does not transition: the
+           clip would lift on the first frame of a re-expand and flash the
+           whole button over the Canvas hamburger still sitting in this corner.
+           Nor an `overflow-clip-margin`, which the packaged macOS webview turns
+           into a scroll container (see .pane-header-brand-label). */
+        clip-path: inset(-0.25rem);
+        z-index: calc(var(--z-control-panel) + 1);
+        transition: width var(--duration-slow) ease, visibility var(--duration-slow);
+    }
+
+    /* The whole Conversation side is collapsing (maximize Canvas, ⌘⇧↵, a
+       divider double-click), so the toggle leaves WITH its pane instead of
+       fading where it stands. The Canvas pane's hamburger slides left into this
+       very corner (.content-header-elements, floored at the lights reserve),
+       and a toggle dimming there would put a ghost under an arriving control.
+
+       It leaves by SHRINKING in place: `left` stays at the corner, and the
+       slot's width runs to 0 behind the constant clip above, so the icon wipes
+       away toward its own left edge. The hamburger's left edge runs to the
+       corner on the same ease from a whole pane away, so it arrives after the
+       icon has gone and leaves before the icon is back. The one exception is
+       a narrow pane on the packaged build, whose hamburger stops at the lights
+       reserve: there the last pixels of the wipe can meet it for a frame or
+       two. Staying put keeps the toggle clear of the traffic lights, where a
+       slide to 0 would pass under them.
+
+       visibility transitions as a step at the END of its duration, so the button
+       stays paintable while it shrinks and leaves the tab order only once it is
+       gone. */
+    :root[data-thread-collapsed] .thread-toggle-slot {
+        width: 0;
+        visibility: hidden;
+        pointer-events: none;
+    }
+
+    /* Threads header: the title centred on the drawer pane, Filter leading just
+       past the drawer toggle's room, and Grouping and Search at the trailing end.
+       z-index 3 keeps the row's controls above .drawer-divider / .split-divider
+       (both z-index 2), whose bands meet this header's edges. */
+    .threads-header {
+        /* The room the row keeps at its leading end for the drawer toggle,
+           which rests over it (.thread-toggle-slot): the toggle's inset, its
+           box and one gap. The row pads its content past this and CLIPS at it,
+           so nothing in the row paints or hit-tests under the toggle. That
+           includes Grouping and Search, which ride the row's shrinking right
+           edge toward the corner as the drawer shuts.
+
+           Declared HERE rather than on :root, because --pane-header-gap is
+           declared on .pane-header, and a custom property is substituted on the
+           element that declares it. A :root copy would be invalid at
+           computed-value time, silently dropping the padding and the clip. The
+           title inherits it for its clamp. */
+        --threads-row-lead: calc(var(--header-lead-inset) + var(--header-icon-box) + var(--pane-header-gap));
+        position: absolute;
+        left: 0;
+        width: var(--co);
+        top: 50%;
+        transform: translateY(calc(-50% - var(--header-band-lift)));
+        display: flex;
+        align-items: center;
+        /* Grouping and Search sit at the trailing end, and Filter leads by its
+           own auto margin (below); the title is centred on the pane out of
+           flow. Harmless under .search-active, where the field is the one
+           visible child and fills the row on its own `flex: 1`. */
+        justify-content: flex-end;
+        gap: var(--pane-header-gap);
+        padding: 0 0.5rem 0 var(--threads-row-lead);
+        z-index: 3;
+        /* Always mounted: width rides --co to 0 when the drawer closes, so
+           the drawer header slides shut in lockstep with the drawer body
+           instead of popping out, and the row is clipped SIDEWAYS as it shrinks.
+
+           A clip-path rather than `overflow: clip`, and it must STAY one: the
+           packaged macOS webview clips both axes as soon as one of them is
+           `clip` (see .pane-header-brand), so `overflow-x: clip` is not
+           available and `overflow: clip` would shave anything that ever needs
+           to leave this box vertically.
+
+           The leading inset is the toggle's room (above). A pair of insets that
+           adds up to more than the box encloses no area, so a row narrower than
+           its own lead paints nothing at all. The top and bottom let out
+           0.25rem, room for the 0.1875rem focus ring: the row is exactly one
+           button tall, so a flush clip cut the ring on Filter and Search. */
+        clip-path: inset(-0.25rem 0 -0.25rem var(--threads-row-lead));
+        transition: width var(--duration-slow) ease,
+                    padding var(--duration-slow) ease,
+                    opacity var(--duration-slow) ease,
+                    visibility var(--duration-slow);
+    }
+
+    /* No search-active exception, deliberately: the field starts after the
+       row's lead like everything else in the row. The toggle stays in its
+       corner while search is up, and on the packaged build the traffic lights
+       sit in front of it, so a field that took the lead back would run under
+       both and lose any click that landed there. */
+
+    /* Drawer closed (or thread pane collapsed → drawerVisible false): the
+       width transition is the exit animation; visibility transitions so the
+       clipped buttons leave the tab order only after the slide finishes.
+       padding must collapse too: a border-box width bottoms out at the row's
+       horizontal padding, the toggle's room included, and would leave a
+       phantom box behind otherwise. */
+    :root:not([data-thread-drawer-open]) .threads-header {
+        padding: 0;
+        visibility: hidden;
+        pointer-events: none;
+    }
+
+    /* Centred on the PANE's true middle, the same way .pane-header-brand-label
+       is centred on the Conversation pane one region over, and for the same
+       reason: what the eye reads the title against is the drawer under it, not
+       the controls flanking it. A `flex: 1` zone would centre it on the gap
+       between the row's two ends instead, and those ends differ in width.
+
+       `left: 50%` resolves against the containing block, which for an absolutely
+       positioned child is the row's PADDING box (the full --co), so the row's
+       asymmetric padding cannot reach this. `top` is set explicitly rather than
+       left to the flex static position, which is a weaker guarantee for an
+       out-of-flow child.
+
+       The max-width is the structural non-overlap guarantee: the title clears
+       the WIDER of the row's two ends on both sides, instead of running under a
+       control. The leading end is the toggle's room (--threads-row-lead, which
+       carries the traffic-lights reserve on the overlay build) plus Filter. The
+       trailing end is the row's padding plus Grouping and Search. Each control
+       is a --header-icon-box and a gap.
+
+       A word wider than that room is hidden, never ellipsized
+       (`ThreadsPaneTitle`'s data-cramped, below). computeMinDrawerWidth
+       (store/paneMinimums.ts) floors the drawer at the two ends alone, so the
+       controls always fit and the title is what gives way. */
+    .threads-header-title {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        max-width: calc(100% - 2 * max(var(--threads-row-lead) + var(--header-icon-box) + var(--pane-header-gap), 0.5rem + 2 * (var(--header-icon-box) + var(--pane-header-gap))));
+        font-size: var(--font-size-lg);
+        font-weight: 600;
+        color: var(--text-primary);
+        white-space: nowrap;
+        text-align: center;
+        overflow: hidden;
+    }
+
+    /* The buttons never shrink — the title gives way instead. */
+    .threads-header .threads-header-btn {
+        flex-shrink: 0;
+    }
+
+    /* Filter leads the row, past the toggle's room. */
+    .threads-header .filter-slot {
+        margin-right: auto;
+    }
+
+    /* Brand area spans from drawer edge to split divider. It holds the Lucidos
+       mark + workspace name (brand-label, absolutely centred on the pane) and
+       the trailing actions cluster. While the drawer is shut, the drawer toggle
+       overlaps its LEADING edge from outside (.thread-toggle-slot is positioned
+       against the header, not a member of this region); --brand-side-reserve is
+       what keeps the centred label clear of it (and of the wider trailing
+       cluster opposite). With the drawer open the toggle rests over the drawer
+       row instead. Home, when present, leads the region in both states. */
+    .app-header .pane-header-brand {
+        position: absolute;
+        left: calc(var(--co) + var(--ddo));
+        width: calc(var(--divider-x) - var(--co) - var(--ddo));
+        /* As tall as the tallest thing it HOLDS, which is not the same as the
+           tallest thing in its FLOW. The region declares no height, so it
+           shrinks to its one in-flow child, the actions cluster, and that is one
+           --header-icon-box. The brand label is out of flow and centred on the
+           region, and it is as tall as the taller of the chevrons
+           (--header-icon-box) and the mark's tap target (--header-mark-tap). At
+           the shipped tuning those are 2.25rem and 2.1rem, so the label fits
+           exactly and nothing here reads as wrong. But --header-mark-tap is a
+           style-remote tunable, and the moment it passes the icon box the label
+           hangs past this box, top and bottom.
+
+           Sizing the box to what it centres keeps every member inside it, on
+           any engine and at any tuning, whatever the clip below lets through.
+           `min-height` rather than `height`, so a
+           taller in-flow cluster still grows the region. The region has no
+           paint of its own, so growing it moves nothing: both it and the label
+           stay centred on the same line (each is `top: 50%` plus a -50%
+           translate of its own height, so neither centre depends on a height).
+           Pinned by styles/__tests__/header-band-centering.test.ts and
+           e2e/lucidos-menu-desktop.spec.ts. */
+        min-height: max(var(--header-icon-box), var(--header-mark-tap));
+        top: 50%;
+        transform: translateY(calc(-50% - var(--header-band-lift)));
+        z-index: var(--z-control-panel);
+        /* Clips sideways at its own edges plus ring room, so the trailing
+           action keeps its focus ring at the divider. A full region height of
+           room above and below leaves the vertical axis unclipped.
+
+           A clip-path, never `overflow-x: clip` beside `overflow-y: visible`.
+           The packaged macOS webview does not honour that pair, and makes the
+           box a SCROLL container. It then scrolled the Lucidos mark and both
+           chevrons away on a click and back after, reported twice and out of
+           reach of every automated surface (no WebDriver reaches WKWebView,
+           ADR 0016). A clip-path is no scroll container on any engine. */
+        clip-path: inset(-100% calc(-1 * var(--focus-ring-width)));
+        /* The actions cluster is pinned to the trailing edge. Home, when
+           present, leads the row through its own auto margin below, so the
+           actions stay at the trailing edge whether or not it is there. */
+        justify-content: flex-end;
+        /* Room at the leading edge for Home. With the drawer open the region
+           starts at the drawer divider and the row gap is enough. */
+        padding-left: var(--pane-header-gap);
+        transition: left var(--duration-slow) ease, width var(--duration-slow) ease,
+                    padding-left var(--duration-slow) ease,
+                    opacity var(--duration-slow) ease, visibility var(--duration-slow);
+    }
+
+    /* With the drawer shut the region starts at the window edge, where the
+       drawer toggle overlaps it from outside, so Home starts past the toggle. */
+    :root:not([data-thread-drawer-open]) .app-header .pane-header-brand {
+        padding-left: calc(var(--header-lead-inset) + var(--header-icon-box) + var(--pane-header-gap));
+    }
+
+    .app-header .pane-header-brand > .home-thread-btn {
+        flex-shrink: 0;
+        margin-right: auto;
+    }
+
+    /* Home widens the row's leading end by its box and a gap, so the centred
+       cluster's reserve grows with it. The reserve stays the WIDER end. */
+    .app-header .pane-header-brand:has(> .home-thread-btn) {
+        --brand-side-reserve: max(
+            calc(var(--header-lead-inset) + 2 * var(--header-icon-box) + var(--pane-header-gap)),
+            var(--brand-trail-end)
+        );
+    }
+
+    /* brand-label is absolutely centered on the pane's true middle, and it is
+       the fixed SPAN the two thread chevrons are pinned to (space-between), so
+       they hold their places instead of drifting with the workspace name's
+       width. Its own flex middle, .pane-header-brand-center, is what
+       WorkspaceNameLabel measures itself against.
+       The clamp is the same three-part rule the mobile cluster uses: hold the
+       span when it fits, give way to the side reserves when it does not, never
+       squeeze below the controls' natural width. The reserve on
+       each side clears the nav-group / actions clusters. pointer-events:none lets
+       the transparent box pass clicks through to those clusters and the brand's
+       own focus-on-click; the visible children re-enable pointer events.
+       overflow-x:clip guarantees horizontal non-overlap at narrow chat-pane
+       widths: content that can't shrink further (the mark) clips at the box
+       edges, which sit inside the side reserves, instead of spilling over the
+       clusters. overflow-y stays visible (matching the parent .pane-header-brand
+       above) where an engine honours the pairing. NOTHING VISIBLE MAY RELY ON
+       IT: the packaged macOS webview
+       clips both axes as soon as one of them is `clip`, so anything that has to
+       be seen stays inside this box. The badge does: it rides the mark's own
+       corner, inside the mark's tap target, rather than lifting out of the flex
+       line the way the retired wordmark's superscript did.
+       And NOTHING MAY OVERFLOW THE PARENT vertically, which is a stronger rule
+       than "may be clipped": that webview's clip behaves as a scroll container,
+       so overflow there is not merely hidden, it is scrollable, and a click on a
+       control inside scrolls it away and back. The parent's `min-height` is what
+       keeps this box inside it however --header-mark-tap is retuned; do not drop
+       it without reading its note. */
+
+    /* Why no pane width can put an end of this box on a flanking control. Write
+       `lead` for --header-lead-inset plus one --header-icon-box, and `natural`
+       for --desktop-nav-min-span. The box's leading edge resolves to
+       max(--brand-side-reserve, (pane - natural) / 2), and both arms clear
+       `lead`:
+       - the reserve is a max() that includes `lead`;
+       - (pane - natural) / 2 is at its smallest at the Conversation pane's own
+         floor, and store/paneMinimums.ts derives that floor as
+         natural + 2 * lead.
+       The box is centred, so the trailing end has the same clearance, and
+       useHeaderActionCollapse folds the actions cluster to fit whatever this
+       box leaves. Retuning any of the four terms keeps the proof, since the
+       floor is computed from the same tokens; a floor written as a constant
+       again is what breaks it, and was the reported overlap. */
+    .app-header .pane-header-brand .pane-header-brand-label {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        width: clamp(
+            var(--desktop-nav-min-span),
+            calc(100% - 2 * var(--brand-side-reserve)),
+            var(--desktop-nav-span)
+        );
+        justify-content: space-between;
+        overflow-x: clip;
+        overflow-y: visible;
+        pointer-events: none;
+    }
+
+    /* The header regions that hold a badge, centred on whole pixels. A
+       region's -50% is half its own height, which is -24.75px at 137.5%.
+       Inside a fractional translate, Chrome snaps a badge's pill and digit
+       apart. On a 1x screen the pill then loses a row and the count sits low.
+       Pinned by e2e/badge-glyph-centring.spec.ts.
+       Gated, and after every rule it rounds. An engine without `round()`
+       drops a whole transform that carries a `var()`, and the region would
+       fall half its height down the bar. */
+    @supports (width: round(1.5px, 1px)) {
+        .threads-header,
+        .app-header .pane-header-brand,
+        .app-header .content-header-elements,
+        .thread-toggle-slot {
+            transform: translateY(round(calc(-50% - var(--header-band-lift)), 1px));
+        }
+
+        .app-header .pane-header-brand .pane-header-brand-label {
+            transform: translate(round(-50%, 1px), round(-50%, 1px));
+        }
+    }
+
+    /* …and the members are targets again, EXCEPT while an overlay owns the
+       screen. The gate is the desktop copy of the one `.header-nav-cluster > *`
+       carries in styles/header-mark.css, and it is load-bearing rather than
+       cautious for the same reason: the inert-behind half of the overlay
+       contract works by setting `pointer-events: none` on an ANCESTOR
+       (`:root[data-overlay-open] .app-shell > *`, global/modal-overlay.css) and
+       letting it inherit down, and a value applied DIRECTLY to a child beats an
+       inherited one at any specificity. Ungated, this punched a live hole
+       through that inert exactly the width of the brand span: with the Lucidos
+       menu up, the two thread chevrons and everything in the brand centre were
+       the only things behind the scrim still answering the pointer, so they kept
+       their hover highlight and were one swallowed click away from navigating
+       thread history instead of dismissing.
+
+       Gating instead of naming this box in the inert rule is what keeps the
+       overlay's ANCHOR exemption working. A chevron is itself the anchor while
+       its own long-press history menu is open, and `[data-overlay-anchor]` is
+       (0,2,0): it can beat inheritance, but it would lose to a rule reaching in
+       here to re-assert `none`. With this rule simply not applying, the anchor
+       is the only declaration on the element and re-tapping it still closes its
+       own menu. Same for the mark, which is the anchor for the menu in question.
+
+       Only `[data-overlay-open]`, where the mobile twin also gates on
+       `[data-keyboard-active]`: that regime is `:root[data-keyboard-active]
+       .app-header` in mobile.css, inside the mobile breakpoint, so it can never
+       co-apply with a rule that lives in the desktop one. */
+    :root:not([data-overlay-open]) .app-header .pane-header-brand .pane-header-brand-label > * {
+        pointer-events: auto;
+    }
+
+    /* The brand itself, holding the span's middle: the mark, and the workspace
+       name while it fits. flex:1 + min-width:0 make it the one member that
+       gives way, so the chevrons at the ends never move, and its width is the
+       room WorkspaceNameLabel measures the name against. */
+    .app-header .pane-header-brand-center {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex: 1 1 auto;
+        min-width: 0;
+    }
+
+    .app-header .pane-header-brand-label > .icon-btn {
+        flex: 0 0 auto;
+    }
+
+    /* The title cluster: the two chevrons pinned to the ends of a FIXED SPAN
+       with the title between them, absolutely centred on the row's own middle.
+       The content pane's copy of .pane-header-brand-label one region over, down
+       to the clamp, and of .header-nav-cluster on both mobile rows.
+
+       Centred on the ROW rather than between the two clusters flanking it,
+       which is what it used to be (a flex:1 zone). The eye reads the title
+       against the pane under it, and this row's trailing cluster is 1 to 3 icon
+       boxes wide depending on the content view, so the flex middle put the
+       title and both chevrons somewhere different on every navigation.
+
+       The row and the pane share a middle in every state but one: the packaged
+       macOS build with the Canvas pane maximized, where the row's `left` is
+       floored at the traffic-lights reserve while the pane still starts at the
+       window's edge. Centring on the row there puts the title in the middle of
+       the room left AFTER the lights, which is the space every other control in
+       the row is placed against, and is where the flex zone had it too. The
+       threads title makes the opposite call for its own row, and can: the
+       reserve is padding there, so its box still spans the whole drawer.
+
+       Same span as the thread pane's (--desktop-nav-span), so the chevrons on
+       the two panes are held the same distance apart whatever each row happens
+       to put between them. A wide Canvas pane is the exception: its span grows
+       out of room past --content-unfolded-reserve, up to
+       --desktop-content-title-span-max, so a long title shows more of itself.
+       The span still depends on the pane width alone, so the chevrons still
+       hold still across navigations. The clamp is the same three-part rule:
+       hold the span when the pane can afford it, give way to the side reserves when it
+       cannot, never squeeze below the controls' own width. Its middle arm is
+       the structural non-overlap guarantee that `min-width: 0` used to give the
+       flex zone, and it is a DERIVED reserve rather than a guessed one (see
+       --content-side-reserve). The min-span arm engages only BELOW this pane's
+       own floor, since twice the reserve plus the min span is inside
+       MIN_CONTENT_PANE_REM (store/paneMinimums.ts). Only an unclamped persisted
+       ratio reaches such a width. There the ends do reach the
+       clusters, and `useHeaderActionCollapse` is what pulls the actions
+       into the ⋯ menu instead.
+
+       As tall as the row, by construction rather than by luck: the row's height
+       is its tallest in-flow child, the hamburger, and this box's tallest
+       member is a chevron. Both are one --header-icon-box. That matters because
+       the row clips at its own box plus only ring room, so a box that hung out
+       of it vertically would be cut. Anything added here that is taller than
+       that token needs the row to reserve it.
+
+       No pointer-events juggling, unlike the two centred clusters this mirrors:
+       the clamp keeps the box off both clusters, so the only thing under its
+       empty middle is the header band, and a click landing there still reaches
+       the band's own handlers by bubbling (pane focus, the maximize
+       double-click, the Tauri window drag). What the box does need is the
+       stacking guard below, because being out of flow it paints OVER its
+       in-flow siblings. */
+    .app-header .pane-header-content-title {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        width: clamp(
+            var(--desktop-nav-min-span),
+            calc(100% - 2 * var(--content-side-reserve)),
+            clamp(
+                var(--desktop-nav-span),
+                calc(100% - 2 * var(--content-unfolded-reserve)),
+                var(--desktop-content-title-span-max)
+            )
+        );
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--dot-gap);
+        font-size: var(--font-size-lg);
+        font-weight: 600;
+        color: var(--text-primary);
+        white-space: nowrap;
+        overflow: hidden;
+    }
+
+    /* The trailing cluster stays ON TOP of the centred box, which is the same
+       guard `.mobile-header-row .content-header-actions` carries (mobile.css)
+       and is needed here for the same reason: a positioned element paints after
+       its in-flow siblings, so the title box would cover any icon it reached.
+       It should never reach one, the clamp holding it off the reserve and the
+       collapse folding the cluster on the min-span arm, and this is what keeps
+       a miss in either from turning into a dead ⋯ trigger rather than just a
+       cosmetic overlap. Costs nothing while they do not overlap. */
+    .app-header .content-header-actions {
+        position: relative;
+        z-index: 1;
+    }
+
+    .app-header .pane-header-content-title .pane-header-title-text,
+    .app-header .pane-header-content-title .panel-url-title {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    /* Focused-pane wash: a faint lighter-blue overlay filling the focused pane's
+       header segment — the visual cue for which pane is focused. One invisible
+       positioning box PER PANE, each STATICALLY pinned over its own header segment
+       (drawer / thread / content) via the SAME geometry vars the three header
+       regions are positioned from (--co / --ddo / --divider-x), so each lines up
+       with — and slides in lockstep with — its region as the split or drawer width
+       changes. Focus moving between panes is a CROSSFADE, not a slide: the outgoing
+       pane's tint eases out and the incoming pane's eases in, while each box
+       stays fixed to its own segment. The tint is painted by ::before so it can
+       spill past the box edges to cover the adjacent header divider(s), giving the
+       focused pane ONE continuous lighter band with no unwashed strip at the divider
+       seams. NO z-index and rendered as the header's first children, so it sits
+       above the header background yet under every control. Driven by
+       data-focused-pane on :root (set by SplitLayout); collapsed panes never show
+       theirs (the :not() guards). */
+    .header-focus-wash {
+        display: block;
+        position: absolute;
+        /* Rise OUT of the header, up through the reclaimed macOS title-bar band,
+           so the focused pane is painted all the way to the top edge of the
+           window (traffic-light band included) rather than stopping at the
+           header's top and leaving an unwashed strip above it. --titlebar-inset
+           is the .titlebar-strip height — set only by the macOS Tauri build
+           (`titlebar_inset_script` in lib.rs) and unset everywhere else, so on
+           web / PWA / non-macOS this is `top: 0` and the wash is unchanged.
+           Painting over the strip works without a z-index: .app-header is
+           position:relative here and .titlebar-strip is a static sibling, so the
+           header's whole subtree paints after the strip's background. The strip
+           keeps its solid --titlebar-strip-bg as the base — this only tints the
+           focused pane's segment of it, matching the header below. */
+        top: calc(-1 * var(--titlebar-inset, 0px));
+        bottom: 0;
+        left: 0;
+        width: 0;
+        pointer-events: none;
+        /* GEOMETRY ONLY (split / drawer resize). The box's position never changes
+           on a focus shift, so it cannot slide between panes. The kill-rule below
+           switches exactly these two off, for 1:1 tracking during a divider drag.
+           The fade itself lives on ::before, and must: see the note there. */
+        transition: left var(--duration-slow) ease, width var(--duration-slow) ease;
+    }
+
+    /* Each box sits over its own segment ALWAYS (focused or not) — this is what
+       makes a focus shift a crossfade rather than a slide. */
+    .header-focus-wash[data-pane="drawer"] {
+        left: 0;
+        width: var(--co);
+    }
+    .header-focus-wash[data-pane="thread"] {
+        left: calc(var(--co) + var(--ddo));
+        width: calc(var(--divider-x) - var(--co) - var(--ddo));
+    }
+    .header-focus-wash[data-pane="content"] {
+        left: calc(var(--divider-x) + var(--divider-width));
+        width: calc(100% - var(--divider-x) - var(--divider-width));
+    }
+
+    /* The tint. It lives on ::before rather than the box background so its edges can
+       extend PAST the box (via negative left/right) to cover the adjacent header
+       divider(s) too — the box itself stops flush at each divider, leaving a thin
+       unwashed seam otherwise. Full box height, no z-index. The per-pane overhangs
+       below push each interior edge out by exactly the neighbouring divider's width.
+
+       The fade is the TINT'S OWN COLOUR, transparent to --focus-header-tint,
+       and that is load-bearing rather than a tidier spelling of the same thing.
+       It was `opacity: 0` to `1` on the box, and an engine animates opacity on
+       the compositor. So the transition conjured a layer under the whole header
+       segment, then tore it down again at the end. Safari answers either change
+       by re-rasterising everything overlapping it. A colour is not an accelerated
+       property, so there is no layer and the text holds still. Interpolation
+       from `transparent` is premultiplied, so the tint cannot darken mid-fade.
+       The mechanism, the two titles it moved and the scan that pins it:
+       styles/__tests__/header-focus-wash-fade.test.ts.
+
+       Deliberately off the geometry kill-list below: the fade is about focus,
+       not about tracking a divider under the pointer. */
+    .header-focus-wash::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        background-color: transparent;
+        /* The underline cue (--focus-header-underline), drawn as an inset
+           shadow so it adds no layout. At rest its colour is transparent. */
+        box-shadow: inset 0 calc(-1 * var(--focus-header-underline-width)) 0 0 transparent;
+        /* Slower than --duration-slow on purpose, so the wash blooms up like a
+           light turning on rather than popping in. Scaled like every token in
+           global/base.css, or it would be the one animation in the app that
+           ignores the animation-speed slider. A shadow is painted, not
+           composited, so fading it conjures no layer either. */
+        transition: background-color calc(0.33s * var(--duration-scale)) ease-out,
+                    box-shadow calc(0.33s * var(--duration-scale)) ease-out;
+    }
+    /* Drawer: extend the RIGHT edge over the drawer divider (--ddo wide when open,
+       0 when closed). Left is the window edge. */
+    .header-focus-wash[data-pane="drawer"]::before {
+        right: calc(-1 * var(--ddo));
+    }
+    /* Thread: extend LEFT over the drawer divider (--ddo) and RIGHT over the split
+       divider (--divider-width). */
+    .header-focus-wash[data-pane="thread"]::before {
+        left: calc(-1 * var(--ddo));
+        right: calc(-1 * var(--divider-width));
+    }
+    /* Content: extend the LEFT edge over the split divider. Right is the window edge. */
+    .header-focus-wash[data-pane="content"]::before {
+        left: calc(-1 * var(--divider-width));
+    }
+
+    /* A focus shift only paints the tint in. Each box is already positioned over
+       its own segment above, so the outgoing pane's tint eases out while the
+       incoming pane's eases in, never sliding across. Collapsed panes never
+       reveal theirs (the :not() guards). */
+    :root[data-focused-pane="drawer"][data-thread-drawer-open] .header-focus-wash[data-pane="drawer"]::before,
+    :root[data-focused-pane="thread"]:not([data-thread-collapsed]) .header-focus-wash[data-pane="thread"]::before,
+    :root[data-focused-pane="content"]:not([data-content-collapsed]) .header-focus-wash[data-pane="content"]::before {
+        background-color: var(--focus-header-tint);
+        box-shadow: inset 0 calc(-1 * var(--focus-header-underline-width)) 0 0 var(--focus-header-underline);
+    }
+
+    /* While a divider drag is live (data-pane-resizing, set by
+       beginPaneResize in splitHelpers.ts), geometry transitions go off so the
+       header regions and the drawer track the pointer 1:1 with the panes —
+       the always-on var(--duration-slow) eases otherwise leave the header
+       visibly lagging behind the panels mid-drag. They come back on at
+       release. A drag corrects nothing on release now (ADR 0056), so what they
+       come back for is the next explicit ratio change: a toggle, a maximize, a
+       keyboard step, a layout reset. */
+    :root[data-pane-resizing] .app-header::before,
+    :root[data-pane-resizing] .app-header::after,
+    :root[data-pane-resizing] .app-header .content-header-elements,
+    :root[data-pane-resizing] .app-header .pane-header-brand,
+    :root[data-pane-resizing] .threads-header,
+    /* The drawer toggle's `width` transitions for its collapse exit, and a
+       drag on the split divider can re-expand a collapsed Conversation pane.
+       Left out, the toggle would ease in behind a pane that is tracking the
+       pointer 1:1. */
+    :root[data-pane-resizing] .thread-toggle-slot,
+    :root[data-pane-resizing] .thread-drawer,
+    :root[data-pane-resizing] .header-focus-wash,
+    :root[data-pane-resizing] .toast-column,
+    :root[data-pane-resizing] .split-layout.pane-animate .pane {
+        transition: none;
+    }
+
+    /* Ease the Blocked / drafts toggles' active-state color change. */
+    .threads-header .icon-btn {
+        transition: color var(--duration-normal), background var(--duration-normal);
+    }
+}
+
+/* Right-side cluster of the brand: control panel + compose + search (+ recovery).
+   Pinned to the brand box's right edge by the brand's justify-content; the
+   centered brand-label floats over the middle independently. */
+.pane-header-brand-actions {
+    display: flex;
+    /* The brand's own justify-content already places the cluster. */
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.25rem;
+    flex-shrink: 0;
+}
+
+@media (--desktop-layout) {
+    /* Collapsing a pane fades its header regions out while their left/width
+       transitions slide them to zero — display:none here popped them out at
+       the start of the pane animation. The drawer toggle is deliberately NOT in
+       this list: it is a single control rather than a whole region, and it
+       shrinks away in place instead (see .thread-toggle-slot above), because
+       the corner it would fade in is the one the Canvas pane's hamburger
+       slides into. */
+    :root[data-thread-collapsed] .app-header .threads-header,
+    :root[data-thread-collapsed] .app-header .pane-header-brand,
+    :root[data-content-collapsed] .app-header .content-header-elements {
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+    }
+}
+
+
+.workspace-name-label {
+    /* Read together with the mark's own padding, not on its own: the tap target
+       holds 0.25rem of clearance around the glyph (the same an .icon-btn holds
+       around its own), so the gap the eye sees is this plus that. Mirrored as a
+       constant in WorkspaceNameLabel, which cannot read it back once hidden. */
+    margin-left: 0.0625rem;
+    color: var(--text-secondary);
+    font-size: var(--font-size-lg);
+    white-space: nowrap;
+    /* Whole or hidden, never truncated: it does not shrink, and there is no
+       ellipsis to shrink into. WorkspaceNameLabel hides it when the name does
+       not fit beside the mark. */
+    flex: 0 0 auto;
+    /* Never clips anything (the box is always the text's natural width), and
+       that is not what it is for: `is-hidden` below zeroes the width, and an
+       element with VISIBLE overflow has no scrolling area, so `scrollWidth`
+       stops reporting the natural width the measurement reads to decide when
+       the name fits again. Without this the name never comes back. */
+    overflow: hidden;
+}
+
+/* Set by WorkspaceNameLabel when even a name shrunk to its margin gap doesn't
+   fit beside the mark. Stays in the DOM so scrollWidth keeps reporting the
+   natural text width: the measurement reads it to decide when to un-hide. */
+.workspace-name-label.is-hidden {
+    flex: 0 0 0;
+    width: 0;
+    margin: 0;
+    visibility: hidden;
+}
+
+/* Base status dot: the Settings System page's connection row, and the Lucidos
+   menu's connection notice. The header's own dot is retired, the Lucidos mark
+   being the connection light there now (see styles/header-mark.css), which is
+   also why the notice exists: the mark says its state in strength alone, so the
+   panel is where the state is spelled and this is the dot that leads it.
+   Size is the host's, since the two draw it at different scales. */
+.status-dot {
+    border-radius: var(--radius-round);
+    background: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.status-dot.connected {
+    background: var(--accent-green);
+}
+
+/* In-between, and the amber every other in-between state in the app takes (a
+   booting workspace in the picker, a pending step). Without it the class fell
+   through to the muted base, so Settings > System drew a grey dot beside the
+   word "Connecting..." and said the state twice, once truthfully. */
+.status-dot.connecting {
+    background: var(--accent-yellow);
+}
+
+.status-dot.disconnected {
+    background: var(--accent-red);
+}
+
+/* --- The desktop brand label: the Lucidos mark and the workspace name --- */
+
+/* The centring box. The mark inside it is dressed in styles/header-mark.css,
+   shared with the two mobile marks that open the same menu, and that file also
+   hosts the brand badge on the mark's corner, on every viewport: there is no
+   superscript-beside-a-title shape any more, because there is no title. */
+.pane-header-brand-label {
+    position: relative;
+}
+
+/* The PENDING badge: new code exists in source with no version built behind it.
+   A bare dot, deliberately quieter than the ready "!" and the spinner, because
+   it reports a fact rather than an action that is waiting: it is smaller than
+   the base .badge box, and it draws no glyph (the box IS the dot), so it reads
+   as a mark on the brand rather than as a second attention mark competing with
+   the one that means "you can switch right now". The Lucidos menu's pending
+   row is the way back to its toast. */
+/* The unread count's box, so the mark's two badges share one size and one
+   column on its right edge. */
+.brand-badge {
+    --badge-height: var(--header-mark-count-size);
+}
+
+.brand-badge-dot {
+    min-width: 0.4375rem;
+    min-height: 0.4375rem;
+    /* The base .badge pads for a glyph and reserves a line box for one. Neither
+       applies to an empty box, and both would stretch the dot out of round. */
+    padding: 0;
+    line-height: 0;
+}
+
+/* Rebuilding has been proved unable to deliver the pending version, so this one
+   will not clear on its own the way an ordinary pending badge does. Amber for
+   the same reason the toast turns `warning`: it is the accent's "waiting"
+   sibling rather than an error, and the situation is recoverable, just not from
+   inside the app. */
+.brand-badge-dot.brand-badge-wedged {
+    background: var(--accent-yellow);
+}
+
+/* Inherits the badge's ink via currentColor. */
+.brand-badge-spinner {
+    display: inline-flex;
+    animation: spin 1s linear infinite;
+}
+
+:root[data-motion="reduce"] .brand-badge-spinner {
+    animation: none;
+}
+
+.brand-badge-spinner svg,
+.brand-badge-queued svg {
+    display: block;
+    width: 0.5625rem;
+    height: 0.5625rem;
+}
+
+/* The still glyph a queued build shows in the spinner's place. */
+.brand-badge-queued {
+    display: inline-flex;
+}
+
+/* ─── Brand-blue header: light foreground inversion ──────────────────────────
+   The header bar (.pane-header.app-header) is painted with --header-gradient,
+   so every glyph and label in the BAR flips to the light --header-* scale
+   (defined on .pane-header above). These rules live at the END of shell.css so
+   source order wins over the equal-specificity .app-header ... rules in the
+   desktop media block above. They cover desktop AND mobile (the mobile header
+   is the same element, .pane-header.app-header).
+
+   Popout panels that render *inside* the header subtree (anchored dropdowns,
+   the nav-history menu) are NOT part of the blue bar:
+   they reset the --header-* tokens to the normal dark-on-light values at the
+   bottom of this block, so the same selectors render them conventionally. */
+
+.app-header .icon-btn {
+    color: var(--header-fg-muted);
+}
+
+/* Every veiled state below declares its ALPHA and washes it in the same rule,
+   on the same element. Do not hoist the wash to a token on `.pane-header`. The
+   browser substitutes a var() inside a custom property where that property is
+   DECLARED, so the hoisted copy bakes in the resting 0%. */
+.app-header .icon-btn.filter-active,
+.app-header .icon-btn.view-selector-active {
+    --header-control-veil: var(--header-control-veil-active);
+    color: var(--header-fg);
+    background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
+}
+
+.app-header .icon-btn:focus-visible,
+.app-header .panel-url-input {
+    /* Recolor the shared ring to the header foreground: the accent ring is
+       low-contrast on the blue header bar. The .icon-btn and text-input
+       focus rules read this overridden --focus-ring for their box-shadow. */
+    --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--header-fg) 55%, transparent);
+}
+
+/* An aria-disabled button keeps the pointer for its tooltip, and takes no
+   press: the busy Refresh (ContentRefreshButton). */
+.app-header .icon-btn[aria-disabled="true"] {
+    cursor: default;
+}
+
+@media (hover: hover) {
+    .app-header .icon-btn:hover:where(:not(:disabled, [aria-disabled="true"])) {
+        --header-control-veil: var(--header-control-veil-hover);
+        color: var(--header-fg);
+        background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
+    }
+
+    .app-header .icon-btn.filter-active:hover,
+    .app-header .icon-btn.view-selector-active:hover {
+        --header-control-veil: var(--header-control-veil-active-hover);
+        color: var(--header-fg);
+        background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
+    }
+}
+
+/* Titles + labels rendered directly on the bar. */
+.app-header .pane-header-title,
+.app-header .threads-header-title,
+.app-header .pane-header-content-title,
+.app-header .pane-header-title-text,
+.app-header .panel-url-title {
+    color: var(--header-fg);
+}
+
+.app-header .workspace-name-label {
+    color: var(--header-fg-muted);
+}
+
+/* The threads search field rides on the bar, so it takes the header's own
+   veil as its fill and flips its text, caret and glyph light. */
+.app-header .search-field {
+    --search-field-bg: color-mix(in srgb, var(--header-fg) var(--header-control-veil-hover), transparent);
+    --search-field-fg: var(--header-fg);
+    --search-field-muted: var(--header-fg-muted);
+}
+
+/* Count badges (notification bell, brand update count): a white pill with blue
+   text, so they read against the bar instead of vanishing into the blue.
+   The ring is the other half of that: white-on-blue is what makes them legible
+   against the BAR, and white-on-white is what made them fuse with the GLYPH
+   they sit on. Every badge on this bar gets both, so the bell, the Lucidos
+   mark's unread count, and its build / update / pending badge all sit the same
+   way. `box-shadow` rather than a border, so the ring costs no layout: a border
+   would grow the badge's box, and the mark places both of its badges with a
+   `calc()` against that box.
+
+   The ring takes the bar PLUS whatever veil the control it rides is wearing.
+   On a hovered or toggled-on button it then reads as that button's own lighter
+   square, rather than as a dark hole punched through it. It transitions on the
+   button's own timing, so the two arrive together. */
+.app-header .badge {
+    background: var(--header-badge-bg);
+    color: var(--header-badge-fg);
+    box-shadow: 0 0 0 var(--header-badge-ring-width)
+        color-mix(in srgb, var(--header-fg) var(--header-control-veil), var(--header-badge-ring));
+    transition: box-shadow var(--duration-normal);
+}
+
+/* The reduced-motion rules in global/modal-overlay.css cancel the button's
+   own transitions, not this ring's. So the ring's cancel lives here, beside the
+   transition it cancels, or it would fade against a button that snapped. */
+:root[data-motion="reduce"] .app-header .badge {
+    transition: none;
+}
+
+/* ─── The threads Filter and Grouping buttons' fades ────────────────────────
+   Their glyphs, badges and pressed highlight, the pane title and the filter
+   panel (drawer.css) all change on --duration-fast, so they land together.
+
+   Each element that fades holds `will-change: opacity` at rest. A running fade
+   puts its element on a compositing layer, and a layer snaps to whole pixels.
+   The button sits at a fractional y, so on a GPU-composited renderer the glyph
+   and badge can hop as a fade starts and drop back as it ends. Emulators paint
+   without that compositing and never show it: check on a real iPhone. */
+
+.app-header .icon-btn.filter-btn,
+.app-header .icon-btn.grouping-btn {
+    transition-duration: var(--duration-fast);
+}
+
+/* The glyph crossfades between shapes stacked in one cell. Painted in the
+   translucent muted white, the overlap would paint twice and the rim would
+   flare mid-fade. So the shapes paint opaque and the WRAPPER carries the
+   alpha, which composites the whole stack once. Hover and pressed paint the
+   glyph opaque, as they paint the other header icons. */
+.app-header .crossfade-glyph {
+    color: var(--header-fg);
+    opacity: var(--header-fg-muted-alpha);
+    transition: opacity var(--duration-fast) ease;
+    will-change: opacity;
+}
+
+.app-header .crossfade-glyph > .crossfade-layer {
+    display: flex;
+    will-change: opacity;
+}
+
+.app-header .icon-btn.view-selector-active .crossfade-glyph {
+    opacity: 1;
+}
+
+@media (hover: hover) {
+    .app-header .icon-btn:hover:where(:not(:disabled)) .crossfade-glyph {
+        opacity: 1;
+    }
+}
+
+/* Cancelled outright rather than left to the scaled duration, which still
+   waits a frame or two for its start (see .crossfade-layer). The button's own
+   transitions are cancelled in global/modal-overlay.css. */
+:root[data-motion="reduce"] .app-header .crossfade-glyph {
+    transition: none;
+}
+
+/* A popout anchored in the header needs no token restore, because it is never
+   IN the header subtree: `.dropdown-menu` and `.nav-history-menu` both portal
+   their panel to <body>, so they inherit the document's own dark-on-light
+   defaults rather than the bar's light-on-blue ones. Reintroduce the restore
+   only alongside a header popout that renders inline. */

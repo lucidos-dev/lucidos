@@ -1,0 +1,1107 @@
+//! Frontend-only Apply → advance the served client in-process (dev).
+//! `docs/plans/2026-07-02-frontend-only-apply-served-in-dev.md`.
+//!
+//! At boot the engine pins `dist/` into a snapshot and serves that for its
+//! lifetime (`api::frontend_snapshot`, INV-A: never serve a client that could be
+//! incompatible with the running engine binary). A *frontend-only* Apply
+//! (`files_require_restart == false`) never respawns the engine, so without this
+//! the boot snapshot never advances and the client refresh badge/toast never fire
+//! — the applied TS/CSS silently doesn't take effect until an unrelated restart.
+//!
+//! For a frontend-only change the engine binary is unchanged, so a newer client
+//! built from that diff IS compatible. This module waits for the build-watch to
+//! republish `dist/`, re-snapshots it into a fresh generation, and atomically
+//! swaps what `api::serve_frontend` serves — so the served `sw.js` BUILD_ID
+//! advances and the EXISTING client-update surface (`syncClientUpdateFromBuild`
+//! → badge + Refresh toast) fires, with no engine respawn. Mixed changes still go
+//! through the Switch flow (`join_or_start_background_rebuild`), which re-snapshots at
+//! the new engine's boot — untouched here.
+//!
+//! When the advance is DEFERRED instead (INV-A: an engine version change is
+//! already pending, so `dist/` holds a client for the new engine that can't be
+//! served on the old one), the change still ships when the user Switches — but
+//! the page would otherwise get no signal that a frontend-only Apply was queued.
+//! So each deferral branch emits the transient `FrontendUpdateDeferred` UI event
+//! (`emit_frontend_update_deferred`); the frontend renders a keyed hint toast.
+
+use super::LucidosEngine;
+use crate::api::frontend_snapshot;
+use crate::engine::engine_version::BuildState;
+use chrono::{DateTime, Utc};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+/// How long to wait for the build-watch to republish `dist/` after a
+/// frontend-only Apply before giving up. A fresh `vite build` takes a few
+/// seconds, so this is generous headroom. On timeout we don't swap. A green build after the
+/// Apply means the bundle came out identical, which is silent. Anything else
+/// warns the page with `FrontendUpdateStranded`.
+const REBUILD_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Poll cadence while waiting for the rebuild.
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Grace period before removing the superseded snapshot after a swap, so an
+/// in-flight request that already resolved the old path can finish serving from
+/// it (hardlinked files also survive removal while an fd is open, but the delay
+/// closes the read-path-then-open window entirely).
+const CLEANUP_GRACE: Duration = Duration::from_secs(30);
+
+/// Cadence of the per-engine peer-sync poll (dev only). A peer workspace has no
+/// event signal that the checkout-shared `dist/` moved under another workspace's
+/// frontend-only Apply, so each engine periodically re-checks. Cheap: reads one
+/// `sw.js` build id per tick and only re-snapshots (+ emits) when it changed AND
+/// the advance is INV-A-safe. 10s keeps "switch to the peer tab and see the
+/// badge" prompt without meaningful idle cost.
+const SERVED_FRONTEND_SYNC_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Pure: what the build-watch's status document says went wrong, if anything.
+///
+/// `None` for a healthy build, for a document that will not parse, and for one
+/// that reports a failure with no message. Every one of those means "nothing to
+/// add", and the caller then keeps the generic advice it always gave.
+///
+/// The shape is written by `crates/lucidos-app/dev-build-watch.mjs`. This reads
+/// it rather than sharing a type, since one side is a JavaScript dev tool and
+/// the other is a Rust engine. The field name plus this test is what binds them.
+fn build_failure_reason(status_json: &str) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_str(status_json).ok()?;
+    if doc.get("ok")?.as_bool()? {
+        return None;
+    }
+    let reason = doc.get("error")?.as_str()?.trim();
+    (!reason.is_empty()).then(|| reason.to_string())
+}
+
+/// Pure: did the build-watch finish a green build at or after `since`?
+///
+/// After a frontend Apply this means the build ran over the merged tree. If the
+/// BUILD_ID still did not move, the change left the bundle byte-identical (a
+/// comment, a test file) and there is nothing new to serve.
+fn build_succeeded_since(status_json: &str, since: DateTime<Utc>) -> bool {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(status_json) else {
+        return false;
+    };
+    doc.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+        && doc
+            .get("at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| at >= since)
+}
+
+/// `served_dir` is `<app>/dist`, and the watcher keeps its state one level up in
+/// `<app>/.build-watch/`.
+fn build_watch_dir(served_dir: &Path) -> Option<PathBuf> {
+    Some(served_dir.parent()?.join(".build-watch"))
+}
+
+fn read_build_status(served_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(build_watch_dir(served_dir)?.join("status.json")).ok()
+}
+
+/// The build-watch's failure for the checkout that owns `served_dir`. An absent
+/// file is the ordinary case on any stack whose watcher predates the status
+/// file, so it is a quiet `None`.
+fn read_build_failure(served_dir: &Path) -> Option<String> {
+    build_failure_reason(&read_build_status(served_dir)?)
+}
+
+fn read_build_succeeded_since(served_dir: &Path, since: DateTime<Utc>) -> bool {
+    read_build_status(served_dir).is_some_and(|status| build_succeeded_since(&status, since))
+}
+
+/// What the build-watch is doing, as far as its pidfile can say.
+///
+/// Three states, because two would have to lie about one of them. The status
+/// file alone cannot tell them apart: it records the last COMPLETED build, so a
+/// watch that died leaves a healthy `{"ok": true}` behind it. That is how a
+/// frontend Apply came to promise the change would "appear on its own" while
+/// nothing had rebuilt for five hours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildWatchState {
+    /// The pidfile names a live process.
+    Running,
+    /// The pidfile is gone, unreadable or names a dead process. Both the
+    /// teardown and a failed initial build remove it, so on a stack that uses
+    /// a watch its absence means the watch went away.
+    Stopped,
+    /// No `.build-watch/` at all, so this checkout has never run one. Packaged
+    /// is the case that matters: it serves its own bundled Resources, nowhere
+    /// near a checkout. Never reported as stopped, because nobody here was
+    /// promised a watch in the first place.
+    ///
+    /// A checkout that HAS run `web-dev.sh` keeps the directory for good, since
+    /// the teardown removes only the pidfile. So a later one-shot stack over
+    /// the same `dist/` (e2e, `run.sh`) reads Stopped rather than Unknown. That
+    /// is the honest answer there: nothing is watching, and a relaunch is what
+    /// republishes.
+    Unknown,
+}
+
+/// Pure: the state, from what the filesystem and a liveness probe reported.
+///
+/// `pid` is `None` for a missing or unparseable pidfile, which reads the same
+/// as a dead one: either way nothing is watching.
+fn classify_build_watch(dir_exists: bool, pid: Option<i32>, alive: bool) -> BuildWatchState {
+    if !dir_exists {
+        return BuildWatchState::Unknown;
+    }
+    match pid {
+        Some(_) if alive => BuildWatchState::Running,
+        _ => BuildWatchState::Stopped,
+    }
+}
+
+/// Is this pid a live process? `kill(pid, 0)` signals nothing and only asks.
+///
+/// `EPERM` counts as alive: the process exists, we merely may not signal it.
+/// Only `ESRCH` means there is no such process.
+fn pid_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 delivers nothing. It only performs the existence and
+    // permission checks and reports them through errno.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The build-watch's state for the checkout that owns `served_dir`, read from
+/// the pidfile beside the status file [`read_build_failure`] uses.
+fn read_build_watch_state(served_dir: &Path) -> BuildWatchState {
+    let Some(dir) = build_watch_dir(served_dir) else {
+        return BuildWatchState::Unknown;
+    };
+    let pid = std::fs::read_to_string(dir.join("pid"))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i32>().ok());
+    classify_build_watch(dir.is_dir(), pid, pid.is_some_and(pid_is_alive))
+}
+
+/// Whether the source `dist/` has been republished with a client different from
+/// the one we currently serve — i.e. the build-watch's rebuild has landed.
+/// `None` current (couldn't read the served snapshot) + a readable source → treat
+/// as new enough to swap; an unreadable source (mid-rebuild / no `sw.js`) → keep
+/// waiting. Pure so the poll's core decision is unit-testable.
+fn source_rebuilt(current_id: Option<&str>, source_id: Option<&str>) -> bool {
+    match (current_id, source_id) {
+        (Some(cur), Some(src)) => cur != src,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+/// Pure: the elapsed time of the refresh recorded in `started`, or `None`
+/// unless it is still the current generation. The peer sync bumps the
+/// generation when it aborts the applying task, and that abort skips the
+/// task's own cleanup.
+fn live_refresh_elapsed(started: Option<(u64, Instant)>, current: u64) -> Option<Duration> {
+    started
+        .filter(|(generation, _)| *generation == current)
+        .map(|(_, at)| at.elapsed())
+}
+
+/// Pure INV-A decision: is it safe to advance the served client in-process,
+/// given the engine's rebuild state + on-disk vs running binary id?
+///
+/// Safe ONLY when no engine version change is pending: `build_state == Idle`
+/// (no rebuild this engine triggered is in flight/ready) AND the on-disk binary
+/// still matches the running one. If EITHER signals a pending engine change, the
+/// live `dist/` was rebuilt from source that includes that engine change (new
+/// endpoint / event / migration), so serving it on the still-running OLD engine
+/// would reintroduce the incompatible pairing the snapshot exists to prevent —
+/// the Switch must advance client + engine together instead. `None` disk id
+/// mirrors `version_status`'s "no update" semantics (packaged / unreadable), and
+/// `build_state` — set to `Building` synchronously the instant a mixed Apply
+/// triggers the rebuild — covers the window before the new binary is even written.
+fn frontend_advance_is_safe(
+    build_state: &BuildState,
+    disk_build_id: Option<&str>,
+    running_build_id: &str,
+) -> bool {
+    if *build_state != BuildState::Idle {
+        return false;
+    }
+    match disk_build_id {
+        Some(disk) => disk == running_build_id,
+        None => true,
+    }
+}
+
+/// Pure INV-A decision for a PEER engine advancing its served snapshot to a
+/// client built from HEAD. The disk/build_state gate ([`frontend_advance_is_safe`])
+/// is NOT enough cross-workspace: during ANOTHER workspace's mixed-change engine
+/// rebuild the on-disk binary is still old (disk == running) for tens of seconds
+/// while the build-watch has already republished `dist/` with a new-engine client,
+/// so the disk gate would wrongly permit the advance. The load-bearing signal is
+/// whether engine-relevant source changed between the running engine's commit and
+/// HEAD (see [`LucidosEngine::engine_source_matches_head`]): `Some(true)` = no
+/// engine change (frontend-only → safe), `Some(false)` = engine change in flight
+/// (mixed → the Switch must advance client+engine together), `None` = git
+/// unavailable → don't drag a peer forward on a guess (fail-safe; the manual
+/// restart still works). So a peer advances ONLY on `Some(true)`.
+fn peer_git_gate(engine_source_matches_head: Option<bool>) -> bool {
+    engine_source_matches_head == Some(true)
+}
+
+/// Pure INV-A decision for the APPLYING engine's own frontend-only advance. Here
+/// the git check only VETOES: a `Some(false)` means a mixed change is in flight in
+/// some workspace, so the rebuilt `dist/` targets a newer engine and must not be
+/// served on this one (the deferred-hint branch fires instead). When git is
+/// unavailable (`None`) we keep today's disk/build_state-gate behavior (fail-open),
+/// so only `Some(false)` blocks.
+fn applying_git_gate(engine_source_matches_head: Option<bool>) -> bool {
+    engine_source_matches_head != Some(false)
+}
+
+impl LucidosEngine {
+    /// Register the swappable served-frontend handle + its source dir. Called once
+    /// by `api::create_router` when `LUCIDOS_STATIC_DIR` is set. A second call
+    /// (e.g. a second router in a test) is ignored: the first registration wins.
+    pub fn init_served_frontend(&self, handle: Arc<RwLock<PathBuf>>, source: PathBuf) {
+        let _ = self.served_frontend.set(handle);
+        let _ = self.served_frontend_source.set(source);
+    }
+
+    /// The commit the served snapshot was built from, read from its stamp, or
+    /// `None` when nothing is served or the snapshot carries no stamp.
+    ///
+    /// Not yet checked against the running engine. `pending_commits_since` in
+    /// `engine_version` makes that check before it trusts the commit.
+    pub(crate) fn served_frontend_source_commit(&self) -> Option<String> {
+        let served_dir = self.served_frontend.get()?.read().unwrap().clone();
+        frontend_snapshot::read_source_commit(&served_dir)
+    }
+
+    fn frontend_refresh_superseded(&self, generation: u64) -> bool {
+        self.frontend_refresh_generation.load(Ordering::SeqCst) != generation
+    }
+
+    /// How long this engine's applying frontend refresh has been running, or
+    /// `None` when none is in flight. Reported as `frontend_refresh_elapsed_ms`.
+    pub(crate) fn frontend_refresh_elapsed(&self) -> Option<Duration> {
+        live_refresh_elapsed(
+            *self.frontend_refresh_started.lock().unwrap(),
+            self.frontend_refresh_generation.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Every exit of the applying task ends here, so the indicator stops at
+    /// once rather than on the next poll. A newer generation owns the slot.
+    async fn finish_frontend_refresh(&self, generation: u64) {
+        {
+            let mut slot = self.frontend_refresh_started.lock().unwrap();
+            if slot.is_some_and(|(started, _)| started == generation) {
+                *slot = None;
+            }
+        }
+        self.emit_frontend_refresh_state_changed().await;
+    }
+
+    /// Emit the transient `FrontendRefreshStateChanged` UI poke. The client
+    /// re-reads version-status rather than trusting the event.
+    async fn emit_frontend_refresh_state_changed(&self) {
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::System(
+                    crate::engine::event_bus::SystemEvent::FrontendRefreshStateChanged {
+                        sent_at_ms: crate::engine::now_epoch_millis(),
+                    },
+                ),
+                "[Frontend] FrontendRefreshStateChanged",
+            )
+            .await;
+    }
+
+    /// Emit the transient `FrontendUpdateDeferred` UI signal — the page-facing
+    /// hint that a frontend-only Apply's in-process served-client advance was
+    /// deferred because an engine version change is pending (INV-A). Fired from
+    /// both deferral branches below; never persisted (a pure UI hint), so the
+    /// frontend surfaces "your frontend change applies on Switch" instead of
+    /// the user seeing nothing happen.
+    async fn emit_frontend_update_deferred(&self) {
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::System(
+                    crate::engine::event_bus::SystemEvent::FrontendUpdateDeferred {
+                        sent_at_ms: crate::engine::now_epoch_millis(),
+                    },
+                ),
+                "[Frontend] FrontendUpdateDeferred",
+            )
+            .await;
+    }
+
+    /// Emit the transient `FrontendUpdateStranded` UI signal — a frontend-only
+    /// Apply that rebuilt but can never reach the served client, because the
+    /// `dist/` this engine serves is not the one being republished. Deliberately
+    /// NOT `FrontendUpdateDeferred`: that one promises "arrives on Switch", which
+    /// here would be false.
+    async fn emit_frontend_update_stranded(
+        &self,
+        served_dir: &Path,
+        in_worktree: bool,
+        build_error: Option<String>,
+        build_watch_stopped: bool,
+    ) {
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::System(
+                    crate::engine::event_bus::SystemEvent::FrontendUpdateStranded {
+                        served_dir: served_dir.display().to_string(),
+                        served_in_worktree: in_worktree,
+                        build_error,
+                        build_watch_stopped,
+                        sent_at_ms: crate::engine::now_epoch_millis(),
+                    },
+                ),
+                "[Frontend] FrontendUpdateStranded",
+            )
+            .await;
+    }
+
+    /// INV-A gate for the in-process served-frontend advance — see
+    /// [`frontend_advance_is_safe`]. Reads the live build state + on-disk engine
+    /// build id (the latter behind its mtime cache, so it's cheap on the steady
+    /// path).
+    async fn engine_binary_is_current(&self) -> bool {
+        let disk = self.engine_disk_build_id().await;
+        frontend_advance_is_safe(&self.build_state(), disk.as_deref(), crate::ENGINE_BUILD_ID)
+    }
+
+    /// Runtime INV-A signal: is the running engine binary already current with
+    /// HEAD, or is a restart-requiring (binary-affecting) engine change pending?
+    /// `Some(true)` = NO restart-requiring file changed between the running
+    /// engine's commit and HEAD (a client built from HEAD is compatible with this
+    /// running binary — the change is frontend-only / test / docs); `Some(false)` =
+    /// a restart-requiring change IS pending (a mixed change is in flight/applied —
+    /// the rebuilt `dist/` targets a NEWER engine, so don't serve it on this one);
+    /// `None` = couldn't determine (git unavailable, or an unstamped / shipped
+    /// `ENGINE_BUILD_ID`).
+    ///
+    /// Reuses [`files_require_restart`](crate::engine::git_ops::files_require_restart)
+    /// — the SAME classifier the Apply path uses to decide `restart_required` —
+    /// over the files changed since the running engine's commit, so this gate
+    /// agrees EXACTLY with whether a rebuild + Switch was (or would be) scheduled.
+    /// A coarser pathspec diff over `crates/lucidos-engine` would wrongly flag
+    /// restart-IGNORED engine files (a test `.rs`, a `.md`) and strand a genuinely
+    /// frontend-only advance the Apply path never schedules a Switch for. This is
+    /// the cross-workspace-correct complement to `engine_binary_is_current` (the
+    /// disk-id gate): during another workspace's mixed rebuild the on-disk binary
+    /// is still old (disk == running) for tens of seconds while `dist/` already
+    /// holds a new-engine client, so the disk gate alone would wrongly permit an
+    /// advance.
+    pub(crate) async fn engine_source_matches_head(&self) -> Option<bool> {
+        crate::engine::engine_version::own_source_matches_head().await
+    }
+
+    /// Composed INV-A gate for the APPLYING engine's own frontend-only advance:
+    /// the disk/build_state gate AND the git veto (see [`applying_git_gate`]).
+    async fn applying_advance_is_safe(&self) -> bool {
+        self.engine_binary_is_current().await
+            && applying_git_gate(self.engine_source_matches_head().await)
+    }
+
+    /// Composed INV-A gate for the periodic PEER advance: the disk/build_state gate
+    /// AND git-confirmed engine-source parity with HEAD (see [`peer_git_gate`]).
+    async fn peer_advance_is_safe(&self) -> bool {
+        self.engine_binary_is_current().await
+            && peer_git_gate(self.engine_source_matches_head().await)
+    }
+
+    /// After a *frontend-only* Apply (engine binary unchanged), wait for the
+    /// build-watch to republish `dist/`, then re-snapshot it into a fresh
+    /// generation and atomically swap what the engine serves — so the served
+    /// `sw.js` BUILD_ID advances and the client refresh badge/toast surface
+    /// WITHOUT an engine respawn. The caller must only invoke this for a
+    /// frontend-only, Lucidos-source change, which keeps INV-A.
+    ///
+    /// No-op in packaged (never rebuilds) or when the frontend isn't served
+    /// (no `LUCIDOS_STATIC_DIR`). Coalesces: a later call supersedes an in-flight
+    /// one (only the latest generation swaps).
+    pub fn refresh_served_frontend_after_rebuild(self: &Arc<Self>) {
+        if crate::runtime::is_packaged() {
+            return;
+        }
+        let (Some(handle), Some(source)) = (
+            self.served_frontend.get().cloned(),
+            self.served_frontend_source.get().cloned(),
+        ) else {
+            return; // frontend not served (headless) — nothing to advance
+        };
+        // Taken here, not inside the task: the merge has just landed, and a fast
+        // build must not finish before the task is first polled.
+        let applied_at = Utc::now();
+        let generation = self
+            .frontend_refresh_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        *self.frontend_refresh_started.lock().unwrap() = Some((generation, Instant::now()));
+        // Coalesce: abort any in-flight refresh; the new generation supersedes it.
+        if let Some(old) = self.frontend_refresh_task.lock().unwrap().take() {
+            old.abort();
+        }
+        let engine = self.clone();
+        let workspace = self.workspace_path().to_path_buf();
+        let task = tokio::spawn(async move {
+            engine.emit_frontend_refresh_state_changed().await;
+            engine
+                .clone()
+                .run_served_frontend_refresh(handle, source, workspace, generation, applied_at)
+                .await;
+            engine.finish_frontend_refresh(generation).await;
+        });
+        *self.frontend_refresh_task.lock().unwrap() = Some(task);
+    }
+
+    async fn run_served_frontend_refresh(
+        self: Arc<Self>,
+        handle: Arc<RwLock<PathBuf>>,
+        source: PathBuf,
+        workspace: PathBuf,
+        generation: u64,
+        applied_at: DateTime<Utc>,
+    ) {
+        // INV-A early-out: if an engine version change is already pending (a prior
+        // mixed Apply's rebuild is in flight/ready, a newer binary is on disk, or
+        // git shows engine source diverged from HEAD — the cross-workspace case
+        // where ANOTHER workspace's mixed Apply moved `dist/` while this engine's
+        // binary is still old), the live `dist/` is built for the NEW engine —
+        // advancing it onto the running old engine would serve an incompatible
+        // client. Skip; the Switch advances client + engine together. (Re-checked
+        // before the swap, since a mixed Apply can land during the poll window.)
+        if !self.applying_advance_is_safe().await {
+            crate::log!(
+                "[Frontend] frontend-only Apply: an engine version change is pending — not advancing the served client (the Switch will)"
+            );
+            // Tell the page the change is queued for the Switch (not ignored).
+            self.emit_frontend_update_deferred().await;
+            return;
+        }
+
+        // The build id the running client loaded against (what we serve now).
+        let current_dir = handle.read().unwrap().clone();
+        let current_id = frontend_snapshot::read_build_id(&current_dir);
+
+        // Wait for the build-watch to republish `dist/` with a different BUILD_ID.
+        // Bounded — on timeout we simply don't swap (safe no-op).
+        let deadline = Instant::now() + REBUILD_WAIT_TIMEOUT;
+        loop {
+            if self.frontend_refresh_superseded(generation) {
+                return; // a newer refresh took over
+            }
+            let source_id = frontend_snapshot::read_build_id(&source);
+            if source_rebuilt(current_id.as_deref(), source_id.as_deref()) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                // Not a benign no-op: the user applied a frontend change and it
+                // has not appeared. Until 2026-07-26 this returned in silence,
+                // which is how a stack serving a worktree-pinned dist/ swallowed
+                // every frontend Apply for hours while looking healthy.
+                //
+                // Two different situations, and only one is permanent — don't
+                // conflate them. A worktree-pinned source can NEVER receive the
+                // rebuild (the build-watch republishes a different directory), so
+                // it needs operator action. Any other timeout is recoverable: a
+                // build slower than the wait, or a briefly-stopped watch, still
+                // lands eventually and the ~10s peer sync advances the snapshot on
+                // its own. Claiming "will never arrive" there would be wrong.
+                let in_worktree = crate::paths::path_is_in_cc_worktree(&source);
+                let build_error = read_build_failure(&source);
+                let watch_stopped = read_build_watch_state(&source) == BuildWatchState::Stopped;
+                // Decided at the deadline rather than on the first green build,
+                // so a build queued behind it has had time to move the id.
+                if !in_worktree && !watch_stopped && read_build_succeeded_since(&source, applied_at)
+                {
+                    crate::log!(
+                        "[Frontend] frontend-only Apply: {} rebuilt with the same BUILD_ID, so \
+                         the served client is already current",
+                        source.display()
+                    );
+                    return;
+                }
+                if let Some(reason) = build_error.as_deref() {
+                    crate::log!(
+                        "[Frontend] the build-watch reports a FAILING build, which is why \
+                         nothing republished: {reason}"
+                    );
+                }
+                // Said before the branches below, because it outranks the
+                // status file: a stopped watch is retrying nothing, so the
+                // reason it last recorded describes a build nobody will repeat.
+                if watch_stopped {
+                    crate::log!(
+                        "[Frontend] the build-watch is NOT RUNNING, so nothing will republish \
+                         {} until the stack is relaunched",
+                        source.display()
+                    );
+                }
+                if in_worktree {
+                    crate::log!(
+                        "[Frontend] frontend-only Apply STRANDED: {} is inside a coding-agent \
+                         worktree, so the build-watch republishes a different directory and the \
+                         served client can NEVER advance — relaunch the stack from the real \
+                         checkout",
+                        source.display()
+                    );
+                } else if !watch_stopped {
+                    // Only recoverable while something is still watching. With
+                    // the watch stopped the periodic sync has nothing to pick
+                    // up, and the line above already said so.
+                    crate::log!(
+                        "[Frontend] frontend-only Apply: {} did not republish within {}s — not \
+                         advancing the served client yet. Recoverable: the periodic sync picks \
+                         it up if the rebuild lands.",
+                        source.display(),
+                        REBUILD_WAIT_TIMEOUT.as_secs()
+                    );
+                }
+                self.emit_frontend_update_stranded(
+                    &source,
+                    in_worktree,
+                    build_error,
+                    watch_stopped,
+                )
+                .await;
+                return;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        if self.frontend_refresh_superseded(generation) {
+            return;
+        }
+        // Definitive INV-A re-check: a mixed Apply may have landed DURING the poll
+        // above (its rebuild flips build_state to Building and republishes dist/
+        // with an engine-requiring client, or a peer workspace's mixed Apply moved
+        // engine source past HEAD). If so, the dist we're about to snapshot is for
+        // the new engine — don't serve it on the running old engine.
+        if !self.applying_advance_is_safe().await {
+            crate::log!(
+                "[Frontend] frontend-only Apply: an engine version change landed during the rebuild wait — not advancing the served client (the Switch will)"
+            );
+            // Tell the page the change is queued for the Switch (not ignored).
+            self.emit_frontend_update_deferred().await;
+            return;
+        }
+
+        // Pin a fresh snapshot of the rebuilt `dist/` and swap the served dir.
+        self.advance_served_snapshot(&handle, &source, &workspace, generation)
+            .await;
+    }
+
+    /// Pin a fresh snapshot of `source`, atomically swap the served handle to it,
+    /// and announce the swap with `ServedFrontendAdvanced`. Grace-cleans the
+    /// previous snapshot. Shared by the applying-engine refresh
+    /// ([`run_served_frontend_refresh`]) and the periodic peer sync
+    /// ([`sync_served_frontend_if_safe`]); both honor the generation guard (a newer
+    /// refresh supersedes this one) and the cleanup guard (only ever removes a dir
+    /// UNDER the snapshot parent, never the live `dist/`). The caller is
+    /// responsible for the INV-A gate before calling.
+    ///
+    /// The announcement is the client's only prompt signal that a newer client
+    /// is served. Every swap must emit it, or the Refresh toast waits for the
+    /// next page resume.
+    async fn advance_served_snapshot(
+        &self,
+        handle: &Arc<RwLock<PathBuf>>,
+        source: &Path,
+        workspace: &Path,
+        generation: u64,
+    ) {
+        match frontend_snapshot::pin_generation(source, workspace, generation) {
+            Ok(new_dir) => {
+                if self.frontend_refresh_superseded(generation) {
+                    // A newer refresh won while we were copying; drop our snapshot.
+                    frontend_snapshot::remove_snapshot_dir(&new_dir);
+                    return;
+                }
+                let prev = {
+                    let mut guard = handle.write().unwrap();
+                    std::mem::replace(&mut *guard, new_dir.clone())
+                };
+                crate::log!(
+                    "[Frontend] serving re-snapshotted dist at {}",
+                    new_dir.display()
+                );
+                // Grace-delayed cleanup of the previous snapshot. Guard: only remove
+                // a dir UNDER the snapshot parent — never the live `dist/` (which the
+                // boot fail-safe may serve directly).
+                let parent = frontend_snapshot::snapshot_parent(workspace);
+                if prev != new_dir && prev.starts_with(&parent) {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(CLEANUP_GRACE).await;
+                        frontend_snapshot::remove_snapshot_dir(&prev);
+                    });
+                }
+                self.emit_served_frontend_advanced().await;
+            }
+            Err(e) => {
+                // Fail-safe: leave the current served dir in place (never a 404).
+                crate::log!("[Frontend] re-snapshot failed ({e}); served snapshot unchanged");
+            }
+        }
+    }
+
+    /// Emit the transient `ServedFrontendAdvanced` UI signal: this engine just
+    /// swapped its served snapshot, so the client re-runs
+    /// `syncClientUpdateFromBuild` and surfaces the Refresh badge and toast.
+    async fn emit_served_frontend_advanced(&self) {
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::System(
+                    crate::engine::event_bus::SystemEvent::ServedFrontendAdvanced {
+                        sent_at_ms: crate::engine::now_epoch_millis(),
+                    },
+                ),
+                "[Frontend] ServedFrontendAdvanced",
+            )
+            .await;
+    }
+
+    /// One periodic peer-sync check (dev only): if the checkout-shared `dist/` has
+    /// advanced past what this engine serves AND advancing is INV-A-safe
+    /// ([`Self::peer_advance_is_safe`]), re-snapshot in-process and broadcast
+    /// `ServedFrontendAdvanced`. This is what lets a PEER workspace pick up ANOTHER
+    /// workspace's frontend-only Apply without a manual restart — the applying
+    /// engine advances only its own snapshot. No advance / no emit when a mixed
+    /// change is pending (the Switch flow handles that peer instead).
+    /// Warn ONCE per process when the `dist/` this engine serves lives inside a
+    /// coding-agent worktree — a configuration that can never track `main`, so
+    /// every future frontend-only Apply will strand.
+    ///
+    /// This is deliberately a config check, not a build-id comparison. The
+    /// obvious "is what I serve older than the source?" test is already
+    /// [`sync_served_frontend_if_safe`]'s own trigger and self-heals, so it can
+    /// never fire for this failure; and because `repo_root()` resolves from
+    /// `current_exe()`, a worktree-pinned engine's repo root IS the worktree, so
+    /// comparing against the checkout's `dist/` finds no divergence either. The
+    /// one thing reliably knowable from inside the pinned process is the shape of
+    /// the path it was handed.
+    ///
+    /// Fires from the periodic tick rather than boot so it lands after the event
+    /// bus has subscribers; latched so a ~10s cadence doesn't log forever. Log
+    /// only — the user-facing event belongs to an actual stranded Apply
+    /// ([`emit_frontend_update_stranded`]), which carries the same flag.
+    fn warn_once_if_frontend_worktree_pinned(&self, source: &Path) {
+        if !crate::paths::path_is_in_cc_worktree(source) {
+            return;
+        }
+        if self
+            .frontend_worktree_pin_warned
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        crate::log!(
+            "[Frontend] WARNING: serving dist/ from a coding-agent worktree ({}). \
+             A worktree is a throwaway checkout pinned to one commit, and the build-watch \
+             republishes the real checkout's dist/, so frontend changes will NOT appear here. \
+             Relaunch the stack from the real checkout (./scripts/web-dev.sh -w <workspace> -b). \
+             See docs/plans/2026-07-26-worktree-pinned-stack-guard.md",
+            source.display()
+        );
+    }
+
+    /// Advance the served client to a peer's newer `dist/`. A pinned engine
+    /// never does: a newer client is a newer version, and it raises the
+    /// Refresh toast.
+    async fn sync_served_frontend_if_safe(self: &Arc<Self>) {
+        if !self.newer_version_visible() {
+            return;
+        }
+        let (Some(handle), Some(source)) = (
+            self.served_frontend.get().cloned(),
+            self.served_frontend_source.get().cloned(),
+        ) else {
+            return; // frontend not served (headless) — nothing to advance
+        };
+        // Announce a structurally broken serving config even when nothing has been
+        // applied yet, so it is diagnosable before it eats someone's change.
+        self.warn_once_if_frontend_worktree_pinned(&source);
+        // Cheap first: has the source `dist/` diverged from what we serve? Avoids
+        // the git fork on the steady (unchanged) path — the common case per tick.
+        let served_dir = handle.read().unwrap().clone();
+        let served_id = frontend_snapshot::read_build_id(&served_dir);
+        let source_id = frontend_snapshot::read_build_id(&source);
+        if !source_rebuilt(served_id.as_deref(), source_id.as_deref()) {
+            return;
+        }
+        // Diverged — is it safe to advance THIS engine to the newer client? The git
+        // gate distinguishes a peer's frontend-only advance (safe) from a mixed
+        // change still mid-rebuild (defer; the Switch advances this peer).
+        if !self.peer_advance_is_safe().await {
+            return; // mixed change pending → no in-process advance, no hint here
+        }
+        // Advance under a fresh generation so a concurrent applying refresh
+        // coalesces (only the latest generation swaps).
+        let superseded_applying_refresh = self.frontend_refresh_elapsed().is_some();
+        let generation = self
+            .frontend_refresh_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        if let Some(old) = self.frontend_refresh_task.lock().unwrap().take() {
+            old.abort();
+        }
+        // The aborted task never reaches `finish_frontend_refresh`, so this
+        // takeover owes the page the end-of-refresh poke.
+        if superseded_applying_refresh {
+            self.emit_frontend_refresh_state_changed().await;
+        }
+        let workspace = self.workspace_path().to_path_buf();
+        self.advance_served_snapshot(&handle, &source, &workspace, generation)
+            .await;
+    }
+
+    /// Dev-only: spawn the periodic dev-maintenance loop (every
+    /// [`SERVED_FRONTEND_SYNC_INTERVAL`]). Two responsibilities per tick:
+    /// 1. **Served-frontend peer sync** (`sync_served_frontend_if_safe`) — a peer
+    ///    workspace picks up another workspace's frontend-only Apply without a
+    ///    manual restart. See `docs/plans/2026-07-03-cross-workspace-frontend-only-refresh.md`.
+    /// 2. **Engine-version self-heal** (`self_heal_engine_version_if_needed`) — if
+    ///    the engine source is behind HEAD with a stale on-disk binary (a mixed
+    ///    Apply's rebuild failed / never ran), (re)trigger a coordinated background
+    ///    rebuild so the Switch surfaces without a manual `-b`. See
+    ///    `docs/plans/2026-07-03-engine-version-switch-selfheal.md`.
+    ///
+    /// Packaged returns immediately (no source rebuild); a headless engine (no
+    /// served handle yet) ticks harmlessly — each step early-returns per tick, so
+    /// this is robust to being spawned before the router registers the handle.
+    pub fn spawn_served_frontend_sync(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            if crate::runtime::is_packaged() {
+                return;
+            }
+            let mut ticker = tokio::time::interval(SERVED_FRONTEND_SYNC_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                engine.sync_served_frontend_if_safe().await;
+                // Same dev-only cadence drives engine-version self-heal: if the
+                // engine SOURCE is behind HEAD with a stale on-disk binary
+                // (a mixed Apply's rebuild failed / never ran), (re)trigger a
+                // coordinated background rebuild so the Switch can surface without
+                // a manual `-b`. No-op packaged / when not behind.
+                engine.self_heal_engine_version_if_needed().await;
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        applying_git_gate, build_failure_reason, build_succeeded_since, classify_build_watch,
+        frontend_advance_is_safe, live_refresh_elapsed, peer_git_gate, pid_is_alive,
+        read_build_failure, read_build_succeeded_since, read_build_watch_state, source_rebuilt,
+        BuildState, BuildWatchState,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn every_served_snapshot_swap_announces_itself() {
+        let src = include_str!("frontend_refresh.rs");
+        // Split so this test's own source is not a match.
+        let emit = concat!("self.emit_served_frontend", "_advanced()");
+        let start = src
+            .find("async fn advance_served_snapshot(")
+            .expect("advance_served_snapshot exists");
+        let swap = &src[start..start + src[start..].find("\n    }\n").expect("method end")];
+        assert!(
+            swap.contains(emit),
+            "the swap itself must emit ServedFrontendAdvanced, so no caller can forget"
+        );
+        assert_eq!(
+            src.matches(emit).count(),
+            1,
+            "ServedFrontendAdvanced is emitted in one place, the swap"
+        );
+    }
+
+    #[test]
+    fn a_refresh_is_live_only_while_its_generation_is_current() {
+        let started = Instant::now() - Duration::from_secs(5);
+        let elapsed = live_refresh_elapsed(Some((3, started)), 3).expect("current generation");
+        assert!(elapsed >= Duration::from_secs(5));
+        // The peer sync took over with generation 4 and aborted the task, so
+        // its cleanup never ran. The slot still says 3, and must read as idle.
+        assert_eq!(live_refresh_elapsed(Some((3, started)), 4), None);
+        assert_eq!(live_refresh_elapsed(None, 3), None);
+    }
+
+    #[test]
+    fn peer_git_gate_advances_only_on_confirmed_source_parity() {
+        // Frontend-only: engine source matches HEAD → advance the peer.
+        assert!(peer_git_gate(Some(true)));
+        // Mixed change in flight (engine source diverged) → defer; the Switch
+        // advances client + engine together on this peer.
+        assert!(!peer_git_gate(Some(false)));
+        // git unavailable → don't drag a peer forward on a guess (fail-safe).
+        assert!(!peer_git_gate(None));
+    }
+
+    #[test]
+    fn applying_git_gate_only_vetoes_a_confirmed_engine_change() {
+        // Engine source matches HEAD → allow (defer to the disk gate for the rest).
+        assert!(applying_git_gate(Some(true)));
+        // A mixed change is in flight somewhere → veto (the deferred-hint fires).
+        assert!(!applying_git_gate(Some(false)));
+        // git unavailable → keep today's disk/build_state-gate behavior (fail-open).
+        assert!(applying_git_gate(None));
+    }
+
+    #[test]
+    fn source_rebuilt_fires_only_when_the_client_actually_changed() {
+        // Same id → not yet republished (or deterministic identical rebuild).
+        assert!(!source_rebuilt(Some("aaaa"), Some("aaaa")));
+        // Different id → the rebuild landed.
+        assert!(source_rebuilt(Some("aaaa"), Some("bbbb")));
+        // Served snapshot unreadable but source is stamped → swap to the source.
+        assert!(source_rebuilt(None, Some("bbbb")));
+        // Source unreadable (mid-rebuild / no sw.js) → keep waiting.
+        assert!(!source_rebuilt(Some("aaaa"), None));
+        assert!(!source_rebuilt(None, None));
+    }
+
+    #[test]
+    fn frontend_advance_is_safe_only_when_no_engine_change_is_pending() {
+        // Clean engine: idle, on-disk binary matches the running one → safe.
+        assert!(frontend_advance_is_safe(
+            &BuildState::Idle,
+            Some("engine1"),
+            "engine1"
+        ));
+        // Idle + no readable disk id (packaged / unreadable) → treat as current.
+        assert!(frontend_advance_is_safe(&BuildState::Idle, None, "engine1"));
+
+        // A mixed Apply's rebuild is in flight/ready → NOT safe (dist is for the
+        // new engine; the Switch must advance client + engine together).
+        assert!(!frontend_advance_is_safe(
+            &BuildState::building_now(),
+            Some("engine1"),
+            "engine1"
+        ));
+        assert!(!frontend_advance_is_safe(
+            &BuildState::ready_from(Some("head1".into())),
+            Some("engine1"),
+            "engine1"
+        ));
+        assert!(!frontend_advance_is_safe(
+            &BuildState::failed_with(crate::engine::engine_version::BuildFailure::plain(
+                "error: boom".into()
+            )),
+            Some("engine1"),
+            "engine1"
+        ));
+
+        // A newer engine binary is already on disk (e.g. an external/peer rebuild)
+        // even though this engine is Idle → NOT safe.
+        assert!(!frontend_advance_is_safe(
+            &BuildState::Idle,
+            Some("engine2"),
+            "engine1"
+        ));
+    }
+
+    #[test]
+    fn a_failing_build_is_read_out_of_the_watch_status() {
+        // The shape `dev-build-watch.mjs` writes. This is the only thing binding
+        // the two sides, so it is spelled out rather than round-tripped.
+        let status = r#"{
+          "ok": false,
+          "at": "2026-08-21T11:13:53.249Z",
+          "error": "[vite]: Rollup failed to resolve import \"jsqr\" from \"main.tsx\".",
+          "skippedInstall": null
+        }"#;
+        assert_eq!(
+            build_failure_reason(status).as_deref(),
+            Some("[vite]: Rollup failed to resolve import \"jsqr\" from \"main.tsx\".")
+        );
+    }
+
+    #[test]
+    fn a_healthy_or_unreadable_status_adds_nothing() {
+        // Each of these must leave the generic advice in place rather than
+        // inventing a cause. A stale success is the one that would mislead.
+        for status in [
+            r#"{"ok": true, "at": "2026-08-21T11:00:00Z", "error": null}"#,
+            r#"{"ok": true, "at": "2026-08-21T11:00:00Z", "error": "an old failure"}"#,
+            r#"{"ok": false, "error": null}"#,
+            r#"{"ok": false, "error": ""}"#,
+            r#"{"ok": false, "error": "   "}"#,
+            r#"{"at": "2026-08-21T11:00:00Z"}"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(build_failure_reason(status), None, "spoke for {status:?}");
+        }
+    }
+
+    #[test]
+    fn the_status_is_looked_for_beside_the_served_dist() {
+        // `served_dir` is `<app>/dist`; the watcher keeps state in
+        // `<app>/.build-watch/`. Getting that relationship wrong reads as "the
+        // build is fine" on every stranded Apply.
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path();
+        std::fs::create_dir_all(app.join(".build-watch")).unwrap();
+        std::fs::write(
+            app.join(".build-watch/status.json"),
+            r#"{"ok": false, "error": "boom"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_build_failure(&app.join("dist")).as_deref(),
+            Some("boom")
+        );
+
+        // A checkout whose watcher predates the status file is the ordinary
+        // case, and must stay quiet.
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(read_build_failure(&bare.path().join("dist")), None);
+    }
+
+    fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn a_green_build_after_the_apply_counts_as_landed() {
+        // The incident: a comment-only edit rebuilt to the same BUILD_ID, and
+        // the Apply warned that its change was "not served yet".
+        let applied = at("2026-09-26T05:15:34Z");
+        let status = r#"{"ok": true, "at": "2026-09-26T05:15:38.732Z", "error": null}"#;
+        assert!(build_succeeded_since(status, applied));
+    }
+
+    #[test]
+    fn only_a_green_build_after_the_apply_counts() {
+        let applied = at("2026-09-26T05:15:34Z");
+        for status in [
+            // Green, but from before the Apply: it never saw the change.
+            r#"{"ok": true, "at": "2026-09-26T05:02:00Z", "error": null}"#,
+            // After the Apply, but red: a real reason to warn.
+            r#"{"ok": false, "at": "2026-09-26T05:15:38Z", "error": "boom"}"#,
+            r#"{"ok": true, "at": "not a time"}"#,
+            r#"{"ok": true}"#,
+            "not json at all",
+            "",
+        ] {
+            assert!(
+                !build_succeeded_since(status, applied),
+                "counted {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_green_build_is_read_beside_the_served_dist() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path();
+        std::fs::create_dir_all(app.join(".build-watch")).unwrap();
+        std::fs::write(
+            app.join(".build-watch/status.json"),
+            r#"{"ok": true, "at": "2026-09-26T05:15:38Z", "error": null}"#,
+        )
+        .unwrap();
+        let applied = at("2026-09-26T05:15:34Z");
+        assert!(read_build_succeeded_since(&app.join("dist"), applied));
+
+        let bare = tempfile::tempdir().unwrap();
+        assert!(!read_build_succeeded_since(
+            &bare.path().join("dist"),
+            applied
+        ));
+    }
+
+    #[test]
+    fn a_watch_is_stopped_when_its_pid_is_gone_or_dead() {
+        // The incident: the teardown removed the pidfile and the status file
+        // kept reporting the healthy build from hours earlier.
+        assert_eq!(
+            classify_build_watch(true, None, false),
+            BuildWatchState::Stopped
+        );
+        assert_eq!(
+            classify_build_watch(true, Some(4242), false),
+            BuildWatchState::Stopped
+        );
+        assert_eq!(
+            classify_build_watch(true, Some(4242), true),
+            BuildWatchState::Running
+        );
+    }
+
+    #[test]
+    fn a_stack_with_no_watch_directory_is_unknown_not_stopped() {
+        // Packaged serving and e2e's one-shot build never run a watch. Telling
+        // either that "the build-watch is not running" names a thing that was
+        // never there, and points at a relaunch that would not help.
+        assert_eq!(
+            classify_build_watch(false, None, false),
+            BuildWatchState::Unknown
+        );
+        // Even if a stale pidfile somehow survived without its directory.
+        assert_eq!(
+            classify_build_watch(false, Some(4242), true),
+            BuildWatchState::Unknown
+        );
+    }
+
+    #[test]
+    fn the_watch_state_is_read_beside_the_served_dist() {
+        // Same `<app>/dist` to `<app>/.build-watch/` relationship the status
+        // file uses, so the two can never disagree about where to look.
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path();
+        let watch = app.join(".build-watch");
+        std::fs::create_dir_all(&watch).unwrap();
+
+        // A torn-down watch: the directory keeps its log and status, the
+        // pidfile is gone.
+        std::fs::write(watch.join("status.json"), r#"{"ok": true}"#).unwrap();
+        assert_eq!(
+            read_build_watch_state(&app.join("dist")),
+            BuildWatchState::Stopped
+        );
+
+        // Our own pid stands in for a live watch. Nothing is signalled: the
+        // probe is `kill(pid, 0)`, which only asks.
+        std::fs::write(watch.join("pid"), format!("{}\n", std::process::id())).unwrap();
+        assert_eq!(
+            read_build_watch_state(&app.join("dist")),
+            BuildWatchState::Running
+        );
+
+        // A truncated or garbage pidfile reads as stopped, never as running.
+        std::fs::write(watch.join("pid"), "not-a-pid").unwrap();
+        assert_eq!(
+            read_build_watch_state(&app.join("dist")),
+            BuildWatchState::Stopped
+        );
+
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_build_watch_state(&bare.path().join("dist")),
+            BuildWatchState::Unknown
+        );
+    }
+
+    #[test]
+    fn pid_zero_and_negatives_are_never_alive() {
+        // `kill(0, 0)` signals the caller's whole process group and `kill(-1, 0)`
+        // reaches every process it may. Neither is a liveness question, so the
+        // guard runs before the syscall rather than after it.
+        assert!(!pid_is_alive(0));
+        assert!(!pid_is_alive(-1));
+        assert!(pid_is_alive(std::process::id() as i32));
+    }
+}

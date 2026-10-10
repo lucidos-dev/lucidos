@@ -1,0 +1,1769 @@
+//! HTTP surface for pairing, plus the middleware that enforces authorization.
+//!
+//! Policy and storage live in [`crate::auth`], which has no HTTP in it and is
+//! unit-tested on its own. This module is the wiring.
+//!
+//! # What stays reachable without a credential
+//!
+//! [`is_public_path`] is the whole exemption list, and it is deliberately
+//! short. The picker's shell and assets are public because an unpaired browser
+//! needs a surface to pair *from*: gating them would answer a new phone with a
+//! bare 401 and no way forward. Every API under `/~/api/` is gated except the
+//! two pairing calls and health.
+//!
+//! Under a workspace slug there are two exemptions. [`is_public_app_asset`]
+//! covers the handful of `/api/v1` files an app frame loads as tags on its own
+//! document. [`frame_capability_admits`] covers the frame's own workspace
+//! files, which carry proof in the URL rather than being exempt by name. Each
+//! carries its own reasoning, and the engine holds the matching half of both.
+//!
+//! An unauthenticated *navigation* is answered with the pairing screen, at the
+//! URL it asked for. Anything else gets 401. [`crate::server::serve_pairing_shell`]
+//! records why the screen is served in place rather than redirected to.
+
+use axum::extract::{Path, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+
+use lucidos_frame_capability as frame_capability;
+
+use crate::auth::{self, Authorization};
+use crate::error::ApiError;
+use crate::pairing_qr;
+use crate::registry::SIGIL;
+use crate::server::GatewayState;
+
+pub fn router() -> Router<GatewayState> {
+    Router::new()
+        .route("/pairing-code", post(pairing_code))
+        .route("/devices", get(list_devices))
+        .route("/devices/:id", axum::routing::delete(revoke_device))
+        // These mint, list and revoke credentials, so an app document must not
+        // reach them with the user's cookie. Covers only the routes above it.
+        .route_layer(middleware::from_fn(crate::control::control_authz))
+        // The two pre-auth calls a new device makes. Public anyway, so the
+        // gate would add nothing against a caller who skips the browser.
+        .route("/session", get(session))
+        .route("/pair", post(pair))
+}
+
+/// May this path be served with no credential at all?
+///
+/// Exact-matched, never prefix-matched, so a future `/~/api/v1/health/secrets`
+/// cannot inherit the exemption its parent has.
+pub fn is_public_path(path: &str) -> bool {
+    if carries_a_dot_segment(path) {
+        return false;
+    }
+    if path == "/" {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix("/~/") else {
+        // Outside the picker's namespace, so this is a workspace path. All of
+        // one is gated except the tags on an app frame's own document.
+        return is_public_app_asset(path);
+    };
+    if !rest.starts_with("api/") {
+        // The picker shell and its bundled assets. Static files only: no
+        // workspace data and no control surface is served from here.
+        return true;
+    }
+    matches!(
+        rest,
+        "api/v1/health" | "api/v1/auth/pair" | "api/v1/auth/session"
+    )
+}
+
+/// Does any segment of this path walk upwards?
+///
+/// A dot segment is never public, and paths arrive un-normalized. Three walks
+/// this stops: `/~/assets/../api/v1/control/...` out of the picker's assets,
+/// `/<slug>/api/v1/fonts/../threads/list` out of the app-asset exemption, and
+/// `/<slug>/~cap/<token>/data/../api/v1/credentials` out of a capability.
+///
+/// Both exemptions call it first, so neither can forget it.
+fn carries_a_dot_segment(path: &str) -> bool {
+    path.split(['/', '\\']).any(is_dot_segment)
+}
+
+/// Is this segment a `.` or `..`, in any spelling a URL parser collapses?
+///
+/// Not a string comparison, because the gateway builds the upstream URL with
+/// `reqwest::Url::parse`, which follows the WHATWG rules. There `%2e` is a dot
+/// and `\` is a segment separator, so `/dev/api/v1/fonts/%2e%2e/threads/list`
+/// reaches the engine as `/api/v1/threads/list`. A literal-only guard reads
+/// that as an ordinary asset under `/fonts/` and exempts it, which is an auth
+/// bypass rather than a near miss.
+///
+/// The four double-dot spellings and the two single-dot ones are the parser's
+/// own list. `%2e%2e%2f` is not among them: an encoded slash stays encoded, so
+/// no segment split happens and nothing pops. A double-encoded `%252e` reaches
+/// the engine unchanged, where the exempt tree holds one single-segment route
+/// and no wildcard, so it 404s. Adding a `/fonts/*path` that decodes would
+/// reopen that half.
+fn is_dot_segment(segment: &str) -> bool {
+    if segment == "." || segment == ".." {
+        return true;
+    }
+    // Only an encoded spelling reaches the allocation below.
+    if !segment.contains('%') {
+        return false;
+    }
+    let spelled_out = segment.to_ascii_lowercase().replace("%2e", ".");
+    spelled_out == "." || spelled_out == ".."
+}
+
+/// The `/api/v1` files an app frame loads as tags, spelled as the engine spells
+/// them. Exact names, so a sibling route cannot inherit the exemption.
+const APP_ASSET_FILES: [&str; 4] = [
+    "/sdk.js",
+    "/sdk-prefs.js",
+    "/sdk-iframe.css",
+    "/sdk-iframe-audio.js",
+];
+
+/// The `/api/v1` sub-trees an app frame loads from. Prefixes, because a font
+/// file and a bundled script are named by the asset rather than listed here.
+const APP_ASSET_TREES: [&str; 1] = ["/fonts/"];
+
+/// May an app frame load this with no credential at all?
+///
+/// An app frame runs at an OPAQUE origin (ADR 0227). Its site-for-cookies is
+/// null, so the browser withholds our `SameSite=Lax` device credential from
+/// every subresource the frame's document asks for. Those are `<script>` and
+/// `<link>` tags on the app's own document, and the font a stylesheet names. A
+/// bridge cannot carry any of them. Refuse them and every app renders unstyled,
+/// with no `lucidos` global. The font's CORS header is the engine's to send
+/// (ADR 0289), and we relay it.
+///
+/// Exempt because they carry nothing to protect. Four are the same bytes for
+/// every caller, and `sdk-prefs.js` answers one device's appearance. Everything
+/// that touches the workspace stays gated, over the host bridge instead.
+///
+/// The engine owns the same list, in
+/// `crates/lucidos-engine/src/api/browser_origin.rs::is_public_app_asset`, and
+/// `the_two_halves_of_the_app_asset_exemption_agree` pins the two together. It
+/// sees `/api/v1/sdk.js` where we see `/<slug>/api/v1/sdk.js` (ADR 0014 §4).
+/// `server::fallback` is the other reader: an exempt path must not lazy-start a
+/// stopped workspace for an unpaired caller.
+pub(crate) fn is_public_app_asset(path: &str) -> bool {
+    let Some((_, rest)) = split_workspace_path(path) else {
+        return false;
+    };
+    // The leading slash is kept, so `api/v1beta/...` cannot wear the prefix and
+    // the names above are the engine's own spelling.
+    let Some(asset) = rest.strip_prefix("/api/v1").filter(|a| a.starts_with('/')) else {
+        return false;
+    };
+    APP_ASSET_FILES.contains(&asset) || APP_ASSET_TREES.iter().any(|t| asset.starts_with(t))
+}
+
+/// Split `/<slug>/<rest>` into its two halves, the shape of every workspace
+/// path (ADR 0014 §4). The rest keeps its leading slash, which is how the
+/// engine spells its own routes.
+///
+/// `None` for a path with no slug, and for a slug with nothing after it. The
+/// picker's `/~/` namespace splits like any other, so a caller that must not
+/// treat it as a workspace says so for itself.
+fn split_workspace_path(path: &str) -> Option<(&str, &str)> {
+    let after = path.strip_prefix('/')?;
+    let cut = after.find('/')?;
+    let (slug, rest) = after.split_at(cut);
+    if slug.is_empty() {
+        return None;
+    }
+    Some((slug, rest))
+}
+
+/// Does a frame capability in this URL admit this request?
+///
+/// An app frame's own files cannot be exempted by name the way the `/api/v1`
+/// assets above are: `/<slug>/data/*` is the user's artifacts and
+/// `/<slug>/app/<id>/*` is an app's source. So the browser carries proof
+/// instead, in one path segment the engine minted when it served that frame's
+/// document (ADR 0238). An unpaired device that guesses a URL still gets
+/// nothing, because it cannot forge the segment.
+///
+/// Five things have to hold, and the crate owns the last two:
+///
+///  * no dot segment, so nothing walks out of the tree it was admitted to;
+///  * `GET` or `HEAD`, because reading is the whole grant;
+///  * no `Upgrade`, so a handshake cannot ride a pass meant for a file;
+///  * a signature this machine's key made, for THIS slug, not yet expired;
+///  * a target under `/data/` or under the capability's own `/app/<id>/`.
+///
+/// The key is derived per call rather than held. It is one HMAC of a short
+/// constant, and only a request that already carries the segment pays it.
+pub(crate) fn frame_capability_admits(state: &GatewayState, req: &Request) -> bool {
+    // Shape first, then policy. This runs on EVERY gated request, and almost
+    // none of them carry a segment, so the two prefix checks below are what
+    // most callers pay. The five conditions are ANDed, so the order decides
+    // cost rather than the answer.
+    let Some((slug, rest)) = split_workspace_path(req.uri().path()) else {
+        return false;
+    };
+    let Some((token, target)) = frame_capability::split(rest) else {
+        return false;
+    };
+    if carries_a_dot_segment(req.uri().path())
+        || !frame_capability::method_is_read_only(req.method().as_str())
+        || req.headers().contains_key(header::UPGRADE)
+        // The picker is not a workspace, and no engine mints for it. Said here
+        // rather than left to the signature, so the boundary is readable.
+        || slug.strip_prefix(SIGIL).is_some_and(str::is_empty)
+    {
+        return false;
+    }
+    let key = frame_capability::derive_key(state.local_token());
+    frame_capability::verify(&key, token, slug, chrono::Utc::now().timestamp())
+        .is_some_and(|app_id| frame_capability::admits(target, &app_id))
+}
+
+/// Does this path carry a capability segment at all, whatever it proves?
+///
+/// Asked by callers that must treat such a request as machinery rather than as
+/// a person arriving: [`crate::server::fallback`] will not wake a stopped
+/// workspace for one, and the refusal below will not hand one the pairing
+/// screen. Presence is the right question for both, because a forged segment
+/// is no more a person than a valid one.
+pub(crate) fn path_carries_frame_capability(path: &str) -> bool {
+    split_workspace_path(path).is_some_and(|(_, rest)| frame_capability::split(rest).is_some())
+}
+
+/// Is this request a top-level page load, as opposed to a fetch?
+///
+/// `Sec-Fetch-Mode` is set by the browser and cannot be forged from script,
+/// which is why it is read first. The `Accept` fallback covers clients that
+/// send no fetch metadata at all.
+///
+/// Deliberately NOT `server::is_document_navigation`, which answers a related
+/// question and disagrees on the case that matters here. That one reaches
+/// `Accept` whenever the fetch metadata is merely not a navigation. So a script
+/// `fetch` asking for HTML reads to it as a page load. Waking a stopped
+/// workspace for one is harmless. Handing it a pairing screen is not: the
+/// caller cannot use it, and its JSON parse fails.
+fn wants_html(headers: &HeaderMap) -> bool {
+    if let Some(mode) = headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok()) {
+        return mode == "navigate";
+    }
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"))
+}
+
+/// Is this the browser's OWN address bar arriving, rather than a frame or a
+/// subresource inside somebody's page?
+///
+/// Only that caller may be handed the pairing screen. `Sec-Fetch-Dest` is the
+/// discriminator, because [`wants_html`] cannot tell the two apart: a nested
+/// iframe navigates, so it reads there as a page load. That is how a refused
+/// artifact preview rendered the whole Lucidos shell inside a user's app. It
+/// looks like the app being possessed (ADR 0238).
+///
+/// An absent value falls back to the older question, which decides exactly as
+/// it did before. Two callers land there. A client sending no fetch metadata is
+/// the ordinary one. The other is a browser old enough to send `Sec-Fetch-Mode`
+/// and not `Sec-Fetch-Dest`, which Chrome shipped four versions apart. Such a
+/// browser keeps today's behaviour, including the shell in a nested frame.
+fn is_top_level_navigation(headers: &HeaderMap) -> bool {
+    match headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) {
+        Some(dest) => dest == "document",
+        None => wants_html(headers),
+    }
+}
+
+/// What a refused nested frame renders.
+///
+/// Small, and honest about both causes: an unpaired device, and a capability
+/// that lapsed under a long-open app. The reader is looking at a box inside an
+/// app, so the one useful instruction is to reload it.
+const REFUSED_FRAME_PAGE: &str = concat!(
+    "<!doctype html><meta charset=\"utf-8\">",
+    "<title>Lucidos could not load this</title>",
+    "<body style=\"margin:0;display:grid;place-items:center;min-height:100vh;",
+    "font:14px/1.5 system-ui,sans-serif;color:#7a828c;text-align:center;padding:1rem\">",
+    "<p>Lucidos could not load this file. The app's pass to it expired, ",
+    "or this device is not paired.<br>Reload the app to try again.</p>"
+);
+
+/// Refuse a request that proved nothing.
+///
+/// Applied in front of everything: the proxy into each workspace, the control
+/// plane and the picker's own API.
+pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: Next) -> Response {
+    if is_public_path(req.uri().path()) || frame_capability_admits(&state, &req) {
+        return next.run(req).await;
+    }
+    // One scan of the `Cookie` header for a decision this then acts on twice:
+    // stamp the device, and re-issue the credential it presented.
+    let (decision, matched) = state.authorize_with_match(req.headers());
+    match decision {
+        Authorization::Device { id, label } => {
+            // Three reasons to hand this device a cookie. All are decided here,
+            // before the request moves into the handler.
+            //
+            // A PAGE LOAD. A browser certainly stores what we send there, and a
+            // launch is a handful of them rather than one per request. So the
+            // credential's window restarts on every launch. Renewing once a day
+            // instead asked the browser to hold a year-long cookie untouched,
+            // and an iOS home-screen container does not.
+            //
+            // A NAME THAT IS NOT OURS, at once and whatever the beat says. That
+            // is the whole migration: a device on the pre-split name holds the
+            // one slot every gateway on this host writes, so the next pairing
+            // there evicts it. It also covers a data-dir move, which renames
+            // our own cookie under a device that did nothing wrong.
+            //
+            // A DAY SINCE WE LAST SAW IT, which is the liveness stamp for the
+            // devices list. Only that third reason writes the store, so an
+            // active device still pays one whole-file save per day.
+            let renaming = matched.is_some_and(auth::PresentedCredential::is_renamed);
+            let page_load = wants_html(req.headers());
+            let due = state.touch_device(&id, chrono::Utc::now());
+            let refresh = matched
+                .filter(|_| renaming || page_load || due)
+                .and_then(|p| refreshed_credential_cookie(&state, req.headers(), p));
+            // Tell the proxy who this is. The engine keys push, preferences and
+            // actor attribution on the same id. So the device the gateway let
+            // in and the device the workspace knows are one row, not two.
+            req.extensions_mut()
+                .insert(auth::AuthenticatedDevice { id, label });
+            let cookie_name = state.device_cookie_name().to_string();
+            let mut response = next.run(req).await;
+            if let Some(cookie) = refresh {
+                if !response_speaks_for_the_credential(&response, &cookie_name) {
+                    // Appended, never inserted. `Set-Cookie` is multi-valued, and
+                    // this wraps every handler, so replacing the header would
+                    // drop any other cookie the response set.
+                    response.headers_mut().append(header::SET_COOKIE, cookie);
+                }
+            }
+            return response;
+        }
+        Authorization::LocalProcess => {
+            req.extensions_mut().insert(auth::AuthenticatedLocalProcess);
+            return next.run(req).await;
+        }
+        Authorization::Unauthorized => {}
+    }
+    state.log_device_refusal(req.headers());
+    if is_top_level_navigation(req.headers()) {
+        // Show the pairing screen here, rather than a bare 401 with no
+        // affordance. In place rather than redirected: see `serve_pairing_shell`.
+        // Hand the screen the code the caller arrived with: a `pair` query does
+        // reach a gated path, and `serve_pairing_shell` says how.
+        let pair_code = pairing_qr::pairing_code_in_query(req.uri().query());
+        return crate::server::serve_pairing_shell(&state, pair_code);
+    }
+    if is_nested_frame(req.headers()) {
+        // A frame renders what it is given, so JSON would paint the reader a
+        // wall of braces. Never the shell: see `is_top_level_navigation`.
+        return (
+            StatusCode::UNAUTHORIZED,
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            REFUSED_FRAME_PAGE,
+        )
+            .into_response();
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "this device is not paired with Lucidos",
+            "pair_at": "/~/",
+        })),
+    )
+        .into_response()
+}
+
+/// Is this request a nested document, rather than a subresource of one?
+///
+/// The engine asks the same question of the same header, to decide whether to
+/// mint. So the answer lives in the crate the two share.
+fn is_nested_frame(headers: &HeaderMap) -> bool {
+    frame_capability::is_nested_frame_dest(
+        headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()),
+    )
+}
+
+/// Did the handler already say something about the credential cookie?
+///
+/// Then the refresh stands down. `revoke_device` is the case that matters. It
+/// clears the caller's own cookie, and it runs behind this middleware. So a
+/// revoke landing on the day a restamp is due would otherwise hand the browser
+/// a fresh credential instead of clearing it.
+///
+/// `name` is this gateway's own. Another gateway's cookie on the same response
+/// is not ours to read as an answer, and there is no such response anyway.
+///
+/// Matched with the `=`, so a longer name that merely starts with ours cannot
+/// answer for it. Every name here shares the `lucidos_device_` stem.
+fn response_speaks_for_the_credential(response: &Response, name: &str) -> bool {
+    let prefix = format!("{name}=");
+    response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.trim_start().starts_with(&prefix))
+}
+
+/// The same credential this request carried, in a cookie with a fresh window.
+///
+/// Always under THIS gateway's name, whichever name it arrived under. That is
+/// what moves a device off the legacy shared cookie without asking it to pair
+/// again.
+///
+/// `None` when the header will not build, which leaves the existing cookie
+/// alone. That is the safe miss: the device stays paired either way, and the
+/// server never checks the window.
+///
+/// `presented` is passed in rather than re-read, so the caller's one scan of
+/// the `Cookie` header is the only one.
+fn refreshed_credential_cookie(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    presented: auth::PresentedCredential<'_>,
+) -> Option<axum::http::HeaderValue> {
+    let secure = auth::request_is_secure(headers, state.serves_tls());
+    auth::credential_cookie(state.device_cookie_name(), presented.value(), secure)
+        .parse()
+        .ok()
+}
+
+#[derive(Serialize)]
+struct SessionBody {
+    paired: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_label: Option<String>,
+    /// True when the caller is a local process, which is what may mint the very
+    /// first pairing code. No shipped client branches on it: a browser is never
+    /// local, and the desktop app mints through its own Rust side instead.
+    local: bool,
+}
+
+/// Who is calling? Public, so an unpaired client can ask before it is refused.
+async fn session(State(state): State<GatewayState>, headers: HeaderMap) -> Json<SessionBody> {
+    Json(match state.authorize(&headers) {
+        Authorization::LocalProcess => SessionBody {
+            paired: true,
+            device_id: None,
+            device_label: None,
+            local: true,
+        },
+        Authorization::Device { id, label } => SessionBody {
+            paired: true,
+            device_id: Some(id),
+            device_label: Some(label),
+            local: false,
+        },
+        Authorization::Unauthorized => SessionBody {
+            paired: false,
+            device_id: None,
+            device_label: None,
+            local: false,
+        },
+    })
+}
+
+/// What the mint call accepts.
+///
+/// `label` names the device that redeems the code, so `lucidos pair --label`
+/// does more than print a name in the terminal. `origin` asks for a QR, and is
+/// the address the new device should open. Only the caller knows which of this
+/// machine's addresses another device can reach.
+#[derive(Deserialize, Default)]
+struct PairingCodeQuery {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    origin: Option<String>,
+}
+
+/// The minted code, plus the QR when the caller asked for one.
+///
+/// With no `origin` sent, both extra fields are omitted rather than null. A
+/// client that never heard of them sees exactly the body it always did.
+#[derive(Serialize)]
+struct PairingCodeBody {
+    code: String,
+    expires_in_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pair_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qr_svg: Option<String>,
+}
+
+/// Mint a one-time pairing code.
+///
+/// Gated by [`enforce`], so either a local process or an already-paired device
+/// may mint one. A paired device is allowed on purpose: it already holds full
+/// authority, so refusing it would add no safety and would strand a user who is
+/// away from the machine.
+async fn pairing_code(
+    State(state): State<GatewayState>,
+    axum::extract::Query(query): axum::extract::Query<PairingCodeQuery>,
+) -> Result<Json<PairingCodeBody>, ApiError> {
+    let label = query
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    // Validated BEFORE the code is minted. A bad origin is the caller's
+    // mistake, and it must not burn a code the user then has to re-request.
+    let origin = match query
+        .origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => Some(pairing_qr::valid_origin(raw).ok_or_else(|| {
+            ApiError::bad_request("origin must be a bare http(s) origin, such as https://host:port")
+        })?),
+        None => None,
+    };
+    let code = state.mint_pairing_code(label).map_err(ApiError::internal)?;
+    let pair_url = origin.map(|o| pairing_qr::pair_url(o, &code));
+    // A `None` here means the URL fits in no QR at all, which the length cap in
+    // `valid_origin` already rules out. The code is still good, so the response
+    // carries it and the page falls back to showing the digits.
+    let qr_svg = pair_url.as_deref().and_then(pairing_qr::qr_svg);
+    Ok(Json(PairingCodeBody {
+        expires_in_secs: auth::pairing_code_ttl_secs(),
+        code,
+        pair_url,
+        qr_svg,
+    }))
+}
+
+#[derive(Deserialize)]
+struct PairRequest {
+    code: String,
+    /// What to call this device in the paired list. Optional, because a phone
+    /// typing a code should not also be made to name itself.
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// Redeem a pairing code and become a paired device.
+///
+/// Public by necessity: the caller has no credential yet, which is the point.
+/// The code is the only thing standing here, so it is single use, it expires,
+/// and wrong guesses are rate limited. On a wide bind this route is reachable
+/// from the LAN. Unthrottled, it would be eight digits against a caller that
+/// guesses as fast as the socket accepts.
+async fn pair(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<PairRequest>,
+) -> Result<Response, ApiError> {
+    let credential =
+        match state
+            .redeem_pairing_code(&body.code, body.label.as_deref())
+            .map_err(ApiError::internal)?
+        {
+            crate::server::PairingOutcome::Paired(credential) => credential,
+            crate::server::PairingOutcome::Rejected => {
+                return Err(ApiError::bad_request(
+                    "that pairing code is not valid or has expired",
+                ))
+            }
+            // Said plainly, because the person on the other end may be the user
+            // watching a real code go unanswered. A 400 here would send them
+            // hunting a typo that is not there.
+            crate::server::PairingOutcome::Throttled => return Err(ApiError::too_many_requests(
+                "too many pairing attempts just now, so this one was not checked. Wait a minute \
+                 and try again.",
+            )),
+        };
+    let secure = auth::request_is_secure(&headers, state.serves_tls());
+    Ok((
+        StatusCode::OK,
+        [(
+            header::SET_COOKIE,
+            auth::credential_cookie(state.device_cookie_name(), &credential, secure),
+        )],
+        Json(serde_json::json!({ "paired": true })),
+    )
+        .into_response())
+}
+
+#[derive(Serialize)]
+struct DeviceRow {
+    id: String,
+    label: String,
+    paired_at: String,
+    /// Omitted for a device paired before the field existed, so the list can
+    /// say nothing rather than guess. It fills in on that device's next
+    /// request. Never the credential, and never anything finer than a day.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen_at: Option<String>,
+}
+
+async fn list_devices(State(state): State<GatewayState>) -> Result<Json<Vec<DeviceRow>>, ApiError> {
+    let devices = state.paired_devices();
+    Ok(Json(
+        devices
+            .devices
+            .into_iter()
+            .map(|d| DeviceRow {
+                id: d.id,
+                label: d.label,
+                paired_at: d.paired_at,
+                last_seen_at: d.last_seen_at,
+            })
+            .collect(),
+    ))
+}
+
+/// Revoke a device. Revoking the caller's own device clears its cookie in the
+/// same response, so the browser does not keep sending a credential that no
+/// longer resolves.
+async fn revoke_device(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    // Resolve the caller BEFORE revoking. Afterwards its credential matches no
+    // stored device, so `authorize` returns `Unauthorized`. A device revoking
+    // itself would then never be recognised as having done so, and would keep
+    // sending a credential that no longer resolves.
+    let revoked_self = matches!(state.authorize(&headers), Authorization::Device { id: caller, .. } if caller == id);
+    let removed = state.revoke_device(&id).map_err(ApiError::internal)?;
+    if !removed {
+        return Err(ApiError::bad_request("no paired device with that id"));
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if revoked_self {
+        if let Ok(value) = auth::cleared_credential_cookie(state.device_cookie_name()).parse() {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+    }
+    Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_picker_shell_is_public_so_an_unpaired_phone_can_pair() {
+        assert!(is_public_path("/~/"));
+        assert!(is_public_path("/~/index.html"));
+        assert!(is_public_path("/~/assets/index-abc123.js"));
+        assert!(is_public_path("/~/sw.js"));
+        assert!(is_public_path("/"));
+    }
+
+    #[test]
+    fn only_the_two_pairing_calls_and_health_are_public_apis() {
+        assert!(is_public_path("/~/api/v1/health"));
+        assert!(is_public_path("/~/api/v1/auth/pair"));
+        assert!(is_public_path("/~/api/v1/auth/session"));
+
+        assert!(!is_public_path("/~/api/v1/auth/pairing-code"));
+        assert!(!is_public_path("/~/api/v1/auth/devices"));
+        assert!(!is_public_path("/~/api/v1/control/workspaces"));
+        assert!(!is_public_path("/~/api/v1/control/workspaces/dev"));
+    }
+
+    #[test]
+    fn a_code_minted_without_an_origin_serializes_to_the_body_it_always_had() {
+        // `lucidos pair` sends no origin and parses this body. A `null` field
+        // is a contract change to a caller that may be older than the gateway.
+        let body = PairingCodeBody {
+            code: "01234567".into(),
+            expires_in_secs: 300,
+            pair_url: None,
+            qr_svg: None,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert_eq!(json, r#"{"code":"01234567","expires_in_secs":300}"#);
+    }
+
+    #[test]
+    fn a_workspace_path_is_never_public() {
+        assert!(!is_public_path("/dev/"));
+        assert!(!is_public_path("/dev/api/v1/threads/list"));
+        assert!(!is_public_path("/dev/app/habit-tracker/"));
+        assert!(!is_public_path("/personal/data/artifacts/notes.md"));
+    }
+
+    #[test]
+    fn a_dot_segment_is_never_public() {
+        // Paths are not normalized before they reach here, so a traversal must
+        // not be able to wear a picker-asset prefix into the exemption list.
+        assert!(!is_public_path("/~/assets/../api/v1/control/workspaces"));
+        assert!(!is_public_path("/~/.."));
+        assert!(!is_public_path("/~/./index.html"));
+        assert!(!is_public_path("/../~/index.html"));
+        // A dot INSIDE a segment is an ordinary filename, not a traversal.
+        assert!(is_public_path("/~/assets/index-abc123.js"));
+        assert!(is_public_path("/~/..well-known"));
+    }
+
+    #[test]
+    fn an_app_frame_s_own_tags_are_public_under_a_workspace_slug() {
+        // The shape this gateway actually sees. An app frame loads at
+        // `/<slug>/app/<id>/`, and the engine rescopes its root-absolute refs,
+        // so every tag on its document arrives with the workspace prefix on.
+        for path in [
+            "/dev/api/v1/sdk.js",
+            "/dev/api/v1/sdk-prefs.js",
+            "/dev/api/v1/sdk-iframe.css",
+            "/dev/api/v1/sdk-iframe-audio.js",
+            "/dev/api/v1/fonts/fira-code.css",
+            "/myws/api/v1/sdk.js",
+        ] {
+            assert!(is_public_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn nothing_beside_an_app_tag_inherits_the_exemption() {
+        for path in [
+            // Workspace data, which an app reaches over the host bridge.
+            "/dev/api/v1/threads/list",
+            "/dev/api/v1/data/artifacts/notes.md",
+            "/dev/app/habit-tracker/style.css",
+            // A neighbour of an exempt name is not that name.
+            "/dev/api/v1/sdk.js.map",
+            "/dev/api/v1/sdk.jsx",
+            "/dev/api/v1/sdk-iframe.css.map",
+            // A tree exemption needs the tree, not a route that starts like it.
+            "/dev/api/v1/fonts",
+            "/dev/api/v1/fonts-admin/list",
+            // Not an app-asset tree: the engine serves nothing under `/static/`.
+            "/dev/api/v1/static/html2canvas.min.js",
+            // The prefix has to be the whole of `api/v1`, and a slug has to be
+            // there: `/api/v1/sdk.js` names a workspace called `api`.
+            "/dev/api/v1beta/sdk.js",
+            "/api/v1/sdk.js",
+            "//api/v1/sdk.js",
+            "/dev",
+            // A dot segment is never public, whatever it wears.
+            "/dev/api/v1/../control/x",
+            "/dev/api/v1/./sdk.js",
+            "/../dev/api/v1/sdk.js",
+            // The picker's namespace serves no app frame, so it gets no
+            // app-asset exemption on top of the three routes it already has.
+            "/~/api/v1/sdk.js",
+            "/~/api/v1/fonts/fira-code.css",
+        ] {
+            assert!(!is_public_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_tree_exemption_cannot_be_walked_out_of() {
+        // `/fonts/` is a prefix, so it admits a tail, and the proxy hands that
+        // tail to `reqwest::Url::parse`. Every path here is
+        // ordinary-looking to a literal `..` scan and pops the tree off once
+        // the parser sees it. Each assertion states both halves: the gate
+        // refuses it, and the reason it must.
+        for path in [
+            r"/dev/api/v1/fonts/%2e%2e/threads/list",
+            r"/dev/api/v1/fonts/%2E%2E/threads/list",
+            r"/dev/api/v1/fonts/.%2e/threads/list",
+            r"/dev/api/v1/fonts/%2e./threads/list",
+            r"/dev/api/v1/fonts/%2e/%2e%2e/threads/list",
+            r"/dev/api/v1/fonts/a/%2e%2e/%2e%2e/credentials",
+            r"/dev/api/v1/fonts/..\threads/list",
+            r"/dev/api/v1/fonts/%2e%2e\threads/list",
+        ] {
+            assert!(!is_public_path(path), "{path}");
+
+            // What `proxy::proxy` builds: the slug stripped, the rest appended
+            // to the engine's base. If one of these ever stops escaping, it is
+            // no longer the hostile input this test believes it is.
+            let rest = path.strip_prefix("/dev").expect("a slug-prefixed path");
+            let upstream =
+                reqwest::Url::parse(&format!("http://127.0.0.1:0{rest}")).expect("a parsable url");
+            assert!(
+                !upstream.path().starts_with("/api/v1/fonts/"),
+                "{path} was chosen because it escapes its tree, and it resolved to {}",
+                upstream.path()
+            );
+        }
+    }
+
+    #[test]
+    fn a_dot_is_a_dot_in_every_spelling_the_parser_collapses() {
+        for segment in [".", "..", "%2e", "%2E", "%2e%2e", "%2E%2e", ".%2e", "%2e."] {
+            assert!(is_dot_segment(segment), "{segment}");
+        }
+        // Three dots is a directory name, and the parser agrees: it collapses
+        // neither of these, so neither may be refused.
+        for segment in ["...", "%2e%2e%2e", "%2e%2e%2f", "a%2eb", "", "%2f"] {
+            assert!(!is_dot_segment(segment), "{segment}");
+        }
+    }
+
+    /// The engine's own copy of the list, read out of its source.
+    ///
+    /// A scan rather than a dependency: the gateway does not link the engine,
+    /// and pulling it in to share two arrays would be the tail wagging the dog.
+    /// `net_config.rs` reads this crate's sources the same way.
+    fn engine_app_asset_literals() -> Vec<String> {
+        let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the gateway crate sits in crates/")
+            .join("lucidos-engine/src/api/browser_origin.rs");
+        let source = std::fs::read_to_string(&engine)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", engine.display()));
+        let body = source
+            .split_once("fn is_public_app_asset")
+            .expect("the engine still defines is_public_app_asset")
+            .1;
+        // Stop at the first line-initial `}`, which closes the function.
+        let body = body.split_once("\n}").expect("a closed function body").0;
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            // The `strip_prefix` argument, which is the nest rather than an
+            // asset. The gateway strips `/<slug>` and then the same prefix.
+            .filter(|literal| *literal != "/api/v1")
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn the_two_halves_of_the_app_asset_exemption_agree() {
+        // The engine admits these tags and this gateway refuses them, or the
+        // reverse, and an app frame is broken either way. Both must hold the
+        // same list, so adding one on one side alone fails here.
+        let engine = engine_app_asset_literals();
+        assert!(
+            engine.len() >= APP_ASSET_FILES.len(),
+            "the scan read {engine:?}, which is too little to be the real list"
+        );
+
+        // Sorted on both sides, so reordering the engine's `matches!` arms is
+        // not a failure. What has to agree is the set, not the spelling order.
+        let (mut trees, mut files): (Vec<&str>, Vec<&str>) = engine
+            .iter()
+            .map(String::as_str)
+            .partition(|literal| literal.ends_with('/'));
+        files.sort_unstable();
+        trees.sort_unstable();
+        let mut want_files = APP_ASSET_FILES;
+        let mut want_trees = APP_ASSET_TREES;
+        want_files.sort_unstable();
+        want_trees.sort_unstable();
+
+        assert_eq!(
+            files, want_files,
+            "the exact-matched names differ; reconcile with browser_origin.rs"
+        );
+        assert_eq!(
+            trees, want_trees,
+            "the prefix-matched trees differ; reconcile with browser_origin.rs"
+        );
+    }
+
+    #[test]
+    fn an_exemption_is_exact_and_is_not_inherited_by_children() {
+        // The trap this guards: prefix-matching `api/v1/health` would exempt
+        // anything someone later mounts underneath it.
+        assert!(!is_public_path("/~/api/v1/health/detail"));
+        assert!(!is_public_path("/~/api/v1/auth/pair/steal"));
+        assert!(!is_public_path("/~/api/v1/authx"));
+    }
+
+    /// A gateway's own cookie name, for the pure helpers below.
+    const TEST_COOKIE: &str = "lucidos_device_deadbeef";
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn a_navigation_is_recognised_from_forge_proof_fetch_metadata() {
+        assert!(wants_html(&headers(&[("sec-fetch-mode", "navigate")])));
+        assert!(!wants_html(&headers(&[("sec-fetch-mode", "cors")])));
+        // Fetch metadata wins over Accept: a script `fetch` asking for HTML is
+        // still a fetch, and must get 401 rather than a page it cannot use.
+        let both = headers(&[("sec-fetch-mode", "cors"), ("accept", "text/html")]);
+        assert!(!wants_html(&both));
+    }
+
+    #[test]
+    fn a_client_with_no_fetch_metadata_falls_back_to_accept() {
+        assert!(wants_html(&headers(&[("accept", "text/html,*/*")])));
+        assert!(!wants_html(&headers(&[("accept", "application/json")])));
+        assert!(!wants_html(&headers(&[])));
+    }
+
+    // ── `enforce`, driven through a real router ─────────────────────────────
+
+    /// A gateway with a frontend on disk, so the pairing shell is a real body
+    /// rather than "no frontend configured".
+    fn state_with_frontend(dir: &std::path::Path) -> GatewayState {
+        std::fs::write(
+            dir.join("index.html"),
+            "<html><head></head><body></body></html>",
+        )
+        .unwrap();
+        GatewayState::for_tests_with_static_dir(Some(dir.to_path_buf()))
+    }
+
+    /// The gated surface, behind the real middleware. The inner handler must
+    /// never run for an unauthorized caller, so it answers a teapot: seeing one
+    /// means `enforce` let the request through.
+    fn gated_router(state: GatewayState) -> Router {
+        Router::new()
+            .fallback(|| async { StatusCode::IM_A_TEAPOT })
+            .layer(axum::middleware::from_fn_with_state(state.clone(), enforce))
+            .with_state(state)
+    }
+
+    async fn get(state: &GatewayState, uri: &str, hdrs: &[(&str, &str)]) -> Response {
+        use tower::ServiceExt as _;
+        let mut builder = axum::extract::Request::builder().method("GET").uri(uri);
+        for (k, v) in hdrs {
+            builder = builder.header(*k, *v);
+        }
+        gated_router(state.clone())
+            .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_navigation_gets_the_pairing_screen_where_it_stands() {
+        // The migration invariant. A 3xx makes an already-installed PWA serve
+        // its stale cached shell instead, and while unpaired it cannot update
+        // the worker that would fix that.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        for path in ["/dev/", "/dev/some/deep/route", "/personal/"] {
+            let response = get(&state, path, &[("sec-fetch-mode", "navigate")]).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(
+                response.headers().get(header::LOCATION).is_none(),
+                "{path} must be answered in place, never redirected"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(crate::server::PAIRING_SHELL_HEADER)
+                    .and_then(|v| v.to_str().ok()),
+                Some("1"),
+                "{path} must mark itself as the pairing screen"
+            );
+        }
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// The pairing screen served for a request that arrived with a code.
+    async fn pairing_shell_for(query: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let uri = format!("/dev/{query}");
+        let response = get(&state, &uri, &[("sec-fetch-mode", "navigate")]).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        body_text(response).await
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_navigation_carries_its_code_into_the_manifest_link() {
+        // A scan lands on the public `/~/?pair=`, but the picker's cold-start
+        // fast path redirects a remembered workspace and takes the query along.
+        // The code has to survive that, or the install it feeds pairs nothing.
+        let body = pairing_shell_for("?pair=01234567").await;
+        assert!(body.contains("manifest.json?pair=01234567"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_pairing_screen_asked_for_no_code_stamps_none() {
+        let body = pairing_shell_for("").await;
+        assert!(!body.contains("?pair="), "{body}");
+    }
+
+    #[tokio::test]
+    async fn nothing_but_a_minted_shape_reaches_the_stamped_link() {
+        // The query is caller-supplied and lands in an HTML attribute. One
+        // grammar governs it, and it is `valid_pairing_code`.
+        for query in [
+            "?pair=abc",
+            "?pair=0123456",
+            "?pair=012345678",
+            "?pair=",
+            "?pair=0123456%22%3E%3Cscript%3E",
+        ] {
+            let body = pairing_shell_for(query).await;
+            assert!(!body.contains("?pair="), "{query} was echoed: {body}");
+        }
+    }
+
+    /// A state holding one paired device, and the credential that reaches it.
+    fn state_with_device(dir: &std::path::Path, last_seen_at: Option<&str>) -> GatewayState {
+        let state = state_with_frontend(dir);
+        let credential = "cred-abc";
+        state
+            .write_paired_devices_for_test(|paired| {
+                paired.devices.push(auth::PairedDevice {
+                    id: "device-1".into(),
+                    label: "My iPhone".into(),
+                    credential_digest: auth::digest(credential),
+                    paired_at: "2020-01-01T00:00:00Z".into(),
+                    last_seen_at: last_seen_at.map(str::to_string),
+                });
+            })
+            .unwrap();
+        state
+    }
+
+    /// The pre-split cookie every gateway used to write. Still accepted.
+    const LEGACY_DEVICE_COOKIE: (&str, &str) = ("cookie", "lucidos_device=cred-abc");
+
+    /// What a browser paired to `state` since the split sends back.
+    fn own_device_cookie(state: &GatewayState) -> String {
+        format!("{}=cred-abc", state.device_cookie_name())
+    }
+
+    #[tokio::test]
+    async fn a_device_unseen_for_a_day_is_restamped_and_gets_a_fresh_cookie() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_device(dir.path(), Some("2020-01-02T00:00:00Z"));
+
+        let own = own_device_cookie(&state);
+        let response = get(&state, "/dev/api/v1/threads/list", &[("cookie", &own)]).await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("a restamped device is handed a fresh window");
+        // The same credential, under THIS gateway's name, and every attribute
+        // the original carried. A refresh that dropped HttpOnly would hand app
+        // iframes the credential.
+        assert!(cookie.contains(&own), "{cookie}");
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+        assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+        assert!(cookie.contains("Max-Age="), "{cookie}");
+
+        assert!(
+            state.paired_devices().devices[0].last_seen_at.as_deref() > Some("2026-01-01"),
+            "the stamp must move to now"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fetch_by_a_device_seen_today_is_not_rewritten_and_gets_no_cookie() {
+        // The throttle. Without it every authorized request rewrites the whole
+        // store and re-sets the cookie, on a path that runs constantly. A page
+        // load DOES get a fresh cookie now, which is why this one says it is a
+        // fetch rather than leaving the metadata off.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = state_with_device(dir.path(), Some(&now));
+
+        let own = own_device_cookie(&state);
+        let response = get(
+            &state,
+            "/dev/api/v1/threads/list",
+            &[("cookie", &own), ("sec-fetch-mode", "cors")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(
+            state.paired_devices().devices[0].last_seen_at.as_deref(),
+            Some(now.as_str()),
+            "a device seen today must not be restamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_cookie_still_authorizes_and_is_moved_to_this_gateway_s_name() {
+        // Nobody paired before the split meets the pairing screen. The device
+        // is let in on the old shared name. The same response then hands it
+        // this gateway's own, so it stops holding the one contested slot.
+        // Seen today, so the daily restamp is not what triggers the re-issue.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = state_with_device(dir.path(), Some(&now));
+
+        let response = get(&state, "/dev/api/v1/threads/list", &[LEGACY_DEVICE_COOKIE]).await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("a legacy credential is migrated on sight");
+        assert!(cookie.starts_with(state.device_cookie_name()), "{cookie}");
+        assert!(cookie.contains("cred-abc"), "{cookie}");
+    }
+
+    #[tokio::test]
+    async fn a_credential_in_a_second_cookie_field_never_meets_the_pairing_screen() {
+        // The report this came from. HTTP/2 may split one jar across several
+        // `cookie` fields, and `enforce` read only the first. A paired iPhone
+        // met the pairing screen with its row still in the store. The refusal
+        // log stayed silent too, having counted no credential at all.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = state_with_device(dir.path(), Some(&now));
+
+        let own = own_device_cookie(&state);
+        let response = get(
+            &state,
+            "/dev/",
+            &[
+                ("cookie", "theme=dark"),
+                ("cookie", &own),
+                ("sec-fetch-mode", "navigate"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::IM_A_TEAPOT,
+            "the teapot is the handler, so `enforce` let this device through"
+        );
+        assert!(
+            response
+                .headers()
+                .get(crate::server::PAIRING_SHELL_HEADER)
+                .is_none(),
+            "a device the store holds must never be asked to pair again"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_gateways_on_one_host_do_not_share_a_cookie_name() {
+        // Measured before this split: pairing the second gateway took the first
+        // from 200 to 401, because a cookie is scoped to the host and ignores
+        // the port. Distinct names are what let one browser hold both.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = state_with_device(dir_a.path(), None);
+        let b = state_with_device(dir_b.path(), None);
+        assert_ne!(a.device_cookie_name(), b.device_cookie_name());
+
+        // One browser holding both cookies is answered by each gateway.
+        let both = format!(
+            "{}=cred-abc; {}=cred-abc",
+            a.device_cookie_name(),
+            b.device_cookie_name()
+        );
+        for state in [&a, &b] {
+            let response = get(state, "/dev/api/v1/threads/list", &[("cookie", &both)]).await;
+            assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refresh_never_overwrites_what_the_handler_said_about_the_cookie() {
+        // `revoke_device` clears the caller's own cookie and runs behind this
+        // middleware. A revoke landing on a day the device was also due a
+        // restamp must still clear, not be handed a fresh credential.
+        let mut cleared = StatusCode::NO_CONTENT.into_response();
+        cleared.headers_mut().insert(
+            header::SET_COOKIE,
+            auth::cleared_credential_cookie(TEST_COOKIE)
+                .parse()
+                .unwrap(),
+        );
+        assert!(response_speaks_for_the_credential(&cleared, TEST_COOKIE));
+
+        // Another handler's unrelated cookie is not ours, so the refresh rides
+        // alongside it rather than standing down or replacing it.
+        let mut other = StatusCode::OK.into_response();
+        other
+            .headers_mut()
+            .insert(header::SET_COOKIE, "theme=dark; Path=/".parse().unwrap());
+        assert!(!response_speaks_for_the_credential(&other, TEST_COOKIE));
+
+        assert!(!response_speaks_for_the_credential(
+            &StatusCode::OK.into_response(),
+            TEST_COOKIE
+        ));
+    }
+
+    /// The `Set-Cookie` on a response, or the empty string when there is none.
+    fn set_cookie(response: &Response) -> String {
+        response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn every_page_load_restarts_the_credential_s_window() {
+        // The reported failure, from the one angle a server can address. The
+        // credential lives only in a cookie, so a browser that lets one lapse
+        // is unpaired with its row still in the store. A launch is where a
+        // browser certainly stores what we send, so the window restarts there
+        // rather than once a day.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = state_with_device(dir.path(), Some(&now));
+        let own = own_device_cookie(&state);
+
+        let response = get(
+            &state,
+            "/dev/",
+            &[("cookie", &own), ("sec-fetch-mode", "navigate")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        let cookie = set_cookie(&response);
+        assert!(cookie.contains(&own), "{cookie}");
+        assert!(cookie.contains("Max-Age="), "{cookie}");
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+
+        // The renewal is a header and nothing else: no store write, and no
+        // second device. Otherwise every launch would grow the devices list.
+        let devices = state.paired_devices().devices;
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].last_seen_at.as_deref(), Some(now.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_cookie_left_by_a_data_dir_move_is_migrated_rather_than_refused() {
+        // The store's own migration carries the ROW across a data-dir move. The
+        // cookie name is the other half. It has to move too, or every device
+        // meets the pairing screen while the store still lists it.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = state_with_device(dir.path(), Some(&now));
+        let before = auth::device_cookie_name(std::path::Path::new("/tmp/its-old-data-dir"));
+        assert_ne!(before, state.device_cookie_name());
+
+        let response = get(
+            &state,
+            "/dev/api/v1/threads/list",
+            &[("cookie", &format!("{before}=cred-abc"))],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        let cookie = set_cookie(&response);
+        assert!(cookie.starts_with(state.device_cookie_name()), "{cookie}");
+        assert!(cookie.contains("cred-abc"), "{cookie}");
+    }
+
+    #[tokio::test]
+    async fn a_dead_value_in_our_own_slot_does_not_lock_the_device_out() {
+        // A cookie is scoped to the HOST and ignores the port. So a slot on this
+        // hostname can hold a value from a gateway that is long gone. Reading
+        // only the first name PRESENT refused a device whose credential was on
+        // the very same request.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = state_with_device(dir.path(), Some(&now));
+        let sent = format!(
+            "{}=long-dead; lucidos_device=cred-abc",
+            state.device_cookie_name()
+        );
+
+        let response = get(&state, "/dev/api/v1/threads/list", &[("cookie", &sent)]).await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        let cookie = set_cookie(&response);
+        assert!(cookie.starts_with(state.device_cookie_name()), "{cookie}");
+        assert!(cookie.contains("cred-abc"), "{cookie}");
+    }
+
+    #[tokio::test]
+    async fn a_device_last_seen_years_ago_still_authorizes() {
+        // Revocation-only. Age is a liveness hint for the list, and never an
+        // input to the auth decision.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_device(dir.path(), Some("2020-01-02T00:00:00Z"));
+        let own = own_device_cookie(&state);
+        let response = get(&state, "/dev/api/v1/threads/list", &[("cookie", &own)]).await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+    }
+
+    #[tokio::test]
+    async fn a_local_process_is_never_stamped_and_is_handed_no_cookie() {
+        // The local token names no device, so there is no row to touch and
+        // nothing that should acquire a browser credential.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_device(dir.path(), Some("2020-01-02T00:00:00Z"));
+        let response = get(
+            &state,
+            "/dev/api/v1/threads/list",
+            &[(auth::HEADER_LOCAL_TOKEN, "test-local-token")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(
+            state.paired_devices().devices[0].last_seen_at.as_deref(),
+            Some("2020-01-02T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gateway_with_no_frontend_does_not_call_its_error_the_pairing_screen() {
+        // The marker tells a service worker "show this, cache nothing". Putting
+        // it on a 404 would make the worker show that instead of the cached
+        // shell it falls back to for every other failure.
+        let state = GatewayState::for_tests();
+        let response = get(&state, "/dev/", &[("sec-fetch-mode", "navigate")]).await;
+        assert!(!response.status().is_success());
+        assert!(response
+            .headers()
+            .get(crate::server::PAIRING_SHELL_HEADER)
+            .is_none());
+    }
+
+    /// The upgrade path is a SECOND way into a workspace, so it has to meet the
+    /// same door (ADR 0151). `enforce` is a router layer and covers the
+    /// fallback, so an unpaired upgrade is refused before the proxy considers
+    /// it. Pinned here because a 401 on a handshake is the whole defence: a
+    /// client that gets one never reaches the engine's socket.
+    #[tokio::test]
+    async fn an_unpaired_websocket_upgrade_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let response = get(
+            &state,
+            "/dev/api/v1/ws-echo",
+            &[
+                ("connection", "keep-alive, Upgrade"),
+                ("upgrade", "websocket"),
+                ("sec-websocket-version", "13"),
+                ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // Never a pairing screen: a socket cannot render one, and a 101 here
+        // would hand an unpaired caller the workspace.
+        assert!(response
+            .headers()
+            .get(crate::server::PAIRING_SHELL_HEADER)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_fetch_still_gets_a_bare_401() {
+        // A pairing screen would be unusable here, and would fail the caller's
+        // JSON parse on the way.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let response = get(
+            &state,
+            "/dev/api/v1/threads/list",
+            &[("sec-fetch-mode", "cors")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response
+            .headers()
+            .get(crate::server::PAIRING_SHELL_HEADER)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_app_frame_loads_its_tags_with_no_cookie_and_reaches_nothing_else() {
+        // The reported break. An app frame is opaque-origin (ADR 0227), so its
+        // site-for-cookies is null and the browser sends no `SameSite=Lax`
+        // credential with a subresource. Every app rendered unstyled and every
+        // app calling the SDK hung, because each of these 401'd here.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        // What Chrome sends for a stylesheet on an opaque-origin document.
+        let as_a_tag = [
+            ("sec-fetch-mode", "no-cors"),
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-dest", "style"),
+        ];
+        for path in [
+            "/dev/api/v1/sdk-iframe.css",
+            "/dev/api/v1/sdk-prefs.js?device=abc123",
+            "/dev/api/v1/sdk.js",
+            "/dev/api/v1/sdk-iframe-audio.js",
+            "/dev/api/v1/fonts/fira-code.css",
+        ] {
+            let response = get(&state, path, &as_a_tag).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::IM_A_TEAPOT,
+                "{path} must reach the workspace with no credential"
+            );
+        }
+
+        // And nothing beyond them moved. The same cookieless caller asking for
+        // workspace data is still refused, which is the whole device gate.
+        let refused = get(&state, "/dev/api/v1/threads/list", &as_a_tag).await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_public_path_and_an_authorized_caller_both_reach_the_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let public = get(&state, "/~/api/v1/health", &[("sec-fetch-mode", "cors")]).await;
+        assert_eq!(public.status(), StatusCode::IM_A_TEAPOT);
+
+        let local = get(
+            &state,
+            "/dev/api/v1/threads/list",
+            &[
+                ("sec-fetch-mode", "cors"),
+                (auth::HEADER_LOCAL_TOKEN, "test-local-token"),
+            ],
+        )
+        .await;
+        assert_eq!(local.status(), StatusCode::IM_A_TEAPOT);
+    }
+
+    // ── What a refusal looks like ───────────────────────────────────────────
+
+    #[test]
+    fn only_the_address_bar_counts_as_a_top_level_navigation() {
+        assert!(is_top_level_navigation(&headers(&[(
+            "sec-fetch-dest",
+            "document"
+        )])));
+        // The measured bug: a nested iframe navigates, so the older question
+        // reads it as a page load and hands it the whole shell.
+        let nested = headers(&[("sec-fetch-mode", "navigate"), ("sec-fetch-dest", "iframe")]);
+        assert!(wants_html(&nested), "the older question still says yes");
+        assert!(!is_top_level_navigation(&nested));
+        for dest in [
+            "iframe", "frame", "script", "style", "image", "font", "empty",
+        ] {
+            let h = headers(&[("sec-fetch-dest", dest), ("accept", "text/html")]);
+            assert!(!is_top_level_navigation(&h), "{dest}");
+        }
+    }
+
+    #[test]
+    fn a_client_with_no_fetch_metadata_is_judged_exactly_as_before() {
+        // Curl, an old browser, a script. Nothing about this case changed, so
+        // the pairing screen still answers one that asks for HTML.
+        assert!(is_top_level_navigation(&headers(&[(
+            "accept",
+            "text/html,*/*"
+        )])));
+        assert!(!is_top_level_navigation(&headers(&[(
+            "accept",
+            "application/json"
+        )])));
+        assert!(!is_top_level_navigation(&headers(&[])));
+    }
+
+    #[tokio::test]
+    async fn a_refused_nested_frame_gets_a_short_page_and_never_the_shell() {
+        // Rendering the Lucidos shell inside somebody's app reads as the app
+        // being possessed, on every install with a gateway in front.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        for dest in ["iframe", "frame"] {
+            let response = get(
+                &state,
+                "/dev/data/artifacts/web/lucidos-me/index.html",
+                &[("sec-fetch-mode", "navigate"), ("sec-fetch-dest", dest)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{dest}");
+            assert!(
+                response
+                    .headers()
+                    .get(crate::server::PAIRING_SHELL_HEADER)
+                    .is_none(),
+                "{dest} must not be handed the pairing screen"
+            );
+            let body = body_text(response).await;
+            assert!(!body.contains("boot-splash"), "{dest}: {body}");
+            assert!(body.len() < 1000, "{dest} got {} bytes", body.len());
+            assert!(body.contains("Reload the app"), "{dest}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_subresource_still_gets_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        for dest in ["script", "style", "image", "font", "empty"] {
+            let response = get(
+                &state,
+                "/dev/app/site-publisher/style.css",
+                &[("sec-fetch-dest", dest)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{dest}");
+            let body = body_text(response).await;
+            assert!(body.contains("not paired with Lucidos"), "{dest}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_real_page_load_still_gets_the_pairing_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let response = get(
+            &state,
+            "/dev/",
+            &[
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(crate::server::PAIRING_SHELL_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+        );
+    }
+
+    // ── The frame capability ────────────────────────────────────────────────
+    //
+    // An app frame's own files behind a gateway (ADR 0238). Every case here is
+    // COOKIELESS, because that is the whole problem: an opaque-origin frame
+    // sends no device credential with any subresource of its document.
+
+    /// A capability this test gateway's key signs, for one workspace and app.
+    fn capability(slug: &str, app_id: &str) -> String {
+        let key = frame_capability::derive_key("test-local-token");
+        let now = chrono::Utc::now().timestamp();
+        frame_capability::mint(&key, slug, app_id, now, frame_capability::TTL_SECS)
+            .expect("a slug-shaped app id mints")
+    }
+
+    /// One that lapsed an hour ago, for the long-open-app case.
+    fn expired_capability(slug: &str, app_id: &str) -> String {
+        let key = frame_capability::derive_key("test-local-token");
+        let then = chrono::Utc::now().timestamp() - frame_capability::TTL_SECS - 1;
+        frame_capability::mint(&key, slug, app_id, then, frame_capability::TTL_SECS)
+            .expect("a slug-shaped app id mints")
+    }
+
+    #[tokio::test]
+    async fn a_frame_capability_carries_an_app_to_its_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let cap = capability("dev", "site-publisher");
+        // A stylesheet, an image, the app's own index, the artifact a preview
+        // iframe loads, and the relative click one hop INSIDE that preview.
+        for path in [
+            format!("/dev/~cap/{cap}/app/site-publisher/style.css"),
+            format!("/dev/~cap/{cap}/app/site-publisher/img/logo.png"),
+            format!("/dev/~cap/{cap}/app/site-publisher/"),
+            format!("/dev/~cap/{cap}/data/artifacts/web/lucidos-me/index.html"),
+            format!("/dev/~cap/{cap}/data/artifacts/web/lucidos-me/five-ai-words/index.html"),
+        ] {
+            let response = get(&state, &path, &[("sec-fetch-dest", "iframe")]).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::IM_A_TEAPOT,
+                "{path} must reach the workspace with no credential"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_capability_reaches_nothing_but_those_two_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let cap = capability("dev", "site-publisher");
+        for path in [
+            // The engine API and the control plane, which the pass must never
+            // widen. A frame hands it to every document it embeds.
+            format!("/dev/~cap/{cap}/api/v1/threads/list"),
+            format!("/dev/~cap/{cap}/api/v1/credentials"),
+            format!("/dev/~cap/{cap}/api/v1/data/config/apis.json"),
+            format!("/dev/~cap/{cap}/control/workspaces"),
+            // A sibling app's source, and a name that merely starts the same.
+            format!("/dev/~cap/{cap}/app/habit-tracker/index.html"),
+            format!("/dev/~cap/{cap}/app/site-publisher-two/style.css"),
+            // Out of the tree, in the two spellings the URL parser collapses.
+            format!("/dev/~cap/{cap}/data/../api/v1/threads/list"),
+            format!("/dev/~cap/{cap}/data/%2e%2e/api/v1/threads/list"),
+            // Another workspace, which matters because the signing key is
+            // machine-wide and every engine on this host derives the same one.
+            format!("/personal/~cap/{cap}/data/artifacts/notes.md"),
+            // A capability minted for another app, against this app's files.
+            format!(
+                "/dev/~cap/{}/app/site-publisher/style.css",
+                capability("dev", "habit-tracker")
+            ),
+            // One that lapsed. This is what a long-open app hits if renewal
+            // never lands, and it must refuse rather than slide.
+            format!(
+                "/dev/~cap/{}/data/artifacts/notes.md",
+                expired_capability("dev", "site-publisher")
+            ),
+            // Nothing anyone can guess without the key.
+            "/dev/~cap/forged/data/artifacts/notes.md".to_string(),
+            "/dev/~cap//data/artifacts/notes.md".to_string(),
+            // And the same file with no capability at all, which is the state
+            // this whole feature starts from.
+            "/dev/data/artifacts/notes.md".to_string(),
+        ] {
+            let response = get(&state, &path, &[("sec-fetch-dest", "iframe")]).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must stay refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_picker_namespace_gets_no_capability_branch() {
+        // Asserted against the branch rather than a status code. Anything under
+        // `/~/` that is not `api/` is already public: that is where the picker's
+        // own static files live. So a 401 would prove nothing here. What must
+        // hold is that a signed pass never becomes a second way in.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let cap = capability("~", "site-publisher");
+        for path in [
+            format!("/~/~cap/{cap}/data/artifacts/notes.md"),
+            format!("/~/~cap/{cap}/api/v1/control/workspaces"),
+            format!("/~/~cap/{cap}/api/v1/auth/devices"),
+        ] {
+            let req = axum::extract::Request::builder()
+                .method("GET")
+                .uri(&path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert!(!frame_capability_admits(&state, &req), "{path}");
+        }
+
+        // The picker's real API is three exact routes, so no segment wedged in
+        // front of one reaches it. That is what keeps the branch above from
+        // mattering, and it holds with a capability as without.
+        let gated = get(
+            &state,
+            "/~/api/v1/auth/devices",
+            &[("sec-fetch-dest", "empty")],
+        )
+        .await;
+        assert_eq!(gated.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn only_a_read_rides_a_frame_capability() {
+        use tower::ServiceExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let cap = capability("dev", "site-publisher");
+        let uri = format!("/dev/~cap/{cap}/data/artifacts/notes.md");
+
+        for method in ["POST", "PUT", "DELETE", "PATCH"] {
+            let request = axum::extract::Request::builder()
+                .method(method)
+                .uri(&uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = gated_router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} must not ride a read-only pass"
+            );
+        }
+
+        // A WebSocket handshake is a GET, so the method check alone would let
+        // one through. An upgraded connection is not a subresource load.
+        let handshake = get(
+            &state,
+            &uri,
+            &[("connection", "Upgrade"), ("upgrade", "websocket")],
+        )
+        .await;
+        assert_eq!(handshake.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// One call through the real gateway router, holding a real credential.
+    async fn auth_plane_call(method: &str, path: &str, hdrs: &[(&str, &str)]) -> StatusCode {
+        use tower::ServiceExt as _;
+        let state = GatewayState::for_tests();
+        let mut builder = axum::extract::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(auth::HEADER_LOCAL_TOKEN, "test-local-token");
+        for (k, v) in hdrs {
+            builder = builder.header(*k, *v);
+        }
+        crate::server::gateway_router(state)
+            .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    const FROM_AN_APP_DOCUMENT: &[(&str, &str)] = &[
+        ("sec-fetch-site", "same-origin"),
+        ("referer", "https://localhost:5251/dev/app/habit-tracker/"),
+    ];
+
+    #[tokio::test]
+    async fn an_app_document_cannot_mint_list_or_revoke_credentials() {
+        // The caller authenticates, so `enforce` passes it, exactly as an app
+        // carrying the user's device cookie does. The document it came from is
+        // what refuses it.
+        for (method, path) in [
+            ("POST", "/~/api/v1/auth/pairing-code"),
+            ("GET", "/~/api/v1/auth/devices"),
+            ("DELETE", "/~/api/v1/auth/devices/no-such-device"),
+        ] {
+            assert_eq!(
+                auth_plane_call(method, path, FROM_AN_APP_DOCUMENT).await,
+                StatusCode::FORBIDDEN,
+                "{method} {path} must refuse an app document"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_picker_and_the_cli_still_reach_the_auth_plane() {
+        let from_the_picker = &[
+            ("sec-fetch-site", "same-origin"),
+            ("referer", "https://localhost:5251/~/"),
+        ];
+        // `lucidos pair` and the desktop shell send no fetch metadata at all.
+        for hdrs in [&from_the_picker[..], &[]] {
+            assert_eq!(
+                auth_plane_call("GET", "/~/api/v1/auth/devices", hdrs).await,
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_pre_auth_calls_stay_outside_the_app_document_gate() {
+        assert_ne!(
+            auth_plane_call("GET", "/~/api/v1/auth/session", FROM_AN_APP_DOCUMENT).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+}

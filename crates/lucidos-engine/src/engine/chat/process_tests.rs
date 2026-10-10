@@ -1,0 +1,1931 @@
+use super::super::process_helpers::{
+    build_system_knowhow_section, build_trigger_knowhow_section, build_trigger_started_event,
+    classify_or_fallback, forced_classification, summarize_or_none, summary_is_too_thin,
+    TriggerContext, APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, ENGINE_RESTART_RULE,
+    FORCE_QUERY_CLASSIFICATION_ENV,
+};
+use super::{build_capture_sections, build_loaded_knowhow_block, TurnTail};
+use crate::core::knowhow::KnowhowSummary;
+use crate::engine::loaded_knowhow::LoadedKnowhow;
+use crate::engine::thread_events::{
+    EngineReason, EventChannel, MessageOrigin, ThreadEvent, TriggerInvocation,
+};
+use crate::engine::ContextRole;
+use crate::memory::QueryClassification;
+use std::future::pending;
+
+/// Helper to invoke `build_capture_sections` with mostly empty context
+/// strings so individual tests only fill in what they care about. Returns
+/// the produced sections; tests filter/index by name.
+#[allow(clippy::too_many_arguments)]
+fn run_build(
+    system_prompt: &str,
+    profile_context: &str,
+    device_preferences_context: &str,
+    file_list_context: &str,
+    credentials_context: &str,
+    email_accounts_context: &str,
+    oauth_context: &str,
+    memory_context: &str,
+    history_context: &str,
+    app_context_section: &str,
+    file_context_section: &str,
+    url_context_section: &str,
+    mcp_stopped_context: &str,
+    setup_reminder: &str,
+    thread_depth_context: &str,
+    user_message: &str,
+    loaded: &[LoadedKnowhow],
+    resume: &[crate::llm::Message],
+) -> Vec<crate::engine::ContextSection> {
+    build_capture_sections(
+        system_prompt,
+        profile_context,
+        device_preferences_context,
+        file_list_context,
+        credentials_context,
+        email_accounts_context,
+        oauth_context,
+        memory_context,
+        history_context,
+        app_context_section,
+        file_context_section,
+        url_context_section,
+        mcp_stopped_context,
+        "",
+        setup_reminder,
+        thread_depth_context,
+        // Empty for the same reason as the two tail blocks below, and filled
+        // in by `build_capture_sections_bills_the_todo_list_block`.
+        "",
+        user_message,
+        // Engine Build and Client URL empty, so the row set stays what the
+        // per-section tests below assert. The two are filled in by
+        // `build_capture_sections_surfaces_the_two_relocated_tail_blocks`.
+        &TurnTail {
+            engine_build: "",
+            client_url: "",
+            current_time: CLOCK_BLOCK,
+        },
+        loaded,
+        resume,
+    )
+}
+
+/// The clock block a turn really carries, so the capture row's size is a
+/// realistic one rather than a stub.
+const CLOCK_BLOCK: &str =
+    "[CURRENT TIME]\nNow: Monday, August 17, 2026 at 15:02 Europe/Oslo (UTC+2).\n\
+     The same instant in UTC: Monday, August 17, 2026 at 13:02.\n[END CURRENT TIME]";
+
+/// After Phase 1 of the trigger-knowhow-discovery refactor, `TriggerContext`
+/// no longer carries `knowhow_ids` or `event_payload`. The synthetic
+/// `load_knowhow` tool turns the engine fabricated for trigger fires
+/// (commits 6beff8f0b / b64df77f9) lived only in the in-memory messages
+/// vec on the first turn; resume rebuilt context from events and dropped
+/// the recipe body. Trigger threads now discover knowhow the same way
+/// chat does — system-prompt list + LLM-driven `load_knowhow` calls. The
+/// on_event triggering payload travels in the intent prefix instead of as
+/// a fabricated `MessageReceived`. This struct-init guard asserts the
+/// shape: a refactor that re-introduces either field will fail to compile
+/// here, which is the contract.
+#[test]
+fn trigger_context_has_no_preload_fields() {
+    let _tc = TriggerContext {
+        trigger_id: "id".to_string(),
+        trigger_name: "name".to_string(),
+        slug: "name".to_string(),
+        invocation: TriggerInvocation::Schedule,
+        go_to_review: false,
+        side_effect_grant: vec![],
+        queue_entry_id: uuid::Uuid::new_v4(),
+    };
+}
+
+/// Regression for the v5-hash leak: the trigger id passed in (a
+/// `config.id` from `/api/v1/triggers`) must propagate verbatim to both
+/// `TriggerStarted.trigger_id` and `EngineReason::Scheduler.trigger_id`,
+/// otherwise the dropdown filter (which posts the same `config.id`) finds
+/// nothing in `thread_summaries.trigger_id`.
+#[test]
+fn build_trigger_started_event_preserves_config_id_verbatim() {
+    let config_id = "5633f3e1-110c-4df4-a6fc-c0df8fd36df4";
+    let (event, meta) = build_trigger_started_event(
+        config_id,
+        "Job Listing Check",
+        &TriggerInvocation::Schedule,
+        "Run the check.",
+        false,
+        &sel(None, None, None),
+    );
+    assert_eq!(meta.channel, Some(EventChannel::Trigger));
+    let ThreadEvent::TriggerStarted {
+        trigger_id,
+        trigger_name,
+        origin,
+        ..
+    } = event
+    else {
+        panic!("expected TriggerStarted");
+    };
+    assert_eq!(trigger_id, config_id);
+    assert_eq!(trigger_name.as_deref(), Some("Job Listing Check"));
+    let MessageOrigin::Engine {
+        reason:
+            EngineReason::Scheduler {
+                trigger_id: origin_id,
+                trigger_name: origin_name,
+            },
+    } = origin.expect("scheduler origin")
+    else {
+        panic!("expected Engine{{Scheduler}} origin");
+    };
+    assert_eq!(origin_id, config_id);
+    assert_eq!(origin_name.as_deref(), Some("Job Listing Check"));
+}
+
+/// The starter event of a trigger thread records the model / effort the run
+/// ACTUALLY used, because it is the only place the per-thread model memory can
+/// read them from (a trigger thread has no `MessageReceived`).
+#[test]
+fn build_trigger_started_event_records_the_resolved_model_and_effort() {
+    let (event, _meta) = build_trigger_started_event(
+        "t-1",
+        "Daily Digest",
+        &TriggerInvocation::Schedule,
+        "Summarize today.",
+        false,
+        &sel(Some("gemini-3.8-flash"), Some("low"), Some("anthropic")),
+    );
+    let ThreadEvent::TriggerStarted {
+        model,
+        reasoning_effort,
+        provider,
+        ..
+    } = event
+    else {
+        panic!("expected TriggerStarted");
+    };
+    assert_eq!(model.as_deref(), Some("gemini-3.8-flash"));
+    assert_eq!(reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(
+        provider.as_deref(),
+        Some("anthropic"),
+        "a trigger's pinned backend is recorded too, so a human follow-up on \
+         the thread stays on the backend the fire ran on"
+    );
+}
+
+/// The override triple a caller passes `resolve_route_overrides`, spelled
+/// positionally so the cases read as (model, effort, provider).
+fn sel(
+    model: Option<&str>,
+    effort: Option<&str>,
+    provider: Option<&str>,
+) -> crate::core::ResolvedModelSelection {
+    crate::core::ResolvedModelSelection {
+        model: model.map(str::to_string),
+        reasoning_effort: effort.map(str::to_string),
+        provider: provider.map(str::to_string),
+    }
+}
+
+/// The deadline these tests run against. The real ones come from
+/// `engine::aux_purpose::budget_for`; here any finite value does, since every
+/// case either resolves at once or hangs forever.
+const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A paragraph long enough to clear the thin-output floor for any turn count.
+fn thick_summary() -> String {
+    "Fixed the summariser. ".repeat(40)
+}
+
+/// A hang yields nothing, so the caller falls back to its cached summary
+/// rather than to a line claiming the turns were resolved (ADR 0102).
+#[tokio::test(start_paused = true)]
+async fn summarize_yields_nothing_when_flash_hangs() {
+    let hang = pending::<Result<String, Box<dyn std::error::Error + Send + Sync>>>();
+    assert_eq!(summarize_or_none(hang, 7, TEST_DEADLINE).await, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn summarize_yields_nothing_on_provider_error() {
+    let err =
+        async { Err::<String, Box<dyn std::error::Error + Send + Sync>>("vertex 503".into()) };
+    assert_eq!(summarize_or_none(err, 4, TEST_DEADLINE).await, None);
+}
+
+/// An empty answer is a failure, not a summary. A blank paragraph would
+/// otherwise overwrite a good cached one.
+#[tokio::test(start_paused = true)]
+async fn summarize_yields_nothing_on_a_blank_answer() {
+    let blank = async { Ok::<String, Box<dyn std::error::Error + Send + Sync>>("  \n ".into()) };
+    assert_eq!(summarize_or_none(blank, 9, TEST_DEADLINE).await, None);
+}
+
+/// The measured bad roll: 24 output tokens, roughly 100 chars, for a segment
+/// covering many turns. It is a SUCCESS to everything downstream, so before
+/// the floor it was cached and then held for about five turns.
+#[tokio::test(start_paused = true)]
+async fn summarize_yields_nothing_on_a_thin_answer() {
+    let thin = async {
+        Ok::<String, Box<dyn std::error::Error + Send + Sync>>(
+            "The assistant worked on the thread.".into(),
+        )
+    };
+    assert_eq!(summarize_or_none(thin, 19, TEST_DEADLINE).await, None);
+}
+
+/// The floor scales with the turns covered, so a short segment is allowed a
+/// short paragraph. Two turns require 120 chars, which this clears while
+/// staying far under what a 19-turn segment would owe.
+#[tokio::test(start_paused = true)]
+async fn a_short_segment_may_have_a_short_summary() {
+    let text = "Fixed the login redirect, and confirmed the session cookie now survives \
+                a reload. Nothing else was touched in this segment.";
+    let short = async { Ok::<String, Box<dyn std::error::Error + Send + Sync>>(text.into()) };
+    assert_eq!(
+        summarize_or_none(short, 2, TEST_DEADLINE).await,
+        Some(text.to_string())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn summarize_returns_the_paragraph_it_got() {
+    let text = thick_summary();
+    let expected = text.clone();
+    let ok = async { Ok::<String, Box<dyn std::error::Error + Send + Sync>>(text) };
+    assert_eq!(
+        summarize_or_none(ok, 9, TEST_DEADLINE).await,
+        Some(expected)
+    );
+}
+
+/// The floor counts CHARACTERS, not bytes. The summariser writes in the user's
+/// language, so a Norwegian or CJK paragraph is the ordinary case rather than
+/// an exotic one. At 3 bytes per character, a byte count would let a
+/// third-length CJK summary clear the floor and be cached for five turns.
+#[tokio::test(start_paused = true)]
+async fn a_multibyte_summary_is_measured_in_characters() {
+    // 250 CJK characters at 3 bytes each: 750 bytes, over the 19-turn floor of
+    // 600, but 250 characters, well under it.
+    let text = "要約".repeat(125);
+    assert!(
+        text.len() > 600,
+        "the byte count would have passed the floor"
+    );
+    assert!(
+        text.chars().count() < 600,
+        "the character count must not pass it"
+    );
+    let thin = async { Ok::<String, Box<dyn std::error::Error + Send + Sync>>(text) };
+    assert_eq!(summarize_or_none(thin, 19, TEST_DEADLINE).await, None);
+}
+
+/// The floor's own arithmetic, without a model. The requirement scales per
+/// covered turn and stops at the cap, so a long thread never owes a
+/// proportionally longer paragraph.
+#[test]
+fn the_thin_output_floor_scales_then_caps() {
+    // 100 chars is the measured bad roll. Fine for one turn, not for many.
+    assert!(!summary_is_too_thin(100, 1));
+    assert!(summary_is_too_thin(100, 19));
+    // The cap: 40 turns asks no more than 10 turns past it would.
+    assert!(!summary_is_too_thin(600, 40));
+    assert!(summary_is_too_thin(599, 40));
+    // Zero covered turns can demand nothing.
+    assert!(!summary_is_too_thin(0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn classify_falls_back_when_flash_hangs() {
+    let hang = pending::<Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>>>();
+    let result = classify_or_fallback(hang, TEST_DEADLINE).await;
+    let default = QueryClassification::default();
+    assert_eq!(result.needs_memory, default.needs_memory);
+    assert_eq!(result.needs_file_list, default.needs_file_list);
+    assert_eq!(result.needs_credentials, default.needs_credentials);
+    assert!(result.sub_queries.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn classify_falls_back_on_provider_error() {
+    let err = async {
+        Err::<QueryClassification, Box<dyn std::error::Error + Send + Sync>>("bad json".into())
+    };
+    let result = classify_or_fallback(err, TEST_DEADLINE).await;
+    assert!(result.needs_memory);
+    assert!(result.needs_file_list);
+    assert!(result.needs_credentials);
+    assert!(result.sub_queries.is_empty());
+}
+
+/// `all` is what the eval harness sets on both arms: every section retrieved,
+/// so the curated context mode has memory to curate rather than none.
+#[test]
+fn the_all_pin_retrieves_every_section() {
+    let pinned = forced_classification(Some("all")).expect("`all` is a pin");
+    assert!(pinned.needs_memory);
+    assert!(pinned.needs_file_list);
+    assert!(pinned.needs_credentials);
+    assert!(pinned.sub_queries.is_empty());
+}
+
+#[test]
+fn the_none_pin_retrieves_nothing() {
+    let pinned = forced_classification(Some("none")).expect("`none` is a pin");
+    assert!(!pinned.needs_memory);
+    assert!(!pinned.needs_file_list);
+    assert!(!pinned.needs_credentials);
+    assert!(pinned.sub_queries.is_empty());
+}
+
+/// The pin is opt-in. Unset has to leave every ordinary workspace on the
+/// classifier it has always used.
+#[test]
+fn no_pin_means_the_classifier_runs_as_before() {
+    assert!(forced_classification(None).is_none());
+}
+
+/// A typo must not silently pin the classification to something, and must not
+/// kill the engine either. It falls through to the ordinary classifier, and the
+/// pin reader logs the ignored value.
+#[test]
+fn a_value_that_is_neither_all_nor_none_is_ignored() {
+    assert!(forced_classification(Some("yes")).is_none());
+    assert!(forced_classification(Some("true")).is_none());
+    assert!(forced_classification(Some("")).is_none());
+    assert!(forced_classification(Some("   ")).is_none());
+    assert!(forced_classification(Some("all,none")).is_none());
+}
+
+/// Surrounding whitespace and a shouted spelling both come free with a shell
+/// export, and neither should cost a paid run its pin. `ALL` reaching the
+/// engine as "no pin" would be silent: the arms would classify live again and
+/// go back to voiding the pairs this exists to save.
+#[test]
+fn a_padded_or_shouted_pin_is_still_a_pin() {
+    assert!(forced_classification(Some("  all  ")).is_some());
+    assert!(forced_classification(Some("ALL")).is_some());
+    assert!(forced_classification(Some(" None\n")).is_some());
+    assert_eq!(
+        forced_classification(Some("NONE")).map(|c| c.needs_memory),
+        Some(false)
+    );
+}
+
+/// The eval harness exports this name and this value from its own copies of
+/// both strings, in `crates/lucidos-eval/src/workspace.rs`. That crate does not
+/// depend on the engine (ADR 0087 decision 15), so nothing but a literal joins
+/// the two sides. Rename or re-spell either and the harness keeps exporting the
+/// old one: nothing fails to compile, the pin silently stops working, and the
+/// run goes back to voiding the pairs it exists to save. This is the tripwire.
+#[test]
+fn the_pin_is_the_name_and_value_the_eval_harness_exports() {
+    assert_eq!(
+        FORCE_QUERY_CLASSIFICATION_ENV,
+        "LUCIDOS_FORCE_QUERY_CLASSIFICATION"
+    );
+    assert!(forced_classification(Some("all")).is_some());
+}
+
+/// Regression: an earlier version of the system prompt said
+/// "shipped with the Lucidos engine" with no live-reload clause. The LLM
+/// repeatedly inferred "baked into the binary, restart required" and told
+/// users to restart after editing system-knowhow files — even though the
+/// engine reads them fresh from disk on every chat turn. The section MUST
+/// state explicitly that no engine restart is needed and that Apply is the
+/// only step required.
+#[test]
+fn system_knowhow_section_tells_llm_no_restart_needed_after_apply() {
+    let summaries = vec![KnowhowSummary {
+        id: "building-an-auth-handshake".into(),
+        name: "Building an Auth Handshake".into(),
+        description: "How to wire external auth.".into(),
+    }];
+    let section = build_system_knowhow_section(&summaries);
+    assert!(
+        section.contains("no engine restart"),
+        "section must state no restart is needed:\n{section}"
+    );
+    assert!(
+        section.contains("Apply"),
+        "section must reference Apply as the activation step:\n{section}"
+    );
+    assert!(
+        section.contains("system-knowhow/building-an-auth-handshake"),
+        "section must list the summary entry:\n{section}"
+    );
+}
+
+#[test]
+fn system_knowhow_section_is_empty_when_no_summaries_loaded() {
+    assert!(build_system_knowhow_section(&[]).is_empty());
+}
+
+/// Per-trigger knowhow listing must scope to the firing trigger's slug —
+/// threads of OTHER triggers must not see this trigger's knowhow listed.
+/// The id namespace is `triggers/<slug>/<file>` so the LLM's `load_knowhow`
+/// call resolves through the same fallback path as bare ids.
+#[test]
+fn trigger_knowhow_section_scoped_to_firing_trigger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let triggers_dir = tmp.path().to_path_buf();
+    // Drop a knowhow file under nightly-build/knowhow/
+    let kh_dir = triggers_dir.join("nightly-build").join("knowhow");
+    std::fs::create_dir_all(&kh_dir).unwrap();
+    std::fs::write(
+        kh_dir.join("orchestration.md"),
+        "---\nname: Orchestration\n---\nHow nightly orchestrates each phase.",
+    )
+    .unwrap();
+
+    // Thread of nightly-build sees the section.
+    let section = build_trigger_knowhow_section(&triggers_dir, "nightly-build");
+    assert!(
+        section.contains("## Trigger Know-how (this trigger only)"),
+        "trigger thread must see Trigger Know-how header, got: {section}"
+    );
+    assert!(
+        section.contains("Orchestration"),
+        "section must list file's name, got: {section}"
+    );
+    assert!(
+        section.contains("triggers/nightly-build/orchestration"),
+        "section must use the trigger-scoped id namespace, got: {section}"
+    );
+
+    // Thread of a different trigger sees nothing.
+    let other = build_trigger_knowhow_section(&triggers_dir, "some-other-trigger");
+    assert!(
+        other.is_empty(),
+        "other trigger's thread must NOT see this trigger's knowhow, got: {other}"
+    );
+}
+
+#[test]
+fn trigger_knowhow_section_empty_when_no_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let triggers_dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(triggers_dir.join("standalone").join("knowhow")).unwrap();
+    // Empty knowhow dir → no listing.
+    let section = build_trigger_knowhow_section(&triggers_dir, "standalone");
+    assert!(section.is_empty());
+}
+
+/// Regression for the `Status of Authentication Migration` thread, where
+/// the chat LLM signed off with "Etter restart er denne tråden borte —
+/// jeg husker ingenting. Kom tilbake i en ny tråd og si …" — telling the
+/// user the existing thread was gone and they had to start a NEW one.
+/// Threads are event-sourced; the next turn after a restart loads the
+/// full history from PostgreSQL. The rule must not claim threads, thread
+/// memory, or thread context get wiped.
+#[test]
+fn engine_restart_rule_does_not_claim_thread_is_wiped_or_lost() {
+    let lowered = ENGINE_RESTART_RULE.to_lowercase();
+    for forbidden in [
+        "wipe thread",
+        "wipes thread",
+        "wipe the thread",
+        "thread is gone",
+        "thread is no longer active",
+        "thread is wiped",
+        "no memory of",
+        "have no memory",
+        "start a new thread",
+        "new thread to continue",
+        "hard cut-off",
+        "hard cutoff",
+    ] {
+        assert!(
+                !lowered.contains(forbidden),
+                "ENGINE_RESTART_RULE must not contain `{forbidden}` — threads survive restart and the next turn reloads history:\n{ENGINE_RESTART_RULE}"
+            );
+    }
+}
+
+/// The rule must positively state what actually survives (the thread and
+/// its history) so the LLM sends users back to the same thread instead of
+/// a fresh one.
+#[test]
+fn engine_restart_rule_says_thread_survives_and_history_reloads() {
+    let lowered = ENGINE_RESTART_RULE.to_lowercase();
+    assert!(
+        lowered.contains("survives"),
+        "rule must say the thread survives a restart:\n{ENGINE_RESTART_RULE}"
+    );
+    assert!(
+        lowered.contains("history"),
+        "rule must mention that history is preserved:\n{ENGINE_RESTART_RULE}"
+    );
+    assert!(
+        lowered.contains("this thread") || lowered.contains("same thread"),
+        "rule must direct the user back to the existing thread:\n{ENGINE_RESTART_RULE}"
+    );
+}
+
+/// The fix must keep the original guidance against promising post-restart
+/// continuation — that part of the old rule was correct and is the actual
+/// trap we want the LLM to avoid.
+#[test]
+fn engine_restart_rule_still_blocks_post_restart_promises() {
+    assert!(
+        ENGINE_RESTART_RULE.contains("after the restart"),
+        "rule must still ban `after the restart` promises:\n{ENGINE_RESTART_RULE}"
+    );
+    assert!(
+        ENGINE_RESTART_RULE.contains("check back later"),
+        "rule must still ban `check back later` promises:\n{ENGINE_RESTART_RULE}"
+    );
+}
+
+/// The rule as a DEV install sees it: the unconditional half plus the dev-only
+/// addendum, exactly as `build_chat_system_prompt` composes it when a Lucidos
+/// source checkout exists. The two are separate constants because the
+/// rebuild/restart choreography is meaningless on an install with no source
+/// (see `system_prompt::coding_surface_section`), but every assertion below
+/// still has to hold for the dev variant.
+fn apply_verify_rule_dev_variant() -> String {
+    format!("{APPLY_VERIFY_RULE}{APPLY_VERIFY_DEV_ADDENDUM}")
+}
+
+/// The apply/verify rule must keep the chat agent from bouncing yes/no
+/// "did you apply it? / did you restart?" confirmations at the user — the
+/// font-fix-session failure pattern. It must (1) name both self-service tools,
+/// (2) ban the two confirmation questions, (3) tell the agent to probe the
+/// served asset instead of asking, (4) carry the workspace-prefixed-route
+/// gateway gotcha, and (5) ban the "does it look right now?" closer.
+#[test]
+fn apply_verify_rule_tells_agent_to_act_and_verify_not_ask() {
+    let rule = apply_verify_rule_dev_variant();
+    let lowered = rule.to_lowercase();
+    assert!(
+        rule.contains("`changes` tool")
+            && rule.contains("action 'list'")
+            && rule.contains("action 'apply'"),
+        "rule must name the grouped `changes` tool and its list/apply actions:\n{rule}"
+    );
+    assert!(
+        lowered.contains("have you applied it") && lowered.contains("did you restart"),
+        "rule must explicitly ban the two confirmation questions:\n{rule}"
+    );
+    assert!(
+        lowered.contains("cannot restart the engine"),
+        "rule must state the agent cannot restart the engine (only the user can):\n{rule}"
+    );
+    assert!(
+        lowered.contains("probing the served asset")
+            || lowered.contains("probe the served asset")
+            || lowered.contains("probe served assets"),
+        "rule must tell the agent to verify by probing the served asset:\n{rule}"
+    );
+    assert!(
+        rule.contains("/<workspace>/api/v1/") && lowered.contains("unknown workspace 'api'"),
+        "rule must record the workspace-prefixed-route gateway gotcha:\n{rule}"
+    );
+    assert!(
+        lowered.contains("does it look right now") || lowered.contains("does it match"),
+        "rule must ban the post-apply confirmation-question closer:\n{rule}"
+    );
+}
+
+/// The fix is a NARROW carve-out, not a ban on `ask_user_question` (the user
+/// explicitly flagged this during the work). The rule must reference the tool
+/// to scope the carve-out and must NOT blanket-ban it, so the LLM doesn't
+/// over-correct into never asking genuine next-step choices.
+#[test]
+fn apply_verify_rule_does_not_disable_ask_user_question() {
+    assert!(
+        APPLY_VERIFY_RULE.contains("ask_user_question"),
+        "rule must reference ask_user_question to scope the carve-out:\n{APPLY_VERIFY_RULE}"
+    );
+    let lowered = APPLY_VERIFY_RULE.to_lowercase();
+    for forbidden in [
+        "never use ask_user_question",
+        "do not use ask_user_question",
+        "stop using ask_user_question",
+    ] {
+        assert!(
+            !lowered.contains(forbidden),
+            "rule must not blanket-ban the question tool (`{forbidden}`):\n{APPLY_VERIFY_RULE}"
+        );
+    }
+}
+
+/// The rule must reinforce that the user works on Lucidos constantly and knows
+/// the apply/restart/reload dance — so the agent doesn't re-explain it (the
+/// other half of "don't interrogate the user").
+///
+/// Dev-variant only. On an install with no Lucidos source checkout the premise
+/// is false — there is no engine rebuild to know the dance for — so this half
+/// is deliberately absent there; `system_prompt::tests` pins that direction.
+#[test]
+fn apply_verify_rule_reinforces_user_knows_the_dance() {
+    let rule = apply_verify_rule_dev_variant();
+    let lowered = rule.to_lowercase();
+    assert!(
+        lowered.contains("knows the apply/restart/reload dance")
+            && lowered.contains("do not re-explain it"),
+        "rule must reinforce that the user knows the dance and must not be re-taught it:\n{rule}"
+    );
+}
+
+/// Phase 3.1: every turn after the first must inject a `[LOADED KNOWHOW]`
+/// block listing the docs `load_knowhow` brought in earlier in the thread.
+/// The block lives in the user message so the LLM sees it on every turn —
+/// Phase 4 stubs the resume tool blocks for `load_knowhow` so the same body
+/// isn't sent twice.
+#[test]
+fn loaded_knowhow_block_emits_doc_bodies_verbatim() {
+    // doc.body is already the formatted [SYSTEM-KNOWHOW: <name>] block
+    // produced by core::knowhow::load_one_knowhow_section. The function
+    // must push it verbatim — re-wrapping would double-nest markers and
+    // mismatch id-vs-name (id is the file id, name is the doc's display
+    // name from frontmatter).
+    let docs = vec![
+        LoadedKnowhow {
+            id: "alpha".into(),
+            body: "[SYSTEM-KNOWHOW: Alpha Doc]\nBody A\n[END SYSTEM-KNOWHOW]".into(),
+        },
+        LoadedKnowhow {
+            id: "beta".into(),
+            body: "[KNOW-HOW: Beta Doc]\nBody B\n[END KNOW-HOW]".into(),
+        },
+    ];
+    let s = build_loaded_knowhow_block(&docs).expect("non-empty docs produce a block");
+    assert!(
+        s.starts_with("[LOADED KNOWHOW]"),
+        "block must open with the [LOADED KNOWHOW] marker:\n{s}"
+    );
+    assert!(
+        s.ends_with("[END LOADED KNOWHOW]"),
+        "block must close with the [END LOADED KNOWHOW] marker:\n{s}"
+    );
+    // Bodies pass through verbatim — no re-wrapping with [SYSTEM-KNOWHOW: <id>].
+    assert!(s.contains("[SYSTEM-KNOWHOW: Alpha Doc]"));
+    assert!(s.contains("[KNOW-HOW: Beta Doc]"));
+    assert!(s.contains("Body A"));
+    assert!(s.contains("Body B"));
+    // The id must NOT appear as an outer marker — that would mean re-wrapping.
+    assert!(
+        !s.contains("[SYSTEM-KNOWHOW: alpha]"),
+        "must not re-wrap with id as outer marker:\n{s}"
+    );
+    assert!(
+        !s.contains("[SYSTEM-KNOWHOW: beta]"),
+        "must not re-wrap with id as outer marker:\n{s}"
+    );
+    // Header guidance is present so the LLM knows how to treat the section.
+    assert!(
+        s.contains("Treat their guidance as authoritative"),
+        "header guidance missing from block:\n{s}"
+    );
+}
+
+/// Empty loaded set must not produce a section — pushing an empty-string part
+/// would put a stray double-newline pair into the user message.
+#[test]
+fn loaded_knowhow_block_returns_none_for_empty_docs() {
+    assert!(build_loaded_knowhow_block(&[]).is_none());
+}
+
+/// Phase 5.1: every base section must carry the API role + inner-tier
+/// group the viewer needs to render the new two-layer grouping. Empty
+/// content is filtered out so this test fills every slot to exercise the
+/// full `labeled` array.
+#[test]
+fn build_capture_sections_tags_existing_sections_with_role_and_group() {
+    let sections = run_build(
+        "sys",
+        "profile",
+        "device-prefs",
+        "files",
+        "creds",
+        "emails",
+        "oauth",
+        "memory",
+        "history",
+        "app",
+        "file",
+        "url",
+        "mcp-stopped",
+        "setup-reminder",
+        "depth",
+        "user msg",
+        &[],
+        &[],
+    );
+    let by_name = |n: &str| {
+        sections
+            .iter()
+            .find(|s| s.name == n)
+            .cloned()
+            .unwrap_or_else(|| panic!("section {n} missing"))
+    };
+
+    assert_eq!(by_name("System Instructions").role, ContextRole::System);
+    assert_eq!(by_name("System Instructions").group, None);
+
+    assert_eq!(by_name("User Profile").role, ContextRole::User);
+    assert_eq!(
+        by_name("User Profile").group,
+        Some("Identity & profile".to_string())
+    );
+    assert_eq!(
+        by_name("Device & Preferences").group,
+        Some("Identity & profile".to_string())
+    );
+
+    // Spot-check one row from every inner tier the viewer renders.
+    assert_eq!(
+        by_name("File List").group,
+        Some("Workspace inventory".to_string())
+    );
+    assert_eq!(
+        by_name("Credentials").group,
+        Some("Workspace inventory".to_string())
+    );
+    assert_eq!(
+        by_name("Email Accounts").group,
+        Some("Workspace inventory".to_string())
+    );
+    assert_eq!(
+        by_name("OAuth").group,
+        Some("Workspace inventory".to_string())
+    );
+    assert_eq!(
+        by_name("Long-term Memory").group,
+        Some("Memory & history".to_string())
+    );
+    assert_eq!(
+        by_name("Conversation History").group,
+        Some("Memory & history".to_string())
+    );
+    assert_eq!(
+        by_name("App Context").group,
+        Some("Active context".to_string())
+    );
+    assert_eq!(
+        by_name("File Context").group,
+        Some("Active context".to_string())
+    );
+    assert_eq!(
+        by_name("URL Context").group,
+        Some("Active context".to_string())
+    );
+    assert_eq!(
+        by_name("Stopped MCP Servers").group,
+        Some("System notices".to_string())
+    );
+    assert_eq!(
+        by_name("Setup Reminder").group,
+        Some("System notices".to_string())
+    );
+    assert_eq!(
+        by_name("Thread Depth").group,
+        Some("System notices".to_string())
+    );
+    assert_eq!(
+        by_name("User Message").group,
+        Some("The request".to_string())
+    );
+}
+
+/// Phase 5.1: empty bodies must be filtered out — the viewer must not
+/// render zero-char rows for sections that don't apply this turn.
+#[test]
+fn build_capture_sections_filters_empty_sections() {
+    let sections = run_build(
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &[],
+        &[],
+    );
+    let names: Vec<_> = sections.iter().map(|s| s.name.as_str()).collect();
+    // Current Time is unconditional: `turn_clock::current_time_block` always
+    // renders, so unlike the fifteen filtered rows it can never be empty.
+    assert_eq!(
+        names,
+        vec!["System Instructions", "User Message", "Current Time"]
+    );
+}
+
+/// The turn-start todo block is billed like any other section, so the viewer's
+/// budget bar accounts for it. It is absent on the overwhelming majority of
+/// turns, which is what keeps it cheap: `run_build` above passes it empty and
+/// no row appears.
+#[test]
+fn build_capture_sections_bills_the_todo_list_block() {
+    let block = "[TODO LIST]\n1. [abandoned] a (doing a)\n[END TODO LIST]";
+    let sections = build_capture_sections(
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        block,
+        "user msg",
+        &TurnTail {
+            engine_build: "",
+            client_url: "",
+            current_time: CLOCK_BLOCK,
+        },
+        &[],
+        &[],
+    );
+
+    let row = sections
+        .iter()
+        .find(|s| s.name == "Todo List")
+        .expect("the todo block needs a row of its own");
+    assert_eq!(row.role, ContextRole::User, "it rides in the user message");
+    assert_eq!(row.group.as_deref(), Some("System notices"));
+    assert_eq!(row.content.as_deref(), Some(block));
+    assert_eq!(row.budget_delta_chars, block.chars().count());
+
+    let empty = run_build(
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &[],
+        &[],
+    );
+    assert!(
+        !empty.iter().any(|s| s.name == "Todo List"),
+        "a turn with no block must not carry an empty row"
+    );
+}
+
+/// The MCP tools-not-sent line rides in the first user message, so the
+/// capture bills it on a row of its own.
+#[test]
+fn build_capture_sections_bills_the_mcp_tools_not_sent_notice() {
+    let notice = "[MCP TOOLS NOT SENT] server 'github' (2: a, b)";
+    let sections = build_capture_sections(
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        notice,
+        "",
+        "",
+        "",
+        "user msg",
+        &TurnTail {
+            engine_build: "",
+            client_url: "",
+            current_time: CLOCK_BLOCK,
+        },
+        &[],
+        &[],
+    );
+
+    let row = sections
+        .iter()
+        .find(|s| s.name == "MCP Tools Not Sent")
+        .expect("the notice needs a row of its own");
+    assert_eq!(row.role, ContextRole::User);
+    assert_eq!(row.group.as_deref(), Some("System notices"));
+    assert_eq!(row.content.as_deref(), Some(notice));
+}
+
+/// The two blocks ADR 0084 moved out of the system prompt are billed where
+/// they now ride: the request tail, one row each. Without their own rows the
+/// viewer's budget bar would lose them entirely, since they left the System
+/// Instructions row and joined nothing.
+///
+/// Engine Build is empty on a packaged install, which is why it filters out
+/// above rather than being unconditional like the clock.
+#[test]
+fn build_capture_sections_surfaces_the_two_relocated_tail_blocks() {
+    let sections = build_capture_sections(
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &TurnTail {
+            engine_build: "[ENGINE BUILD]\nCURRENT\n[END ENGINE BUILD]",
+            client_url: "[CLIENT URL]\nhttps://localhost:5173\n[END CLIENT URL]",
+            current_time: CLOCK_BLOCK,
+        },
+        &[],
+        &[],
+    );
+
+    let names: Vec<_> = sections.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "System Instructions",
+            "User Message",
+            "Engine Build",
+            "Client URL",
+            "Current Time"
+        ]
+    );
+    for name in ["Engine Build", "Client URL", "Current Time"] {
+        let row = sections
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("section {name} missing"));
+        assert_eq!(
+            row.role,
+            ContextRole::User,
+            "{name} rides in the user message"
+        );
+        assert_eq!(row.group, Some("The request".to_string()), "{name}");
+    }
+}
+
+/// Phase 5.2: each loaded knowhow doc gets its own collapsible row under
+/// the "Loaded knowhow" inner group. Char count reflects the body so the
+/// viewer's budget bar stays honest when a round drops the body.
+#[test]
+fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
+    let docs = vec![
+        LoadedKnowhow {
+            id: "doc-a".into(),
+            body: "BODY A".into(),
+        },
+        LoadedKnowhow {
+            id: "doc-b".into(),
+            body: "BODY BBBB".into(),
+        },
+    ];
+    let sections = run_build(
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &docs,
+        &[],
+    );
+
+    let knowhow: Vec<_> = sections
+        .iter()
+        .filter(|s| s.group.as_deref() == Some("Loaded knowhow"))
+        .collect();
+    assert_eq!(knowhow.len(), 2, "one row per loaded doc");
+    assert_eq!(knowhow[0].name, "knowhow: doc-a");
+    assert_eq!(knowhow[1].name, "knowhow: doc-b");
+    assert!(knowhow.iter().all(|s| s.role == ContextRole::User));
+    // Nothing else counts a knowhow doc's chars, so the delta is its own size.
+    assert_eq!(knowhow[0].budget_delta_chars, "BODY A".chars().count());
+    assert_eq!(knowhow[1].budget_delta_chars, "BODY BBBB".chars().count());
+    assert_eq!(knowhow[0].content_chars, Some("BODY A".chars().count()));
+    assert_eq!(knowhow[1].content_chars, Some("BODY BBBB".chars().count()));
+    assert_eq!(knowhow[0].content.as_deref(), Some("BODY A"));
+    assert_eq!(knowhow[1].content.as_deref(), Some("BODY BBBB"));
+}
+
+/// Phase 5.3: each `(ToolUse, ToolResult)` pair from `resume_tool_blocks`
+/// becomes its own row under the `PriorMessage` role. Tool name + JSON
+/// args preview live in the row name so the viewer can show what call the
+/// pair represents without expanding it.
+#[test]
+fn build_capture_sections_emits_one_row_per_resume_tool_pair() {
+    use crate::llm::{ContentBlock, Message, MessageContent};
+    let resume = vec![
+        Message {
+            role: "assistant".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "id1".into(),
+                name: "query_events".into(),
+                input: serde_json::json!({"limit": 5}),
+                thought_signature: None,
+            }]),
+        },
+        Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "id1".into(),
+                content: "[]".into(),
+            }]),
+        },
+        Message {
+            role: "assistant".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "id2".into(),
+                name: "load_knowhow".into(),
+                input: serde_json::json!({"id": "x"}),
+                thought_signature: None,
+            }]),
+        },
+        Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "id2".into(),
+                content: "BODY".into(),
+            }]),
+        },
+    ];
+    let sections = run_build(
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &[],
+        &resume,
+    );
+
+    let prior: Vec<_> = sections
+        .iter()
+        .filter(|s| s.role == ContextRole::PriorMessage)
+        .collect();
+    assert_eq!(prior.len(), 2, "one row per resume pair");
+    assert!(prior.iter().any(|s| s.name == "ToolUse: query_events"));
+    assert!(prior.iter().any(|s| s.name == "ToolUse: load_knowhow"));
+    assert!(prior.iter().all(|s| s.group.is_none()));
+    // Both sizes reflect the assembled "ToolUse: …\n\nToolResult:\n…" body,
+    // so the viewer's prior-messages budget stays accurate.
+    assert!(prior.iter().all(|s| s.content.is_some()));
+    assert!(prior.iter().all(|s| s.budget_delta_chars > 0));
+    assert!(prior
+        .iter()
+        .all(|s| s.content_chars == Some(s.budget_delta_chars)));
+}
+
+#[test]
+fn build_capture_sections_includes_device_preferences_context() {
+    let sections = run_build(
+        "",
+        "",
+        "[USER DEVICE & PREFERENCES]\n- theme: light\n[END USER DEVICE & PREFERENCES]",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &[],
+        &[],
+    );
+
+    let section = sections
+        .iter()
+        .find(|s| s.name == "Device & Preferences")
+        .expect("device/preferences section must be captured");
+    assert_eq!(section.group.as_deref(), Some("Identity & profile"));
+    assert_eq!(section.role, ContextRole::User);
+    assert!(section.budget_delta_chars > 0);
+}
+
+/// The turn's section list always carries its bodies, whatever the
+/// `capture_context` switch said when the turn started. The loop drops them
+/// per round (`round_capture_sections`), so a switch flipped while a question
+/// card held the turn open reaches the rounds after the answer.
+#[test]
+fn build_capture_sections_always_carries_the_bodies() {
+    let docs = vec![LoadedKnowhow {
+        id: "doc".into(),
+        body: "BODY".into(),
+    }];
+    let sections = run_build(
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user",
+        &docs,
+        &[],
+    );
+    let system = sections
+        .iter()
+        .find(|s| s.name == "System Instructions")
+        .unwrap();
+    assert_eq!(system.content.as_deref(), Some("sys"));
+    let knowhow = sections.iter().find(|s| s.name == "knowhow: doc").unwrap();
+    assert_eq!(knowhow.content.as_deref(), Some("BODY"));
+}
+
+/// The cap clips the BODY and never either count.
+///
+/// The Context Viewer's budget bar and the eval's utilisation axis read
+/// `budget_delta_chars`, and a region-size question reads `content_chars`.
+/// Both are the true assembled length here whatever the body does. ADR 0110's
+/// full capture lifts the cap, and that gate must not move either number.
+#[test]
+fn a_capped_body_still_reports_its_true_length() {
+    let long = "x".repeat(20_000);
+    let sections = run_build(
+        &long,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user",
+        &[],
+        &[],
+    );
+    let system = sections
+        .iter()
+        .find(|s| s.name == "System Instructions")
+        .expect("the system prompt is always a section");
+    assert_eq!(
+        system.budget_delta_chars,
+        long.chars().count(),
+        "the delta is the assembled length, not the persisted one"
+    );
+    assert_eq!(
+        system.content_chars,
+        Some(long.chars().count()),
+        "a clipped body does not move the region's size"
+    );
+    let body = system.content.as_deref().unwrap_or_default();
+    assert!(
+        body.chars().count() < system.budget_delta_chars,
+        "an over-cap body is clipped by default"
+    );
+}
+
+/// The chat-agent prompt must nudge use of `ask_user_question` for
+/// choice-shaped questions (yes/no, A vs B, "what next?" follow-up menus)
+/// — symmetric with the CC-side `chat_style_prompts_nudge_use_of_ask_user_question`
+/// test in `agent_session::prompts`. Without this nudge the chat agent
+/// reads ACTION FIRST as a blanket "don't ask the user anything" rule and
+/// falls back to plaintext bullet lists for next-step alternatives — the
+/// exact failure pattern the rule was added to prevent.
+#[test]
+fn chat_prompt_nudges_use_of_ask_user_question() {
+    let rule = super::ASK_USER_QUESTION_RULE;
+    assert!(
+        rule.contains("ask_user_question"),
+        "chat ASK_USER_QUESTION_RULE must name the tool (lowercase snake_case — \
+         that's the actual chat-side tool name)",
+    );
+    assert!(
+        rule.contains("2-4 discrete answers"),
+        "chat ASK_USER_QUESTION_RULE must pin the trigger criteria (2-4 \
+         discrete answers); softer phrasing let the LLM keep slipping into \
+         plaintext for genuine choice-shaped questions",
+    );
+    assert!(
+        rule.contains("mid-stream"),
+        "chat ASK_USER_QUESTION_RULE must keep the mid-stream concept — \
+         end-only examples let the chat agent slip plaintext yes/no questions \
+         into the middle of long answers (mirrors the CC-side assertion in \
+         `chat_style_prompts_nudge_use_of_ask_user_question`)",
+    );
+    assert!(
+        rule.contains("what next"),
+        "chat ASK_USER_QUESTION_RULE must include the concrete \"what next?\" \
+         follow-up-menu example — that's the exact failure pattern in \
+         observed threads where the agent emits markdown bullets instead of \
+         buttons",
+    );
+    assert!(
+        rule.contains("ACTION FIRST"),
+        "chat ASK_USER_QUESTION_RULE must explicitly carve itself out of \
+         ACTION FIRST — without the carve-out the two rules fight and the \
+         LLM defaults to silence on next-step alternatives",
+    );
+    assert!(
+        rule.contains("NEVER parallel-call"),
+        "chat ASK_USER_QUESTION_RULE must forbid parallel-calling \
+         `ask_user_question` alongside other tools (see the parallel CC rule \
+         in `agent_session::prompts::ASK_USER_QUESTION_RULE`)",
+    );
+    // Three observed Opus 4.7 leaks emitted
+    // `<ask_user_question>…</ask_user_question>` as
+    // literal assistant text instead of a tool call. The rule must name
+    // that exact failure mode so the next prompt edit can't silently drop
+    // the anti-pattern callout.
+    assert!(
+        rule.contains("<ask_user_question"),
+        "chat ASK_USER_QUESTION_RULE must show the forbidden literal tag \
+         (`<ask_user_question`) — the model has emitted wrapper-tag text \
+         instead of a real tool call multiple times on Opus 4.7 max effort, \
+         and only naming the exact tag string makes the rule self-evident \
+         to the model when it next debates the format",
+    );
+    assert!(
+        rule.contains("INVOKE IT AS A TOOL CALL, NEVER AS TEXT"),
+        "chat ASK_USER_QUESTION_RULE must carry the anti-inline-tag clause \
+         under a heading of its own. Without it the rule only nudges *when* \
+         to ask, not *how*, and Opus 4.7 keeps inventing \
+         `<ask_user_question>` wrappers",
+    );
+}
+
+/// The chat-agent prompt must forbid claiming a repeated action ("again") was
+/// performed without actually calling the tool that turn. Observed failure
+/// (testing-notifications thread, 2026-06-30): the user said "again" four times;
+/// the agent fired `send_notification` on the first two, then — seeing the two
+/// prior identical `ToolUse: send_notification` entries in its context — wrote
+/// "Sent another" for the last two WITHOUT calling the tool, so nothing went
+/// out. The CRITICAL RULES anti-hallucination guidance was scoped to file
+/// writes; this rule generalizes it and names the repeat-request trap directly.
+#[test]
+fn chat_prompt_forbids_faking_repeated_actions() {
+    let rule = super::REPEATED_ACTION_RULE;
+    assert!(
+        rule.contains("again"),
+        "REPEATED_ACTION_RULE must name the repeat-request trigger word \
+         (\"again\") — that's the exact phrasing the user used when the agent \
+         claimed a send it never made",
+    );
+    assert!(
+        rule.contains("CURRENT TURN") || rule.contains("THIS turn") || rule.contains("this turn"),
+        "REPEATED_ACTION_RULE must pin the action to the CURRENT turn — the \
+         failure was the model treating a PRIOR turn's tool call as if it \
+         counted for this one",
+    );
+    assert!(
+        rule.contains("send_notification"),
+        "REPEATED_ACTION_RULE must name `send_notification` — the concrete \
+         action tool the model faked on repeat; naming it keeps the rule \
+         self-evident to the model when it next debates whether a prior call \
+         counts",
+    );
+    assert!(
+        rule.contains("PREVIOUS turn") || rule.contains("does NOT mean the action happened"),
+        "REPEATED_ACTION_RULE must spell out that a prior identical tool call \
+         in context is a record of a PREVIOUS turn, not proof the action \
+         happened this time — that misread is the root of the bug",
+    );
+}
+
+// --- FreeText answer eligibility (child-completion vs. human follow-up) ---
+
+use super::run::message_can_answer_pending_question;
+use super::run::resolve_route_overrides;
+use super::PreEmittedOrigin;
+use crate::core::prefs;
+use crate::engine::thread_events::ActorMode;
+use crate::test_support::{setup_test_db, teardown_test_db};
+use uuid::Uuid;
+
+/// The model registry the resolver clamps the effort against. Empty, so every
+/// id takes the same prefix heuristic `RoutingProvider` would use for a model
+/// with no row (`claude-*` and the unregistered placeholder ids these tests use
+/// alike). Tests that need a specific provider build their own.
+fn registry() -> crate::llm::ModelRegistry {
+    crate::llm::model_registry::empty()
+}
+
+/// The router's own model, standing in for an unset `chat_model`.
+const FALLBACK_MODEL: &str = "router-default";
+
+/// Store `effort` as the account's chat tier for `model`.
+async fn seed_chat_effort(pool: &sqlx::PgPool, model: &str, effort: &str) {
+    crate::test_support::seed_preference(
+        pool,
+        prefs::CHAT_REASONING_EFFORTS.key(),
+        &format!("{model}={effort}"),
+    )
+    .await
+    .unwrap();
+}
+
+/// A registry mapping one id to one provider, for the clamp cases.
+fn registry_with(id: &str, provider: crate::llm::ProviderKind) -> crate::llm::ModelRegistry {
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+    let mut map = HashMap::new();
+    map.insert(
+        id.to_string(),
+        crate::llm::model_registry::ModelRouting::single(provider, id),
+    );
+    Arc::new(RwLock::new(map))
+}
+
+/// Coding-agent requests use the same HTTP `reasoning_effort` field for an
+/// explicit agent pick, but an omitted field means "fall through to agent
+/// settings/defaults". It must not be filled from the Lucidos chat preference:
+/// Codex and Claude Code have their own model/effort configuration surfaces.
+#[tokio::test]
+async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "gemini-3.8-flash")
+        .await
+        .unwrap();
+    seed_chat_effort(&pool, "gemini-3.8-flash", "max").await;
+
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        Some(true),
+        None,
+        None,
+        sel(Some("claude-opus-4-8[1m]"), None, None),
+    )
+    .await;
+
+    assert_eq!(resolved.model, None);
+    assert_eq!(resolved.reasoning_effort, None);
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn coding_agent_route_preserves_explicit_agent_effort_pick() {
+    let (pool, db_name) = setup_test_db().await;
+    seed_chat_effort(&pool, "claude-opus-4-8[1m]", "high").await;
+
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        Some(true),
+        None,
+        None,
+        sel(None, Some("xhigh"), None),
+    )
+    .await;
+
+    assert_eq!(resolved.model, None);
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("xhigh"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn chat_route_still_inherits_chat_model_and_effort_defaults() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "claude-opus-4-8[1m]")
+        .await
+        .unwrap();
+    seed_chat_effort(&pool, "claude-opus-4-8[1m]", "high").await;
+
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        None,
+        None,
+        sel(None, None, None),
+    )
+    .await;
+
+    assert_eq!(resolved.model.as_deref(), Some("claude-opus-4-8[1m]"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Per-thread memory at the route layer: a chat follow-up with no explicit
+/// override reuses the model/effort the thread last ran with, NOT the account
+/// preference (docs/plans/2026-07-03-per-thread-model-memory.md).
+#[tokio::test]
+async fn chat_route_reuses_thread_last_model_over_preference() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "account-model")
+        .await
+        .unwrap();
+    seed_chat_effort(&pool, "account-model", "high").await;
+    let tid = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2, 'MessageReceived', $3, now(), $4)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(tid.to_string())
+    .bind(serde_json::json!({ "text": "hi", "model": "thread-model", "reasoning_effort": "low" }))
+    .bind(tid)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        Some(tid),
+        None,
+        sel(None, None, None),
+    )
+    .await;
+
+    assert_eq!(resolved.model.as_deref(), Some("thread-model"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A trigger thread's starter event is `TriggerStarted`, never
+/// `MessageReceived`, so the per-thread memory has to read it too. Without this
+/// a Continue on a trigger thread pinned to a cheap model would jump back to
+/// the account model, and the in-thread picker would have been showing the
+/// wrong one the whole time.
+#[tokio::test]
+async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "account-model")
+        .await
+        .unwrap();
+    seed_chat_effort(&pool, "account-model", "high").await;
+    let tid = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2, 'TriggerStarted', $3, now(), $4)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(tid.to_string())
+    .bind(serde_json::json!({
+        "trigger_id": "t-1",
+        "model": "gemini-3.8-flash",
+        "reasoning_effort": "low",
+    }))
+    .bind(tid)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        Some(tid),
+        None,
+        sel(None, None, None),
+    )
+    .await;
+
+    assert_eq!(resolved.model.as_deref(), Some("gemini-3.8-flash"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A trigger fire is a brand-new thread (`thread_id = None`) whose model /
+/// effort come from the trigger itself. The pinned value must beat the account
+/// preference, or a trigger deliberately moved to a cheap model would keep
+/// burning the account's chat model.
+#[tokio::test]
+async fn trigger_route_prefers_the_triggers_own_model_and_effort() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "account-model")
+        .await
+        .unwrap();
+    seed_chat_effort(&pool, "account-model", "high").await;
+
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        None,
+        None,
+        sel(Some("gemini-3.8-flash"), Some("low"), None),
+    )
+    .await;
+
+    assert_eq!(resolved.model.as_deref(), Some("gemini-3.8-flash"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A trigger that pins only the model runs it at that model's own tier, never
+/// the account model's. One that pins only the effort still inherits the
+/// account model. Pinning one must never freeze the other.
+#[tokio::test]
+async fn trigger_route_resolves_model_and_effort_independently() {
+    let (pool, db_name) = setup_test_db().await;
+    // An adaptive Claude account model, so every tier is available and the
+    // clamp is a no-op: this test is about the two fields resolving
+    // independently, not about clamping (covered separately below).
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "claude-opus-5")
+        .await
+        .unwrap();
+    seed_chat_effort(&pool, "claude-opus-5", "high").await;
+
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        None,
+        None,
+        sel(Some("gemini-3.8-flash"), None, None),
+    )
+    .await;
+    assert_eq!(resolved.model.as_deref(), Some("gemini-3.8-flash"));
+    assert_eq!(
+        resolved.reasoning_effort, None,
+        "the account's tier belongs to its own model"
+    );
+
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        None,
+        None,
+        sel(None, Some("max"), None),
+    )
+    .await;
+    assert_eq!(
+        resolved.model.as_deref(),
+        Some("claude-opus-5"),
+        "account model still applies"
+    );
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("max"));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The resolved pair is clamped HERE, not only at the wire, so the effort a
+/// turn stamps on its events is the effort it actually sends.
+///
+/// The mismatch is manufactured by a stored tier the model's route cannot run.
+/// Left unclamped, the turn records `xhigh` for a local model,
+/// which the in-thread picker then displays as the thread's setting even though
+/// its dropdown offers no such tier, and which the next turn reads back as the
+/// thread's remembered effort.
+#[tokio::test]
+async fn a_resolved_effort_is_clamped_to_what_the_resolved_model_supports() {
+    let (pool, db_name) = setup_test_db().await;
+    seed_chat_effort(&pool, "muse-glimmer:30b-mlx", "xhigh").await;
+    let registry = registry_with("muse-glimmer:30b-mlx", crate::llm::ProviderKind::Local);
+
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry,
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        None,
+        None,
+        sel(Some("muse-glimmer:30b-mlx"), None, None),
+    )
+    .await;
+
+    assert_eq!(resolved.model.as_deref(), Some("muse-glimmer:30b-mlx"));
+    assert_eq!(
+        resolved.reasoning_effort.as_deref(),
+        Some("high"),
+        "a local model cannot run xhigh, so the turn must not record that it did"
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A coding-agent route is exempt: the effort belongs to Claude Code / Codex,
+/// whose models are not in the chat registry and whose drivers validate it
+/// themselves. Clamping it against a chat model would answer a question about
+/// the wrong agent, and `xhigh` is a perfectly good Codex tier.
+#[tokio::test]
+async fn a_coding_agent_effort_is_not_clamped_against_the_chat_registry() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry = registry_with("muse-glimmer:30b-mlx", crate::llm::ProviderKind::Local);
+
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry,
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        Some(true),
+        None,
+        None,
+        sel(None, Some("xhigh"), None),
+    )
+    .await;
+
+    assert_eq!(resolved.model, None);
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("xhigh"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A genuine human follow-up typed on a thread with an open question is the
+/// one and only case that may be consumed as a FreeText answer.
+#[test]
+fn human_follow_up_can_answer_pending_question() {
+    assert!(message_can_answer_pending_question(
+        false,
+        "repo is private, not public",
+        false,
+        ActorMode::Human,
+        None,
+    ));
+}
+
+/// Images alone are an answer: a screenshot can be the whole reply.
+#[test]
+fn image_only_follow_up_can_answer_pending_question() {
+    assert!(message_can_answer_pending_question(
+        false,
+        "",
+        true,
+        ActorMode::Human,
+        None,
+    ));
+}
+
+/// Regression guard for the emit-before-ack path: a human follow-up whose
+/// `MessageReceived` the API boundary already persisted must NOT also be
+/// consumed as the answer. Answering emits `UserQuestionAnswered` and no
+/// `MessageReceived`, so routing a pre-emitted message here would leave two
+/// events in the thread for one thing the user said.
+#[test]
+fn pre_emitted_message_cannot_also_answer_pending_question() {
+    assert!(!message_can_answer_pending_question(
+        false,
+        "repo is private, not public",
+        false,
+        ActorMode::Human,
+        Some(PreEmittedOrigin::Message(Uuid::new_v4())),
+    ));
+}
+
+/// Regression: an agent-driven child-completion re-entry (the `[CHILD THREAD
+/// COMPLETED] …` block fed through `notify_parent_of_child_completion` with
+/// `ActorMode::Agent`) must NOT be eligible to answer the parent's open
+/// question. Before the `mode == Human` guard it was, producing a bogus
+/// `UserQuestionAnswered { FreeText }` stamped with a `thread_link`/`child`
+/// actor and silently consuming the user's question. It must instead fall
+/// through to the injection fast-path (queued as `ReentryFromEngine`).
+#[test]
+fn child_completion_wake_cannot_answer_pending_question() {
+    assert!(!message_can_answer_pending_question(
+        false,
+        "[CHILD THREAD COMPLETED] 59328631… success\nSession summary…",
+        false,
+        ActorMode::Agent,
+        None,
+    ));
+}
+
+/// Engine-driven re-entries (recovery notes, scheduler) are likewise never the
+/// user's answer.
+#[test]
+fn engine_driven_message_cannot_answer_pending_question() {
+    assert!(!message_can_answer_pending_question(
+        false,
+        "engine recovery note",
+        false,
+        ActorMode::Engine,
+        None,
+    ));
+}
+
+/// A new thread has no pending question to answer, and an empty message can't
+/// be an answer regardless of who authored it.
+#[test]
+fn new_thread_or_empty_message_cannot_answer_pending_question() {
+    assert!(!message_can_answer_pending_question(
+        true,
+        "first message on a brand-new thread",
+        false,
+        ActorMode::Human,
+        None,
+    ));
+    assert!(!message_can_answer_pending_question(
+        false,
+        "",
+        false,
+        ActorMode::Human,
+        None,
+    ));
+}
+
+/// Where the question supersede sits IS the rule, so pin it. Both halves are
+/// load-bearing, and neither has any other seam to test through.
+///
+/// Below the answer fast-path: a message that could answer the question already
+/// did and returned, so anything still open here is a question this follow-up
+/// cannot answer. Inside the coding-agent block: a chat thread queues such a
+/// follow-up as an injection and keeps its question live, which is right there.
+///
+/// The bug this pins is a deadlock. The agent is parked inside the call that
+/// asked. The follow-up's own `CodingAgentPromptSent` then kills the card, and
+/// nothing is left that can release the agent.
+#[test]
+fn the_question_supersede_is_wired_below_the_answer_fast_path() {
+    let source = include_str!("process/run.rs");
+    let fast_path = source
+        .find("lookup_active_question_tool_use_id")
+        .expect("the FreeText answer fast-path must still run first");
+    let permission_supersede = source
+        .find("resolve_pending_permissions_as_superseded")
+        .expect("the coding-agent-only supersede block must still exist");
+    let question_supersede = source
+        .find("resolve_pending_question_as_superseded(")
+        .expect("the message router must supersede an unanswerable open question");
+
+    assert!(
+        fast_path < question_supersede,
+        "a message that can answer the question must answer it, never supersede it"
+    );
+    assert!(
+        permission_supersede < question_supersede,
+        "the question supersede belongs in the coding-agent-only block, beside the permission one"
+    );
+
+    // ADR 0255: a child's completion must not supersede a question the user
+    // can still answer. The decision is unit-tested, so pin that it gates.
+    let keep_check = source
+        .find("follow_up_keeps_open_question")
+        .expect("the supersede must consult follow_up_keeps_open_question");
+    assert!(
+        permission_supersede < keep_check && keep_check < question_supersede,
+        "the keep-open check must gate the question supersede"
+    );
+
+    // ADR 0256: an agent-sent message is held before anything can supersede
+    // the question. A human message releases older held ones after its own
+    // supersedes, so the human is recorded as resolving any open card.
+    let hold = source
+        .find("held_messages::message_is_held")
+        .expect("the router must hold agent messages behind an open question");
+    let release = source
+        .find("deliver_held_messages")
+        .expect("a human message must release the held messages");
+    assert!(
+        fast_path < hold && hold < permission_supersede,
+        "the hold sits after the answer fast path, before any supersede"
+    );
+    assert!(
+        question_supersede < release,
+        "the release follows the human message's own supersedes"
+    );
+}
+
+/// A provider the model has no route on is not stamped. The router would treat
+/// it as stale and fall through, so stamping it would record a backend the turn
+/// never reached. A provider the model does have passes through.
+#[tokio::test]
+async fn a_provider_the_model_cannot_use_is_not_stamped() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry = registry_with("m", crate::llm::ProviderKind::Vertex);
+
+    let off_route = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry,
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        None,
+        None,
+        sel(Some("m"), Some("high"), Some("anthropic")),
+    )
+    .await;
+    assert_eq!(off_route.provider, None);
+
+    let on_route = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry,
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        None,
+        None,
+        sel(Some("m"), Some("high"), Some("vertex")),
+    )
+    .await;
+    assert_eq!(on_route.provider.as_deref(), Some("vertex"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

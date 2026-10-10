@@ -1,0 +1,246 @@
+import { useState, useRef, useEffect } from 'preact/hooks';
+import {
+  artifacts, fileSearchOpen, fileSearchAnchor, activeMenuItem,
+  repoFiles, repoSource, repoDiff, changes,
+} from '../../store/store';
+import { openFilePreview } from '../../store/actions/artifacts';
+import { openRepoFilePreview } from '../../store/actions/repositories';
+import { FileTypeIcon } from '../../utils/fileIcons';
+import {
+  collectSearchResults, filterSearchResults, openableChangeFiles, visibleSearchResults,
+  type FileSearchResult,
+} from './fileSearch';
+import { closeFileSearch } from './fileSearchActions';
+import { changeBadgeLabel } from './changeBadge';
+import { loadedOr } from '../../store/types';
+import { Overlay } from '../shared/Overlay';
+import { LoadingFade } from '../shared/LoadingFade';
+import { ListSkeletonOf, SkBlock, SkText, useSkeleton } from '../shared/Skeleton';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
+import { paneUnder, usePaneCentre } from '../../hooks/usePaneCentre';
+import { CloseIcon } from '../shared/icons';
+import { SearchField } from '../shared/SearchField';
+
+function sourceBadgeLabel(source: FileSearchResult['source']): string {
+  return source === 'workspace' ? 'W' : source === 'repo' ? 'R' : 'C';
+}
+
+/** One search hit. Inside a `SkeletonProvider` it is the results list's
+ *  loading placeholder. The list holds up to `MAX_SHOWN_RESULTS` rows, so the
+ *  loaded path is plain markup and the skeleton check runs once per row. */
+function SearchResultRow({ result, selected = false, showBadge = false, onHover, onPick }: {
+  result?: FileSearchResult;
+  selected?: boolean;
+  showBadge?: boolean;
+  onHover?: () => void;
+  onPick?: () => void;
+}) {
+  if (useSkeleton() || !result) {
+    return (
+      <div class="file-search-result" aria-hidden="true">
+        <SkBlock w="1rem" h="1rem" round />
+        <span class="file-search-result-info">
+          <SkText class="file-search-result-name" w="8rem" />
+          <SkText class="file-search-result-path" w="12rem" />
+        </span>
+      </div>
+    );
+  }
+  const name = result.path.split('/').pop() || result.path;
+  const dir = result.path.includes('/') ? result.path.substring(0, result.path.lastIndexOf('/')) : '';
+  return (
+    <button
+      class={`file-search-result${selected ? ' selected' : ''}`}
+      onMouseEnter={onHover}
+      onClick={onPick}
+    >
+      <FileTypeIcon path={result.path} className="file-search-result-icon" />
+      <span class="file-search-result-info">
+        <span class="file-search-result-name">{name}</span>
+        {dir && <span class="file-search-result-path">{dir}</span>}
+      </span>
+      {showBadge && (
+        <span class={`file-search-source-badge file-search-source-${result.source}`}>
+          {sourceBadgeLabel(result.source)}
+        </span>
+      )}
+      {result.changeStatus && (
+        <span class={`change-badge change-badge-${result.changeStatus}`}>
+          {changeBadgeLabel(result.changeStatus)}
+        </span>
+      )}
+    </button>
+  );
+}
+
+/** The open-state body. Mounted by `<Overlay>` only while the modal is open, so
+ *  the result rows (and their signal subscriptions) and the search compute
+ *  don't run on every `visualViewport.resize` while closed — the same reason the
+ *  overlay element itself stays mounted (hidden) rather than unmounting. */
+function FileSearchPanel() {
+  const [query, setQuery] = useState('');
+  const [selectedIndex, setSelectedIndex] = useState(-1);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const resultsRef = useRef<HTMLDivElement>(null);
+
+  const active = activeMenuItem.value;
+  useEffect(() => {
+    if (active !== 'files') closeFileSearch();
+  }, [active]);
+
+  // Auto-focus on mount (the modal only mounts when open). iOS keeps the
+  // keyboard from openFileSearch's gesture-stack focus once the real input lands.
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (selectedIndex >= 0 && resultsRef.current) {
+      const content = resultsRef.current.querySelector('.loading-fade-content');
+      const el = content?.children[selectedIndex] as HTMLElement | undefined;
+      el?.scrollIntoView({ block: 'nearest' });
+    }
+  }, [selectedIndex]);
+
+  const isRepo = repoSource.value !== null;
+  const primarySource = isRepo ? repoFiles.value : artifacts.value;
+  // CC change files contribute when `loaded`. A `failed` changes signal
+  // bubbles up to the modal's failed state only when no other source has
+  // loaded AND the primary source has reached a terminal state — otherwise the
+  // modal still functions on what's available, and a still-loading primary
+  // shows its placeholder rows rather than a premature "Failed to load files".
+  //
+  // The repo gate runs HERE, before `anyLoaded` counts them: a change this
+  // surface cannot open contributes no row, so it cannot stand in for a loaded
+  // source either. Counting one that is filtered out renders an empty result
+  // list while the primary source is still loading.
+  const ccChanges = openableChangeFiles(loadedOr(changes.value, []), isRepo);
+  const ccChangesFailed = changes.value.status === 'failed';
+  const anyLoaded = primarySource.status === 'loaded' || ccChanges.length > 0;
+  const primaryPending =
+    primarySource.status === 'loading' || primarySource.status === 'not-loaded';
+  const failed =
+    primarySource.status === 'failed' || (ccChangesFailed && !anyLoaded && !primaryPending);
+  const showLoading = useDelayedFlag(!anyLoaded && !failed);
+
+  const workspacePaths = isRepo ? [] : loadedOr(artifacts.value, []);
+  const repoPaths = isRepo ? loadedOr(repoFiles.value, []) : [];
+  const diffFiles = isRepo && repoDiff.value.status === 'loaded'
+    ? repoDiff.value.data.files.map(f => ({ path: f.path, status: f.status }))
+    : [];
+  const ccChangeFiles = ccChanges.flatMap(c => c.files.map(f => ({ path: f })));
+
+  const allResults = collectSearchResults(workspacePaths, repoPaths, diffFiles, ccChangeFiles);
+  const filtered = filterSearchResults(allResults, query);
+  const { shown, hidden } = visibleSearchResults(filtered);
+  const showBadge = allResults.some(r => r.source !== allResults[0]?.source);
+
+  const selectResult = (result: FileSearchResult) => {
+    closeFileSearch();
+    if (result.source === 'workspace') {
+      openFilePreview(result.path);
+    } else if (result.source === 'repo' || result.source === 'change') {
+      openRepoFilePreview(result.path, result.changeStatus ? 'diff' : 'file');
+    }
+  };
+
+  // On iOS, when the search input is focused the first tap on a button
+  // dismisses focus instead of firing click. Using onTouchEnd bypasses this.
+  const closeTouchEnd = (e: TouchEvent) => { e.preventDefault(); closeFileSearch(); };
+  const closeBtn = (
+    <button class="icon-btn surface-close file-search-close" onTouchEnd={closeTouchEnd} onClick={closeFileSearch} aria-label="Close search" data-tooltip="Close search">
+      <CloseIcon />
+    </button>
+  );
+
+  return (
+    <>
+      <div class="surface-head file-search-header">
+        <SearchField
+          class="file-search-field"
+          inputRef={inputRef}
+          inputClass="file-search-input"
+          data-role="file-search-input"
+          placeholder="Search files…"
+          value={query}
+          onInput={(e) => {
+            setQuery(e.currentTarget.value);
+            setSelectedIndex(-1);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') closeFileSearch();
+            if (e.key === 'ArrowDown') {
+              e.preventDefault();
+              setSelectedIndex(i => Math.min(i + 1, shown.length - 1));
+            } else if (e.key === 'ArrowUp') {
+              e.preventDefault();
+              setSelectedIndex(i => Math.max(i - 1, -1));
+            } else if (e.key === 'Enter' && shown.length > 0) {
+              e.preventDefault();
+              const idx = selectedIndex >= 0 ? selectedIndex : 0;
+              selectResult(shown[idx]);
+            }
+          }}
+        />
+        {closeBtn}
+      </div>
+      <div class="file-search-results" ref={resultsRef}>
+        {/* A failed source still leaves the ones that loaded searchable. */}
+        {failed && !anyLoaded ? (
+          <div class="file-search-empty error-text">Failed to load files</div>
+        ) : (
+          // The field above is live from the first frame; only the results wait.
+          <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf count={6} row={() => <SearchResultRow />} />}>
+            {anyLoaded && (shown.length === 0 ? (
+              <div class="file-search-empty">No matching files</div>
+            ) : (
+              <>
+                {shown.map((result, index) => (
+                  <SearchResultRow
+                    key={`${result.source}:${result.path}`}
+                    result={result}
+                    selected={index === selectedIndex}
+                    showBadge={showBadge}
+                    onHover={() => setSelectedIndex(index)}
+                    onPick={() => selectResult(result)}
+                  />
+                ))}
+                {hidden > 0 && (
+                  <div class="file-search-more">
+                    {hidden} more {hidden === 1 ? 'file' : 'files'}. Type to narrow the list.
+                  </div>
+                )}
+              </>
+            ))}
+          </LoadingFade>
+        )}
+      </div>
+    </>
+  );
+}
+
+export function FileSearchModal() {
+  // Over the Canvas pane, whose header holds the button that opens it.
+  const open = fileSearchOpen.value;
+  const paneCentre = usePaneCentre(open ? paneUnder(fileSearchAnchor.value) ?? 'canvas' : undefined);
+  // keepMounted: the overlay div is NEVER removed from the DOM — iOS Safari
+  // PWA's compositor leaves ghost pixels when a fixed-position layer is removed
+  // from the layer tree, so closing toggles `.file-search-closed` instead. The
+  // heavy body (FileSearchPanel) only mounts while open. Same pattern as
+  // SearchEverywhere. Contract (dismiss + swallow + anchor + Escape) lives in
+  // <Overlay>.
+  return (
+    <Overlay
+      open={open}
+      onClose={closeFileSearch}
+      anchor={fileSearchAnchor.value}
+      overlayClass="file-search-overlay"
+      panelClass="surface surface-raised surface-pane-centred file-search-modal"
+      panelStyle={paneCentre}
+      keepMounted
+      hiddenClass="file-search-closed"
+    >
+      <FileSearchPanel />
+    </Overlay>
+  );
+}

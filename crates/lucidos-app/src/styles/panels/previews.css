@@ -1,0 +1,1154 @@
+/* --- App UI inline (panel) --- */
+
+.app-ui-inline {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    /* Containing block for .app-ui-cover below. */
+    position: relative;
+}
+
+.app-ui-iframe {
+    flex: 1;
+    width: 100%;
+    border: none;
+    background: var(--bg-primary);
+}
+
+/* The pseudo-fullscreen exit button is pinned over the find bar's right end,
+   so the bar keeps its footprint clear (--fullscreen-exit-reserve, below). */
+.app-ui-fullscreen .find-bar {
+    padding-right: calc(var(--fullscreen-exit-reserve) + var(--space-sm));
+}
+
+/* Opaque theme surface over a frame that has nothing to show yet, crossfaded
+   out on the frame's `load`. Without it the iOS PWA flashes WHITE on every app
+   open: WKWebView paints the frame's base canvas white, and both things that
+   would say otherwise arrive late over the network (the app's own stylesheet,
+   and `/api/v1/sdk-prefs.js`, which is what applies the theme). Neither is
+   reachable from the host, so the host hides the frame until it is ready
+   instead. Mounted by AppUiInline.tsx; rationale in AppUiInline.test.ts. */
+.app-ui-cover {
+    position: absolute;
+    inset: 0;
+    background: var(--bg-primary);
+    pointer-events: none;
+    opacity: 1;
+    transition: opacity var(--duration-normal) ease;
+}
+
+.app-ui-cover.is-clearing {
+    opacity: 0;
+}
+
+:root[data-motion="reduce"] .app-ui-cover {
+    transition: none;
+}
+
+/* Indeterminate bar along the top of the pane while an app opens. Mounted by
+   AppUiInline.tsx after a delay gate, so it is opaque from its first frame and
+   only fades on the way out. It sits above the cover and outlasts it when the
+   cover's fuse lifts first. */
+.app-ui-load-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 0.1875rem;
+    overflow: hidden;
+    pointer-events: none;
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    opacity: 1;
+    transition: opacity var(--duration-normal) ease;
+}
+
+.app-ui-load-bar::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 35%;
+    border-radius: var(--radius-round);
+    background: var(--accent);
+    /* Indefinite activity indicator, so a literal duration (not a token). */
+    animation: app-ui-load-bar-sweep 1.2s ease-in-out infinite;
+}
+
+.app-ui-load-bar.is-clearing {
+    opacity: 0;
+}
+
+@keyframes app-ui-load-bar-sweep {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(286%); }
+}
+
+:root[data-motion="reduce"] .app-ui-load-bar {
+    transition: none;
+}
+
+:root[data-motion="reduce"] .app-ui-load-bar::before {
+    animation: none;
+    left: 32.5%;
+}
+
+/* --- Pseudo-fullscreen (CSS fallback when native Fullscreen API is unavailable, e.g. iOS Safari) --- */
+
+/* --z-app-fullscreen (base.css) is above the header chrome and BELOW the modal
+   layer, so the host's own modals and toasts still paint over a fullscreen app.
+   Not --z-tooltip: that put the panel over every overlay, which is what made an
+   app's previewFile / confirm / prompt / toast invisible. */
+.app-ui-inline.app-ui-fullscreen {
+    /* The exit button's geometry, read by the button and by whatever must keep
+       clear of it. The reserve is its footprint in from the content edge. */
+    --fullscreen-exit-inset: 0.5rem;
+    --fullscreen-exit-pad: 0.25rem;
+    --fullscreen-exit-border: 1px;
+    --fullscreen-exit-reserve: calc(var(--fullscreen-exit-inset) + var(--icon-size-sm)
+        + 2 * (var(--fullscreen-exit-pad) + var(--fullscreen-exit-border)));
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: var(--z-app-fullscreen);
+    background: var(--bg-primary);
+    height: auto;
+    padding: var(--safe-area-top) var(--safe-area-right) var(--safe-area-bottom) var(--safe-area-left);
+}
+
+/* Native fullscreen (the Fullscreen API path). It is requested on this panel
+   rather than on the iframe, so the host can render its overlay layer INSIDE
+   the fullscreen element (see OverlayLayer): a natively fullscreen element
+   paints only its own subtree, and nothing outside it can be seen at any
+   z-index. The base rules size this panel to the content pane, which is not
+   what a fullscreen element needs, and its own background is transparent over
+   the UA's black backdrop.
+
+   Two rules, not one selector list: an unrecognized pseudo-class invalidates
+   the whole list, so pairing :fullscreen with :-webkit-full-screen would drop
+   both on any engine that knows only one of them. */
+.app-ui-inline:fullscreen {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    background: var(--bg-primary);
+}
+
+.app-ui-inline:-webkit-full-screen {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    background: var(--bg-primary);
+}
+
+.pseudo-fullscreen-exit {
+    position: absolute;
+    top: calc(var(--safe-area-top) + var(--fullscreen-exit-inset));
+    right: calc(var(--safe-area-right) + var(--fullscreen-exit-inset));
+    padding: var(--fullscreen-exit-pad);
+    /* Above the `.edge-swipe-zone` guards this overlay also carries, which
+       rank 1: the right strip is 1.25rem wide and the button sits 0.5rem in,
+       so they overlap. At equal z-index the winner would be whichever renders
+       last, and losing this one means no way out of fullscreen but Escape,
+       which a phone has not got. */
+    z-index: 2;
+    background: var(--bg-secondary);
+    border: var(--fullscreen-exit-border) solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.75);
+    opacity: 0.7;
+    transition: opacity var(--duration-fast);
+}
+
+.pseudo-fullscreen-exit:active {
+    opacity: 1;
+}
+
+@media (hover: hover) {
+    .pseudo-fullscreen-exit:hover {
+        opacity: 1;
+    }
+}
+
+/* --- File preview chrome (the path row, and the column holding it) --- */
+
+/* Every file preview in the content pane is this column: the path row, then
+   whichever preview the locator picked (ContentPane.tsx).
+
+   `height: 100%` plus a `flex: 1` body reproduces the box the preview had as a
+   direct child of `.content-pane-body`. Both roots that land in it size
+   themselves against their parent (`.file-preview-inline` here and
+   `.repo-preview-split` in panels/content.css are each `height: 100%`), so
+   without the column each would be a whole path row TALLER than the pane and
+   would leave a second scrollbar around the one it already has. */
+.file-preview-frame {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.file-preview-frame-body {
+    flex: 1;
+    min-height: 0;
+}
+
+/* The one surface that shows the previewed file's WHOLE path (rationale for it
+   existing at all: FilePreviewPath.tsx). Structural chrome above a full-bleed
+   view, so it takes the content pane's own --space-lg gutter rather than the
+   preview's zero one. */
+.file-preview-path {
+    flex: 0 0 auto;
+    padding: var(--space-sm) var(--space-lg);
+    border-bottom: 1px solid var(--border-color);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    /* The last resort, for one folder or name wider than the whole row. Every
+       other break falls between crumbs. */
+    overflow-wrap: anywhere;
+}
+
+/* Keeps each separator on the line of the folder before it. The break between
+   two crumbs belongs to the row, which wraps normally. */
+.file-preview-path-crumb {
+    white-space: nowrap;
+}
+
+.file-preview-path-folder {
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-control);
+    background: none;
+    color: inherit;
+    cursor: pointer;
+    white-space: normal;
+    /* Leaves room on the line for the separator glued after it, when a folder
+       wider than the row wraps inside itself. */
+    max-width: calc(100% - 1ch - 2 * var(--space-xs));
+    text-align: start;
+}
+
+@media (hover: hover) {
+    .file-preview-path-folder:hover {
+        color: var(--text-primary);
+        text-decoration: underline;
+    }
+}
+
+.file-preview-path-sep {
+    margin: 0 var(--space-xs);
+    opacity: 0.6;
+}
+
+/* A box of its own, so the name moves to the next line whole rather than
+   breaking at a hyphen inside it. */
+.file-preview-path-name {
+    display: inline-block;
+    max-width: 100%;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+/* --- File preview inline (panel) --- */
+
+.file-preview-inline {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.file-preview-content {
+    flex: 1;
+    overflow: auto;
+    /* Named so the pinned gutter can paint over it while the code pans; see
+       `.line-numbered-gutter::before` in panels/content.css. The
+       padding is written THROUGH the var so there is one source for the
+       value. */
+    --code-gutter-inset: 0.75rem;
+    padding: var(--code-gutter-inset);
+}
+
+/* An editable task item's text toggles its checkbox (`MarkdownDocument`).
+   It stays document text, so it undoes base.css's unselectable `label` rule:
+   a reader must still be able to select and copy it. */
+.file-preview-content .task-list-label {
+    cursor: pointer;
+    -webkit-touch-callout: default;
+    -webkit-user-select: text;
+    user-select: text;
+}
+
+/* A preview body fades in from its skeleton inside this wrapper. It passes the
+   pane's height through, because the HTML iframe and the editor fill 100%, and
+   still grows with a long file. */
+.file-preview-fade {
+    height: 100%;
+    grid-template-rows: minmax(100%, auto);
+}
+
+/* Warns that the open handshake script will not run (ADR 0144). Tinted with
+   the accent rather than a warning colour, because there is no warning token
+   and inventing one for a single notice would be a theme decision made in the
+   wrong place. */
+.file-preview-notice {
+    margin-bottom: var(--space-md);
+    padding: var(--space-sm) var(--space-md);
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border-color));
+    border-radius: calc(var(--radius-surface) * 0.5);
+    background: color-mix(in srgb, var(--accent) 8%, var(--bg-tertiary));
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+}
+
+.file-preview-notice code {
+    /* The command is meant to be selected and pasted, so it keeps the mono
+       face and a background that separates it from the sentence. */
+    padding: 0 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
+    background: var(--bg-secondary);
+    font-family: var(--font-mono);
+    word-break: break-all;
+}
+
+/* A markdown file's frontmatter, drawn as a properties card above the body
+   (components/files/MarkdownDocument.tsx). The key column is capped so a long
+   key never squeezes the values off a phone screen. */
+.frontmatter-card {
+    display: grid;
+    grid-template-columns: fit-content(40%) minmax(0, 1fr);
+    gap: var(--space-xs) var(--space-md);
+    margin: 0 0 var(--space-lg);
+    padding: var(--space-sm) var(--space-md);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-surface) * 0.5);
+    background: var(--bg-secondary);
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+}
+
+.frontmatter-row {
+    display: contents;
+}
+
+.frontmatter-card dt {
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+
+.frontmatter-card dd {
+    margin: 0;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+.frontmatter-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-xs);
+}
+
+.frontmatter-chip {
+    padding: 0 var(--space-sm);
+    border-radius: var(--radius-round);
+    background: color-mix(in srgb, var(--accent) 15%, var(--bg-tertiary));
+    color: var(--text-primary);
+    font-size: var(--font-size-xs);
+    line-height: 1.6;
+}
+
+/* YAML beyond the simple subset stays as written, wrapped rather than panned. */
+.frontmatter-card-raw {
+    display: block;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* The image body of any file preview (components/files/PreviewImage.tsx). It
+   is scaled to fit the pane, so the cursor advertises the click that opens it
+   full size in the image popup. */
+.preview-image {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    cursor: zoom-in;
+}
+
+/* Every line of this `<pre>` is a `.code-line`, which carries its own
+   white-space (panels/content.css § the two line-wrapping modes). So this rule
+   is type and metrics only; a white-space value here would reach no text. */
+.file-preview-code {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+}
+
+/* --- Inline file editor (data-file preview) --- */
+
+.file-editor {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    gap: 0.5rem;
+}
+
+.file-editor-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    flex-shrink: 0;
+}
+
+/* The buttons form one positioned cluster, and the point of it is that the
+   primary button never moves. This box takes Cancel OUT OF FLOW, so the cluster
+   is exactly as wide as the primary button. Cancel then arrives and leaves by
+   fading in place, and a save cannot reflow the row the user just clicked in. */
+.file-editor-actions {
+    position: relative;
+    display: flex;
+    /* .file-editor-toolbar already places the cluster at its right end. */
+    justify-content: flex-end;
+}
+
+/* Inert is instant; looking inert waits for the delay gate. A save goes out and
+   both buttons are `disabled` on that same frame, so nobody can hit Cancel on a
+   write already on the wire. Wearing `.action-btn:disabled`'s dim that early is
+   what the user saw as a flash, since the save is usually done in tens of
+   milliseconds. `.is-saving` arrives with the Saving… label and brings the dim
+   with it.
+
+   Harmless for the shut Cancel button, which is also disabled: the slot around
+   it carries that state's opacity, not the button. */
+.file-editor-actions:not(.is-saving) .action-btn:disabled {
+    opacity: 1;
+}
+
+/* EditorToolbar mounts Cancel in both states; this class shuts it rather than
+   unmounting it. See EditorToolbar for why a rebuilt row cannot animate.
+
+   The wrapper carries the fade, not the button. `.action-btn:disabled` sets an
+   opacity of its own and outranks a single class on the same element, and two
+   elements' opacities multiply with no cascade to lose. `visibility` rides the
+   same transition, which takes a shut slot out of the accessibility tree. It
+   flips late on the way out, since any value between the two counts as
+   visible, so nothing cuts the fade short. */
+.file-editor-cancel-slot {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 100%;
+    margin-right: 0.5rem;
+    display: flex;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity var(--duration-normal) ease,
+        visibility var(--duration-normal);
+}
+
+.file-editor-cancel-slot.is-open {
+    opacity: 1;
+    visibility: visible;
+}
+
+/* Hold the primary button at its widest label, so the row does not jitter as
+   Save becomes Saving… and then Close. `.send-cancel-morph` carries a reserve
+   for the same reason.
+
+   `ch` is the width of a "0" in the button's OWN font, so this follows the
+   user's font preference instead of pinning a pixel count measured against one
+   of them. Half a character over the 7 in "Saving…", since an ellipsis is
+   wider than a digit in the default face. It sits on the label rather than the
+   button, so it need not restate `.action-btn`'s padding. */
+.file-editor-primary-label {
+    display: inline-block;
+    min-width: 7.5ch;
+}
+
+/* Box and focus: global/text-input.css. */
+.file-editor-textarea {
+    flex: 1;
+    width: 100%;
+    resize: none;
+    box-sizing: border-box;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+    tab-size: 2;
+    padding: 0.5rem 0.625rem;
+}
+
+/* --- Slides preview (.slides files) --- */
+
+.slides-pv {
+    padding: 0.5rem;
+}
+
+.slides-pv-deck-header {
+    padding: 1rem;
+    margin-bottom: 0.75rem;
+}
+
+.slides-pv-deck-title {
+    font-size: var(--font-size-3xl);
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.slides-pv-deck-subtitle {
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
+    margin-top: 0.25rem;
+}
+
+.slides-pv-deck-count {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    margin-top: 0.375rem;
+}
+
+/* Individual slide card */
+.slides-pv-slide {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-surface) * 2 / 3);
+    margin-bottom: 0.5rem;
+    overflow: hidden;
+}
+
+.slides-pv-slide-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    flex-wrap: wrap;
+}
+
+.slides-pv-slide-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.375rem;
+    height: 1.375rem;
+    border-radius: calc(var(--radius-control) * 0.5);
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    flex-shrink: 0;
+}
+
+.slides-pv-slide-title {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* Decorative emphasis on a hero slide — notable, not a caution. Distinct from
+   the author-driven [data-color] palette below, which is a fixed set of literal
+   colour names ("amber", "rose", …) chosen in the slide content itself and so
+   deliberately NOT mapped onto theme tokens. */
+.slides-pv-hero-badge {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.125rem 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+    background: color-mix(in srgb, var(--accent-notable) 15%, transparent);
+    color: var(--accent-notable);
+}
+
+.slides-pv-section-badge {
+    font-size: var(--font-size-2xs);
+    font-weight: 500;
+    padding: 0.125rem 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+    margin-left: auto;
+}
+
+.slides-pv-section-badge[data-color="green"] { background: color-mix(in srgb, var(--accent-green) 15%, transparent); color: var(--accent-green); }
+.slides-pv-section-badge[data-color="cyan"] { background: color-mix(in srgb, #06b6d4 15%, transparent); color: #06b6d4; }
+.slides-pv-section-badge[data-color="accent"] { background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); }
+
+.slides-pv-slide-body {
+    padding: 0.5rem 0.75rem 0.75rem;
+}
+
+/* Slide header (inside body) */
+.slides-pv-header {
+    margin-bottom: 0.5rem;
+}
+
+.slides-pv-tag {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.125rem 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+}
+
+.slides-pv-tag[data-color="green"] { color: var(--accent-green); background: color-mix(in srgb, var(--accent-green) 15%, transparent); }
+.slides-pv-tag[data-color="cyan"] { color: #06b6d4; background: color-mix(in srgb, #06b6d4 15%, transparent); }
+.slides-pv-tag[data-color="purple"] { color: #a78bfa; background: color-mix(in srgb, #a78bfa 15%, transparent); }
+.slides-pv-tag[data-color="orange"] { color: #f59e0b; background: color-mix(in srgb, #f59e0b 15%, transparent); }
+.slides-pv-tag[data-color="amber"] { color: #f59e0b; background: color-mix(in srgb, #f59e0b 15%, transparent); }
+.slides-pv-tag[data-color="rose"] { color: #f43f5e; background: color-mix(in srgb, #f43f5e 15%, transparent); }
+
+.slides-pv-header-title {
+    font-size: var(--font-size-lg);
+    font-weight: 700;
+    color: var(--text-primary);
+    margin-top: 0.375rem;
+}
+
+.slides-pv-header-subtitle {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    margin-top: 0.125rem;
+    line-height: 1.4;
+}
+
+/* HTML content blocks */
+.slides-pv-html {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.slides-pv-html h3 {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 0.25rem;
+}
+
+.slides-pv-html p {
+    margin-bottom: 0.25rem;
+}
+
+.slides-pv-html code {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    background: var(--bg-tertiary);
+    padding: 0.0625rem 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+}
+
+/* Lists */
+.slides-pv-list {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    line-height: 1.5;
+    padding-left: 1rem;
+    margin: 0.25rem 0;
+}
+
+.slides-pv-list li {
+    margin-bottom: 0.125rem;
+}
+
+.slides-pv-list li::marker {
+    color: var(--text-muted);
+}
+
+/* Icon */
+.slides-pv-icon {
+    font-size: var(--font-size-2xl);
+    margin-bottom: 0.25rem;
+}
+
+/* Insight callout */
+/* Emphasis is carried by the tinted surface alone. A colored left border here
+   would be the banned left-accent stripe (.claude/rules/frontend.md F18). */
+.slides-pv-insight {
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+    color: var(--text-secondary);
+    padding: 0.375rem 0.625rem;
+    margin-top: 0.5rem;
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    border-radius: calc(var(--radius-surface) / 3);
+    font-style: italic;
+}
+
+.slides-pv-insight[data-color="green"] { background: color-mix(in srgb, var(--accent-green) 8%, transparent); }
+.slides-pv-insight[data-color="orange"] { background: color-mix(in srgb, #f59e0b 8%, transparent); }
+.slides-pv-insight[data-color="purple"] { background: color-mix(in srgb, #a78bfa 8%, transparent); }
+.slides-pv-insight[data-color="cyan"] { background: color-mix(in srgb, #06b6d4 8%, transparent); }
+
+/* Card */
+.slides-pv-card {
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-surface) * 0.5);
+    padding: 0.5rem 0.625rem;
+    margin-bottom: 0.375rem;
+}
+
+.slides-pv-card[data-highlight="accent"] { border-color: color-mix(in srgb, var(--accent) 40%, var(--border-color)); }
+.slides-pv-card[data-highlight="green"] { border-color: color-mix(in srgb, var(--accent-green) 40%, var(--border-color)); }
+.slides-pv-card[data-highlight="cyan"] { border-color: color-mix(in srgb, #06b6d4 40%, var(--border-color)); }
+.slides-pv-card[data-highlight="purple"] { border-color: color-mix(in srgb, #a78bfa 40%, var(--border-color)); }
+.slides-pv-card[data-highlight="orange"] { border-color: color-mix(in srgb, #f59e0b 40%, var(--border-color)); }
+.slides-pv-card[data-highlight="amber"] { border-color: color-mix(in srgb, #f59e0b 40%, var(--border-color)); }
+.slides-pv-card[data-highlight="rose"] { border-color: color-mix(in srgb, #f43f5e 40%, var(--border-color)); }
+
+/* Columns layout */
+.slides-pv-columns {
+    display: grid;
+    gap: 0.375rem;
+    margin: 0.375rem 0;
+}
+
+.slides-pv-columns[data-layout="columns"] { grid-template-columns: 1fr 1fr; }
+.slides-pv-columns[data-layout="threeCol"] { grid-template-columns: repeat(3, 1fr); }
+.slides-pv-columns[data-layout="fourCol"] { grid-template-columns: repeat(4, 1fr); }
+
+/* Stack columns on narrow panels */
+@media (max-width: 600px) {
+    .slides-pv-columns { grid-template-columns: 1fr; }
+}
+
+/* Group */
+.slides-pv-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+/* Pipeline flow */
+.slides-pv-pipeline {
+    display: flex;
+    gap: 0.25rem;
+    flex-wrap: wrap;
+    margin: 0.375rem 0;
+}
+
+.slides-pv-pipeline-step {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-surface) / 3);
+    padding: 0.25rem 0.5rem;
+    font-size: var(--font-size-xs);
+    color: var(--text-primary);
+}
+
+.slides-pv-pipeline-icon {
+    font-size: var(--font-size-lg);
+}
+
+.slides-pv-pipeline-label {
+    font-weight: 600;
+}
+
+/* Tree (code structure) */
+.slides-pv-tree {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    line-height: 1.5;
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-surface) / 3);
+    padding: 0.5rem 0.625rem;
+    overflow-x: auto;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+/* Skill chips */
+.slides-pv-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    margin: 0.25rem 0;
+}
+
+.slides-pv-chip {
+    font-size: var(--font-size-2xs);
+    padding: 0.125rem 0.375rem;
+    border-radius: calc(var(--radius-control) * 1.5);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+}
+
+/* Event sourcing flow */
+.slides-pv-es-flow {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    margin: 0.375rem 0;
+}
+
+.slides-pv-es-event {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-2xs);
+    padding: 0.125rem 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+    background: color-mix(in srgb, #a78bfa 15%, transparent);
+    color: #a78bfa;
+}
+
+.slides-pv-es-arrow {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+/* Takeaway items */
+.slides-pv-takeaways {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+.slides-pv-takeaway {
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-start;
+}
+
+.slides-pv-takeaway-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.375rem;
+    height: 1.375rem;
+    border-radius: var(--radius-round);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    flex-shrink: 0;
+}
+
+.slides-pv-takeaway-title {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.slides-pv-takeaway-body {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    line-height: 1.4;
+    margin-top: 0.125rem;
+}
+
+/* Badge */
+.slides-pv-badge {
+    display: inline-block;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 0.1875rem 0.5rem;
+    border-radius: calc(var(--radius-control) * 0.5);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+    margin-bottom: 0.5rem;
+}
+
+/* VS label */
+.slides-pv-vs-label {
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+/* Architecture diagram */
+.slides-pv-diagram {
+    margin: 0.375rem 0;
+}
+
+.slides-pv-diagram svg {
+    width: 100%;
+    height: auto;
+}
+
+/* --- URL preview inline (panel) --- */
+
+.url-preview-inline {
+    position: absolute;
+    inset: 0;
+}
+
+.url-preview-frame {
+    width: 100%;
+    height: 100%;
+    border: none;
+    background: var(--bg-primary);
+    pointer-events: none;
+}
+
+/* --- Panel URL title (clickable to edit) --- */
+
+.panel-url-title {
+    cursor: pointer;
+    border-radius: calc(var(--radius-control) * 0.5);
+    padding: 0.125rem 0.375rem;
+    transition: background-color var(--duration-fast);
+}
+
+@media (hover: hover) {
+    .panel-url-title:hover {
+        background: var(--bg-hover);
+    }
+}
+
+/* --- Panel URL input (address bar) --- */
+
+.panel-url-input {
+    pointer-events: auto;
+    width: 100%;
+    max-width: 30rem;
+    padding: 0.125rem 0.5rem;
+    font-size: var(--font-size-sm);
+    font-family: var(--font-ui);
+}
+
+
+.prompt-box {
+    background: var(--bg-secondary);
+    /* Tokenized because the chat composer derives its inner horizontal padding
+       from --turn-surface-inset minus this width, so that its typed text lands
+       on the same content edge as the question / change cards above it
+       (chat/input-messages.css `.prompt-row .prompt-textarea`). */
+    border: var(--prompt-box-border-width) solid color-mix(in srgb, var(--border-color) 50%, transparent);
+    border-radius: calc(var(--radius-surface) * 4 / 3);
+    transition: border-color var(--duration-emphasis) ease, box-shadow var(--duration-normal);
+}
+
+/* The text-input focus (global/text-input.css): the shared --focus-ring glow
+   alone. The border goes transparent but keeps its width, so the composer's
+   text stays on the card content edge. The transparent outline is the
+   forced-colors fallback. */
+.prompt-box:focus-within {
+    border-color: transparent;
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+/* The shared shell of the two .prompt-box surfaces: the chat composer and the
+   trigger form's Intent field. Selector qualified with .prompt-box so it
+   outranks `.form-group textarea` in skills.css (the Intent textarea sits inside
+   both wrappers). The type SCALE is deliberately not here: it differs per
+   surface, so the composer sets its own on `.prompt-row .prompt-textarea`
+   (chat/input-messages.css) and the Intent field keeps the form's size from
+   `.form-group textarea`. */
+.prompt-box .prompt-textarea {
+    width: 100%;
+    padding: 0.5rem 1rem;
+    font-family: var(--font-ui);
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    outline: none;
+    resize: none;
+    min-height: 2.75rem;
+    /* Cap growth so thread content always stays visible above the prompt. */
+    max-height: 40vh;
+    /* overflow-y is managed by resizeTextarea() — hidden when content fits
+       (prevents caret-tracking scroll jank), auto when content exceeds max-height.
+       CSS fallback is hidden; JS overrides inline. */
+    overflow-y: hidden;
+    scrollbar-width: none;
+    line-height: 1.4;
+}
+
+.prompt-box .prompt-textarea::-webkit-scrollbar {
+    display: none;
+}
+
+.prompt-box .prompt-textarea::placeholder {
+    color: var(--text-muted);
+}
+
+/* Message route panel — anchored popover opened from the route badge.
+   See MessageRoutePanel.tsx + useAnchoredPopover hook. */
+.message-route-panel {
+    position: fixed;
+    z-index: var(--z-control-panel);
+    /* A body-only popover: its text sits on the surface inset. */
+    padding: var(--space-md) var(--surface-inset);
+    min-width: 0;
+    max-width: min(24rem, calc(100vw - 1rem));
+    font-size: var(--font-size-md);
+}
+
+.message-route-panel .route-section + .route-section {
+    margin-top: 0.625rem;
+    padding-top: 0.625rem;
+}
+
+.message-route-panel h4 {
+    margin: 0 0 0.375rem;
+    font-size: var(--font-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.03125rem;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+/* All of a section's rows share ONE two-column grid, so every value starts at
+   the same x whatever its label's width. Each row used to be its own flex box,
+   which let "Model", "Effort" and "Repository" each set a different value
+   offset and left the value column visibly ragged.
+
+   `display: contents` on a row lets its label + value join the section's
+   grid. A row therefore
+   contributes EXACTLY two grid items: a third would push every row below it one
+   cell along, so a multi-part value brings its own `.route-value-group` box
+   rather than adding a sibling. Pinned by MessageRoutePanel.test.ts. Anything
+   that is NOT a row (the heading, an audit line, an explainer) spans both
+   columns. */
+.message-route-panel .route-section {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    align-items: baseline;
+    column-gap: 0.5rem;
+    row-gap: 0.125rem;
+}
+
+.message-route-panel .route-section > *:not(.route-row) {
+    grid-column: 1 / -1;
+}
+
+.message-route-panel .route-row {
+    display: contents;
+}
+
+.message-route-panel .route-row > strong {
+    font-weight: 600;
+}
+
+.message-route-panel .route-row > span,
+.message-route-panel .route-row > .accent-link {
+    min-width: 0;
+    word-break: break-word;
+}
+
+/* Direct children only, so a nested span keeps its own colour and takes this
+   one by inheritance. Relaxed to a descendant selector, the rule outscores
+   `.pill`, and the trimmed pill loses its accent.
+
+   `:not(.error-text)` is that same fight one level up. This selector scores
+   (0,2,1) against `.error-text`'s (0,2,0), which is why the Repository row's
+   "(load failed)" rendered secondary rather than red. */
+.message-route-panel .route-row > span:not(.error-text) {
+    color: var(--text-secondary);
+}
+
+.message-route-panel .mono {
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+}
+
+/* A value made of more than one element (app icon + name, user-agent + thread
+   link) keeps them on one line inside the row's single value cell. The baseline
+   is what lines two pieces of TEXT up; the app's icon opts out of it, for the
+   reason its own rule below gives. */
+.message-route-panel .route-value-group {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.message-route-panel .route-value-group > * {
+    min-width: 0;
+    word-break: break-word;
+}
+
+/* The app's icon stays on the name's line. A flex line breaks on an item's FULL
+   width, never on the width it could shrink to. So any name too long to sit
+   beside the icon went below it and stranded it. Held on one line, the name
+   shrinks and wraps its own text instead, which is what the `min-width: 0`
+   above is for.
+
+   `:has()` scopes this to the App row. The API-client row's thread link is a
+   button, and it does want a line of its own once the user-agent fills the
+   row. */
+.message-route-panel .route-value-group:has(> .route-app-icon) {
+    flex-wrap: nowrap;
+}
+
+/* Holds the app's `AppIcon`.
+
+   `align-self` opts the slot out of the group's baseline alignment, which a
+   tile cannot answer. It has no baseline, so the browser synthesizes one at its
+   bottom edge. That parked the tile's bottom on the text baseline and left its
+   top above the cap, riding visibly high beside the name.
+
+   The tile is the step below the row's `--font-size-md` text, as
+   `.explainer-btn` uses for a glyph inline with the same text, so it fits
+   the name's line box.
+
+   The name carries no colour or weight of its own, so it inherits the same
+   secondary as every other value in the panel. */
+.message-route-panel .route-app-icon {
+    --app-icon-size: var(--icon-size-sm);
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    align-self: center;
+}
+
+.message-route-panel .muted {
+    color: var(--text-muted);
+}
+
+.message-route-panel .pill {
+    display: inline-block;
+    margin-left: 0.375rem;
+    padding: 0.0625rem 0.3125rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+    font-size: var(--font-size-3xs);
+    text-transform: uppercase;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+}
+
+.message-route-panel .error-text {
+    color: var(--accent-red);
+}
+
+.message-route-panel .route-explainer {
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+}
+
+.message-route-panel .route-explainer p {
+    margin: 0.25rem 0 0;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+    line-height: 1.4;
+}
+
+/* Technical details: the ids and machine names, folded at the foot of a
+   section. Its rows are `.route-row`s too, so the fold body gives them the
+   same two-column grid the section does. */
+.message-route-panel .route-technical {
+    margin-top: var(--space-sm);
+}
+
+.message-route-panel .route-technical .event-row-fold-body {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    align-items: baseline;
+    column-gap: var(--space-sm);
+    row-gap: 0.125rem;
+}

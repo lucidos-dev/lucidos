@@ -1,0 +1,3720 @@
+//! Engine-version identity + "new version available" detection.
+//!
+//! The dev half of the unified *Switch to new version* flow (see
+//! `docs/plans/2026-07-01-new-engine-version-switch-flow.md`). An *Apply*
+//! rebuilds the engine binary on disk in the background. A running engine then
+//! detects that the on-disk binary differs from the one it runs, and surfaces
+//! the switch. Mirrors the gateway self-reload (`GATEWAY_BUILD_ID`,
+//! `gateway_update_available`).
+//!
+//! Packaged builds never rebuild from source, so `update_available` is always
+//! false here and `BuildState` stays `Idle`. Their "new version" source is the
+//! release updater, `updater.rs`.
+
+use super::background_build::{BackgroundBuild, BuildHost, FinishedBuild};
+use super::LucidosEngine;
+use serde::Serialize;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// How long a `source_behind_head` verdict is reused before the underlying
+/// `git diff` is re-run. version-status is polled ~4s per client; a shared TTL
+/// bounds the git fork to at most one per interval regardless of client count.
+/// Short enough that a freshly-merged engine change surfaces within a few seconds.
+const SOURCE_BEHIND_TTL: Duration = Duration::from_secs(3);
+
+/// How long a [`PendingCommits`] read is reused before `git log` is re-run.
+/// Same rationale and the same window as [`SOURCE_BEHIND_TTL`].
+const PENDING_COMMITS_TTL: Duration = Duration::from_secs(3);
+
+/// How many commit descriptions each [`CommitGroup`] carries. PER GROUP, not
+/// across the range: a flat cap let forty doc commits crowd out the one `feat`
+/// the user actually wanted to read about. The rest are counted
+/// ([`CommitGroup::total`]) rather than named, because the toast is a glance,
+/// not a changelog.
+const PENDING_COMMIT_DESCRIPTION_CAP: usize = 5;
+
+/// Max background rebuilds the self-heal driver auto-triggers for a single HEAD
+/// before giving up (until HEAD moves). Bounds a genuinely broken `main` so it
+/// can't spin builds forever; an Apply or a manual rebuild is always still
+/// available. Debug builds are ~1 min, so this is a few minutes of retrying.
+const SELF_HEAL_MAX_ATTEMPTS_PER_HEAD: u32 = 5;
+
+/// Dev background-rebuild state. `Idle` in packaged (no source rebuild) and
+/// between Applies; the Phase-2 build orchestration drives the transitions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum BuildState {
+    /// No rebuild running and none pending.
+    #[default]
+    Idle,
+    /// A background `cargo build` is in progress; the old engine keeps serving.
+    ///
+    /// Carries the moment it started so the status toast can count up while it
+    /// runs. In the variant rather than beside it, so "building, but nobody
+    /// knows since when" is unrepresentable. In-memory only: a build dies with
+    /// the engine, and a restart starts from `Idle`.
+    Building { started_at: Instant },
+    /// The rebuild finished successfully. Usually that means a newer on-disk
+    /// binary is ready to switch onto, but NOT always: a build can succeed and
+    /// publish nothing this engine can see, which is the wedge
+    /// [`rebuild_is_wedged`] exists to name.
+    ///
+    /// Carries the HEAD the build STARTED from, or `None` when git could not
+    /// say. In the variant for the same reason `Building` carries its instant:
+    /// "a build finished, but nobody knows what it built" is the ambiguity that
+    /// makes the wedge verdict unanswerable. Started-from rather than
+    /// finished-at, because an Apply landing mid-build would otherwise make the
+    /// finished build claim a HEAD it did not compile.
+    Ready { built_head: Option<String> },
+    /// The rebuild failed. The old engine keeps running.
+    ///
+    /// Carries WHY, for the same reason `Building` carries its instant. The
+    /// toast has to tell the user something they can act on. "Failed, but
+    /// nobody knows why" is not representable: a failure no recognizer names
+    /// still reports its exit status and last output line.
+    Failed { reason: BuildFailure },
+}
+
+/// Why a background build failed, reduced to what a toast can carry.
+///
+/// One line, not a log tail. The reader is often on a phone, where the engine
+/// log is unreachable. So this has to BE the message, rather than point at one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BuildFailure {
+    /// The first real error line from the build, already trimmed.
+    pub summary: String,
+    /// A likely fix, when the output looks like a class we recognize. A
+    /// SUGGESTION shown beside the error, never a verdict, so it does not
+    /// decide whether Retry is offered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<String>,
+    /// True only when retrying is PROVED futile, which is what lets the toast
+    /// withhold Retry. That is the `rebuild_wedged` treatment, applied to a
+    /// failing build rather than a fruitless successful one.
+    ///
+    /// **Proof takes a recognized failure AND an observed repeat**, because
+    /// either alone over-fires. See the two paragraphs in
+    /// [`classify_build_failure`] for the false positive each one prevents.
+    ///
+    /// So an unreadable, unrecognized, or first-time failure is `false`.
+    pub repeatable: bool,
+}
+
+impl BuildFailure {
+    /// A failure with a summary and nothing else: no remedy to suggest, and
+    /// never proved repeatable, so Retry stays offered.
+    pub(crate) fn plain(summary: String) -> Self {
+        BuildFailure {
+            summary,
+            remedy: None,
+            repeatable: false,
+        }
+    }
+}
+
+/// Longest summary a toast should carry. Past this the line stops being
+/// readable on a phone, which is the device this whole shape exists for.
+const BUILD_FAILURE_SUMMARY_CAP: usize = 200;
+
+/// Reduce a failed build's output to the one line worth showing, and decide
+/// whether retrying could ever change the answer.
+///
+/// `previous_summary` is the failure the build being reported was retrying, or
+/// `None` when it was not retrying one. It is half of what sets
+/// [`BuildFailure::repeatable`]; the recognized shape is the other half, and
+/// the body says why neither is sufficient alone.
+///
+/// Pure, so every recognizer is testable without running a build.
+///
+/// Three recognizers, tried most specific first: a build-script panic, a cargo
+/// error line, then the wrapper script's own `ERROR:` for a build that died
+/// before cargo ran. See [`script_error`] for why the last one exists.
+///
+/// `None` when the output carries no error line at all. This function never
+/// invents a cause; the caller reports what it saw instead, through
+/// [`unrecognized_build_failure`].
+pub fn classify_build_failure(
+    output: &str,
+    previous_summary: Option<&str>,
+) -> Option<BuildFailure> {
+    // The `error:` line and the panic message are two different things, and
+    // for a build script the panic is the informative one: cargo's own line
+    // only ever says "failed to run custom build command".
+    let error_line = output
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("error:") || l.starts_with("error["));
+    let panic_message = output
+        .lines()
+        .skip_while(|l| !l.contains("panicked at"))
+        .nth(1)
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
+
+    let summary = cap_summary(
+        panic_message
+            .or(error_line)
+            .or_else(|| script_error(output))?,
+    );
+
+    // BOTH halves are required, and each answers a way the other is wrong.
+    //
+    // Repetition alone over-fires, because a summary is not an identity. Two
+    // unrelated type errors both read `error[E0308]: mismatched types`, so a
+    // user fixing one and meeting the next would lose the button mid-progress.
+    //
+    // The shape alone over-fires too. A build script reporting a missing file
+    // may be missing a real input, which a rebuild fixes once it is back.
+    //
+    // Together they are the standard `rebuild_is_wedged` sets: a specific
+    // failure we recognize, observed to survive an attempt that changed nothing.
+    let remedy = stale_artifact_remedy(output);
+    Some(BuildFailure {
+        repeatable: remedy.is_some() && previous_summary == Some(summary.as_str()),
+        remedy,
+        summary,
+    })
+}
+
+/// The failure no recognizer names, described by what the engine saw: the exit
+/// status, and the last line the build printed.
+///
+/// This is what keeps a silent failure honest. A build can die before it
+/// prints anything, and the toast then said the output could not be read. The
+/// output had been read; there was none. Pure, so both shapes are testable.
+fn unrecognized_build_failure(exit: &str, last_line: Option<&str>) -> BuildFailure {
+    let summary = match last_line {
+        Some(line) => format!("the build stopped ({exit}) after printing \"{line}\""),
+        None => format!("the build stopped ({exit}) without printing anything"),
+    };
+    BuildFailure::plain(cap_summary(&summary))
+}
+
+/// Trim a summary to [`BUILD_FAILURE_SUMMARY_CAP`] without splitting a
+/// character.
+fn cap_summary(summary: &str) -> String {
+    summary
+        .get(..summary.floor_char_boundary(BUILD_FAILURE_SUMMARY_CAP))
+        .unwrap_or(summary)
+        .trim_end()
+        .to_string()
+}
+
+/// The wrapper script's own refusal, for a build that died before cargo ran.
+///
+/// `web-dev.sh --engine-build` is a shell script and can fail on its own terms.
+/// A missing tool, a Docker daemon that is down, a preflight that refuses. Each
+/// prints `ERROR:` at line start, the convention every `scripts/lib/*.sh` uses,
+/// and none is a cargo diagnostic. The two recognizers above therefore find
+/// nothing, while the script's own line names the cause.
+///
+/// RANKED LAST, after the panic and the cargo error, and that ordering is the
+/// point. A compile failure is the more specific cause whenever both appear.
+///
+/// Returns the text AFTER the marker. `ERROR:` is how the script shouts, not
+/// part of what it says, and the toast already frames the line as a failure. A
+/// blank remainder is no answer, so it falls through to the next `ERROR:` line.
+fn script_error(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("ERROR:"))
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+}
+
+/// `cargo clean` for a build script that failed on a path which is not there.
+/// That is the shape of a stale cached artifact (ADR 0079). Such a binary is
+/// reused across checkouts sharing a target directory. It can therefore name a
+/// tree that is gone, which cargo calls fresh forever.
+///
+/// A SUGGESTION, never a proof. The same output comes from a build script whose
+/// input is genuinely missing. There a clean fixes nothing and restoring the
+/// file fixes everything. So this names a likely fix beside the error, and
+/// never decides whether Retry is offered.
+fn stale_artifact_remedy(output: &str) -> Option<String> {
+    let build_script_failed = output.contains("failed to run custom build command");
+    let path_missing = output.contains("No such file or directory") || output.contains("NotFound");
+    if !(build_script_failed && path_missing) {
+        return None;
+    }
+    Some(match failing_package(output) {
+        Some(pkg) => format!("cargo clean -p {pkg}"),
+        None => "cargo clean".to_string(),
+    })
+}
+
+/// The package name out of cargo's ``failed to run custom build command for
+/// `name v1.2.3 (/path)` `` line, so the remedy can name `-p <package>`.
+///
+/// `None` rather than a guess when the line is not shaped as expected: a wrong
+/// `-p` would send the user to clean a package that is not the broken one.
+fn failing_package(output: &str) -> Option<&str> {
+    let tail = output.split("custom build command for `").nth(1)?;
+    let name = tail.split([' ', '`']).next()?;
+    (!name.is_empty()).then_some(name)
+}
+
+impl BuildState {
+    /// Kebab-case wire tag for the version-status response.
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            BuildState::Idle => "idle",
+            BuildState::Building { .. } => "building",
+            BuildState::Ready { .. } => "ready",
+            BuildState::Failed { .. } => "failed",
+        }
+    }
+
+    /// Why this build failed, or `None` when it is not a failed build.
+    pub fn failure(&self) -> Option<&BuildFailure> {
+        match self {
+            BuildState::Failed { reason } => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// A fresh `Building` stamped with now. The one constructor, so every build
+    /// start records its own clock rather than inheriting a caller's.
+    pub fn building_now() -> Self {
+        BuildState::Building {
+            started_at: Instant::now(),
+        }
+    }
+
+    /// How long this build has been running, or `None` when it isn't one.
+    pub fn elapsed(&self) -> Option<Duration> {
+        match self {
+            BuildState::Building { started_at } => Some(started_at.elapsed()),
+            _ => None,
+        }
+    }
+
+    /// A finished build stamped with the HEAD it was started from. The one
+    /// constructor for `Ready`, so a completion site cannot forget the stamp.
+    pub fn ready_from(built_head: Option<String>) -> Self {
+        BuildState::Ready { built_head }
+    }
+
+    /// A failed build carrying why. The one constructor for `Failed`, matching
+    /// its two siblings above.
+    pub fn failed_with(reason: BuildFailure) -> Self {
+        BuildState::Failed { reason }
+    }
+}
+
+/// Has a rebuild already been PROVED unable to deliver the pending version?
+///
+/// True when a build for the checkout's current HEAD finished successfully and
+/// the caller has separately established that nothing switchable came of it
+/// (`source_behind_head && !update_available`). Rebuilding again runs the same
+/// build from the same source, so stop offering the button and name the
+/// operator fix instead.
+///
+/// **Scoped to the HEAD the build was started from, and that scoping is the
+/// whole point.** A build that succeeded before new commits landed says nothing
+/// about whether a rebuild would help NOW, so `built_head != head` re-arms the
+/// rebuild. An unknown `built_head` or an unknown HEAD is likewise not a proof:
+/// both fall to `false`, which keeps the escape hatch offered.
+pub fn rebuild_is_wedged(build_state: &BuildState, head: Option<&str>) -> bool {
+    match (build_state, head) {
+        (BuildState::Ready { built_head }, Some(head)) => built_head.as_deref() == Some(head),
+        _ => false,
+    }
+}
+
+/// Memoized on-disk binary build id, keyed by the running binary's last-seen
+/// mtime. A `None` mtime means "not yet checked"; a `None` `disk_build_id` means
+/// the id couldn't be read (binary mid-rewrite / spawn failure / packaged).
+#[derive(Default)]
+pub struct UpdateCheck {
+    last_mtime: Option<std::time::SystemTime>,
+    disk_build_id: Option<String>,
+}
+
+/// Throttled cache of the `source_behind_head` verdict (see
+/// [`LucidosEngine::source_behind_head`]). `checked_at == None` means "never
+/// computed". TTL-gated by `SOURCE_BEHIND_TTL`, so the git probe runs at most
+/// once per interval across all polling clients.
+#[derive(Default)]
+pub struct SourceBehindCache {
+    checked_at: Option<Instant>,
+    behind: bool,
+}
+
+/// Throttled cache of the checkout's HEAD sha (see [`LucidosEngine::head_sha`]).
+/// `checked_at == None` means "never read". A cached `sha` of `None` is a cached
+/// UNKNOWN, deliberately cached so a broken git is not re-forked on every poll.
+/// TTL-gated by [`SOURCE_BEHIND_TTL`], the window the sibling probes use.
+#[derive(Default)]
+pub struct HeadShaCache {
+    checked_at: Option<Instant>,
+    sha: Option<String>,
+}
+
+/// What a commit in the range IS, so the toast can describe the build rather
+/// than reciting its log. Derived from the conventional-commit type; the
+/// frontend owns the wording each kind renders as.
+///
+/// [`CommitGroupKind::Other`] is the honest home of a subject with no type we
+/// recognize (a hand commit, a revert): guessing would be worse than saying so,
+/// and dropping it would lose a commit that might be the interesting one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommitGroupKind {
+    /// `feat`.
+    New,
+    /// `fix`.
+    Fixed,
+    /// `perf`, `refactor`, `style`. In this repo `style` is UI design work, not
+    /// whitespace, so it belongs with the user-visible improvements.
+    Improved,
+    /// No recognized conventional-commit type.
+    Other,
+    /// `docs`, `chore`, `test`, `ci`, `build`, `harden`. Counted, never listed:
+    /// it is the bulk of this repo's log and none of it answers "what am I
+    /// getting". [`CommitGroup::descriptions`] is always empty for this kind.
+    Housekeeping,
+}
+
+impl CommitGroupKind {
+    /// How many kinds there are, and the width of the tallies
+    /// [`group_commit_subjects`] counts into.
+    const COUNT: usize = 5;
+
+    /// This kind's index in those tallies, and in [`COMMIT_GROUP_ORDER`].
+    ///
+    /// An exhaustive `match` rather than a lookup in the order array: adding a
+    /// variant then has to answer this, at compile time, instead of panicking
+    /// on a `position(...).unwrap()` inside a version-status poll.
+    fn slot(self) -> usize {
+        match self {
+            CommitGroupKind::New => 0,
+            CommitGroupKind::Fixed => 1,
+            CommitGroupKind::Improved => 2,
+            CommitGroupKind::Other => 3,
+            CommitGroupKind::Housekeeping => 4,
+        }
+    }
+}
+
+/// One bucket of the pending range, with its own count so a capped list can say
+/// how much it is not showing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CommitGroup {
+    pub kind: CommitGroupKind,
+    /// Every commit in this group, capped or not.
+    pub total: usize,
+    /// Newest-first, at most [`PENDING_COMMIT_DESCRIPTION_CAP`], and empty for
+    /// [`CommitGroupKind::Housekeeping`]. Each line is the commit subject with
+    /// its conventional-commit TYPE stripped and its scope kept as a lead-in
+    /// (`fix(ui): the trash is sized by its ink` becomes `ui: the trash is
+    /// sized by its ink`): the type is already carried by the group, and the
+    /// scope names the area. Nothing is re-capitalized, since these subjects
+    /// are authored lowercase and a mechanical uppercase turns `ui` into `Ui`.
+    pub descriptions: Vec<String>,
+}
+
+/// The commits a *Switch to new version* would bring, grouped by what they are.
+/// Surfaced on `version_status`, and read by two client surfaces: the status
+/// toast behind the spinning brand badge, which says what is being BUILT, and
+/// the new-version confirm, which says what the switch would BRING.
+///
+/// **Only what the switch adds** ([`pending_commits_since`]): the list leaves
+/// out whatever the served client already carries.
+///
+/// **Merges are excluded** ([`pending_commits_since`] passes `--no-merges`). An
+/// Apply lands as a merge named after its branch, which describes no work. What
+/// it merged is already in this range under its own subjects.
+///
+/// "commits", not "changes". A *change* is the coding-agent change the user
+/// Applies (see `system-knowhow/glossary.md`), and not every commit here is one
+/// (a hand commit, a revert).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PendingCommits {
+    /// Every commit the switch brings. Computed from `groups` by
+    /// [`Self::from_groups`], the only constructor, so the count the toast
+    /// headlines can never drift from the list under it.
+    pub total: usize,
+    /// Non-empty groups, in the order the toast lists them.
+    pub groups: Vec<CommitGroup>,
+}
+
+impl PendingCommits {
+    /// The one constructor: derives `total` so it cannot disagree with the
+    /// groups it summarizes.
+    fn from_groups(groups: Vec<CommitGroup>) -> Self {
+        PendingCommits {
+            total: groups.iter().map(|g| g.total).sum(),
+            groups,
+        }
+    }
+}
+
+/// Throttled cache of [`LucidosEngine::pending_commits`], mirroring
+/// [`SourceBehindCache`]. `checked_at == None` means "never computed", and
+/// `commits == None` is a cached UNKNOWN, cached so a wedged git is not
+/// re-forked per poll.
+#[derive(Default)]
+pub struct PendingCommitsCache {
+    checked_at: Option<Instant>,
+    commits: Option<PendingCommits>,
+}
+
+/// Memoized ancestry verdict for the on-disk binary (see
+/// [`LucidosEngine::disk_binary_is_upgrade`]). Keyed by the on-disk build id
+/// alone, because the RUNNING id is a compile-time constant.
+/// `is_strict_ancestor` is the cached
+/// `git merge-base --is-ancestor <disk> <running>` answer; `None` means git
+/// could not tell.
+#[derive(Default)]
+pub struct DiskDirectionCache {
+    disk_id: Option<String>,
+    is_strict_ancestor: Option<bool>,
+}
+
+/// The variable that pins an engine to the build it runs. Only
+/// `scripts/lib/e2e.sh` sets it, so a commit landing in the checkout mid-run
+/// cannot rebuild the e2e engine or raise a version toast over its specs.
+pub const PIN_ENGINE_VERSION_ENV: &str = "LUCIDOS_PIN_ENGINE_VERSION";
+
+/// Does this dev engine look past its own build for a newer version?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersionTracking {
+    /// A newer HEAD or on-disk binary is a new version, and self-heal rebuilds
+    /// toward it. Every engine but the e2e one.
+    FollowCheckout,
+    /// The build this engine runs is the newest it will ever report. Nothing
+    /// newer surfaces, and self-heal never rebuilds.
+    PinnedToBuild,
+}
+
+impl VersionTracking {
+    /// Read [`PIN_ENGINE_VERSION_ENV`]. Once, at construction: a run is pinned
+    /// for its whole life or not at all.
+    pub fn from_env() -> Self {
+        Self::from_flag(std::env::var_os(PIN_ENGINE_VERSION_ENV).as_deref())
+    }
+
+    /// Only `1` pins, the convention `LUCIDOS_PACKAGED` uses. Anything else
+    /// follows the checkout, so a stray value can never freeze a dev engine.
+    fn from_flag(flag: Option<&std::ffi::OsStr>) -> Self {
+        if flag.is_some_and(|v| v == "1") {
+            VersionTracking::PinnedToBuild
+        } else {
+            VersionTracking::FollowCheckout
+        }
+    }
+}
+
+/// May an engine report a version newer than the one it runs?
+///
+/// The one gate three probes share: [`LucidosEngine::source_behind_head`]
+/// (which also drives self-heal), the on-disk binary check, and the
+/// served-frontend peer sync. Packaged engines learn of new versions from the
+/// release updater instead, so they answer no too.
+fn newer_version_visible(tracking: VersionTracking, packaged: bool) -> bool {
+    tracking == VersionTracking::FollowCheckout && !packaged
+}
+
+/// Per-HEAD self-heal attempt bookkeeping (see
+/// [`LucidosEngine::self_heal_engine_version_if_needed`]). `head` is the HEAD
+/// the attempts were counted for; when HEAD moves the counter resets.
+#[derive(Default)]
+pub struct SelfHealState {
+    head: Option<String>,
+    attempts: u32,
+}
+
+/// Wire shape of `GET /api/v1/engine/version-status`.
+#[derive(Serialize)]
+pub struct VersionStatus {
+    /// The running engine's baked build id.
+    pub build_id: String,
+    /// True when a newer engine version is ready to switch onto (dev: the
+    /// on-disk binary build id differs). Always false packaged.
+    pub update_available: bool,
+    /// The on-disk binary's build id (dev), or `None` when packaged or
+    /// unreadable. The frontend keys the "Switch to new version" dismissal on
+    /// this. A dismiss then sticks for THIS on-disk build, while a genuinely
+    /// newer build re-surfaces the switch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_build_id: Option<String>,
+    /// True under the packaged desktop/service runtime. The frontend uses it to
+    /// route to the release updater instead of the dev build/switch flow.
+    pub packaged: bool,
+    /// Dev background-rebuild state: `idle` | `building` | `ready` | `failed`.
+    pub build_state: &'static str,
+    /// True (dev only) when the engine SOURCE is behind HEAD by a
+    /// restart-requiring change, so a NEW engine version exists in source even
+    /// with no fresh binary on disk. Distinct from `update_available`, which
+    /// means a fresh binary IS on disk. The frontend uses it to surface a
+    /// pending version and drive self-heal, so the Switch cannot dead-end.
+    /// Always false packaged or when git is unavailable.
+    pub source_behind_head: bool,
+    /// True (dev only) when the checkout-shared engine-build lock is held, by a
+    /// CO-LOCATED peer engine's `run_engine_build` or by this engine's own
+    /// build. Co-located workspaces share one `target/` and one build lock, so a
+    /// peer's build advances the binary THIS engine serves. A workspace that
+    /// lost the lock would otherwise read as idle and wrongly offer the manual
+    /// "Rebuild" escape hatch instead of the spinner.
+    ///
+    /// Named "shared" rather than "peer" because the probe cannot distinguish
+    /// this engine's own held lock from a peer's. The frontend disambiguates via
+    /// `build_state`. Always false packaged.
+    pub shared_build_in_progress: bool,
+    /// The checkout's HEAD sha, or absent when git could not say, when
+    /// packaged, or when nothing is pending. **Identity, never display**: the
+    /// frontend pins a dismissal of the *pending* version toast to it, the way
+    /// it pins the *Switch* toast to `disk_build_id`. A pending version has no
+    /// on-disk build id to key on, which is precisely what makes it pending.
+    /// When HEAD moves there is something new to announce, and the old dismissal
+    /// stops matching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_commit: Option<String>,
+    /// True when a rebuild has already been proved unable to deliver the pending
+    /// version ([`rebuild_is_wedged`], plus the surrounding "and nothing
+    /// switchable came of it" context). The frontend withholds the *Rebuild*
+    /// button here and names the operator fix instead: the button re-runs the
+    /// same build from the same source, so it completes in seconds and puts the
+    /// same toast straight back. Always false packaged.
+    pub rebuild_wedged: bool,
+    /// Why the last build failed, absent unless `build_state` is `failed`.
+    ///
+    /// The toast renders this INSTEAD of pointing at the engine log, which a
+    /// phone cannot open. Always present on a failure from this engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_failure: Option<BuildFailure>,
+    /// How long THIS engine's own background rebuild has been running, in ms,
+    /// or absent when no build of ours is in flight. A co-located peer's build
+    /// is absent too, since we do not have its clock.
+    ///
+    /// ELAPSED rather than a start timestamp on purpose. Differencing an engine
+    /// wall-clock against the browser's shows a wrong or negative duration
+    /// whenever the two clocks disagree. The client anchors this to its own
+    /// `Date.now()` at receipt and counts up locally, so skew cannot reach the
+    /// number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_elapsed_ms: Option<u64>,
+    /// Present while THIS engine's rebuild waits for a *build slot* rather
+    /// than compiling, naming what holds the slots. Absent otherwise, and
+    /// always absent for a co-located peer's build. See [`queued_behind`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_queued: Option<QueuedBuild>,
+    /// The commits the switch would bring, or absent when git could not say
+    /// (see [`PendingCommits`]). Read only when a surface
+    /// will show it, so an idle workspace forks no git: see
+    /// [`wants_pending_commits`] for the four reasons.
+    ///
+    /// Absent is UNKNOWN, never "none pending": a `Some` with `total: 0` is the
+    /// only way to say there is nothing to bring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_commits: Option<PendingCommits>,
+    /// How long THIS engine has been waiting for the build-watch to republish
+    /// `dist/` after a frontend-only Apply, in ms, or absent when it is not.
+    /// Elapsed rather than a timestamp, for the reason `build_elapsed_ms` gives.
+    /// Always absent packaged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend_refresh_elapsed_ms: Option<u64>,
+}
+
+/// A rebuild that is waiting for a *build slot*, as the version-status wire
+/// carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QueuedBuild {
+    /// What holds each slot, by the label its wrapper recorded.
+    pub holders: Vec<String>,
+}
+
+/// Stands in for a holder that recorded no label.
+const UNLABELLED_HOLDER: &str = "a build";
+
+/// Is the build running in process group `our_group` queued for a slot?
+///
+/// Queued means every slot is held and no holder is in our group. A slot's
+/// holder is the `lucidos build-slot` wrapper, which stays in the build's group
+/// on purpose (ADR 0070). So a holder in our group means we compile.
+/// Pure over the probe results, so each case is testable without a pool.
+fn queued_behind(
+    our_group: Option<u32>,
+    slots: &[lucidos_build_slot::SlotState],
+    group_of: impl Fn(u32) -> Option<u32>,
+) -> Option<QueuedBuild> {
+    let our_group = our_group?;
+    if slots.is_empty() {
+        return None;
+    }
+    let mut holders = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let holder = slot.holder.as_ref()?;
+        if holder.pid.and_then(&group_of) == Some(our_group) {
+            return None;
+        }
+        holders.push(if holder.label.is_empty() {
+            UNLABELLED_HOLDER.to_string()
+        } else {
+            holder.label.clone()
+        });
+    }
+    Some(QueuedBuild { holders })
+}
+
+/// The stash rule, extracted from [`LucidosEngine::stash_restart_actor`] so it
+/// is testable without an engine: **first writer wins, and `None` is never
+/// stored**. Returns whether `actor` was taken.
+///
+/// Two writers race for one slot on a single restart. The in-workspace *Switch*
+/// (`/api/v1/restart`) stashes the device that clicked it and only THEN asks the
+/// gateway to respawn the stack. The gateway notifies the engine back before it
+/// signals (`/api/v1/internal/restart-intent`), so the same restart arrives
+/// twice. Keeping the first makes the second harmless: where the two could
+/// disagree, the one holding the click's HTTP context is the honest answer.
+///
+/// A `None` is not an answer, it is the absence of one, so it must never erase a
+/// stashed actor. That matters for the notify path in particular, whose caller
+/// skips it entirely when it has no device to name.
+fn stash_first_restart_actor(
+    slot: &mut Option<crate::engine::thread_events::MessageOrigin>,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) -> bool {
+    match (slot.is_some(), actor) {
+        (false, Some(actor)) => {
+            *slot = Some(actor);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Move the restart stash into the teardown slot: spend it exactly once, and
+/// leave a COPY where every later emit in this teardown can read it.
+///
+/// The two halves are the whole point, and each answers a different failure:
+///
+/// * Spending it (`take`) is what `take_restart_actor` documents. A stash
+///   belongs to the restart that made it, so a later teardown nobody asked for
+///   cannot inherit a device actor and auto-resume work on the strength of it.
+/// * KEEPING a copy is what stops the answer depending on timing. Without it,
+///   the pre-emit consumes the only copy and every later emit in the same
+///   teardown falls back to a system actor. One *Switch to new version* then
+///   produces two verdicts, decided by when a thread became in-flight.
+///
+/// A free function over the two slots, like [`stash_first_restart_actor`] above,
+/// so the rule is testable without standing up an engine.
+fn open_teardown(
+    restart_slot: &mut Option<crate::engine::thread_events::MessageOrigin>,
+    teardown_slot: &mut Option<crate::engine::thread_events::MessageOrigin>,
+) -> Option<crate::engine::thread_events::MessageOrigin> {
+    let actor = restart_slot.take();
+    *teardown_slot = actor.clone();
+    actor
+}
+
+impl LucidosEngine {
+    /// Stash the device actor at restart-request time. The graceful-shutdown
+    /// boundary emit runs in the signal handler with no HTTP context. Without
+    /// the stash it cannot attribute the restart to "You", and recovery cannot
+    /// auto-resume in-flight threads. Returns whether this call stashed.
+    ///
+    /// Two callers, one per way a user can ask this engine to go down: the
+    /// in-workspace *Switch to new version* handler (`/api/v1/restart`), and
+    /// the gateway's restart-intent notify (`/api/v1/internal/restart-intent`),
+    /// which fires just before the picker's Restart or Stop signals the process.
+    /// Both go through [`stash_first_restart_actor`].
+    pub fn stash_restart_actor(
+        &self,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+    ) -> bool {
+        stash_first_restart_actor(&mut self.restart_actor.lock().unwrap(), actor)
+    }
+
+    /// Take (and clear) the stashed restart actor. Cleared so a later teardown
+    /// nobody asked for (stop.sh, an external SIGUSR1, a crash-respawn) doesn't
+    /// reuse a stale device actor: it then falls back to System attribution and
+    /// a manual Continue.
+    ///
+    /// Two callers, and the second is why this is not simply "read it at
+    /// teardown": [`begin_teardown`](Self::begin_teardown), and `restart_engine`
+    /// undoing its OWN stash when the respawn it asked for never happened. Under
+    /// first-writer-wins an abandoned stash is not merely stale, it is a block on
+    /// the next restart's actor.
+    pub fn take_restart_actor(&self) -> Option<crate::engine::thread_events::MessageOrigin> {
+        self.restart_actor.lock().unwrap().take()
+    }
+
+    /// Open the teardown: mark the engine shutting down, decide the teardown's
+    /// actor ONCE, and return it for the boundary pre-emit.
+    ///
+    /// Called from `main.rs::shutdown_signal` and nowhere else. Everything after
+    /// it reads the decision back through
+    /// [`teardown_actor`](Self::teardown_actor) rather than re-deriving it, which
+    /// is the whole point: **who tore the engine down is a property of the
+    /// teardown, not of when a thread became in-flight.**
+    ///
+    /// A device actor is half the switch fingerprint
+    /// (`agent_recovery::SWITCH_TEARDOWN_ABORT_SQL`). A thread that reaches a
+    /// later emit with a system actor therefore loses the `paused` verdict, the
+    /// withheld Continue button, and the auto-resume. See
+    /// `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`.
+    ///
+    /// Still spends the stash rather than peeking at it, so the invariant
+    /// `take_restart_actor` documents holds unchanged: a stash is consumed by the
+    /// teardown it belongs to. See [`open_teardown`] for both halves of that.
+    pub fn begin_teardown(&self) -> Option<crate::engine::thread_events::MessageOrigin> {
+        self.mark_shutting_down();
+        // A teardown abort can complete a child. Its parent's turn would open on
+        // an engine that is leaving, so the wake waits for the next boot's refire.
+        self.event_bus.hold_parent_wakes();
+        open_teardown(
+            &mut self.restart_actor.lock().unwrap(),
+            &mut self.teardown_actor.lock().unwrap(),
+        )
+    }
+
+    /// The actor of the teardown under way, for an `EngineShutdown` abort that
+    /// runs after the boundary pre-emit. `None` outside a teardown, and `None`
+    /// for one nobody requested (bare `stop.sh`, an external SIGUSR1, ctrl-c).
+    /// Callers fall back to `MessageOrigin::system()` for both.
+    pub(crate) fn teardown_actor(&self) -> Option<crate::engine::thread_events::MessageOrigin> {
+        self.teardown_actor.lock().unwrap().clone()
+    }
+
+    /// Enqueue a thread for auto-resume after a user-initiated switch (recovery).
+    pub(crate) fn enqueue_switch_resume(&self, thread_id: uuid::Uuid) {
+        self.pending_switch_resumes.lock().unwrap().push(thread_id);
+    }
+
+    /// Whether recovery queued this thread for auto-resume. Only answers before
+    /// [`resume_pending_switches`](Self::resume_pending_switches) drains the
+    /// queue, so a caller must run between agent recovery and that drain.
+    pub(crate) fn switch_resume_queued(&self, thread_id: uuid::Uuid) -> bool {
+        self.pending_switch_resumes
+            .lock()
+            .unwrap()
+            .contains(&thread_id)
+    }
+
+    /// Emit `ContinuationRequested` for every thread recovery queued for
+    /// auto-resume after a user-initiated switch, so the spawn dispatcher boots
+    /// a `--resume`. Called by `main.rs` AFTER `SpawnDispatcher::spawn()`, which
+    /// opens the broadcast subscription synchronously before it returns. These
+    /// emits are therefore buffered by the receiver even while the dispatcher's
+    /// startup backfill is still running. Engine-attributed (`actor: None`),
+    /// because the resume is a recovery consequence, not a device click.
+    ///
+    /// Returns the thread ids whose resume this boot has taken responsibility
+    /// for, which `settle_unresumed_switch_threads` must EXCLUDE. The dispatcher
+    /// has not emitted `ContinuationStarted` yet when the floor runs, and
+    /// `ContinuationRequested` is deliberately absent from
+    /// `THREAD_START_EVENTS_SQL`, so a query-only exclusion would re-abort a
+    /// thread that is resuming correctly. The skip branch below still counts as
+    /// actuated: the dispatcher's startup orphan re-dispatch owns that resume.
+    pub async fn resume_pending_switches(&self) -> Vec<uuid::Uuid> {
+        let ids = std::mem::take(&mut *self.pending_switch_resumes.lock().unwrap());
+        let mut actuated = Vec::with_capacity(ids.len());
+        for thread_id in ids {
+            // A prior boot may have left this thread an unactuated
+            // ContinuationRequested: emitted but never spawned. The
+            // dispatcher's startup orphan re-dispatch drives that existing
+            // request. Emitting a second one here would put two request event
+            // ids on one thread, past the per-EVENT idempotency guard, and
+            // double-spawn.
+            if crate::engine::agent_session::spawn_dispatcher::thread_has_unactuated_continuation(
+                self.pool(),
+                thread_id,
+            )
+            .await
+            {
+                log!(
+                    "[Recovery] thread {} already has an unactuated ContinuationRequested: \
+                     the dispatcher's startup orphan re-dispatch owns the resume; skipping duplicate emit",
+                    thread_id
+                );
+                actuated.push(thread_id);
+                continue;
+            }
+            // Only a request that actually PERSISTED counts as actuated. An
+            // emit that errored leaves nothing for the dispatcher to act on, so
+            // the thread must stay visible to
+            // `settle_unresumed_switch_threads`, which withdraws the promise and
+            // gives the user their Continue button back.
+            let requested = crate::engine::thread_events::emit_continuation_requested_or_log(
+                &self.event_bus,
+                thread_id,
+                crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON,
+                None,
+                "[Recovery] ContinuationRequested (auto-resume after switch)",
+            )
+            .await;
+            if requested {
+                actuated.push(thread_id);
+            }
+        }
+        actuated
+    }
+
+    /// [`newer_version_visible`] for this engine.
+    pub(crate) fn newer_version_visible(&self) -> bool {
+        newer_version_visible(self.version_tracking, crate::runtime::is_packaged())
+    }
+
+    /// Current background-rebuild state.
+    pub fn build_state(&self) -> BuildState {
+        self.build_state.read().unwrap().clone()
+    }
+
+    /// Set the background-rebuild state (Phase 2 build orchestration).
+    pub fn set_build_state(&self, state: BuildState) {
+        *self.build_state.write().unwrap() = state;
+    }
+
+    /// The on-disk engine binary's build id (dev), or `None` when packaged or the
+    /// id can't be read (binary mid-rewrite / spawn failure). Cheap on the steady
+    /// path: only forks `current_exe --build-id` when the binary's mtime has moved
+    /// since the last check; otherwise reuses the cached id. Mirrors
+    /// `gateway_update_available`'s memoization.
+    pub async fn engine_disk_build_id(&self) -> Option<String> {
+        if crate::runtime::is_packaged() {
+            return None;
+        }
+        let exe = std::env::current_exe().ok()?;
+        let mtime = std::fs::metadata(&exe).and_then(|m| m.modified()).ok();
+        {
+            let cache = self.update_check.lock().unwrap();
+            if cache.last_mtime == mtime {
+                return cache.disk_build_id.clone();
+            }
+        }
+        let disk_id = match tokio::process::Command::new(&exe)
+            .arg("--build-id")
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                (!id.is_empty()).then_some(id)
+            }
+            // Unreadable, mid-rewrite: leave the cache untouched so the next
+            // poll retries once the mtime settles.
+            _ => return self.update_check.lock().unwrap().disk_build_id.clone(),
+        };
+        let mut cache = self.update_check.lock().unwrap();
+        cache.last_mtime = mtime;
+        cache.disk_build_id = disk_id.clone();
+        disk_id
+    }
+
+    /// Is the on-disk binary a genuine UPGRADE target for this running engine,
+    /// so that switching onto it is a step FORWARD?
+    ///
+    /// The naive test is `disk_build_id != ENGINE_BUILD_ID`, but *different* is
+    /// not *newer*. Co-located dev workspaces share one checkout and one
+    /// published launch binary (ADR 0022 and 0063). The binary on disk is
+    /// therefore written routinely by something other than this workspace. When
+    /// what lands is OLDER, the difference test announces a **downgrade** as a
+    /// new version. Switching then leaves the engine behind HEAD, so self-heal
+    /// rebuilds and the pair ping-pongs forever.
+    ///
+    /// Direction is therefore decided by git ancestry over the two ids' commit
+    /// prefixes. A disk commit that is a STRICT ANCESTOR of the running commit
+    /// is provably older and vetoes the update. Everything indeterminate falls
+    /// back to the difference test. That removes a false positive without adding
+    /// a way to MISS a real update, which is the worse failure.
+    ///
+    /// The ancestry answer is memoized per on-disk build id, in
+    /// [`DiskDirectionCache`], and only consulted when the ids differ. So
+    /// `git merge-base` runs at most once per distinct on-disk binary.
+    pub async fn disk_binary_is_upgrade(&self) -> bool {
+        let disk = self.engine_disk_build_id().await;
+        self.disk_id_is_upgrade(disk.as_deref()).await
+    }
+
+    /// [`Self::disk_binary_is_upgrade`] for an on-disk id the caller already
+    /// read. `version_status` then reports the id and the verdict from ONE
+    /// read, so they cannot straddle an mtime change and disagree.
+    async fn disk_id_is_upgrade(&self, disk: Option<&str>) -> bool {
+        if !self.newer_version_visible() {
+            return false;
+        }
+        let Some(disk) = disk else {
+            return false; // packaged or unreadable: nothing to switch onto
+        };
+        if disk == crate::ENGINE_BUILD_ID {
+            return false; // identical build, no git needed
+        }
+        disk_upgrade_verdict(
+            Some(disk),
+            crate::ENGINE_BUILD_ID,
+            self.disk_is_older(disk).await,
+        )
+    }
+
+    /// Cached `git merge-base --is-ancestor <disk-commit> <running-commit>`.
+    /// `Some(true)` means the on-disk binary is provably OLDER, and `None` means
+    /// git could not tell. Logs the downgrade case once per distinct on-disk
+    /// build id, so the wedge is diagnosable from the engine log.
+    async fn disk_is_older(&self, disk_id: &str) -> Option<bool> {
+        {
+            let cache = self.disk_direction_cache.lock().unwrap();
+            if cache.disk_id.as_deref() == Some(disk_id) {
+                return cache.is_strict_ancestor;
+            }
+        }
+        let verdict = match (
+            build_id_commit(disk_id),
+            build_id_commit(crate::ENGINE_BUILD_ID),
+        ) {
+            (Some(disk_commit), Some(running_commit)) if disk_commit != running_commit => {
+                match crate::paths::repo_root() {
+                    Ok(root) => commit_is_strict_ancestor(&root, disk_commit, running_commit).await,
+                    Err(_) => None,
+                }
+            }
+            // Same commit, differing only in the uncommitted-diff suffix. A
+            // rebuilt dirty tree is a real update, not an older commit.
+            (Some(_), Some(_)) => Some(false),
+            // A `src-…` or empty id on either side: no commit to compare.
+            _ => None,
+        };
+        if verdict == Some(true) {
+            crate::log!(
+                "[Rebuild] on-disk engine binary ({}) is OLDER than the running engine ({}): \
+                 not offering a downgrade as a new version. Something rebuilt an earlier checkout \
+                 state over target/debug; `web-dev.sh -w <ws> -b` rebuilds it forward.",
+                disk_id,
+                crate::ENGINE_BUILD_ID
+            );
+        }
+        let mut cache = self.disk_direction_cache.lock().unwrap();
+        cache.disk_id = Some(disk_id.to_string());
+        cache.is_strict_ancestor = verdict;
+        verdict
+    }
+
+    /// Whether the engine SOURCE is behind HEAD by a restart-requiring change.
+    /// A NEW engine version then exists in source even with no fresh binary on
+    /// disk. Reuses [`Self::engine_source_matches_head`], the SAME git
+    /// classifier the frontend-only-Apply veto uses, so this signal and that
+    /// veto agree by construction. TTL-cached by [`SOURCE_BEHIND_TTL`].
+    /// Dev-only: false packaged.
+    ///
+    /// Direction-guarded for the same reason [`Self::disk_binary_is_upgrade`]
+    /// is. `engine_source_matches_head` compares the two trees with a two-dot
+    /// `git diff <running-commit> HEAD`, which is symmetric: it reports a
+    /// difference whether HEAD is ahead of the running engine or behind it. An
+    /// engine running a commit that HEAD is an ancestor of is not behind
+    /// anything. Claiming otherwise pins a permanent pending-version toast and a
+    /// self-heal build storm on a workspace that is already current.
+    ///
+    /// Always false for a pinned engine, which is what keeps self-heal from
+    /// rebuilding it: see [`VersionTracking::PinnedToBuild`].
+    pub async fn source_behind_head(&self) -> bool {
+        if !self.newer_version_visible() {
+            return false;
+        }
+        {
+            let cache = self.source_behind_cache.lock().unwrap();
+            if cache
+                .checked_at
+                .is_some_and(|at| at.elapsed() < SOURCE_BEHIND_TTL)
+            {
+                return cache.behind;
+            }
+        }
+        // `Some(false)` means a restart-requiring change is pending between the
+        // running engine's commit and HEAD. `Some(true)` (frontend-only) and
+        // `None` (git unavailable) both read as not behind.
+        let behind = self.engine_source_matches_head().await == Some(false)
+            && !self.running_is_ahead_of_head().await;
+        let mut cache = self.source_behind_cache.lock().unwrap();
+        cache.checked_at = Some(Instant::now());
+        cache.behind = behind;
+        behind
+    }
+
+    /// The checkout's HEAD sha, TTL-cached ([`SOURCE_BEHIND_TTL`]), or `None`
+    /// when git could not say.
+    ///
+    /// Three hot-path callers share this: the version-status response (which
+    /// publishes it as the pending version's identity), the wedged-rebuild
+    /// verdict, and the self-heal driver's per-HEAD budget. Uncached, that is a
+    /// `git rev-parse` per caller per ~4s poll per connected client, on a
+    /// question whose answer only changes when someone commits. Dev-only: no
+    /// caller reaches it packaged.
+    pub(crate) async fn head_sha(&self) -> Option<String> {
+        {
+            let cache = self.head_sha_cache.lock().unwrap();
+            if cache
+                .checked_at
+                .is_some_and(|at| at.elapsed() < SOURCE_BEHIND_TTL)
+            {
+                return cache.sha.clone();
+            }
+        }
+        let sha = current_head_sha().await;
+        let mut cache = self.head_sha_cache.lock().unwrap();
+        cache.checked_at = Some(Instant::now());
+        cache.sha.clone_from(&sha);
+        sha
+    }
+
+    /// Is the running engine's commit a strict DESCENDANT of HEAD, so that this
+    /// engine is ahead of the checkout rather than behind it? The direction
+    /// guard for [`Self::source_behind_head`]. `false` whenever git cannot tell,
+    /// so an indeterminate answer changes nothing.
+    async fn running_is_ahead_of_head(&self) -> bool {
+        let Some(running_commit) = build_id_commit(crate::ENGINE_BUILD_ID) else {
+            return false; // `src-…` or unstamped id: no commit to compare
+        };
+        let Ok(root) = crate::paths::repo_root() else {
+            return false;
+        };
+        let Some(head) = self.head_sha().await else {
+            return false;
+        };
+        commit_is_strict_ancestor(&root, &head, running_commit).await == Some(true)
+    }
+
+    /// Full version status for `GET /api/v1/engine/version-status`. A newer
+    /// engine is available when the on-disk binary is readable, differs from the
+    /// running one, and is not provably OLDER than it. See
+    /// [`Self::disk_binary_is_upgrade`], which is always false packaged.
+    pub async fn version_status(&self) -> VersionStatus {
+        let disk_build_id = self.engine_disk_build_id().await;
+        let update_available = self.disk_id_is_upgrade(disk_build_id.as_deref()).await;
+        let source_behind_head = self.source_behind_head().await;
+        // Fail-OPEN-to-false probe: an indeterminate answer must not read as "a
+        // build is running", which would hide the Rebuild escape hatch.
+        let shared_build_in_progress =
+            !crate::runtime::is_packaged() && shared_engine_build_lock_held();
+        let build_state = self.build_state();
+        let pending_commits = if wants_pending_commits(
+            build_state.elapsed().is_some(),
+            shared_build_in_progress,
+            source_behind_head,
+            update_available,
+        ) {
+            self.pending_commits().await
+        } else {
+            None
+        };
+        // The HEAD rides the SAME gate, for the same reason. It only ever
+        // answers "which pending version is this?", so a workspace with nothing
+        // pending has no question to answer.
+        let head_commit = if source_behind_head {
+            self.head_sha().await
+        } else {
+            None
+        };
+        // Wedged is a claim about the PENDING version specifically, so all three
+        // terms are required: the source is ahead, nothing switchable came of
+        // the build anyway, and the build that proved it was for this HEAD.
+        // Dropping the middle term would call a workspace wedged the moment a
+        // successful build produced something the user simply hasn't switched
+        // onto yet.
+        let rebuild_wedged = source_behind_head
+            && !update_available
+            && rebuild_is_wedged(&build_state, head_commit.as_deref());
+        VersionStatus {
+            build_id: crate::ENGINE_BUILD_ID.to_string(),
+            update_available,
+            disk_build_id,
+            packaged: crate::runtime::is_packaged(),
+            build_state: build_state.as_wire(),
+            source_behind_head,
+            head_commit,
+            rebuild_wedged,
+            build_failure: build_state.failure().cloned(),
+            shared_build_in_progress,
+            build_elapsed_ms: build_state
+                .elapsed()
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            build_queued: self.build_queued(),
+            pending_commits,
+            frontend_refresh_elapsed_ms: self
+                .frontend_refresh_elapsed()
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+        }
+    }
+
+    /// Whether this engine's own rebuild is waiting for a build slot. Reads
+    /// the pool only while a build of ours runs, so an idle engine probes
+    /// nothing. An unreadable pool is not a queue.
+    ///
+    /// The build also runs steps that hold no slot, such as publishing and the
+    /// SDK build. A priority waiter must be up, or those would read as queued.
+    fn build_queued(&self) -> Option<QueuedBuild> {
+        if crate::runtime::is_packaged() {
+            return None;
+        }
+        let group = self.build_process_group.load(Ordering::SeqCst);
+        if group == 0 {
+            return None;
+        }
+        let pool = lucidos_build_slot::BuildSlotPool::open().ok()?;
+        if !pool.priority_waiting() {
+            return None;
+        }
+        queued_behind(
+            Some(group),
+            &pool.status(),
+            crate::runtime::spawn_env::process_group_of,
+        )
+    }
+
+    /// The [`PendingCommits`] a switch would bring, or `None` when git could
+    /// not answer. TTL-cached
+    /// ([`PENDING_COMMITS_TTL`]) so the `git log` runs at most once per interval
+    /// across every polling client.
+    async fn pending_commits(&self) -> Option<PendingCommits> {
+        {
+            let mut cache = self.pending_commits_cache.lock().unwrap();
+            if cache
+                .checked_at
+                .is_some_and(|at| at.elapsed() < PENDING_COMMITS_TTL)
+            {
+                return cache.commits.clone();
+            }
+            // Claim the refresh BEFORE dropping the lock and forking git, so a
+            // client polling during the read reuses the previous answer instead
+            // of starting a second `git log`. Stamping only on completion leaves
+            // the TTL bounding nothing under concurrency: every client arriving
+            // mid-read sees the same expired timestamp and forks its own. The
+            // cost is one stale generation for the length of a single `git log`.
+            cache.checked_at = Some(Instant::now());
+        }
+        let commits = self.read_pending_commits().await;
+        self.pending_commits_cache
+            .lock()
+            .unwrap()
+            .commits
+            .clone_from(&commits);
+        commits
+    }
+
+    /// Uncached read behind [`Self::pending_commits`]. `None` at every step
+    /// that cannot produce a trustworthy answer: packaged, a `src-…` build id
+    /// with no commit to range from, no resolvable checkout, or a failed
+    /// `git log`.
+    async fn read_pending_commits(&self) -> Option<PendingCommits> {
+        if crate::runtime::is_packaged() {
+            return None;
+        }
+        let running = build_id_commit(crate::ENGINE_BUILD_ID)?;
+        let root = crate::paths::repo_root().ok()?;
+        let served = self.served_frontend_source_commit();
+        pending_commits_since(running, served.as_deref(), &root).await
+    }
+
+    /// One periodic self-heal tick (dev only). Retriggers a background rebuild
+    /// when the engine SOURCE is behind HEAD with no fresh binary on disk. The
+    /// shared binary then advances and the Switch surfaces, with no manual
+    /// `web-dev.sh -b`.
+    ///
+    /// Coordinated and bounded:
+    /// - Skips when a co-located engine is already building (shared-lock probe),
+    ///   so the N workspaces do not stampede the shared `target/`.
+    /// - Skips when a genuine UPGRADE is already on disk
+    ///   ([`Self::disk_binary_is_upgrade`]), since switching is next rather than
+    ///   rebuilding. Deliberately the SAME question `update_available` asks, so
+    ///   the two can never disagree. A bare `disk != running` here would read an
+    ///   OLDER binary as fresh and suppress the rebuild that would fix it.
+    /// - Bounded to [`SELF_HEAL_MAX_ATTEMPTS_PER_HEAD`] per HEAD, so a broken
+    ///   `main` cannot spin builds forever. The count resets when HEAD moves.
+    /// - Gives up once a rebuild it triggered SUCCEEDED without advancing the
+    ///   binary ([`self_heal_is_wedged`]), which retrying cannot fix.
+    ///
+    /// No-op packaged or when git is unavailable. Driven by the dev periodic
+    /// loop (`frontend_refresh::spawn_served_frontend_sync`).
+    pub(crate) async fn self_heal_engine_version_if_needed(self: &Arc<Self>) {
+        if crate::runtime::is_packaged() {
+            return;
+        }
+        if !self.source_behind_head().await {
+            *self.self_heal_state.lock().unwrap() = SelfHealState::default();
+            return;
+        }
+        // `matches!` rather than `==`: `Building` carries its start instant, so
+        // two in-flight builds are never equal to each other.
+        if matches!(self.build_state(), BuildState::Building { .. }) {
+            return;
+        }
+        // An unreadable disk id reads as "no upgrade" and falls through to the
+        // rebuild, which is the safe direction: at worst we rebuild a binary
+        // that was already fine, and the attempt cap bounds it.
+        if self.disk_binary_is_upgrade().await {
+            return;
+        }
+        let head = self.head_sha().await;
+        // Read the build state at DECISION time, not before the awaits above. A
+        // rebuild can start or finish during them, and judging "did my rebuild
+        // succeed?" from a stale value gives up on a live build.
+        let build_state = self.build_state();
+        {
+            let mut sh = self.self_heal_state.lock().unwrap();
+            if sh.head != head {
+                sh.head = head;
+                sh.attempts = 0;
+            }
+            // Budget spent for this HEAD: stay silent until a new commit lands.
+            // Checked BEFORE the wedge branch below so the give-up is announced
+            // exactly once. The wedge condition stays true on every later tick,
+            // since nothing clears `Ready`, so evaluating it first would re-log
+            // the same line every tick.
+            if sh.attempts >= SELF_HEAL_MAX_ATTEMPTS_PER_HEAD {
+                return;
+            }
+            // A rebuild we triggered for this HEAD finished successfully and
+            // STILL left no upgrade on disk. That is a wedged build
+            // configuration, which no number of retries fixes, so burn the
+            // budget and say so once rather than rebuilding forever.
+            if self_heal_is_wedged(sh.attempts, &build_state, sh.head.as_deref()) {
+                sh.attempts = SELF_HEAL_MAX_ATTEMPTS_PER_HEAD;
+                crate::log!(
+                    "[Rebuild] self-heal: a rebuild succeeded but the on-disk binary is still not \
+                     newer than the running engine ({}), so giving up for this HEAD. Rebuild \
+                     manually with `web-dev.sh -w <ws> -b`.",
+                    crate::ENGINE_BUILD_ID
+                );
+                return;
+            }
+            // Racy probe; the in-build lock in `run_engine_build` is the real
+            // guard. Synchronous, so no await is held across the state lock.
+            if engine_build_in_progress_elsewhere() {
+                return;
+            }
+            sh.attempts += 1;
+        }
+        crate::log!(
+            "[Rebuild] self-heal: engine source is behind HEAD with a stale binary, triggering a background rebuild"
+        );
+        self.join_or_start_background_rebuild();
+    }
+
+    /// Kick off a background engine rebuild (dev only), the non-disruptive half
+    /// of the *Switch to new version* flow. The running engine keeps serving.
+    /// When the rebuild finishes, the on-disk build id differs from the running
+    /// `ENGINE_BUILD_ID` and `version_status` surfaces the switch.
+    ///
+    /// For an Apply and self-heal. A build in flight is **joined**, never
+    /// aborted: it builds once more if HEAD moved past it (ADR 0412). No-op
+    /// packaged.
+    pub fn join_or_start_background_rebuild(self: &Arc<Self>) {
+        if crate::runtime::is_packaged() {
+            return;
+        }
+        crate::engine::background_build::join_or_start(self);
+    }
+
+    /// The explicit Rebuild (`POST /api/v1/engine/rebuild`): abort the build in
+    /// flight, killing its whole process group, and start over. The user's
+    /// escape from a hung build. No-op packaged.
+    pub fn restart_background_rebuild(self: &Arc<Self>) {
+        if crate::runtime::is_packaged() {
+            return;
+        }
+        crate::engine::background_build::restart(self);
+    }
+
+    /// Emit the transient `EngineBuildStateChanged` UI poke. A connected client
+    /// then learns of a background-rebuild transition over the live SSE stream.
+    /// The throttled version-status poll cannot carry it, because iOS suspends
+    /// that timer on a backgrounded PWA. The frontend handler re-runs the
+    /// authoritative `checkEngineVersion` GET, so this is a pure nudge and
+    /// `state` is informational.
+    async fn emit_build_state_changed(&self, state: &BuildState) {
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::System(
+                    crate::engine::event_bus::SystemEvent::EngineBuildStateChanged {
+                        state: state.as_wire().to_string(),
+                        sent_at_ms: crate::engine::now_epoch_millis(),
+                    },
+                ),
+                "[Rebuild] EngineBuildStateChanged",
+            )
+            .await;
+    }
+}
+
+#[async_trait::async_trait]
+impl BuildHost for LucidosEngine {
+    fn background_build(&self) -> &BackgroundBuild {
+        &self.background_build
+    }
+
+    fn build_state(&self) -> BuildState {
+        LucidosEngine::build_state(self)
+    }
+
+    fn set_build_state(&self, state: BuildState) {
+        LucidosEngine::set_build_state(self, state);
+    }
+
+    async fn emit_build_state_changed(&self, state: &BuildState) {
+        LucidosEngine::emit_build_state_changed(self, state).await;
+    }
+
+    async fn run_build(&self, previous_failure: Option<&str>) -> FinishedBuild {
+        // Read BEFORE the build, so a `Ready` records the source it
+        // actually compiled. Read after, an Apply landing mid-build would
+        // give `Ready` commits it never saw, and `rebuild_is_wedged` would
+        // declare futile a rebuild nobody has attempted yet.
+        //
+        // UNCACHED, unlike every other caller. Here a stale read is recorded
+        // as fact: an Apply that moves HEAD and triggers a build inside one
+        // TTL window hands this build the PREVIOUS commit. The stamp is then
+        // wrong forever, and the wedge for that HEAD is missed. One fork per
+        // build, against a build running for tens of seconds, is cheap.
+        let built_head = current_head_sha().await;
+        let outcome = run_engine_build(
+            self.workspace_path(),
+            previous_failure,
+            &self.build_process_group,
+        )
+        .await;
+        let state = match outcome {
+            EngineBuildOutcome::Succeeded => BuildState::ready_from(built_head.clone()),
+            EngineBuildOutcome::Failed(reason) => BuildState::failed_with(reason),
+            // A co-located engine holds the shared build lock. This is
+            // NOT our compile failure, so it must not surface the
+            // build-failed toast. The peer's build advances the shared
+            // binary, and the self-heal driver retries next tick if it
+            // does not land.
+            EngineBuildOutcome::SkippedLocked => BuildState::Idle,
+        };
+        FinishedBuild { state, built_head }
+    }
+
+    /// A success is judged by the binary it published, which the build
+    /// script's own rebuild once may have moved past `built_head`.
+    async fn covers_head(&self, finished: &FinishedBuild) -> bool {
+        let built = match &finished.state {
+            // A peer holds the build lock and builds for us. Self-heal follows
+            // that build up, as it did before any join.
+            BuildState::Idle => return true,
+            BuildState::Ready { .. } => self
+                .engine_disk_build_id()
+                .await
+                .as_deref()
+                .and_then(build_id_commit)
+                .map(str::to_string)
+                .or_else(|| finished.built_head.clone()),
+            _ => finished.built_head.clone(),
+        };
+        let (Some(built), Some(head), Ok(root)) =
+            (built, current_head_sha().await, crate::paths::repo_root())
+        else {
+            return false;
+        };
+        build_covers_head(&built, &head, &root).await
+    }
+}
+
+/// Whether a build of commit `built` already reflects `head`: the same commit,
+/// or no restart-requiring file between them. An unknown answer reads as
+/// "not covered", since one more build costs less than a binary behind HEAD.
+async fn build_covers_head(built: &str, head: &str, root: &std::path::Path) -> bool {
+    head.starts_with(built) || no_restart_between(built, head, root).await == Some(true)
+}
+
+/// Outcome of a background engine build. `SkippedLocked` is distinct from
+/// `Failed`: a co-located engine holds the checkout-shared build lock, so THIS
+/// engine deliberately did not build. Not a compile failure, so it must not
+/// surface the "build failed" toast.
+enum EngineBuildOutcome {
+    Succeeded,
+    /// Carries why, so the toast can say it.
+    Failed(BuildFailure),
+    SkippedLocked,
+}
+
+/// Try to acquire the checkout-shared engine-build lock, an advisory `flock` in
+/// the checkout's `.launch/` (see `engine_build_lock_path` and ADR 0063).
+/// Returns the held guard, or `None` when a co-located engine holds it.
+///
+/// Co-located workspaces share one checkout and one `target/`, so only one
+/// `web-dev.sh --engine-build` may run at a time. Concurrent cargo builds on
+/// the same target OOM or corrupt it (CLAUDE.md). Keep the returned guard alive
+/// for the whole build; dropping it releases the lock.
+fn try_acquire_engine_build_lock() -> Option<std::fs::File> {
+    try_lock_file(&engine_build_lock_path()?)
+}
+
+/// How long [`run_engine_build`] waits for the checkout-shared build lock before
+/// concluding a co-located engine owns it.
+///
+/// A single instantaneous try is not a verdict, it is a sample. Two things make
+/// a FREE lock read as held for a few milliseconds: a build this one just
+/// superseded may still be dropping its guard, and a concurrently-forked
+/// subprocess transiently inherits the open file description until it reaches
+/// `exec`. Both resolve in milliseconds, while a genuine peer build runs for a
+/// minute or more, so a short wait separates the two.
+const BUILD_LOCK_WAIT: Duration = Duration::from_secs(3);
+
+/// Poll interval while waiting for [`BUILD_LOCK_WAIT`]. `flock` has no async
+/// notification, so the wait is a poll; fine at this granularity for something
+/// that either resolves in milliseconds or not at all.
+const BUILD_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// [`try_lock_file`] with a bounded retry, for the one caller that must not
+/// mistake a millisecond of contention for a peer build. Returns the held guard,
+/// or `None` when `wait` elapsed with the lock still held. Path- and
+/// duration-parameterized so the timing is unit-testable without a checkout.
+async fn acquire_engine_build_lock_waiting(
+    lock_path: &std::path::Path,
+    wait: Duration,
+) -> Option<std::fs::File> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(guard) = try_lock_file(lock_path) {
+            return Some(guard);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(BUILD_LOCK_POLL).await;
+    }
+}
+
+/// SIGKILLs the build's process group if the build future is DROPPED, i.e. when
+/// an explicit Rebuild restarts it.
+///
+/// `kill_on_drop(true)` reaches only the direct child, which is `web-dev.sh`.
+/// The `cargo` it spawned is a grandchild and survives. Without this guard, a
+/// restarted build leaves its `cargo` compiling against the shared `target/`,
+/// slowing the build the user is waiting on.
+///
+/// Disarmed the moment the child is reaped. After `wait` the pid, and with it
+/// the group id, can be recycled, and signalling a recycled group would hit
+/// unrelated processes (see `spawn_env::signal_child_process_group`).
+///
+/// It also PUBLISHES the group while armed, for the queued probe. Clearing it
+/// at the same moment keeps the probe from reading a recycled group too.
+///
+/// SIGKILL is untrappable, so a kill landing inside the launch-binary publish
+/// leaves its `*.tmp.<pid>` behind. That is disk only, never a corrupt binary:
+/// the publish copies and signs a temp and reaches the launch path solely
+/// through `mv -f`. `prune_dead_launch_temps` (`scripts/lib/workspace.sh`)
+/// collects the residue on the next publish.
+struct BuildProcessGroupGuard<'a> {
+    pid: Option<u32>,
+    published: &'a AtomicU32,
+}
+
+impl<'a> BuildProcessGroupGuard<'a> {
+    fn arm(pid: Option<u32>, published: &'a AtomicU32) -> Self {
+        published.store(pid.unwrap_or(0), Ordering::SeqCst);
+        BuildProcessGroupGuard { pid, published }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+        self.published.store(0, Ordering::SeqCst);
+    }
+}
+
+impl Drop for BuildProcessGroupGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            self.published.store(0, Ordering::SeqCst);
+            crate::runtime::spawn_env::kill_child_process_group_now(pid);
+        }
+    }
+}
+
+/// Path of the checkout-shared engine-build lock, or `None` when `repo_root` is
+/// unresolvable. Split out so `run_engine_build` can tell "no checkout to
+/// coordinate on", which proceeds uncoordinated, from "a peer holds the lock",
+/// which skips. The two must not be conflated.
+///
+/// Sits beside the published launch binaries in `.launch/`, deliberately NOT
+/// under `target/`. `flock` binds to an INODE, not to a path, so a `cargo clean`
+/// that deletes the lock file mid-build releases nothing: the next builder
+/// creates a fresh file, gets a fresh inode, and takes an uncontended lock. Both
+/// then run cargo against the shared `target/` at once, which is the collision
+/// this lock exists to prevent. `.launch/` is outside every cargo subcommand's
+/// reach, so the inode is stable for the life of the checkout.
+fn engine_build_lock_path() -> Option<std::path::PathBuf> {
+    Some(
+        crate::paths::repo_root()
+            .ok()?
+            .join(".launch")
+            .join(".lucidos-engine-build.lock"),
+    )
+}
+
+/// Open (creating parents) and non-blocking advisory-`flock` `lock_path`,
+/// returning the held guard or `None` when another open file description holds
+/// it. `flock` is per-open-file-description on Unix, so a second open of the
+/// same path conflicts, in this process and across processes alike.
+fn try_lock_file(lock_path: &std::path::Path) -> Option<std::fs::File> {
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        // The file is a pure `flock` handle: nothing is ever written into it,
+        // and a peer may already hold this same path open.
+        .truncate(false)
+        .open(lock_path)
+        .ok()?;
+    fs2::FileExt::try_lock_exclusive(&file).ok()?;
+    Some(file)
+}
+
+/// Cheap "is a co-located engine building right now?" probe: try the shared
+/// build lock and immediately release it. Racy by nature, since the real guard
+/// is the lock held across [`run_engine_build`]. Treats an un-acquirable lock as
+/// busy, so the self-heal driver skips this tick and retries.
+fn engine_build_in_progress_elsewhere() -> bool {
+    match try_acquire_engine_build_lock() {
+        Some(file) => {
+            let _ = fs2::FileExt::unlock(&file);
+            false
+        }
+        None => true,
+    }
+}
+
+/// Whether the checkout-shared engine-build lock is **definitely** held, so a
+/// build IS running, this engine's own or a co-located peer's. Drives the
+/// `shared_build_in_progress` version-status field.
+///
+/// Deliberately the INVERSE fail-mode of [`engine_build_in_progress_elsewhere`],
+/// which treats an unrunnable probe as busy so the self-heal driver errs toward
+/// NOT stampeding a peer. This one **fails open to `false`**. The wire field
+/// suppresses the manual "Rebuild" escape hatch, so an indeterminate probe
+/// reading as busy would hide that hatch while nothing advances the binary.
+/// Returns `true` ONLY when the non-blocking `flock` fails with `WouldBlock`.
+fn shared_engine_build_lock_held() -> bool {
+    match engine_build_lock_path() {
+        Some(path) => lock_held_at(&path),
+        None => false, // no checkout to coordinate on, so no shared build
+    }
+}
+
+/// Path-parameterized core of [`shared_engine_build_lock_held`], split out so
+/// the held, free and indeterminate cases are unit-testable without a checkout.
+/// Returns `true` ONLY when a non-blocking `flock` fails with `WouldBlock`. A
+/// free lock, an unopenable file, or any other lock error returns `false`.
+fn lock_held_at(path: &std::path::Path) -> bool {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        // Probe-only open: never truncate the lock file a peer may be holding.
+        .truncate(false)
+        .open(path)
+    else {
+        return false; // unopenable probe file is indeterminate, so fail open
+    };
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            // Acquired, so held by no one. Release immediately.
+            let _ = fs2::FileExt::unlock(&file);
+            false
+        }
+        // WouldBlock means another open file description holds it.
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+        // Indeterminate, so fail open and keep Rebuild available.
+        Err(_) => false,
+    }
+}
+
+/// The commit prefix of an engine build id, or `None` when there isn't one.
+///
+/// `build.rs` stamps `<short-sha>` for a clean tree and `<short-sha>-<diffhash>`
+/// when engine source is dirty, falling back to `src-<hash>` with no git. Only
+/// the commit is comparable across two binaries, so split at the first `-` and
+/// reject the no-git and unstamped forms.
+pub(crate) fn build_id_commit(id: &str) -> Option<&str> {
+    if id.is_empty() || id.starts_with("src") {
+        return None;
+    }
+    let commit = id.split('-').next().unwrap_or("");
+    (!commit.is_empty()).then_some(commit)
+}
+
+/// Is anyone going to read the pending range this poll? Pure, so the four
+/// reasons are one expression rather than a condition inlined in
+/// [`LucidosEngine::version_status`].
+///
+/// The range is read only when something will show it, since an at-rest
+/// workspace would otherwise fork a `git log` per poll per connected client.
+/// Each term names a surface that describes the range:
+///
+/// - `build_running`: this engine's own rebuild, narrated by the status toast.
+/// - `shared_building`: a co-located peer's, which advances the same binary.
+/// - `source_behind`: new code with nothing built behind it, the pending toast.
+/// - `update_available`: a built version waiting to be switched onto. This is
+///   the one the *new version* confirm reads, and it is not implied by any of
+///   the others: a finished rebuild leaves nothing building, and a binary can
+///   differ from the running one without the source being behind HEAD.
+fn wants_pending_commits(
+    build_running: bool,
+    shared_building: bool,
+    source_behind: bool,
+    update_available: bool,
+) -> bool {
+    build_running || shared_building || source_behind || update_available
+}
+
+/// The [`PendingCommits`] a switch from the `running` commit would bring, or
+/// `None` when git could not answer.
+///
+/// Every commit since `running` that the served client lacks. `served` is the
+/// commit its snapshot was built from
+/// (`LucidosEngine::served_frontend_source_commit`). Excluding both keeps the
+/// list inside `running..HEAD` even when `served` is older. With no `served`
+/// commit known, or one past an engine change, it lists everything since
+/// `running`.
+///
+/// `--no-merges`: an Apply lands as a merge whose subject is the branch name,
+/// and everything it merged is in this same range under its own subject.
+async fn pending_commits_since(
+    running: &str,
+    served: Option<&str>,
+    root: &std::path::Path,
+) -> Option<PendingCommits> {
+    let served = match served {
+        Some(commit) => compatible_served_commit(running, commit, root).await,
+        None => None,
+    };
+    let mut args = vec![
+        "log".to_string(),
+        "--no-merges".to_string(),
+        "--format=%s".to_string(),
+        "HEAD".to_string(),
+        format!("^{running}"),
+    ];
+    args.extend(served.map(|commit| format!("^{commit}")));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    classify_pending_commits(crate::engine::git_ops::git_cmd(&args, root).await)
+}
+
+/// `candidate` when a client built from it runs on the `running` engine, else
+/// `None`. That is INV-A's git test: no file `files_require_restart` flags
+/// differs between the two commits.
+///
+/// Excluding a served commit only through this check means an engine change
+/// is never left out of the list as already served.
+async fn compatible_served_commit(
+    running: &str,
+    candidate: &str,
+    root: &std::path::Path,
+) -> Option<String> {
+    (no_restart_between(running, candidate, root).await == Some(true))
+        .then(|| candidate.to_string())
+}
+
+/// Whether no file `files_require_restart` flags differs between `from` and
+/// `to`. `None` when git could not answer: a failed spawn, the timeout, or a
+/// commit this checkout does not know.
+pub(crate) async fn no_restart_between(
+    from: &str,
+    to: &str,
+    root: &std::path::Path,
+) -> Option<bool> {
+    let out = crate::engine::git_ops::git_cmd(&["diff", "--name-only", from, to], root)
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    Some(!crate::engine::git_ops::files_require_restart(&files))
+}
+
+/// Whether this binary still serves the engine source at HEAD: no file
+/// `files_require_restart` flags differs between its build commit and HEAD.
+/// `None` for an unstamped id, no checkout, or a git probe that could not run.
+pub(crate) async fn own_source_matches_head() -> Option<bool> {
+    let commit = build_id_commit(crate::ENGINE_BUILD_ID)?;
+    let root = crate::paths::repo_root().ok()?;
+    no_restart_between(commit, "HEAD", &root).await
+}
+
+/// What `lucidos-engine --build-id --source-state` prints.
+///
+/// The dev build script reads it to decide whether HEAD moving during a build
+/// needs a second build (`published_build_state`, `scripts/lib/workspace.sh`).
+/// It treats every answer but `current` as a mismatch.
+pub async fn own_source_state() -> &'static str {
+    source_state_word(own_source_matches_head().await)
+}
+
+fn source_state_word(no_restart: Option<bool>) -> &'static str {
+    match no_restart {
+        Some(true) => "current",
+        Some(false) => "stale",
+        None => "unknown",
+    }
+}
+
+/// Classify a [`pending_commits_since`] run into the grouped commit list the
+/// status toast shows, keeping "git could not answer" apart from "git answered
+/// none".
+///
+/// `Err` is a spawn failure or the [`GIT_TIMEOUT`](crate::engine::git_ops)
+/// ceiling, and a non-zero exit means git refused the range. Neither says
+/// anything about what is pending, so both are `None`. Only a successful run
+/// yields a verdict, and an empty one is a real `total: 0` with no groups.
+/// Reading an unanswerable probe as "nothing is coming" is the failure this
+/// split exists to prevent (`.claude/rules/rust.md`).
+fn classify_pending_commits(
+    result: Result<std::process::Output, String>,
+) -> Option<PendingCommits> {
+    match result {
+        Ok(out) if out.status.success() => Some(group_commit_subjects(
+            String::from_utf8_lossy(&out.stdout).lines(),
+        )),
+        Ok(_) | Err(_) => None,
+    }
+}
+
+/// The order the toast lists the groups in. What the user is being GIVEN leads;
+/// what was merely tidied trails.
+const COMMIT_GROUP_ORDER: [CommitGroupKind; CommitGroupKind::COUNT] = [
+    CommitGroupKind::New,
+    CommitGroupKind::Fixed,
+    CommitGroupKind::Improved,
+    CommitGroupKind::Other,
+    CommitGroupKind::Housekeeping,
+];
+
+/// Split a conventional-commit subject into its type, scope and description, or
+/// `None` when it isn't one. Pure and deliberately strict: the type is `[a-z]+`
+/// optionally followed by a `(scope)` and/or a breaking-change `!`, then `": "`.
+/// A looser rule would read the colon in an ordinary English subject as a type
+/// tag and eat the words before it, so "Note to self: don't" keeps its lead-in
+/// and lands in [`CommitGroupKind::Other`] whole.
+fn split_conventional(subject: &str) -> Option<(&str, &str, &str)> {
+    let (head, rest) = subject.split_once(": ")?;
+    let head = head.strip_suffix('!').unwrap_or(head);
+    let (kind, scope) = match head.split_once('(') {
+        Some((kind, scope)) => (kind, scope.strip_suffix(')')?),
+        None => (head, ""),
+    };
+    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_lowercase()) {
+        return None;
+    }
+    Some((kind, scope, rest))
+}
+
+/// Classify one commit subject into its group and the line the toast shows for
+/// it. Pure, so the whole taxonomy is testable without a repository.
+///
+/// An unrecognized type keeps its WHOLE subject: we only strip a tag we
+/// understood, since deleting a token we could not classify loses information
+/// for nothing.
+fn classify_commit_subject(subject: &str) -> (CommitGroupKind, String) {
+    let Some((kind, scope, description)) = split_conventional(subject) else {
+        return (CommitGroupKind::Other, subject.to_string());
+    };
+    let group = match kind {
+        "feat" => CommitGroupKind::New,
+        "fix" => CommitGroupKind::Fixed,
+        "perf" | "refactor" | "style" => CommitGroupKind::Improved,
+        "docs" | "chore" | "test" | "ci" | "build" | "harden" => CommitGroupKind::Housekeeping,
+        _ => return (CommitGroupKind::Other, subject.to_string()),
+    };
+    let line = if scope.is_empty() {
+        description.to_string()
+    } else {
+        format!("{scope}: {description}")
+    };
+    (group, line)
+}
+
+/// Group commit subjects (newest first) into the list the status toast shows.
+/// Pure so the taxonomy, the per-group cap, the counts and the ordering are
+/// testable without a repository.
+///
+/// Blank subjects are dropped: they would render as an empty bullet, and they
+/// would inflate the count of what the user is waiting for. Empty groups are
+/// omitted, so no heading is ever rendered over nothing.
+fn group_commit_subjects<'a>(subjects: impl IntoIterator<Item = &'a str>) -> PendingCommits {
+    let mut totals = [0usize; CommitGroupKind::COUNT];
+    let mut descriptions: [Vec<String>; CommitGroupKind::COUNT] = Default::default();
+    for subject in subjects
+        .into_iter()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        let (kind, line) = classify_commit_subject(subject);
+        let slot = kind.slot();
+        totals[slot] += 1;
+        // Housekeeping is counted only, so it collects no lines to send.
+        if kind != CommitGroupKind::Housekeeping
+            && descriptions[slot].len() < PENDING_COMMIT_DESCRIPTION_CAP
+        {
+            descriptions[slot].push(line);
+        }
+    }
+    PendingCommits::from_groups(
+        COMMIT_GROUP_ORDER
+            .into_iter()
+            .zip(totals)
+            .zip(descriptions)
+            .filter(|((_, total), _)| *total > 0)
+            .map(|((kind, total), descriptions)| CommitGroup {
+                kind,
+                total,
+                descriptions,
+            })
+            .collect(),
+    )
+}
+
+/// Is the on-disk binary a genuine upgrade, given its id, the running id, and
+/// the ancestry answer? `Some(true)` means the disk commit is provably older,
+/// and `None` means git could not tell.
+///
+/// An upgrade is a readable, DIFFERENT id that is not provably older.
+/// Indeterminate ancestry keeps the plain difference test, because stranding
+/// the user on an old engine with no Switch is the worse failure.
+fn disk_upgrade_verdict(
+    disk_id: Option<&str>,
+    running_id: &str,
+    disk_is_strict_ancestor: Option<bool>,
+) -> bool {
+    match disk_id {
+        Some(disk) => disk != running_id && disk_is_strict_ancestor != Some(true),
+        None => false,
+    }
+}
+
+/// Has SELF-HEAL proved that rebuilding cannot help for this HEAD? The wedge
+/// verdict ([`rebuild_is_wedged`], the shared definition the wire also reports)
+/// plus the one extra condition that belongs to the driver rather than to the
+/// verdict: self-heal must have triggered a rebuild in this process
+/// (`attempts > 0`) before it is entitled to spend its own budget on the answer.
+///
+/// The caller only reaches this after establishing that no upgrade is on disk,
+/// which is the "and nothing switchable came of it" half `version_status` states
+/// explicitly.
+///
+/// `Failed` deliberately does NOT count: a compile error is exactly what
+/// self-heal exists to retry, under the per-HEAD attempt cap. See
+/// `docs/plans/2026-07-03-engine-version-switch-selfheal.md`.
+fn self_heal_is_wedged(attempts: u32, build_state: &BuildState, head: Option<&str>) -> bool {
+    attempts > 0 && rebuild_is_wedged(build_state, head)
+}
+
+/// Is `ancestor` a STRICT ancestor of `descendant`? That is `git merge-base
+/// --is-ancestor` plus the two being different commits. `None` when git cannot
+/// answer, so callers can tell "provably older" from "don't know".
+///
+/// The gateway carries a hand-synced copy of this, and of [`build_id_commit`]
+/// and [`disk_upgrade_verdict`], in `crates/lucidos-gateway/src/build_id.rs`.
+/// ADR 0014 keeps that crate free of any dependency on the engine, so **keep
+/// the two in step**.
+///
+/// Takes `root` rather than resolving it internally so the tests can drive it
+/// against a throwaway repo.
+///
+/// STRICT is enforced here, not by git: `git merge-base --is-ancestor X X`
+/// exits 0, so the same commit must be screened out first. The screen is
+/// prefix-aware because build ids carry git's SHORT sha while
+/// `current_head_sha` returns the full one.
+async fn commit_is_strict_ancestor(
+    root: &std::path::Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Option<bool> {
+    if ancestor.starts_with(descendant) || descendant.starts_with(ancestor) {
+        return Some(false); // same commit, possibly abbreviated, so not OLDER
+    }
+    let out = crate::engine::git_ops::git_cmd(
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        root,
+    )
+    .await
+    .ok()?;
+    match out.status.code() {
+        Some(0) => Some(true),  // is an ancestor
+        Some(1) => Some(false), // is not an ancestor
+        // Any other code is an error (bad object, not a repo), not a verdict.
+        _ => None,
+    }
+}
+
+/// The checkout's current HEAD sha (`git rev-parse HEAD`), or `None` when git is
+/// unavailable. Keys the self-heal attempt counter so a broken `main` gives up
+/// per-HEAD and retries once new work lands.
+async fn current_head_sha() -> Option<String> {
+    let root = crate::paths::repo_root().ok()?;
+    crate::engine::git_ops::current_head_sha(&root).await
+}
+
+/// Run `web-dev.sh --engine-build -w <ws>` to rebuild the engine binary on disk,
+/// copying its output into the workspace engine log. The build runs in its own
+/// process group so a restart kills `cargo` too, not just the script
+/// (see [`BuildProcessGroupGuard`]). Holds the checkout-shared build lock for
+/// the whole build, and returns `SkippedLocked` when a peer already holds it.
+async fn run_engine_build(
+    workspace: &std::path::Path,
+    previous_failure: Option<&str>,
+    published_group: &AtomicU32,
+) -> EngineBuildOutcome {
+    // Elect a single builder across co-located engines. With no resolvable
+    // checkout there is no shared `target/` to coordinate on, so proceed
+    // uncoordinated rather than never building. Only a genuinely held lock
+    // means a peer is building.
+    let _build_lock = match engine_build_lock_path() {
+        Some(path) => match acquire_engine_build_lock_waiting(&path, BUILD_LOCK_WAIT).await {
+            Some(guard) => Some(guard),
+            None => {
+                crate::log!(
+                    "[Rebuild] the checkout-shared engine build lock stayed held for {}s, \
+                     skipping this build (a co-located workspace is building; its build \
+                     advances the shared binary for us too)",
+                    BUILD_LOCK_WAIT.as_secs()
+                );
+                return EngineBuildOutcome::SkippedLocked;
+            }
+        },
+        None => None,
+    };
+    let script = match crate::paths::script("web-dev.sh") {
+        Ok(s) => s,
+        Err(e) => {
+            crate::log!("[Rebuild] cannot locate web-dev.sh: {e}");
+            return EngineBuildOutcome::Failed(BuildFailure::plain(format!(
+                "cannot locate web-dev.sh: {e}"
+            )));
+        }
+    };
+    let cmd = engine_build_command(&script, workspace);
+    let log_path = workspace.join(".lucidos/engine.log");
+    match run_capturing_output(cmd, &log_path, BUILD_OUTPUT_DRAIN_GRACE, published_group).await {
+        Ok((status, _)) if status.success() => EngineBuildOutcome::Succeeded,
+        Ok((status, output)) => {
+            crate::log!("[Rebuild] engine build exited {status}");
+            let reason = classify_build_failure(&output.head_text(), previous_failure)
+                .unwrap_or_else(|| {
+                    unrecognized_build_failure(&status.to_string(), output.last_line().as_deref())
+                });
+            crate::log!("[Rebuild] cause: {}", reason.summary);
+            EngineBuildOutcome::Failed(reason)
+        }
+        Err(e) => {
+            crate::log!("[Rebuild] {e}");
+            EngineBuildOutcome::Failed(BuildFailure::plain(e))
+        }
+    }
+}
+
+/// The `web-dev.sh --engine-build` command, before its output is wired.
+///
+/// It waits for a build slot as a priority waiter, because the user is
+/// watching this build (ADR 0304). Nothing else in the tree asks for that.
+fn engine_build_command(
+    script: &std::path::Path,
+    workspace: &std::path::Path,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(script);
+    cmd.arg("-w")
+        .arg(workspace)
+        .arg("--engine-build")
+        .env(lucidos_build_slot::ENV_PRIORITY, "1")
+        .kill_on_drop(true);
+    // Own process group, so a restart can reach the `cargo` grandchild
+    // and not just this script. See `BuildProcessGroupGuard`.
+    crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
+    cmd
+}
+
+/// How long to wait for a build's output to end after the build exits. A
+/// process the build left running can hold the pipe open indefinitely, so the
+/// build's result does not wait on end-of-file.
+const BUILD_OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Run `cmd` with stdout and stderr on ONE pipe that this function drains. It
+/// copies every chunk into `log_path` and keeps the text for
+/// [`classify_build_failure`].
+///
+/// A pipe rather than the log file itself, because the file failed for real.
+/// Handed the log as its stdout, the build exited 1 in under a second and wrote
+/// zero bytes: its first `echo` failed under `set -e`, and so did the error
+/// message. The pipe stays writable while this function reads it. So a log that
+/// cannot be written costs the copy, never the build, and says so with its
+/// real error.
+///
+/// One pipe for both streams keeps them in the order they were printed.
+async fn run_capturing_output(
+    mut cmd: tokio::process::Command,
+    log_path: &std::path::Path,
+    drain_grace: Duration,
+    published_group: &AtomicU32,
+) -> Result<(std::process::ExitStatus, BuildOutput), String> {
+    use tokio::io::AsyncReadExt;
+    let capture_failed = |e: std::io::Error| format!("could not capture the build output: {e}");
+    let (sender, mut receiver) = tokio::net::unix::pipe::pipe().map_err(capture_failed)?;
+    let stdout = sender.into_blocking_fd().map_err(capture_failed)?;
+    let stderr = stdout.try_clone().map_err(capture_failed)?;
+    cmd.stdout(stdout).stderr(stderr);
+    // `spawn` + `wait` rather than `status`, so the pid is in hand for the
+    // group-kill guard before the wait can be cancelled.
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start the build: {e}"))?;
+    // Our copies of the write end must go, or end-of-file never arrives.
+    drop(cmd);
+    let mut group_guard = BuildProcessGroupGuard::arm(child.id(), published_group);
+    let mut output = BuildOutput::new(log_path);
+    let mut buf = vec![0u8; 8192];
+    let mut open = true;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status,
+            read = receiver.read(&mut buf), if open => match read {
+                Ok(0) => open = false,
+                Err(e) => {
+                    crate::log!("[Rebuild] stopped reading the build output: {e}");
+                    open = false;
+                }
+                Ok(n) => output.push(&buf[..n]),
+            },
+        }
+    };
+    // Reaped: the pid may now be recycled, so the group must not be signalled.
+    group_guard.disarm();
+    let status = status.map_err(|e| format!("the build could not be waited on: {e}"))?;
+    if open {
+        let drained = tokio::time::timeout(drain_grace, async {
+            while let Ok(n @ 1..) = receiver.read(&mut buf).await {
+                output.push(&buf[..n]);
+            }
+        })
+        .await;
+        if drained.is_err() {
+            crate::log!(
+                "[Rebuild] a process the build started still holds its output open; \
+                 its output keeps going to the log in the background"
+            );
+            // Keep the read end alive. Closing it would turn that process's
+            // next write into a SIGPIPE, which the log file never did.
+            let mut log = output.log.take();
+            tokio::spawn(async move {
+                use std::io::Write;
+                let mut buf = vec![0u8; 8192];
+                while let Ok(n @ 1..) = receiver.read(&mut buf).await {
+                    if let Some(Err(e)) = log.as_mut().map(|f| f.write_all(&buf[..n])) {
+                        crate::log!("[Rebuild] stopped copying late build output: {e}");
+                        log = None;
+                    }
+                }
+            });
+        }
+    }
+    Ok((status, output))
+}
+
+/// How much of a build's output to keep for [`classify_build_failure`]. Cargo
+/// stops at the error, so it sits near the start. The cap therefore costs
+/// nothing and bounds a pathological build.
+const BUILD_OUTPUT_HEAD_CAP: usize = 512 * 1024;
+
+/// How much of the END of a build's output to keep, for the last line an
+/// unrecognized failure reports.
+const BUILD_OUTPUT_TAIL_CAP: usize = 4 * 1024;
+
+/// What a build printed, as it arrives: the head the classifier reads, a short
+/// tail for the last line, and the copy into the engine log.
+struct BuildOutput {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    log: Option<std::fs::File>,
+    log_path: std::path::PathBuf,
+}
+
+impl BuildOutput {
+    /// Opens `log_path` for appending. A log that cannot be opened is logged
+    /// and skipped: the copy is a convenience, the build is not.
+    fn new(log_path: &std::path::Path) -> Self {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .inspect_err(|e| {
+                crate::log!(
+                    "[Rebuild] cannot open {} to copy the build output: {e}",
+                    log_path.display()
+                );
+            })
+            .ok();
+        BuildOutput {
+            head: Vec::new(),
+            tail: Vec::new(),
+            log,
+            log_path: log_path.to_path_buf(),
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        use std::io::Write;
+        if let Some(log) = &mut self.log {
+            if let Err(e) = log.write_all(chunk) {
+                crate::log!(
+                    "[Rebuild] stopped copying the build output to {}: {e}",
+                    self.log_path.display()
+                );
+                self.log = None;
+            }
+        }
+        let room = BUILD_OUTPUT_HEAD_CAP.saturating_sub(self.head.len());
+        self.head.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        self.tail.extend_from_slice(chunk);
+        if self.tail.len() > 2 * BUILD_OUTPUT_TAIL_CAP {
+            self.tail.drain(..self.tail.len() - BUILD_OUTPUT_TAIL_CAP);
+        }
+    }
+
+    /// The kept head as text. Lossy, deliberately: a partial UTF-8 sequence
+    /// can land at the cap, and a decode error must not cost the error line
+    /// before it.
+    fn head_text(&self) -> String {
+        String::from_utf8_lossy(&self.head).into_owned()
+    }
+
+    /// The last non-blank line the build printed, or `None` when it printed
+    /// nothing but whitespace.
+    fn last_line(&self) -> Option<String> {
+        String::from_utf8_lossy(&self.tail)
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .map(str::to_string)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        acquire_engine_build_lock_waiting, build_id_commit, classify_build_failure,
+        classify_commit_subject, classify_pending_commits, commit_is_strict_ancestor,
+        compatible_served_commit, disk_upgrade_verdict, engine_build_command,
+        engine_build_lock_path, group_commit_subjects, lock_held_at, newer_version_visible,
+        no_restart_between, open_teardown, pending_commits_since, queued_behind, rebuild_is_wedged,
+        run_capturing_output, self_heal_is_wedged, source_state_word, stash_first_restart_actor,
+        try_lock_file, unrecognized_build_failure, wants_pending_commits, BuildFailure,
+        BuildOutput, BuildProcessGroupGuard, BuildState, CommitGroupKind, QueuedBuild,
+        VersionTracking, BUILD_FAILURE_SUMMARY_CAP, BUILD_OUTPUT_HEAD_CAP, BUILD_OUTPUT_TAIL_CAP,
+        COMMIT_GROUP_ORDER, PENDING_COMMIT_DESCRIPTION_CAP, UNLABELLED_HOLDER,
+    };
+    use crate::engine::thread_events::MessageOrigin;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    // ── Why a build failed ───────────────────────────────────────────────────
+
+    /// The real output from the incident that produced this code path: a build
+    /// script carrying a path into a checkout that had been deleted.
+    const STALE_BUILD_SCRIPT_OUTPUT: &str = "\
+   Compiling lucidos-engine v0.1.0 (/repo/crates/lucidos-engine)
+error: failed to run custom build command for `lucidos-engine v0.1.0 (/repo/crates/lucidos-engine)`
+
+Caused by:
+  process didn't exit successfully: `/repo/target/debug/build/lucidos-engine-7d7f/build-script-build` (exit status: 101)
+  --- stderr
+
+  thread 'main' (11466974) panicked at crates/lucidos-engine/build.rs:52:45:
+  Failed to create default VERSION: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+";
+
+    #[test]
+    fn the_stale_build_script_failure_is_named_with_its_likely_remedy() {
+        // The class this whole change exists for: the panic message is the
+        // cause, and cargo's own line only says "custom build command".
+        let f = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, None)
+            .expect("a build-script panic must classify");
+        assert!(
+            f.summary.contains("Failed to create default VERSION"),
+            "the panic message is the cause, not cargo's generic line: {}",
+            f.summary
+        );
+        assert_eq!(f.remedy.as_deref(), Some("cargo clean -p lucidos-engine"));
+    }
+
+    #[test]
+    fn a_recognized_shape_alone_never_retires_the_retry_button() {
+        // The shape is a GUESS. A build script reporting a missing file may be
+        // missing a real input, which a rebuild fixes once it is back, and
+        // `cargo clean` does not. So a first sighting keeps Retry.
+        let f = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, None).expect("must classify");
+        assert!(
+            !f.repeatable,
+            "a pattern is not proof; only a repeat is: {f:?}"
+        );
+    }
+
+    #[test]
+    fn an_identical_repeat_is_what_proves_retrying_futile() {
+        // The build in between changed nothing, so the button goes. Same
+        // evidence-based shape as `rebuild_is_wedged`.
+        let first = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, None).expect("must classify");
+        let second = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, Some(&first.summary))
+            .expect("must classify");
+        assert!(second.repeatable);
+    }
+
+    #[test]
+    fn a_repeating_generic_error_line_never_retires_retry_on_its_own() {
+        // A summary is not an identity. Two unrelated type errors both read
+        // `error[E0308]: mismatched types`. Fix one, meet the next, and the
+        // button would go while the user is making progress. So repetition
+        // only counts for a failure we actually recognize.
+        let out = "error[E0308]: mismatched types\n --> src/b.rs:9:1\n";
+        let f = classify_build_failure(out, Some("error[E0308]: mismatched types"))
+            .expect("must classify");
+        assert!(
+            !f.repeatable,
+            "a repeated generic line is not a repeated failure: {f:?}"
+        );
+    }
+
+    #[test]
+    fn a_build_that_fails_differently_re_arms_retry() {
+        // Something changed between the two attempts, so the next one is
+        // worth taking. A restored input lands here.
+        let previous = "error[E0308]: mismatched types";
+        let f = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, Some(previous))
+            .expect("must classify");
+        assert!(!f.repeatable);
+    }
+
+    #[test]
+    fn an_ordinary_compile_error_keeps_the_retry_button() {
+        let f = classify_build_failure(
+            "error[E0308]: mismatched types\n --> crates/lucidos-engine/src/foo.rs:12:5\n",
+            None,
+        )
+        .expect("a compile error must classify");
+        assert_eq!(f.summary, "error[E0308]: mismatched types");
+        assert_eq!(f.remedy, None);
+        assert!(!f.repeatable);
+    }
+
+    #[test]
+    fn output_with_no_error_line_is_not_given_a_cause() {
+        // The classifier never invents a cause. The caller describes what it
+        // saw instead, through `unrecognized_build_failure`.
+        assert!(classify_build_failure("", None).is_none());
+        assert!(classify_build_failure("   Compiling lucidos-engine v0.1.0\n", None).is_none());
+    }
+
+    #[test]
+    fn a_missing_path_outside_a_build_script_gets_no_clean_remedy() {
+        // `cargo clean` is not the fix for a source file that genuinely is not
+        // there, so the recognizer must not claim it.
+        let f = classify_build_failure(
+            "error: couldn't read src/gone.rs: No such file or directory (os error 2)\n",
+            None,
+        )
+        .expect("must classify");
+        assert_eq!(f.remedy, None);
+    }
+
+    #[test]
+    fn an_unparseable_package_line_falls_back_to_a_bare_clean() {
+        // A wrong `-p` would send the user to clean the wrong package. So an
+        // unrecognized line drops the flag rather than guess at a name.
+        let out = "error: failed to run custom build command\n\
+                   No such file or directory\n";
+        let f = classify_build_failure(out, None).expect("must classify");
+        assert_eq!(f.remedy.as_deref(), Some("cargo clean"));
+    }
+
+    #[test]
+    fn a_runaway_error_line_is_capped_without_splitting_a_character() {
+        // The summary goes in a toast on a phone. Capping by BYTE index would
+        // panic on a multi-byte character straddling the boundary.
+        let long = format!("error: {}", "\u{e9}".repeat(400));
+        let f = classify_build_failure(&long, None).expect("must classify");
+        assert!(f.summary.len() <= BUILD_FAILURE_SUMMARY_CAP);
+    }
+
+    /// The real output from the incident that produced the script recognizer: a
+    /// background rebuild that died in the port allocator, before cargo. The
+    /// workspace path is a placeholder; everything else is verbatim.
+    const PORT_ALLOCATOR_OUTPUT: &str = "\
+ports.sh: refusing to signal protected host pid 39004
+ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 5173 (pid 39004)
+       Source: lucidos.toml vite=5173 (vite=5173, vite-internal=3000).
+       Free that port or change the pin in /Users/me/workspaces/dev/lucidos.toml.
+";
+
+    #[test]
+    fn a_build_that_died_before_cargo_still_names_its_cause() {
+        // The class this recognizer exists for. The output WAS captured, and
+        // its first error line said what went wrong. No cargo diagnostic
+        // appeared, so the toast reported the cause as unreadable.
+        let f = classify_build_failure(PORT_ALLOCATOR_OUTPUT, None)
+            .expect("a script refusal must classify");
+        assert!(
+            f.summary.starts_with("pinned port for workspace"),
+            "the marker is how the script shouts, not part of the cause: {}",
+            f.summary
+        );
+        assert_eq!(f.remedy, None);
+        assert!(
+            !f.repeatable,
+            "no remedy recognized, so Retry stays offered"
+        );
+    }
+
+    #[test]
+    fn a_repeated_script_refusal_still_keeps_the_retry_button() {
+        // Same rule as every other unrecognized shape: repetition alone is not
+        // proof. Retiring Retry takes a recognized remedy AND an observed
+        // repeat, and this recognizer deliberately offers no remedy.
+        let first = classify_build_failure(PORT_ALLOCATOR_OUTPUT, None).expect("must classify");
+        let second = classify_build_failure(PORT_ALLOCATOR_OUTPUT, Some(&first.summary))
+            .expect("must classify");
+        assert!(!second.repeatable, "{second:?}");
+    }
+
+    #[test]
+    fn a_compile_error_beats_a_script_error_line() {
+        // Ordering is the point. A script that shouts on its way out while
+        // cargo has already said what is wrong must not replace the diagnosis.
+        let out = "ERROR: the build slot broker went away\n\
+                   error[E0433]: failed to resolve: use of undeclared crate `foo`\n";
+        let f = classify_build_failure(out, None).expect("must classify");
+        assert_eq!(
+            f.summary,
+            "error[E0433]: failed to resolve: use of undeclared crate `foo`"
+        );
+    }
+
+    #[test]
+    fn a_build_script_panic_beats_a_script_error_line_too() {
+        // The panic outranks both, unchanged by this recognizer.
+        let out = format!("ERROR: something the wrapper shouted\n{STALE_BUILD_SCRIPT_OUTPUT}");
+        let f = classify_build_failure(&out, None).expect("must classify");
+        assert!(
+            f.summary.contains("Failed to create default VERSION"),
+            "{}",
+            f.summary
+        );
+    }
+
+    #[test]
+    fn a_bare_marker_with_nothing_after_it_is_not_a_cause() {
+        // "ERROR:" alone says nothing, and a blank summary would render as a
+        // toast with an empty cause. Fall through to the line that talks.
+        let out = "ERROR:\nERROR:   the real problem\n";
+        let f = classify_build_failure(out, None).expect("must classify");
+        assert_eq!(f.summary, "the real problem");
+
+        // ...and with no talking line at all, the cause stays unknown.
+        assert!(classify_build_failure("ERROR:\nERROR:    \n", None).is_none());
+    }
+
+    #[test]
+    fn a_marker_mid_line_is_prose_and_is_never_claimed() {
+        // The marker is how these scripts shout, at line start. A sentence
+        // mentioning one is not a diagnosis.
+        assert!(classify_build_failure("the build hit an ERROR: somewhere\n", None).is_none());
+    }
+
+    #[test]
+    fn a_silent_failure_says_it_printed_nothing() {
+        // The incident: exit 1 in under a second, zero bytes. The output WAS
+        // read; there was none. Saying it could not be read was the lie.
+        let f = unrecognized_build_failure("exit status: 1", None);
+        assert_eq!(
+            f.summary,
+            "the build stopped (exit status: 1) without printing anything"
+        );
+        assert_eq!(f.remedy, None);
+        assert!(!f.repeatable, "an unknown cause never retires Retry");
+    }
+
+    #[test]
+    fn an_unrecognized_failure_quotes_its_last_line() {
+        let f = unrecognized_build_failure("signal: 9 (SIGKILL)", Some("Building engine..."));
+        assert_eq!(
+            f.summary,
+            "the build stopped (signal: 9 (SIGKILL)) after printing \"Building engine...\""
+        );
+        let long = "\u{e9}".repeat(400);
+        let f = unrecognized_build_failure("exit status: 1", Some(&long));
+        assert!(f.summary.len() <= BUILD_FAILURE_SUMMARY_CAP);
+    }
+
+    #[test]
+    fn the_failure_rides_in_the_variant_and_only_the_failed_variant_has_one() {
+        // Same argument as `Building` carrying its instant: "failed, but nobody
+        // knows why" should not be reachable through the state.
+        let f = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, None).expect("must classify");
+        let state = BuildState::failed_with(f);
+        assert_eq!(state.as_wire(), "failed");
+        assert!(state.failure().is_some());
+        assert!(BuildState::Idle.failure().is_none());
+        assert!(BuildState::ready_from(None).failure().is_none());
+        assert!(BuildState::building_now().failure().is_none());
+    }
+
+    // ── Capturing the build's output ─────────────────────────────────────────
+
+    fn shell(script: &str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lucidos-build-output-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn both_streams_are_captured_in_order_and_copied_to_the_log() {
+        let dir = scratch_dir("order");
+        let log = dir.join("engine.log");
+        let (status, output) = run_capturing_output(
+            shell("echo first; echo second >&2; echo third; exit 3"),
+            &log,
+            Duration::from_secs(2),
+            &AtomicU32::new(0),
+        )
+        .await
+        .expect("the build must run");
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(output.head_text(), "first\nsecond\nthird\n");
+        assert_eq!(output.last_line().as_deref(), Some("third"));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "first\nsecond\nthird\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_log_that_cannot_be_written_never_fails_the_build() {
+        // The incident class. Handed the log as its stdout, the build died on
+        // its first `echo` and said nothing. Through the pipe it cannot.
+        let dir = scratch_dir("unwritable");
+        let log = dir.join("engine.log");
+        std::fs::write(&log, "").unwrap();
+        let mut perms = std::fs::metadata(&log).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o444);
+        std::fs::set_permissions(&log, perms).unwrap();
+        let (status, output) = run_capturing_output(
+            shell("set -e; echo Building engine...; echo done"),
+            &log,
+            Duration::from_secs(2),
+            &AtomicU32::new(0),
+        )
+        .await
+        .expect("the build must run");
+        assert!(status.success(), "{status}");
+        assert_eq!(output.last_line().as_deref(), Some("done"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_process_left_holding_the_pipe_does_not_hang_the_build() {
+        // A daemon the build started inherits the write end, so end-of-file
+        // may never come. The grace bounds the wait.
+        let dir = scratch_dir("lingering");
+        let started = std::time::Instant::now();
+        let (status, output) = run_capturing_output(
+            shell("sleep 5 & echo done"),
+            &dir.join("engine.log"),
+            Duration::from_millis(200),
+            &AtomicU32::new(0),
+        )
+        .await
+        .expect("the build must run");
+        assert!(status.success());
+        assert_eq!(output.last_line().as_deref(), Some("done"));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "waited {:?} for a pipe a daemon held open",
+            started.elapsed()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_output_keeps_a_bounded_head_and_tail() {
+        let dir = scratch_dir("caps");
+        let mut output = BuildOutput::new(&dir.join("engine.log"));
+        output.push(b"error: the first line wins\n");
+        let filler = vec![b'x'; 1024];
+        for _ in 0..(BUILD_OUTPUT_HEAD_CAP / filler.len() + 8) {
+            output.push(&filler);
+        }
+        output.push(b"\nthe last line\n");
+        assert_eq!(output.head.len(), BUILD_OUTPUT_HEAD_CAP);
+        assert!(output.head_text().starts_with("error: the first line wins"));
+        assert!(output.tail.len() <= 2 * BUILD_OUTPUT_TAIL_CAP);
+        assert_eq!(output.last_line().as_deref(), Some("the last line"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── The restart-actor stash ──────────────────────────────────────────────
+
+    fn device(id: &str) -> Option<MessageOrigin> {
+        Some(MessageOrigin::Device {
+            device_id: id.to_string(),
+        })
+    }
+
+    fn device_id_of(slot: &Option<MessageOrigin>) -> Option<&str> {
+        match slot {
+            Some(MessageOrigin::Device { device_id, .. }) => Some(device_id.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_first_restart_actor_wins_and_a_later_one_cannot_overwrite_it() {
+        // The in-workspace Switch stashes the device that clicked it, then asks
+        // the gateway to respawn the stack; the gateway notifies back before it
+        // signals, so the SAME restart tries to stash twice. The click's own
+        // actor is the one that must survive.
+        let mut slot = None;
+        assert!(stash_first_restart_actor(&mut slot, device("the-click")));
+        assert!(
+            !stash_first_restart_actor(&mut slot, device("the-notify")),
+            "a second stash must report that it did not store"
+        );
+        assert_eq!(device_id_of(&slot), Some("the-click"));
+    }
+
+    #[test]
+    fn stashing_none_never_erases_an_actor_and_never_fills_an_empty_slot() {
+        // `None` is the absence of an answer, not an answer. The notify path
+        // skips itself when it has no device to name, and nothing else may turn
+        // that silence into a cleared stash.
+        let mut slot = device("the-click");
+        assert!(!stash_first_restart_actor(&mut slot, None));
+        assert_eq!(device_id_of(&slot), Some("the-click"));
+
+        let mut empty = None;
+        assert!(!stash_first_restart_actor(&mut empty, None));
+        assert!(empty.is_none());
+    }
+
+    #[test]
+    fn a_taken_slot_accepts_the_next_restarts_actor() {
+        // First-writer-wins is per restart, not for the engine's lifetime, and
+        // this is the half that makes the rule safe. `take_restart_actor` empties
+        // the slot both at teardown and when a restart request FAILS before the
+        // engine was signalled (`restart_engine` undoing its own stash), and the
+        // freed slot has to be writable again: otherwise one abandoned stash
+        // would refuse every later restart's actor for the life of the process.
+        let mut slot = None;
+        assert!(stash_first_restart_actor(&mut slot, device("first")));
+        slot.take();
+        assert!(stash_first_restart_actor(&mut slot, device("second")));
+        assert_eq!(device_id_of(&slot), Some("second"));
+    }
+
+    // ── Opening the teardown ─────────────────────────────────────────────────
+
+    #[test]
+    fn opening_the_teardown_spends_the_stash_and_keeps_a_copy_for_every_later_emit() {
+        // The pre-emit is not the only thing that emits an `EngineShutdown`
+        // abort during a teardown: `shutdown_active_threads` and
+        // `emit_stop_terminal`'s abort arm run after it, for threads that
+        // became in-flight after its snapshot. All three must attribute the
+        // teardown the same way. A `Device` actor is half the switch
+        // fingerprint, so it decides the `paused` verdict and the auto-resume.
+        // Handing the only copy to the first reader splits sibling threads
+        // between "Paused by restart" and a manual Continue.
+        let mut restart = device("the-click");
+        let mut teardown = None;
+
+        let returned = open_teardown(&mut restart, &mut teardown);
+
+        assert_eq!(
+            device_id_of(&returned),
+            Some("the-click"),
+            "the pre-emit still gets the actor as its argument"
+        );
+        assert_eq!(
+            device_id_of(&teardown),
+            Some("the-click"),
+            "and every later emit in the same teardown can still read it"
+        );
+        assert!(
+            restart.is_none(),
+            "the stash is still SPENT: a later teardown nobody asked for must \
+             not inherit this device actor and auto-resume on the strength of it"
+        );
+    }
+
+    #[test]
+    fn a_teardown_nobody_requested_opens_with_no_actor() {
+        // A bare `stop.sh`, an external SIGUSR1, ctrl-c. Every emit site falls
+        // back to `MessageOrigin::system()`, so the threads settle `failed` and
+        // keep their manual Continue: work that may have crashed the engine
+        // can't be looped.
+        let mut restart = None;
+        let mut teardown = None;
+
+        assert!(open_teardown(&mut restart, &mut teardown).is_none());
+        assert!(teardown.is_none());
+    }
+
+    #[test]
+    fn a_non_device_actor_is_still_stashable_by_this_rule() {
+        // The device-only requirement is enforced at the HTTP boundary (the
+        // restart-intent handler 400s a non-device caller), NOT here: the
+        // in-workspace Switch legitimately stashes whatever `user_actor`
+        // gave it, and downstream reads the actor's kind for itself. Pinned so a
+        // later "tighten the stash" edit has to notice it would change that path.
+        let mut slot = None;
+        let api = Some(MessageOrigin::Api {
+            user_agent: Some("curl".to_string()),
+            mode: crate::engine::thread_events::ActorMode::Human,
+            source_thread_id: None,
+        });
+        assert!(stash_first_restart_actor(&mut slot, api));
+        assert!(slot.is_some());
+    }
+
+    /// Poll `cond` until it holds, up to ~2 s.
+    ///
+    /// Releasing an `flock` is only *eventually* observable in a process that
+    /// spawns subprocesses. The lock belongs to the open file description, and
+    /// `fork` hands the child a reference to that same description. Until the
+    /// child reaches `exec`, where `O_CLOEXEC` drops it, the lock stays alive
+    /// even though the owner closed its own fd. This suite forks constantly, and
+    /// under load a child can be descheduled between fork and exec.
+    ///
+    /// The retry is not a weakened assertion. Nothing about the release path is
+    /// instantaneous by contract, and the real consumer
+    /// (`engine_build_in_progress_elsewhere`) treats an un-acquirable lock as a
+    /// peer build to retry past. The *held* direction is still asserted
+    /// immediately; only the released direction is given time.
+    fn eventually(cond: impl Fn() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// A lock that frees DURING the wait is acquired, not reported as a peer
+    /// build. A build an explicit Rebuild restarted is still dropping its
+    /// guard when the replacement probes. A single instantaneous try turns that
+    /// millisecond into `SkippedLocked`, leaving no build running at all.
+    #[tokio::test]
+    async fn build_lock_wait_rides_out_a_holder_that_is_about_to_release() {
+        let dir = std::env::temp_dir().join(format!("lucidos-lockwait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".lucidos-engine-build.lock");
+
+        let held = eventually_acquire(&path);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            drop(held);
+        });
+        assert!(
+            acquire_engine_build_lock_waiting(&path, Duration::from_secs(5))
+                .await
+                .is_some(),
+            "a lock released partway through the wait must be acquired, not read as a peer build"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other direction, so the wait cannot paper over a genuine peer build.
+    /// A lock held for the whole window still yields `None`, which becomes
+    /// `SkippedLocked` rather than a second concurrent cargo.
+    #[tokio::test]
+    async fn build_lock_wait_gives_up_on_a_holder_that_never_releases() {
+        let dir = std::env::temp_dir().join(format!("lucidos-lockheld-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".lucidos-engine-build.lock");
+
+        let _held = eventually_acquire(&path);
+        assert!(
+            acquire_engine_build_lock_waiting(&path, Duration::from_millis(150))
+                .await
+                .is_none(),
+            "a lock held for the whole wait must still report the peer build"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A restart must take the GRANDCHILD down with the script.
+    /// `kill_on_drop` reaps only the direct child, so without the group guard a
+    /// restarted build leaves its `cargo` compiling against the shared
+    /// `target/`. Modelled with a shell that backgrounds a `sleep` and waits.
+    #[tokio::test]
+    async fn dropping_the_build_group_guard_kills_the_grandchild() {
+        let dir = std::env::temp_dir().join(format!("lucidos-buildgroup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("grandchild.pid");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "sleep 60 & echo $! > {}; wait",
+                pid_file.to_string_lossy()
+            ))
+            .kill_on_drop(true);
+        crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn the group leader");
+
+        let grandchild = read_pid_when_written(&pid_file).expect("grandchild pid");
+        assert!(pid_is_alive(grandchild), "the grandchild must start alive");
+
+        // Exactly what a cancelled build future does: guard first (declared
+        // last), then the child.
+        let published = AtomicU32::new(0);
+        drop(BuildProcessGroupGuard::arm(child.id(), &published));
+        child.start_kill().ok();
+        child.wait().await.ok();
+        assert_eq!(
+            published.load(Ordering::SeqCst),
+            0,
+            "a dead build names no group"
+        );
+
+        assert!(
+            eventually(|| !pid_is_alive(grandchild)),
+            "the group kill must reach the grandchild; kill_on_drop alone leaves it running"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The queued probe reads the group while the build runs. It must never
+    /// read it once the leader is reaped and its pid can be recycled.
+    #[tokio::test]
+    async fn the_build_group_is_published_while_it_runs_and_cleared_once_reaped() {
+        let dir = scratch_dir("published-group");
+        let log = dir.join("engine.log");
+        let published = AtomicU32::new(0);
+        let mut cmd = shell("sleep 0.5");
+        crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
+        let (result, seen) = tokio::join!(
+            run_capturing_output(cmd, &log, Duration::from_secs(2), &published),
+            async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                published.load(Ordering::SeqCst)
+            },
+        );
+        assert!(result.expect("the build must run").0.success());
+        assert_ne!(seen, 0, "a running build publishes its group");
+        assert_eq!(
+            published.load(Ordering::SeqCst),
+            0,
+            "a reaped build does not"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_engine_rebuild_waits_as_a_priority_build() {
+        let cmd = engine_build_command(
+            std::path::Path::new("/repo/scripts/web-dev.sh"),
+            std::path::Path::new("/ws"),
+        );
+        let priority = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == lucidos_build_slot::ENV_PRIORITY)
+            .and_then(|(_, v)| v);
+        assert_eq!(priority, Some(std::ffi::OsStr::new("1")));
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(args, ["-w", "/ws", "--engine-build"]);
+    }
+
+    fn held(pid: u32, label: &str) -> lucidos_build_slot::SlotState {
+        lucidos_build_slot::SlotState {
+            index: 0,
+            holder: Some(lucidos_build_slot::SlotHolder {
+                pid: Some(pid),
+                label: label.to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn free() -> lucidos_build_slot::SlotState {
+        lucidos_build_slot::SlotState {
+            index: 0,
+            holder: None,
+        }
+    }
+
+    /// Pids 1xx are in group 100 (ours), 2xx in group 200.
+    fn group_of(pid: u32) -> Option<u32> {
+        Some(pid / 100 * 100)
+    }
+
+    #[test]
+    fn a_build_is_queued_when_every_slot_is_held_by_someone_else() {
+        let slots = [
+            held(201, "make lint"),
+            held(202, ""),
+            held(203, "engine tests"),
+        ];
+        assert_eq!(
+            queued_behind(Some(100), &slots, group_of),
+            Some(QueuedBuild {
+                holders: vec![
+                    "make lint".into(),
+                    UNLABELLED_HOLDER.into(),
+                    "engine tests".into()
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn a_build_is_not_queued_while_it_holds_a_slot_or_one_is_free() {
+        let ours = [held(201, "make lint"), held(101, "engine build")];
+        assert_eq!(
+            queued_behind(Some(100), &ours, group_of),
+            None,
+            "it compiles"
+        );
+        let room = [held(201, "make lint"), free()];
+        assert_eq!(
+            queued_behind(Some(100), &room, group_of),
+            None,
+            "a slot is free"
+        );
+    }
+
+    #[test]
+    fn no_build_of_ours_or_no_pool_is_never_queued() {
+        let full = [held(201, "make lint")];
+        assert_eq!(queued_behind(None, &full, group_of), None, "idle");
+        assert_eq!(queued_behind(Some(100), &[], group_of), None, "no pool");
+    }
+
+    #[test]
+    fn a_holder_whose_group_cannot_be_read_is_someone_else() {
+        let slots = [held(101, "engine build")];
+        assert_eq!(
+            queued_behind(Some(100), &slots, |_| None),
+            Some(QueuedBuild {
+                holders: vec!["engine build".into()]
+            })
+        );
+    }
+
+    /// Poll for the pid the shell writes once it has backgrounded its child.
+    fn read_pid_when_written(path: &std::path::Path) -> Option<i32> {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    return Some(pid);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// `ps -p` rather than `kill(pid, 0)`, to keep the test free of `unsafe`.
+    /// The grandchild is reparented to init when its shell dies, so init reaps
+    /// it and it leaves the table rather than lingering as a zombie.
+    fn pid_is_alive(pid: i32) -> bool {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The load-bearing single-builder invariant: while one holder has the
+    /// build lock, no other acquire succeeds, and the lock releases on drop.
+    /// `flock` is per-open-file-description on Unix, so this same-process check
+    /// mirrors the cross-process case that serializes rebuilds.
+    #[test]
+    fn build_lock_admits_a_single_holder_and_releases_on_drop() {
+        let dir = std::env::temp_dir().join(format!("lucidos-buildlock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".lucidos-engine-build.lock");
+
+        let held = eventually_acquire(&path);
+        assert!(
+            try_lock_file(&path).is_none(),
+            "a second acquire must fail while the lock is held (single builder)"
+        );
+        drop(held);
+        assert!(
+            eventually(|| try_lock_file(&path).is_some()),
+            "the lock must become acquirable again after release"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The lock must not live under `target/`. `flock` binds to an inode, so a
+    /// `cargo clean` deleting the file mid-build releases nothing: the next
+    /// builder creates a fresh inode and takes an uncontended lock, and two
+    /// cargo builds then run against the shared `target/` at once. That is the
+    /// collision the lock exists to prevent, and a clean build is exactly when
+    /// it would happen.
+    #[test]
+    fn build_lock_lives_outside_cargos_target_dir() {
+        let Some(path) = engine_build_lock_path() else {
+            // No repo root (packaged runtime): there is no checkout to
+            // coordinate on, which `run_engine_build` handles separately.
+            return;
+        };
+        // Checked RELATIVE to the checkout. A repo living under an unrelated
+        // directory named `target` is not a cargo target dir, and an
+        // absolute-path scan would fail the test for it.
+        let root = crate::paths::repo_root().expect("lock path implies a repo root");
+        let rel = path
+            .strip_prefix(&root)
+            .expect("the lock lives inside the checkout");
+        assert!(
+            !rel.components().any(|c| c.as_os_str() == "target"),
+            "build lock must not sit under target/, cargo clean would orphan its inode: {}",
+            rel.display()
+        );
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(".lucidos-engine-build.lock"),
+            "lock filename changed: {}",
+            path.display()
+        );
+    }
+
+    /// Take the lock, tolerating a transient hold by a concurrently-forked
+    /// child that hasn't reached `exec` yet. See [`eventually`].
+    fn eventually_acquire(path: &std::path::Path) -> std::fs::File {
+        for _ in 0..200 {
+            if let Some(file) = try_lock_file(path) {
+                return file;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("could not acquire {} within 2 s", path.display());
+    }
+
+    /// The `shared_build_in_progress` fail-OPEN contract. The held-detection
+    /// probe reports `true` ONLY while the lock is genuinely held. A free or
+    /// indeterminate probe can therefore never hide the manual "Rebuild" escape
+    /// hatch behind a phantom spinner.
+    #[test]
+    fn lock_held_at_reports_held_only_while_genuinely_locked() {
+        let dir = std::env::temp_dir().join(format!("lucidos-heldprobe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".lucidos-engine-build.lock");
+
+        // Free lock reads as not held, so the escape hatch stays available.
+        assert!(
+            eventually(|| !lock_held_at(&path)),
+            "an unlocked path must read as NOT held"
+        );
+        // Held by another open file description, so genuinely busy. This
+        // direction is immediate: nothing can make a held lock look free.
+        let held = eventually_acquire(&path);
+        assert!(
+            lock_held_at(&path),
+            "a held lock must read as held (flock WouldBlock)"
+        );
+        // Released, so free again. See `eventually`: a forked child can hold
+        // the inherited description for a beat after we close ours.
+        drop(held);
+        assert!(
+            eventually(|| !lock_held_at(&path)),
+            "a released lock must read as NOT held again"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_id_commit_takes_the_sha_and_rejects_the_no_git_forms() {
+        assert_eq!(build_id_commit("aa7075ee2"), Some("aa7075ee2"));
+        // Dirty tree, `<sha>-<diffhash>`: only the sha is comparable.
+        assert_eq!(
+            build_id_commit("aa7075ee2-0badc0ffee123456"),
+            Some("aa7075ee2")
+        );
+        // No git (shipped build) or unstamped: nothing to compare.
+        assert_eq!(build_id_commit("src-0123456789abcdef"), None);
+        assert_eq!(build_id_commit(""), None);
+        assert_eq!(build_id_commit("-abc"), None);
+    }
+
+    /// The build script matches these words exactly, so a rename strands it on
+    /// the old behaviour of rebuilding after every move of HEAD.
+    #[test]
+    fn source_state_word_keeps_the_three_words_the_build_script_reads() {
+        assert_eq!(source_state_word(Some(true)), "current");
+        assert_eq!(source_state_word(Some(false)), "stale");
+        assert_eq!(source_state_word(None), "unknown");
+    }
+
+    /// End to end over a real repo: a move by a stylesheet keeps a binary
+    /// current, and a move by engine source makes it stale.
+    #[tokio::test]
+    async fn no_restart_between_passes_a_css_move_and_stops_a_rust_move() {
+        let dir = std::env::temp_dir().join(format!(
+            "lucidos-source-state-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        let commit_file = |path: &str| {
+            let full = dir.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, uuid::Uuid::new_v4().to_string()).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", path]);
+            git(&["rev-parse", "--short", "HEAD"])
+        };
+        let built = commit_file("README.md");
+        commit_file("crates/lucidos-app/src/styles/header-mark.css");
+        assert_eq!(no_restart_between(&built, "HEAD", &dir).await, Some(true));
+        commit_file("crates/lucidos-engine/src/lib.rs");
+        assert_eq!(no_restart_between(&built, "HEAD", &dir).await, Some(false));
+        assert_eq!(no_restart_between("0123456789ab", "HEAD", &dir).await, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_the_value_one_pins_the_engine_version() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            VersionTracking::from_flag(Some(OsStr::new("1"))),
+            VersionTracking::PinnedToBuild
+        );
+        for unpinned in [None, Some(""), Some("0"), Some("true"), Some("yes")] {
+            assert_eq!(
+                VersionTracking::from_flag(unpinned.map(OsStr::new)),
+                VersionTracking::FollowCheckout,
+                "{unpinned:?} must leave a dev engine following its checkout"
+            );
+        }
+    }
+
+    /// The e2e engine's regression: a commit landing mid-run made it rebuild
+    /// itself and raise a version toast over unrelated specs.
+    #[test]
+    fn a_pinned_engine_never_sees_a_newer_version() {
+        assert!(!newer_version_visible(
+            VersionTracking::PinnedToBuild,
+            false
+        ));
+        assert!(newer_version_visible(
+            VersionTracking::FollowCheckout,
+            false
+        ));
+        assert!(!newer_version_visible(
+            VersionTracking::FollowCheckout,
+            true
+        ));
+        assert!(!newer_version_visible(VersionTracking::PinnedToBuild, true));
+    }
+
+    /// The gate only pins anything if every probe asks it first. Self-heal and
+    /// the pending toast read `source_behind_head`, the Switch reads the disk
+    /// probe, and the peer sync raises the Refresh toast. A probe that skips
+    /// the gate re-opens a mid-run rebuild or toast.
+    #[test]
+    fn every_newer_version_probe_asks_the_gate_first() {
+        // Split so this test's own source is not a match.
+        let gate = concat!("if !self.newer_version", "_visible() {");
+        for (src, probe) in [
+            (
+                include_str!("engine_version.rs"),
+                "pub async fn source_behind_head(&self) -> bool {",
+            ),
+            (
+                include_str!("engine_version.rs"),
+                "async fn disk_id_is_upgrade(&self, disk: Option<&str>) -> bool {",
+            ),
+            (
+                include_str!("frontend_refresh.rs"),
+                "async fn sync_served_frontend_if_safe(self: &Arc<Self>) {",
+            ),
+        ] {
+            let start = src.find(probe).expect("probe exists") + probe.len();
+            let first_line = src[start..]
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .expect("probe has a body");
+            assert_eq!(first_line, gate, "{probe} must ask the pin gate first");
+        }
+    }
+
+    /// A DIFFERENT on-disk binary is an update only when it is not provably
+    /// OLDER. Everything indeterminate keeps the plain difference test, so this
+    /// can only remove a false positive.
+    #[test]
+    fn disk_upgrade_verdict_offers_only_a_step_forward() {
+        // The downgrade: disk `71c8d39b1` is an ancestor of running `aa7075ee2`.
+        assert!(
+            !disk_upgrade_verdict(Some("71c8d39b1"), "aa7075ee2", Some(true)),
+            "an older on-disk binary is a DOWNGRADE and must not be offered"
+        );
+        // The normal case: a newer binary was built (not an ancestor).
+        assert!(disk_upgrade_verdict(
+            Some("bb1122334"),
+            "aa7075ee2",
+            Some(false)
+        ));
+        // Same id: nothing to switch onto, whatever git says.
+        assert!(!disk_upgrade_verdict(
+            Some("aa7075ee2"),
+            "aa7075ee2",
+            Some(false)
+        ));
+        // Unreadable disk id (packaged, mid-rewrite): no update.
+        assert!(!disk_upgrade_verdict(None, "aa7075ee2", None));
+        // Indeterminate ancestry falls back to "different is an update", so a
+        // real one is never MISSED.
+        assert!(disk_upgrade_verdict(Some("cc9988776"), "aa7075ee2", None));
+        // Same commit, different uncommitted diff: a real rebuild.
+        assert!(disk_upgrade_verdict(
+            Some("aa7075ee2-0badc0ffee123456"),
+            "aa7075ee2",
+            Some(false)
+        ));
+    }
+
+    /// Retrying a rebuild is only futile once one has SUCCEEDED without
+    /// advancing the binary. A failed build keeps its retry budget, which is
+    /// the case self-heal exists for.
+    #[test]
+    fn self_heal_gives_up_only_after_a_successful_build_changed_nothing() {
+        let ready = BuildState::ready_from(Some("head1".into()));
+        assert!(self_heal_is_wedged(1, &ready, Some("head1")));
+        assert!(self_heal_is_wedged(3, &ready, Some("head1")));
+        // Nothing tried yet this process, so the Ready state is not ours to
+        // conclude from.
+        assert!(!self_heal_is_wedged(0, &ready, Some("head1")));
+        // A compile error is retryable, not wedged.
+        assert!(!self_heal_is_wedged(
+            1,
+            &BuildState::failed_with(BuildFailure::plain("error: boom".into())),
+            Some("head1")
+        ));
+        // Idle: no build outcome to judge (the caller already excluded Building).
+        assert!(!self_heal_is_wedged(1, &BuildState::Idle, Some("head1")));
+        // Deliberately still true at the cap: nothing clears `Ready`, so the
+        // predicate stays hot on every later tick. That is WHY the caller
+        // checks the spent budget FIRST. Reordering those two checks makes the
+        // give-up line re-log every tick instead of once.
+        assert!(self_heal_is_wedged(
+            super::SELF_HEAL_MAX_ATTEMPTS_PER_HEAD,
+            &ready,
+            Some("head1")
+        ));
+    }
+
+    /// The wedge verdict is a claim about ONE head. Commits landing after the
+    /// build that proved nothing must re-arm the rebuild, or a workspace that
+    /// wedged once would refuse to offer a rebuild for every future commit.
+    #[test]
+    fn a_wedge_belongs_to_the_head_the_build_was_started_from() {
+        let ready = BuildState::ready_from(Some("head1".into()));
+        assert!(rebuild_is_wedged(&ready, Some("head1")));
+        // New work landed since that build: nothing has been proved about it.
+        assert!(!rebuild_is_wedged(&ready, Some("head2")));
+        // Neither side of the comparison may be guessed at. An unknown is not a
+        // proof, and the safe direction is to keep offering the escape hatch.
+        assert!(!rebuild_is_wedged(
+            &BuildState::ready_from(None),
+            Some("head1")
+        ));
+        assert!(!rebuild_is_wedged(&ready, None));
+        // Only a COMPLETED build is evidence.
+        assert!(!rebuild_is_wedged(&BuildState::Idle, Some("head1")));
+        assert!(!rebuild_is_wedged(
+            &BuildState::failed_with(BuildFailure::plain("error: boom".into())),
+            Some("head1")
+        ));
+        assert!(!rebuild_is_wedged(
+            &BuildState::building_now(),
+            Some("head1")
+        ));
+    }
+
+    /// The real git probe behind the direction check, against a throwaway repo:
+    /// ancestor → `Some(true)`, the reverse → `Some(false)`, an unknown object →
+    /// `None` (so an unresolvable id can't be mistaken for "provably older").
+    #[tokio::test]
+    async fn commit_is_strict_ancestor_reads_history_direction() {
+        let dir = std::env::temp_dir().join(format!(
+            "lucidos-ancestry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git runs in the test environment")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+        let first = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(dir.join("a.txt"), "two").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "second"]);
+        let second = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        assert_eq!(
+            commit_is_strict_ancestor(&dir, &first, &second).await,
+            Some(true),
+            "the earlier commit IS a strict ancestor of the later one"
+        );
+        assert_eq!(
+            commit_is_strict_ancestor(&dir, &second, &first).await,
+            Some(false),
+            "the later commit is NOT an ancestor of the earlier one"
+        );
+        assert_eq!(
+            commit_is_strict_ancestor(&dir, &first, &first).await,
+            Some(false),
+            "a commit is not a STRICT ancestor of itself"
+        );
+        // The abbreviation trap. Build ids carry the SHORT sha while HEAD
+        // arrives full, and `git merge-base --is-ancestor X X` exits 0. Without
+        // the prefix-aware screen the same commit reads as provably older.
+        assert_eq!(
+            commit_is_strict_ancestor(&dir, &second[..9], &second).await,
+            Some(false),
+            "the same commit abbreviated is still not a strict ancestor of itself"
+        );
+        assert_eq!(
+            commit_is_strict_ancestor(&dir, "0000000000000000000000000000000000000000", &second)
+                .await,
+            None,
+            "an unknown object is indeterminate, never 'provably older'"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The two halves of the group indexing have to agree: `slot()` is what
+    /// tallies are counted into and `COMMIT_GROUP_ORDER` is what they are read
+    /// back out as, so a kind counted at one index and emitted at another would
+    /// silently attribute every `feat` to the wrong heading. The compiler
+    /// already forces a new variant to answer `slot()`; this forces it into the
+    /// order array at the matching position.
+    #[test]
+    fn every_group_reads_back_out_at_the_index_it_was_counted_into() {
+        for (index, kind) in COMMIT_GROUP_ORDER.into_iter().enumerate() {
+            assert_eq!(kind.slot(), index, "{kind:?} is misplaced in the order");
+        }
+    }
+
+    /// The taxonomy: each conventional-commit type lands in the group the toast
+    /// describes it under, the type tag is stripped, and the scope is kept as a
+    /// lead-in so the line names its area.
+    #[test]
+    fn classify_commit_subject_maps_the_type_and_keeps_the_scope() {
+        let cases = [
+            (
+                "feat(memory): one cache per user",
+                CommitGroupKind::New,
+                "memory: one cache per user",
+            ),
+            ("feat: no scope here", CommitGroupKind::New, "no scope here"),
+            (
+                "feat(api)!: a breaking one",
+                CommitGroupKind::New,
+                "api: a breaking one",
+            ),
+            (
+                "fix(ui): the trash is sized by its ink",
+                CommitGroupKind::Fixed,
+                "ui: the trash is sized by its ink",
+            ),
+            (
+                "style(triggers): the actions stack",
+                CommitGroupKind::Improved,
+                "triggers: the actions stack",
+            ),
+            (
+                "perf: fewer probes",
+                CommitGroupKind::Improved,
+                "fewer probes",
+            ),
+            (
+                "refactor: one writer",
+                CommitGroupKind::Improved,
+                "one writer",
+            ),
+            (
+                "docs(plans): a plan",
+                CommitGroupKind::Housekeeping,
+                "plans: a plan",
+            ),
+            (
+                "harden(ui): pinned",
+                CommitGroupKind::Housekeeping,
+                "ui: pinned",
+            ),
+        ];
+        for (subject, kind, line) in cases {
+            assert_eq!(
+                classify_commit_subject(subject),
+                (kind, line.to_string()),
+                "{subject}"
+            );
+        }
+    }
+
+    /// A subject we could not classify keeps every word of itself. Stripping a
+    /// tag we did not understand would lose information for nothing, and the
+    /// commit that is hardest to categorize is often the interesting one.
+    #[test]
+    fn classify_commit_subject_leaves_an_unrecognized_subject_whole() {
+        for subject in [
+            "Merge branch 'main' into some-branch",
+            "wip: an unknown type",
+            "Revert \"feat(ui): a thing\"",
+            "no colon at all",
+            "Note to self: not a conventional type",
+        ] {
+            assert_eq!(
+                classify_commit_subject(subject),
+                (CommitGroupKind::Other, subject.to_string()),
+                "{subject}"
+            );
+        }
+    }
+
+    /// Each group's list is capped so the toast stays glanceable, but the COUNTS
+    /// are not: "and N more" is only honest if every commit was seen. The cap is
+    /// PER GROUP, which is what stops a pile of doc commits from crowding out
+    /// the one feature. Blank lines are dropped rather than counted, since an
+    /// empty subject would both render as an empty bullet and inflate what the
+    /// user is waiting for.
+    #[test]
+    fn group_commit_subjects_groups_and_caps_each_list_but_not_the_counts() {
+        let mut log = String::new();
+        for i in 1..=8 {
+            log.push_str(&format!("fix: bug {i}\n"));
+        }
+        log.push_str("feat: the one feature\n");
+        for i in 1..=4 {
+            log.push_str(&format!("docs: page {i}\n"));
+        }
+        let parsed = group_commit_subjects(log.lines());
+
+        assert_eq!(parsed.total, 13, "every commit counts toward the total");
+        assert_eq!(
+            parsed.total,
+            parsed.groups.iter().map(|g| g.total).sum::<usize>(),
+            "the headline count reconciles with the groups under it"
+        );
+        assert_eq!(
+            parsed.groups.iter().map(|g| g.kind).collect::<Vec<_>>(),
+            vec![
+                CommitGroupKind::New,
+                CommitGroupKind::Fixed,
+                CommitGroupKind::Housekeeping,
+            ],
+            "listed in display order, and a group with nothing in it is omitted"
+        );
+
+        let fixed = &parsed.groups[1];
+        assert_eq!(fixed.total, 8);
+        assert_eq!(fixed.descriptions.len(), PENDING_COMMIT_DESCRIPTION_CAP);
+        assert_eq!(
+            fixed.descriptions[0], "bug 1",
+            "git log order is preserved (newest first)"
+        );
+        assert_eq!(
+            parsed.groups[0].descriptions,
+            vec!["the one feature"],
+            "the lone feature survives eight fixes ahead of it"
+        );
+
+        let housekeeping = &parsed.groups[2];
+        assert_eq!(housekeeping.total, 4);
+        assert!(
+            housekeeping.descriptions.is_empty(),
+            "housekeeping is counted, never listed"
+        );
+
+        // Blank and whitespace-only subjects are not commits.
+        let ragged = group_commit_subjects(["fix: one", "", "   ", "fix: two"]);
+        assert_eq!(ragged.total, 2);
+        assert_eq!(ragged.groups[0].descriptions, vec!["one", "two"]);
+
+        // A genuinely empty range is a real answer: zero, with nothing to list.
+        let none = group_commit_subjects([]);
+        assert_eq!(none.total, 0);
+        assert!(none.groups.is_empty());
+    }
+
+    /// A ready version is its own reason to read the range. The confirm behind
+    /// *Switch to new version* lists what the switch brings, and that state
+    /// implies none of the other three: the build has finished, no peer is
+    /// building, and a binary can differ from the running one while the source
+    /// is level with HEAD.
+    #[test]
+    fn a_switch_on_offer_wants_the_range_on_its_own() {
+        assert!(wants_pending_commits(false, false, false, true));
+        // ...and an at-rest workspace still forks no git.
+        assert!(!wants_pending_commits(false, false, false, false));
+        // The three pre-existing reasons are unchanged.
+        assert!(wants_pending_commits(true, false, false, false));
+        assert!(wants_pending_commits(false, true, false, false));
+        assert!(wants_pending_commits(false, false, true, false));
+    }
+
+    /// The distinction the whole field rests on: git saying "no commits" is
+    /// `Some(total: 0)`, git failing to say anything is `None`. Collapsing the
+    /// second into the first would tell the user nothing is coming while a build
+    /// is running (`.claude/rules/rust.md`: unknown is never a no).
+    #[test]
+    fn classify_pending_commits_keeps_unknown_apart_from_none() {
+        // A spawn failure or the git timeout is unknowable, so it is no verdict.
+        assert_eq!(
+            classify_pending_commits(Err("git log timed out after 30s".to_string())),
+            None
+        );
+    }
+
+    /// Elapsed exists exactly while a build does, so the toast cannot show a
+    /// timer for work that is not running.
+    #[test]
+    fn build_state_reports_elapsed_only_while_building() {
+        assert!(BuildState::building_now().elapsed().is_some());
+        assert!(BuildState::Idle.elapsed().is_none());
+        assert!(BuildState::ready_from(None).elapsed().is_none());
+        assert!(
+            BuildState::failed_with(BuildFailure::plain("error: boom".into()))
+                .elapsed()
+                .is_none()
+        );
+        assert_eq!(BuildState::building_now().as_wire(), "building");
+        // The HEAD a build was started from is bookkeeping for the wedge
+        // verdict, not a new wire state: `ready` stays `ready` either way.
+        assert_eq!(BuildState::ready_from(None).as_wire(), "ready");
+        assert_eq!(
+            BuildState::ready_from(Some("head1".into())).as_wire(),
+            "ready"
+        );
+    }
+
+    /// The real range against a throwaway repo, landed the way Apply lands: the
+    /// branch merges the trunk in, then the trunk fast-forwards. The served
+    /// client's commit decides: what it carries is left out, everything else
+    /// since the running commit is listed. No MERGE subject is listed, and an
+    /// unresolvable range is UNKNOWN.
+    #[tokio::test]
+    async fn pending_commits_leave_out_what_the_served_client_carries() {
+        let dir = std::env::temp_dir().join(format!(
+            "lucidos-pending-commits-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git runs in the test environment")
+        };
+        let stdout = |args: &[&str]| {
+            String::from_utf8(git(args).stdout)
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "running: the version in use"]);
+        let running = stdout(&["rev-parse", "HEAD"]);
+        // `init.defaultBranch` is the user's config, so read the trunk's name.
+        let trunk = stdout(&["symbolic-ref", "--short", "HEAD"]);
+        let apply = |branch: &str, base: &str, commits: &[(&str, &str)]| {
+            git(&["checkout", "-q", "-b", branch, base]);
+            for (subject, file) in commits {
+                let path = dir.join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, subject).unwrap();
+                git(&["add", "."]);
+                git(&["commit", "-qm", subject]);
+            }
+            git(&["merge", "-q", "--no-edit", &trunk]);
+            git(&["checkout", "-q", &trunk]);
+            git(&["merge", "-q", "--ff-only", branch]);
+        };
+        apply(
+            "a",
+            &running,
+            &[("feat(ui): live, landed before any engine change", "app.tsx")],
+        );
+        // INV-A lets the served client advance to here, and no further.
+        let served = stdout(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            compatible_served_commit(&running, &served, &dir).await,
+            Some(served.clone()),
+            "a frontend-only landing can count as served"
+        );
+        apply(
+            "b",
+            &running,
+            &[("fix(engine): the engine change", "src/lib.rs")],
+        );
+        apply(
+            "c",
+            &running,
+            &[("feat(ui): held behind the engine change", "app2.tsx")],
+        );
+        apply(
+            "d",
+            &trunk,
+            &[
+                ("feat(ui): a frontend step", "app3.tsx"),
+                ("feat: the newer one", "src/new.rs"),
+            ],
+        );
+
+        // The served commit arrives as the snapshot's stamp, the way the
+        // engine reads it.
+        let snapshot = dir.join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(
+            snapshot.join(crate::api::frontend_snapshot::SOURCE_COMMIT_FILE),
+            format!("{served}\n"),
+        )
+        .unwrap();
+        let stamped = crate::api::frontend_snapshot::read_source_commit(&snapshot);
+        assert_eq!(stamped.as_deref(), Some(served.as_str()));
+        let commits = pending_commits_since(&running, stamped.as_deref(), &dir)
+            .await
+            .expect("a resolvable range is a real answer");
+        assert_eq!(
+            commits.total, 4,
+            "the engine change and every landing after it wait for the switch; \
+             the served frontend commit and the merges do not"
+        );
+        let group = |kind| {
+            commits
+                .groups
+                .iter()
+                .find(|g| g.kind == kind)
+                .unwrap_or_else(|| panic!("{kind:?} group is present"))
+        };
+        // Sorted: commits made within one second share a date, so `git log`
+        // order between them is not fixed.
+        let mut new = group(CommitGroupKind::New).descriptions.clone();
+        new.sort();
+        assert_eq!(
+            new,
+            vec![
+                "the newer one",
+                "ui: a frontend step",
+                "ui: held behind the engine change"
+            ],
+            "a frontend commit landed after the engine change waits for the switch"
+        );
+        assert_eq!(
+            group(CommitGroupKind::Fixed).descriptions,
+            vec!["engine: the engine change"]
+        );
+        assert!(
+            !commits
+                .groups
+                .iter()
+                .flat_map(|g| g.descriptions.iter())
+                .any(|d| d.contains("Merge branch")),
+            "no merge subject reaches the toast"
+        );
+
+        // The served client never advanced (a failed rebuild, or no served
+        // commit known): the frontend commit is listed too.
+        for served in [Some(running.as_str()), None] {
+            let all = pending_commits_since(&running, served, &dir).await;
+            assert_eq!(all.map(|c| c.total), Some(5), "served {served:?}");
+        }
+
+        // Running at HEAD: a real, empty answer.
+        let head = stdout(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            compatible_served_commit(&running, &head, &dir).await,
+            None,
+            "a commit past an engine change never counts as served"
+        );
+        // A snapshot stamped past the engine change: a client for the new
+        // engine. The switch still brings the engine change, so all five show.
+        let past_engine = pending_commits_since(&running, Some(&head), &dir).await;
+        assert_eq!(
+            past_engine.map(|c| c.total),
+            Some(5),
+            "an engine change is never left out as already served"
+        );
+        let level = pending_commits_since(&head, Some(&head), &dir).await;
+        assert_eq!(level.map(|c| c.total), Some(0), "nothing to bring");
+
+        // A range git refuses (unknown object) exits non-zero: unknown, not empty.
+        assert_eq!(
+            pending_commits_since("0000000000000000000000000000000000000000", None, &dir).await,
+            None,
+            "a range git cannot resolve says nothing about what is pending"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

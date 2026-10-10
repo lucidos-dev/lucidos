@@ -1,0 +1,377 @@
+---
+paths:
+  - "crates/lucidos-app/e2e/**"
+  - "crates/lucidos-app/src/**/*.rs"
+  - "crates/lucidos-app/src/**/*.test.ts"
+  - "crates/lucidos-engine/tests/**"
+  - "crates/lucidos-e2e/tests/**"
+  - "crates/lucidos-app/src/generated/**"
+---
+
+# E2E Testing
+
+Six test suites. The API + browser suites run against the e2e workspace
+(`~/workspaces/e2e-test`); the wasm + embedder suites are pure Rust integration
+tests that only need external setup (built WASM artifacts; downloaded ML model);
+the packaged-build smoke test boots the macOS `.app` itself. Contract tests run
+inline as part of `cargo test`.
+
+**The e2e engine builds + runs in RELEASE by default** (`scripts/lib/e2e.sh` sets
+`RELEASE=1`; `docs/plans/2026-06-28-e2e-always-release-build.md`). The debug engine's
+CPU cost was the dominant driver of the mobile-webkit WebContent cold-start
+contention wedge — release eliminates that flake class and matches the
+packaged/prod engine. For fast local single-spec iteration on the debug build, set
+`LUCIDOS_E2E_DEBUG=1` (the opt-out is authoritative; an explicit `RELEASE=` is
+otherwise honored). The release compile caps `CARGO_BUILD_JOBS` at half the cores
+to avoid a host OOM during codegen. Test-only seams that production must not expose
+(e.g. `POST /api/v1/internal/seed-change-for-test`) are gated on
+`cfg!(any(debug_assertions, feature = "e2e-test-hooks"))` so they survive the
+release e2e build — which passes `--features e2e-test-hooks` — while a plain
+`cargo build --release` / `cargo tauri build` (no feature) still 404s them.
+
+**The e2e workspace database is rebuilt from zero on every run.**
+`reset_e2e_database` (`scripts/lib/e2e.sh`) drops and recreates it instead of
+truncating, so the engine's next boot runs the whole sqlx migration chain against
+an empty database — **migration seeds included**, which a truncate that spared
+`_sqlx_migrations` silently skipped (that left `models` permanently empty in e2e).
+So e2e tests may assert on seeded data, e.g. the builtin model registry. Two rules
+follow:
+
+- **The reset owns the engine lifecycle.** It stops the engine, recreates the
+  database, and starts it again, because migrations and the pgvector setup run
+  only at boot. Call `reset_e2e_database` **instead of**
+  `ensure_workspace_running`, never before it.
+- **The reset also starts the workspace TREE committed.** With the engine
+  stopped, `settle_e2e_workspace_tree` commits whatever an earlier run left
+  uncommitted, such as a fixture a spec removed with a raw `rmSync`. Every apply
+  refuses a dirty tree, so without it those leftovers fail the next run's apply
+  tests. It commits and never discards.
+- **Registry-style seeded rows are shared state within a run.** A test that
+  mutates one (a builtin's `context_window`, say) must restore it; the database is
+  recreated per run, not per test.
+
+`--no-reset` skips the reset entirely and reuses the running workspace. Rationale
+and the rejected template-database alternative: `docs/e2e-test-decisions.md`
+§ "The e2e database is rebuilt from zero, never truncated".
+
+## GitHub mode is the default (`--local` opts out)
+
+Every e2e script runs on GitHub's runners when it can: `./scripts/e2e.sh`,
+`./scripts/e2e-browser.sh -f chat.spec.ts`, and so on (ADRs 0382, 0386). The
+report and exit code match a local run. The driver is `scripts/e2e-github.sh`,
+the runner half `scripts/e2e-github-shard.sh`, the workflow
+`.github/workflows/e2e.yml`.
+
+- **Where a run goes.** `e2e_github_handoff` decides, once, for all five
+  scripts. A run stays here for any of these:
+  - `--local`, or a local-only flag (`--no-reset`, `--headed`, `--ios`,
+    `--packaged` and friends).
+  - A local-only variable: `THREAD_SHOTS` and the other screenshot switches, or
+    `LUCIDOS_E2E_DEBUG`.
+  - An unmet precondition: a dirty tree, no release libraries, no `lucidos`
+    remote, or no `gh`. The fallback prints its reason.
+- **`--github` insists.** It skips the fallback and fails instead.
+- **`LUCIDOS_E2E_LOCAL=1` keeps nested scripts here.** A local decision exports
+  it, and the shard and the local leg set it. A new caller of an e2e script
+  from inside a run inherits it, so it never pushes a second run.
+- **What runs where.** Linux runs API, WASM, embedder, `chromium` and `mobile`.
+  macOS runs `mobile-webkit`, on the port iOS ships. A spec with a test tagged
+  `@real-claude-code` (`e2e_spec_needs_real_claude_code`) runs on this host as
+  the local leg. Every other spec meets the *fake Claude Code* on GitHub.
+- **Tag a test `@real-claude-code` when it needs real model behaviour**: resume
+  memory, interrupts mid-turn, mid-turn messages, side questions, tool use. An
+  untagged test gets only `Say exactly: "X"` answered, and anything else gets
+  the fake's fixed `no rule` reply. Why: ADR 0388.
+- **What gets pushed.** HEAD, stripped and scanned like a release, as a
+  parentless commit on an `e2e/<run-id>` branch of the mirror. The driver
+  deletes the branch afterwards, and each run sweeps finished ones over a day
+  old.
+- **No secrets in the workflow, ever.** That is why the real-Claude-Code specs
+  stay local. `./scripts/check-e2e-workflow.sh` enforces the workflow's limits.
+- **Exit 76** means the run produced no verdict.
+- **Harness changes must stay runner-safe.** A shard reaches Postgres only
+  through `shared_pg_psql` and `LUCIDOS_EXTERNAL_PG_PORT`, because macOS runners
+  have no Docker. Shell must work under GNU tools as well as BSD.
+
+## Browser E2E (Playwright)
+
+Tests in `crates/lucidos-app/e2e/`. Chat, streaming, cancellation, CC sessions, changes UI, threads, reload resilience.
+
+```bash
+./scripts/e2e-browser.sh                        # Run all (chromium + mobile + iOS webkit)
+./scripts/e2e-browser.sh -h -f chat.spec.ts     # Headed, single file
+./scripts/e2e-browser.sh -- --grep "cancel"     # Filter by name
+./scripts/e2e-browser.sh --ios                  # Launch iOS Simulator with Safari (requires Xcode)
+```
+
+Three Playwright projects run by default:
+
+- `chromium` (1280x800) — desktop browser
+- `mobile` (375x812) — mobile Chromium emulation
+- `mobile-webkit` (390x844) — iOS Safari emulation (WebKit engine, iPhone UA, 3x scale)
+
+Serial, 2min timeout, traces on failure.
+Helpers: `e2e/helpers.ts` — `sendMessage()`, `waitForResponse()`, `switchToClaudeMode()`, etc.
+DB helpers: `e2e/db-helpers.ts` — `psql()`, `git()`.
+
+**When to write:** UI bugs, interaction flows, state transitions, streaming, layout behavior.
+
+## API E2E (Rust)
+
+Tests in `crates/lucidos-e2e/tests/api_support/` (workspace member crate `lucidos-e2e`). HTTP contracts, SSE, errors.
+
+```bash
+./scripts/e2e-api.sh                    # Run all
+./scripts/e2e-api.sh -f health          # Filter
+```
+
+**When to write:** New endpoints, changed responses, error handling, SSE.
+
+**A run must leave the workspace tree as clean as it found it.** Every apply
+refuses a dirty tree, so `e2e-api.sh` fails a run that leaves an uncommitted
+change behind, and names the paths. It checks after a failed test run too. A
+test that needs a fixture file under `data/` writes it with `write_data_fixture`
+and removes it with `remove_data_fixtures` (both in `api_support/mod.rs`). Both
+go through `PUT` / `DELETE /api/v1/data`, which commit in the same step.
+
+`e2e-api.sh` also runs the **gateway chain test**
+(`crates/lucidos-gateway/src/chain_tests.rs`), the only local test that puts a
+real gateway in front of a real engine. It binds the gateway's own router to a free
+port and routes `/e2e-test/` at the session's engine. It then asks for an app's
+own files with no cookie. It lives in `lucidos-gateway` because that crate is
+bin-only: nothing outside it can build the router. It is `#[ignore]`d because
+`make test` has no engine. The script runs it BY NAME, so a second ignored test
+cannot join the step by accident.
+
+The gateway BINARY is not an option here: it refuses to boot from a
+coding-agent worktree, deliberately and with no opt-out (ADR 0021 § "the opt-out
+stops at the gateway"). Do not work around that to write a gateway test. A test
+process spawns no engine and dies with the run, which is why the router is fair
+game where the daemon is not.
+
+**GitHub browser shards do run the binary** (`LUCIDOS_E2E_GATEWAY=own`, ADR
+0385). A runner is no worktree. That gateway is session-scoped, and it only
+adopts the engine the harness started. In every mode the e2e engine's
+`LUCIDOS_GATEWAY_PORT` and `LUCIDOS_WORKSPACE_ID` come from a gateway that lists
+it at the engine's port. They are never inherited from the caller.
+
+## Contract Tests (Rust ↔ TypeScript)
+
+Rust is the source of truth. TS is generated, so never hand-edit `src/generated/`.
+
+Regenerate the contract files (the full writer list is in the `run-tests` skill):
+
+```bash
+cargo test -p lucidos-engine generate_typescript_file -- --ignored
+cargo test -p lucidos-engine generate_cross_validation_fixture_file -- --ignored
+cargo test -p lucidos-engine generate_thread_event_wire_file -- --ignored
+cargo test -p lucidos-engine --lib generate_title_match_fixture_file -- --ignored
+```
+
+Staleness checks run as part of `cargo test`.
+
+**When to update:** changes to `available_thread_actions()`, `display_section()`,
+the `ThreadEvent` enum, or any payload type it reaches, and to
+`engine/title_match.rs`.
+
+### ThreadEvent payload types (generated, ADR 0166)
+
+The **payload** shapes are generated too, into
+`src/generated/thread-event-wire.ts`, by the `syn` reader in
+`crates/lucidos-engine/src/engine/thread_events_tests/ts_codegen.rs`. It parses
+the `ThreadEvent` enum and its supporting types out of the engine source.
+`store/thread-events/thread-event-types.ts` re-exports them and keeps only what
+the wire does not decide (display labels, summary helpers, fingerprints).
+
+What it emits is the **wire** shape, not the enum alone:
+`variant + EventMeta fields + API stamps - API strips`. Optionality is
+mechanical: `#[serde(default…)]` or `skip_serializing_if` makes the property
+optional, because both mean the key can be absent. `Option<T>` is `T`, never
+`T | null`.
+
+**When you add a Rust `ThreadEvent` variant or field:** regenerate. Nothing to
+hand-write. Four things fail loudly instead:
+
+- **A new supporting type** fails the generator until you add it to
+  `TYPE_SOURCES` with the file that declares it.
+- **A carried doc comment** with an unspaced em dash or an ISO date fails the generator.
+  Rewrite the Rust line; the generated file ships and is scanned like any source.
+  Its FIRST PARAGRAPH is what gets carried, so that paragraph is bound by
+  `.claude/rules/prose.md` too. A sentence or paragraph over the limit surfaces
+  at `check-prose.sh` on the generated file, and the fix is always at the Rust
+  doc comment. Put a note a frontend reader needs in the first paragraph, or on
+  the field itself, since a later paragraph does not travel.
+- **A new persisted variant** fails `all_persisted_event_types_matches_the_enum`
+  until you add it to that list in `thread_lifecycle.rs`.
+- **A stale checked-in file** fails `generated_thread_event_wire_is_up_to_date`.
+
+Anything the wire carries but Rust does not is a row in a declared table in the
+generator, never a hand edit to the output. That covers a retired variant, a
+legacy field, and an API-layer stamp or strip.
+`src/generated/thread-event-union.test.ts` keeps the two generated files in
+agreement. Containment is one-way, because the union carries retired members the
+classification map omits.
+
+`src/generated/wire-types-have-one-spelling.test.ts` scans `src/` for a second
+declaration of any generated type. Re-export, never re-declare.
+
+## WASM Signer E2E (Rust)
+
+Tests in `crates/lucidos-e2e/tests/wasm_signers.rs`. Exercise real `.wasm`
+artifacts produced by `./signers/build-all.sh` (compiled from
+`signers/binance-hmac/` and `signers/test-echo/` to `wasm32-unknown-unknown`)
+through `WasmSignerLayer::apply`. The artifacts are gitignored; the script
+builds them before running the tests.
+
+```bash
+./scripts/e2e-wasm.sh                   # Build signers + run all
+```
+
+**When to write:** New signer, change to the WASM signer layer host imports
+(`__wasm_test_internals`), or any change that could break the
+manifest → load → sign pipeline against a real artifact.
+
+The wat-based tests of the same layer (`wasm_signer_layer_runs_echo_signer_end_to_end`,
+the body-mode and capability tests) stay in
+`crates/lucidos-engine/tests/proxy_wasm_engine.rs` — they construct WASM inline
+via `wat::parse_str` and need no external setup.
+
+## Real-Embedder Tests (Cargo Feature Gate)
+
+Tests that exercise properties of the real fastembed model (MultilingualE5Small)
+— cross-lingual similarity, Norwegian synonyms, semantic ranking, etc. — live
+behind the `real-embedder-tests` Cargo feature in `lucidos-engine`. They
+download ~465 MB from huggingface.co on first run and would otherwise flake on
+slow networks or fail offline.
+
+```bash
+./scripts/e2e-embedder.sh               # Run only the gated tests
+cargo test -p lucidos-engine --features real-embedder-tests   # All lib tests + gated
+```
+
+The `e2e-embedder.sh` script keeps a hand-maintained list of the gated test
+names and passes them as substring filters, so it runs **5** tests instead of
+the whole lib suite. `GATED_TESTS` at the top of the script is the source of
+truth for that number — don't restate the count elsewhere, read it from there.
+When you add a new `#[cfg(feature = "real-embedder-tests")]` test, add its name
+to `GATED_TESTS`; the script's own drift check (it re-extracts the gated test
+names from the source and diffs them against the list) fails loudly if you
+forget, so the count cannot silently go stale again.
+
+**Network resilience (warm cache + graceful skip).** These tests must never red
+the suite on a transient huggingface.co outage (a real failure mode — a
+`tokenizer.json` fetch once timed out and failed the nightly e2e). Two layers:
+
+- **Warm cache (fast/deterministic path).** `e2e-embedder.sh` pins
+  `FASTEMBED_CACHE_DIR` to a stable, machine-persistent dir
+  (`${XDG_CACHE_HOME:-$HOME/.cache}/lucidos/fastembed`) so the ~465 MB seed
+  survives `cargo clean` / worktree churn and is shared across worktrees + the
+  nightly checkout. On a cache hit, `hf-hub`'s `ApiRepo::get` short-circuits
+  before any network call — seeded runs are fully offline. (The model is far too
+  large to commit, so `.fastembed_cache/` stays gitignored; the cache is *seeded*
+  once, not checked in.)
+- **Graceful skip (resilience guarantee).** When the cache is cold *and*
+  huggingface.co is unreachable, `test_util::shared_embedder()` returns `None`
+  (logging a `SKIP` line) instead of panicking on the model-fetch `.unwrap()`.
+  Each gated test does `let Some(provider) = shared_embedder() else { return };`,
+  so an HF outage degrades to *skipped*, never *failed*. Only a model-fetch /
+  network error skips (matched by `is_model_fetch_failure`) — assertion failures
+  and non-network init errors (corrupt model, bad config) still fail loudly.
+
+To prove the offline path locally: seed once (`./scripts/e2e-embedder.sh`), then
+re-run with `HF_ENDPOINT=http://127.0.0.1:1` — the tests pass from the warm cache
+with zero network. To prove the skip: point `FASTEMBED_CACHE_DIR` at an empty dir
+with the same unreachable endpoint — the tests skip rather than fail.
+
+For unit/wiring tests of code that *uses* the embedder (e.g. memory rebuild,
+`recall_memory`), use the `KeywordEmbedder` mock from `crate::test_util` —
+deterministic, network-free, cosine reflects keyword overlap. Default
+`cargo test` stays offline; only add `#[cfg(feature = "real-embedder-tests")]`
+when the test genuinely depends on the model's semantic behavior.
+
+## Packaged Build Smoke Test (macOS)
+
+`scripts/e2e-packaged.sh` — boots the **packaged** macOS build end-to-end and
+asserts the chain that dev e2e never touches: staged Resources, the bundled
+gateway + engine binaries, relocatable **embedded** Postgres provisioning, a
+per-workspace database, the engine spawn, and static serving through the gateway
+proxy.
+
+```bash
+./scripts/e2e-packaged.sh            # reuse an existing .app, else build it
+./scripts/e2e-packaged.sh --rebuild  # force a fresh build-dmg.sh build first
+./scripts/e2e.sh --packaged          # run it as a final phase of the full suite
+```
+
+It runs the bundle's **headless service role** (`Lucidos --service`) under an
+isolated temp `HOME` + a free port + a seeded fastembed cache, then asserts over
+HTTP + on disk: gateway health (`/~/api/v1/health`) → picker → create a workspace
+→ poll it to `healthy` → engine health through the gateway (`/<slug>/api/v1/health`)
+→ app shell base href → embedded Postgres on disk. Graceful SIGTERM teardown
+verifies a clean stop (port freed, no `postmaster.pid`) and removes the temp `HOME`.
+
+It does **not** drive the WKWebView UI: Apple's WKWebView exposes no WebDriver and
+`tauri-driver` supports only Linux/Windows, so the packaged window can't be
+automated on macOS (ADR 0016). The Tauri layer's non-UI logic is unit-tested in
+`crates/lucidos-app` (`lib.rs` / `notifications.rs` / `desktop.rs`,
+`cargo test -p lucidos-app` — needs a built `crates/lucidos-app/dist/` for
+`generate_context!` to compile, so run a frontend build first).
+
+**macOS-only** (skips gracefully elsewhere) and **heavy** (full release + DMG
+build + a Postgres download) — so it is standalone and NOT in the default
+`e2e.sh` run; the nightly opts in via `--packaged` / `LUCIDOS_E2E_PACKAGED=1`.
+See `docs/e2e-test-decisions.md` for the rationale.
+
+**When to write:** changes to the packaged boot chain — `build-dmg.sh` resource
+staging, `crates/lucidos-app/src/desktop.rs` service/gateway wiring, the embedded
+Postgres provisioning, or the gateway's boot/control surface.
+
+## The Codex driver tests fail under load
+
+`runtime::codex::driver_tests` and `runtime::codex_app_server::driver_tests`
+spawn a `/bin/sh` stub from a temp dir, never the real `codex`. They share no
+state with a Codex review. What they do have is 30 s and 60 s event timeouts.
+On 2026-08-10 a merge-hardening run overlapped the engine suite with a Codex
+review and got **twelve failures out of 5,325**. The run took 539s against the
+usual 82s, and every failing test passed in isolation moments later.
+
+The failures look like real breakage in the diff, which is the whole cost: they
+point at Codex-driver code the branch never touched.
+
+Two rules follow:
+
+- **`/harden` runs these two modules alone, after the Codex review is
+  joined.** Its early suite run skips them (`scripts/harden-suites.sh`, ADR
+  0292) and runs them narrowly in `wait`.
+- **Never accept a driver-test failure as a finding** until you have re-run
+  that module alone on a quiet host (`./scripts/test-engine.sh -- --
+  runtime::codex::driver_tests runtime::codex_app_server::driver_tests`). If
+  it passes there, it was load.
+
+## Test Level Selection
+
+| Scenario | Test type |
+|----------|-----------|
+| UI bug / interaction flow | Browser e2e |
+| API response / SSE | API e2e |
+| WASM signer artifact behavior | WASM signer e2e |
+| Embedder semantic behavior | Real-embedder gated test |
+| Shared Rust logic changed | Contract test |
+| Store/signal behavior | Vitest |
+| Rust engine logic | `cargo test` |
+| Packaged macOS build boots | Packaged build smoke test |
+| Native Tauri (non-UI) logic | `cargo test -p lucidos-app` |
+
+**That last row is the one nothing else runs for you.** `make test` runs the
+engine suite plus the eval, gateway and six library crates, never
+`lucidos-app`. Clippy compiles
+the client's test targets and never executes them, so a broken assertion there
+lands on `main` green. Touch a `.rs` file under `crates/lucidos-app/src/` and
+run `cargo test --locked -p lucidos-app --lib` yourself: seconds, and no
+Postgres. `/harden` Phase 4.5 carries the same row.
+
+`./scripts/e2e.sh` runs API → browser → wasm → embedder back-to-back. The
+nightly trigger calls it; nothing else runs the wasm + embedder suites
+automatically, so don't bypass `./scripts/e2e.sh` in trigger pipelines. The
+packaged smoke test is opt-in (`./scripts/e2e.sh --packaged` /
+`LUCIDOS_E2E_PACKAGED=1`) because the full build is too heavy for every run.
