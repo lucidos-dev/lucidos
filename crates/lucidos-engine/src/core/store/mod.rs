@@ -11,7 +11,7 @@ pub(crate) use messages::{
     build_resume_tool_blocks_with_skip_ids, collect_tool_pairs_chronological,
     find_orphan_tool_called_ids, newest_conversation_summary, parse_event_address,
     synthesize_tool_use_id, tool_called_event_id_of, with_event_address, CachedSummary,
-    RESUME_VERBATIM_TOOL_TAIL,
+    ResumeToolPair, RESUME_VERBATIM_TOOL_TAIL,
 };
 pub use messages::{format_child_thread_completed_block, ChangeStatuses};
 use sqlx::PgPool;

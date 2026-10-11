@@ -16,7 +16,7 @@ pub use build::{format_child_thread_completed_block, ChangeStatuses};
 pub(crate) use resume::{
     build_resume_tool_blocks_with_skip_ids, collect_tool_pairs_chronological,
     find_orphan_tool_called_ids, parse_event_address, synthesize_tool_use_id,
-    tool_called_event_id_of, with_event_address, RESUME_VERBATIM_TOOL_TAIL,
+    tool_called_event_id_of, with_event_address, ResumeToolPair, RESUME_VERBATIM_TOOL_TAIL,
 };
 
 impl EventStore {

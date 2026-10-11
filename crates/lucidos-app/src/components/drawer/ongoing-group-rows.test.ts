@@ -23,8 +23,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { blockedThreads, reviewThreads, inFlightThreads, threadIsInFlight } from './ThreadDrawer';
 import type { NestedThread } from './ThreadDrawer';
-import { filterOngoingRows, ongoingBreakdown } from './family-graph';
-import { blockedThreadCount, ongoingFilterSteps, threadIsBlocked, threadInReview, threadMap } from '../../store/store';
+import { filterOngoingRows, ongoingBreakdown, ongoingFilterSteps } from './family-graph';
+import { blockedThreadCount, threadIsBlocked, threadInReview, threadMap } from '../../store/store';
 import type { ThreadState, ThreadMeta, ThreadStatus } from '../../store/thread-events';
 import type { ArchiveState } from '../../generated/thread-lifecycle';
 import type { CodingAgentChangeState } from '../../api/threads';
@@ -448,14 +448,25 @@ describe('the Review breakdown', () => {
 });
 
 describe('ongoingFilterSteps', () => {
+    const proposed: CodingAgentChangeState = { kind: 'proposed', requires_restart: false };
+    const reviewRows = (threads: ThreadState[]) => reviewThreads(asMap(threads)).map(thread => ({ thread, depth: 0 }));
+
     it('steps In flight through running and waiting, and Review through changes and unread', () => {
-        expect(ongoingFilterSteps('in-flight')).toEqual(['all', 'running', 'waiting']);
-        expect(ongoingFilterSteps('review')).toEqual(['all', 'changes', 'unread']);
+        const inFlight = inFlightThreads(asMap([makeThread('run', { status: 'running' }), makeThread('parked', { liveEventWaitCount: 1 })]));
+        const review = reviewRows([makeThread('change', { codingAgentChangeState: proposed }), makeThread('unread', { readRequested: true })]);
+        expect(ongoingFilterSteps('in-flight', inFlight)).toEqual(['all', 'running', 'waiting']);
+        expect(ongoingFilterSteps('review', review)).toEqual(['all', 'changes', 'unread']);
+    });
+
+    it('steps no filter while only one part has rows, since it would list them all', () => {
+        expect(ongoingFilterSteps('review', reviewRows([makeThread('unread', { readRequested: true })]))).toEqual(['all']);
+        expect(ongoingFilterSteps('in-flight', inFlightThreads(asMap([makeThread('parked', { liveEventWaitCount: 1 })])))).toEqual(['all']);
+        expect(ongoingFilterSteps('review', [])).toEqual(['all']);
     });
 
     it('gives Blocked and Drafts no filter, so a press on them only selects', () => {
-        expect(ongoingFilterSteps('blocked')).toEqual(['all']);
-        expect(ongoingFilterSteps('drafts')).toEqual(['all']);
+        expect(ongoingFilterSteps('blocked', blockedThreads(asMap([makeThread('q', { status: 'waiting_for_user_answer' })])).map(thread => ({ thread, depth: 0 })))).toEqual(['all']);
+        expect(ongoingFilterSteps('drafts', [])).toEqual(['all']);
     });
 });
 

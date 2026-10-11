@@ -73,7 +73,7 @@ const EMBED_RULE: &str = "EMBED A WIDGET WHERE A PICTURE DRAWS: `![label](app:<i
      draws it live in an option's description or preview, a card's message, or a reply. Only \
      the leading `!` draws it. The alt text is its label, and params are a JSON object of its \
      listed names. Embed one when the user must hear, see or try something to decide, such as \
-     a voice sample in each option. Put an option's sample only in it, never above the card. \
+     a voice sample or a video clip in each option. Put an option's sample only in it, never above the card. \
      One embed per option. A bad embed refuses the card: fix it and ask again.\n";
 
 /// What opens the widgets list. Every workspace lists the built-in widgets,
@@ -167,7 +167,7 @@ mod tests {
         for rule in [
             "`![label](app:<id>?params={...})`",
             "Only the leading `!` draws it",
-            "a voice sample in each option",
+            "a voice sample or a video clip in each option",
             "Put an option's sample only in it, never above the card",
             "A bad embed refuses the card",
             "- **Sound player** (id: `lucidos-sound-player`, built in): Plays one sound clip.",

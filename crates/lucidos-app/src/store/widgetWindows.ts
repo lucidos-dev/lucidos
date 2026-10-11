@@ -12,7 +12,7 @@ import { viewportIsMobile } from '../utils/viewport';
 
 /** How a window draws (ADR 0419). `minimal` is the widget alone, shaped as it
  *  draws itself. `window` is a card with a bar, at a size the user sets.
- *  `docked` snaps it under the thread's title row. */
+ *  `docked` hangs it under the header, beside the other docked windows. */
 export type WidgetWindowMode = 'minimal' | 'window' | 'docked';
 
 export const WIDGET_WINDOW_MODES: readonly WidgetWindowMode[] = ['minimal', 'window', 'docked'];
@@ -245,4 +245,69 @@ export function resizeFromCorner(
   const h = resizeAxis(from.x, size.width, dx, corner.endsWith('w'), bounds.left, bounds.right, min.width);
   const v = resizeAxis(from.y, size.height, dy, corner.startsWith('n'), bounds.top, bounds.bottom, min.height);
   return { at: { x: h.start, y: v.start }, size: { width: h.length, height: v.length } };
+}
+
+/** A docked window as it wants to hang: under its own left edge, at its own
+ *  size. */
+export interface DockedBox {
+  x: number;
+  width: number;
+  height: number;
+}
+
+/** The two edges docked windows pack between. */
+export interface DockSpan {
+  left: number;
+  right: number;
+}
+
+/** The free spot for `width` on a shelf nearest `x`, or null when no gap on it
+ *  is wide enough. */
+function nearestGap(taken: readonly DockSpan[], x: number, width: number, line: DockSpan, gap: number): number | null {
+  const sorted = [...taken].sort((a, b) => a.left - b.left);
+  const gaps: DockSpan[] = [];
+  let start = line.left;
+  for (const span of sorted) {
+    gaps.push({ left: start, right: span.left - gap });
+    start = span.right + gap;
+  }
+  gaps.push({ left: start, right: line.right });
+  let best: number | null = null;
+  for (const free of gaps.filter((g) => g.right - g.left >= width)) {
+    const spot = clamp(x, free.left, free.right - width);
+    if (best === null || Math.abs(spot - x) < Math.abs(best - x)) best = spot;
+  }
+  return best;
+}
+
+/** Where each docked window hangs, packed in shelves across `line`: its `x`,
+ *  and its `y` below the dock line. In `order`, each takes the first shelf with
+ *  room for it, at the spot nearest its own `x`. With no room on any shelf, it
+ *  opens one below. A shelf is as tall as its tallest window. A window with no
+ *  box yet is left out. */
+export function packDockedWindows(
+  order: readonly string[],
+  boxes: ReadonlyMap<string, DockedBox>,
+  line: DockSpan,
+  gap: number,
+): Map<string, { x: number; y: number }> {
+  const shelves: { taken: DockSpan[]; height: number }[] = [];
+  const placed: { key: string; x: number; shelf: number }[] = [];
+  for (const key of order) {
+    const box = boxes.get(key);
+    if (!box) continue;
+    const width = Math.min(box.width, line.right - line.left);
+    for (let shelf = 0; ; shelf++) {
+      if (shelf === shelves.length) shelves.push({ taken: [], height: 0 });
+      const x = nearestGap(shelves[shelf].taken, box.x, width, line, gap);
+      if (x === null) continue;
+      shelves[shelf].taken.push({ left: x, right: x + width });
+      shelves[shelf].height = Math.max(shelves[shelf].height, box.height);
+      placed.push({ key, x, shelf });
+      break;
+    }
+  }
+  const tops = [0];
+  for (const shelf of shelves) tops.push(tops[tops.length - 1] + shelf.height + gap);
+  return new Map(placed.map(({ key, x, shelf }) => [key, { x, y: tops[shelf] }]));
 }

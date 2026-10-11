@@ -467,6 +467,10 @@ See also: *child thread*, *event wait*, *capacity policy*.
 The principle at the heart of Lucidos: you and the *Lucidos Agent* shape the whole living system, **data and presentation together**. You do it continuously and in place, with no build → deploy → observe gap. The *Conversation* and the *Canvas* are always live and a gesture apart: side by side on desktop, a swipe apart on mobile. The Canvas runs on the real workspace, since apps read live data through the SDK. So you research, build and iterate inside Lucidos in one motion, seeing real behavior at once. The Conversation↔Canvas back-and-forth is the surface of live co-creation; the depth is that one conversation reaches the entire stack.
 <!--gloss-live-cocreation-end-->
 
+### Loaded knowhow
+The *knowhow docs* a thread's `[LOADED KNOWHOW]` block carries in full this turn. A doc joins on the turn after its load. It leaves after a few agent replies without a load, or on `unload_knowhow`. A second `load_knowhow` of a doc the block holds keeps it and returns no body. The Context viewer lists the set as its Loaded knowhow tier, with how long each doc stays.
+See also: `system-knowhow/building-knowhow.md` § "Lifecycle: loaded while in use", ADR 0425.
+
 ### Lucidos Agent
 The LLM driving a *thread* on the user's behalf: chat responses, trigger-thread runs, sub-thread callbacks, anything the LLM authored. UI actor-chip label: "Lucidos Agent". Returned by `mcp_client_name(ActorMode::Agent)` in `crates/lucidos-engine/src/mcp/client.rs`. Contrast with *Lucidos Engine*.
 
@@ -1016,7 +1020,7 @@ See also: *Folders grouping*, *thread drawer*.
 ### In flight
 The *Ongoing grouping* group for work that is not finished and does not need you. It lists every Current and Saved *thread* whose status reads **Running** or **Waiting**: a turn running now, a thread watching for an *event wait* of its own, or a parent waiting on its *sub-threads*. A sub-thread sits under its parent when both are in flight. A thread waiting for your answer or one that failed is in *Blocked* instead. A finished one with a ready *change* is in *Review*. So is one whose agent made a *read request*, which leaves In flight even while it still waits.
 
-Its tile also works as a filter. Press the selected In flight tile again to list only the running threads, again for only the waiting ones, and once more for all. The tile marks the count it lists. Selecting another group lists the whole group again.
+Its tile also works as a filter. Press the selected In flight tile again to list only the running threads, again for only the waiting ones, and once more for all. The filter skips a kind with no threads, and with only one kind there is nothing to filter. The tile marks the count it lists. When the listed kind runs out, or you select another group, the whole group lists again.
 
 ### Blocked
 The *Ongoing grouping* group for threads that cannot go on without you. It lists every Current and Saved *thread* waiting for your answer or permission, one that failed, and a stopped *sub-thread*. It also lists one resting with *unproposed work* that is not hardened, whose *Not ready* strip offers **Harden**.
@@ -1026,7 +1030,7 @@ Questions come first, then the newest. Its count rides the *grouping button* und
 ### Review
 The *Ongoing grouping* group for finished work that is your turn to look at. It lists every Current and Saved *thread* whose turn has ended and that holds a ready *change* or a *read request*. Opening one from Review lands on the change's turn when a change is ready, and otherwise on the start of the newest turn. A read request adds nothing to the Blocked count.
 
-Its tile splits the count into changes and unread. A thread with both a ready change and a read request counts as a change. Press the selected Review tile again to list only the changes, again for only the unread ones, and once more for all. The tile marks the count it lists. Selecting another group lists the whole group again.
+Its tile splits the count into changes and unread. A thread with both a ready change and a read request counts as a change. Press the selected Review tile again to list only the changes, again for only the unread ones, and once more for all. The filter skips a kind with no threads, and with only one kind there is nothing to filter. The tile marks the count it lists. When the listed kind runs out, or you select another group, the whole group lists again.
 
 ### Read decision
 The yes or no every agent turn ends with, about whether its reply is worth reading. A yes is a *read request*. The agent decides with the `request_read` tool when it is sure, or a coding agent with `lucidos request-read yes|no`. There is no default: a turn that ends without deciding is decided by one background model call (Settings → Models → Background tasks → Read decision). When a ready *change* or a harden hold already lists the thread, the answer is no, with no call.
@@ -1448,7 +1452,7 @@ How a *widget window* draws (ADR 0419):
 
 - **Minimal**, the default on a desktop: the widget alone, in the shape it draws, with no bar or frame. Its controls show on hover, or for a few seconds after a tap on a touch screen. They float in a pill above the widget, so they never cover it. The widget is told, so it can draw a compact form.
 - **Window**: the card with its bar, dragged by the bar and resized from any corner. It keeps its size, so a widget that grows scrolls inside it.
-- **Docked**, the default on a phone: hung under the thread's title row at the row's width, with the same floating controls as minimal.
+- **Docked**, the default on a phone: hung under the header at its own width, beside the other docked windows, with the same floating controls as minimal. A shelf with no room left opens a new one below. On a phone it hangs under the thread's title row instead.
 
 ### Thread widgets
 Every *widget instance* shown or pinned in a thread: each one's params, label, name, `reusable` flag, pin state and the turn that last showed it. The *widget cards* read it, and the *widget shelf* keeps its pinned ones. It derives from the thread's `WidgetShown`, `WidgetPinned` and `WidgetUnpinned` events. A *widget embed* records no event, so only its pin adds an entry. Read it with `widgets(action="thread")`, `lucidos widgets thread` or `GET /api/v1/widgets/thread`.
@@ -1469,7 +1473,7 @@ The JSON object a *widget* receives for one place it is shown, read with `lucido
 One *widget* with one set of *widget params*. *Thread widgets* and the *widget shelf* key on it, so two instances of one widget can both be pinned. Its label is not part of the key. The same names and values in a different order are one instance (ADR 0415).
 
 ### Built-in widget
-A *reusable widget* that ships inside Lucidos, under an id starting `lucidos-`, read-only, updated with each release. The sound player, `lucidos-sound-player`, is the first. No workspace app can take a `lucidos-` id. "Make app" gives an editable copy (ADR 0415).
+A *reusable widget* that ships inside Lucidos, under an id starting `lucidos-`, read-only, updated with each release. Two ship: the sound player, `lucidos-sound-player`, and the video player, `lucidos-video-player`. No workspace app can take a `lucidos-` id. "Make app" gives an editable copy (ADR 0415).
 
 ### Workspace
 A user's complete Lucidos instance: one PostgreSQL database inside the shared

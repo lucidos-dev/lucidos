@@ -3,15 +3,8 @@ use crate::core::EventRow;
 
 /// Number of recent (ToolCalled, ToolResult) pairs reconstructed verbatim as
 /// `Message::Blocks(...)` pairs on resume — see
-/// [`build_resume_tool_blocks_with_skip_ids`]. `load_knowhow` results are
-/// pinned regardless of N.
+/// [`build_resume_tool_blocks_with_skip_ids`].
 pub(crate) const RESUME_VERBATIM_TOOL_TAIL: usize = 3;
-
-/// Tool names whose results survive the N-most-recent window. `load_knowhow`
-/// returns reference material (a procedure body) that doesn't decay across
-/// turns, so multi-step orchestrators keep their recipe across callback
-/// resumes.
-const PINNED_TOOL_NAMES: &[&str] = &[crate::llm::tool_names::LOAD_KNOWHOW];
 
 /// Render a `ToolCalled` event id as the `evt-<32 hex>` address the LLM sees.
 ///
@@ -90,6 +83,8 @@ pub(crate) struct ResumeToolPair {
     /// `None` when the matching `ToolResult` event is missing — emit a
     /// synthetic `[tool result unavailable: orphaned]` stub on the wire.
     pub(crate) result: Option<String>,
+    /// The `ToolResult`'s `success` flag. A row without one succeeded.
+    pub(crate) succeeded: bool,
 }
 
 /// Synthetic stub body for orphan `ToolCalled` events (no matching
@@ -132,6 +127,7 @@ pub(crate) fn collect_tool_pairs_chronological(events: &[EventRow]) -> Vec<Resum
                     tool_name: tool_name.clone(),
                     args,
                     result: None,
+                    succeeded: false,
                 });
                 pending.push((slot_idx, tool_name));
             }
@@ -166,6 +162,11 @@ pub(crate) fn collect_tool_pairs_chronological(events: &[EventRow]) -> Vec<Resum
                         .to_string();
                     if let Some(slot) = slots.get_mut(slot_idx) {
                         slot.result = Some(result);
+                        slot.succeeded = event
+                            .payload
+                            .get("success")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
                     }
                 }
             }
@@ -177,27 +178,6 @@ pub(crate) fn collect_tool_pairs_chronological(events: &[EventRow]) -> Vec<Resum
     // `result` is still `None` is an orphan — surfaced as a synthetic stub
     // by `build_resume_tool_blocks_with_skip_ids`.
     slots
-}
-
-/// Partition resume pairs into (pinned, tail) for the resume-block builder.
-/// Pinned pairs survive regardless of N (see [`PINNED_TOOL_NAMES`]); tail is
-/// the last N non-pinned pairs in chronological order.
-fn select_pinned_and_tail(
-    pairs: &[ResumeToolPair],
-    n: usize,
-) -> (Vec<&ResumeToolPair>, Vec<&ResumeToolPair>) {
-    let mut pinned: Vec<&ResumeToolPair> = Vec::new();
-    let mut others: Vec<&ResumeToolPair> = Vec::new();
-    for p in pairs {
-        if PINNED_TOOL_NAMES.contains(&p.tool_name.as_str()) {
-            pinned.push(p);
-        } else {
-            others.push(p);
-        }
-    }
-    let tail_start = others.len().saturating_sub(n);
-    let tail: Vec<&ResumeToolPair> = others[tail_start..].to_vec();
-    (pinned, tail)
 }
 
 /// Return `(ToolCalled.event_id, tool_name)` for every `ToolCalled` whose
@@ -218,10 +198,9 @@ pub(crate) fn find_orphan_tool_called_ids(events: &[EventRow]) -> Vec<(uuid::Uui
 /// derive from, so callers can skip the same tools in their stringified
 /// history summaries to avoid double-billing.
 ///
-/// `load_knowhow` results are pinned: any pair where `tool_name == "load_knowhow"`
-/// is included regardless of where it falls in the N-most-recent ordering.
-/// Other tools follow the N window (most recent N kept, older dropped — they
-/// keep their `[tools: ...]` summary in stringified history).
+/// Every tool follows the N window, `load_knowhow` included (most recent N
+/// kept, older dropped: they keep their `[tools: ...]` summary in stringified
+/// history).
 ///
 /// `ContextDismissed` records: any tool pair whose `tool_called_event_id`
 /// appears in the dismissed set is dropped from BOTH the rebuilt blocks and
@@ -229,19 +208,15 @@ pub(crate) fn find_orphan_tool_called_ids(events: &[EventRow]) -> Vec<(uuid::Uui
 /// stops rendering for the dismissed tool (the agent asked for the entry to
 /// be gone, not just shrunk).
 ///
-/// `loaded_knowhow_ids` is the set of knowhow doc ids currently in the per-
-/// thread loaded set. For a `load_knowhow` pair whose `args.id` is in that
-/// set, the result body is replaced with a one-line stub pointing the LLM at
-/// the `[LOADED KNOWHOW]` block in this turn's user message. The full body
-/// already lives there (Phase 3) — sending it again in the resume tool
-/// result would double-bill the tokens. Pairs whose id is NOT in the set
-/// (e.g. recovery hadn't run yet, or a future `unload_knowhow` removed the
-/// entry) keep the verbatim body so the LLM never loses context.
+/// `loaded_knowhow_ids` is the thread's loaded knowhow this turn. A resumed
+/// `load_knowhow` pair never carries a doc body (ADR 0425): a loaded doc's
+/// body is in the `[LOADED KNOWHOW]` block, and an unloaded one is a call
+/// away. So a successful result becomes a one-line stub saying which. A
+/// not-found answer stays verbatim, being short and still true.
 ///
-/// Output ordering: pinned pairs first (chronological), then tail pairs
-/// (chronological). Each pair emits an assistant `ToolUse` block followed by
-/// a user `ToolResult` block, matching the wire shape Anthropic and OpenAI
-/// providers expect.
+/// Output ordering: chronological. Each pair emits an assistant `ToolUse`
+/// block followed by a user `ToolResult` block, matching the wire shape
+/// Anthropic and OpenAI providers expect.
 pub(crate) fn build_resume_tool_blocks_with_skip_ids(
     events: &[EventRow],
     n: usize,
@@ -256,13 +231,12 @@ pub(crate) fn build_resume_tool_blocks_with_skip_ids(
     if pairs.is_empty() {
         return (Vec::new(), std::collections::HashSet::new());
     }
-    let (pinned, tail) = select_pinned_and_tail(&pairs, n);
+    let tail = &pairs[pairs.len().saturating_sub(n)..];
 
-    let total = pinned.len() + tail.len();
-    let mut messages: Vec<crate::llm::Message> = Vec::with_capacity(total * 2);
+    let mut messages: Vec<crate::llm::Message> = Vec::with_capacity(tail.len() * 2);
     let mut skip_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::with_capacity(total);
-    for p in pinned.into_iter().chain(tail.into_iter()) {
+        std::collections::HashSet::with_capacity(tail.len());
+    for p in tail {
         skip_ids.insert(p.tool_called_event_id.to_string());
         let id = synthesize_tool_use_id(&p.tool_called_event_id);
         messages.push(crate::llm::Message {
@@ -282,25 +256,12 @@ pub(crate) fn build_resume_tool_blocks_with_skip_ids(
         // Orphans (`result: None`) emit a synthetic stub so every assistant
         // tool_use block has its paired user tool_result on the wire.
         // Anthropic 400s otherwise — see thread b101c3d7 repro.
-        let mut content = p
-            .result
-            .clone()
-            .unwrap_or_else(|| ORPHAN_TOOL_RESULT_STUB.to_string());
-        // Body-stub swap for already-loaded knowhow: the doc body lives in
-        // this turn's `[LOADED KNOWHOW]` user-message section (Phase 3).
-        // Order matters — orphan stub takes precedence, since an orphaned
-        // `load_knowhow` ToolCalled never produced a body to dedupe in the
-        // first place. Only a real, paired result body gets stubbed here.
-        if p.tool_name == crate::llm::tool_names::LOAD_KNOWHOW && p.result.is_some() {
-            if let Some(doc_id) = p.args.get("id").and_then(|v| v.as_str()) {
-                if loaded_knowhow_ids.contains(doc_id) {
-                    content = format!(
-                        "Loaded. Doc body now lives in the [LOADED KNOWHOW] section of this turn's user message — refer to that section for the body of `{}`.",
-                        doc_id
-                    );
-                }
+        let content = match &p.result {
+            None => ORPHAN_TOOL_RESULT_STUB.to_string(),
+            Some(result) => {
+                knowhow_body_stub(p, result, loaded_knowhow_ids).unwrap_or_else(|| result.clone())
             }
-        }
+        };
         messages.push(crate::llm::Message {
             role: "user".to_string(),
             content: crate::llm::MessageContent::Blocks(vec![
@@ -316,4 +277,29 @@ pub(crate) fn build_resume_tool_blocks_with_skip_ids(
         });
     }
     (messages, skip_ids)
+}
+
+/// The stub a resumed `load_knowhow` result shows instead of its doc body, or
+/// `None` for a pair that keeps its result verbatim.
+fn knowhow_body_stub(
+    pair: &ResumeToolPair,
+    result: &str,
+    loaded_knowhow_ids: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if pair.tool_name != crate::llm::tool_names::LOAD_KNOWHOW
+        || !pair.succeeded
+        || crate::core::knowhow::is_not_found_body(result)
+    {
+        return None;
+    }
+    let doc_id = pair.args.get("id").and_then(|v| v.as_str())?;
+    Some(if loaded_knowhow_ids.contains(doc_id) {
+        format!(
+            "Loaded. The body of `{doc_id}` is in the [LOADED KNOWHOW] section of this turn's user message."
+        )
+    } else {
+        format!(
+            "Unloaded. `{doc_id}` left the [LOADED KNOWHOW] section. Call load_knowhow again if you need it."
+        )
+    })
 }

@@ -43,7 +43,7 @@ pub mod http;
 pub(crate) mod image_size_hint;
 pub(crate) mod inline_question_repair;
 pub(crate) mod inline_tool_call_repair;
-pub(crate) mod loaded_knowhow;
+pub mod loaded_knowhow;
 pub mod mcp_permission;
 /// `pub(crate)` for `relevance_score` / `age_in_days`: the `/memory/search`
 /// endpoint ranks with the SAME formula as the pre-turn injection, so a
@@ -672,10 +672,6 @@ pub struct LucidosEngine {
     pub frontend_origin: std::sync::Mutex<Option<String>>,
     /// Active coding-agent sessions keyed by thread_id.
     pub(crate) agent_sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
-    /// Per-thread loaded knowhow set — populated when `load_knowhow` is called,
-    /// consumed when assembling the user message + stubbing resume tool blocks.
-    /// Reconstructable from `ToolResult` events on engine restart (task 2.3).
-    pub(crate) loaded_knowhow: Arc<crate::engine::loaded_knowhow::LoadedKnowhowStore>,
     /// The live workspace *view snapshots* of the Tree memory module, one per
     /// view budget. A cache: a restart folds them afresh.
     pub(crate) view_snapshots: crate::engine::summary_tree::view::ViewSnapshots,

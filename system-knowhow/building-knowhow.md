@@ -62,11 +62,22 @@ Load it with `load_knowhow` before you start a release.
 Nothing else routes to a reference. It stays loadable by full id forever, but if no doc
 names it, nothing can find it.
 
-## Lifecycle: load-once-stays-loaded
+## Lifecycle: loaded while in use
 
-When the engine LLM calls `load_knowhow` on a doc, the body goes into the `[LOADED KNOWHOW]` block of every later turn's user message. The LLM does **not** need to call `load_knowhow` again for that id. A second call is a no-op: the loaded set is keyed by id, so the body is overwritten with itself. The engine restores the loaded set from events on restart, so the doc stays loaded across engine restarts. There is no auto-unload and no LRU: a loaded doc stays loaded for the thread's lifetime.
+When the engine LLM calls `load_knowhow` on a doc, the body comes back as the tool result. From the next turn on, it rides in the `[LOADED KNOWHOW]` block of the user message instead. The block is built once per turn and never changes inside one, so a doc loaded mid-turn joins it on the next turn.
 
-So write the body for a reader who has it in context for the rest of the thread. Don't structure it to be re-read each turn, and don't plan for eviction. The LLM Context Viewer shows loaded docs under the **Loaded knowhow** tier, inside the user-message group.
+A doc leaves when it is no longer in use (ADR 0425):
+
+- **It ages one step per finished turn**, that is per agent reply, unless that turn loaded it. A question the agent asks and the user answers stays inside the turn. A stopped, aborted or failed turn does not count.
+- **It leaves after a few finished turns in a row that do not load it.** The block's header states how many. Each doc's line in the block says how many more turns it stays.
+- **Calling `load_knowhow` again keeps it.** If the block already holds the doc and the file has not changed, the call returns a short note and no body. A changed file returns the new body.
+- **`unload_knowhow` drops a doc** the agent is done with.
+- **A doc leaves only between turns**, never in the middle of one.
+- **After it leaves, a load works exactly like the first one**: full body, back in the block next turn. The doc stays in the routing list throughout.
+
+The loaded set is worked out from the thread's events on every turn, so it survives an engine restart unchanged, evictions and unloads included.
+
+So write the body for a reader who has it in context while a task lasts, not for the rest of the thread. A doc that a long task follows step by step gets loaded again at each step, which keeps it at no cost. The LLM Context Viewer shows loaded docs under the **Loaded knowhow** tier, inside the user-message group, each with how long it stays.
 
 ## Questions to settle with the user before creating
 

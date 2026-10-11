@@ -441,11 +441,9 @@ fn find_orphan_tool_called_ids_name_mismatch_falls_back_to_most_recent_pending()
 }
 
 // ----------------------------------------------------------------------------
-// Phase 4 of the loaded-knowhow plan: when a `load_knowhow` doc is in the
-// per-thread loaded set, its result body in the resume tool blocks must be
-// stubbed out — the full body is injected into the user message's
-// `[LOADED KNOWHOW]` section, so sending it in the resume blocks too would
-// double-bill the tokens.
+// A resumed `load_knowhow` result never carries a doc body (ADR 0425). A
+// loaded doc's body is in the user message's `[LOADED KNOWHOW]` section, and
+// an unloaded doc is one `load_knowhow` call away.
 // ----------------------------------------------------------------------------
 
 #[test]
@@ -508,7 +506,7 @@ fn resume_blocks_stub_load_knowhow_result_when_doc_in_loaded_set() {
 }
 
 #[test]
-fn resume_blocks_keep_load_knowhow_body_when_doc_not_in_loaded_set() {
+fn resume_blocks_stub_an_unloaded_doc_body_too() {
     use crate::core::EventRow;
     use chrono::Utc;
     let now = Utc::now();
@@ -530,8 +528,8 @@ fn resume_blocks_keep_load_knowhow_body_when_doc_not_in_loaded_set() {
             sequence: Some(2),
         },
     ];
-    // Empty loaded set: no recovery yet, or the doc was unloaded. The body must
-    // survive so the LLM does not lose context.
+    // Empty loaded set: the doc was evicted or unloaded. Its body must not
+    // come back through the resume blocks.
     let loaded = std::collections::HashSet::new();
     let (messages, _skip) =
         crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &loaded);
@@ -543,21 +541,71 @@ fn resume_blocks_keep_load_knowhow_body_when_doc_not_in_loaded_set() {
         .expect("expect a user-role ToolResult message");
     if let MessageContent::Blocks(blocks) = &result_msg.content {
         if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
-            // Body verbatim, plus the address of its own `ToolCalled`. The
-            // rebuild is what a follow-up turn sends, so an unaddressed result
-            // would be unkeepable and unsweepable for the rest of the thread.
-            assert_eq!(
-                content,
-                &crate::core::store::with_event_address(
-                    "ORIGINAL DOC BODY".into(),
-                    Some(&events[0].id)
-                )
+            assert!(!content.contains("ORIGINAL DOC BODY"), "{content}");
+            assert!(content.starts_with("Unloaded. `my-doc`"), "{content}");
+            assert!(content.contains("load_knowhow"), "{content}");
+            // Still addressed by its own `ToolCalled`, like every rebuilt pair.
+            assert!(
+                content.ends_with(&format!(
+                    "[{}]",
+                    crate::core::store::synthesize_tool_use_id(&events[0].id)
+                )),
+                "{content}"
             );
         } else {
             panic!("expected ToolResult block");
         }
     } else {
         panic!("expected Blocks content");
+    }
+}
+
+/// A miss or a failure carries no body, and its text is still true.
+#[test]
+fn resume_blocks_keep_a_knowhow_miss_or_failure_verbatim() {
+    use crate::core::EventRow;
+    use chrono::Utc;
+    let now = Utc::now();
+    let not_found = crate::core::knowhow::knowhow_not_found_body("ghost");
+    let cases = [
+        (not_found.as_str(), true),
+        ("Error: database unreachable", false),
+    ];
+    for (result, success) in cases {
+        let events = vec![
+            EventRow {
+                id: uuid::Uuid::new_v4(),
+                event_type: "ToolCalled".into(),
+                payload: json!({"name": "load_knowhow", "args": {"id": "ghost"}}),
+                created: now,
+                thread_id: None,
+                sequence: Some(1),
+            },
+            EventRow {
+                id: uuid::Uuid::new_v4(),
+                event_type: "ToolResult".into(),
+                payload: json!({"name": "load_knowhow", "result": result, "success": success}),
+                created: now + chrono::Duration::seconds(1),
+                thread_id: None,
+                sequence: Some(2),
+            },
+        ];
+        let (messages, _skip) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+            &events,
+            5,
+            &std::collections::HashSet::new(),
+        );
+        use crate::llm::{ContentBlock, MessageContent};
+        let MessageContent::Blocks(blocks) = &messages[1].content else {
+            panic!("expected Blocks content");
+        };
+        let ContentBlock::ToolResult { content, .. } = &blocks[0] else {
+            panic!("expected ToolResult block");
+        };
+        assert_eq!(
+            content,
+            &crate::core::store::with_event_address(result.to_string(), Some(&events[0].id))
+        );
     }
 }
 

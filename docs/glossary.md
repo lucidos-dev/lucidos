@@ -2383,7 +2383,9 @@ The header row holds two controls at each end: the toggle and Filter lead, Group
 
 A thread matching none is in no group. Only In flight is disjoint from the others.
 
-Review and In flight are *split groups* (`ONGOING_PARTS` in `store.ts`). Each row belongs to exactly one part (`ongoingPartOf`): Review splits into `changes` and `unread`, In flight into `running` and `waiting`. A Review row holding both a ready change and a read request counts as a change, so the parts sum to the group. The tile names each non-empty part (`OngoingTileBreakdown`). A press on the selected split tile steps `ongoingFilter` through `ongoingFilterSteps`, and `filterOngoingRows` applies it. Selecting a group resets it to `all`.
+Review and In flight are *split groups* (`ONGOING_PARTS` in `store.ts`). Each row belongs to exactly one part (`ongoingPartOf`): Review splits into `changes` and `unread`, In flight into `running` and `waiting`. A Review row holding both a ready change and a read request counts as a change, so the parts sum to the group. The tile names each non-empty part (`OngoingTileBreakdown`).
+
+A press on the selected split tile steps the filter through `ongoingFilterSteps`: `all`, then each part that holds rows, and no part at all unless two do. The store keeps the choice (`ongoingFilterChoice`), and `ongoingFilter` (`family-graph.ts`) reads it as `all` once its part empties, so a filtered list is never empty. While the list shows, `OngoingList` then resets the choice, so a part that refills does not narrow the list again. Selecting a group resets the choice to `all`, and `filterOngoingRows` applies the filter.
 
 `OngoingTiles` always draws all four `OngoingTile`s in `.drawer-ongoing-tiles`, and only the selected group's rows follow. A tile's count stays blank until the threads load, so a cold boot never claims a group is empty. A selected group with no rows shows its own empty state. A click or Enter on a tile selects it and opens its first row (`pressOngoingTile`, ADR 0401). On the phone that open needs a group of exactly one (ADR 0409).
 

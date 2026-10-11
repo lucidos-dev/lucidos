@@ -8,6 +8,7 @@ import {
   forgetWidgetWindow,
   moveWidgetWindow,
   openWidgetWindow,
+  packDockedWindows,
   raiseWidgetWindow,
   resizeFromCorner,
   resizeWidgetWindow,
@@ -171,5 +172,55 @@ describe('resizeFromCorner', () => {
   it('stops at the screen edge', () => {
     expect(resizeFromCorner('nw', from, size, -900, -900, bounds, min)).toEqual({ at: { x: 0, y: 0 }, size: { width: 500, height: 400 } });
     expect(resizeFromCorner('se', from, size, 900, 900, bounds, min).size).toEqual({ width: 800, height: 600 });
+  });
+});
+
+describe('packDockedWindows', () => {
+  const line = { left: 10, right: 1010 };
+  const gap = 10;
+  const pack = (boxes: [string, { x: number; width: number; height: number }][]) =>
+    Object.fromEntries(packDockedWindows(boxes.map(([key]) => key), new Map(boxes), line, gap));
+
+  it('docks a lone window under its own left edge, on the first shelf', () => {
+    expect(pack([['fares', { x: 400, width: 300, height: 100 }]])).toEqual({ fares: { x: 400, y: 0 } });
+  });
+
+  it('keeps every window on screen, however wide or far right', () => {
+    expect(pack([['fares', { x: 900, width: 300, height: 100 }]])).toEqual({ fares: { x: 710, y: 0 } });
+    expect(pack([['fares', { x: 400, width: 5000, height: 100 }]])).toEqual({ fares: { x: 10, y: 0 } });
+  });
+
+  it('sets windows side by side, each nearest its own edge', () => {
+    expect(pack([
+      ['fares', { x: 400, width: 300, height: 100 }],
+      ['weather', { x: 450, width: 300, height: 80 }],
+    ])).toEqual({ fares: { x: 400, y: 0 }, weather: { x: 710, y: 0 } });
+  });
+
+  it('takes the gap on the other side when it is nearer', () => {
+    expect(pack([
+      ['fares', { x: 400, width: 300, height: 100 }],
+      ['weather', { x: 300, width: 200, height: 80 }],
+    ])).toEqual({ fares: { x: 400, y: 0 }, weather: { x: 190, y: 0 } });
+  });
+
+  it('starts a shelf below, as tall as the tallest above, only when no gap fits', () => {
+    expect(pack([
+      ['fares', { x: 10, width: 480, height: 100 }],
+      ['weather', { x: 500, width: 480, height: 140 }],
+      ['cost', { x: 300, width: 300, height: 60 }],
+    ])).toEqual({ fares: { x: 10, y: 0 }, weather: { x: 500, y: 0 }, cost: { x: 300, y: 150 } });
+  });
+
+  it('fills a gap on an upper shelf before a lower one', () => {
+    expect(pack([
+      ['fares', { x: 10, width: 600, height: 100 }],
+      ['weather', { x: 10, width: 600, height: 100 }],
+      ['cost', { x: 10, width: 300, height: 60 }],
+    ])).toEqual({ fares: { x: 10, y: 0 }, weather: { x: 10, y: 110 }, cost: { x: 620, y: 0 } });
+  });
+
+  it('skips a window it has no size for yet', () => {
+    expect(packDockedWindows(['fares'], new Map(), line, gap).size).toBe(0);
   });
 });

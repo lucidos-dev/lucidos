@@ -275,7 +275,7 @@ pub(crate) fn build_capture_sections(
     for doc in loaded_knowhow_docs {
         let chars = doc.body.chars().count();
         capture_sections.push(ContextSection {
-            name: format!("knowhow: {}", doc.id),
+            name: format!("knowhow: {} ({})", doc.id, doc.retention_note()),
             content: truncate(&doc.body),
             budget_delta_chars: chars,
             content_chars: Some(chars),
@@ -332,24 +332,26 @@ pub(crate) fn build_capture_sections(
 }
 
 /// Build the per-turn `[LOADED KNOWHOW]` block injected into the user
-/// message — the source-of-truth location for loaded knowhow text after
-/// the first turn. Returns `None` for an empty loaded set so callers can
-/// skip pushing an empty section.
+/// message: the only place a loaded doc's body rides after the turn that
+/// loaded it. Returns `None` for an empty loaded set so callers can skip
+/// pushing an empty section.
 ///
 /// `doc.body` is already the formatted `[SYSTEM-KNOWHOW: <name>]` /
 /// `[KNOW-HOW: <name>]` block produced by
-/// `core::knowhow::load_one_knowhow_section` — pushed verbatim so the LLM
-/// sees the same markers it did on first-turn inline returns. Re-wrapping
-/// here would nest markers and mismatch id-vs-name.
+/// `core::knowhow::load_one_knowhow_section`, pushed verbatim so the LLM
+/// sees the same markers it did on first-turn inline returns. Each doc gets a
+/// line with its id and its retention note, since the marker carries the name.
 pub(crate) fn build_loaded_knowhow_block(docs: &[LoadedKnowhow]) -> Option<String> {
     if docs.is_empty() {
         return None;
     }
-    let mut s = String::from(
-        "[LOADED KNOWHOW]\nThe following knowhow docs are loaded for this thread. Treat their guidance as authoritative.\n",
+    let mut s = format!(
+        "[LOADED KNOWHOW]\nThe following knowhow docs are loaded for this thread. Treat their guidance as authoritative.\n\
+         A doc leaves after {} finished turns that do not load it. To keep one you still follow, call load_knowhow on it again: that returns no body. Call unload_knowhow on one you are done with.\n",
+        crate::engine::loaded_knowhow::IDLE_TURNS_BEFORE_UNLOAD
     );
     for doc in docs {
-        s.push('\n');
+        s.push_str(&format!("\n(`{}` {})\n", doc.id, doc.retention_note()));
         s.push_str(&doc.body);
     }
     s.push_str("\n[END LOADED KNOWHOW]");

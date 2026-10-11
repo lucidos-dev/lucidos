@@ -160,9 +160,13 @@
       fail('No clip to play.');
     } else {
       audio.src = clipUrl(clip.trim());
+      // A pause before the clip starts, by a tap or by another frame's sound,
+      // rejects with AbortError. That is not a failure.
       play.addEventListener('click', () => {
-        if (audio.paused) audio.play().catch((e) => fail(`Could not play the clip: ${e.message}`));
-        else audio.pause();
+        if (!audio.paused) return audio.pause();
+        audio.play().catch((e) => {
+          if (e.name !== 'AbortError') fail(`Could not play the clip: ${e.message}`);
+        });
       });
       audio.addEventListener('play', () => {
         player.classList.add('playing');

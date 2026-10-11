@@ -1950,10 +1950,9 @@ impl LucidosEngine {
         ));
 
         // Prepend reconstructed (ToolUse, ToolResult) Message pairs for the
-        // most recent N tool calls (Phase 3). This keeps tool result bodies —
-        // notably `load_knowhow` recipe contents — alive across resumes so
-        // multi-step trigger pipelines don't collapse to the stringified
-        // `[tools: ...]` summary on the next turn. See
+        // most recent N tool calls (Phase 3), so the last turn's work does not
+        // collapse to the stringified `[tools: ...]` summary. A knowhow body
+        // rides in the `[LOADED KNOWHOW]` block instead. See
         // `core::store::build_resume_tool_blocks_with_skip_ids`.
         let mut messages = resume_tool_blocks;
         messages.push(Message {

@@ -1,0 +1,12 @@
+{
+  "name": "Video player",
+  "description": "Plays one video clip: the first frame, play and pause, a scrubber, the time and full screen.",
+  "kind": "widget",
+  "reusable": true,
+  "params": {
+    "clip": {
+      "description": "The clip to play: a workspace path such as artifacts/films/ending-a.mp4, or an https URL",
+      "required": true
+    }
+  }
+}

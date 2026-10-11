@@ -643,14 +643,12 @@ fn loaded_knowhow_block_emits_doc_bodies_verbatim() {
     // mismatch id-vs-name (id is the file id, name is the doc's display
     // name from frontmatter).
     let docs = vec![
-        LoadedKnowhow {
-            id: "alpha".into(),
-            body: "[SYSTEM-KNOWHOW: Alpha Doc]\nBody A\n[END SYSTEM-KNOWHOW]".into(),
-        },
-        LoadedKnowhow {
-            id: "beta".into(),
-            body: "[KNOW-HOW: Beta Doc]\nBody B\n[END KNOW-HOW]".into(),
-        },
+        LoadedKnowhow::loaded_turns_ago(
+            "alpha",
+            "[SYSTEM-KNOWHOW: Alpha Doc]\nBody A\n[END SYSTEM-KNOWHOW]",
+            1,
+        ),
+        LoadedKnowhow::loaded_turns_ago("beta", "[KNOW-HOW: Beta Doc]\nBody B\n[END KNOW-HOW]", 3),
     ];
     let s = build_loaded_knowhow_block(&docs).expect("non-empty docs produce a block");
     assert!(
@@ -680,6 +678,13 @@ fn loaded_knowhow_block_emits_doc_bodies_verbatim() {
         s.contains("Treat their guidance as authoritative"),
         "header guidance missing from block:\n{s}"
     );
+    // Each doc says how long it stays, so the agent can keep one in time.
+    assert!(s.contains("call load_knowhow on it again"), "{s}");
+    assert!(s.contains("unload_knowhow"), "{s}");
+    for doc in &docs {
+        let line = format!("(`{}` {})", doc.id, doc.retention_note());
+        assert!(s.contains(&line), "missing `{line}`:\n{s}");
+    }
 }
 
 /// Empty loaded set must not produce a section — pushing an empty-string part
@@ -1004,14 +1009,8 @@ fn build_capture_sections_surfaces_the_two_relocated_tail_blocks() {
 #[test]
 fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
     let docs = vec![
-        LoadedKnowhow {
-            id: "doc-a".into(),
-            body: "BODY A".into(),
-        },
-        LoadedKnowhow {
-            id: "doc-b".into(),
-            body: "BODY BBBB".into(),
-        },
+        LoadedKnowhow::loaded_turns_ago("doc-a", "BODY A", 1),
+        LoadedKnowhow::loaded_turns_ago("doc-b", "BODY BBBB", 3),
     ];
     let sections = run_build(
         "",
@@ -1039,8 +1038,15 @@ fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
         .filter(|s| s.group.as_deref() == Some("Loaded knowhow"))
         .collect();
     assert_eq!(knowhow.len(), 2, "one row per loaded doc");
-    assert_eq!(knowhow[0].name, "knowhow: doc-a");
-    assert_eq!(knowhow[1].name, "knowhow: doc-b");
+    // The row says why the doc is still loaded.
+    assert_eq!(
+        knowhow[0].name,
+        format!("knowhow: doc-a ({})", docs[0].retention_note())
+    );
+    assert_eq!(
+        knowhow[1].name,
+        format!("knowhow: doc-b ({})", docs[1].retention_note())
+    );
     assert!(knowhow.iter().all(|s| s.role == ContextRole::User));
     // Nothing else counts a knowhow doc's chars, so the delta is its own size.
     assert_eq!(knowhow[0].budget_delta_chars, "BODY A".chars().count());
@@ -1168,10 +1174,7 @@ fn build_capture_sections_includes_device_preferences_context() {
 /// card held the turn open reaches the rounds after the answer.
 #[test]
 fn build_capture_sections_always_carries_the_bodies() {
-    let docs = vec![LoadedKnowhow {
-        id: "doc".into(),
-        body: "BODY".into(),
-    }];
+    let docs = vec![LoadedKnowhow::loaded_turns_ago("doc", "BODY", 1)];
     let sections = run_build(
         "sys",
         "",
@@ -1197,7 +1200,10 @@ fn build_capture_sections_always_carries_the_bodies() {
         .find(|s| s.name == "System Instructions")
         .unwrap();
     assert_eq!(system.content.as_deref(), Some("sys"));
-    let knowhow = sections.iter().find(|s| s.name == "knowhow: doc").unwrap();
+    let knowhow = sections
+        .iter()
+        .find(|s| s.group.as_deref() == Some("Loaded knowhow"))
+        .unwrap();
     assert_eq!(knowhow.content.as_deref(), Some("BODY"));
 }
 

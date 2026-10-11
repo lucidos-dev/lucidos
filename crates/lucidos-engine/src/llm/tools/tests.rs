@@ -1401,6 +1401,9 @@ fn every_offered_schema_comes_from_a_gated_registry_row() {
 /// gated on the mode, so a control array is untouched by their going. A lean
 /// array pays a rewrite on this build regardless, since the whole mode prompt
 /// changed.
+///
+/// `unload_knowhow` sits beside `load_knowhow`, where a model looks for it
+/// (ADR 0425). Like any new tool, it rewrites the segment after it once.
 const FROZEN_WIRE_ORDER: &[&str] = &[
     "read_file",
     "write_file",
@@ -1442,6 +1445,7 @@ const FROZEN_WIRE_ORDER: &[&str] = &[
     "create_app",
     "list_apps",
     "load_knowhow",
+    "unload_knowhow",
     "refresh_app",
     "capture_app",
     "connect_oauth_account",

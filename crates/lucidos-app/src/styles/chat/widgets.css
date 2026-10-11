@@ -240,9 +240,10 @@
 
 /* A widget window (ADR 0419): an open widget floating over the app. Three
    modes. Minimal is the widget alone, shaped as it draws itself. Window is the
-   card with its bar, at a size the user sets. Docked hangs under the thread's
-   title row. Minimal and docked carry their controls in a floating pill that
-   shows on hover, or on a tap on a touch screen. */
+   card with its bar, at a size the user sets. Docked hangs under the header,
+   at its own width, packed beside the other docked windows. Minimal and
+   docked carry their controls in a floating pill that shows on hover, or on a
+   tap on a touch screen. */
 .widget-window {
     --widget-minimal-cap: min(24rem, calc(100vw - 2 * var(--space-sm)));
     position: fixed;
@@ -307,7 +308,8 @@
     height: min(var(--widget-content-height, 15rem), 50dvh);
 }
 
-/* Off with its title row, such as on a phone swiped to another pane. */
+/* Not packed yet, or off with a phone's title row after a swipe to another
+   pane. */
 .widget-window.is-dock-hidden {
     visibility: hidden;
     pointer-events: none;

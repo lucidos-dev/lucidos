@@ -34,6 +34,7 @@ import {
 import { viewportIsMobile } from '../../../utils/viewport';
 import { widgetInstanceKey } from '../../../utils/widgetParams';
 import { getRemPx } from '../../../utils/dom';
+import { DOCK_GAP_REM } from '../useDockLine';
 import { CONTROLS_REVEAL_MS, CONTROLS_ROOM_REM, controlsBelow, WidgetWindows, WIDGET_WINDOW_FADE_MS } from '../WidgetWindows';
 
 let host: HTMLDivElement;
@@ -399,17 +400,50 @@ describe('window mode', () => {
 });
 
 describe('docked mode', () => {
-  it('is how a new window opens on a phone, hung under the title row at its width', () => {
+  /** A shell element at a fixed box, as jsdom lays out nothing. */
+  const shellAt = (className: string, rect: { left: number; top: number; right: number; bottom: number }) => {
+    const el = document.createElement('div');
+    el.className = className;
+    el.getBoundingClientRect = () => ({ ...rect, width: rect.right - rect.left, height: rect.bottom - rect.top }) as DOMRect;
+    document.body.appendChild(el);
+    return el;
+  };
+  const gap = () => DOCK_GAP_REM * getRemPx();
+
+  it('is how a new window opens on a phone, hung under the title row and inside it', () => {
     viewportIsMobile.value = true;
-    const row = document.createElement('div');
-    row.className = 'mobile-thread-title-row';
-    row.getBoundingClientRect = () => ({ left: 12, top: 40, right: 312, bottom: 80, width: 300, height: 40 }) as DOMRect;
-    document.body.appendChild(row);
+    const row = shellAt('mobile-thread-title-row', { left: 12, top: 40, right: 312, bottom: 80 });
     openWidgetWindow('home', k('fares'), { x: 10, y: 20 }, 24);
     mount();
     expect(win('fares').classList.contains('is-docked')).toBe(true);
-    expect([win('fares').style.left, win('fares').style.top, win('fares').style.width]).toEqual(['12px', '80px', '300px']);
+    expect([win('fares').style.left, win('fares').style.top]).toEqual([`${12 + gap()}px`, 'calc(80px)']);
+    expect(win('fares').style.maxWidth).toBe(`${300 - 2 * gap()}px`);
     row.remove();
+  });
+
+  it('hides on a phone while the title row is off screen, as after a swipe to another pane', () => {
+    viewportIsMobile.value = true;
+    vi.stubGlobal('IntersectionObserver', class {
+      constructor(private readonly onChange: (entries: { isIntersecting: boolean }[]) => void) {}
+      observe() { this.onChange([{ isIntersecting: false }]); }
+      disconnect() {}
+    });
+    const row = shellAt('mobile-thread-title-row', { left: 400, top: 40, right: 700, bottom: 80 });
+    openWidgetWindow('home', k('fares'), { x: 10, y: 20 }, 24);
+    mount();
+    expect(win('fares').classList.contains('is-dock-hidden')).toBe(true);
+    row.remove();
+  });
+
+  it('hangs under the app header and its banners on a desktop, under its own place and at its own width', () => {
+    const titleRow = shellAt('thread-view-header', { left: 300, top: 48, right: 1000, bottom: 96 });
+    openWidgetWindow('home', k('fares'), { x: 100, y: 300 }, 24);
+    resizeWidgetWindow('home', k('fares'), { width: 300, height: 200 });
+    setWidgetWindowMode('home', k('fares'), 'docked');
+    mount();
+    expect([win('fares').style.left, win('fares').style.top, win('fares').style.width])
+      .toEqual(['100px', 'calc(var(--app-header-bottom) + 0px)', '300px']);
+    titleRow.remove();
   });
 
   it('leaving dock returns the window to its last free place', () => {
@@ -424,7 +458,7 @@ describe('docked mode', () => {
     openWidgetWindow('home', k('fares'), { x: 10, y: 20 }, 24);
     setWidgetWindowMode('home', k('fares'), 'docked');
     mount();
-    expect(controls('fares')).toEqual(['Mode: Dock under the title', 'fares widget actions', 'Close fares']);
+    expect(controls('fares')).toEqual(['Mode: Dock under the header', 'fares widget actions', 'Close fares']);
   });
 });
 
@@ -477,7 +511,7 @@ describe('the mode button', () => {
     setWidgetWindowMode('home', k('fares'), 'docked');
     mount();
     const button = win('fares').querySelector<HTMLButtonElement>('.widget-window-mode')!;
-    expect(button.getAttribute('aria-label')).toBe('Mode: Dock under the title');
+    expect(button.getAttribute('aria-label')).toBe('Mode: Dock under the header');
     act(() => button.click());
     const rows = [...document.querySelectorAll<HTMLElement>('[role="menuitemradio"]')];
     expect(rows.map((r) => [r.dataset.widgetWindowMode, r.getAttribute('aria-checked')]))

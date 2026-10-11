@@ -5,6 +5,7 @@ import {
   findLatestPendingQuestion,
   computeSubmitMultiCount,
   promptPlaceholder,
+  threadHasConversation,
   PLACEHOLDER_ANSWERING,
   PLACEHOLDER_SIDE_QUESTION,
   PLACEHOLDER_FOLLOW_UP,
@@ -263,6 +264,51 @@ describe('promptPlaceholder', () => {
   // The mode wins over a pending card: Send asks, and the × goes back to it.
   it('invites a side question over a pending card in side-question mode', () => {
     expect(promptPlaceholder(true, true, true)).toBe(PLACEHOLDER_SIDE_QUESTION);
+  });
+});
+
+describe('threadHasConversation', () => {
+  const message = { type: 'MessageReceived', text: 'hi' } as ThreadEvent;
+
+  it('is false with no thread open', () => {
+    expect(threadHasConversation(null, undefined)).toBe(false);
+  });
+
+  // A cold open focuses the thread before the thread list lands.
+  it('is true for a focused thread not yet in the thread list', () => {
+    expect(threadHasConversation('thread-1', undefined)).toBe(true);
+  });
+
+  it('is true for a thread with a message', () => {
+    expect(threadHasConversation('thread-1', buildThreadState([message]))).toBe(true);
+  });
+
+  it('is false for the home thread, even with messages', () => {
+    const home = buildThreadState([message]);
+    home.meta.home = true;
+    expect(threadHasConversation('thread-1', home)).toBe(false);
+    expect(threadHasConversation('thread-1', { ...home, events: new Map() })).toBe(false);
+  });
+
+  it('is false for a loaded thread with no messages', () => {
+    expect(threadHasConversation('thread-1', buildThreadState([]))).toBe(false);
+  });
+
+  it('is false for a draft', () => {
+    const draft = buildThreadState([]);
+    draft.meta.state = 'composing';
+    expect(threadHasConversation('thread-1', draft)).toBe(false);
+  });
+
+  it('is true for a thread whose first message is still in flight', () => {
+    const sending = buildThreadState([]);
+    sending.pendingUserMessages = [{ text: 'hi' } as ThreadState['pendingUserMessages'][number]];
+    expect(threadHasConversation('thread-1', sending)).toBe(true);
+  });
+
+  // A long thread opens before its events land; it must not flash the new-thread line.
+  it('is true for a thread still loading', () => {
+    expect(threadHasConversation('thread-1', { ...buildThreadState([]), eventsLoaded: false })).toBe(true);
   });
 });
 

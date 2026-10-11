@@ -266,7 +266,7 @@ impl LucidosEngine {
                 self.execute_credential_tool(name, args, thread_id, device_id)
                     .await,
             ),
-            tn::CREATE_APP | tn::LIST_APPS | tn::LOAD_KNOWHOW => {
+            tn::CREATE_APP | tn::LIST_APPS | tn::LOAD_KNOWHOW | tn::UNLOAD_KNOWHOW => {
                 to_outcome(self.execute_app_tool(name, args, thread_id).await)
             }
             tn::EXECUTE_INTENT => to_outcome(

@@ -69,6 +69,15 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: tn::UNLOAD_KNOWHOW.to_string(),
+            description: "Drop a loaded knowhow doc you are done with, from the next turn.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }),
+        },
+        ToolDefinition {
             name: tn::REFRESH_APP.to_string(),
             description: "Refresh the currently-open app UI so it reflects on-disk changes, then return a screenshot and DOM snapshot unless skip_capture is true. If the app is not open the refresh is a no-op and the capture fails, so navigate_ui to it first.".to_string(),
             parameters: json!({

@@ -142,13 +142,16 @@ test.describe('The home thread from the phone header', () => {
         return Math.abs((await win.boundingBox())!.y - (row.y + row.height));
       }).toBeLessThan(1);
 
-      // A tap inside the widget shows its controls, and Window floats it.
+      // A tap inside the widget shows its controls. The mode button opens a
+      // menu of the three modes, and its Window row floats it.
       const frame = page.frameLocator(`[data-widget-window^="${appId}?"] iframe[data-role="app-ui-frame"]`);
       await expect(frame.locator('h1')).toHaveText('Fares');
       await frame.locator('h1').tap();
       await expect(win).toHaveClass(/\bis-revealed\b/);
-      await win.locator('button[aria-label="Window: E2E home fares"]').click();
+      await win.locator('button[aria-label="Mode: Dock under the header"]').tap();
+      await page.locator('[role="menuitemradio"][data-widget-window-mode="window"]').tap();
       await expect(win).toHaveClass(/\bis-window\b/);
+      await expect(win.locator('button[aria-label="Mode: Window"]')).toBeVisible();
 
       // A drag on the bar moves it.
       const before = (await win.boundingBox())!;

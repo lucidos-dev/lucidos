@@ -1647,7 +1647,16 @@ mod tests {
     /// one shape instead of a table, the three shape classes, no title and no
     /// border inside the card. The full rules are in `building-an-app`; this
     /// anchor keeps the core of them in view while the agent writes the HTML.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 128_647;
+    ///
+    /// Raised by 279 to a measured 128,926 for the built-in video player's
+    /// line and the embed rule naming a video clip. Without them the agent
+    /// offers a choice between films as labels, with nothing to watch.
+    ///
+    /// Raised by 193 to a measured 129,119 for `unload_knowhow` (ADR 0425), so
+    /// the agent can drop a loaded knowhow doc it is done with. A loaded doc
+    /// costs thousands of tokens on every turn it stays. The schema was cut
+    /// to its id argument, and the lifecycle text lives in the block header.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 129_119;
 
     /// The gate set the ratchet bills.
     ///

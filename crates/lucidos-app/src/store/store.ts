@@ -714,7 +714,7 @@ export const selectedOngoingGroup: ReadonlySignal<OngoingGroup> = selectedOngoin
 /** Select one ongoing group. Persists the choice, and lists the whole group. */
 export function setSelectedOngoingGroup(group: OngoingGroup): void {
   selectedOngoingGroupState.value = group;
-  ongoingFilterState.value = 'all';
+  ongoingFilterChoiceState.value = 'all';
   localStorage.setItem(SELECTED_ONGOING_GROUP_KEY, group);
 }
 
@@ -736,23 +736,15 @@ export function isSplitOngoingGroup(group: OngoingGroup): group is SplitOngoingG
   return group in ONGOING_PARTS;
 }
 
-/** The filters a press on `group`'s selected tile steps through, in order. */
-export function ongoingFilterSteps(group: OngoingGroup): readonly OngoingFilter[] {
-  return isSplitOngoingGroup(group) ? ['all', ...ONGOING_PARTS[group]] : ['all'];
-}
+const ongoingFilterChoiceState = signal<OngoingFilter>('all');
 
-const ongoingFilterState = signal<OngoingFilter>('all');
+/** The filter last stepped to. Selecting a group resets it, and so does its
+ *  part running out of rows. The list reads `ongoingFilter`
+ *  (components/drawer/family-graph.ts), which never names an empty part. */
+export const ongoingFilterChoice: ReadonlySignal<OngoingFilter> = ongoingFilterChoiceState;
 
-/** Read-only, so `stepOngoingFilter` and `setSelectedOngoingGroup` stay the
- *  only writers. Selecting a group resets it, and stepping walks only the
- *  selected group's steps, so it always names one of them. */
-export const ongoingFilter: ReadonlySignal<OngoingFilter> = ongoingFilterState;
-
-/** Step the selected group's filter: all, then each part, then all again. */
-export function stepOngoingFilter(): void {
-  const steps = ongoingFilterSteps(selectedOngoingGroupState.value);
-  const next = (steps.indexOf(ongoingFilterState.value) + 1) % steps.length;
-  ongoingFilterState.value = steps[next];
+export function setOngoingFilterChoice(filter: OngoingFilter): void {
+  ongoingFilterChoiceState.value = filter;
 }
 export const DEFAULT_DRAWER_WIDTH = 300;
 export const THREAD_DRAWER_WIDTH_KEY = 'lucidos-thread-drawer-width';

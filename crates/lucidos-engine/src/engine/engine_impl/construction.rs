@@ -1367,7 +1367,6 @@ impl LucidosEngine {
             pending_uninstalls: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             frontend_origin: std::sync::Mutex::new(None),
             agent_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            loaded_knowhow: Arc::new(crate::engine::loaded_knowhow::LoadedKnowhowStore::new()),
             view_snapshots: Default::default(),
             find_cache: Default::default(),
             agent_runtimes: {

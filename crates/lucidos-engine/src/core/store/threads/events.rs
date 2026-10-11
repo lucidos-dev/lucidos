@@ -50,6 +50,34 @@ impl EventStore {
         Ok(events)
     }
 
+    /// The events a thread's loaded knowhow is folded from, in the order of
+    /// [`Self::get_thread_events`]: the knowhow tools' pairs and every
+    /// finished turn. For a caller with no reason to read the whole thread.
+    pub async fn get_thread_knowhow_events(
+        &self,
+        thread_id: uuid::Uuid,
+    ) -> Result<Vec<EventRow>, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::engine::loaded_knowhow::{KNOWHOW_TOOLS, TURN_FINISHED_EVENT};
+        let events = sqlx::query_as::<_, EventRow>(
+            r#"
+            SELECT id, event_type, payload, created, thread_id, sequence
+            FROM events
+            WHERE thread_id = $1
+              AND (event_type = $2
+                   OR (event_type IN ('ToolCalled', 'ToolResult')
+                       AND payload->>'name' = ANY($3)))
+            ORDER BY created ASC, sequence ASC
+            "#,
+        )
+        .bind(thread_id)
+        .bind(TURN_FINISHED_EVENT)
+        .bind(&KNOWHOW_TOOLS[..])
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(events)
+    }
+
     /// The newest `limit` events on a thread, still ordered chronologically.
     ///
     /// For a caller that wants recent turns rather than the whole history, and

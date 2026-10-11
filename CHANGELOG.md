@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.48.1 — 2026-10-11
+
+### Added
+- A built-in Video player widget. A question option can carry a clip to play, with play, pause, a scrubber and full screen.
+- Docked widget windows sit under the window header and keep their own position and width. Several dock side by side, and a full row wraps to the next line.
+
+### Changed
+- A loaded knowhow doc leaves the agent's context after 3 finished turns that do not use it. The agent can also drop one itself. The Context viewer shows how many turns each doc has left.
+
+### Fixed
+- Home and empty threads invite a first message, not a follow-up.
+- Pressing the selected Review or In flight tile again no longer lands on a kind with no threads. A filter whose kind runs out lists the whole group again.
+- A dropped Ongoing filter stays dropped when its kind fills again.
 ## v0.48.0 — 2026-10-11
 
 ### Added
@@ -36,6 +49,7 @@
 - Archive all leaves a pinned thread's family alone.
 - Picking a Text hit in Search Everywhere also opens Find in file with your search.
 - Find in file searches only the code in a source preview, never its line numbers.
+- A knowhow doc the agent loads no longer stays in every later turn of the thread. It leaves after three agent replies that do not load it again, so a long thread like Home stops paying for docs from finished tasks. The agent keeps a doc it still follows by loading it again, which sends no second copy, and can drop one itself. The Context viewer shows how long each loaded doc stays.
 - Gemini 3.5 Flash settings move to Gemini 3.8 Flash.
 - The Canvas title grows with a wide pane, up to 36rem.
 
@@ -52,6 +66,7 @@
 - A reload after a failed download no longer serves a half-cached frontend.
 - Panning a long file sideways with line wrap off is smooth on an iPhone.
 - On a phone, a button in an app no longer stays grey after a tap.
+
 ## v0.47.1 — 2026-10-07
 
 ### Fixed

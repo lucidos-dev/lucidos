@@ -77,12 +77,12 @@ pub(super) fn locate_message_images(
 /// single per-thread events fetch that the rest of the turn consumes.
 pub(super) struct ChatHistoryLoad {
     /// Verbatim `(ToolUse, ToolResult)` Message pairs for the most recent N
-    /// tool calls (plus pinned `load_knowhow` results), prepended to the LLM
-    /// messages vec.
+    /// tool calls, prepended to the LLM messages vec. A knowhow body in one
+    /// is stubbed.
     pub resume_tool_blocks: Vec<Message>,
-    /// Per-thread loaded knowhow docs (warm- and cold-path), consumed by the
-    /// resume-block stub swap, history body-strip, `[LOADED KNOWHOW]` block,
-    /// and capture sections.
+    /// The thread's loaded knowhow this turn (ADR 0425), consumed by the
+    /// resume-block stub, history body-strip, `[LOADED KNOWHOW]` block, and
+    /// capture sections.
     pub loaded_knowhow_docs: Vec<LoadedKnowhow>,
     /// Stringified `[CONVERSATION HISTORY]` block (may be trimmed by budget).
     pub history_context: String,
@@ -93,30 +93,6 @@ pub(super) struct ChatHistoryLoad {
 }
 
 impl LucidosEngine {
-    /// The thread's loaded knowhow docs, replayed from its events after a
-    /// restart emptied the in-memory set.
-    async fn thread_loaded_knowhow(&self, thread_id: Uuid) -> Vec<LoadedKnowhow> {
-        if self.loaded_knowhow.needs_replay(thread_id).await {
-            match self
-                .event_store
-                .get_thread_events(&thread_id.to_string())
-                .await
-            {
-                Ok(events) => {
-                    self.loaded_knowhow
-                        .recover_for_thread(thread_id, &events)
-                        .await
-                }
-                Err(e) => log!(
-                    "[Chat] Could not replay the loaded knowhow of {}: {}",
-                    thread_id,
-                    e
-                ),
-            }
-        }
-        self.loaded_knowhow.for_thread(thread_id).await
-    }
-
     /// Load conversation history + resume tool blocks + loaded knowhow for a
     /// chat turn. Verbatim extraction of the inline block from
     /// `process_message_with_steps_internal`.
@@ -157,7 +133,17 @@ impl LucidosEngine {
         if gates.memory_tree {
             return ChatHistoryLoad {
                 resume_tool_blocks: Vec::new(),
-                loaded_knowhow_docs: self.thread_loaded_knowhow(thread_id).await,
+                loaded_knowhow_docs: match self.thread_loaded_knowhow(thread_id).await {
+                    Ok(docs) => docs,
+                    Err(e) => {
+                        log!(
+                            "[Chat] Could not read the loaded knowhow of {}: {}",
+                            thread_id,
+                            e
+                        );
+                        Vec::new()
+                    }
+                },
                 history_context: String::new(),
                 conversation_summary: user_message.to_string(),
                 history_image_hashes: Vec::new(),
@@ -165,22 +151,16 @@ impl LucidosEngine {
         }
 
         // Resume tool blocks: full ToolUse + ToolResult Message pairs for the
-        // most recent N tool calls (Phase 3). Pinned `load_knowhow` results
-        // survive regardless of N — see
-        // `build_resume_tool_blocks_with_skip_ids`.
+        // most recent N tool calls (Phase 3), with no knowhow body in them
+        // (`build_resume_tool_blocks_with_skip_ids`).
         let mut resume_tool_blocks: Vec<Message> = Vec::new();
         let mut resume_skip_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        // Per-thread loaded knowhow docs. Populated inside the follow-up
-        // branch below (after `recover_for_thread` runs) so it carries every
-        // successful `load_knowhow` for this thread — warm-path
-        // (handler-populated) and cold-path (recovery-replayed). Consumed by
-        // (a) the resume-block body-stub swap (by id), (b)
+        // The thread's loaded knowhow, folded from the same events below
+        // (ADR 0425). Consumed by (a) the resume-block body stub (by id), (b)
         // `format_history_content`'s body-strip (by exact body substring),
         // (c) the `[LOADED KNOWHOW]` user-message block, and (d)
-        // `build_capture_sections`. Single fetch, multiple consumers — bodies
-        // can be 5-50KB each so the prior triple-fetch wasted ~150KB clones
-        // per turn.
+        // `build_capture_sections`.
         let mut loaded_knowhow_docs: Vec<crate::engine::loaded_knowhow::LoadedKnowhow> = Vec::new();
         // The thread's cached conversation summary, from the same events walk.
         // `None` before its first successful summarisation (ADR 0102).
@@ -197,16 +177,7 @@ impl LucidosEngine {
                 .await
             {
                 Ok(events) => {
-                    // Engine restart loses the per-thread loaded-knowhow set,
-                    // which is in memory only. Replaying this thread's
-                    // load_knowhow results keeps the dedupe below working after
-                    // a cold start, and after the store evicted this thread.
-                    if self.loaded_knowhow.needs_replay(thread_id).await {
-                        self.loaded_knowhow
-                            .recover_for_thread(thread_id, &events)
-                            .await;
-                    }
-                    loaded_knowhow_docs = self.loaded_knowhow.for_thread(thread_id).await;
+                    loaded_knowhow_docs = crate::engine::loaded_knowhow::loaded_knowhow(&events);
                     cached_summary = crate::core::store::newest_conversation_summary(&events);
                     let loaded_knowhow_ids: std::collections::HashSet<String> =
                         loaded_knowhow_docs.iter().map(|d| d.id.clone()).collect();

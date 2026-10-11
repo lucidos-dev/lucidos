@@ -13,6 +13,7 @@ import {
   closeWidgetWindow,
   forgetWidgetWindow,
   moveWidgetWindow,
+  packDockedWindows,
   raiseWidgetWindow,
   resizeFromCorner,
   resizeWidgetWindow,
@@ -24,6 +25,7 @@ import {
   RESIZE_CORNERS,
   WIDGET_WINDOW_MODES,
   type Box,
+  type DockedBox,
   type ResizeCorner,
   type WidgetWindow,
   type WidgetWindowMode,
@@ -43,7 +45,7 @@ import { WidgetBar } from './WidgetCard';
 import { WidgetFrame } from './WidgetFrame';
 import { widgetMenuItems } from './WidgetMenu';
 import { menuTarget } from './WidgetShelf';
-import { useDockBox } from './useDockBox';
+import { DOCK_GAP_REM, useDockLine } from './useDockLine';
 
 /** The 1x length of `widget-window-out`, which runs on `--duration-normal`. */
 export const WIDGET_WINDOW_FADE_MS = 200;
@@ -63,7 +65,7 @@ const MINIMAL_GRAB_REM = 2;
 const MODE_ACTIONS: Record<WidgetWindowMode, { label: string; icon: () => JSX.Element }> = {
   minimal: { label: 'Minimal', icon: WidgetMinimalModeIcon },
   window: { label: 'Window', icon: WidgetWindowModeIcon },
-  docked: { label: 'Dock under the title', icon: WidgetDockedModeIcon },
+  docked: { label: 'Dock under the header', icon: WidgetDockedModeIcon },
 };
 
 /** The room the floating controls take above a window, gap included, in rem. */
@@ -71,7 +73,7 @@ export const CONTROLS_ROOM_REM = 2.5;
 
 /** Whether the floating controls hang under the widget rather than over it.
  *  They never cover the widget, so they go under when there is no room above,
- *  and always when docked, where above is the title row. */
+ *  and always when docked, where above is the header. */
 export function controlsBelow(mode: WidgetWindowMode, top: number): boolean {
   return mode === 'docked' || top < CONTROLS_ROOM_REM * getRemPx();
 }
@@ -149,36 +151,35 @@ export function WidgetWindows() {
     if (hiddenByFailure) showToast(`Couldn't read Home's widgets, so their windows are hidden: ${hiddenByFailure}`, 'error');
   }, [hiddenByFailure]);
 
-  // Docked windows stack under the title row in the order they were opened.
+  // Docked windows pack side by side under the header, in the order they
+  // were opened.
   const docked = windows.filter((w) => widgetWindowLayout(w.threadId, w.instanceKey).mode === 'docked');
-  const dockBox = useDockBox(docked.length > 0);
-  const [dockHeights, setDockHeights] = useState<ReadonlyMap<string, number>>(new Map());
-  const onDockedHeight = useCallback((instanceKey: string, px: number) => {
-    setDockHeights((prev) => (prev.get(instanceKey) === px ? prev : new Map(prev).set(instanceKey, px)));
+  const dockLine = useDockLine(docked.length > 0);
+  const [dockedBoxes, setDockedBoxes] = useState<ReadonlyMap<string, DockedBox>>(new Map());
+  const onDockedBox = useCallback((instanceKey: string, box: DockedBox) => {
+    setDockedBoxes((prev) => (sameDockedBox(prev.get(instanceKey), box) ? prev : new Map(prev).set(instanceKey, box)));
   }, []);
 
   if (!pinned) return null;
   const ranks = stackRanks(windows);
-  const dockTops = new Map<string, number>();
-  let dockTop = dockBox?.top ?? 0;
-  for (const w of docked) {
-    dockTops.set(w.instanceKey, dockTop);
-    dockTop += dockHeights.get(w.instanceKey) ?? 0;
-  }
+  const dockPlaces = dockLine
+    ? packDockedWindows(docked.map((w) => w.instanceKey), dockedBoxes, dockLine, DOCK_GAP_REM * getRemPx())
+    : null;
   return (
     <>
       {windows.map((w) => {
         const entry = pinned.find((p) => threadWidgetKey(p) === w.instanceKey);
-        const top = dockTops.get(w.instanceKey);
-        const dock = dockBox && top !== undefined ? { left: dockBox.left, top, width: dockBox.right - dockBox.left } : null;
+        const place = dockPlaces?.get(w.instanceKey);
         return entry && (
           <WidgetWindowView
             key={w.instanceKey}
             placed={w}
             entry={entry}
             rank={ranks.get(w.instanceKey) ?? 0}
-            dock={dock}
-            onDockedHeight={onDockedHeight}
+            dock={dockLine && place
+              ? { left: place.x, top: `calc(${dockLine.top} + ${place.y}px)`, maxWidth: dockLine.right - dockLine.left }
+              : null}
+            onDockedBox={onDockedBox}
           />
         );
       })}
@@ -204,19 +205,17 @@ interface Gesture {
   moving: boolean;
 }
 
-interface Dock {
-  left: number;
-  top: number;
-  width: number;
-}
+const sameDockedBox = (a: DockedBox | undefined, b: DockedBox) =>
+  !!a && a.x === b.x && a.width === b.width && a.height === b.height;
 
-function WidgetWindowView({ placed, entry, rank, dock, onDockedHeight }: {
+function WidgetWindowView({ placed, entry, rank, dock, onDockedBox }: {
   placed: WidgetWindow;
   entry: ThreadWidget;
   rank: number;
-  /** Where it hangs while docked; null while the title row is off screen. */
-  dock: Dock | null;
-  onDockedHeight: (instanceKey: string, px: number) => void;
+  /** Where it hangs while docked. Null before its first report, and while a
+   *  phone's title row is off screen. */
+  dock: { left: number; top: string; maxWidth: number } | null;
+  onDockedBox: (instanceKey: string, box: DockedBox) => void;
 }) {
   const { threadId, instanceKey } = placed;
   const layout = widgetWindowLayout(threadId, instanceKey);
@@ -229,7 +228,7 @@ function WidgetWindowView({ placed, entry, rank, dock, onDockedHeight }: {
   // which cancels a close still fading out.
   const [closedAt, setClosedAt] = useState<number | null>(null);
   const closing = closedAt !== null && closedAt === placed.raise;
-  const [measured, setMeasured] = useState({ width: 0, barHeight: 0 });
+  const [measured, setMeasured] = useState({ width: 0, height: 0, barHeight: 0 });
   const [bounds, setBounds] = useState(windowBounds);
   const [content, setContent] = useState<ContentSize | null>(null);
   // The mode the widget last reported a size in, since a report from before a
@@ -250,8 +249,11 @@ function WidgetWindowView({ placed, entry, rank, dock, onDockedHeight }: {
     if (!el) return undefined;
     const measure = () => {
       const bar = el.querySelector<HTMLElement>('.widget-bar')?.offsetHeight;
-      setMeasured({ width: el.offsetWidth, barHeight: bar ?? Math.min(el.offsetHeight, MINIMAL_GRAB_REM * getRemPx()) });
-      if (modeRef.current === 'docked') onDockedHeight(instanceKey, el.offsetHeight);
+      setMeasured({
+        width: el.offsetWidth,
+        height: el.offsetHeight,
+        barHeight: bar ?? Math.min(el.offsetHeight, MINIMAL_GRAB_REM * getRemPx()),
+      });
     };
     measure();
     const observer = new ResizeObserver(measure);
@@ -262,7 +264,12 @@ function WidgetWindowView({ placed, entry, rank, dock, onDockedHeight }: {
       observer.disconnect();
       window.removeEventListener('resize', onResize);
     };
-  }, [mode, instanceKey, onDockedHeight]);
+  }, [mode]);
+
+  // A docked window wants to hang under its own free place, at its own size.
+  useLayoutEffect(() => {
+    if (mode === 'docked') onDockedBox(instanceKey, { x: layout.x, width: measured.width, height: measured.height });
+  }, [mode, instanceKey, onDockedBox, layout.x, measured.width, measured.height]);
 
   useEffect(() => {
     if (!closing) return undefined;
@@ -316,7 +323,7 @@ function WidgetWindowView({ placed, entry, rank, dock, onDockedHeight }: {
     resizeWidgetWindow(threadId, instanceKey, clampWindowSize(start, at, bounds, minWindowSize()));
   });
 
-  // Docked hangs under the title row, so only the other modes move.
+  // Docked hangs where the dock packs it, so only the other modes move.
   const movable = mode !== 'docked';
 
   const onPointerDown = (e: PointerEvent) => {
@@ -436,7 +443,9 @@ function WidgetWindowView({ placed, entry, rank, dock, onDockedHeight }: {
 
   const style: Record<string, string> = { zIndex: `calc(var(--z-widget-window) + ${rank})` };
   if (mode === 'docked') {
-    if (dock) Object.assign(style, { left: `${dock.left}px`, top: `${dock.top}px`, width: `${dock.width}px` });
+    // Never wider than the line, as the packer assumed.
+    if (dock) Object.assign(style, { left: `${dock.left}px`, top: dock.top, maxWidth: `${dock.maxWidth}px` });
+    if (layout.size) style.width = `${layout.size.width}px`;
   } else {
     Object.assign(style, { left: `${at.x}px`, top: `${at.y}px` });
   }

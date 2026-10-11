@@ -97,15 +97,14 @@ impl LucidosEngine {
                 ))
             }
             "list_apps" => list_apps_text(&self.app_manager),
-            "load_knowhow" => {
-                load_knowhow_impl(
-                    &self.knowhow_dirs(),
-                    self.system_knowhow_dir(),
-                    &self.loaded_knowhow,
-                    thread_id,
-                    args,
-                )
-                .await
+            "load_knowhow" => load_knowhow_impl(
+                &self.knowhow_dirs(),
+                self.system_knowhow_dir(),
+                &self.thread_loaded_knowhow(thread_id).await?,
+                args,
+            ),
+            "unload_knowhow" => {
+                unload_knowhow_impl(&self.thread_loaded_knowhow(thread_id).await?, args)
             }
             _ => Err(format!("Unknown app tool: {}", name).into()),
         }
@@ -221,52 +220,62 @@ fn list_apps_text(
         .join("\n"))
 }
 
-/// Validation + side-effect core for the `load_knowhow` tool, factored out
-/// of the `LucidosEngine` impl so unit tests can exercise the loader and
-/// store-insertion semantics against fixture knowhow dirs without booting
-/// the full engine. The handler on `LucidosEngine` is now a thin wrapper.
+/// The `load_knowhow` tool's answer, given the thread's loaded knowhow.
 ///
-/// On success: returns the formatted `[KNOW-HOW: …]` / `[SYSTEM-KNOWHOW: …]`
-/// body and inserts the doc into the per-thread loaded set so subsequent
-/// turns can dedupe via the `[LOADED KNOWHOW]` user-message section.
-///
-/// On miss: returns the canonical not-found sentinel (see
-/// [`crate::core::knowhow::knowhow_not_found_body`]) and DOES NOT insert —
-/// only real docs belong in the loaded set.
-pub(crate) async fn load_knowhow_impl(
+/// The full formatted body, or the not-found sentinel for a miss. A doc this
+/// turn's block already holds, unchanged on disk, gets the short kept result
+/// instead (ADR 0425). Either way the recorded pair is what the next turn's
+/// fold reads, so nothing else is written.
+pub(crate) fn load_knowhow_impl(
     kh_dirs: &crate::core::knowhow::KnowhowDirs,
     system_dir: Option<&std::path::Path>,
-    loaded_knowhow: &crate::engine::loaded_knowhow::LoadedKnowhowStore,
-    thread_id: uuid::Uuid,
+    loaded: &[crate::engine::loaded_knowhow::LoadedKnowhow],
     args: &serde_json::Value,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let id = args["id"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .ok_or("id is required")?;
+    let id = required_knowhow_id(args)?;
     let body = crate::core::knowhow::load_one_knowhow_section(kh_dirs, system_dir, id)
         .unwrap_or_else(|| crate::core::knowhow::knowhow_not_found_body(id));
-    if !crate::core::knowhow::is_not_found_body(&body) {
-        loaded_knowhow
-            .insert(
-                thread_id,
-                crate::engine::loaded_knowhow::LoadedKnowhow {
-                    id: id.to_string(),
-                    body: body.clone(),
-                },
-            )
-            .await;
-    }
-    Ok(body)
+    let held = loaded
+        .iter()
+        .any(|doc| doc.id == id && doc.body_in_block() && doc.body == body);
+    Ok(if held {
+        crate::engine::loaded_knowhow::kept_result(id)
+    } else {
+        body
+    })
+}
+
+/// The `unload_knowhow` tool's answer. The recorded pair is the unload.
+pub(crate) fn unload_knowhow_impl(
+    loaded: &[crate::engine::loaded_knowhow::LoadedKnowhow],
+    args: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let id = required_knowhow_id(args)?;
+    Ok(if loaded.iter().any(|doc| doc.id == id) {
+        format!(
+            "Unloaded `{id}`. It leaves the [LOADED KNOWHOW] section from the next turn. \
+             Call load_knowhow again if you need it."
+        )
+    } else {
+        format!("`{id}` is not loaded, so there is nothing to unload.")
+    })
+}
+
+fn required_knowhow_id(
+    args: &serde_json::Value,
+) -> Result<&str, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(args["id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or("id is required")?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::knowhow::{write_knowhow_file, KnowhowDirs};
-    use crate::engine::loaded_knowhow::LoadedKnowhowStore;
+    use crate::engine::loaded_knowhow::LoadedKnowhow;
     use serde_json::json;
-    use uuid::Uuid;
 
     #[tokio::test]
     async fn the_list_apps_tool_shows_no_widget() {
@@ -325,91 +334,89 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn load_knowhow_inserts_into_store_on_hit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let local = tmp.path().join("local");
+    fn my_doc(local: &std::path::Path) -> String {
         write_knowhow_file(&local.join("my-doc.md"), "My Doc", "Body of my doc.");
-
-        let store = LoadedKnowhowStore::new();
-        let thread_id = Uuid::new_v4();
-        let body = load_knowhow_impl(
-            &dirs(&local),
-            None,
-            &store,
-            thread_id,
-            &json!({ "id": "my-doc" }),
-        )
-        .await
-        .expect("load should succeed");
-
-        // Returned body is the formatted [KNOW-HOW: …] section.
-        assert!(body.contains("[KNOW-HOW: My Doc]"), "got: {}", body);
-        assert!(body.contains("Body of my doc."), "got: {}", body);
-
-        // And the per-thread loaded set now contains exactly this doc.
-        let loaded = store.for_thread(thread_id).await;
-        assert_eq!(
-            loaded.len(),
-            1,
-            "expected one loaded doc, got: {:?}",
-            loaded
-        );
-        assert_eq!(loaded[0].id, "my-doc");
-        assert_eq!(loaded[0].body, body);
+        load_knowhow_impl(&dirs(local), None, &[], &json!({ "id": "my-doc" })).unwrap()
     }
 
-    #[tokio::test]
-    async fn load_knowhow_does_not_insert_on_miss() {
+    #[test]
+    fn load_knowhow_returns_the_formatted_body_on_a_first_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = my_doc(&tmp.path().join("local"));
+        assert!(body.contains("[KNOW-HOW: My Doc]"), "got: {}", body);
+        assert!(body.contains("Body of my doc."), "got: {}", body);
+    }
+
+    #[test]
+    fn load_knowhow_returns_the_not_found_sentinel_on_a_miss() {
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().join("local");
         std::fs::create_dir_all(&local).unwrap();
-
-        let store = LoadedKnowhowStore::new();
-        let thread_id = Uuid::new_v4();
-        let body = load_knowhow_impl(
-            &dirs(&local),
-            None,
-            &store,
-            thread_id,
-            &json!({ "id": "no-such-doc" }),
-        )
-        .await
-        .expect("miss returns Ok with sentinel body, not Err");
-
-        // Body is the canonical not-found sentinel.
+        let body =
+            load_knowhow_impl(&dirs(&local), None, &[], &json!({ "id": "no-such-doc" })).unwrap();
         assert!(
             crate::core::knowhow::is_not_found_body(&body),
             "miss must return the not-found sentinel, got: {}",
             body
         );
+    }
 
-        // And the per-thread loaded set is untouched — only real docs belong.
-        let loaded = store.for_thread(thread_id).await;
-        assert!(
-            loaded.is_empty(),
-            "miss must not insert into the loaded set, got: {:?}",
-            loaded
+    #[test]
+    fn knowhow_tools_reject_a_missing_or_empty_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        for args in [json!({}), json!({ "id": "" })] {
+            let err = load_knowhow_impl(&dirs(&local), None, &[], &args).unwrap_err();
+            assert!(err.to_string().contains("id is required"), "got: {}", err);
+            let err = unload_knowhow_impl(&[], &args).unwrap_err();
+            assert!(err.to_string().contains("id is required"), "got: {}", err);
+        }
+    }
+
+    /// Keeping a doc the block already carries costs no body (ADR 0425).
+    #[test]
+    fn reloading_a_doc_the_block_holds_returns_the_kept_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        let body = my_doc(&local);
+        let loaded = [LoadedKnowhow::loaded_turns_ago("my-doc", &body, 2)];
+        let again = load_knowhow_impl(&dirs(&local), None, &loaded, &json!({ "id": "my-doc" }));
+        assert_eq!(
+            again.unwrap(),
+            crate::engine::loaded_knowhow::kept_result("my-doc")
         );
     }
 
-    #[tokio::test]
-    async fn load_knowhow_rejects_missing_or_empty_id() {
+    /// The agent must never get no body while none is in front of it.
+    #[test]
+    fn reloading_returns_the_body_when_the_block_does_not_hold_it() {
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().join("local");
-        std::fs::create_dir_all(&local).unwrap();
+        let body = my_doc(&local);
+        let cases = [
+            (
+                "loaded earlier in this turn",
+                LoadedKnowhow::loaded_turns_ago("my-doc", &body, 0),
+            ),
+            (
+                "changed on disk since",
+                LoadedKnowhow::loaded_turns_ago("my-doc", "OLD", 1),
+            ),
+        ];
+        for (case, doc) in cases {
+            let again = load_knowhow_impl(&dirs(&local), None, &[doc], &json!({ "id": "my-doc" }));
+            assert_eq!(again.unwrap(), body, "{case}");
+        }
+    }
 
-        let store = LoadedKnowhowStore::new();
-        let thread_id = Uuid::new_v4();
+    #[test]
+    fn unload_knowhow_says_whether_the_doc_was_loaded() {
+        let loaded = [LoadedKnowhow::loaded_turns_ago("my-doc", "BODY", 1)];
+        let unloaded = unload_knowhow_impl(&loaded, &json!({ "id": "my-doc" })).unwrap();
+        assert!(unloaded.starts_with("Unloaded `my-doc`"), "{unloaded}");
+        assert!(unloaded.contains("from the next turn"), "{unloaded}");
 
-        let err = load_knowhow_impl(&dirs(&local), None, &store, thread_id, &json!({}))
-            .await
-            .expect_err("missing id must error");
-        assert!(err.to_string().contains("id is required"), "got: {}", err);
-
-        let err = load_knowhow_impl(&dirs(&local), None, &store, thread_id, &json!({ "id": "" }))
-            .await
-            .expect_err("empty id must error");
-        assert!(err.to_string().contains("id is required"), "got: {}", err);
+        let absent = unload_knowhow_impl(&loaded, &json!({ "id": "other" })).unwrap();
+        assert!(absent.contains("not loaded"), "{absent}");
     }
 }

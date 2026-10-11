@@ -35,7 +35,7 @@ import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup } from '../../ho
 import { TodoPanelSlot, closeTodoPanel, todoIndicatorAction } from './todoIndicator';
 import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
 import { composerBannerState, getBannerActions, getWaitingState, getStandaloneActions } from './WaitingBanner';
-import { composeHasContent, sideQuestionModeActive, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, queuedUploadSends, queueUploadSend, clearQueuedUploadSend, uploadBlockedSends, markUploadBlockedSend, settleQueuedUploadSends, uploadSendNotice, uploadSendNoticeText, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionBlocker, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, sideQuestionModeActive, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, threadHasConversation, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, queuedUploadSends, queueUploadSend, clearQueuedUploadSend, uploadBlockedSends, markUploadBlockedSend, settleQueuedUploadSends, uploadSendNotice, uploadSendNoticeText, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionBlocker, type UploadSendIntent } from './prompt-input-helpers';
 import { canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting } from '../../store/canceledQuestions';
 import { SplitButton } from '../shared/SplitButton';
 import { NotReadyStrip } from './NotReadyStrip';
@@ -917,7 +917,7 @@ export function PromptInput() {
   //
   // A height ease in flight is re-aimed rather than overwritten, so it never
   // ends in a snap. See `remeasureTextareaForPlaceholder`.
-  const placeholder = promptPlaceholder(!!focusedThreadId.value, answeringQuestionCard, sideQuestionMode);
+  const placeholder = promptPlaceholder(threadHasConversation(focusedThreadId.value, focusedThread), answeringQuestionCard, sideQuestionMode);
   useEffect(() => {
     const el = inputRef.current;
     if (el) remeasureTextareaForPlaceholder(el);

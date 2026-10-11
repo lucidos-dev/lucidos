@@ -65,10 +65,9 @@ mod tests {
             .into_iter()
             .filter(|w| w.built_in)
             .collect();
-        assert!(
-            built_ins.iter().any(|w| w.id == "lucidos-sound-player"),
-            "the sound player ships"
-        );
+        for id in ["lucidos-sound-player", "lucidos-video-player"] {
+            assert!(built_ins.iter().any(|w| w.id == id), "{id} ships");
+        }
         let on_disk = std::fs::read_dir(repo_system_widgets()).unwrap().count();
         assert_eq!(built_ins.len(), on_disk, "every folder loads as a built-in");
         for widget in built_ins {

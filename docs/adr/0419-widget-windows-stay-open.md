@@ -126,3 +126,20 @@ Plan: `docs/plans/2026-10-11-widget-window-controls-and-drag-anywhere.md`.
   Touch is left out: a finger drag inside a frame stays a scroll.
 - **Window mode resizes from every corner, and draws no corner mark.** Each
   corner is an invisible grab zone, and the opposite corner holds.
+
+## Amendment, 2026-10-11: docked windows pack under the header
+
+The maintainer asked for docked windows to hang under the window's header,
+each under where it is, with room for many side by side.
+Plan: `docs/plans/2026-10-11-docked-widgets-pack-under-the-header.md`.
+
+- **A desktop docks under the app header and its banners**, across the whole
+  window, so a widget over Canvas docks right where it is. A phone still docks under the
+  thread's title row, which a dock under its header would cover.
+- **A docked window keeps its own width and wants its own left edge**: its
+  window mode size, and the place it last floated at.
+- **Docked windows pack in shelves.** In open order, each takes the first
+  shelf with room for it, at the spot nearest its own left edge. With no room
+  on any shelf, it opens a new one below.
+
+This replaces "hung under the thread's title row" in the amendment above.

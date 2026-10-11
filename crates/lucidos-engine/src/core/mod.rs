@@ -1624,6 +1624,10 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             "Loading know-how '{}'...",
             args["id"].as_str().unwrap_or("knowhow")
         ),
+        "unload_knowhow" => format!(
+            "Unloading know-how '{}'...",
+            args["id"].as_str().unwrap_or("knowhow")
+        ),
         "execute_intent" => format!(
             "Executing intent {}...",
             args["intent_id"].as_str().unwrap_or("intent")

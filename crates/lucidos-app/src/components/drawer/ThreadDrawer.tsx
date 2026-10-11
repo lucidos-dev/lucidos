@@ -2,7 +2,7 @@ import type { ComponentChildren, RefObject } from 'preact';
 import { useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { batch, effect, signal, useSignal } from '@preact/signals';
-import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerGrouping, setDrawerGrouping, selectedOngoingGroup, setSelectedOngoingGroup, ongoingFilter, stepOngoingFilter, isSplitOngoingGroup, type OngoingFilter, type OngoingPart, type SplitOngoingGroup, ONGOING_GROUPS, type OngoingGroup, type DrawerGrouping, repositories, focusedPane, scaledDurationMs, showToast, ALL_CHANNELS, clearThreadFilter } from '../../store/store';
+import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerGrouping, setDrawerGrouping, selectedOngoingGroup, setSelectedOngoingGroup, ongoingFilterChoice, setOngoingFilterChoice, isSplitOngoingGroup, type OngoingFilter, type OngoingPart, type SplitOngoingGroup, ONGOING_GROUPS, type OngoingGroup, type DrawerGrouping, repositories, focusedPane, scaledDurationMs, showToast, ALL_CHANNELS, clearThreadFilter } from '../../store/store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../../store/appliedThreadFilter';
 import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
 import { composeDraftContextName } from '../../store/composeDestination';
@@ -866,7 +866,7 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
 }
 
 
-import { ongoingBreakdown, ongoingPartOf, composingThreads, collapsedAncestorIds, computeDrawerCategorization, depthStyle, filterHiddenArchived, inboxThreadCount, nestByParent, renderedFamilyRows, ongoingGroupLists, selectedOngoingRows, threadHasUnsentDraft, visibleChildrenCount } from './family-graph';
+import { ongoingBreakdown, ongoingFilter, ongoingPartOf, stepOngoingFilter, composingThreads, collapsedAncestorIds, computeDrawerCategorization, depthStyle, filterHiddenArchived, inboxThreadCount, nestByParent, renderedFamilyRows, ongoingGroupLists, selectedOngoingRows, threadHasUnsentDraft, visibleChildrenCount } from './family-graph';
 import type { DrawerCategorization, FamilyGraph, NestedThread } from './family-graph';
 export * from './family-graph';
 function ThreadList() {
@@ -1939,14 +1939,6 @@ const ONGOING_GROUP_META: Record<OngoingGroup, { title: string; empty: string; I
     'in-flight': { title: 'In flight', empty: 'Nothing in flight', Icon: InFlightIcon },
 };
 
-/** The empty state of a list filtered to one part. */
-const ONGOING_PART_EMPTY: Record<OngoingPart, string> = {
-    changes: 'No changes',
-    unread: 'Nothing unread',
-    running: 'Nothing running',
-    waiting: 'Nothing waiting',
-};
-
 /** How a part's count reads on its tile: "1 change", "2 changes", "3 unread". */
 function ongoingPartLabel(part: OngoingPart, count: number): string {
     return part === 'changes' && count === 1 ? '1 change' : `${count} ${part}`;
@@ -2020,8 +2012,12 @@ function OngoingList() {
     const selected = selectedOngoingGroup.value;
     const filter = ongoingFilter.value;
     const rows = selectedOngoingRows.value;
+    // A dropped choice stays dropped, so a part that refills never narrows the
+    // list without a press.
+    useEffect(() => {
+        if (filter !== ongoingFilterChoice.value) setOngoingFilterChoice('all');
+    }, [filter]);
     const rowIds = rows.map(n => n.thread.meta.id);
-    const empty = filter === 'all' ? ONGOING_GROUP_META[selected].empty : ONGOING_PART_EMPTY[filter];
     const landing = landingGroupFor('ongoing', selected);
     const openRow = landing ? (id: string) => openOngoingThread(id, landing) : focusThread;
 
@@ -2051,7 +2047,7 @@ function OngoingList() {
                     offerShowInFolders
                     onOpen={openRow}
                 />)}
-            {hydrated && rows.length === 0 && <div class="empty-state">{empty}</div>}
+            {hydrated && rows.length === 0 && <div class="empty-state">{ONGOING_GROUP_META[selected].empty}</div>}
         </div>
     );
 }

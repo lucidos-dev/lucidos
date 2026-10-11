@@ -8,8 +8,8 @@ use crate::core::changes::ChangeStatus;
 //
 // On resume, the most recent N (ToolCalled, ToolResult) pairs are
 // reconstructed as full Message::Blocks(...) pairs prepended to the LLM
-// messages vec. `load_knowhow` results are pinned regardless of N — their
-// value is reference material that doesn't decay across turns.
+// messages vec. `load_knowhow` follows the same window, with no body in it
+// (ADR 0425).
 // ----------------------------------------------------------------------------
 
 #[test]
@@ -30,7 +30,7 @@ fn build_resume_tool_blocks_emits_paired_tool_use_and_result_for_recent_tool() {
         EventRow {
             id: tool_called_id,
             event_type: "ToolCalled".into(),
-            payload: json!({"name": "load_knowhow", "args": {"id": "x"}, "description": "Loading"}),
+            payload: json!({"name": "read_file", "args": {"path": "x"}, "description": "Reading"}),
             created: now,
             thread_id: None,
             sequence: Some(2),
@@ -38,7 +38,7 @@ fn build_resume_tool_blocks_emits_paired_tool_use_and_result_for_recent_tool() {
         EventRow {
             id: uuid::Uuid::new_v4(),
             event_type: "ToolResult".into(),
-            payload: json!({"name": "load_knowhow", "result": "PROCEDURE BODY", "success": true}),
+            payload: json!({"name": "read_file", "result": "PROCEDURE BODY", "success": true}),
             created: now,
             thread_id: None,
             sequence: Some(3),
@@ -69,8 +69,8 @@ fn build_resume_tool_blocks_emits_paired_tool_use_and_result_for_recent_tool() {
             ContentBlock::ToolUse {
                 id, name, input, ..
             } => {
-                assert_eq!(name, "load_knowhow");
-                assert_eq!(input["id"], "x");
+                assert_eq!(name, "read_file");
+                assert_eq!(input["path"], "x");
                 assert!(id.starts_with("evt-"), "id should be synthesized: {}", id);
             }
             _ => panic!("expected ToolUse block"),
@@ -119,7 +119,7 @@ fn build_resume_tool_blocks_returns_empty_when_no_tools() {
 }
 
 #[test]
-fn build_resume_tool_blocks_caps_at_n_excluding_pinned() {
+fn build_resume_tool_blocks_caps_at_n() {
     // 5 unrelated tool calls, N=2 -> 2 most recent emitted
     use crate::core::EventRow;
     use chrono::Utc;
@@ -161,7 +161,7 @@ fn build_resume_tool_blocks_caps_at_n_excluding_pinned() {
 }
 
 #[test]
-fn build_resume_tool_blocks_pins_load_knowhow_beyond_n() {
+fn build_resume_tool_blocks_drop_an_old_load_knowhow_like_any_tool() {
     use crate::core::EventRow;
     use chrono::Utc;
     let now = Utc::now();
@@ -203,14 +203,13 @@ fn build_resume_tool_blocks_pins_load_knowhow_beyond_n() {
         });
     }
 
-    // N=2, but load_knowhow must be pinned even though it's older
+    // N=2: the older load_knowhow falls out of the window like any tool.
     let (blocks, _skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
         &events,
         2,
         &std::collections::HashSet::new(),
     );
-    // Pinned load_knowhow pair + 2 most recent unrelated pairs = 3 pairs * 2 = 6
-    assert_eq!(blocks.len(), 6);
+    assert_eq!(blocks.len(), 4, "2 most recent pairs * 2 messages each");
 
     use crate::llm::{ContentBlock, MessageContent};
     let names: Vec<String> = blocks
@@ -224,13 +223,8 @@ fn build_resume_tool_blocks_pins_load_knowhow_beyond_n() {
             None
         })
         .collect();
-    // Pinned load_knowhow first (chronological), then last 2 unrelated tools
-    assert_eq!(
-        names,
-        vec!["load_knowhow".to_string(), "tool_3".into(), "tool_4".into()]
-    );
+    assert_eq!(names, vec!["tool_3".to_string(), "tool_4".into()]);
 
-    // Verify body preserved
     let body_present = blocks.iter().any(|m| {
         if let MessageContent::Blocks(b) = &m.content {
             if let ContentBlock::ToolResult { content, .. } = &b[0] {
@@ -240,14 +234,14 @@ fn build_resume_tool_blocks_pins_load_knowhow_beyond_n() {
         false
     });
     assert!(
-        body_present,
-        "load_knowhow body should be present in pinned pair"
+        !body_present,
+        "an old knowhow body must not ride in the resume blocks"
     );
 }
 
 /// The skip set returned alongside the resume blocks must contain ONLY the
 /// `ToolCalled` event ids that were emitted as full Message::Blocks pairs —
-/// older non-pinned tools must NOT be in it, so their `[tools: ...]` summary
+/// older tools must NOT be in it, so their `[tools: ...]` summary
 /// in stringified history survives. Without this, suppressing the summary
 /// for the wrong rows would silently strip the orchestrator's older tool
 /// context twice over (once dropped from blocks, once dropped from summary).

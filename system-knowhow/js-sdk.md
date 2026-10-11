@@ -1942,7 +1942,8 @@ html[data-widget-mode="minimal"] .list { display: none; }
   text wraps there.
 - **Window** keeps the size the user set, and your page scrolls inside it.
   A "Show more" never resizes the window.
-- **Docked** hangs under the thread's title row at the row's width. Its
+- **Docked** hangs under the header at the window's own width, beside the
+  other docked windows (on a phone, under the thread's title row). Its
   height follows your content, up to half the screen.
 - **The window owns its controls.** It draws a mode button, a ⋯ menu and
   Close in a pill above your widget. Near the top of the screen, or docked,

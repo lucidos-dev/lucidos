@@ -95,6 +95,7 @@ pub const CREATE_APP: &str = "create_app";
 pub const LIST_APPS: &str = "list_apps";
 pub const EXECUTE_INTENT: &str = "execute_intent";
 pub const LOAD_KNOWHOW: &str = "load_knowhow";
+pub const UNLOAD_KNOWHOW: &str = "unload_knowhow";
 
 // App UI (handled by handle_special_tool)
 pub const REFRESH_APP: &str = "refresh_app";

@@ -84,7 +84,7 @@ The host carries them in the frame URL, so they are visible there. Never put a c
 - **In a reply**, a bad embed cannot be refused, so it reads "This widget is not available" in place. While the reply streams it shows its label; the widget mounts once the text is final.
 - **An embed records no showing.** Its frame in a reply offers Pin to shelf (Pin to Home in Home) and Open in Canvas. A pin adds the instance to the *thread widgets*.
 
-**Built-in widgets ship with Lucidos.** A *built-in widget* is a reusable widget under an id starting `lucidos-`, such as `lucidos-sound-player` (param `clip`: a workspace path or an https URL). It is read-only: no tool, route or CLI command can change, delete or stop reusing it, and `create_app` refuses a new `lucidos-` id. Read its files at `apps/<id>/` to build your own from it. Prefer a built-in over building the same thing again.
+**Built-in widgets ship with Lucidos.** A *built-in widget* is a reusable widget under an id starting `lucidos-`, such as `lucidos-sound-player` or `lucidos-video-player` (each takes param `clip`: a workspace path or an https URL). It is read-only: no tool, route or CLI command can change, delete or stop reusing it, and `create_app` refuses a new `lucidos-` id. Read its files at `apps/<id>/` to build your own from it. Prefer a built-in over building the same thing again.
 
 **Only one sound plays at a time.** A clip that starts in one app or widget pauses the others. So a voice sample per option never talks over another (`system-knowhow/js-sdk.md` § One sound at a time).
 

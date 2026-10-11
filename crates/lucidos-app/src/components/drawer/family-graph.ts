@@ -1,5 +1,5 @@
 import { computed } from '@preact/signals';
-import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadIsBlocked, threadInReview, ONGOING_GROUPS, selectedOngoingGroup, ongoingFilter, ONGOING_PARTS, isSplitOngoingGroup, type OngoingFilter, type OngoingGroup, type OngoingPart, type SplitOngoingGroup, type ThreadChannel } from '../../store/store';
+import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadIsBlocked, threadInReview, ONGOING_GROUPS, selectedOngoingGroup, ongoingFilterChoice, setOngoingFilterChoice, ONGOING_PARTS, isSplitOngoingGroup, type OngoingFilter, type OngoingGroup, type OngoingPart, type SplitOngoingGroup, type ThreadChannel } from '../../store/store';
 import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { byRecent, byCreated, changeReadyToReview, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
 import type { ThreadState } from '../../store/thread-events';
@@ -749,6 +749,15 @@ export function ongoingBreakdown(group: SplitOngoingGroup, rows: readonly Nested
     return ONGOING_PARTS[group].map(part => ({ part, count: rows.filter(n => ongoingPartOf(group, n) === part).length }));
 }
 
+/** The filters a press on `group`'s selected tile steps through, in order:
+ *  all, then each part that holds rows. A filter needs two such parts, since
+ *  one would keep every row. */
+export function ongoingFilterSteps(group: OngoingGroup, rows: readonly NestedThread[]): readonly OngoingFilter[] {
+    if (!isSplitOngoingGroup(group)) return ['all'];
+    const filled = ongoingBreakdown(group, rows).filter(({ count }) => count > 0).map(({ part }) => part);
+    return filled.length > 1 ? ['all', ...filled] : ['all'];
+}
+
 /** The rows of `group` that `filter` keeps. In flight nests, so its kept rows
  *  re-nest, and a row whose parent the filter drops stands at root level. */
 export function filterOngoingRows(group: OngoingGroup, rows: NestedThread[], filter: OngoingFilter): NestedThread[] {
@@ -778,14 +787,30 @@ export type OngoingGroupList = { group: OngoingGroup; rows: NestedThread[] };
  *  both read it, so neither rebuilds the groups on an unrelated render. */
 export const ongoingGroupLists = computed<OngoingGroupList[]>(() => ongoingGroups(threadMap.value, ONGOING_GROUPS));
 
+const selectedGroupRows = computed<NestedThread[]>(() =>
+    ongoingGroupLists.value.find(g => g.group === selectedOngoingGroup.value)?.rows ?? []);
+
+const selectedFilterSteps = computed(() => ongoingFilterSteps(selectedOngoingGroup.value, selectedGroupRows.value));
+
+/** The selected group's filter: the choice while it is one of the group's
+ *  steps, else all. So a filtered list is never empty, and a part that empties
+ *  under the filter lists the whole group again. */
+export const ongoingFilter = computed<OngoingFilter>(() => {
+    const choice = ongoingFilterChoice.value;
+    return selectedFilterSteps.value.includes(choice) ? choice : 'all';
+});
+
+/** Step the selected group's filter: all, then each part with rows, then all again. */
+export function stepOngoingFilter(): void {
+    const steps = selectedFilterSteps.value;
+    setOngoingFilterChoice(steps[(steps.indexOf(ongoingFilter.value) + 1) % steps.length]);
+}
+
 /** The selected ongoing group's rows as the drawer lists them, after its
  *  filter. The list, a tile press and the post-archive hand-off read
  *  it, so all three walk the rows on screen. */
-export const selectedOngoingRows = computed<NestedThread[]>(() => {
-    const selected = selectedOngoingGroup.value;
-    const rows = ongoingGroupLists.value.find(g => g.group === selected)?.rows ?? [];
-    return filterOngoingRows(selected, rows, ongoingFilter.value);
-});
+export const selectedOngoingRows = computed<NestedThread[]>(() =>
+    filterOngoingRows(selectedOngoingGroup.value, selectedGroupRows.value, ongoingFilter.value));
 
 /** Every ongoing group with its rows, in the order `groups` names. */
 export function ongoingGroups(

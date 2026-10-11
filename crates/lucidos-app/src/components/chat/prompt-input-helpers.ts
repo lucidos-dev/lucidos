@@ -1,6 +1,6 @@
 import { signal } from '@preact/signals';
 import { focusedThreadId, isMidTurn } from '../../store/store';
-import { computeExchanges, findQuestionAnswer } from '../../store/thread-events';
+import { computeExchanges, findQuestionAnswer, hasContentEvents } from '../../store/thread-events';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
 import { uploadsGate, type PendingUpload } from '../../store/pendingUploads';
 
@@ -417,16 +417,29 @@ export const PLACEHOLDER_FOLLOW_UP = 'Post a follow up…';
 export const PLACEHOLDER_ANSWERING = 'Type custom answer here…';
 export const PLACEHOLDER_SIDE_QUESTION = 'Ask a side question…';
 
+/** Whether a message here follows up on something. The home thread never does:
+ *  it never ends, so a message there starts something new. Nor does a thread
+ *  with no messages yet. A thread still loading counts as started, so a
+ *  long thread never flashes the new-thread line on open. That includes one
+ *  focused before the thread list lands, as on a cold open. */
+export function threadHasConversation(threadId: string | null, thread: ThreadState | undefined): boolean {
+  if (threadId === null) return false;
+  if (!thread) return true;
+  if (thread.meta.home || thread.meta.state === 'composing') return false;
+  if (!thread.eventsLoaded) return true;
+  return hasContentEvents(thread.events) || thread.pendingUserMessages.length > 0;
+}
+
 /** Side-question mode wins over a pending question card: in the mode, Send
  *  asks the side question, and the × goes back to answering the card. */
 export function promptPlaceholder(
-  hasFocusedThread: boolean,
+  hasConversation: boolean,
   answeringQuestionCard: boolean,
   sideQuestionMode: boolean,
 ): string {
   if (sideQuestionMode) return PLACEHOLDER_SIDE_QUESTION;
   if (answeringQuestionCard) return PLACEHOLDER_ANSWERING;
-  return hasFocusedThread ? PLACEHOLDER_FOLLOW_UP : PLACEHOLDER_NEW_THREAD;
+  return hasConversation ? PLACEHOLDER_FOLLOW_UP : PLACEHOLDER_NEW_THREAD;
 }
 
 // Stamp cancelTargetId BEFORE invoking send. sendCompose's sync prefix

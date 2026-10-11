@@ -431,3 +431,4 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0422: A widget frame mounts on first sight and stays loaded two minutes off screen; the shared cap still evicts](0422-widget-frames-stay-loaded-a-while-off-screen.md)
 - [0423: The proxy asks OpenAI speech for an SSE stream, so a TTS call records its cost](0423-proxy-asks-speech-for-its-usage.md)
 - [0424: The read decision knows when work is still in flight, and a read request lists during a live event wait](0424-read-decision-knows-work-in-flight.md)
+- [0425: A loaded knowhow doc leaves the prompt after 3 finished turns that do not load it; the set is derived from events, a re-load of a loaded doc keeps it without a body, and unload_knowhow drops one](0425-loaded-knowhow-leaves-after-three-idle-turns.md)

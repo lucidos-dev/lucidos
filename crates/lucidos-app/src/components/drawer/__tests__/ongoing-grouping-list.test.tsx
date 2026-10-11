@@ -4,8 +4,9 @@
  * - four tiles, always, in one fixed order, whatever their counts;
  * - exactly one selected, and only its threads listed below the tiles;
  * - a press opens the group's first thread, on the phone only when it is the sole one;
- * - a press on the selected In flight tile lists only running, then only waiting, then all;
- * - a press on the selected Review tile lists only changes, then only unread, then all;
+ * - a press on the selected In flight tile lists only running, then only waiting, then all,
+ *   skipping a part with no rows;
+ * - a press on the selected Review tile does the same with changes and unread;
  * - a selected group that is empty says so, and nothing is claimed before load;
  * - every thread type, whatever the thread-type filter says;
  * - no Idle group, and no Archive all.
@@ -151,15 +152,14 @@ describe('the Ongoing grouping', () => {
             expect(focusedThreadId.value).toBe('parked');
         });
 
-        it('says which kind it is missing when the filter keeps nothing', () => {
+        it('steps no filter while only one part has rows', () => {
             threadMap.value = new Map([...threadMap.value].filter(([id]) => id !== 'run'));
             setSelectedOngoingGroup('in-flight');
             mount();
             act(() => { tile('In flight').click(); });
-            expect(rowIds()).toEqual([]);
-            expect(emptyState()).toBe('Nothing running');
-            act(() => { tile('In flight').click(); });
             expect(rowIds()).toEqual(['parked']);
+            expect(listed()).toEqual([]);
+            expect(tile('In flight').getAttribute('aria-label')).toBe('In flight, 1');
         });
 
         it('lists the whole group again once another group is selected', () => {
@@ -207,15 +207,36 @@ describe('the Ongoing grouping', () => {
             expect(listed()).toEqual([]);
         });
 
-        it('says which kind it is missing, and drops a part with no rows from the tile', () => {
-            threadMap.value = new Map([...threadMap.value].filter(([id]) => id !== 'unread' && id !== 'both'));
+        it('drops a part with no rows from the tile, and never lists it', () => {
+            threadMap.value = new Map([...threadMap.value].filter(([id]) => id === 'unread'));
             setSelectedOngoingGroup('review');
             mount();
-            expect(parts()).toEqual(['1 change']);
+            expect(parts()).toEqual(['1 unread']);
+            for (let press = 0; press < 3; press++) {
+                act(() => { tile('Review').click(); });
+                expect(rowIds()).toEqual(['unread']);
+                expect(emptyState()).toBeUndefined();
+            }
+        });
+
+        it('lists the whole group again once the listed part empties', () => {
+            setSelectedOngoingGroup('review');
+            mount();
             act(() => { tile('Review').click(); });
-            act(() => { tile('Review').click(); });
-            expect(rowIds()).toEqual([]);
-            expect(emptyState()).toBe('Nothing unread');
+            expect(rowIds().sort()).toEqual(['both', 'change']);
+            const before = threadMap.value;
+            act(() => { threadMap.value = new Map([...before].filter(([id]) => id !== 'change' && id !== 'both')); });
+            expect(rowIds()).toEqual(['unread']);
+            expect(listed()).toEqual([]);
+            expect(emptyState()).toBeUndefined();
+            // The returning rows roll in, and jsdom has no Web Animations.
+            Element.prototype.animate = (() => ({ finished: new Promise(() => {}), startTime: null, pause() {}, play() {}, cancel() {} })) as unknown as typeof Element.prototype.animate;
+            try {
+                act(() => { threadMap.value = before; });
+                expect(rowIds().sort()).toEqual(['both', 'change', 'unread']);
+            } finally {
+                delete (Element.prototype as Partial<Element>).animate;
+            }
         });
 
         it('lists the whole group again once another group is selected', () => {

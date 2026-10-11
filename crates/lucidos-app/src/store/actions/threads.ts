@@ -1,11 +1,11 @@
-import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, awaitedThreadId, drawerGrouping, selectedOngoingGroup, ongoingFilter, threadSearchQuery, threadSearchResults } from '../store';
+import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, awaitedThreadId, drawerGrouping, selectedOngoingGroup, threadSearchQuery, threadSearchResults } from '../store';
 import { appliedThreadFilter } from '../appliedThreadFilter';
 import { revealThreadPane } from './pane';
 import type { ThreadMeta, ThreadSection, ThreadState } from '../thread-events';
 import { deepLinkAnchorInThread, describeWaitSubscription, NO_CHANGE } from '../thread-events';
 import type { ConfirmDetailGroup, ConfirmDetails } from '../types';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, selectedOngoingRows } from '../../components/drawer/family-graph';
+import { computeFamilyGraph, filterByTopThread, ongoingFilter, orderedCurrentForReview, selectedOngoingRows } from '../../components/drawer/family-graph';
 import type { FamilyGraph } from '../../components/drawer/family-graph';
 import { saveThread, unsaveThread, archiveThread, unarchiveThreads, type ArchiveSkippedMember } from '../../api/threads';
 import { ApiError, putComposeOnThread } from '../../api/client';
